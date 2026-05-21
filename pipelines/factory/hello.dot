@@ -1,0 +1,20 @@
+digraph hello {
+    graph [
+        goal="Minimal smoke pipeline — plan, implement, holdout-eval, exit."
+        label="Hello"
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    plan      [type="codergen", label="Plan",      prompt="@prompts/hello/plan.md"]
+    implement [type="codergen", label="Implement", prompt="@prompts/hello/implement.md"]
+    holdout   [type="holdout_eval", label="Holdout Eval", feature="hello"]
+    fix       [type="codergen", label="Fix",       prompt="@prompts/hello/fix.md", max_visits="3"]
+
+    start -> plan -> implement -> holdout
+    holdout -> exit [condition="outcome=success"]
+    holdout -> fix  [condition="outcome!=success"]
+    fix     -> holdout
+}
