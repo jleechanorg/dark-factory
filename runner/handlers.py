@@ -126,6 +126,7 @@ def _ao_wait_idle(
     timeout: int = 900,
     stable_reads: int = 3,
     poll_interval: int = 10,
+    project: Optional[str] = None,
 ) -> str:
     """Poll `ao status --json` until the session is idle for `stable_reads`
     consecutive polls.
@@ -135,19 +136,25 @@ def _ao_wait_idle(
     bouncing back to "active". Requiring N consecutive idle reads makes the
     wait robust against that.
 
+    `project` filters the status query (`ao status -p <project> --json`),
+    which is much faster than the unfiltered call when the fleet has many
+    sessions.
+
     Returns the last observed terminal activity ("exited", "ready",
     "missing"), or "timeout" if the deadline elapsed before idle stabilised.
     """
     deadline = time.monotonic() + timeout
     consecutive = 0
-    last_terminal = "unknown"
+    status_cmd = ["ao", "status", "--json"]
+    if project:
+        status_cmd = ["ao", "status", "-p", project, "--json"]
     while time.monotonic() < deadline:
         proc = subprocess.run(
-            ["ao", "status", "--json"],
+            status_cmd,
             cwd=workdir,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=180,
             check=False,
             env=_sanitized_env(),
         )
@@ -221,7 +228,7 @@ def _codergen(node: Node, ctx: Context) -> Result:
             ctx.state["ao.session"] = sess_name
             if worktree:
                 ctx.state["ao.worktree"] = worktree
-            activity = _ao_wait_idle(sess_name, ctx.workdir, timeout=900)
+            activity = _ao_wait_idle(sess_name, ctx.workdir, timeout=900, project=project)
             outcome = "success" if activity in ("exited", "ready") else "failure"
             return Result(
                 outcome=outcome,
@@ -244,7 +251,7 @@ def _codergen(node: Node, ctx: Context) -> Result:
                 outcome="failure",
                 output=f"ao send failed (rc={proc.returncode})\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
             )
-        activity = _ao_wait_idle(session, ctx.workdir, timeout=900)
+        activity = _ao_wait_idle(session, ctx.workdir, timeout=900, project=project)
         outcome = "success" if activity in ("exited", "ready") else "failure"
         return Result(
             outcome=outcome,
