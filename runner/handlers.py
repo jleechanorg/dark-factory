@@ -106,12 +106,16 @@ def _tool(node: Node, ctx: Context) -> Result:
     cmd = node.attrs.get("command")
     if not cmd:
         return Result(outcome="failure", output="no command attribute")
+    try:
+        timeout = int(node.attrs.get("timeout", "300"))
+    except (TypeError, ValueError):
+        timeout = 300
     proc = subprocess.run(
         shlex.split(cmd),
         cwd=ctx.workdir,
         capture_output=True,
         text=True,
-        timeout=int(node.attrs.get("timeout", "300")),
+        timeout=timeout,
         check=False,
     )
     outcome = "success" if proc.returncode == 0 else "failure"

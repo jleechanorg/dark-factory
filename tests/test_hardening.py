@@ -63,6 +63,19 @@ def test_parse_verdict_standalone_fallback():
     assert raw == "pass"
 
 
+def test_tool_handler_tolerates_bad_timeout(tmp_path, monkeypatch):
+    """`_tool` must not crash when a .dot author writes `timeout="abc"`."""
+    from runner.handlers import _tool, Context, Result
+    from runner.parser import Node
+
+    node = Node(name="t", attrs={"command": "echo hi", "timeout": "not-a-number"})
+    ctx = Context(goal="t", workdir=tmp_path, backend="echo")
+    # Must run without raising ValueError and surface the command output.
+    result = _tool(node, ctx)
+    assert isinstance(result, Result)
+    assert result.outcome in {"success", "failure"}
+
+
 def test_parse_verdict_marker_invalid_token_does_not_fall_back():
     """If a `verdict:` marker exists with an invalid token, refuse to guess.
 
