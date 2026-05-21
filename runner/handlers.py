@@ -33,6 +33,8 @@ class Context:
     state: dict[str, str] = field(default_factory=dict)
     history: list[dict[str, str]] = field(default_factory=list)
     backend: str = "echo"  # echo | claude | codex | shell
+    cxdb_path: Optional[pathlib.Path] = None
+    run_id: Optional[str] = None
 
 
 Handler = Callable[[Node, Context], Result]
@@ -135,6 +137,82 @@ def _human_gate(node: Node, ctx: Context) -> Result:
     return Result(outcome=answer, output=f"human={answer}")
 
 
+_VERDICT_PATTERNS = [
+    ("fail", "failure"),
+    ("partial", "failure"),
+    ("inconclusive", "failure"),
+    ("warn", "success"),
+    ("pass", "success"),
+]
+
+
+def _parse_verdict(text: str) -> tuple[str, str]:
+    """Extract a normalized verdict from gate output.
+
+    Looks for `VERDICT:` or `Overall:` lines (case-insensitive) and returns
+    (raw_verdict, normalized_outcome). Falls back to scanning the last 40 lines
+    for verdict keywords.
+    """
+    lines = text.splitlines()
+    candidates = []
+    for line in lines:
+        low = line.lower()
+        if "verdict:" in low or "overall:" in low or low.strip().startswith("normalized:"):
+            candidates.append(low)
+    if not candidates:
+        candidates = [line.lower() for line in lines[-40:]]
+    for verdict, normalized in _VERDICT_PATTERNS:
+        for line in candidates:
+            if verdict in line:
+                return verdict, normalized
+    return "unknown", "failure"
+
+
+def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
+    """Build a handler that shells out to `claude --print /<command> <args>`."""
+
+    def handler(node: Node, ctx: Context) -> Result:
+        args = node.attrs.get("args", default_args)
+        target = node.attrs.get("target", str(ctx.workdir))
+        prompt = f"/{slash_command} {args} {target}".strip()
+
+        # Echo backend: outcome from state hint, used by tests + CI.
+        if ctx.backend == "echo":
+            hint = ctx.state.get(f"{node.name}.outcome", "success")
+            return Result(
+                outcome=hint,
+                output=f"echo gate /{slash_command}: pre-seeded {hint}",
+                metadata={"slash_command": slash_command, "verdict": "echo:" + hint},
+            )
+
+        proc = subprocess.run(
+            ["claude", "--print", "--dangerously-skip-permissions", prompt],
+            cwd=ctx.workdir,
+            capture_output=True,
+            text=True,
+            timeout=int(node.attrs.get("timeout", "1200")),
+            check=False,
+        )
+        verdict, normalized = _parse_verdict(proc.stdout + "\n" + proc.stderr)
+        return Result(
+            outcome=normalized,
+            output=proc.stdout,
+            metadata={
+                "slash_command": slash_command,
+                "verdict": verdict,
+                "returncode": str(proc.returncode),
+            },
+        )
+
+    handler.__name__ = f"_gate_{slash_command}"  # noqa: WPS125
+    return handler
+
+
+_gate_es = _slash_gate("es")
+_gate_er = _slash_gate("er")
+_gate_code_standards = _slash_gate("code_standards")
+
+
 def _holdout_eval(node: Node, ctx: Context) -> Result:
     """Run the sealed holdout evaluator in a separate process.
 
@@ -210,6 +288,9 @@ TYPE_REGISTRY: dict[str, Handler] = {
     "tool": _tool,
     "human_gate": _human_gate,
     "holdout_eval": _holdout_eval,
+    "gate_es": _gate_es,
+    "gate_er": _gate_er,
+    "gate_code_standards": _gate_code_standards,
 }
 
 

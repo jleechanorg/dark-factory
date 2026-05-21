@@ -8,6 +8,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
+from .cxdb import CXDB
 from .handlers import Context, Result, resolve
 from .parser import Edge, Graph, Node
 
@@ -52,6 +53,11 @@ def run(
     visits: dict[str, int] = {}
     current = graph.nodes["start"]
 
+    cxdb: Optional[CXDB] = None
+    if ctx.cxdb_path is not None:
+        cxdb = CXDB(ctx.cxdb_path)
+        ctx.run_id = cxdb.start_run(pipeline=graph.name, goal=ctx.goal)
+
     while True:
         visits[current.name] = visits.get(current.name, 0) + 1
         max_visits = int(current.attrs.get("max_visits", "0") or 0)
@@ -82,6 +88,16 @@ def run(
             checkpoint.write_text(
                 json.dumps([asdict(r) for r in history], indent=2)
             )
+        if cxdb is not None and ctx.run_id is not None:
+            cxdb.record_step(
+                run_id=ctx.run_id,
+                seq=len(history) - 1,
+                node=current.name,
+                outcome=result.outcome,
+                ts=record.ts,
+                output=result.output,
+                metadata=result.metadata,
+            )
 
         if current.name == "exit" or len(history) >= max_steps:
             break
@@ -96,8 +112,22 @@ def run(
                     output_preview="no matching outgoing edge",
                 )
             )
+            if cxdb is not None and ctx.run_id is not None:
+                cxdb.record_step(
+                    run_id=ctx.run_id,
+                    seq=len(history) - 1,
+                    node=current.name,
+                    outcome="stuck",
+                    ts=history[-1].ts,
+                    output="no matching outgoing edge",
+                    metadata={},
+                )
             break
         current = next_node
+
+    if cxdb is not None and ctx.run_id is not None:
+        cxdb.end_run(ctx.run_id, final=history[-1].outcome if history else "empty")
+        cxdb.close()
 
     return history
 

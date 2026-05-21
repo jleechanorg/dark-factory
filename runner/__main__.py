@@ -26,10 +26,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--checkpoint", type=pathlib.Path, default=None)
     p.add_argument("--max-steps", type=int, default=100)
     p.add_argument("--feature", default=None, help="feature name for holdout eval")
+    p.add_argument(
+        "--cxdb",
+        type=pathlib.Path,
+        default=None,
+        help="Path to CXDB SQLite file; records every step for Healer consumption.",
+    )
     args = p.parse_args(argv)
 
     graph = parse(args.pipeline)
-    ctx = Context(goal=args.goal, workdir=args.workdir, backend=args.backend)
+    ctx = Context(
+        goal=args.goal,
+        workdir=args.workdir,
+        backend=args.backend,
+        cxdb_path=args.cxdb,
+    )
     if args.feature:
         ctx.state["feature"] = args.feature
 
