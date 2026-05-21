@@ -26,8 +26,10 @@ def test_parse_verdict_pass_warn_fail():
     assert _parse_verdict("verdict: FAIL")[1] == "failure"
     assert _parse_verdict("Verdict: PARTIAL")[1] == "failure"
     assert _parse_verdict("verdict: INCONCLUSIVE")[1] == "failure"
-    # Falls back to scanning the tail when there's no explicit marker.
-    assert _parse_verdict("everything is fine\nresult: pass")[1] == "success"
+    # Standalone-line fallback fires when no marker is present.
+    assert _parse_verdict("everything is fine\nPASS\n")[1] == "success"
+    # Prose that contains the word "pass" inside another phrase is NOT a verdict.
+    assert _parse_verdict("everything is fine\nresult: pass needed")[1] == "failure"
 
 
 def test_gate_echo_seeded_outcome(monkeypatch):

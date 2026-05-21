@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shlex
 import subprocess
 from dataclasses import dataclass, field
@@ -132,39 +133,73 @@ def _human_gate(node: Node, ctx: Context) -> Result:
         return Result(outcome="failure", output="human gate reached non-interactively")
 
     print(f"\n[HUMAN GATE] {node.name}: {node.attrs.get('label', node.name)}")
-    print(f"  edges: {[e.attrs.get('label', e.dst) for e in []]}")
     answer = input("approve? (success/failure): ").strip().lower() or "success"
     return Result(outcome=answer, output=f"human={answer}")
 
 
-_VERDICT_PATTERNS = [
-    ("fail", "failure"),
-    ("partial", "failure"),
-    ("inconclusive", "failure"),
-    ("warn", "success"),
-    ("pass", "success"),
-]
+_VERDICT_NORMALIZE = {
+    "pass": "success",
+    "warn": "success",
+    "fail": "failure",
+    "partial": "failure",
+    "inconclusive": "failure",
+}
+
+# Anchored regex: keyword must follow a marker like "verdict:", "overall:", or "normalized:"
+# and stand on its own word boundary. Avoids substring hits inside "passes warnings".
+_MARKER_RE = re.compile(
+    r"(?:verdict|overall|normalized)\s*:\s*(pass|warn|fail|partial|inconclusive)\b",
+    re.IGNORECASE,
+)
+
+# Bare marker (presence of "verdict:"/"overall:"/"normalized:" anywhere) — used to
+# detect that the gate *attempted* to emit a verdict line. If that's present we
+# trust only the regex above; we don't fall back to scanning the whole tail,
+# because the fallback can lift "fail" out of compound phrases like
+# "verdict: not a fail".
+_MARKER_PRESENT_RE = re.compile(
+    r"(?:verdict|overall|normalized)\s*:",
+    re.IGNORECASE,
+)
+
+# Fallback: a verdict line standing alone (whitespace + token + optional
+# trailing punctuation). Stricter than a free `\b` scan so prose like
+# "not a fail" doesn't slip through.
+_STANDALONE_RE = re.compile(
+    r"^\s*(pass|warn|fail|partial|inconclusive)\b[\s.!:]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def _parse_verdict(text: str) -> tuple[str, str]:
     """Extract a normalized verdict from gate output.
 
-    Looks for `VERDICT:` or `Overall:` lines (case-insensitive) and returns
-    (raw_verdict, normalized_outcome). Falls back to scanning the last 40 lines
-    for verdict keywords.
+    Strategy:
+      1. Look for explicit marker lines (`Verdict: PASS`). The LAST valid marker
+         wins — gates may emit progress lines before the authoritative one.
+      2. If a marker word was present but no matching token followed it,
+         return ("unknown", "failure") — do NOT fall back; the gate's own
+         marker line is the contract.
+      3. With no marker at all, scan the last 40 lines for a *standalone*
+         verdict token (not embedded in prose).
+
+    Returns (raw_verdict, normalized_outcome). Unknown returns ("unknown", "failure").
     """
-    lines = text.splitlines()
-    candidates = []
-    for line in lines:
-        low = line.lower()
-        if "verdict:" in low or "overall:" in low or low.strip().startswith("normalized:"):
-            candidates.append(low)
-    if not candidates:
-        candidates = [line.lower() for line in lines[-40:]]
-    for verdict, normalized in _VERDICT_PATTERNS:
-        for line in candidates:
-            if verdict in line:
-                return verdict, normalized
+    body = text or ""
+    matches = list(_MARKER_RE.finditer(body))
+    if matches:
+        raw = matches[-1].group(1).lower()
+        return raw, _VERDICT_NORMALIZE.get(raw, "failure")
+
+    if _MARKER_PRESENT_RE.search(body):
+        # A verdict marker existed but with an invalid token — refuse to guess.
+        return "unknown", "failure"
+
+    tail = "\n".join(body.splitlines()[-40:])
+    fallback = list(_STANDALONE_RE.finditer(tail))
+    if fallback:
+        raw = fallback[-1].group(1).lower()
+        return raw, _VERDICT_NORMALIZE.get(raw, "failure")
     return "unknown", "failure"
 
 
@@ -185,17 +220,27 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
                 metadata={"slash_command": slash_command, "verdict": "echo:" + hint},
             )
 
+        try:
+            timeout = int(node.attrs.get("timeout", "1200"))
+        except (TypeError, ValueError):
+            timeout = 1200
         proc = subprocess.run(
             ["claude", "--print", "--dangerously-skip-permissions", prompt],
             cwd=ctx.workdir,
             capture_output=True,
             text=True,
-            timeout=int(node.attrs.get("timeout", "1200")),
+            timeout=timeout,
             check=False,
         )
         verdict, normalized = _parse_verdict(proc.stdout + "\n" + proc.stderr)
+        # Distinguish infra failures (claude crashed / not installed / network)
+        # from real "FAIL" verdicts so the Healer can group them separately.
+        if proc.returncode != 0 and verdict == "unknown":
+            outcome = "error"
+        else:
+            outcome = normalized
         return Result(
-            outcome=normalized,
+            outcome=outcome,
             output=proc.stdout,
             metadata={
                 "slash_command": slash_command,

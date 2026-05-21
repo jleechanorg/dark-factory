@@ -25,6 +25,8 @@ class Cluster:
     sample: str
     run_ids: list[str]
 
+    # Heuristic over the Healer's own node-name namespace (not user/model
+    # input), so prefix matching here is internal data routing, not ZFC.
     @property
     def is_gate(self) -> bool:
         return self.node.startswith("gate_") or self.node in {"holdout", "validate"}
@@ -35,15 +37,15 @@ class Cluster:
                 f"prompt template at `prompts/<feature>/{self.node}.md` returned "
                 f"`{self.outcome}` — review prompt or upstream spec."
             )
-        if self.is_gate:
-            return (
-                f"gate `{self.node}` returned `{self.outcome}` — re-inspect "
-                "evidence bundle / diff against the relevant slash-command standards."
-            )
         if self.node == "holdout":
             return (
                 "holdout evaluator reported failure — sealed scenarios diverge from "
                 "implementation; do NOT inspect scenarios. Re-read spec + impl."
+            )
+        if self.is_gate:
+            return (
+                f"gate `{self.node}` returned `{self.outcome}` — re-inspect "
+                "evidence bundle / diff against the relevant slash-command standards."
             )
         return (
             f"node `{self.node}` failed with `{self.outcome}` ({self.hits} run(s)). "

@@ -32,11 +32,17 @@ dark-factory/
 │   └── factory/       # Per-pipeline prompt directories
 ├── runner/            # Python DOT pipeline engine
 │   ├── __init__.py
+│   ├── __main__.py    # CLI entry point
 │   ├── parser.py      # DOT → graph model
 │   ├── engine.py      # Graph traversal + checkpointing
-│   ├── handlers.py    # Node type handlers (codergen, tool, conditional, fan-in, human-gate)
-│   ├── backends.py    # Agent backends (AO, Claude Code, Codex)
-│   └── evaluator.py   # Holdout scenario runner
+│   ├── handlers.py    # Node handlers + inline backend dispatch (echo|claude|codex via ctx.backend)
+│   ├── cxdb.py        # CXDB — SQLite event log of every step (for Healer)
+│   └── healer.py      # Healer — clusters CXDB failures into a diagnosis report
+│
+│   # Note: the holdout evaluator lives in a sealed sibling repo
+│   # (~/projects/dark-factory-holdouts/evaluator/run.py); its path is
+│   # supplied via the DARK_FACTORY_HOLDOUTS environment variable so the
+│   # coding agent never sees scenario files.
 ├── tests/
 ├── .claude/           # Agent config (scoped to this repo only)
 │   └── CLAUDE.md
@@ -46,15 +52,41 @@ dark-factory/
 ## Quick Start
 
 ```bash
-# Run a pipeline
-python -m runner --pipeline pipelines/factory/implement.dot --goal "Add rate limiting to campaign creation"
+# Smallest end-to-end pipeline (echo backend; no LLM calls)
+python -m runner --pipeline pipelines/factory/hello.dot --goal "smoke test"
 
-# Run with holdout evaluation
-python -m runner --pipeline pipelines/factory/implement.dot --goal "Add rate limiting" --holdouts holdouts/rate_limit/
+# Pipeline with gates, recording every step to CXDB
+python -m runner \
+  --pipeline pipelines/factory/gates.dot \
+  --goal "Add rate limiting to campaign creation" \
+  --backend claude \
+  --feature rate_limit \
+  --cxdb ~/.dark-factory/cxdb.sqlite
 
 # Visualize a pipeline
-dot -Tpng pipelines/factory/implement.dot -o implement.png
+dot -Tpng pipelines/factory/gates.dot -o gates.png
+
+# Run holdout evaluation against the sealed sibling repo
+export DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts
+python -m runner --pipeline pipelines/factory/gates.dot --goal "Add rate limiting" --feature rate_limit
+
+# After one or more runs, diagnose failures
+python -m runner.healer --cxdb ~/.dark-factory/cxdb.sqlite
 ```
+
+`--feature <name>` selects the holdout subdirectory; the sealed evaluator repo
+is located via the `DARK_FACTORY_HOLDOUTS` environment variable. The CLI
+intentionally does not accept a holdouts path argument — scenario files must
+stay out of the agent's view.
+
+## CXDB + Healer
+
+Every node execution is appended to a SQLite event log (CXDB) when `--cxdb`
+is set. The Healer reads that log, clusters terminal failures by
+`(node, outcome, output_hash)`, and emits a Markdown diagnosis with a
+prescription per cluster (which prompt template, holdout, or gate to inspect).
+This is the loop that lets dorodango runner code stay disposable while
+learning accumulates in the log, not the code.
 
 ## Key Innovation
 

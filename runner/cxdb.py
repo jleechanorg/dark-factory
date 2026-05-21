@@ -57,6 +57,11 @@ class CXDB:
         self.path = pathlib.Path(path).expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path))
+        # WAL + busy_timeout so concurrent pipelines into the same CXDB don't
+        # collide on `database is locked`. README explicitly promises many
+        # runs into one CXDB for the Healer.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
         self._conn.commit()
 
@@ -106,8 +111,9 @@ class CXDB:
         self._conn.commit()
 
     def failed_steps(self) -> Iterable[sqlite3.Row]:
-        self._conn.row_factory = sqlite3.Row
-        cur = self._conn.execute(
+        cur = self._conn.cursor()
+        cur.row_factory = sqlite3.Row
+        cur.execute(
             """
             SELECT node, outcome, output_hash, COUNT(*) AS hits,
                    GROUP_CONCAT(run_id, ',') AS run_ids,
