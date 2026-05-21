@@ -64,16 +64,23 @@ def test_parse_verdict_standalone_fallback():
 
 
 def test_tool_handler_tolerates_bad_timeout(tmp_path, monkeypatch):
-    """`_tool` must not crash when a .dot author writes `timeout="abc"`."""
+    """`_tool` must not crash when a .dot author writes `timeout="abc"`.
+
+    Also verifies the command actually ran and its output flowed through:
+    the previous version of this test only checked the outcome was in a
+    set that included both success and failure, so a no-op would have
+    passed it silently.
+    """
     from runner.handlers import _tool, Context, Result
     from runner.parser import Node
 
     node = Node(name="t", attrs={"command": "echo hi", "timeout": "not-a-number"})
     ctx = Context(goal="t", workdir=tmp_path, backend="echo")
-    # Must run without raising ValueError and surface the command output.
     result = _tool(node, ctx)
     assert isinstance(result, Result)
-    assert result.outcome in {"success", "failure"}
+    assert result.outcome == "success", f"unexpected outcome: {result.outcome}"
+    assert "hi" in result.output, f"command output missing: {result.output!r}"
+    assert result.metadata.get("returncode") == "0", result.metadata
 
 
 def test_parse_verdict_marker_invalid_token_does_not_fall_back():
