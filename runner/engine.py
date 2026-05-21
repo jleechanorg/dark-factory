@@ -12,6 +12,8 @@ from .cxdb import CXDB
 from .handlers import Context, Result, resolve
 from .parser import Edge, Graph, Node
 
+_VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards"}
+
 
 @dataclass
 class StepRecord:
@@ -33,7 +35,7 @@ def _edge_matches(edge: Edge, last: Result) -> bool:
     if "=" in cond:
         k, v = cond.split("=", 1)
         return _lookup(k.strip(), last) == v.strip()
-    return True
+    return False
 
 
 def _lookup(key: str, last: Result) -> str:
@@ -80,9 +82,7 @@ def run(
                     ts=time.time(),
                     output_preview=f"max_visits={max_visits} exceeded",
                 )
-                history.append(record)
-                _persist(cxdb, ctx, seq, record, "")
-                seq += 1
+                seq = _append_record(history, checkpoint, cxdb, ctx, seq, record, "")
                 break
 
             handler = resolve(current)
@@ -94,17 +94,23 @@ def run(
                 output_preview=result.output[:280],
                 metadata=result.metadata,
             )
-            history.append(record)
+            _update_failure_state(current, ctx, result)
             ctx.history.append({"node": current.name, "outcome": result.outcome})
+            seq = _append_record(
+                history, checkpoint, cxdb, ctx, seq, record, result.output, result.metadata
+            )
 
-            if checkpoint is not None:
-                checkpoint.write_text(
-                    json.dumps([asdict(r) for r in history], indent=2)
+            if current.name == "exit":
+                break
+
+            if len(history) >= max_steps:
+                record = StepRecord(
+                    node=current.name,
+                    outcome="exhausted",
+                    ts=time.time(),
+                    output_preview=f"max_steps={max_steps} reached before exit",
                 )
-            _persist(cxdb, ctx, seq, record, result.output, result.metadata)
-            seq += 1
-
-            if current.name == "exit" or len(history) >= max_steps:
+                seq = _append_record(history, checkpoint, cxdb, ctx, seq, record, "")
                 break
 
             next_node = _pick_next(graph, current, result)
@@ -115,9 +121,9 @@ def run(
                     ts=time.time(),
                     output_preview="no matching outgoing edge",
                 )
-                history.append(record)
-                _persist(cxdb, ctx, seq, record, "no matching outgoing edge")
-                seq += 1
+                seq = _append_record(
+                    history, checkpoint, cxdb, ctx, seq, record, "no matching outgoing edge"
+                )
                 break
             current = next_node
     finally:
@@ -129,6 +135,31 @@ def run(
             cxdb.close()
 
     return history
+
+
+def _update_failure_state(node: Node, ctx: Context, result: Result) -> None:
+    if result.outcome != "success":
+        ctx.state["_unresolved_failure"] = result.outcome
+        return
+    if node.attrs.get("type") in _VALIDATION_TYPES:
+        ctx.state.pop("_unresolved_failure", None)
+
+
+def _append_record(
+    history: list[StepRecord],
+    checkpoint: Optional[pathlib.Path],
+    cxdb: Optional[CXDB],
+    ctx: Context,
+    seq: int,
+    record: StepRecord,
+    output: str,
+    metadata: Optional[dict[str, str]] = None,
+) -> int:
+    history.append(record)
+    if checkpoint is not None:
+        checkpoint.write_text(json.dumps([asdict(r) for r in history], indent=2))
+    _persist(cxdb, ctx, seq, record, output, metadata)
+    return seq + 1
 
 
 def _persist(

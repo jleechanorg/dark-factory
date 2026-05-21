@@ -6,6 +6,10 @@ that orchestrates multi-stage AI workflows using directed graphs.
 **The coding agent never sees this repo.** Holdout scenarios live in `holdouts/`;
 the agent only sees `specs/`. The evaluator runs holdouts independently.
 
+> **For AI coding agents:** read [`CLAUDE.md`](CLAUDE.md) (or [`AGENTS.md`](AGENTS.md),
+> identical content) before touching code. It defines the agent-isolation rule,
+> architecture, handler-registry contract, and the CXDB/Healer feedback loop.
+
 ## Architecture (3-Layer Convergence)
 
 ```
@@ -44,8 +48,8 @@ dark-factory/
 │   # supplied via the DARK_FACTORY_HOLDOUTS environment variable so the
 │   # coding agent never sees scenario files.
 ├── tests/
-├── .claude/           # Agent config (scoped to this repo only)
-│   └── CLAUDE.md
+├── CLAUDE.md          # Agent guidance (auto-loaded by Claude Code)
+├── AGENTS.md          # Same content as CLAUDE.md, for non-Claude agents
 └── README.md
 ```
 

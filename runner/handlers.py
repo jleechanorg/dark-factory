@@ -11,7 +11,9 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -46,7 +48,122 @@ def _start(node: Node, ctx: Context) -> Result:
 
 
 def _exit(node: Node, ctx: Context) -> Result:
+    unresolved = ctx.state.get("_unresolved_failure")
+    if unresolved:
+        return Result(outcome=unresolved, output=f"exit after unresolved {unresolved}")
+    if ctx.history:
+        previous = ctx.history[-1].get("outcome", "success")
+        if previous != "success":
+            return Result(outcome=previous, output=f"exit after {previous}")
     return Result(outcome="success", output="exit")
+
+
+def _sanitized_env() -> dict[str, str]:
+    env = {}
+    for k, v in os.environ.items():
+        if k == "DARK_FACTORY_HOLDOUTS":
+            continue
+        if "HOLDOUT" in k.upper():
+            continue
+        env[k] = v
+    return env
+
+
+def _holdouts_repo_path() -> pathlib.Path:
+    repo = os.environ.get(
+        "DARK_FACTORY_HOLDOUTS",
+        str(pathlib.Path.home() / "projects" / "dark-factory-holdouts"),
+    )
+    return pathlib.Path(repo).expanduser().resolve()
+
+
+def _holdout_denied_paths() -> list[pathlib.Path]:
+    paths = {_holdouts_repo_path()}
+    paths.add((pathlib.Path.home() / "projects" / "dark-factory-holdouts").resolve())
+    return sorted(paths, key=lambda p: str(p))
+
+
+def _sandboxed_args(args: list[str]) -> Optional[list[str]]:
+    sandbox_exec = shutil.which("sandbox-exec")
+    if sandbox_exec is None:
+        return None
+    denies = []
+    for path in _holdout_denied_paths():
+        holdouts_repo = str(path).replace("\\", "\\\\").replace('"', '\\"')
+        denies.append(f'(deny file-read* (subpath "{holdouts_repo}"))')
+        denies.append(f'(deny file-write* (subpath "{holdouts_repo}"))')
+    deny_rules = "\n".join(denies)
+    profile = f"""
+(version 1)
+(allow default)
+{deny_rules}
+"""
+    return [sandbox_exec, "-p", profile] + args
+
+
+def _ao_parse_status(stdout: str, session: str) -> str:
+    """Pull a session's `activity` from `ao status --json` output.
+
+    `ao status` prepends notifier noise lines before the JSON array; strip
+    everything before the first `[`.
+    """
+    idx = stdout.find("[")
+    if idx < 0:
+        return "unknown"
+    try:
+        data = json.loads(stdout[idx:])
+    except json.JSONDecodeError:
+        return "unknown"
+    for entry in data:
+        if entry.get("name") == session:
+            return str(entry.get("activity", "unknown"))
+    return "missing"
+
+
+def _ao_wait_idle(
+    session: str,
+    workdir: pathlib.Path,
+    timeout: int = 900,
+    stable_reads: int = 3,
+    poll_interval: int = 10,
+) -> str:
+    """Poll `ao status --json` until the session is idle for `stable_reads`
+    consecutive polls.
+
+    During retry loops inside the agent (e.g. claude rate-limit backoff), a
+    session can momentarily report "ready" between retry attempts before
+    bouncing back to "active". Requiring N consecutive idle reads makes the
+    wait robust against that.
+
+    Returns the last observed terminal activity ("exited", "ready",
+    "missing"), or "timeout" if the deadline elapsed before idle stabilised.
+    """
+    deadline = time.monotonic() + timeout
+    consecutive = 0
+    last_terminal = "unknown"
+    while time.monotonic() < deadline:
+        proc = subprocess.run(
+            ["ao", "status", "--json"],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+            env=_sanitized_env(),
+        )
+        if proc.returncode == 0:
+            activity = _ao_parse_status(proc.stdout, session)
+            if activity in ("exited", "missing"):
+                return activity
+            if activity == "ready":
+                consecutive += 1
+                last_terminal = "ready"
+                if consecutive >= stable_reads:
+                    return "ready"
+            else:
+                consecutive = 0
+        time.sleep(poll_interval)
+    return "timeout"
 
 
 def _codergen(node: Node, ctx: Context) -> Result:
@@ -60,28 +177,106 @@ def _codergen(node: Node, ctx: Context) -> Result:
       - echo: no LLM — just record the rendered prompt. Used in tests.
       - claude: shell out to `claude --print` with --dangerously-skip-permissions
       - codex: shell out to `codex exec --yolo`
+      - ao: dispatch to an Agent Orchestrator worker. First call spawns a
+        session (`ao spawn`); subsequent calls reuse it (`ao send`). The
+        worker writes inside its own AO-managed worktree; the path is stored
+        in `ctx.state["ao.worktree"]` so downstream tool nodes can target it.
     """
     prompt_text = _render_prompt(node, ctx)
     if ctx.backend == "echo":
         return Result(outcome="success", output=prompt_text)
 
-    if ctx.backend == "claude":
+    if ctx.backend == "ao":
+        project = ctx.state.get("ao.project")
+        if not project:
+            return Result(outcome="failure", output="ao backend requires --ao-project")
+        agent = ctx.state.get("ao.agent", "claude-code")
+        session = ctx.state.get("ao.session")
+        if not session:
+            spawn_args = ["ao", "spawn", prompt_text, "-p", project, "--agent", agent]
+            proc = subprocess.run(
+                spawn_args,
+                cwd=ctx.workdir,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+                env=_sanitized_env(),
+            )
+            if proc.returncode != 0:
+                return Result(
+                    outcome="failure",
+                    output=f"ao spawn failed (rc={proc.returncode})\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+                )
+            sess_name = None
+            worktree = None
+            for line in proc.stdout.splitlines():
+                if line.startswith("SESSION="):
+                    sess_name = line.split("=", 1)[1].strip()
+                m = re.search(r"Worktree:\s*(\S+)", line)
+                if m:
+                    worktree = m.group(1)
+            if not sess_name:
+                return Result(outcome="failure", output=f"ao spawn produced no SESSION= line\n{proc.stdout}")
+            ctx.state["ao.session"] = sess_name
+            if worktree:
+                ctx.state["ao.worktree"] = worktree
+            activity = _ao_wait_idle(sess_name, ctx.workdir, timeout=900)
+            outcome = "success" if activity in ("exited", "ready") else "failure"
+            return Result(
+                outcome=outcome,
+                output=f"ao spawn session={sess_name} worktree={worktree} activity={activity}",
+                metadata={"session": sess_name, "worktree": worktree or "", "activity": activity},
+            )
+
+        send_args = ["ao", "send", session, prompt_text, "--timeout", "900"]
         proc = subprocess.run(
-            ["claude", "--print", "--dangerously-skip-permissions", prompt_text],
+            send_args,
+            cwd=ctx.workdir,
+            capture_output=True,
+            text=True,
+            timeout=960,
+            check=False,
+            env=_sanitized_env(),
+        )
+        if proc.returncode != 0:
+            return Result(
+                outcome="failure",
+                output=f"ao send failed (rc={proc.returncode})\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+            )
+        activity = _ao_wait_idle(session, ctx.workdir, timeout=900)
+        outcome = "success" if activity in ("exited", "ready") else "failure"
+        return Result(
+            outcome=outcome,
+            output=f"ao send session={session} activity={activity}",
+            metadata={"session": session, "activity": activity},
+        )
+
+    if ctx.backend == "claude":
+        args = _sandboxed_args(["claude", "--print", "--dangerously-skip-permissions", prompt_text])
+        if args is None:
+            return Result(outcome="failure", output="sandbox-exec unavailable")
+        proc = subprocess.run(
+            args,
             cwd=ctx.workdir,
             capture_output=True,
             text=True,
             timeout=600,
             check=False,
+            env=_sanitized_env(),
         )
     elif ctx.backend == "codex":
+        args = _sandboxed_args(["codex", "exec", "--yolo", "--skip-git-repo-check", prompt_text])
+        if args is None:
+            return Result(outcome="failure", output="sandbox-exec unavailable")
         proc = subprocess.run(
-            ["codex", "exec", "--yolo", "--skip-git-repo-check", prompt_text],
+            args,
             cwd=ctx.workdir,
             capture_output=True,
             text=True,
             timeout=600,
             check=False,
+            env=_sanitized_env(),
         )
     else:
         return Result(outcome="failure", output=f"unknown backend {ctx.backend!r}")
@@ -101,22 +296,61 @@ def _conditional(node: Node, ctx: Context) -> Result:
     return Result(outcome=outcome, output=f"decision({key})={outcome}")
 
 
+def _substitute_state(text: str, ctx: Context) -> str:
+    """Replace `${state.<key>}` markers in `text` from ctx.state.
+
+    Unresolved markers are left intact so a downstream subprocess will see
+    them (and typically fail visibly) rather than silently substituting "".
+    """
+    if "${state." not in text:
+        return text
+    for k, v in ctx.state.items():
+        text = text.replace("${state." + k + "}", str(v))
+    return text
+
+
 def _tool(node: Node, ctx: Context) -> Result:
-    """Shell out to a deterministic command supplied via `command="..."`."""
+    """Shell out to a deterministic command supplied via `command="..."`.
+
+    Supports `${state.<key>}` substitution in both `command` and the optional
+    `cwd` attribute. `cwd` lets the node target a directory other than
+    `ctx.workdir` (e.g. an AO worker's worktree path stashed in state).
+    """
     cmd = node.attrs.get("command")
     if not cmd:
         return Result(outcome="failure", output="no command attribute")
+    cmd = _substitute_state(cmd, ctx)
     try:
         timeout = int(node.attrs.get("timeout", "300"))
     except (TypeError, ValueError):
         timeout = 300
+    cwd_attr = node.attrs.get("cwd")
+    if cwd_attr:
+        cwd_attr = _substitute_state(cwd_attr, ctx)
+        if "${state." in cwd_attr:
+            # Unresolved placeholder — backend didn't set the state key.
+            # Fall back to ctx.workdir so the pipeline still works under
+            # backends that don't populate it (e.g. echo / claude).
+            cwd = ctx.workdir
+        else:
+            cwd = pathlib.Path(cwd_attr).expanduser()
+            if not cwd.is_absolute():
+                cwd = (ctx.workdir / cwd).resolve()
+            if not cwd.exists():
+                return Result(outcome="failure", output=f"cwd does not exist: {cwd}")
+    else:
+        cwd = ctx.workdir
+    args = _sandboxed_args(shlex.split(cmd))
+    if args is None:
+        return Result(outcome="failure", output="sandbox-exec unavailable")
     proc = subprocess.run(
-        shlex.split(cmd),
-        cwd=ctx.workdir,
+        args,
+        cwd=cwd,
         capture_output=True,
         text=True,
         timeout=timeout,
         check=False,
+        env=_sanitized_env(),
     )
     outcome = "success" if proc.returncode == 0 else "failure"
     return Result(
@@ -228,18 +462,22 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
             timeout = int(node.attrs.get("timeout", "1200"))
         except (TypeError, ValueError):
             timeout = 1200
+        args = _sandboxed_args(["claude", "--print", "--dangerously-skip-permissions", prompt])
+        if args is None:
+            return Result(outcome="failure", output="sandbox-exec unavailable")
         proc = subprocess.run(
-            ["claude", "--print", "--dangerously-skip-permissions", prompt],
+            args,
             cwd=ctx.workdir,
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
+            env=_sanitized_env(),
         )
         verdict, normalized = _parse_verdict(proc.stdout + "\n" + proc.stderr)
         # Distinguish infra failures (claude crashed / not installed / network)
         # from real "FAIL" verdicts so the Healer can group them separately.
-        if proc.returncode != 0 and verdict == "unknown":
+        if proc.returncode != 0 and (verdict == "unknown" or normalized == "success"):
             outcome = "error"
         else:
             outcome = normalized
@@ -266,14 +504,11 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
     """Run the sealed holdout evaluator in a separate process.
 
     The evaluator script lives outside this repo at the path given by
-    `holdouts_repo="..."` (or env var DARK_FACTORY_HOLDOUTS). The agent never
-    sees the scenarios — only the verdict.
+    DARK_FACTORY_HOLDOUTS or the default sibling path. Pipeline DOT cannot
+    override this path; otherwise an agent-visible pipeline could fake PASS.
     """
-    repo = node.attrs.get("holdouts_repo") or os.environ.get(
-        "DARK_FACTORY_HOLDOUTS", str(pathlib.Path.home() / "projects" / "dark-factory-holdouts")
-    )
-    repo_path = pathlib.Path(repo).expanduser()
-    feature = node.attrs.get("feature") or ctx.state.get("feature")
+    repo_path = _holdouts_repo_path()
+    feature = ctx.state.get("feature") or node.attrs.get("feature")
     if not feature:
         return Result(outcome="failure", output="no feature attribute or state")
 
@@ -303,7 +538,10 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
                 break
             except json.JSONDecodeError:
                 continue
-    outcome = "success" if verdict == "pass" else verdict
+    if proc.returncode != 0 and verdict == "pass":
+        outcome = "error"
+    else:
+        outcome = "success" if verdict == "pass" else verdict
     return Result(outcome=outcome, output=proc.stdout, metadata={"verdict": verdict})
 
 
@@ -311,7 +549,15 @@ def _render_prompt(node: Node, ctx: Context) -> str:
     ref = node.prompt_ref
     if not ref:
         return f"# {node.name}\n\nGoal: {ctx.goal}"
-    p = ctx.workdir / ref
+    ref_path = pathlib.Path(ref)
+    if ref_path.is_absolute():
+        return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
+    root = ctx.workdir.resolve()
+    p = (root / ref_path).resolve()
+    try:
+        p.relative_to(root)
+    except ValueError:
+        return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
     if not p.exists():
         return f"# {node.name}\n\nGoal: {ctx.goal}\n(missing prompt: {ref})"
     text = p.read_text()

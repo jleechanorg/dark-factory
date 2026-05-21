@@ -9,6 +9,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import pathlib
 import sqlite3
 import sys
@@ -19,8 +20,17 @@ ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from runner.cxdb import CXDB  # noqa: E402
-from runner.engine import _attr_int, run  # noqa: E402
-from runner.handlers import Context, Result, TYPE_REGISTRY, _parse_verdict  # noqa: E402
+from runner.engine import _attr_int, _edge_matches, run  # noqa: E402
+from runner.handlers import (  # noqa: E402
+    Context,
+    Result,
+    TYPE_REGISTRY,
+    _holdout_eval,
+    _parse_verdict,
+    _render_prompt,
+    _sanitized_env,
+)
+from runner.parser import Edge  # noqa: E402
 from runner.parser import Node, parse  # noqa: E402
 
 
@@ -155,6 +165,11 @@ def test_attr_int_fallback():
     assert _attr_int(Node(name="x", attrs={"max_visits": "3"}), "max_visits", 0) == 3
 
 
+def test_malformed_edge_condition_fails_closed():
+    edge = Edge(src="a", dst="b", attrs={"condition": "not-a-condition"})
+    assert _edge_matches(edge, Result(outcome="success")) is False
+
+
 # ---------------------------------------------------------------------------
 # engine.run finally-block CXDB closure on stuck pipelines
 # ---------------------------------------------------------------------------
@@ -218,3 +233,159 @@ def test_engine_records_finally_on_stuck(monkeypatch, tmp_path):
     ended_ts, final = row
     assert ended_ts is not None, "runs.ended_ts is NULL — finally block did not fire"
     assert final == "stuck", f"expected final='stuck', got {final!r}"
+
+
+def test_checkpoint_includes_synthetic_terminal_record(monkeypatch, tmp_path):
+    """Checkpoint state must match in-memory history after max_visits exhaustion."""
+    fake_holdout = lambda node, ctx: Result(outcome="fail", output="boom")
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+
+    checkpoint = tmp_path / "checkpoint.json"
+    g = parse(_pipeline("hello.dot"))
+    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    history = run(g, ctx, checkpoint=checkpoint, max_steps=50)
+
+    saved = json.loads(checkpoint.read_text())
+    assert history[-1].outcome == "exhausted"
+    assert saved[-1]["outcome"] == "exhausted"
+    assert len(saved) == len(history)
+
+
+def test_prompt_references_cannot_escape_workdir():
+    node = Node(
+        name="leak",
+        attrs={
+            "prompt": "@/Users/jleechan/projects/dark-factory-holdouts/holdouts/hello/scenarios.yaml"
+        },
+    )
+    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+
+    text = _render_prompt(node, ctx)
+
+    assert "expect_return" not in text
+    assert "Hello, world!" not in text
+    assert "invalid prompt" in text
+
+
+def test_sanitized_env_strips_holdout_paths(monkeypatch):
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", "/secret/holdouts")
+    monkeypatch.setenv("SOME_HOLDOUT_TOKEN", "secret")
+    monkeypatch.setenv("SAFE_VALUE", "ok")
+
+    env = _sanitized_env()
+
+    assert "DARK_FACTORY_HOLDOUTS" not in env
+    assert "SOME_HOLDOUT_TOKEN" not in env
+    assert env["SAFE_VALUE"] == "ok"
+
+
+def test_tool_nodes_cannot_read_holdout_files():
+    from runner.handlers import _tool
+
+    scenarios = (
+        "/Users/jleechan/projects/dark-factory-holdouts/holdouts/hello/scenarios.yaml"
+    )
+    node = Node(
+        name="tool_leak",
+        attrs={
+            "type": "tool",
+            "command": (
+                f"{sys.executable} -c "
+                f"\"import pathlib; print(pathlib.Path({scenarios!r}).read_text())\""
+            ),
+        },
+    )
+    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+
+    result = _tool(node, ctx)
+
+    assert result.outcome == "failure"
+    assert "expect_return" not in result.output
+    assert "Hello, world!" not in result.output
+
+
+def test_tool_sandbox_still_denies_real_holdouts_when_env_overridden(monkeypatch, tmp_path):
+    from runner.handlers import _tool
+
+    fake_holdouts = tmp_path / "fake-holdouts"
+    fake_holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(fake_holdouts))
+    scenarios = (
+        "/Users/jleechan/projects/dark-factory-holdouts/holdouts/hello/scenarios.yaml"
+    )
+    node = Node(
+        name="tool_leak",
+        attrs={
+            "type": "tool",
+            "command": (
+                f"{sys.executable} -c "
+                f"\"import pathlib; print(pathlib.Path({scenarios!r}).read_text())\""
+            ),
+        },
+    )
+    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+
+    result = _tool(node, ctx)
+
+    assert result.outcome == "failure"
+    assert "expect_return" not in result.output
+
+
+def test_intermediate_success_does_not_clear_unvalidated_failure(tmp_path):
+    dot = tmp_path / "greenwash.dot"
+    dot.write_text(
+        'digraph greenwash {\n'
+        '  start [shape=Mdiamond]\n'
+        '  fail [type="tool" command="/usr/bin/false"]\n'
+        '  ok [type="codergen"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> fail -> ok -> exit\n'
+        '}\n'
+    )
+    g = parse(dot)
+    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+
+    history = run(g, ctx)
+
+    assert any(r.node == "fail" and r.outcome == "failure" for r in history)
+    assert history[-1].outcome == "failure"
+
+
+def test_holdout_eval_ignores_pipeline_repo_override(tmp_path):
+    fake_repo = tmp_path / "fake-holdouts"
+    evaluator = fake_repo / "evaluator"
+    evaluator.mkdir(parents=True)
+    (evaluator / "run.py").write_text(
+        "import json\nprint(json.dumps({'verdict': 'pass', 'scenarios': []}))\n"
+    )
+
+    node = Node(
+        name="holdout",
+        attrs={
+            "type": "holdout_eval",
+            "feature": "missing-feature-name",
+            "holdouts_repo": str(fake_repo),
+        },
+    )
+    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+
+    result = _holdout_eval(node, ctx)
+
+    assert result.outcome != "success"
+
+
+def test_holdout_eval_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path):
+    fake_repo = tmp_path / "fake-holdouts"
+    evaluator = fake_repo / "evaluator"
+    evaluator.mkdir(parents=True)
+    (evaluator / "run.py").write_text(
+        "import json, sys\nprint(json.dumps({'verdict': 'pass', 'scenarios': []}))\nsys.exit(17)\n"
+    )
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(fake_repo))
+
+    node = Node(name="holdout", attrs={"type": "holdout_eval", "feature": "hello"})
+    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+
+    result = _holdout_eval(node, ctx)
+
+    assert result.outcome != "success"

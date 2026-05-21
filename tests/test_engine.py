@@ -26,6 +26,7 @@ def _pipeline(name: str) -> pathlib.Path:
 def test_parser_round_trip():
     g = parse(_pipeline("hello.dot"))
     assert g.name == "hello"
+    assert g.goal == "Minimal smoke pipeline — plan, implement, holdout-eval, exit."
     assert "start" in g.nodes
     assert "exit" in g.nodes
     assert "holdout" in g.nodes
@@ -67,6 +68,25 @@ def test_echo_backend_green_path(monkeypatch):
     assert history[-1].outcome == "success"
 
 
+def test_successful_validation_clears_prior_failure(monkeypatch):
+    """A fix loop can recover if a later validation node succeeds."""
+    calls = {"holdout": 0}
+
+    def fake_holdout(node, ctx):
+        calls["holdout"] += 1
+        if calls["holdout"] == 1:
+            return Result(outcome="fail", output="first fail")
+        return Result(outcome="success", output="recovered")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    g = parse(_pipeline("hello.dot"))
+    ctx = Context(goal="test", workdir=ROOT, backend="echo")
+    history = run(g, ctx, max_steps=50)
+
+    assert [r.node for r in history][-3:] == ["fix", "holdout", "exit"]
+    assert history[-1].outcome == "success"
+
+
 def test_cli_invocation_green():
     """End-to-end: run the CLI with the real holdout evaluator against the impl tree."""
     proc = subprocess.run(
@@ -86,3 +106,32 @@ def test_cli_invocation_green():
     # The greet.py impl ships with the repo so the holdout should pass.
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert '"final_outcome": "success"' in proc.stdout
+
+
+def test_cli_feature_flag_overrides_dot_feature():
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "runner",
+            "--pipeline", str(_pipeline("hello.dot")),
+            "--goal", "smoke",
+            "--backend", "echo",
+            "--feature", "does-not-exist",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 1
+    assert '"final_outcome": "success"' not in proc.stdout
+
+
+def test_max_steps_before_exit_is_failure():
+    """A run that stops before reaching exit must not report success."""
+    g = parse(_pipeline("hello.dot"))
+    ctx = Context(goal="test", workdir=ROOT, backend="echo")
+    history = run(g, ctx, max_steps=1)
+
+    assert history[-1].outcome == "exhausted"
+    assert "max_steps=1" in history[-1].output_preview

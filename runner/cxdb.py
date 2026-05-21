@@ -119,7 +119,9 @@ class CXDB:
                    GROUP_CONCAT(run_id, ',') AS run_ids,
                    MAX(output_head) AS sample
             FROM steps
-            WHERE outcome IN ('failure', 'fail', 'exhausted', 'stuck', 'partial', 'inconclusive')
+            WHERE outcome IN (
+                'failure', 'fail', 'error', 'exhausted', 'stuck', 'partial', 'inconclusive'
+            )
             GROUP BY node, outcome, output_hash
             ORDER BY hits DESC, node ASC
             """,

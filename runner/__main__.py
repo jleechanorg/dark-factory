@@ -19,9 +19,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--workdir", type=pathlib.Path, default=pathlib.Path.cwd())
     p.add_argument(
         "--backend",
-        choices=["echo", "claude", "codex"],
+        choices=["echo", "claude", "codex", "ao"],
         default="echo",
         help="LLM backend for codergen nodes",
+    )
+    p.add_argument(
+        "--ao-project",
+        default=None,
+        help="AO project ID (required when --backend ao). Stored in state['ao.project'].",
+    )
+    p.add_argument(
+        "--ao-agent",
+        default="claude-code",
+        help="AO agent plugin to use when --backend ao (default: claude-code).",
     )
     p.add_argument("--checkpoint", type=pathlib.Path, default=None)
     p.add_argument("--max-steps", type=int, default=100)
@@ -43,6 +53,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.feature:
         ctx.state["feature"] = args.feature
+    if args.backend == "ao":
+        if not args.ao_project:
+            p.error("--backend ao requires --ao-project")
+        ctx.state["ao.project"] = args.ao_project
+        ctx.state["ao.agent"] = args.ao_agent
 
     history = run(graph, ctx, checkpoint=args.checkpoint, max_steps=args.max_steps)
 

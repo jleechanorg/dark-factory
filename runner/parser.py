@@ -82,11 +82,16 @@ def parse(path: pathlib.Path) -> Graph:
     nodes: dict[str, Node] = {}
 
     def collect_nodes(scope) -> None:
+        nonlocal goal
         for n in scope.get_nodes():
             nm = _strip(n.get_name())
-            if nm in ("graph", "node", "edge"):
-                continue
             attrs = {k: _strip(v) for k, v in (n.get_attributes() or {}).items()}
+            if nm == "graph":
+                if not goal:
+                    goal = attrs.get("goal", "")
+                continue
+            if nm in ("node", "edge"):
+                continue
             nodes[nm] = Node(name=nm, attrs=attrs)
         for sub in scope.get_subgraphs():
             collect_nodes(sub)

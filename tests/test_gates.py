@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+import stat
 import sys
 
 ROOT = pathlib.Path(__file__).parent.parent
@@ -62,6 +63,27 @@ def test_gate_failure_short_circuits(monkeypatch):
     history = run(g, ctx, max_steps=20)
     nodes = [r.node for r in history]
     assert nodes == ["start", "holdout", "gate_es", "gate_er", "exit"]
+    assert history[-1].outcome == "failure"
+
+
+def test_gate_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path):
+    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    claude = bin_dir / "claude"
+    claude.write_text("#!/bin/sh\nprintf 'VERDICT: PASS\\n'\nexit 19\n")
+    claude.chmod(claude.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{pathlib.Path('/usr/bin')}")
+
+    g = parse(_pipeline("gates.dot"))
+    ctx = Context(goal="t", workdir=ROOT, backend="claude")
+
+    history = run(g, ctx, max_steps=20)
+
+    assert history[-1].outcome != "success"
+    assert any(r.node == "gate_es" and r.outcome == "error" for r in history)
 
 
 def test_cxdb_records_steps(tmp_path, monkeypatch):
@@ -103,6 +125,24 @@ def test_healer_reports_failures(tmp_path, monkeypatch):
     assert "holdout" in text
     assert "fail" in text.lower()
     assert "Prescription" in text or "prescription" in text.lower()
+
+
+def test_healer_reports_gate_infra_errors(tmp_path, monkeypatch):
+    """Gate infra errors are terminal failures and must be diagnosable."""
+    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+
+    g = parse(_pipeline("gates.dot"))
+    ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=tmp_path / "cxdb.sqlite")
+    ctx.state["gate_es.outcome"] = "success"
+    ctx.state["gate_er.outcome"] = "error"
+
+    history = run(g, ctx, max_steps=20)
+    assert any(r.outcome == "error" for r in history)
+
+    text = report(ctx.cxdb_path)
+    assert "gate_er" in text
+    assert "error" in text.lower()
 
 
 def test_healer_no_failures(tmp_path, monkeypatch):
