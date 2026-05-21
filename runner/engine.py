@@ -15,6 +15,22 @@ from .parser import Edge, Graph, Node
 _VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards"}
 
 
+def _is_validation_node(node: Node) -> bool:
+    """A node counts as a validator (clearing prior `_unresolved_failure` on
+    success) if either:
+      - its `type` is in the canonical validation set, or
+      - it opts in via `validation="true"` (case-insensitive) on the DOT node.
+
+    The opt-in path lets pipelines treat a generic `tool` node (e.g. pytest)
+    as the verifier in a `verify -> fix -> verify -> exit` loop without
+    inventing a new handler type.
+    """
+    if node.attrs.get("type") in _VALIDATION_TYPES:
+        return True
+    flag = node.attrs.get("validation", "").strip().lower()
+    return flag in {"true", "1", "yes"}
+
+
 @dataclass
 class StepRecord:
     node: str
@@ -141,7 +157,7 @@ def _update_failure_state(node: Node, ctx: Context, result: Result) -> None:
     if result.outcome != "success":
         ctx.state["_unresolved_failure"] = result.outcome
         return
-    if node.attrs.get("type") in _VALIDATION_TYPES:
+    if _is_validation_node(node):
         ctx.state.pop("_unresolved_failure", None)
 
 

@@ -1,0 +1,34 @@
+digraph roman_benchmark {
+    graph [
+        goal="Implement to_roman per the inlined spec; verify against the sealed _holdout/ test suite."
+        label="AllNodesCoverage"
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    plan      [type="codergen", label="Plan",      prompt="@benchmarks/all-nodes-coverage/prompts/plan.md"]
+    implement [type="codergen", label="Implement", prompt="@benchmarks/all-nodes-coverage/prompts/implement.md"]
+
+    // verify is a `tool` node opting into validation behaviour. On success
+    // it clears `_unresolved_failure` so the exit node can report `success`
+    // even after a prior verify -> fix loop. The cp + pytest happens inside
+    // the AO worker's worktree (cwd resolves via ${state.ao.worktree}).
+    // The _holdout/ fixtures come from this benchmark dir, NOT the worker's
+    // worktree -- the worker never sees the test source on disk during the
+    // plan/implement turns. They are copied in only at verify time.
+    verify [type="tool",
+            label="pytest holdout",
+            validation="true",
+            command="bash -c 'mkdir -p df_demo3/_holdout && cp -R /Users/jleechan/projects/dark-factory/benchmarks/all-nodes-coverage/_holdout/. df_demo3/_holdout/ && pytest df_demo3/_holdout/ -q --tb=short'",
+            cwd="${state.ao.worktree}",
+            timeout="180"]
+
+    fix [type="codergen", label="Fix", prompt="@benchmarks/all-nodes-coverage/prompts/fix.md", max_visits="3"]
+
+    start -> plan -> implement -> verify
+    verify -> exit [condition="outcome=success"]
+    verify -> fix  [condition="outcome!=success"]
+    fix    -> verify
+}
