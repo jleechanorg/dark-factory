@@ -1,0 +1,17 @@
+digraph tracker_amazon {
+    graph [label="Tracker - Harper/Dippin method"]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    analyze [type="codergen", label="Analyze", prompt="@benchmarks/amazon-clone/prompts/tracker/analyze.md"]
+    create  [type="codergen", label="Create", prompt="@benchmarks/amazon-clone/prompts/implement.md"]
+    check   [type="holdout_eval", label="Check", timeout="300"]
+    refine  [type="codergen", label="Refine", prompt="@benchmarks/amazon-clone/prompts/tracker/refine.md"]
+
+    start -> analyze -> create -> check
+    check -> exit [condition="outcome=success"]
+    check -> refine [condition="outcome!=success"]
+    refine -> create
+}

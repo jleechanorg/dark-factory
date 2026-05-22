@@ -1,0 +1,17 @@
+digraph amazon_mvp {
+    graph [label="Dark Factory - Amazon MVP"]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    plan      [type="codergen", label="Plan", prompt="@benchmarks/amazon-clone/prompts/plan.md"]
+    implement [type="codergen", label="Implement", prompt="@benchmarks/amazon-clone/prompts/implement.md"]
+    verify    [type="holdout_eval", label="Holdout Eval", validation="true", timeout="300"]
+    fix       [type="codergen", label="Fix", prompt="@benchmarks/amazon-clone/prompts/fix.md", max_visits="5"]
+
+    start -> plan -> implement -> verify
+    verify -> exit [condition="outcome=success"]
+    verify -> fix [condition="outcome!=success"]
+    fix -> verify
+}

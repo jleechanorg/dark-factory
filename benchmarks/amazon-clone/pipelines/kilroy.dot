@@ -1,0 +1,17 @@
+digraph kilroy_amazon {
+    graph [label="Kilroy - Dan Shapiro method"]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    spec   [type="codergen", label="Spec", prompt="@benchmarks/amazon-clone/prompts/kilroy/spec.md"]
+    build  [type="codergen", label="Build", prompt="@benchmarks/amazon-clone/prompts/kilroy/build.md"]
+    test   [type="holdout_eval", label="Test", timeout="300"]
+    review [type="codergen", label="Review", prompt="@benchmarks/amazon-clone/prompts/kilroy/review.md"]
+
+    start -> spec -> build -> test
+    test -> exit [condition="outcome=success"]
+    test -> review [condition="outcome!=success"]
+    review -> build
+}
