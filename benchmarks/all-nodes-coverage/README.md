@@ -109,11 +109,36 @@ miss     : []
   plan/implement turns; the spec is inlined into the prompt so the worker
   doesn't need filesystem access for it)
 
-## Caveat
+## Caveat — isolation strength
 
-The "isolation" of `_holdout/` from the worker is **prompt-discipline**,
-not sandbox-enforced. `sandbox-exec` only denies reads of
-`~/projects/dark-factory-holdouts/`, not arbitrary `_holdout/` directories.
-A worker that ignores its prompt could `cat _holdout/test_roman.py` and
-get the answer. For stricter isolation, use the `holdout_eval` node type
-and the sealed `dark-factory-holdouts` sibling repo.
+Per [`CLAUDE.md`](../../CLAUDE.md), the rule is: the *spawned coding agent*
+(this benchmark's AO worker) must not read holdouts/tests. The *operator*
+running the benchmark obviously can — they wrote them.
+
+In this benchmark the worker isolation is **prompt-discipline + verify-time
+injection**, not `sandbox-exec`-enforced:
+
+- The plan/implement prompts inline the visible spec and never mention
+  `_holdout/`. Until the first `verify` runs, the worker's worktree
+  contains no test source.
+- `sandbox-exec` only blocks reads of `~/projects/dark-factory-holdouts/`,
+  not arbitrary `_holdout/` directories elsewhere.
+- Once `verify` runs (it `cp`s the fixtures into the worktree so pytest
+  can find them), the test source is on disk inside the worktree. The
+  `fix.md` prompt instructs the worker to read pytest's assertion
+  messages, not the test source — but a worker that ignores the prompt
+  could `cat _holdout/test_roman.py` directly and trivially pass.
+
+For the **stricter, AttractorBench-grade** isolation (training-contamination
+prevention + leak-proof against an adversarial worker) use the
+`holdout_eval` node type instead of `tool`: that runs the sealed evaluator
+at `$DARK_FACTORY_HOLDOUTS/evaluator/run.py`, which the worker can't read
+(sandbox deny rule + stripped env), and returns only a verdict.
+
+This benchmark deliberately chose the lighter `tool`-based design because
+its purpose is to **exercise every graph node in a single deterministic
+run**, not to defend against an adversarial worker — Sonnet under our
+prompts doesn't cheat, and the forcing function is reliable. If you want
+to exercise the same six nodes against a sealed evaluator, swap the
+`verify` node's type from `tool` (with `validation="true"`) to
+`holdout_eval` and move the test source to `dark-factory-holdouts/`.

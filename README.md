@@ -1,14 +1,23 @@
 # Dark Factory — Attractor-Pattern DOT Pipeline Runner
 
-Python implementation of StrongDM's Attractor pattern: a DOT-based pipeline runner
+Python implementation of the **Attractor pattern**: a DOT-based pipeline runner
 that orchestrates multi-stage AI workflows using directed graphs.
 
-**The coding agent never sees this repo.** Holdout scenarios live in `holdouts/`;
-the agent only sees `specs/`. The evaluator runs holdouts independently.
+## Source material
+
+- StrongDM, **AttractorBench** — <https://github.com/strongdm/attractorbench> — the benchmark we mirror: agents read a public natural-language spec, the conformance harness is generated locally and held out of the public repo to prevent training-data contamination.
+- Dan Shapiro, **"You don't write the code"** — <https://www.danshapiro.com/blog/2026/02/you-dont-write-the-code/> — Level 5 = the dark factory, lights off, nobody reviews the code; quality enforced by observability + adversarial review, not by reading.
+- 2389, **"The Dark Factory is a .dot file"** — <https://2389.ai/posts/the-dark-factory-is-a-dot-file/> — four independent Attractor implementations (Kilroy, Mammoth, Smasher, Tracker) converged on the same three-layer architecture; pipeline `.dot` files are the durable artifact, the runner code is *dorodango* (polish, discard, rebuild from spec).
+
+## Role boundary
+
+**The *spawned coding agent* (the `codergen` worker — Claude / Codex / AO session) never reads `holdouts/`, `runner/evaluator.py`, or the source of any `_holdout/` tests.** That's the AttractorBench rule, enforced here by `sandbox-exec` deny rules + `_sanitized_env` stripping in `runner/handlers.py`.
+
+You, the **operator**, can and should read all of it — the runner, the sealed `dark-factory-holdouts/` sibling, the evaluator, the tests, the CXDB logs. The discipline is that nothing you read leaks into the prompt template a `codergen` node ships to the worker.
 
 > **For AI coding agents:** read [`CLAUDE.md`](CLAUDE.md) (or [`AGENTS.md`](AGENTS.md),
-> identical content) before touching code. It defines the agent-isolation rule,
-> architecture, handler-registry contract, and the CXDB/Healer feedback loop.
+> identical content) before touching code. It defines the operator-vs-implementing-agent
+> isolation rule, architecture, handler-registry contract, and the CXDB/Healer feedback loop.
 
 ## Architecture (3-Layer Convergence)
 
