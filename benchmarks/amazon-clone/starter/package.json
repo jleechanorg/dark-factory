@@ -1,0 +1,13 @@
+{
+  "name": "amazon-clone-mvp-starter",
+  "version": "1.0.0",
+  "description": "Amazon Clone MVP Starter - minimal scaffold for benchmark",
+  "scripts": {
+    "build": "npm install",
+    "test": "echo 'No tests yet'",
+    "run": "serve . -p 3000"
+  },
+  "devDependencies": {
+    "serve": "^14.2.0"
+  }
+}
