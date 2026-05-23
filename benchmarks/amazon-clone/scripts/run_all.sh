@@ -13,7 +13,8 @@ WORKDIR_BASE="${1:-$HOME/benchmark-runs}"
 
 # Methods to run
 METHODS=("dark-factory" "df-slim" "kilroy" "tracker")
-RUNS=3
+RUNS="${BENCHMARK_RUNS:-3}"
+
 
 # Prepare script paths
 PREPARE_SCRIPT="$SCRIPT_DIR/prepare_candidate.sh"

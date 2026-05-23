@@ -34,6 +34,13 @@ mkdir -p "$(dirname "$WORKDIR")"
 echo "Copying starter to workdir..."
 cp -r "${BENCHMARK_DIR}/starter" "$WORKDIR"
 
+# Copy benchmarks structure so pipeline prompt references resolve
+# Pipeline has: prompt="@benchmarks/amazon-clone/prompts/plan.md"
+echo "Copying benchmark files..."
+mkdir -p "$WORKDIR/benchmarks/amazon-clone"
+cp "${BENCHMARK_DIR}/spec.md" "$WORKDIR/benchmarks/amazon-clone/spec.md"
+cp -r "${BENCHMARK_DIR}/prompts" "$WORKDIR/benchmarks/amazon-clone/"
+
 # Copy spec to workdir
 echo "Copying spec to workdir..."
 mkdir -p "$WORKDIR/spec"

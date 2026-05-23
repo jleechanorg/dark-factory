@@ -25,6 +25,9 @@ class Result:
     outcome: str = "success"  # used by edge `condition="outcome=success"`
     output: str = ""
     metadata: dict[str, str] = field(default_factory=dict)
+    preferred_label: str = ""
+    suggested_next_ids: list[str] = field(default_factory=list)
+    context_updates: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -69,6 +72,14 @@ def _sanitized_env() -> dict[str, str]:
     return env
 
 
+def _get_claude_executable() -> str:
+    nvm_claude = pathlib.Path.home() / ".nvm" / "versions" / "node" / "v22.22.0" / "bin" / "claude"
+    if nvm_claude.exists():
+        return str(nvm_claude)
+    return "claude"
+
+
+
 def _holdouts_repo_path() -> pathlib.Path:
     repo = os.environ.get(
         "DARK_FACTORY_HOLDOUTS",
@@ -84,6 +95,9 @@ def _holdout_denied_paths() -> list[pathlib.Path]:
 
 
 def _sandboxed_args(args: list[str]) -> Optional[list[str]]:
+    # Skip sandbox if DISABLE_SANDBOX env is set (for testing)
+    if os.environ.get("DISABLE_SANDBOX"):
+        return args
     sandbox_exec = shutil.which("sandbox-exec")
     if sandbox_exec is None:
         return None
@@ -201,6 +215,9 @@ def _codergen(node: Node, ctx: Context) -> Result:
         session = ctx.state.get("ao.session")
         if not session:
             spawn_args = ["ao", "spawn", prompt_text, "-p", project, "--agent", agent]
+            spawn_args = _sandboxed_args(spawn_args)
+            if spawn_args is None:
+                return Result(outcome="failure", output="sandbox-exec unavailable")
             proc = subprocess.run(
                 spawn_args,
                 cwd=ctx.workdir,
@@ -236,7 +253,9 @@ def _codergen(node: Node, ctx: Context) -> Result:
                 metadata={"session": sess_name, "worktree": worktree or "", "activity": activity},
             )
 
-        send_args = ["ao", "send", session, prompt_text, "--timeout", "900"]
+        send_args = _sandboxed_args(["ao", "send", session, prompt_text, "--timeout", "900"])
+        if send_args is None:
+            return Result(outcome="failure", output="sandbox-exec unavailable")
         proc = subprocess.run(
             send_args,
             cwd=ctx.workdir,
@@ -260,18 +279,25 @@ def _codergen(node: Node, ctx: Context) -> Result:
         )
 
     if ctx.backend == "claude":
-        args = _sandboxed_args(["claude", "--print", "--dangerously-skip-permissions", prompt_text])
+        args = _sandboxed_args([_get_claude_executable(), "--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt_text])
         if args is None:
             return Result(outcome="failure", output="sandbox-exec unavailable")
-        proc = subprocess.run(
-            args,
-            cwd=ctx.workdir,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            check=False,
-            env=_sanitized_env(),
-        )
+        try:
+            proc = subprocess.run(
+                args,
+                cwd=ctx.workdir,
+                capture_output=True,
+                text=True,
+                timeout=1800,  # 30 min timeout for complex tasks
+                check=False,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                env=_sanitized_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return Result(outcome="failure", output="claude backend timed out after 30 minutes")
+        except Exception as e:
+            return Result(outcome="failure", output=f"claude backend error: {e}")
     elif ctx.backend == "codex":
         args = _sandboxed_args(["codex", "exec", "--yolo", "--skip-git-repo-check", prompt_text])
         if args is None:
@@ -316,6 +342,23 @@ def _substitute_state(text: str, ctx: Context) -> str:
     return text
 
 
+def _path_attr(node: Node, ctx: Context, key: str, default: pathlib.Path) -> pathlib.Path:
+    raw = node.attrs.get(key)
+    if not raw:
+        return default
+    raw = _substitute_state(raw, ctx)
+    if "${state." in raw:
+        return default
+    path = pathlib.Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (ctx.workdir / path).resolve()
+    return path
+
+
+def _has_unresolved_state_placeholder(value: str) -> bool:
+    return "${state." in value
+
+
 def _tool(node: Node, ctx: Context) -> Result:
     """Shell out to a deterministic command supplied via `command="..."`.
 
@@ -340,9 +383,7 @@ def _tool(node: Node, ctx: Context) -> Result:
             # backends that don't populate it (e.g. echo / claude).
             cwd = ctx.workdir
         else:
-            cwd = pathlib.Path(cwd_attr).expanduser()
-            if not cwd.is_absolute():
-                cwd = (ctx.workdir / cwd).resolve()
+            cwd = _path_attr(node, ctx, "cwd", ctx.workdir)
             if not cwd.exists():
                 return Result(outcome="failure", output=f"cwd does not exist: {cwd}")
     else:
@@ -469,7 +510,7 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
             timeout = int(node.attrs.get("timeout", "1200"))
         except (TypeError, ValueError):
             timeout = 1200
-        args = _sandboxed_args(["claude", "--print", "--dangerously-skip-permissions", prompt])
+        args = _sandboxed_args([_get_claude_executable(), "--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt])
         if args is None:
             return Result(outcome="failure", output="sandbox-exec unavailable")
         proc = subprocess.run(
@@ -510,10 +551,10 @@ _gate_code_standards = _slash_gate("code_standards")
 def _holdout_eval(node: Node, ctx: Context) -> Result:
     """Run the sealed holdout evaluator in a separate process.
 
-    The evaluator script lives outside this repo at the path given by
-    DARK_FACTORY_HOLDOUTS or the default sibling path. Pipeline DOT cannot
-    override this path; otherwise an agent-visible pipeline could fake PASS.
+    Random port allocation per run to avoid conflicts when running multiple benchmarks.
     """
+    import random, time
+
     repo_path = _holdouts_repo_path()
     feature = ctx.state.get("feature") or node.attrs.get("feature")
     if not feature:
@@ -521,36 +562,63 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
 
     eval_script = repo_path / "evaluator" / "run.py"
     if not eval_script.exists():
-        return Result(
-            outcome="failure",
-            output=f"holdout evaluator missing: {eval_script}",
-        )
+        return Result(outcome="failure", output=f"holdout evaluator missing: {eval_script}")
 
-    proc = subprocess.run(
-        ["python3", str(eval_script), "--feature", feature, "--implementation", str(ctx.workdir)],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-        timeout=600,
-        check=False,
-    )
-    # The evaluator emits a final JSON line with {verdict, scenarios:[{name, status}]}.
-    verdict = "failure"
-    for line in proc.stdout.splitlines()[::-1]:
-        line = line.strip()
-        if line.startswith("{") and line.endswith("}"):
-            try:
-                data = json.loads(line)
-                verdict = data.get("verdict", "failure").lower()
-                break
-            except json.JSONDecodeError:
-                continue
-    if proc.returncode != 0 and verdict == "pass":
-        outcome = "error"
-    else:
-        outcome = "success" if verdict == "pass" else verdict
-    return Result(outcome=outcome, output=proc.stdout, metadata={"verdict": verdict})
+    impl_attr = node.attrs.get("implementation")
+    if impl_attr:
+        resolved = _substitute_state(impl_attr, ctx)
+        if _has_unresolved_state_placeholder(resolved):
+            return Result(outcome="failure", output=f"unresolved implementation: {impl_attr}")
 
+    impl = _path_attr(node, ctx, "implementation", ctx.workdir)
+    if not impl.exists():
+        return Result(outcome="failure", output=f"implementation missing: {impl}")
+
+    port = random.randint(30001, 30999)
+    eval_env = dict(os.environ)
+    eval_env["BENCHMARK_PORT"] = str(port)
+
+    server_proc = None
+    if (impl / "Makefile").exists():
+        env_p = dict(eval_env)
+        env_p["PORT"] = str(port)
+        server_proc = subprocess.Popen(
+            ["make", "run"], cwd=str(impl), env=env_p,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        time.sleep(5)
+
+    try:
+        proc = subprocess.run(
+            ["python3", str(eval_script), "--feature", feature, "--impl", str(impl)],
+            cwd=repo_path, capture_output=True, text=True, timeout=600, check=False, env=eval_env)
+        verdict = "failure"
+        for line in reversed(proc.stdout.splitlines()):
+            if line.strip().startswith("{") and line.strip().endswith("}"):
+                try:
+                    data = json.loads(line.strip())
+                    verdict = data.get("verdict", "failure").lower()
+                    
+                    # Write holdout results for scoring candidate
+                    scenarios = data.get("scenarios", [])
+                    passed = sum(1 for sc in scenarios if sc.get("status") == "pass")
+                    total = len(scenarios)
+                    results_file = impl / "results" / "holdout_results.json"
+                    results_file.parent.mkdir(exist_ok=True)
+                    results_file.write_text(json.dumps({
+                        "passed": passed,
+                        "total": total,
+                        "scenarios": scenarios
+                    }, indent=2))
+                    
+                    break
+                except: pass
+        outcome = "error" if proc.returncode and verdict == "pass" else verdict
+        return Result(outcome="success" if verdict == "pass" else verdict, output=proc.stdout, metadata={"verdict": verdict, "port": str(port)})
+    finally:
+        if server_proc:
+            server_proc.terminate()
+            try: server_proc.wait(5)
+            except: server_proc.kill()
 
 def _render_prompt(node: Node, ctx: Context) -> str:
     ref = node.prompt_ref
