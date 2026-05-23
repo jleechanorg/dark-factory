@@ -1,15 +1,10 @@
-.PHONY: build test run clean
-
-PORT ?= 3000
+.PHONY: build test run
 
 build:
 	npm install
 
 test:
-	echo "Define your test suite"
+	npm test
 
 run:
-	npx serve . -p $(PORT)
-
-clean:
-	rm -rf node_modules
+	npm start
