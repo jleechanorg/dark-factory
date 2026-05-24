@@ -1,0 +1,31 @@
+digraph airbnb_sprint_1 {
+    graph [
+        goal="Sprint 1 — Data Layer: schemas, security rules, indexes, Cloud Functions, seed."
+        label="AirbnbCloneSprint1"
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    plan      [type="codergen", label="Plan S1",      prompt="@benchmarks/airbnb-clone/prompts/sprint-1-plan.md"]
+    implement [type="codergen", label="Implement S1", prompt="@benchmarks/airbnb-clone/prompts/sprint-1-implement.md"]
+
+    verify [type="holdout_eval",
+            label="sealed evaluator (S1)",
+            validation="true",
+            feature="airbnb-clone-sprint-1",
+            implementation="${state.ao.worktree}",
+            startup_delay="120",
+            timeout="600"]
+
+    fix [type="codergen",
+         label="Fix S1",
+         prompt="@benchmarks/airbnb-clone/prompts/sprint-1-fix.md",
+         max_visits="5"]
+
+    start -> plan -> implement -> verify
+    verify -> exit [condition="outcome=success"]
+    verify -> fix  [condition="outcome!=success"]
+    fix    -> verify
+}

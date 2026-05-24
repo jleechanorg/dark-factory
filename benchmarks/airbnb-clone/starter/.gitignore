@@ -1,0 +1,36 @@
+# Dependencies
+node_modules
+functions/node_modules
+functions/lib
+
+# Next.js build output
+.next
+out
+
+# Environment variables
+.env.local
+.env.*.local
+
+# Firebase
+.firebase
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+storage-debug.log
+
+# TypeScript
+*.tsbuildinfo
+
+# Testing
+coverage
+.nyc_output
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode
+.idea
+*.swp
+*.swo

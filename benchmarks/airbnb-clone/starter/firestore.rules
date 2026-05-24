@@ -1,0 +1,9 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+    match /{doc=**} {
+      // Sprint implementations replace this deny-all baseline with per-collection rules.
+      allow read, write: if false;
+    }
+  }
+}

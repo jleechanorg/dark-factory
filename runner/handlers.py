@@ -12,6 +12,8 @@ import pathlib
 import re
 import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -211,8 +213,12 @@ def _codergen(node: Node, ctx: Context) -> Result:
         in `ctx.state["ao.worktree"]` so downstream tool nodes can target it.
     """
     prompt_text = _render_prompt(node, ctx)
+    backend = node.attrs.get("backend", node.attrs.get("model", ctx.backend))
+    if isinstance(backend, bool):
+        backend = ctx.backend
+    backend = str(backend)
     _start_ts = time.monotonic()
-    if ctx.backend == "echo":
+    if backend == "echo":
         wall_ms = int((time.monotonic() - _start_ts) * 1000)
         metrics = _codergen_metrics("", "", wall_ms)
         # Stringify so the metadata dict matches Result's declared type (str
@@ -220,7 +226,7 @@ def _codergen(node: Node, ctx: Context) -> Result:
         meta = {k: ("" if v is None else str(v)) for k, v in metrics.items()}
         return Result(outcome="success", output=prompt_text, metadata=meta)
 
-    if ctx.backend == "mock_llm":
+    if backend == "mock_llm":
         mock_url = str(ctx.state.get("mock_url", "")).rstrip("/")
         endpoint = f"{mock_url}/responses" if "/responses" not in mock_url else mock_url
         import urllib.request
@@ -270,7 +276,7 @@ def _codergen(node: Node, ctx: Context) -> Result:
         }
         return Result(outcome="success", output=content_text, metadata=meta)
 
-    if ctx.backend == "ao":
+    if backend == "ao":
         project = ctx.state.get("ao.project")
         if not project:
             return Result(outcome="failure", output="ao backend requires --ao-project")
@@ -354,7 +360,7 @@ def _codergen(node: Node, ctx: Context) -> Result:
             metadata=meta,
         )
 
-    if ctx.backend == "claude":
+    if backend == "claude":
         args = _sandboxed_args([_get_claude_executable(), "--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt_text])
         if args is None:
             return Result(outcome="failure", output="sandbox-exec unavailable")
@@ -374,7 +380,7 @@ def _codergen(node: Node, ctx: Context) -> Result:
             return Result(outcome="failure", output="claude backend timed out after 30 minutes")
         except Exception as e:
             return Result(outcome="failure", output=f"claude backend error: {e}")
-    elif ctx.backend == "codex":
+    elif backend == "codex":
         args = _sandboxed_args(["codex", "exec", "--yolo", "--skip-git-repo-check", prompt_text])
         if args is None:
             return Result(outcome="failure", output="sandbox-exec unavailable")
@@ -388,7 +394,7 @@ def _codergen(node: Node, ctx: Context) -> Result:
             env=_sanitized_env(),
         )
     else:
-        return Result(outcome="failure", output=f"unknown backend {ctx.backend!r}")
+        return Result(outcome="failure", output=f"unknown backend {backend!r}")
 
     outcome = "success" if proc.returncode == 0 else "failure"
     wall_ms = int((time.monotonic() - _start_ts) * 1000)
@@ -804,6 +810,14 @@ _gate_er = _slash_gate("er")
 _gate_code_standards = _slash_gate("code_standards")
 
 
+def _tcp_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _holdout_eval(node: Node, ctx: Context) -> Result:
     """Run the sealed holdout evaluator in a separate process.
 
@@ -812,7 +826,13 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
     import random, time
 
     repo_path = _holdouts_repo_path()
-    feature = ctx.state.get("feature") or node.attrs.get("feature")
+    node_feature = node.attrs.get("feature")
+    feature = str(ctx.state.get("feature", "")) or (str(node_feature) if node_feature is not None else "")
+    if isinstance(feature, str) and "${state." in feature:
+        feature = _substitute_state(feature, ctx)
+        if "${state." in feature:
+            return Result(outcome="failure", output=f"unresolved feature path: {node_feature!r}")
+    feature = str(feature or "").strip()
     if not feature:
         return Result(outcome="failure", output="no feature attribute or state")
 
@@ -833,15 +853,75 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
     port = random.randint(30001, 30999)
     eval_env = dict(os.environ)
     eval_env["BENCHMARK_PORT"] = str(port)
+    # Strip real GCP credentials so Firebase emulators don't try to reach
+    # production — they should use emulator-local auth only.
+    for _cred_key in ("GOOGLE_APPLICATION_CREDENTIALS", "GCLOUD_PROJECT",
+                      "GOOGLE_CLOUD_PROJECT"):
+        eval_env.pop(_cred_key, None)
 
+    startup_delay = int(node.attrs.get("startup_delay", "5"))
     server_proc = None
-    if (impl / "Makefile").exists():
+    makefile = impl / "Makefile"
+    firebase_json = impl / "firebase.json"
+    has_make_run = False
+    if makefile.exists():
+        try:
+            has_make_run = bool(re.search(r"^run\s*:", makefile.read_text(), re.MULTILINE))
+        except Exception:
+            pass
+    if has_make_run:
         env_p = dict(eval_env)
         env_p["PORT"] = str(port)
         server_proc = subprocess.Popen(
             ["make", "run"], cwd=str(impl), env=env_p,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-        time.sleep(5)
+        time.sleep(startup_delay)
+    elif firebase_json.exists():
+        # Kill any lingering processes from previous runs that hold the
+        # Firebase emulator ports, so the new emulator can bind cleanly.
+        for _em_port in (8080, 9099, 5001, 4000, 4400):
+            try:
+                _lsof = subprocess.run(
+                    ["lsof", "-ti", f":{_em_port}"],
+                    capture_output=True, text=True, timeout=5)
+                for _pid_s in _lsof.stdout.strip().split():
+                    try:
+                        os.kill(int(_pid_s), signal.SIGTERM)
+                    except (ProcessLookupError, ValueError):
+                        pass
+            except Exception:
+                pass
+        time.sleep(2)
+        # Ensure Java is on PATH — Firebase emulators require it.
+        # Homebrew installs Java at /opt/homebrew/opt/java/bin but doesn't
+        # add it to PATH by default. Prepend it so emulators can find `java`.
+        _homebrew_java = "/opt/homebrew/opt/java/bin"
+        _java_path = eval_env.get("PATH", "")
+        if _homebrew_java not in _java_path:
+            eval_env["PATH"] = _homebrew_java + ":" + _java_path
+        eval_env.setdefault("JAVA_HOME", "/opt/homebrew/opt/java")
+        # Build Cloud Functions if source exists but compiled output is missing
+        fn_pkg = impl / "functions" / "package.json"
+        fn_lib = impl / "functions" / "lib" / "index.js"
+        if fn_pkg.exists() and not fn_lib.exists():
+            subprocess.run(
+                ["npm", "install", "--prefix", str(impl / "functions"), "--silent"],
+                cwd=str(impl), capture_output=True, timeout=120)
+            subprocess.run(
+                ["npm", "run", "build", "--prefix", str(impl / "functions")],
+                cwd=str(impl), capture_output=True, timeout=120)
+        server_proc = subprocess.Popen(
+            ["firebase", "emulators:start",
+             "--only", "firestore,auth,storage,functions"],
+            cwd=str(impl), env=dict(eval_env),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        # Poll until all required emulator ports respond or startup_delay expires.
+        _emulator_ports = [8080, 9099, 5001]
+        _deadline = time.monotonic() + startup_delay
+        while time.monotonic() < _deadline:
+            if all(_tcp_port_open("localhost", p) for p in _emulator_ports):
+                break
+            time.sleep(2)
 
     try:
         proc = subprocess.run(
@@ -902,9 +982,23 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
         )
     finally:
         if server_proc:
-            server_proc.terminate()
-            try: server_proc.wait(5)
-            except: server_proc.kill()
+            # Kill the entire process group so JVM child processes (Firestore
+            # emulator) are terminated along with the firebase CLI wrapper.
+            # start_new_session=True gives the process its own session, so
+            # os.killpg on the process group reaps all children.
+            try:
+                pgid = os.getpgid(server_proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                server_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    pgid = os.getpgid(server_proc.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 def _render_prompt(node: Node, ctx: Context) -> str:
     ref = node.prompt_ref

@@ -8,6 +8,7 @@ extracted (node attributes, edge attributes, optional subgraph clusters).
 from __future__ import annotations
 
 import pathlib
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -16,9 +17,13 @@ import pydot
 AttrValue = str | int | bool
 
 _GRAPH_INT_ATTRS = {"default_max_retries"}
-_NODE_INT_ATTRS = {"max_retries", "max_visits", "timeout"}
-_NODE_BOOL_ATTRS = {"allow_partial", "goal_gate", "validation"}
+_NODE_INT_ATTRS = {"max_retries", "max_visits", "timeout", "join_quorum"}
+_NODE_BOOL_ATTRS = {"allow_partial", "goal_gate", "validation", "parallel"}
 _EDGE_INT_ATTRS = {"weight"}
+_STYLE_RULE_RE = re.compile(
+    r"(?P<selector>[^\n{]+)\{\s*(?P<body>[^}]*)\}",
+    re.MULTILINE | re.DOTALL,
+)
 
 
 @dataclass
@@ -109,6 +114,77 @@ def _coerce_bool(value: str, context: str) -> bool:
     if normalized in {"false", "0", "no"}:
         return False
     raise ValueError(f"{context}: expected boolean, got {value!r}")
+
+
+def _parse_model_style_rules(raw: str) -> list[tuple[str, dict[str, str]]]:
+    """Parse a tiny CSS-like stylesheet into ordered selector → attrs rules.
+
+    Supported syntax is intentionally tiny:
+
+    ```
+    * {backend: codex}
+    node-name {timeout: 120}
+    ```
+    """
+    rules: list[tuple[str, dict[str, str]]] = []
+    for match in _STYLE_RULE_RE.finditer(raw):
+        selector = match.group("selector").strip()
+        body = match.group("body")
+        if not selector or body is None:
+            continue
+        attrs: dict[str, str] = {}
+        for decl in re.split(r";", body):
+            decl = decl.strip()
+            if not decl:
+                continue
+            if ":" in decl:
+                key, value = decl.split(":", 1)
+            elif "=" in decl:
+                key, value = decl.split("=", 1)
+            else:
+                continue
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                attrs[key] = value
+        if attrs:
+            rules.append((selector, attrs))
+    return rules
+
+
+def _selector_matches(selector: str, node: Node) -> bool:
+    if selector == "*":
+        return True
+    if selector.startswith("."):
+        token = selector[1:]
+        classes = str(node.attrs.get("class", "")).replace(",", " ").split()
+        return token in classes
+    return selector == node.name
+
+
+def _apply_model_stylesheet(
+    path: pathlib.Path,
+    nodes: dict[str, Node],
+    stylesheet: Optional[str],
+) -> None:
+    if not stylesheet:
+        return
+    stylesheet_path = pathlib.Path(stylesheet)
+    if not stylesheet_path.is_absolute():
+        stylesheet_path = (path.parent / stylesheet_path).resolve()
+    if not stylesheet_path.exists():
+        raise ValueError(f"{path}: model stylesheet missing {stylesheet_path!s}")
+    raw = stylesheet_path.read_text(encoding="utf-8")
+    rules = _parse_model_style_rules(raw)
+    explicit_node_attrs = {name: set(node.attrs.keys()) for name, node in nodes.items()}
+    for selector, attrs in rules:
+        for node in nodes.values():
+            if not _selector_matches(selector, node):
+                continue
+            for key, value in attrs.items():
+                if key in explicit_node_attrs.get(node.name, set()):
+                    continue
+                node.attrs[key] = value
 
 
 def _coerce_attrs(
@@ -216,6 +292,8 @@ def parse(path: pathlib.Path) -> Graph:
             collect_edges(sub)
 
     collect_edges(g)
+
+    _apply_model_stylesheet(path, nodes, graph_attrs.get("model_stylesheet"))
 
     if not any(is_start_node(node) for node in nodes.values()) or not any(
         is_exit_node(node) for node in nodes.values()

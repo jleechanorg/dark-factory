@@ -5,6 +5,7 @@ Run with: source .venv/bin/activate && python -m pytest tests/
 
 from __future__ import annotations
 
+import json
 import pathlib
 import subprocess
 import sys
@@ -32,6 +33,25 @@ def test_parser_round_trip():
     assert "holdout" in g.nodes
     # fix -> holdout edge exists
     assert any(e.src == "fix" and e.dst == "holdout" for e in g.edges)
+
+
+def test_model_stylesheet_sets_node_backend_attributes(tmp_path):
+    style = tmp_path / "minimal.model.css"
+    style.write_text('* { backend: "echo" }\n.hot { backend: "mock_llm" }\n')
+    dot = tmp_path / "styled.dot"
+    dot.write_text(
+        'digraph styled {\n'
+        '  graph [goal="styled" model_stylesheet="minimal.model.css"]\n'
+        '  start [shape=Mdiamond]\n'
+        '  plan [type="codergen"]\n'
+        '  implement [type="codergen", class="hot"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> plan -> implement -> exit\n'
+        '}\n'
+    )
+    g = parse(dot)
+    assert g.nodes["plan"].attrs["backend"] == "echo"
+    assert g.nodes["implement"].attrs["backend"] == "mock_llm"
 
 
 def test_echo_backend_loops_on_failed_holdout(monkeypatch, tmp_path):
@@ -135,3 +155,76 @@ def test_max_steps_before_exit_is_failure():
 
     assert history[-1].outcome == "exhausted"
     assert "max_steps=1" in history[-1].output_preview
+
+
+def test_engine_resume_from_checkpoint(tmp_path):
+    dot = tmp_path / "resume.dot"
+    dot.write_text(
+        'digraph resume {\n'
+        '  graph [goal="Resume test" rankdir=LR]\n'
+        '  start [shape=Mdiamond, label="Start"]\n'
+        '  one [type="codergen", label="One"]\n'
+        '  two [type="codergen", label="Two"]\n'
+        '  exit [shape=Msquare, label="Exit"]\n'
+        '  start -> one -> two -> exit\n'
+        '}\n'
+    )
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(
+        json.dumps(
+            [
+                {
+                    "node": "start",
+                    "outcome": "success",
+                    "ts": 0.0,
+                    "output_preview": "start",
+                    "metadata": {},
+                },
+                {
+                    "node": "one",
+                    "outcome": "success",
+                    "ts": 0.0,
+                    "output_preview": "one",
+                    "metadata": {},
+                },
+            ]
+        )
+    )
+    graph = parse(dot)
+    ctx = Context(goal="resume", workdir=ROOT, backend="echo")
+    history = run(graph, ctx, resume=checkpoint, max_steps=10)
+
+    assert [step.node for step in history] == ["start", "one", "two", "exit"]
+
+
+def test_engine_parallel_fanout_with_join_quorum_and_allow_partial(tmp_path, monkeypatch):
+    dot = tmp_path / "parallel.dot"
+    dot.write_text(
+        'digraph parallel {\n'
+        '  graph [goal="Parallel gate test" rankdir=LR]\n'
+        '  start [shape=Mdiamond, label="Start"]\n'
+        '  fan [type="codergen", label="Fanout", parallel="true", allow_partial="true", join_quorum=2]\n'
+        '  branch_pass [type="branch_pass", label="Branch pass"]\n'
+        '  branch_partial [type="branch_partial", label="Branch partial"]\n'
+        '  exit [shape=Msquare, label="Exit"]\n'
+        '  start -> fan\n'
+        '  fan -> branch_pass\n'
+        '  fan -> branch_partial\n'
+        '  fan -> exit [join=true]\n'
+        '}\n'
+    )
+    monkeypatch.setitem(TYPE_REGISTRY, "branch_pass", lambda node, ctx: Result(outcome="success", output="ok"))
+    monkeypatch.setitem(TYPE_REGISTRY, "branch_partial", lambda node, ctx: Result(outcome="partial", output="ok"))
+
+    graph = parse(dot)
+    ctx = Context(goal="parallel", workdir=ROOT, backend="echo")
+    history = run(graph, ctx, max_steps=20)
+
+    assert [step.node for step in history] == [
+        "start",
+        "fan",
+        "branch_pass",
+        "branch_partial",
+        "exit",
+    ]
+    assert history[-1].outcome == "success"

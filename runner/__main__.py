@@ -34,8 +34,11 @@ def main(argv: list[str] | None = None) -> int:
         help="AO agent plugin to use when --backend ao (default: claude-code).",
     )
     p.add_argument("--checkpoint", type=pathlib.Path, default=None)
+    p.add_argument("--resume", type=pathlib.Path, default=None, help="Resume from a prior checkpoint file.")
     p.add_argument("--max-steps", type=int, default=100)
     p.add_argument("--feature", default=None, help="feature name for holdout eval")
+    p.add_argument("--ao-session", default=None, help="Reuse existing AO session (skip spawn)")
+    p.add_argument("--ao-worktree", default=None, help="AO worktree path to use for holdout eval")
     p.add_argument(
         "--cxdb",
         type=pathlib.Path,
@@ -74,8 +77,18 @@ def main(argv: list[str] | None = None) -> int:
             p.error("--backend ao requires --ao-project")
         ctx.state["ao.project"] = args.ao_project
         ctx.state["ao.agent"] = args.ao_agent
+    if args.ao_session:
+        ctx.state["ao.session"] = args.ao_session
+    if args.ao_worktree:
+        ctx.state["ao.worktree"] = str(pathlib.Path(args.ao_worktree).expanduser().resolve())
 
-    history = run(graph, ctx, checkpoint=args.checkpoint, max_steps=args.max_steps)
+    history = run(
+        graph,
+        ctx,
+        checkpoint=args.checkpoint,
+        resume=args.resume,
+        max_steps=args.max_steps,
+    )
 
     if args.evidence_bundle is not None and ctx.run_id is not None:
         # Lazy import so the CLI module stays cheap to load.

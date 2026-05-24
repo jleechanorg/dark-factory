@@ -1,0 +1,31 @@
+digraph airbnb_sprint_2 {
+    graph [
+        goal="Sprint 2 — Backend Layer: SDK init, auth, validation, server actions, Stripe, search."
+        label="AirbnbCloneSprint2"
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    plan      [type="codergen", label="Plan S2",      prompt="@benchmarks/airbnb-clone/prompts/sprint-2-plan.md"]
+    implement [type="codergen", label="Implement S2", prompt="@benchmarks/airbnb-clone/prompts/sprint-2-implement.md"]
+
+    verify [type="holdout_eval",
+            label="sealed evaluator (S2)",
+            validation="true",
+            feature="airbnb-clone-sprint-2",
+            implementation="${state.ao.worktree}",
+            startup_delay="120",
+            timeout="600"]
+
+    fix [type="codergen",
+         label="Fix S2",
+         prompt="@benchmarks/airbnb-clone/prompts/sprint-2-fix.md",
+         max_visits="5"]
+
+    start -> plan -> implement -> verify
+    verify -> exit [condition="outcome=success"]
+    verify -> fix  [condition="outcome!=success"]
+    fix    -> verify
+}

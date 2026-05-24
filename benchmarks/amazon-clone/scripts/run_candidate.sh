@@ -54,6 +54,11 @@ if [ ! -f "$PIPELINE_PATH" ]; then
     exit 1
 fi
 
+PYTHON_BIN="python"
+if [ -x "$PROJECT_ROOT/.venv/bin/python" ]; then
+    PYTHON_BIN="$PROJECT_ROOT/.venv/bin/python"
+fi
+
 : "${DARK_FACTORY_HOLDOUTS:?DARK_FACTORY_HOLDOUTS must point to the sealed holdouts repo}"
 AO_AGENT="${AO_AGENT:-antigravity}"
 AO_PROJECT="${AO_PROJECT:-amazon-clone}"
@@ -84,7 +89,7 @@ echo ""
 # Run dark-factory runner
 set +e
 cd "$PROJECT_ROOT"
-python -m runner \
+$PYTHON_BIN -m runner \
     --pipeline "$PIPELINE" \
     --workdir "$WORKDIR" \
     --goal "Amazon Clone MVP - implement all features per spec" \

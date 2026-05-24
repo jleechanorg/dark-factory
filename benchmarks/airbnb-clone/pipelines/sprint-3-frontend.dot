@@ -1,0 +1,31 @@
+digraph airbnb_sprint_3 {
+    graph [
+        goal="Sprint 3 — Frontend Layer: Next.js UI, searchbar, search results, listing detail, dashboard, mobile, a11y."
+        label="AirbnbCloneSprint3"
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    plan      [type="codergen", label="Plan S3",      prompt="@benchmarks/airbnb-clone/prompts/sprint-3-plan.md"]
+    implement [type="codergen", label="Implement S3", prompt="@benchmarks/airbnb-clone/prompts/sprint-3-implement.md"]
+
+    verify [type="holdout_eval",
+            label="sealed evaluator (S3)",
+            validation="true",
+            feature="airbnb-clone-sprint-3",
+            implementation="${state.ao.worktree}",
+            startup_delay="120",
+            timeout="900"]
+
+    fix [type="codergen",
+         label="Fix S3",
+         prompt="@benchmarks/airbnb-clone/prompts/sprint-3-fix.md",
+         max_visits="5"]
+
+    start -> plan -> implement -> verify
+    verify -> exit [condition="outcome=success"]
+    verify -> fix  [condition="outcome!=success"]
+    fix    -> verify
+}

@@ -15,6 +15,39 @@ from .parser import Edge, Graph, Node, is_exit_node, is_start_node
 _VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards"}
 
 
+def _classify_outcome(raw: str) -> str:
+    """Normalize diverse outcomes to a small engine outcome taxonomy.
+
+    Notes:
+      - `pass` and `warn` are treated as success for routing.
+      - `partial` is preserved as partial so caller can opt into
+        `allow_partial` semantics.
+      - Any non-empty unknown token collapses to failure.
+    """
+    value = str(raw).strip().lower()
+    if value in {"success", "pass", "warn"}:
+        return "success"
+    if value in {"partial", "partial_success"}:
+        return "partial"
+    if value == "error":
+        return "error"
+    if value in {"failure", "fail", "exhausted", "stuck", "inconclusive"}:
+        return "failure"
+    return "failure"
+
+
+def _is_success_result(outcome: str) -> bool:
+    return _classify_outcome(outcome) == "success"
+
+
+def _is_partial_result(outcome: str, allow_partial: bool) -> bool:
+    return allow_partial and _classify_outcome(outcome) == "partial"
+
+
+def _is_validation_failed(outcome: str) -> bool:
+    return _classify_outcome(outcome) in {"failure", "error", "partial"}
+
+
 def _is_validation_node(node: Node) -> bool:
     """A node counts as a validator (clearing prior `_unresolved_failure` on
     success) if either:
@@ -41,6 +74,38 @@ class StepRecord:
     ts: float
     output_preview: str
     metadata: dict[str, str] = field(default_factory=dict)
+
+
+def _clone_context(ctx: Context) -> Context:
+    return Context(
+        goal=ctx.goal,
+        workdir=ctx.workdir,
+        state=dict(ctx.state),
+        history=[dict(entry) for entry in ctx.history],
+        backend=ctx.backend,
+        cxdb_path=ctx.cxdb_path,
+        run_id=ctx.run_id,
+    )
+
+
+def _load_checkpoint(path: pathlib.Path) -> list[StepRecord]:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, list):
+        raise ValueError(f"checkpoint {path} does not contain a list")
+    records: list[StepRecord] = []
+    for raw in payload:
+        if not isinstance(raw, dict):
+            raise ValueError(f"checkpoint {path} contains non-dict entry: {raw!r}")
+        records.append(
+            StepRecord(
+                node=str(raw["node"]),
+                outcome=str(raw["outcome"]),
+                ts=float(raw.get("ts", 0.0)),
+                output_preview=str(raw.get("output_preview", "")),
+                metadata=dict(raw.get("metadata", {})),
+            )
+        )
+    return records
 
 def _is_decision_node(node: Optional[Node]) -> bool:
     if node is None:
@@ -82,6 +147,132 @@ def _lookup(
     return str(last.metadata.get(key, ""))
 
 
+def _normalize_outcome_only(value: str) -> str:
+    return _classify_outcome(value)
+
+
+def _classify_records(records: list[Result]) -> tuple[int, int, int]:
+    success = 0
+    partial = 0
+    failure = 0
+    for record in records:
+        outcome = _normalize_outcome_only(record.outcome)
+        if outcome == "success":
+            success += 1
+        elif outcome == "partial":
+            partial += 1
+        else:
+            failure += 1
+    return success, partial, failure
+
+
+def _normalized_result(result: Result) -> Result:
+    outcome = _normalize_outcome_only(result.outcome)
+    if outcome == result.outcome:
+        return result
+    result.outcome = outcome
+    return result
+
+
+def _parallel_join_edges(edges: list[Edge]) -> list[Edge]:
+    join: list[Edge] = []
+    for edge in edges:
+        join_value = edge.attrs.get("join", "")
+        if isinstance(join_value, bool):
+            if join_value:
+                join.append(edge)
+            continue
+        if str(join_value).strip().lower() in {"true", "1", "yes"}:
+            join.append(edge)
+    return join
+
+
+def _parallel_branches(
+    graph: Graph,
+    current: Node,
+    result: Result,
+    ctx: Optional[Context],
+) -> list[Edge]:
+    branches: list[Edge] = []
+    for edge in graph.outgoing(current.name):
+        if not _edge_matches(edge, result, ctx, current):
+            continue
+        if edge in _parallel_join_edges(graph.outgoing(current.name)):
+            continue
+        branches.append(edge)
+    return branches
+
+
+def _parallel_join_outcome(
+    current: Node,
+    branch_outcomes: list[Result],
+    allow_partial: bool,
+) -> str:
+    success_count, partial_count, _ = _classify_records(branch_outcomes)
+    effective_success = success_count + (partial_count if allow_partial else 0)
+    if not branch_outcomes:
+        return _normalize_outcome_only("success")
+    quorum = _attr_int(current, "join_quorum", len(branch_outcomes))
+    if quorum <= 0:
+        quorum = len(branch_outcomes)
+    return _normalize_outcome_only("success" if effective_success >= quorum else "failure")
+
+
+def _run_single_node(
+    node: Node,
+    ctx: Context,
+    graph: Graph,
+) -> tuple[list[Result], list[StepRecord]]:
+    handler = resolve(node)
+    results = _run_with_retries(handler, node, ctx, graph)
+    normalized_results: list[Result] = []
+    records: list[StepRecord] = []
+    for attempt in results:
+        attempt = _normalized_result(attempt)
+        ctx.state.update(attempt.context_updates)
+        normalized_results.append(attempt)
+        records.append(
+            StepRecord(
+                node=node.name,
+                outcome=attempt.outcome,
+                ts=time.time(),
+                output_preview=attempt.output[:280],
+                metadata=attempt.metadata,
+            )
+        )
+        _update_failure_state(node, ctx, attempt)
+        ctx.history.append({"node": node.name, "outcome": attempt.outcome})
+    return normalized_results, records
+
+
+def _allow_partial(node: Node) -> bool:
+    allow_partial = node.attrs.get("allow_partial", False)
+    if isinstance(allow_partial, bool):
+        return allow_partial
+    return str(allow_partial).strip().lower() in {"true", "1", "yes"}
+
+
+def _pick_next_from_edges(
+    graph: Graph,
+    current: Node,
+    edges: list[Edge],
+    last: Result,
+    ctx: Optional[Context] = None,
+) -> Optional[Node]:
+    # Keep behavior consistent with _pick_next() while allowing explicit edges.
+    if not edges:
+        return None
+    matching = [edge for edge in edges if edge.condition and _edge_matches(edge, last, ctx, current)]
+    if matching:
+        selected = _choose_edge(matching, last)
+        return graph.nodes.get(selected.dst)
+    unconditional = [edge for edge in edges if not edge.condition]
+    if unconditional:
+        selected = _choose_edge(unconditional, last)
+        return graph.nodes.get(selected.dst)
+    return None
+
+
 def _attr_int(node: Node, key: str, default: int) -> int:
     raw = node.attrs.get(key)
     if raw is None or raw == "":
@@ -100,13 +291,40 @@ def run(
     graph: Graph,
     ctx: Context,
     checkpoint: Optional[pathlib.Path] = None,
+    resume: Optional[pathlib.Path] = None,
     max_steps: int = 100,
 ) -> list[StepRecord]:
-    """Execute the graph starting at 'start' until 'exit' or max_steps."""
+    """Execute the graph starting at 'start' until 'exit' or max_steps.
+
+    If `resume` is provided, execution restarts from the successor of the
+    checkpointed last step.
+    """
     history: list[StepRecord] = []
     visits: dict[str, int] = {}
     current = _start_node(graph)
     seq = 0  # CXDB sequence — independent of history length so refactors can't desync.
+
+    if resume is not None:
+        resumed = _load_checkpoint(resume)
+        history.extend(resumed)
+        for step in resumed:
+            visits[step.node] = visits.get(step.node, 0) + 1
+
+        if resumed:
+            last = resumed[-1]
+            last_node = graph.nodes.get(last.node)
+            if last_node is None:
+                raise ValueError(f"checkpoint node missing from graph: {last.node!r}")
+            if is_exit_node(last_node):
+                return history
+            if len(history) >= max_steps:
+                return history
+            synthetic = _normalized_result(Result(outcome=last.outcome))
+            goal_gate_node = _goal_gate_target(graph, last_node, synthetic, ctx)
+            next_node = goal_gate_node or _pick_next(graph, last_node, synthetic, ctx)
+            if next_node is None:
+                return history
+            current = next_node
 
     cxdb: Optional[CXDB] = None
     if ctx.cxdb_path is not None:
@@ -115,6 +333,16 @@ def run(
 
     try:
         while True:
+            if len(history) >= max_steps:
+                record = StepRecord(
+                    node=current.name,
+                    outcome="exhausted",
+                    ts=time.time(),
+                    output_preview=f"max_steps={max_steps} reached before exit",
+                )
+                seq = _append_record(history, checkpoint, cxdb, ctx, seq, record, "")
+                break
+
             visits[current.name] = visits.get(current.name, 0) + 1
             max_visits = _attr_int(current, "max_visits", 0)
             if max_visits and visits[current.name] > max_visits:
@@ -127,20 +355,50 @@ def run(
                 seq = _append_record(history, checkpoint, cxdb, ctx, seq, record, "")
                 break
 
-            handler = resolve(current)
-            results = _run_with_retries(handler, current, ctx, graph)
-            result = results[-1]
-            for attempt_result in results:
-                ctx.state.update(attempt_result.context_updates)
-                record = StepRecord(
-                    node=current.name,
-                    outcome=attempt_result.outcome,
-                    ts=time.time(),
-                    output_preview=attempt_result.output[:280],
-                    metadata=attempt_result.metadata,
-                )
-                _update_failure_state(current, ctx, attempt_result)
-                ctx.history.append({"node": current.name, "outcome": attempt_result.outcome})
+            results, records = _run_single_node(current, ctx, graph)
+            if records:
+                result = results[-1]
+            else:
+                result = _normalized_result(Result(outcome="success"))
+
+            branch_records: list[tuple[StepRecord, str, dict[str, str]]] = []
+            if current.attrs.get("parallel", False):
+                branch_edges = _parallel_branches(graph, current, result, ctx)
+                branch_results: list[Result] = []
+                for edge in branch_edges:
+                    target = graph.nodes.get(edge.dst)
+                    if target is None:
+                        continue
+                    b_results, b_records = _run_single_node(target, _clone_context(ctx), graph)
+                    if b_records:
+                        for branch_index, b_result in enumerate(b_results):
+                            b_record = b_records[branch_index]
+                            branch_records.append((b_record, b_result.output, b_record.metadata))
+                        branch_results.append(b_records[-1])
+
+                if branch_records:
+                    join_outcome = _parallel_join_outcome(current, branch_results, _allow_partial(current))
+                    join_metadata = {
+                        "parallel_branches": str(len(branch_results)),
+                        "parallel_successes": str(
+                            sum(1 for branch in branch_results if _is_success_result(branch.outcome))
+                        ),
+                        "join_quorum": str(_attr_int(current, "join_quorum", len(branch_results))),
+                        "parallel": "true",
+                    }
+                    result = _normalized_result(
+                        Result(
+                            outcome=join_outcome,
+                            output=result.output,
+                            metadata={**result.metadata, **join_metadata},
+                        )
+                    )
+                    if records:
+                        records[-1].outcome = result.outcome
+                        records[-1].metadata = result.metadata
+
+            for index, attempt in enumerate(results):
+                record = records[index]
                 seq = _append_record(
                     history,
                     checkpoint,
@@ -148,25 +406,37 @@ def run(
                     ctx,
                     seq,
                     record,
-                    attempt_result.output,
-                    attempt_result.metadata,
+                    attempt.output,
+                    record.metadata,
                 )
+
+            for b_record, b_output, b_metadata in branch_records:
+                seq = _append_record(
+                    history,
+                    checkpoint,
+                    cxdb,
+                    ctx,
+                    seq,
+                    b_record,
+                    b_output,
+                    b_metadata,
+                )
+
+            if records:
+                _update_failure_state(current, ctx, result)
 
             if is_exit_node(current):
                 break
 
-            if len(history) >= max_steps:
-                record = StepRecord(
-                    node=current.name,
-                    outcome="exhausted",
-                    ts=time.time(),
-                    output_preview=f"max_steps={max_steps} reached before exit",
-                )
-                seq = _append_record(history, checkpoint, cxdb, ctx, seq, record, "")
-                break
-
             gate_target = _goal_gate_target(graph, current, result, ctx)
-            next_node = gate_target or _pick_next(graph, current, result, ctx)
+            if gate_target is not None:
+                next_node = gate_target
+            else:
+                outgoing = graph.outgoing(current.name)
+                join_edges = _parallel_join_edges(outgoing) if current.attrs.get("parallel", False) else []
+                chosen = join_edges if join_edges else outgoing
+                next_node = _pick_next_from_edges(graph, current, chosen, result, ctx)
+
             if next_node is None:
                 record = StepRecord(
                     node=current.name,
@@ -234,14 +504,15 @@ def _node_max_retries(node: Node, graph: Graph) -> int:
 
 
 def _successful_for_node(node: Node, result: Result) -> bool:
-    if result.outcome == "success":
+    outcome = _classify_outcome(result.outcome)
+    if outcome == "success":
         return True
     allow_partial = node.attrs.get("allow_partial", False)
     if isinstance(allow_partial, bool):
         partial_allowed = allow_partial
     else:
         partial_allowed = str(allow_partial).strip().lower() in {"true", "1", "yes"}
-    return partial_allowed and result.outcome in {"partial", "partial_success"}
+    return partial_allowed and outcome == "partial"
 
 
 def _goal_gate_target(

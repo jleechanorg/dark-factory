@@ -1,0 +1,63 @@
+digraph airbnb_clone_master {
+    graph [
+        goal="Full airbnb-clone benchmark: three sprints (Data -> Backend -> Frontend) each gated by a sealed evaluator."
+        label="AirbnbCloneMaster"
+        default_max_retries="5"
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    // ---------- Sprint 1: Data Layer ----------
+    s1_plan      [type="codergen", label="Plan S1",      prompt="@benchmarks/airbnb-clone/prompts/sprint-1-plan.md"]
+    s1_implement [type="codergen", label="Implement S1", prompt="@benchmarks/airbnb-clone/prompts/sprint-1-implement.md"]
+    s1_verify    [type="holdout_eval",
+                  label="Verify S1",
+                  validation="true",
+                  feature="airbnb-clone-sprint-1",
+                  implementation="${state.ao.worktree}",
+                  startup_delay="120",
+                  timeout="600"]
+    s1_fix       [type="codergen", label="Fix S1", prompt="@benchmarks/airbnb-clone/prompts/sprint-1-fix.md", max_visits="5"]
+
+    // ---------- Sprint 2: Backend Layer ----------
+    s2_plan      [type="codergen", label="Plan S2",      prompt="@benchmarks/airbnb-clone/prompts/sprint-2-plan.md"]
+    s2_implement [type="codergen", label="Implement S2", prompt="@benchmarks/airbnb-clone/prompts/sprint-2-implement.md"]
+    s2_verify    [type="holdout_eval",
+                  label="Verify S2",
+                  validation="true",
+                  feature="airbnb-clone-sprint-2",
+                  implementation="${state.ao.worktree}",
+                  startup_delay="120",
+                  timeout="600"]
+    s2_fix       [type="codergen", label="Fix S2", prompt="@benchmarks/airbnb-clone/prompts/sprint-2-fix.md", max_visits="5"]
+
+    // ---------- Sprint 3: Frontend Layer ----------
+    s3_plan      [type="codergen", label="Plan S3",      prompt="@benchmarks/airbnb-clone/prompts/sprint-3-plan.md"]
+    s3_implement [type="codergen", label="Implement S3", prompt="@benchmarks/airbnb-clone/prompts/sprint-3-implement.md"]
+    s3_verify    [type="holdout_eval",
+                  label="Verify S3",
+                  validation="true",
+                  feature="airbnb-clone-sprint-3",
+                  implementation="${state.ao.worktree}",
+                  startup_delay="120",
+                  timeout="900"]
+    s3_fix       [type="codergen", label="Fix S3", prompt="@benchmarks/airbnb-clone/prompts/sprint-3-fix.md", max_visits="5"]
+
+    // ---------- Wiring ----------
+    start -> s1_plan -> s1_implement -> s1_verify
+    s1_verify -> s2_plan [condition="outcome=success"]
+    s1_verify -> s1_fix  [condition="outcome!=success"]
+    s1_fix    -> s1_verify
+
+    s2_plan -> s2_implement -> s2_verify
+    s2_verify -> s3_plan [condition="outcome=success"]
+    s2_verify -> s2_fix  [condition="outcome!=success"]
+    s2_fix    -> s2_verify
+
+    s3_plan -> s3_implement -> s3_verify
+    s3_verify -> exit    [condition="outcome=success"]
+    s3_verify -> s3_fix  [condition="outcome!=success"]
+    s3_fix    -> s3_verify
+}

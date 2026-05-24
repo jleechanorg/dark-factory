@@ -29,4 +29,5 @@ internals, not material user-story requirements.
 - `fibonacci/` is the tiny deterministic smoke benchmark for harness plumbing.
 - `amazon-clone/` is the larger product benchmark skeleton for multi-method
   comparisons.
-
+- `attractor-spec-review/` adds a spec-quality benchmark with independent
+  reviewer gating (`codex exec --yolo`) in slim/full DOT graphs.

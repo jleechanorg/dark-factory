@@ -1,0 +1,43 @@
+digraph attractor_spec_review_full {
+    graph [
+        goal="Line-aware spec review with full-stack smoke in full mode",
+        rankdir=LR
+    ]
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    plan [type="codergen", label="Plan", prompt="@benchmarks/attractor-spec-review/prompts/plan.md"]
+    implement [type="codergen", label="Implement", prompt="@benchmarks/attractor-spec-review/prompts/implement.md"]
+
+    acceptance [type="tool",
+                label="Public Acceptance",
+                command="python scripts/validate_spec.py --spec spec/feature.md --report spec_review/validation_report.json",
+                goal_gate=true,
+                retry_target="fix"]
+
+    stack_smoke [type="tool",
+                 label="Full-stack smoke",
+                 command="bash scripts/fullstack_smoke.sh",
+                 goal_gate=true,
+                 retry_target="fix"]
+
+    review [type="tool",
+            label="Independent Reviewer",
+            command="benchmarks/attractor-spec-review/scripts/review_with_codex.sh . spec/feature.md spec_review/independent_reviewer.json",
+            goal_gate=true,
+            retry_target="fix"]
+
+    fix [type="codergen", label="Fix", prompt="@benchmarks/attractor-spec-review/prompts/fix.md", max_visits="3"]
+
+    start -> plan
+    plan -> implement
+    implement -> acceptance
+    acceptance -> stack_smoke [condition="outcome=success"]
+    acceptance -> fix [condition="outcome!=success"]
+    stack_smoke -> review [condition="outcome=success"]
+    stack_smoke -> fix [condition="outcome!=success"]
+    review -> exit [condition="outcome=success"]
+    review -> fix [condition="outcome!=success"]
+    fix -> implement
+}

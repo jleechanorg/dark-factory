@@ -105,14 +105,8 @@
   ],
   "users": [],
   "carts": {
-    "guest_m4qc8xr1t": {
-      "items": [
-        {
-          "productId": "p1",
-          "quantity": 1,
-          "priceAtAdd": 49.99
-        }
-      ]
+    "guest_ncbo68l4h": {
+      "items": []
     }
   },
   "orders": []

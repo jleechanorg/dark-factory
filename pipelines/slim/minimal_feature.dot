@@ -1,7 +1,8 @@
 digraph MinimalFeatureFactory {
   graph [
-    goal="Implement a production-ready feature that passes tests, review, and behavioral holdouts",
+    goal="Implement a production-ready feature that passes tests, review, and behavioral holdouts"
     rankdir=LR
+    model_stylesheet="minimal_feature.model.css"
   ]
 
   start [shape=Mdiamond, label="Start"]
@@ -10,12 +11,14 @@ digraph MinimalFeatureFactory {
   plan [
     type="codergen",
     label="Plan & Spec",
+    class="plan",
     prompt="@prompts/slim/plan.md"
   ]
 
   implement [
     type="codergen",
     label="Implement",
+    class="implement",
     prompt="@prompts/slim/implement.md",
     max_retries=2
   ]
@@ -32,18 +35,28 @@ digraph MinimalFeatureFactory {
   review [
     type="codergen",
     label="Fresh Eyes Review",
+    class="review",
     prompt="@prompts/slim/review.md",
     goal_gate=true,
     retry_target="fix"
   ]
 
   holdout [
-    type="tool",
+    type="holdout_eval",
     label="Behavioral Holdouts",
-    command="${state.slim.holdout_command}",
     validation=true,
     goal_gate=true,
     retry_target="fix"
+  ]
+
+  gate_es [
+    type="gate_es",
+    label="/es Evidence Standards"
+  ]
+
+  gate_er [
+    type="gate_er",
+    label="/er Evidence Review"
   ]
 
   fix [
@@ -63,8 +76,14 @@ digraph MinimalFeatureFactory {
   review -> holdout [condition="outcome=success"]
   review -> fix [condition="outcome!=success"]
 
-  holdout -> exit [label="All Gates Pass", condition="outcome=success"]
-  holdout -> fix [label="Gates Failed", condition="outcome!=success"]
+  holdout -> gate_es [condition="outcome=success"]
+  holdout -> fix [condition="outcome!=success"]
+
+  gate_es -> gate_er [condition="outcome=success"]
+  gate_es -> fix [condition="outcome!=success"]
+
+  gate_er -> exit [condition="outcome=success"]
+  gate_er -> fix [condition="outcome!=success"]
 
   fix -> test
 }
