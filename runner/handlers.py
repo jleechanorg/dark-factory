@@ -211,8 +211,14 @@ def _codergen(node: Node, ctx: Context) -> Result:
         in `ctx.state["ao.worktree"]` so downstream tool nodes can target it.
     """
     prompt_text = _render_prompt(node, ctx)
+    _start_ts = time.monotonic()
     if ctx.backend == "echo":
-        return Result(outcome="success", output=prompt_text)
+        wall_ms = int((time.monotonic() - _start_ts) * 1000)
+        metrics = _codergen_metrics("", "", wall_ms)
+        # Stringify so the metadata dict matches Result's declared type (str
+        # values) and round-trips cleanly through the CXDB JSON column.
+        meta = {k: ("" if v is None else str(v)) for k, v in metrics.items()}
+        return Result(outcome="success", output=prompt_text, metadata=meta)
 
     if ctx.backend == "ao":
         project = ctx.state.get("ao.project")
@@ -254,10 +260,14 @@ def _codergen(node: Node, ctx: Context) -> Result:
                 ctx.state["ao.worktree"] = worktree
             activity = _ao_wait_idle(sess_name, ctx.workdir, timeout=900, project=project)
             outcome = "success" if activity in ("exited", "ready") else "failure"
+            wall_ms = int((time.monotonic() - _start_ts) * 1000)
+            metrics = _codergen_metrics(proc.stdout, proc.stderr, wall_ms)
+            meta = {"session": sess_name, "worktree": worktree or "", "activity": activity}
+            meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
             return Result(
                 outcome=outcome,
                 output=f"ao spawn session={sess_name} worktree={worktree} activity={activity}",
-                metadata={"session": sess_name, "worktree": worktree or "", "activity": activity},
+                metadata=meta,
             )
 
         send_args = _sandboxed_args(["ao", "send", session, prompt_text, "--timeout", "900"])
@@ -279,10 +289,14 @@ def _codergen(node: Node, ctx: Context) -> Result:
             )
         activity = _ao_wait_idle(session, ctx.workdir, timeout=900, project=project)
         outcome = "success" if activity in ("exited", "ready") else "failure"
+        wall_ms = int((time.monotonic() - _start_ts) * 1000)
+        metrics = _codergen_metrics(proc.stdout, proc.stderr, wall_ms)
+        meta = {"session": session, "activity": activity}
+        meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
         return Result(
             outcome=outcome,
             output=f"ao send session={session} activity={activity}",
-            metadata={"session": session, "activity": activity},
+            metadata=meta,
         )
 
     if ctx.backend == "claude":
@@ -322,10 +336,14 @@ def _codergen(node: Node, ctx: Context) -> Result:
         return Result(outcome="failure", output=f"unknown backend {ctx.backend!r}")
 
     outcome = "success" if proc.returncode == 0 else "failure"
+    wall_ms = int((time.monotonic() - _start_ts) * 1000)
+    metrics = _codergen_metrics(proc.stdout, proc.stderr, wall_ms)
+    meta = {"returncode": str(proc.returncode)}
+    meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
     return Result(
         outcome=outcome,
         output=proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else ""),
-        metadata={"returncode": str(proc.returncode)},
+        metadata=meta,
     )
 
 
@@ -428,6 +446,98 @@ def _human_gate(node: Node, ctx: Context) -> Result:
     print(f"\n[HUMAN GATE] {node.name}: {node.attrs.get('label', node.name)}")
     answer = input("approve? (success/failure): ").strip().lower() or "success"
     return Result(outcome=answer, output=f"human={answer}")
+
+
+# ---------------------------------------------------------------------------
+# Token + wall-clock metrics for codergen subprocesses (orch-qhez)
+# ---------------------------------------------------------------------------
+
+# Anchored regexes for the most common token-banner shapes emitted by claude /
+# codex / ao workers. We tolerate either snake_case or space-separated and
+# decimal separators. Each pattern captures a single integer.
+_TOKEN_IN_RE = re.compile(
+    r"(?:input[_ ]tokens|prompt[_ ]tokens|tokens[_ ]in)\s*[:=]\s*(\d[\d_,]*)",
+    re.IGNORECASE,
+)
+_TOKEN_OUT_RE = re.compile(
+    r"(?:output[_ ]tokens|completion[_ ]tokens|tokens[_ ]out)\s*[:=]\s*(\d[\d_,]*)",
+    re.IGNORECASE,
+)
+_TOKEN_TOTAL_RE = re.compile(
+    r"(?:total[_ ]tokens|tokens)\s*[:=]\s*(\d[\d_,]*)",
+    re.IGNORECASE,
+)
+_COST_RE = re.compile(
+    r"(?:cost[_ ]usd|total[_ ]cost|cost)\s*[:=]\s*\$?\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _parse_int(raw: str) -> Optional[int]:
+    if raw is None:
+        return None
+    cleaned = raw.replace("_", "").replace(",", "")
+    try:
+        return int(cleaned)
+    except (TypeError, ValueError):
+        return None
+
+
+def _last_match(pattern: re.Pattern[str], *bodies: str) -> Optional[str]:
+    """Return the last regex match across the supplied bodies, or None.
+
+    Token banners are typically the FINAL summary line — we prefer the last
+    occurrence so progress chatter (e.g. streaming usage updates) doesn't win
+    over the authoritative final number.
+    """
+    last: Optional[str] = None
+    for body in bodies:
+        if not body:
+            continue
+        for m in pattern.finditer(body):
+            last = m.group(1)
+    return last
+
+
+def _codergen_metrics(stdout: str, stderr: str, wall_ms: int) -> dict:
+    """Best-effort extraction of token/cost metrics from a backend subprocess.
+
+    The contract is:
+      * `wall_ms` is always populated (callers measure it).
+      * `tokens_in`, `tokens_out`, `cost_usd` may each be `None` when the
+        backend did not emit a recognised banner. Returning `None` (vs. zero)
+        is important so aggregates don't silently undercount.
+
+    Strategy: scan stdout first, then stderr, and keep the LAST hit so a
+    final usage summary wins over intermediate progress prints. If only a
+    total-tokens banner is found and no explicit input/output split, we
+    record it under `tokens_total` so the Healer can still aggregate.
+    """
+    tokens_in = _parse_int(_last_match(_TOKEN_IN_RE, stdout, stderr))
+    tokens_out = _parse_int(_last_match(_TOKEN_OUT_RE, stdout, stderr))
+    cost_raw = _last_match(_COST_RE, stdout, stderr)
+    cost_usd: Optional[float] = None
+    if cost_raw is not None:
+        try:
+            cost_usd = float(cost_raw)
+        except (TypeError, ValueError):
+            cost_usd = None
+
+    metrics: dict = {"wall_ms": int(wall_ms)}
+    # Only include keys whose value is meaningful — None is allowed so
+    # downstream consumers can distinguish "absent" from "zero".
+    metrics["tokens_in"] = tokens_in
+    metrics["tokens_out"] = tokens_out
+    metrics["cost_usd"] = cost_usd
+
+    # If no explicit in/out split was found but a generic "tokens=" or
+    # "total_tokens=" was, surface it under tokens_total for the Healer.
+    if tokens_in is None and tokens_out is None:
+        total_raw = _last_match(_TOKEN_TOTAL_RE, stdout, stderr)
+        total = _parse_int(total_raw)
+        if total is not None:
+            metrics["tokens_total"] = total
+    return metrics
 
 
 _VERDICT_NORMALIZE = {
