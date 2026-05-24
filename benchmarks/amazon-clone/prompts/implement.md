@@ -5,8 +5,10 @@ Implement the Amazon Clone MVP according to the specification.
 ## Reference Spec
 
 Read the full specification at: `benchmarks/amazon-clone/spec.md`
+Read the public acceptance criteria at: `benchmarks/amazon-clone/visible_acceptance.md`
 
-The spec defines 10 required user flows, quality standards, and framework constraints.
+Together, those files define the complete visible product contract. Do not add
+flows that are not present there, and do not inspect hidden evaluator details.
 
 ## Launch Contract
 
@@ -37,12 +39,10 @@ You must create the following structure (minimum viable implementation):
       products.js      # Product API endpoints
       cart.js          # Cart API endpoints
       orders.js        # Order API endpoints
-      auth.js          # Authentication endpoints
     models/
       product.js       # Product data model
       cart.js          # Cart data model
       order.js         # Order data model
-      user.js          # User data model
     public/
       index.html       # Main HTML entry
       app.js           # Frontend JavaScript
@@ -58,18 +58,7 @@ You must create the following structure (minimum viable implementation):
 
 ### Quality Standards
 
-All 10 user flows must work:
-
-1. **Browse Products** - Home page displays products
-2. **Search Products** - Search returns relevant results
-3. **View Product Details** - Product page shows full info
-4. **Shopping Cart** - Add, remove, update quantities
-5. **User Authentication** - Sign up, sign in, sign out
-6. **Checkout Process** - Complete purchase flow
-7. **Order History** - View past orders
-8. **Product Reviews** - Submit and view ratings
-9. **Wishlist** - Save products for later
-10. **Admin Inventory** - Manage product stock
+All visible flows in `spec.md` and `visible_acceptance.md` must work.
 
 ### Do
 

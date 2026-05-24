@@ -12,7 +12,7 @@ PROJECT_ROOT="$(cd "$BENCHMARK_DIR/../.." && pwd)"
 WORKDIR_BASE="${1:-$HOME/benchmark-runs}"
 
 # Methods to run
-METHODS=("dark-factory" "df-slim" "kilroy" "tracker")
+METHODS=("dark-factory" "df-slim" "kilroy" "mammoth" "tracker" "smasher")
 RUNS="${BENCHMARK_RUNS:-3}"
 
 

@@ -35,6 +35,7 @@ You will receive feedback in this format:
 ## Important Constraints
 
 - **Do not read the `holdouts/` directory** — this contains the evaluator tests and is sealed
+- **Do not read sibling sealed evaluator paths** — exact scenarios and selectors are hidden
 - **Do not attempt to game the tests** — make genuine fixes
 - **Focus on the specific failure** — don't refactor unrelated code
 - **Verify your fix** — run `make test` to confirm

@@ -125,7 +125,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             ok = False
             if result is None:
                 results.append({"path": _display_path(path), "status": "fail"})
-    print(json.dumps({"diagnostics": diagnostics, "results": results, "status": "pass" if ok else "fail"}, indent=2))
+    print(json.dumps({"diagnostics": diagnostics}, indent=2))
     return 0 if ok else 1
 
 

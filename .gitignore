@@ -3,6 +3,14 @@ __pycache__/
 .venv/
 .pytest_cache/
 .checkpoints/
+.dark-factory-runs/
+.dark-factory-conformance/
+generated-tasks/
+jobs/
+logs/
+results/
+tasks/
+task-runs/
 *.png
 *.svg
 

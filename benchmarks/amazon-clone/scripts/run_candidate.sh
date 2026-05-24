@@ -24,7 +24,9 @@ declare -A PIPELINES=(
     ["dark-factory"]="benchmarks/amazon-clone/pipelines/dark_factory.dot"
     ["df-slim"]="benchmarks/amazon-clone/pipelines/slim.dot"
     ["kilroy"]="benchmarks/amazon-clone/pipelines/kilroy.dot"
+    ["mammoth"]="benchmarks/amazon-clone/pipelines/mammoth.dot"
     ["tracker"]="benchmarks/amazon-clone/pipelines/tracker.dot"
+    ["smasher"]="benchmarks/amazon-clone/pipelines/smasher.dot"
 )
 
 echo "============================================"
@@ -52,8 +54,9 @@ if [ ! -f "$PIPELINE_PATH" ]; then
     exit 1
 fi
 
-# Set dark-factory holdouts path
-export DARK_FACTORY_HOLDOUTS="$HOME/projects/dark-factory-holdouts"
+: "${DARK_FACTORY_HOLDOUTS:?DARK_FACTORY_HOLDOUTS must point to the sealed holdouts repo}"
+AO_AGENT="${AO_AGENT:-antigravity}"
+AO_PROJECT="${AO_PROJECT:-amazon-clone}"
 
 # Create results directory
 mkdir -p "$RESULTS_DIR"
@@ -65,7 +68,7 @@ if [ ! -f "$GOAL_FILE" ]; then
     exit 1
 fi
 
-GOAL=$(cat "$GOAL_FILE")
+GOAL="Amazon Clone MVP - implement all features per spec"
 
 # Build result file name
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -73,7 +76,7 @@ RESULT_FILE="$RESULTS_DIR/${METHOD}_${RUN_ID}_${TIMESTAMP}.json"
 LOG_FILE="$RESULTS_DIR/${METHOD}_${RUN_ID}.log"
 
 echo "Pipeline: $PIPELINE_PATH"
-echo "Goal: ${GOAL:0:100}..."
+echo "Goal: $GOAL"
 echo "Result: $RESULT_FILE"
 echo "Started: $(date)"
 echo ""
@@ -84,8 +87,11 @@ cd "$PROJECT_ROOT"
 python -m runner \
     --pipeline "$PIPELINE" \
     --workdir "$WORKDIR" \
-    --goal "$GOAL" \
+    --goal "Amazon Clone MVP - implement all features per spec" \
     --backend ao \
+    --ao-agent "$AO_AGENT" \
+    --ao-project "$AO_PROJECT" \
+    --feature amazon-clone \
     --cxdb "$RESULTS_DIR/cxdb.sqlite" 2>&1 | tee "$LOG_FILE"
 
 EXIT_CODE=$?

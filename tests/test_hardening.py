@@ -19,12 +19,14 @@ import pytest
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+import runner.handlers as handlers_mod  # noqa: E402
 from runner.cxdb import CXDB  # noqa: E402
 from runner.engine import _attr_int, _edge_matches, run  # noqa: E402
 from runner.handlers import (  # noqa: E402
     Context,
     Result,
     TYPE_REGISTRY,
+    _codergen,
     _holdout_eval,
     _parse_verdict,
     _render_prompt,
@@ -331,6 +333,83 @@ def test_tool_sandbox_still_denies_real_holdouts_when_env_overridden(monkeypatch
     assert "expect_return" not in result.output
 
 
+def test_ao_spawn_is_launched_through_holdout_sandbox(monkeypatch, tmp_path):
+    commands = []
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("do work")
+
+    def fake_sandbox(args):
+        return ["sandboxed", *args]
+
+    def fake_run(args, **kwargs):
+        commands.append(args)
+
+        class Proc:
+            returncode = 0
+            stdout = "SESSION=session-1\nWorktree: /tmp/ao-worktree\n"
+            stderr = ""
+
+        return Proc()
+
+    monkeypatch.setattr(handlers_mod, "_sandboxed_args", fake_sandbox)
+    monkeypatch.setattr(handlers_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(handlers_mod, "_ao_wait_idle", lambda *args, **kwargs: "ready")
+
+    ctx = Context(goal="t", workdir=tmp_path, backend="ao", state={"ao.project": "dark-factory"})
+    result = _codergen(Node(name="implement", attrs={"prompt": "@prompt.md"}), ctx)
+
+    assert result.outcome == "success"
+    assert commands
+    assert commands[0][:3] == ["sandboxed", "ao", "spawn"]
+
+
+def test_ao_send_is_launched_through_holdout_sandbox(monkeypatch, tmp_path):
+    commands = []
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("fix work")
+
+    def fake_sandbox(args):
+        return ["sandboxed", *args]
+
+    def fake_run(args, **kwargs):
+        commands.append(args)
+
+        class Proc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return Proc()
+
+    monkeypatch.setattr(handlers_mod, "_sandboxed_args", fake_sandbox)
+    monkeypatch.setattr(handlers_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(handlers_mod, "_ao_wait_idle", lambda *args, **kwargs: "ready")
+
+    ctx = Context(
+        goal="t",
+        workdir=tmp_path,
+        backend="ao",
+        state={"ao.project": "dark-factory", "ao.session": "session-1"},
+    )
+    result = _codergen(Node(name="fix", attrs={"prompt": "@prompt.md"}), ctx)
+
+    assert result.outcome == "success"
+    assert commands
+    assert commands[0][:3] == ["sandboxed", "ao", "send"]
+
+
+def test_ao_backend_fails_closed_without_sandbox(monkeypatch, tmp_path):
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("do work")
+    monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: None)
+
+    ctx = Context(goal="t", workdir=tmp_path, backend="ao", state={"ao.project": "dark-factory"})
+    result = _codergen(Node(name="implement", attrs={"prompt": "@prompt.md"}), ctx)
+
+    assert result.outcome == "failure"
+    assert "sandbox-exec unavailable" in result.output
+
+
 def test_intermediate_success_does_not_clear_unvalidated_failure(tmp_path):
     dot = tmp_path / "greenwash.dot"
     dot.write_text(
@@ -389,3 +468,136 @@ def test_holdout_eval_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path
     result = _holdout_eval(node, ctx)
 
     assert result.outcome != "success"
+
+
+def test_holdout_eval_uses_state_substituted_implementation(monkeypatch, tmp_path):
+    fake_repo = tmp_path / "fake-holdouts"
+    evaluator = fake_repo / "evaluator"
+    evaluator.mkdir(parents=True)
+    (evaluator / "run.py").write_text(
+        "import argparse, json, pathlib\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--feature')\n"
+        "p.add_argument('--implementation')\n"
+        "args = p.parse_args()\n"
+        "marker = pathlib.Path(args.implementation, 'marker.txt')\n"
+        "verdict = 'pass' if marker.exists() else 'fail'\n"
+        "print(json.dumps({'verdict': verdict, 'scenarios': []}))\n"
+    )
+    impl = tmp_path / "worker"
+    impl.mkdir()
+    (impl / "marker.txt").write_text("ok")
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(fake_repo))
+
+    node = Node(
+        name="holdout",
+        attrs={
+            "type": "holdout_eval",
+            "feature": "roman",
+            "implementation": "${state.ao.worktree}",
+        },
+    )
+    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx.state["ao.worktree"] = str(impl)
+
+    result = _holdout_eval(node, ctx)
+
+    assert result.outcome == "success"
+
+
+def test_visible_all_nodes_benchmark_has_no_embedded_holdout_contract():
+    benchmark = ROOT / "benchmarks" / "all-nodes-coverage"
+
+    assert not (benchmark / "_holdout").exists()
+    for path in benchmark.rglob("*"):
+        if not path.is_file() or path.name == "README.md":
+            continue
+        text = path.read_text()
+        assert "_holdout" not in text
+        assert "cp -R /Users/jleechan/projects/dark-factory/benchmarks" not in text
+
+
+def test_holdout_eval_fails_closed_on_unresolved_implementation(monkeypatch, tmp_path):
+    fake_repo = tmp_path / "fake-holdouts"
+    evaluator = fake_repo / "evaluator"
+    evaluator.mkdir(parents=True)
+    (evaluator / "run.py").write_text(
+        "import json\nprint(json.dumps({'verdict': 'pass', 'scenarios': []}))\n"
+    )
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(fake_repo))
+
+    node = Node(
+        name="holdout",
+        attrs={
+            "type": "holdout_eval",
+            "feature": "roman",
+            "implementation": "${state.ao.worktree}",
+        },
+    )
+    ctx = Context(goal="t", workdir=tmp_path, backend="echo")
+
+    result = _holdout_eval(node, ctx)
+
+    assert result.outcome == "failure"
+    assert "unresolved implementation path" in result.output
+
+
+def test_holdout_eval_redacts_scenarios_from_agent_output(monkeypatch, tmp_path):
+    monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
+    repo = tmp_path / "sealed"
+    evaluator = repo / "evaluator"
+    evaluator.mkdir(parents=True)
+    (evaluator / "run.py").write_text(
+        "import json\n"
+        "print(json.dumps({"
+        "'verdict': 'fail', "
+        "'scenarios': [{'id': 'secret-story', 'status': 'fail', 'detail': 'hidden checkout edge'}]"
+        "}))\n"
+    )
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(repo))
+    impl = tmp_path / "impl"
+    impl.mkdir()
+
+    node = Node(name="holdout", attrs={"type": "holdout_eval", "feature": "hello"})
+    ctx = Context(goal="t", workdir=impl, backend="echo")
+
+    result = _holdout_eval(node, ctx)
+
+    assert result.outcome == "fail"
+    assert "secret-story" not in result.output
+    assert "hidden checkout edge" not in result.output
+    assert json.loads(result.output)["sealed"] is True
+
+
+def test_holdout_eval_writes_only_redacted_results_to_impl(monkeypatch, tmp_path):
+    monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
+    repo = tmp_path / "sealed"
+    evaluator = repo / "evaluator"
+    evaluator.mkdir(parents=True)
+    (evaluator / "run.py").write_text(
+        "import json\n"
+        "print(json.dumps({"
+        "'verdict': 'pass', "
+        "'scenarios': [{'id': 'secret-story', 'status': 'pass', 'detail': 'hidden checkout edge'}]"
+        "}))\n"
+    )
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(repo))
+    impl = tmp_path / "impl"
+    impl.mkdir()
+
+    node = Node(name="holdout", attrs={"type": "holdout_eval", "feature": "hello"})
+    ctx = Context(goal="t", workdir=impl, backend="echo")
+
+    result = _holdout_eval(node, ctx)
+
+    assert result.outcome == "success"
+    saved = json.loads((impl / "results" / "holdout_results.json").read_text())
+    assert saved == {
+        "verdict": "pass",
+        "passed": 1,
+        "total": 1,
+        "status_counts": {"pass": 1},
+        "sealed": True,
+    }
+    assert "secret-story" not in json.dumps(saved)
+    assert "hidden checkout edge" not in json.dumps(saved)

@@ -283,6 +283,11 @@ def _codergen(node: Node, ctx: Context) -> Result:
             env=_sanitized_env(),
         )
         if proc.returncode != 0:
+            if "does not exist" in proc.stdout or "does not exist" in proc.stderr:
+                if "ao.session" in ctx.state:
+                    del ctx.state["ao.session"]
+                if "ao.worktree" in ctx.state:
+                    del ctx.state["ao.worktree"]
             return Result(
                 outcome="failure",
                 output=f"ao send failed (rc={proc.returncode})\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
@@ -769,7 +774,7 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
     if impl_attr:
         resolved = _substitute_state(impl_attr, ctx)
         if _has_unresolved_state_placeholder(resolved):
-            return Result(outcome="failure", output=f"unresolved implementation: {impl_attr}")
+            return Result(outcome="failure", output=f"unresolved implementation path: {impl_attr}")
 
     impl = _path_attr(node, ctx, "implementation", ctx.workdir)
     if not impl.exists():
@@ -793,24 +798,39 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
             ["python3", str(eval_script), "--feature", feature, "--impl", str(impl)],
             cwd=repo_path, capture_output=True, text=True, timeout=600, check=False, env=eval_env)
         verdict = "failure"
+        summary = {
+            "verdict": verdict,
+            "passed": 0,
+            "total": 0,
+            "status_counts": {},
+            "sealed": True,
+        }
         for line in reversed(proc.stdout.splitlines()):
             if line.strip().startswith("{") and line.strip().endswith("}"):
                 try:
                     data = json.loads(line.strip())
                     verdict = data.get("verdict", "failure").lower()
-                    
-                    # Write holdout results for scoring candidate
                     scenarios = data.get("scenarios", [])
-                    passed = sum(1 for sc in scenarios if sc.get("status") == "pass")
+                    status_counts: dict[str, int] = {}
+                    for sc in scenarios:
+                        status = str(sc.get("status", "unknown"))
+                        status_counts[status] = status_counts.get(status, 0) + 1
+                    passed = status_counts.get("pass", 0)
                     total = len(scenarios)
-                    results_file = impl / "results" / "holdout_results.json"
-                    results_file.parent.mkdir(exist_ok=True)
-                    results_file.write_text(json.dumps({
+                    summary = {
+                        "verdict": verdict,
                         "passed": passed,
                         "total": total,
-                        "scenarios": scenarios
-                    }, indent=2))
-                    
+                        "status_counts": status_counts,
+                        "sealed": True,
+                    }
+
+                    # Write only redacted holdout results into the implementation
+                    # tree. Per-scenario data remains sealed in the evaluator.
+                    results_file = impl / "results" / "holdout_results.json"
+                    results_file.parent.mkdir(exist_ok=True)
+                    results_file.write_text(json.dumps(summary, indent=2))
+
                     break
                 except: pass
         # rc!=0 + verdict=pass means the evaluator process crashed/exited
@@ -820,11 +840,16 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
         # clusters infra crashes separately from real failures.
         if proc.returncode and verdict == "pass":
             outcome = "error"
+            summary = {**summary, "verdict": "error", "returncode": proc.returncode}
         elif verdict == "pass":
             outcome = "success"
         else:
             outcome = verdict
-        return Result(outcome=outcome, output=proc.stdout, metadata={"verdict": verdict, "port": str(port)})
+        return Result(
+            outcome=outcome,
+            output=json.dumps(summary, indent=2),
+            metadata={"verdict": verdict, "port": str(port), "sealed": "true"},
+        )
     finally:
         if server_proc:
             server_proc.terminate()

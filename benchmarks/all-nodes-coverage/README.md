@@ -1,31 +1,25 @@
-# Benchmark — all-nodes-coverage
+# Benchmark - all-nodes-coverage
 
-A self-contained Dark Factory benchmark that **deterministically exercises
-every declared graph node in a single run**: `start → plan → implement →
-verify (fail) → fix → verify (pass) → exit`.
+A Dark Factory benchmark for the all-nodes pipeline shape:
+`start -> plan -> implement -> verify -> fix -> verify -> exit`.
 
-Most pipelines either skip `fix` (when the first implementation passes
-verify) or never reach `exit` (when verify never recovers and the loop
-exhausts via `max_visits`). This benchmark engineers a guaranteed first-pass
-failure + recoverable fix using a **hidden test contract** that the visible
-spec does not enumerate — the test suite asserts a module-level
-`__version__` constant the spec does not mention.
+The visible repo contains only the pipeline, prompts, and public feature spec.
+The verification contract lives in the sibling sealed holdouts repo and is
+reached through the `holdout_eval` node. The spawned coding worker gets only
+redacted evaluator output, not test source or expected hidden values.
 
 ## What gets tested
 
-- **Pipeline parser** — DOT loads, `verify` carries `validation="true"`
-- **Conditional edges** — both `verify → exit [outcome=success]` and
-  `verify → fix [outcome!=success]` fire in the same run
-- **`max_visits` loop guard** — `fix` is capped at 3 visits (not reached here
-  on the happy path)
-- **`tool` node `cwd` + `${state.X}` substitution** — `cwd` resolves to the
-  AO worker's worktree path stashed in state
-- **Engine `validation="true"` opt-in** — without this opt-in, the `tool`
-  verify node would not clear `_unresolved_failure`, and `exit` would
-  report `failure` even after a successful retry
-- **AO backend session reuse** — `plan` spawns a session; `implement`,
-  `fix` reuse it via `ao send`; per-codergen state is preserved on the
-  worker side
+- **Pipeline parser** - DOT loads, and `verify` carries `validation="true"`.
+- **Conditional edges** - `verify -> exit [outcome=success]` and
+  `verify -> fix [outcome!=success]` route from sealed evaluator verdicts.
+- **`max_visits` loop guard** - `fix` is capped at 3 visits.
+- **`holdout_eval` implementation substitution** - `implementation` resolves
+  to the AO worker worktree path stored in state.
+- **Engine `validation="true"` opt-in** - a successful verify clears the
+  unresolved failure before `exit`.
+- **AO backend session reuse** - `plan` spawns a session; `implement` and
+  `fix` reuse it via `ao send`.
 
 ## Files
 
@@ -34,23 +28,19 @@ spec does not enumerate — the test suite asserts a module-level
 | `pipeline.dot` | 6-node graph (start, plan, implement, verify, fix, exit) |
 | `specs/roman.md` | Visible feature spec (also inlined into `prompts/plan.md`) |
 | `prompts/plan.md` | Inlines the spec; asks for a plan, no code |
-| `prompts/implement.md` | Asks for the impl in `df_demo3/roman.py` |
-| `prompts/fix.md` | Diagnoses via `pytest -v`, instructs worker to read assertion message |
-| `_holdout/test_roman.py` | **Sealed test suite** — the worker never sees this during plan/implement |
-| `_holdout/__init__.py` | Empty; pytest package marker |
+| `prompts/implement.md` | Asks for the implementation in `df_demo3/roman.py` |
+| `prompts/fix.md` | Uses redacted sealed-evaluator feedback to request a narrow fix |
+| sibling holdouts repo | Sealed evaluator and scenarios; not stored in this benchmark tree |
 
 ## How to run
 
 ```bash
 cd ~/projects/dark-factory
 
-# Best path: use AO + Sonnet (Anthropic OAuth), real LLM
-SRC=$HOME/.hermes/agent-orchestrator.yaml
-DST=$HOME/.dark-factory/temp-configs/sonnet-mctrl-test.yaml
-cp "$SRC" "$DST"
-yq -i '.projects."mctrl-test".modelByCli."claude-code".model = "claude-sonnet-4-6"' "$DST"
+export DARK_FACTORY_HOLDOUTS=<sealed-holdouts-repo>
 
-AO_CONFIG_PATH="$DST" .venv/bin/python -m runner \
+AO_CONFIG_PATH="$HOME/.dark-factory/temp-configs/sonnet-mctrl-test.yaml" \
+  .venv/bin/python -m runner \
   --pipeline benchmarks/all-nodes-coverage/pipeline.dot \
   --workdir /Users/jleechan/projects/mctrl_test \
   --goal "Implement to_roman per the inlined spec" \
@@ -60,9 +50,11 @@ AO_CONFIG_PATH="$DST" .venv/bin/python -m runner \
   --cxdb ~/.dark-factory/cxdb-benchmark.sqlite
 ```
 
-Or echo backend (deterministic dry-run, no LLM):
+Echo backend dry-run:
 
 ```bash
+export DARK_FACTORY_HOLDOUTS=<sealed-holdouts-repo>
+
 .venv/bin/python -m runner \
   --pipeline benchmarks/all-nodes-coverage/pipeline.dot \
   --workdir /tmp/echo-target \
@@ -70,32 +62,38 @@ Or echo backend (deterministic dry-run, no LLM):
   --backend echo
 ```
 
-The echo run will exhaust the fix loop (echo doesn't write files), proving
-the conditional edges and `max_visits` cap fire correctly.
+The echo run should exhaust the fix loop because echo does not write files.
+That proves conditional routing and the `max_visits` cap without claiming
+feature success.
 
-## Success criteria
+## Success Criteria
 
-After a real-backend run, the CXDB step transcript should match:
+When a real-backend run recovers from an initial evaluator failure, the CXDB
+step transcript has this shape:
 
-```
+```text
 0  start        success
 1  plan         success
 2  implement    success
-3  verify       failure       <- forced by hidden __version__ check
+3  verify       failure
 4  fix          success
-5  verify       success       <- pytest 21/21
-6  exit         success       <- thanks to validation="true" on verify
+5  verify       success
+6  exit         success
 ```
 
-Coverage report (run via `runner.parser` + sqlite query):
+When the sealed evaluator returns only redacted feedback that is insufficient
+for recovery, a run may correctly exhaust at `fix` instead. That still proves
+sealed isolation; it does not prove full all-node recovery.
 
-```
+Coverage report:
+
+```text
 declared: ['exit', 'fix', 'implement', 'plan', 'start', 'verify']
 hit (6/6): ['exit', 'fix', 'implement', 'plan', 'start', 'verify']
 miss     : []
 ```
 
-## Why this is a good benchmark
+## Why This Benchmark
 
 - **Cheap**: ~2 minutes wall, no PR is opened, files live in a throwaway
   AO worktree

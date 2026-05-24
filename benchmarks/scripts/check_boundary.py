@@ -38,7 +38,7 @@ def public_files() -> list[pathlib.Path]:
     files: set[pathlib.Path] = set()
     for pattern in PUBLIC_GLOBS:
         files.update(ROOT.glob(pattern))
-    return sorted(path for path in files if path.is_file())
+    return sorted(path for path in files if path.is_file() and path.name != "README.md")
 
 
 def main() -> int:
