@@ -31,6 +31,16 @@ class Node:
         return ref[1:] if ref.startswith("@") else ref
 
 
+def is_start_node(node: Node) -> bool:
+    """Identify a `start` node — by name or by DOT shape `Mdiamond`."""
+    return node.name == "start" or node.shape == "Mdiamond"
+
+
+def is_exit_node(node: Node) -> bool:
+    """Identify an `exit` node — by name or by DOT shape `Msquare`."""
+    return node.name == "exit" or node.shape == "Msquare"
+
+
 @dataclass
 class Edge:
     src: str

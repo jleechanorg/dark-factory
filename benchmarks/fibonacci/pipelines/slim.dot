@@ -1,0 +1,55 @@
+digraph FibonacciSlim {
+  graph [
+    goal="Implement the Fibonacci CLI from the visible spec",
+    rankdir=LR
+  ]
+
+  start [shape=Mdiamond, label="Start"]
+  exit  [shape=Msquare, label="Exit"]
+
+  plan [
+    type="codergen",
+    label="Plan",
+    prompt="@benchmarks/fibonacci/prompts/plan.md"
+  ]
+
+  implement [
+    type="codergen",
+    label="Implement",
+    prompt="@benchmarks/fibonacci/prompts/implement.md",
+    max_retries=2
+  ]
+
+  public_acceptance [
+    type="tool",
+    label="Public Acceptance",
+    command="${state.fibonacci.public_command}",
+    goal_gate=true,
+    retry_target="fix"
+  ]
+
+  sealed_score [
+    type="tool",
+    label="Redacted Sealed Score",
+    command="${state.fibonacci.score_command}",
+    goal_gate=true,
+    retry_target="fix"
+  ]
+
+  fix [
+    type="codergen",
+    label="Fix",
+    prompt="@benchmarks/fibonacci/prompts/fix.md",
+    max_retries=2
+  ]
+
+  start -> plan
+  plan -> implement
+  implement -> public_acceptance
+  public_acceptance -> sealed_score [condition="outcome=success"]
+  public_acceptance -> fix [condition="outcome!=success"]
+  sealed_score -> exit [condition="outcome=success"]
+  sealed_score -> fix [condition="outcome!=success"]
+  fix -> public_acceptance
+}
+

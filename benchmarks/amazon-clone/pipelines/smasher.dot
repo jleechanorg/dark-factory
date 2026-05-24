@@ -1,0 +1,55 @@
+digraph AmazonCloneSmasher {
+  graph [
+    goal="Implement the Amazon Clone MVP from the visible spec",
+    rankdir=LR
+  ]
+
+  start [shape=Mdiamond, label="Start"]
+  exit  [shape=Msquare, label="Exit"]
+
+  plan [
+    type="codergen",
+    label="Plan",
+    prompt="@benchmarks/amazon-clone/prompts/plan.md"
+  ]
+
+  implement [
+    type="codergen",
+    label="Implement",
+    prompt="@benchmarks/amazon-clone/prompts/implement.md",
+    max_retries=2
+  ]
+
+  test [
+    type="tool",
+    label="Public Acceptance",
+    command="${state.amazon.public_command}",
+    goal_gate=true,
+    retry_target="fix"
+  ]
+
+  holdout [
+    type="tool",
+    label="Redacted Holdout Score",
+    command="${state.amazon.holdout_command}",
+    goal_gate=true,
+    retry_target="fix"
+  ]
+
+  fix [
+    type="codergen",
+    label="Fix",
+    prompt="@benchmarks/amazon-clone/prompts/fix.md",
+    max_retries=2
+  ]
+
+  start -> plan
+  plan -> implement
+  implement -> test
+  test -> holdout [condition="outcome=success"]
+  test -> fix [condition="outcome!=success"]
+  holdout -> exit [condition="outcome=success"]
+  holdout -> fix [condition="outcome!=success"]
+  fix -> test
+}
+

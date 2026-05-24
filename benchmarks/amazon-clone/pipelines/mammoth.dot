@@ -1,0 +1,45 @@
+digraph AmazonCloneMammoth {
+  graph [
+    goal="Implement the Amazon Clone MVP from the visible spec",
+    rankdir=LR
+  ]
+
+  start [shape=Mdiamond, label="Start"]
+  exit  [shape=Msquare, label="Exit"]
+
+  specify [
+    type="codergen",
+    label="Specify",
+    prompt="@benchmarks/amazon-clone/prompts/plan.md"
+  ]
+
+  build [
+    type="codergen",
+    label="Build",
+    prompt="@benchmarks/amazon-clone/prompts/implement.md",
+    max_retries=2
+  ]
+
+  validate [
+    type="holdout_eval",
+    label="Sealed Validate",
+    validation=true,
+    timeout=300,
+    retry_target="repair"
+  ]
+
+  repair [
+    type="codergen",
+    label="Repair",
+    prompt="@benchmarks/amazon-clone/prompts/fix.md",
+    max_retries=2
+  ]
+
+  start -> specify
+  specify -> build
+  build -> validate
+  validate -> exit [condition="outcome=success"]
+  validate -> repair [condition="outcome!=success"]
+  repair -> validate
+}
+

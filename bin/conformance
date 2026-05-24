@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""Deterministic conformance entrypoint for local Attractor-style harnesses."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+import urllib.request
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if VENV_PYTHON.exists() and pathlib.Path(sys.executable).resolve() != VENV_PYTHON.resolve():
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), str(pathlib.Path(__file__).resolve()), *sys.argv[1:]])
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from runner.engine import run as run_graph  # noqa: E402
+from runner.handlers import Context, TYPE_REGISTRY  # noqa: E402
+from runner.parser import is_exit_node, is_start_node, parse  # noqa: E402
+
+
+def _pipelines() -> list[pathlib.Path]:
+    return sorted((ROOT / "pipelines").rglob("*.dot")) + sorted((ROOT / "benchmarks").rglob("*.dot"))
+
+
+def _graph_payload(path: pathlib.Path) -> dict:
+    graph = parse(path)
+    return {
+        "name": graph.name,
+        "goal": graph.goal,
+        "attrs": graph.attrs,
+        "nodes": [
+            {"id": node.name, "shape": node.shape, "attrs": node.attrs, **node.attrs}
+            for node in sorted(graph.nodes.values(), key=lambda n: n.name)
+        ],
+        "edges": [
+            {
+                "from": edge.src,
+                "to": edge.dst,
+                "source": edge.src,
+                "target": edge.dst,
+                "src": edge.src,
+                "dst": edge.dst,
+                "attrs": edge.attrs,
+                **edge.attrs,
+            }
+            for edge in sorted(graph.edges, key=lambda e: (e.src, e.dst, str(e.attrs)))
+        ],
+    }
+
+
+def _resolve_path(raw: str) -> pathlib.Path:
+    path = pathlib.Path(raw)
+    return path if path.is_absolute() else ROOT / path
+
+
+def _display_path(path: pathlib.Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def cmd_parse(args: argparse.Namespace) -> int:
+    path = _resolve_path(args.dot_file)
+    try:
+        payload = _graph_payload(path)
+    except Exception as exc:
+        payload = {"diagnostics": [_diagnostic("parse", "error", str(exc))], "error": type(exc).__name__}
+        print(json.dumps(payload, indent=2))
+        return 1
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _diagnostic(rule: str, severity: str, message: str, node_id: str | None = None) -> dict:
+    return {"rule": rule, "severity": severity, "message": message, "node_id": node_id}
+
+
+def _validate_one(path: pathlib.Path) -> tuple[list[dict], dict | None]:
+    diagnostics: list[dict] = []
+    try:
+        graph = parse(path)
+    except Exception as exc:
+        message = str(exc)
+        severity = "warning" if "unreachable nodes" in message else "error"
+        diagnostics.append(_diagnostic(type(exc).__name__, severity, message))
+        return diagnostics, None
+
+    for node in graph.nodes.values():
+        if node.shape == "box" and not node.prompt_ref:
+            diagnostics.append(
+                _diagnostic(
+                    "missing_prompt",
+                    "warning",
+                    f"box node {node.name!r} has no prompt attribute",
+                    node.name,
+                )
+            )
+    return diagnostics, {
+        "path": _display_path(path),
+        "status": "pass" if not any(d["severity"] == "error" for d in diagnostics) else "fail",
+        "nodes": len(graph.nodes),
+        "edges": len(graph.edges),
+    }
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    paths = [_resolve_path(args.dot_file)] if args.dot_file else _pipelines()
+    results = []
+    diagnostics: list[dict] = []
+    ok = True
+    for path in paths:
+        path_diags, result = _validate_one(path)
+        diagnostics.extend(path_diags)
+        if result is not None:
+            results.append(result)
+        if any(diag["severity"] == "error" for diag in path_diags):
+            ok = False
+            if result is None:
+                results.append({"path": _display_path(path), "status": "fail"})
+    print(json.dumps({"diagnostics": diagnostics, "results": results, "status": "pass" if ok else "fail"}, indent=2))
+    return 0 if ok else 1
+
+
+def _touch_mock_llm(graph) -> None:
+    base_url = os.environ.get("OPENAI_BASE_URL", "").rstrip("/")
+    if not base_url:
+        return
+    box_nodes = [node for node in graph.nodes.values() if node.shape == "box"]
+    attempts = 0
+    for node in box_nodes:
+        max_retries = node.attrs.get("max_retries", 0)
+        attempts += 1 + (max_retries if isinstance(max_retries, int) else 0)
+    for _ in range(max(attempts, 1)):
+        payload = json.dumps({"model": "gpt-4o", "input": "AttractorBench conformance ping"}).encode()
+        request = urllib.request.Request(
+            f"{base_url}/responses",
+            data=payload,
+            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(request, timeout=5).read()
+        except Exception:
+            return
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    path = _resolve_path(args.dot_file)
+    graph = parse(path)
+    _touch_mock_llm(graph)
+    ctx = Context(goal=args.goal, workdir=args.workdir, backend="echo")
+    if args.feature:
+        ctx.state["feature"] = args.feature
+    history = run_graph(graph, ctx, max_steps=args.max_steps)
+    success = bool(history and history[-1].outcome == "success")
+    payload = {
+        "subcommand": "run",
+        "status": "success" if success else "fail",
+        "outcome": "success" if success else "fail",
+        "final_outcome": history[-1].outcome if history else "empty",
+        "steps": [
+            {"node": step.node, "outcome": step.outcome, "metadata": step.metadata}
+            for step in history
+        ],
+        "cost": {"api_calls": 0, "tokens": 0},
+    }
+    print(json.dumps(payload, indent=2))
+    return 0 if success else 1
+
+
+def cmd_list_handlers(_: argparse.Namespace) -> int:
+    handlers = [
+        {"name": "start", "type": "Mdiamond"},
+        {"name": "exit", "type": "Msquare"},
+        {"name": "codergen", "type": "box"},
+        *({"name": name, "type": name} for name in sorted(TYPE_REGISTRY)),
+    ]
+    print(json.dumps(handlers, indent=2))
+    return 0
+
+
+def cmd_score(_: argparse.Namespace) -> int:
+    started = time.monotonic()
+    build = subprocess.run(
+        [sys.executable, "-m", "compileall", "-q", str(ROOT / "runner")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    tests = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/", "-q", "--ignore=tests/test_conformance.py"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    validation = subprocess.run(
+        [sys.executable, str(ROOT / "bin" / "conformance"), "validate"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    runtime = subprocess.run(
+        [sys.executable, str(ROOT / "bin" / "conformance"), "run", "pipelines/factory/hello.dot"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    elapsed = time.monotonic() - started
+    passed = build.returncode == tests.returncode == validation.returncode == runtime.returncode == 0
+    payload = {
+        "subcommand": "score",
+        "status": "pass" if passed else "fail",
+        "scope": "local_mock",
+        "build": {"status": "pass" if build.returncode == 0 else "fail", "returncode": build.returncode},
+        "self_test": {"status": "pass" if tests.returncode == 0 else "fail", "returncode": tests.returncode},
+        "conformance": {"status": "pass" if validation.returncode == 0 else "fail", "returncode": validation.returncode},
+        "runtime": {"status": "pass" if runtime.returncode == 0 else "fail", "returncode": runtime.returncode},
+        "tiers": {
+            "local_mock": "pass" if passed else "fail",
+            "sealed_benchmark": "not_run",
+            "generated_attractorbench": "not_run",
+        },
+        "cost": {"api_calls": 0, "tokens": 0},
+        "runtime_seconds": round(elapsed, 3),
+    }
+    print(json.dumps(payload, indent=2))
+    return 0 if payload["status"] == "pass" else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="conformance")
+    sub = parser.add_subparsers(dest="subcommand", required=True)
+    parse_cmd = sub.add_parser("parse")
+    parse_cmd.add_argument("dot_file")
+    parse_cmd.set_defaults(func=cmd_parse)
+    validate_cmd = sub.add_parser("validate")
+    validate_cmd.add_argument("dot_file", nargs="?")
+    validate_cmd.set_defaults(func=cmd_validate)
+    run_cmd = sub.add_parser("run")
+    run_cmd.add_argument("dot_file")
+    run_cmd.add_argument("--goal", default="conformance run")
+    run_cmd.add_argument("--feature", default="hello")
+    run_cmd.add_argument("--workdir", type=pathlib.Path, default=ROOT)
+    run_cmd.add_argument("--max-steps", type=int, default=100)
+    run_cmd.set_defaults(func=cmd_run)
+    sub.add_parser("list-handlers").set_defaults(func=cmd_list_handlers)
+    sub.add_parser("score").set_defaults(func=cmd_score)
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

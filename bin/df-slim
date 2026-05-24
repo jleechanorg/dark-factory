@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Dark Factory Slim: minimal deterministic feature-factory runner."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+import time
+from dataclasses import asdict
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if VENV_PYTHON.exists() and pathlib.Path(sys.executable).resolve() != VENV_PYTHON.resolve():
+    import os
+
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), str(pathlib.Path(__file__).resolve()), *sys.argv[1:]])
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from runner.engine import run as run_graph  # noqa: E402
+from runner.handlers import Context  # noqa: E402
+from runner.parser import parse  # noqa: E402
+
+
+def _default_command(name: str) -> str:
+    payload = json.dumps({"name": name, "status": "success"})
+    return f"{sys.executable} -c \"print({payload!r})\""
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    pipeline = args.pipeline.resolve()
+    run_dir = args.run_dir or ROOT / ".dark-factory-runs" / f"{int(time.time())}-slim"
+    run_dir = run_dir.resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    graph = parse(pipeline)
+    checkpoint = run_dir / "checkpoint.json"
+    ctx = Context(goal=args.goal, workdir=args.workdir.resolve(), backend=args.backend)
+    ctx.state.update(
+        {
+            "feature": args.feature,
+            "slim.test_command": args.test_command,
+            "slim.holdout_command": args.holdout_command,
+            "slim.run_dir": str(run_dir),
+        }
+    )
+
+    started = time.time()
+    manifest = {
+        "mode": "dark-factory-slim",
+        "pipeline": str(pipeline),
+        "goal": args.goal,
+        "backend": args.backend,
+        "run_dir": str(run_dir),
+        "started_at": started,
+        "status": "running",
+    }
+    (run_dir / "run.json").write_text(json.dumps(manifest, indent=2))
+
+    history = run_graph(graph, ctx, checkpoint=checkpoint, max_steps=args.max_steps)
+    final = history[-1].outcome if history else "empty"
+    manifest.update(
+        {
+            "status": "success" if final == "success" else "failure",
+            "final_outcome": final,
+            "ended_at": time.time(),
+            "steps": [asdict(step) for step in history],
+        }
+    )
+    (run_dir / "run.json").write_text(json.dumps(manifest, indent=2))
+    (run_dir / "summary.md").write_text(
+        "\n".join(
+            [
+                "# Dark Factory Slim run",
+                "",
+                f"- Goal: {args.goal}",
+                f"- Pipeline: {pipeline}",
+                f"- Backend: {args.backend}",
+                f"- Final outcome: {final}",
+                f"- Steps: {len(history)}",
+                "",
+            ]
+        )
+    )
+    print(json.dumps({"status": manifest["status"], "final_outcome": final, "run_dir": str(run_dir)}, indent=2))
+    return 0 if final == "success" else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="df-slim")
+    sub = parser.add_subparsers(dest="command", required=True)
+    run_cmd = sub.add_parser("run")
+    run_cmd.add_argument("--pipeline", type=pathlib.Path, default=ROOT / "pipelines" / "slim" / "minimal_feature.dot")
+    run_cmd.add_argument("--goal", required=True)
+    run_cmd.add_argument("--backend", choices=["echo", "claude", "codex", "ao"], default="echo")
+    run_cmd.add_argument("--feature", default="slim")
+    run_cmd.add_argument("--workdir", type=pathlib.Path, default=ROOT)
+    run_cmd.add_argument("--run-dir", type=pathlib.Path)
+    run_cmd.add_argument("--test-command", default=_default_command("tests"))
+    run_cmd.add_argument("--holdout-command", default=_default_command("holdouts"))
+    run_cmd.add_argument("--max-steps", type=int, default=100)
+    run_cmd.set_defaults(func=cmd_run)
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

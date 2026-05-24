@@ -1,5 +1,16 @@
 {
-  "passed": 0,
-  "total": 0,
-  "scenarios": []
+  "passed": 2,
+  "total": 2,
+  "scenarios": [
+    {
+      "name": "hello_returns_world_string",
+      "status": "pass",
+      "detail": "ok"
+    },
+    {
+      "name": "hello_takes_no_arguments",
+      "status": "pass",
+      "detail": "ok"
+    }
+  ]
 }

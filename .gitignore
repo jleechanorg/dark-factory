@@ -5,3 +5,6 @@ __pycache__/
 .checkpoints/
 *.png
 *.svg
+
+# Agent worktrees (temporary subagent isolation; not part of canonical history)
+.claude/worktrees/
