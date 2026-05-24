@@ -42,7 +42,23 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Path to CXDB SQLite file; records every step for Healer consumption.",
     )
+    p.add_argument(
+        "--evidence-bundle",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "Directory to materialise a per-run evidence bundle (manifest, "
+            "per-step files, single-run CXDB extract). Requires --cxdb."
+        ),
+    )
     args = p.parse_args(argv)
+
+    if args.evidence_bundle is not None and args.cxdb is None:
+        # The bundle's `cxdb-<run_id>.sqlite` extract needs a source CXDB —
+        # auto-provision one in the bundle dir if none was supplied so the
+        # CLI is forgiving for ad-hoc smoke runs.
+        args.evidence_bundle.mkdir(parents=True, exist_ok=True)
+        args.cxdb = args.evidence_bundle / "_run.sqlite"
 
     graph = parse(args.pipeline)
     ctx = Context(
@@ -60,6 +76,19 @@ def main(argv: list[str] | None = None) -> int:
         ctx.state["ao.agent"] = args.ao_agent
 
     history = run(graph, ctx, checkpoint=args.checkpoint, max_steps=args.max_steps)
+
+    if args.evidence_bundle is not None and ctx.run_id is not None:
+        # Lazy import so the CLI module stays cheap to load.
+        from .evidence import write_bundle
+
+        write_bundle(
+            bundle_dir=args.evidence_bundle,
+            cxdb_path=args.cxdb,
+            run_id=ctx.run_id,
+            pipeline_path=args.pipeline,
+            graph=graph,
+            workdir=args.workdir,
+        )
 
     summary = {
         "pipeline": graph.name,
