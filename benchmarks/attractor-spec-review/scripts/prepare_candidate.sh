@@ -36,6 +36,7 @@ mkdir -p "$WORKDIR/benchmarks/attractor-spec-review"
 cp -r "${BENCHMARK_DIR}/prompts" "$WORKDIR/benchmarks/attractor-spec-review/"
 cp -r "${BENCHMARK_DIR}/scripts" "$WORKDIR/benchmarks/attractor-spec-review/"
 cp -r "${BENCHMARK_DIR}/pipelines" "$WORKDIR/benchmarks/attractor-spec-review/"
+cp "${BENCHMARK_DIR}/README.md" "$WORKDIR/benchmarks/attractor-spec-review/README.md"
 cp "${BENCHMARK_DIR}/spec.md" "$WORKDIR/benchmarks/attractor-spec-review/spec.md"
 cp "${BENCHMARK_DIR}/visible_acceptance.md" "$WORKDIR/benchmarks/attractor-spec-review/visible_acceptance.md"
 

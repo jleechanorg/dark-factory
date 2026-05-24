@@ -6,6 +6,7 @@ that orchestrates multi-stage AI workflows using directed graphs.
 ## Source material
 
 - StrongDM, **AttractorBench** — <https://github.com/strongdm/attractorbench> — the benchmark we mirror: agents read a public natural-language spec, the conformance harness is generated locally and held out of the public repo to prevent training-data contamination.
+- jleechanorg, **AttractorBench fork** — <https://github.com/jleechanorg/attractorbench> — public fork used for spec-validation experiments and cross-repo validation.
 - Dan Shapiro, **"You don't write the code"** — <https://www.danshapiro.com/blog/2026/02/you-dont-write-the-code/> — Level 5 = the dark factory, lights off, nobody reviews the code; quality enforced by observability + adversarial review, not by reading.
 - 2389, **"The Dark Factory is a .dot file"** — <https://2389.ai/posts/the-dark-factory-is-a-dot-file/> — four independent Attractor implementations (Kilroy, Mammoth, Smasher, Tracker) converged on the same three-layer architecture; pipeline `.dot` files are the durable artifact, the runner code is *dorodango* (polish, discard, rebuild from spec).
 
@@ -29,16 +30,40 @@ Layer 2: Agent Loop (AO/Claude Code/Codex — existing external tools)
 Layer 1: Unified LLM Client (OpenClaw gateway / thinclaw MCP)
 ```
 
+## Dark Factory Mode
+
+The target mode is Level 5: humans own specs, holdouts, validation economics,
+and outcome audits; agents write code; independent agents and sealed evaluators
+review behavior. Human diff review is not the product-quality gate.
+
+The repo supports that mode with:
+
+- Public NLSpecs in `benchmarks/*/spec.md`.
+- Versioned DOT graphs in `pipelines/` and `benchmarks/*/pipelines/`.
+- Runner CLI coder backends (`echo`, `claude`, `codex`, `ao`).
+- Per-node codergen routing can also use `mock_llm` for test/conformance lanes
+  through node `backend`/`model` attributes or model stylesheets.
+- Reviewer/evaluator lanes as separate nodes: `tool` nodes can invoke
+  `codex exec --yolo`, AO workers, or other reviewer CLIs; sealed
+  `holdout_eval` nodes invoke the evaluator from `$DARK_FACTORY_HOLDOUTS`.
+- Sealed evaluator execution via `$DARK_FACTORY_HOLDOUTS/evaluator/run.py`.
+- Independent reviewer tool nodes, including `codex exec --yolo` or AO reviewers.
+- CXDB + Healer failure clustering for outcome auditing.
+- Spec-validation graphs copied into `benchmarks/attractor-spec-review/`.
+
+Validation should be adversarial and expensive enough to matter. If a benchmark
+is only doing cheap deterministic smoke, it is not yet a real dark factory run.
+
 ## Directory Layout
 
 ```
 dark-factory/
 ├── pipelines/         # .dot files — the durable artifacts worth sharing
 │   └── factory/      # Full factory pipeline (seed→architect→specify→implement→expand→sync)
-├── holdouts/          # Blind evaluation scenarios — agent NEVER sees these
-│   └── <feature>/    # Per-feature holdout directory
-│       ├── scenario_001.yaml
-│       └── ...
+├── benchmarks/        # Public NLSpecs, starter scaffolds, benchmark DOT graphs
+│   ├── amazon-clone/  # Full-stack commerce benchmark
+│   ├── airbnb-clone/  # Sprinted Firebase emulator benchmark
+│   └── attractor-spec-review/ # Spec validation graph + validator copied into repo
 ├── specs/            # Feature specs — agent DOES see these
 │   └── <feature>.md
 ├── prompts/           # Prompt templates referenced by .dot nodes
@@ -48,7 +73,7 @@ dark-factory/
 │   ├── __main__.py    # CLI entry point
 │   ├── parser.py      # DOT → graph model
 │   ├── engine.py      # Graph traversal + checkpointing
-│   ├── handlers.py    # Node handlers + inline backend dispatch (echo|claude|codex via ctx.backend)
+│   ├── handlers.py    # Node handlers + backend dispatch (echo|mock_llm|ao|claude|codex)
 │   ├── cxdb.py        # CXDB — SQLite event log of every step (for Healer)
 │   └── healer.py      # Healer — clusters CXDB failures into a diagnosis report
 │
@@ -62,14 +87,41 @@ dark-factory/
 └── README.md
 ```
 
+## Spec Validation Benchmark
+
+The general Attractor spec validator lives in:
+
+- `benchmarks/attractor-spec-review/starter/scripts/validate_spec.py`
+- `benchmarks/attractor-spec-review/pipelines/review_slim.dot`
+- `benchmarks/attractor-spec-review/pipelines/review_full.dot`
+- `benchmarks/attractor-spec-review/scripts/review_with_codex.sh`
+
+Run it locally:
+
+```bash
+bash benchmarks/attractor-spec-review/scripts/run_matrix_deterministic.sh /tmp/attractor-review-matrix
+```
+
+Run the full-stack smoke node:
+
+```bash
+cd benchmarks/attractor-spec-review
+bash starter/scripts/fullstack_smoke.sh
+```
+
 ## Quick Start
 
 ```bash
+# Setup: Python 3.13 is the supported runtime for this repo.
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3.13)}"
+"$PYTHON_BIN" -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+
 # Smallest end-to-end pipeline (echo backend; no LLM calls)
-python -m runner --pipeline pipelines/factory/hello.dot --goal "smoke test"
+.venv/bin/python -m runner --pipeline pipelines/factory/hello.dot --goal "smoke test"
 
 # Pipeline with gates, recording every step to CXDB
-python -m runner \
+.venv/bin/python -m runner \
   --pipeline pipelines/factory/gates.dot \
   --goal "Add rate limiting to campaign creation" \
   --backend claude \
@@ -81,10 +133,10 @@ dot -Tpng pipelines/factory/gates.dot -o gates.png
 
 # Run holdout evaluation against the sealed sibling repo
 export DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts
-python -m runner --pipeline pipelines/factory/gates.dot --goal "Add rate limiting" --feature rate_limit
+.venv/bin/python -m runner --pipeline pipelines/factory/gates.dot --goal "Add rate limiting" --feature rate_limit
 
 # After one or more runs, diagnose failures
-python -m runner.healer --cxdb ~/.dark-factory/cxdb.sqlite
+.venv/bin/python -m runner.healer --cxdb ~/.dark-factory/cxdb.sqlite
 ```
 
 `--feature <name>` selects the holdout subdirectory; the sealed evaluator repo

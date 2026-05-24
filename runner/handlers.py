@@ -40,7 +40,7 @@ class Context:
     workdir: pathlib.Path
     state: dict[str, str] = field(default_factory=dict)
     history: list[dict[str, str]] = field(default_factory=list)
-    backend: str = "echo"  # echo | claude | codex | shell
+    backend: str = "echo"  # echo | mock_llm | ao | claude | codex
     cxdb_path: Optional[pathlib.Path] = None
     run_id: Optional[str] = None
 

@@ -114,6 +114,7 @@ def parse_last_json(text: str):
 
 payload = parse_last_json(raw_text)
 spec_lines = spec_path.read_text(encoding="utf-8").splitlines()
+reviewable_spec_lines = [idx for idx, line in enumerate(spec_lines, start=1) if line.strip()]
 required_finding_keys = {"line", "severity", "issue", "evidence", "fix_hint"}
 
 errors = []
@@ -161,6 +162,15 @@ else:
         missing = normalized["coverage"].get("missing_lines")
         if not isinstance(reviewed, list) or not isinstance(missing, list):
             errors.append("coverage.reviewed_lines and coverage.missing_lines must be arrays.")
+        elif normalized["verdict"] == "pass":
+            reviewed_set = {int(item) for item in reviewed if isinstance(item, int) or str(item).isdigit()}
+            missing_reviewable = sorted(set(reviewable_spec_lines) - reviewed_set)
+            if missing_reviewable:
+                preview = ", ".join(str(item) for item in missing_reviewable[:20])
+                errors.append(f"reviewer pass did not cover all non-empty spec lines: {preview}")
+            if missing:
+                preview = ", ".join(str(item) for item in missing[:20])
+                errors.append(f"reviewer pass reported missing lines: {preview}")
 
     if not isinstance(normalized["findings"], list):
         errors.append("findings must be an array.")

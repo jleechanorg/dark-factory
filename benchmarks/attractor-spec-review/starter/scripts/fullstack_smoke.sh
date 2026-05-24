@@ -3,6 +3,7 @@ set -euo pipefail
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT_FILE="${BASE_DIR}/spec_review/fullstack_smoke_report.json"
+mkdir -p "$(dirname "$REPORT_FILE")"
 
 REQUIRED_FILES=(
   "$BASE_DIR/backend/main.py"

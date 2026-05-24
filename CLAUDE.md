@@ -13,6 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This repo is a working implementation of the **Attractor pattern** described by these three primary sources. If you're new to the repo, skim them first; the architecture choices below are downstream of them, not invented here.
 
 - **StrongDM, AttractorBench** — <https://github.com/strongdm/attractorbench> — defines the benchmark: agents read a public natural-language spec; the conformance tests, mock LLM server, and scoring harness are generated locally and **intentionally excluded from the public repo to prevent training-data contamination**. We mirror that "spec in, evaluator out" split.
+- **jleechanorg AttractorBench fork** — <https://github.com/jleechanorg/attractorbench> — public fork used for local spec-validation experiments. The spec-validation benchmark copied into this repo lives at `benchmarks/attractor-spec-review/`.
 - **Dan Shapiro, "You don't write the code"** — <https://www.danshapiro.com/blog/2026/02/you-dont-write-the-code/> — argues that humans must stop reading the code, not just stop writing it, and lays out the five-level automation ladder (Level 5 = the dark factory: nobody reviews code). Quality enforced by **CXDB + Healer + adversarial cross-review**, not by inspection.
 - **2389, "The Dark Factory is a .dot file"** — <https://2389.ai/posts/the-dark-factory-is-a-dot-file/> — the Attractor pattern is StrongDM's open-source NLSpec set; four independent implementations (Kilroy, Mammoth, Smasher, Tracker) converged on the same three-layer architecture. Pipeline `.dot` files are the durable artifact; the runner code itself is *dorodango* — polish, discard, rebuild from spec.
 
@@ -32,17 +33,43 @@ Holdout scenarios are intentionally **absent from this repo** — they live in t
 
 > **As the operator you can — and should — read the sealed repo, the evaluator, and the tests.** What you must not do is hand any of that content (verbatim or paraphrased) to a `codergen` node's prompt template.
 
+## Dark Factory operating mode
+
+The target operating model is Level 5: humans define intent, specs, tenets,
+holdouts, and outcome audits; agents write code; independent agents and sealed
+evaluators review behavior. Human code review is a fallback for maintaining the
+factory itself, not the product-quality gate.
+
+Operational rules:
+
+1. Public specs are the scarce artifact. Make them detailed enough that a coding
+   agent can build without hidden product requirements.
+2. Hidden evaluator cases must cover exact data, adversarial payloads, role
+   attacks, race cases, service failures, viewport sizes, and scoring weights.
+3. Every non-trivial pipeline should have at least one independent reviewer node
+   or tool invocation (`codex exec --yolo`, AO worker, or equivalent) separate
+   from the implementing agent.
+4. Merge confidence should come from outcome artifacts: public spec validation,
+   deterministic tests, sealed holdouts, independent reviewer reports, CXDB
+   history, and evidence bundles.
+5. Do not optimize for cheap validation. If the factory is not spending serious
+   token budget on adversarial validation, it is probably under-testing.
+6. Treat `.dot` graphs as the durable process code. Runner code is disposable;
+   graph shape, specs, holdouts, and scoring contracts are the important assets.
+
 ## Common commands
 
 ```bash
 # Setup
-python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3.13)}"
+"$PYTHON_BIN" -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
 
 # Smoke pipeline — echo backend, no LLM calls
-python -m runner --pipeline pipelines/factory/hello.dot --goal "smoke test"
+.venv/bin/python -m runner --pipeline pipelines/factory/hello.dot --goal "smoke test"
 
 # Full gated pipeline with CXDB recording
-python -m runner \
+.venv/bin/python -m runner \
   --pipeline pipelines/factory/gates.dot \
   --goal "<feature description>" \
   --backend claude \
@@ -50,15 +77,15 @@ python -m runner \
   --cxdb ~/.dark-factory/cxdb.sqlite
 
 # Cluster CXDB failures into a Healer diagnosis
-python -m runner.healer --cxdb ~/.dark-factory/cxdb.sqlite
+.venv/bin/python -m runner.healer --cxdb ~/.dark-factory/cxdb.sqlite
 
 # Visualize a pipeline graph
 dot -Tpng pipelines/factory/gates.dot -o gates.png
 
 # Tests (full suite, single file, single test)
-python -m pytest tests/
-python -m pytest tests/test_engine.py -k green
-python -m pytest tests/test_gates.py::test_parse_verdict_pass_warn_fail
+.venv/bin/python -m pytest tests/
+.venv/bin/python -m pytest tests/test_engine.py -k green
+.venv/bin/python -m pytest tests/test_gates.py::test_parse_verdict_pass_warn_fail
 ```
 
 ## Architecture
@@ -87,12 +114,28 @@ Lookup order in `resolve(node)`:
 4. Default → `_codergen`
 
 Handler types:
-- `codergen` — render `prompt="@path"` (with `${goal}` and `${state.*}` substitution) and dispatch to `ctx.backend` (`echo` | `claude` | `codex`).
+- `codergen` — render `prompt="@path"` (with `${goal}` and `${state.*}` substitution) and dispatch to the node's `backend`/`model` attribute or `ctx.backend`. The runner CLI accepts `echo` | `ao` | `claude` | `codex`; per-node/model-stylesheet routing also supports `mock_llm` for test/conformance lanes.
+- Reviewer/evaluator lanes are separate nodes: `tool` nodes can invoke `codex exec --yolo`, AO workers, or another reviewer CLI; `holdout_eval` runs the sealed Python evaluator from `$DARK_FACTORY_HOLDOUTS`.
 - `tool` — shell out to a `command="..."` attribute with optional `timeout`.
 - `human_gate` — block on stdin, or accept pre-seeded `ctx.state["<node>.outcome"]` for tests.
 - `conditional` — hexagon decision node; outcome comes from `ctx.state[decision_key]`.
 - `holdout_eval` — run the sealed evaluator at `$DARK_FACTORY_HOLDOUTS/evaluator/run.py`. Parses the last JSON line of stdout for `{verdict: pass|...}`.
 - `gate_es` / `gate_er` / `gate_code_standards` — shell out to `claude --print /<slash>`. Verdicts are normalized by `_parse_verdict`: the anchored marker regex (`verdict:`/`overall:`/`normalized:` + token) takes priority; the standalone-line fallback only fires when no marker is present; `pass|warn → success`, `fail|partial|inconclusive → failure`. Unknown verdict combined with `rc!=0` becomes `error` (distinct from real failures so the Healer can group infra crashes separately).
+
+### Spec validation benchmark
+
+`benchmarks/attractor-spec-review/` is the local copy of the Attractor-style
+spec-validation experiment. Its public graph and validator are intentionally
+visible:
+
+- `benchmarks/attractor-spec-review/pipelines/review_slim.dot`
+- `benchmarks/attractor-spec-review/pipelines/review_full.dot`
+- `benchmarks/attractor-spec-review/starter/scripts/validate_spec.py`
+- `benchmarks/attractor-spec-review/scripts/review_with_codex.sh`
+
+The full graph validates every reviewable spec line, runs a full-stack smoke
+node, then invokes an independent reviewer through `codex exec --yolo`.
+Use this benchmark as the template for general spec-validation lanes.
 
 ### CXDB + Healer feedback loop
 - `runner/cxdb.py` records `(run_id, seq, node, outcome, ts, output_hash, output_head, metadata)` per step. WAL mode + 5s busy_timeout so concurrent pipelines into one CXDB don't collide on `database is locked`.
@@ -110,4 +153,8 @@ Handler types:
 2. Pipelines must include both `start` and `exit` nodes; the parser enforces this.
 3. Edge conditions are simple: `condition="key=value"` or `key!=value`. The runtime does *not* evaluate arbitrary expressions; encode richer logic in a handler.
 4. Prompt references use `prompt="@relative/path.md"` (the `@` is stripped by the parser). Templates support `${goal}` and `${state.<key>}` substitution only — no Jinja, no conditionals.
-5. Backends are swappable per run via `--backend`; never hardcode a backend in a `.dot` file or handler.
+5. Coder backends are swappable per run via `--backend` or per codergen node via
+   `backend="codex"` / `backend="claude"` / `backend="ao"`. Use reviewer
+   `tool` nodes when separating coder and reviewer/evaluator CLIs.
+6. Use `model_stylesheet="path.model.css"` when a graph needs CSS-like
+   backend/model routing without cluttering every node.
