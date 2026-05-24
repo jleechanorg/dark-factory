@@ -73,6 +73,13 @@ def _sanitized_env() -> dict[str, str]:
 
 
 def _get_claude_executable() -> str:
+    # PATH wins so tests can intercept with a fake claude binary on PATH
+    # (see tests/test_gates.py::test_gate_nonzero_returncode_cannot_spoof_pass).
+    # If nothing on PATH, fall back to the user's nvm-installed binary as a
+    # convenience so live runs don't depend on PATH being just-so.
+    on_path = shutil.which("claude")
+    if on_path:
+        return on_path
     nvm_claude = pathlib.Path.home() / ".nvm" / "versions" / "node" / "v22.22.0" / "bin" / "claude"
     if nvm_claude.exists():
         return str(nvm_claude)
@@ -612,8 +619,18 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
                     
                     break
                 except: pass
-        outcome = "error" if proc.returncode and verdict == "pass" else verdict
-        return Result(outcome="success" if verdict == "pass" else verdict, output=proc.stdout, metadata={"verdict": verdict, "port": str(port)})
+        # rc!=0 + verdict=pass means the evaluator process crashed/exited
+        # abnormally even though it printed a pass verdict line — that's a
+        # spoof attempt or infra bug, not a real pass. Route to "error" so
+        # the engine can route via outcome!=success edges and the Healer
+        # clusters infra crashes separately from real failures.
+        if proc.returncode and verdict == "pass":
+            outcome = "error"
+        elif verdict == "pass":
+            outcome = "success"
+        else:
+            outcome = verdict
+        return Result(outcome=outcome, output=proc.stdout, metadata={"verdict": verdict, "port": str(port)})
     finally:
         if server_proc:
             server_proc.terminate()

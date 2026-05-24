@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import re
 import sqlite3
 import time
 import uuid
@@ -45,9 +46,36 @@ CREATE INDEX IF NOT EXISTS idx_steps_hash ON steps(output_hash);
 
 _MAX_OUTPUT = 4096
 
+# Pytest (and many shell tools) emit a timing line in their output that
+# varies run-to-run even for identical failures, e.g. "2 passed in 0.10s",
+# "no tests ran in 0.13s", "FAILED in 1.4s". When we hash step output to
+# cluster failures, those timing fragments produce phantom-distinct
+# clusters for what is the same failure. Normalise them out before hashing.
+#
+# We strip the *value* of the time, not the surrounding text — so the
+# *shape* of the line is preserved (still distinguishes "no tests ran"
+# from "5 failed", etc.). Lines that don't match are passed through.
+_PYTEST_TIMING_RE = re.compile(
+    r"""
+    \b in \s+ \d+(?:\.\d+)? s \b      # "in 0.10s"
+    |
+    \b \d+(?:\.\d+)? s \b              # bare "0.10s"
+    """,
+    re.VERBOSE,
+)
+
+
+def _normalise_for_hash(text: str) -> str:
+    """Strip non-deterministic timing fragments before clustering."""
+    if not text:
+        return ""
+    return _PYTEST_TIMING_RE.sub("<TIME>", text)
+
 
 def _hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return hashlib.sha256(
+        _normalise_for_hash(text).encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
 
 
 class CXDB:
