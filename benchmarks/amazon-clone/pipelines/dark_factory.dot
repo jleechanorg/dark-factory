@@ -1,17 +1,39 @@
-digraph amazon_mvp {
-    graph [label="Dark Factory - Amazon MVP"]
+digraph amazon_fullstack {
+    graph [label="Dark Factory - Amazon Full-Stack Commerce"]
     rankdir=LR
 
     start [shape=Mdiamond, label="Start"]
     exit  [shape=Msquare, label="Exit"]
 
-    plan      [type="codergen", label="Plan", prompt="@benchmarks/amazon-clone/prompts/plan.md"]
-    implement [type="codergen", label="Implement", prompt="@benchmarks/amazon-clone/prompts/implement.md"]
-    verify    [type="holdout_eval", label="Holdout Eval", validation="true", timeout="300"]
-    fix       [type="codergen", label="Fix", prompt="@benchmarks/amazon-clone/prompts/fix.md", max_visits="5"]
+    spec_review [type="codergen", backend="codex", label="Spec Review", prompt="@benchmarks/amazon-clone/prompts/spec_review.md"]
+    architect   [type="codergen", backend="claude", label="Architecture", prompt="@benchmarks/amazon-clone/prompts/architect.md"]
 
-    start -> plan -> implement -> verify
-    verify -> exit [condition="outcome=success"]
-    verify -> fix [condition="outcome!=success"]
-    fix -> verify
+    data_model      [type="codergen", backend="codex", label="Data Model + Firestore", prompt="@benchmarks/amazon-clone/prompts/data_model.md"]
+    backend         [type="codergen", backend="codex", label="Backend API", prompt="@benchmarks/amazon-clone/prompts/backend.md"]
+    frontend        [type="codergen", backend="claude", label="Frontend App", prompt="@benchmarks/amazon-clone/prompts/frontend.md"]
+    firestore_rules [type="codergen", backend="codex", label="Firestore Rules", prompt="@benchmarks/amazon-clone/prompts/firestore_rules.md"]
+    seed_data       [type="codergen", backend="codex", label="Seed + Reset", prompt="@benchmarks/amazon-clone/prompts/seed_data.md"]
+    validation      [type="codergen", backend="codex", label="Validation Harness", prompt="@benchmarks/amazon-clone/prompts/validation_harness.md"]
+
+    local_smoke [type="tool", label="Local Smoke", command="make test", timeout="900"]
+    size_check  [type="tool", label="Source Size Check", command="make validate-size", timeout="300"]
+    gate_es     [type="gate_es", label="/es Evidence Gate"]
+    gate_er     [type="gate_er", label="/er Review Gate"]
+
+    independent_review [
+        type="tool",
+        label="Independent Reviewer",
+        command="codex exec --yolo --skip-git-repo-check 'Review this Amazon full-stack benchmark implementation adversarially against benchmarks/amazon-clone/spec.md. Do not read sealed holdouts. Report only concrete blockers and evidence gaps.'",
+        timeout="900"
+    ]
+
+    holdout [type="holdout_eval", label="Sealed Holdout Eval", feature="amazon-clone", timeout="900", startup_delay="30"]
+    fix     [type="codergen", backend="codex", label="Fix", prompt="@benchmarks/amazon-clone/prompts/fix.md", max_visits="5"]
+
+    start -> spec_review -> architect
+    architect -> data_model -> backend -> frontend -> firestore_rules -> seed_data -> validation
+    validation -> local_smoke -> size_check -> gate_es -> gate_er -> independent_review -> holdout
+    holdout -> exit [condition="outcome=success"]
+    holdout -> fix [condition="outcome!=success"]
+    fix -> local_smoke
 }

@@ -1,35 +1,40 @@
 # Plan Task
 
-Generate a development plan for implementing the Amazon Clone MVP.
+Generate a concrete implementation plan for the Amazon full-stack commerce benchmark.
 
 ## Reference Spec
 
-Read the full specification at: `benchmarks/amazon-clone/spec.md`
-Read the public acceptance criteria at: `benchmarks/amazon-clone/visible_acceptance.md`
+Read the full public specification at `benchmarks/amazon-clone/spec.md`.
+Read `benchmarks/amazon-clone/visible_acceptance.md` if it exists.
 
-Treat those two files as the complete visible product contract. Do not add
-flows that are not present there, and do not inspect hidden evaluator details.
+Treat the public specification as the complete product contract. Do not inspect
+sealed evaluator repositories, holdout directories, hidden scenarios, or hidden
+test source.
 
-## Launch Contract
+## Required Scope
 
-Your plan must ensure the following commands will succeed:
+The final application must include:
 
-```bash
-make build    # Install dependencies, compile/transpile if needed
-make test     # Run test suite (must pass)
-make run      # Start server on port 3000, must respond to health check
-```
+- Frontend commerce app with route-backed catalog, detail, cart, checkout,
+  account, order history, wishlist, seller, admin, notifications, and
+  diagnostics views.
+- Backend JSON API that owns validation and persistence.
+- Firestore emulator as the local database of record.
+- Deterministic seed/reset flow.
+- Firestore rules for user, seller, and admin ownership boundaries.
+- Validation harness covering lint, unit, API integration, browser checkout,
+  Firestore rules probes, and source-size checks.
+- At least 5,000 non-generated source lines counted by the validation harness.
 
 ## Plan Output
 
-Provide a 2-3 sentence executive summary describing:
-- Main files and their purpose
-- Overall project structure
-- Framework and architecture choices
+Produce a concise architecture plan with:
 
-Then provide a high-level task list (5-10 items) covering:
-- Initial project setup
-- Core data and UI model
-- Frontend components for each visible flow
-- Testing strategy
-- Deployment configuration
+- Chosen frontend/backend stack.
+- Directory layout.
+- Firestore collections and repository boundary.
+- API route groups.
+- State management approach.
+- Seed and reset approach.
+- Validation harness approach.
+- Risks and sequencing.

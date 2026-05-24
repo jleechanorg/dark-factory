@@ -1,91 +1,47 @@
 # Implement Task
 
-Implement the Amazon Clone MVP according to the specification.
+Implement the Amazon full-stack commerce benchmark according to
+`benchmarks/amazon-clone/spec.md`.
 
-## Reference Spec
+## Non-Negotiable Requirements
 
-Read the full specification at: `benchmarks/amazon-clone/spec.md`
-Read the public acceptance criteria at: `benchmarks/amazon-clone/visible_acceptance.md`
-
-Together, those files define the complete visible product contract. Do not add
-flows that are not present there, and do not inspect hidden evaluator details.
+- Build a real frontend, a real backend API, and Firestore emulator persistence.
+- Implement all 20 public user stories in the spec.
+- Use Firestore emulator as the local database of record for persisted commerce
+  state.
+- Provide deterministic seed/reset data.
+- Provide Firestore rules for shopper, seller, admin, and evaluator boundaries.
+- Provide a validation harness that proves the app is not a shallow static demo.
+- Meet the 5,000 non-generated source-line floor.
+- Do not inspect sealed holdouts or hidden evaluator paths.
 
 ## Launch Contract
 
-Your implementation MUST satisfy the following commands:
+The implementation must support these commands or documented equivalents:
 
 ```bash
-make build    # Install dependencies, compile/transpile if needed
-make test     # Run test suite (must pass)
-make run      # Start server on port 3000, respond to health check
+make build
+make seed
+make run
+make test
+make validate-size
 ```
 
-The server MUST:
-- Start on port 3000
-- Respond to `GET /health` with a 200 status code
-- Serve all static assets correctly
+`make run` must start the frontend, backend, and Firestore emulator together.
+Startup output must print the frontend URL, backend URL, backend health URL,
+emulator UI URL, and diagnostics URL.
 
-## Implementation Requirements
+## Implementation Guidance
 
-### Files to Create
+Prefer a boring, maintainable architecture:
 
-You must create the following structure (minimum viable implementation):
+- Frontend components and route views separated from API client code.
+- Backend route handlers separated from validation, domain logic, and Firestore
+  repositories.
+- Money represented as integer cents internally.
+- Checkout totals computed on the backend.
+- Checkout inventory writes protected from overselling.
+- Sensitive checkout fields excluded from logs, storage, URLs, and artifacts.
+- Tests that reset local data deterministically.
 
-```
-/benchmarks/amazon-clone/
-  src/
-    server.js          # Express/HTTP server, port 3000
-    routes/
-      products.js      # Product API endpoints
-      cart.js          # Cart API endpoints
-      orders.js        # Order API endpoints
-    models/
-      product.js       # Product data model
-      cart.js          # Cart data model
-      order.js         # Order data model
-    public/
-      index.html       # Main HTML entry
-      app.js           # Frontend JavaScript
-      styles.css       # Styles
-  tests/
-    products.test.js   # Product API tests
-    cart.test.js        # Cart API tests
-    orders.test.js      # Order API tests
-  package.json
-  Makefile
-  SPEC.md              # Copy of spec.md for reference
-```
-
-### Quality Standards
-
-All visible flows in `spec.md` and `visible_acceptance.md` must work.
-
-### Do
-
-- Make the application actually work end-to-end
-- Ensure `make build` installs all dependencies
-- Ensure `make test` runs and passes
-- Ensure `make run` starts the server on port 3000
-- Handle edge cases (empty cart, invalid input, etc.)
-- Use realistic sample data for products
-- Implement proper error handling
-
-### Don't
-
-- Don't log PII (names, emails, addresses, phone numbers)
-- Don't add features outside the 10 required flows
-- Don't use placeholder data that breaks flows
-- Don't skip error handling
-- Don't use console.log for debugging in final code
-- Don't add analytics or tracking pixels
-
-## Framework Choice
-
-You may use any of:
-- Vanilla JavaScript (Node.js server + vanilla JS frontend)
-- React (create-react-app or Vite)
-- Vue (Vue CLI or Vite)
-- Svelte (SvelteKit or Vite)
-- Next.js
-
-If using a framework, ensure all build commands are in Makefile.
+Complete the product, not only the happy path.
