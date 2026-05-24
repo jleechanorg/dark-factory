@@ -142,3 +142,25 @@ prompts doesn't cheat, and the forcing function is reliable. If you want
 to exercise the same six nodes against a sealed evaluator, swap the
 `verify` node's type from `tool` (with `validation="true"`) to
 `holdout_eval` and move the test source to `dark-factory-holdouts/`.
+
+### Sealed `roman` scenario — where it lives
+
+The sealed-evaluator equivalent of `_holdout/test_roman.py` is committed in
+the sibling repo at `$DARK_FACTORY_HOLDOUTS/holdouts/roman/scenarios.yaml`
+(canonical path: `~/projects/dark-factory-holdouts/holdouts/roman/`). It
+covers the same 19 conversion cases (1, 4, 9, 40, 94, 900, 1994, 3999, …)
+plus the hidden `df_demo3.roman.__version__ == "1.0.0"` module contract.
+The scenarios.yaml is the source of truth — do **not** mirror it back into
+this benchmark, by design. To swap this benchmark onto the sealed
+evaluator, replace the `verify` node with:
+
+```
+verify [type="holdout_eval",
+        feature="roman",
+        implementation="${state.ao.worktree}",
+        validation="true"]
+```
+
+and drop the `cp -R …/_holdout` step; the evaluator's sandbox enforces both
+the conversion correctness and the hidden metadata contract without the
+worker ever seeing the test source.
