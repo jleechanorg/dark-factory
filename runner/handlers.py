@@ -431,6 +431,50 @@ _VERDICT_NORMALIZE = {
     "inconclusive": "failure",
 }
 
+# A gate response must echo back `head_sha: <40-hex>` so we can bind the
+# verdict to the exact worktree SHA the gate was meant to review. Without
+# this binding a late-arriving verdict could be applied to a different
+# commit. Missing/mismatched echo → outcome=error (NOT failure — distinct
+# so the Healer clusters it as an infra issue, like rc!=0 + unknown verdict).
+_HEAD_SHA_ECHO_RE = re.compile(
+    r"head_sha\s*:\s*([0-9a-fA-F]{40})\b",
+    re.IGNORECASE,
+)
+
+
+def _worktree_head_sha(workdir: pathlib.Path) -> Optional[str]:
+    """Return the full 40-char HEAD SHA for `workdir`, or None on failure."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(workdir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    sha = proc.stdout.strip()
+    if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha.lower()):
+        return sha.lower()
+    return None
+
+
+def _verify_head_sha_echo(text: str, expected_sha: str) -> tuple[bool, str]:
+    """Check that `text` contains a `head_sha: <expected>` line.
+
+    Returns (ok, observed_sha). ok=True iff the echoed SHA matches expected.
+    observed_sha is "" if no head_sha line is present.
+    """
+    matches = list(_HEAD_SHA_ECHO_RE.finditer(text or ""))
+    if not matches:
+        return False, ""
+    # If multiple appear, take the LAST one — same convention as verdict parsing.
+    observed = matches[-1].group(1).lower()
+    return observed == expected_sha.lower(), observed
+
 # Anchored regex: keyword must follow a marker like "verdict:", "overall:", or "normalized:"
 # and stand on its own word boundary. Avoids substring hits inside "passes warnings".
 _MARKER_RE = re.compile(
@@ -495,9 +539,11 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
     def handler(node: Node, ctx: Context) -> Result:
         args = node.attrs.get("args", default_args)
         target = node.attrs.get("target", str(ctx.workdir))
-        prompt = f"/{slash_command} {args} {target}".strip()
 
-        # Echo backend: outcome from state hint, used by tests + CI.
+        # Echo backend: outcome from state hint, used by tests + CI. The
+        # echo path does not call out to a subprocess so SHA binding is not
+        # applicable — tests that exercise SHA binding must use the claude
+        # backend with a fake binary on PATH.
         if ctx.backend == "echo":
             hint = ctx.state.get(f"{node.name}.outcome", "success")
             return Result(
@@ -505,6 +551,29 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
                 output=f"echo gate /{slash_command}: pre-seeded {hint}",
                 metadata={"slash_command": slash_command, "verdict": "echo:" + hint},
             )
+
+        # SHA binding: compute the worktree HEAD and require the gate to
+        # echo it back. If we cannot compute a SHA (not a git worktree, git
+        # missing), the gate cannot be safely run — return `error`.
+        expected_sha = _worktree_head_sha(ctx.workdir)
+        if expected_sha is None:
+            return Result(
+                outcome="error",
+                output=f"gate /{slash_command} cannot resolve HEAD SHA for {ctx.workdir}",
+                metadata={
+                    "slash_command": slash_command,
+                    "verdict": "unknown",
+                    "head_sha_status": "missing",
+                },
+            )
+
+        sha_directive = (
+            f"\n\nexpected_head_sha: {expected_sha}\n"
+            f"Your verdict response MUST include a line of the exact form "
+            f"`head_sha: {expected_sha}` so the runner can bind this verdict "
+            f"to the worktree commit it was meant to review.\n"
+        )
+        prompt = f"/{slash_command} {args} {target}".strip() + sha_directive
 
         try:
             timeout = int(node.attrs.get("timeout", "1200"))
@@ -522,13 +591,25 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
             check=False,
             env=_sanitized_env(),
         )
-        verdict, normalized = _parse_verdict(proc.stdout + "\n" + proc.stderr)
+        combined = proc.stdout + "\n" + proc.stderr
+        verdict, normalized = _parse_verdict(combined)
+        # SHA binding check — must come BEFORE collapsing to pass/fail so a
+        # spoofed-pass-with-wrong-SHA collapses to `error`, not `success`.
+        sha_ok, observed_sha = _verify_head_sha_echo(combined, expected_sha)
         # Distinguish infra failures (claude crashed / not installed / network)
         # from real "FAIL" verdicts so the Healer can group them separately.
         if proc.returncode != 0 and (verdict == "unknown" or normalized == "success"):
             outcome = "error"
+        elif not sha_ok:
+            # Echo missing or mismatched — treat as infra error (verdict can
+            # not be safely bound to a commit) regardless of pass/fail content.
+            outcome = "error"
         else:
             outcome = normalized
+        head_sha_status = (
+            "matched" if sha_ok and observed_sha
+            else ("mismatched" if observed_sha else "missing")
+        )
         return Result(
             outcome=outcome,
             output=proc.stdout,
@@ -536,6 +617,9 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
                 "slash_command": slash_command,
                 "verdict": verdict,
                 "returncode": str(proc.returncode),
+                "expected_head_sha": expected_sha,
+                "observed_head_sha": observed_sha,
+                "head_sha_status": head_sha_status,
             },
         )
 
