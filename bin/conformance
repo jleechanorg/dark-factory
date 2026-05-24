@@ -153,27 +153,53 @@ def _touch_mock_llm(graph) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    path = _resolve_path(args.dot_file)
-    graph = parse(path)
-    _touch_mock_llm(graph)
-    ctx = Context(goal=args.goal, workdir=args.workdir, backend="echo")
-    if args.feature:
-        ctx.state["feature"] = args.feature
-    history = run_graph(graph, ctx, max_steps=args.max_steps)
-    success = bool(history and history[-1].outcome == "success")
-    payload = {
-        "subcommand": "run",
-        "status": "success" if success else "fail",
-        "outcome": "success" if success else "fail",
-        "final_outcome": history[-1].outcome if history else "empty",
-        "steps": [
-            {"node": step.node, "outcome": step.outcome, "metadata": step.metadata}
-            for step in history
-        ],
-        "cost": {"api_calls": 0, "tokens": 0},
-    }
-    print(json.dumps(payload, indent=2))
-    return 0 if success else 1
+    try:
+        path = _resolve_path(args.dot_file)
+        graph = parse(path)
+        _touch_mock_llm(graph)
+        mock_url = getattr(args, "mock_url", None) or os.environ.get("OPENAI_BASE_URL", "")
+        if mock_url:
+            ctx = Context(goal=args.goal, workdir=args.workdir, backend="mock_llm")
+            ctx.state["mock_url"] = mock_url
+        else:
+            ctx = Context(goal=args.goal, workdir=args.workdir, backend="echo")
+        if args.feature:
+            ctx.state["feature"] = args.feature
+        history = run_graph(graph, ctx, max_steps=args.max_steps)
+        success = bool(history and history[-1].outcome == "success")
+
+        api_calls = 0
+        tokens = 0
+        for step in history:
+            meta = getattr(step, "metadata", {}) or {}
+            api_calls += int(meta.get("api_calls", 0))
+            tokens += int(meta.get("total_tokens", 0))
+
+        payload = {
+            "subcommand": "run",
+            "status": "success" if success else "fail",
+            "outcome": "success" if success else "fail",
+            "final_outcome": history[-1].outcome if history else "empty",
+            "steps": [
+                {"node": step.node, "outcome": step.outcome, "metadata": step.metadata}
+                for step in history
+            ],
+            "cost": {"api_calls": api_calls, "tokens": tokens},
+        }
+        print(json.dumps(payload, indent=2))
+        return 0 if success else 1
+    except Exception as exc:
+        payload = {
+            "subcommand": "run",
+            "status": "fail",
+            "outcome": "error",
+            "final_outcome": "error",
+            "error": type(exc).__name__,
+            "message": str(exc),
+            "cost": {"api_calls": 0, "tokens": 0},
+        }
+        print(json.dumps(payload, indent=2))
+        return 1
 
 
 def cmd_list_handlers(_: argparse.Namespace) -> int:
@@ -188,59 +214,69 @@ def cmd_list_handlers(_: argparse.Namespace) -> int:
 
 
 def cmd_score(_: argparse.Namespace) -> int:
-    started = time.monotonic()
-    build = subprocess.run(
-        [sys.executable, "-m", "compileall", "-q", str(ROOT / "runner")],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    tests = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/", "-q", "--ignore=tests/test_conformance.py"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-    validation = subprocess.run(
-        [sys.executable, str(ROOT / "bin" / "conformance"), "validate"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    runtime = subprocess.run(
-        [sys.executable, str(ROOT / "bin" / "conformance"), "run", "pipelines/factory/hello.dot"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    elapsed = time.monotonic() - started
-    passed = build.returncode == tests.returncode == validation.returncode == runtime.returncode == 0
-    payload = {
-        "subcommand": "score",
-        "status": "pass" if passed else "fail",
-        "scope": "local_mock",
-        "build": {"status": "pass" if build.returncode == 0 else "fail", "returncode": build.returncode},
-        "self_test": {"status": "pass" if tests.returncode == 0 else "fail", "returncode": tests.returncode},
-        "conformance": {"status": "pass" if validation.returncode == 0 else "fail", "returncode": validation.returncode},
-        "runtime": {"status": "pass" if runtime.returncode == 0 else "fail", "returncode": runtime.returncode},
-        "tiers": {
-            "local_mock": "pass" if passed else "fail",
-            "sealed_benchmark": "not_run",
-            "generated_attractorbench": "not_run",
-        },
-        "cost": {"api_calls": 0, "tokens": 0},
-        "runtime_seconds": round(elapsed, 3),
-    }
-    print(json.dumps(payload, indent=2))
-    return 0 if payload["status"] == "pass" else 1
+    try:
+        started = time.monotonic()
+        build = subprocess.run(
+            [sys.executable, "-m", "compileall", "-q", str(ROOT / "runner")],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        tests = subprocess.run(
+            [sys.executable, "-m", "pytest", "tests/", "-q", "--ignore=tests/test_conformance.py"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        validation = subprocess.run(
+            [sys.executable, str(ROOT / "bin" / "conformance"), "validate"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        runtime = subprocess.run(
+            [sys.executable, str(ROOT / "bin" / "conformance"), "run", "pipelines/factory/hello.dot"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        elapsed = time.monotonic() - started
+        passed = build.returncode == tests.returncode == validation.returncode == runtime.returncode == 0
+        payload = {
+            "subcommand": "score",
+            "status": "pass" if passed else "fail",
+            "scope": "local_mock",
+            "build": {"status": "pass" if build.returncode == 0 else "fail", "returncode": build.returncode},
+            "self_test": {"status": "pass" if tests.returncode == 0 else "fail", "returncode": tests.returncode},
+            "conformance": {"status": "pass" if validation.returncode == 0 else "fail", "returncode": validation.returncode},
+            "runtime": {"status": "pass" if runtime.returncode == 0 else "fail", "returncode": runtime.returncode},
+            "tiers": {
+                "local_mock": "pass" if passed else "fail",
+                "sealed_benchmark": "not_run",
+                "generated_attractorbench": "not_run",
+            },
+            "cost": {"api_calls": 0, "tokens": 0},
+            "runtime_seconds": round(elapsed, 3),
+        }
+        print(json.dumps(payload, indent=2))
+        return 0 if payload["status"] == "pass" else 1
+    except Exception as exc:
+        payload = {
+            "subcommand": "score",
+            "status": "fail",
+            "error": type(exc).__name__,
+            "message": str(exc),
+        }
+        print(json.dumps(payload, indent=2))
+        return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -258,6 +294,7 @@ def main(argv: list[str] | None = None) -> int:
     run_cmd.add_argument("--feature", default="hello")
     run_cmd.add_argument("--workdir", type=pathlib.Path, default=ROOT)
     run_cmd.add_argument("--max-steps", type=int, default=100)
+    run_cmd.add_argument("--mock-url")
     run_cmd.set_defaults(func=cmd_run)
     sub.add_parser("list-handlers").set_defaults(func=cmd_list_handlers)
     sub.add_parser("score").set_defaults(func=cmd_score)

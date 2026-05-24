@@ -84,3 +84,15 @@ def test_conformance_score_is_deterministic_mock_surface():
     assert payload["scope"] == "local_mock"
     assert payload["tiers"]["sealed_benchmark"] == "not_run"
     assert payload["cost"] == {"api_calls": 0, "tokens": 0}
+
+
+def test_conformance_run_supports_mock_url():
+    proc = _run_conformance("run", "pipelines/factory/hello.dot", "--mock-url", "http://127.0.0.1:54321")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["status"] == "success"
+    
+    plan_step = next(s for s in payload["steps"] if s["node"] == "plan")
+    impl_step = next(s for s in payload["steps"] if s["node"] == "implement")
+    assert plan_step["outcome"] == "failure"
+    assert impl_step["outcome"] == "failure"

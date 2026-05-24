@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from .parser import Node
+from .parser import Node, is_start_node, is_exit_node
 
 
 @dataclass
@@ -219,6 +219,56 @@ def _codergen(node: Node, ctx: Context) -> Result:
         # values) and round-trips cleanly through the CXDB JSON column.
         meta = {k: ("" if v is None else str(v)) for k, v in metrics.items()}
         return Result(outcome="success", output=prompt_text, metadata=meta)
+
+    if ctx.backend == "mock_llm":
+        mock_url = str(ctx.state.get("mock_url", "")).rstrip("/")
+        endpoint = f"{mock_url}/responses" if "/responses" not in mock_url else mock_url
+        import urllib.request
+        payload = json.dumps({"model": "gpt-4o", "input": prompt_text}).encode("utf-8")
+        req = urllib.request.Request(
+            endpoint,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer test-key"
+            },
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                resp_data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            return Result(outcome="failure", output=f"mock LLM error: {e}")
+
+        output_parts = resp_data.get("output", [])
+        content_text = ""
+        if output_parts and isinstance(output_parts, list):
+            part = output_parts[0]
+            if "content" in part and isinstance(part["content"], list):
+                content_text = part["content"][0].get("text", "")
+            elif "content" in part and isinstance(part["content"], str):
+                content_text = part["content"]
+        if not content_text:
+            choices = resp_data.get("choices", [])
+            if choices and isinstance(choices, list):
+                msg = choices[0].get("message", {})
+                content_text = msg.get("content", "")
+            else:
+                content_text = json.dumps(resp_data)
+
+        usage = resp_data.get("usage", {})
+        input_tokens = usage.get("input_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0)
+        total_tokens = usage.get("total_tokens", 0)
+        wall_ms = int((time.monotonic() - _start_ts) * 1000)
+        meta = {
+            "api_calls": "1",
+            "input_tokens": str(input_tokens),
+            "output_tokens": str(output_tokens),
+            "total_tokens": str(total_tokens),
+            "wall_ms": str(wall_ms),
+        }
+        return Result(outcome="success", output=content_text, metadata=meta)
 
     if ctx.backend == "ao":
         project = ctx.state.get("ao.project")
@@ -666,7 +716,7 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
         # echo path does not call out to a subprocess so SHA binding is not
         # applicable — tests that exercise SHA binding must use the claude
         # backend with a fake binary on PATH.
-        if ctx.backend == "echo":
+        if ctx.backend in ("echo", "mock_llm"):
             hint = ctx.state.get(f"{node.name}.outcome", "success")
             return Result(
                 outcome=hint,
@@ -904,9 +954,9 @@ def resolve(node: Node) -> Handler:
     t = node.attrs.get("type")
     if t and t in TYPE_REGISTRY:
         return TYPE_REGISTRY[t]
-    if node.name == "start":
+    if is_start_node(node):
         return _start
-    if node.name == "exit":
+    if is_exit_node(node):
         return _exit
     s = node.shape
     if s in REGISTRY:
