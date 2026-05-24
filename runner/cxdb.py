@@ -110,6 +110,66 @@ class CXDB:
         )
         self._conn.commit()
 
+    def cluster_aggregates(
+        self, node: str, outcome: str, output_hash: str
+    ) -> dict:
+        """Sum tokens / cost / wall_ms across every row in a failure cluster.
+
+        Used by the Healer to surface aggregate cost columns per cluster.
+        Each row's `metadata_json` is decoded and the numeric metric keys are
+        summed. Missing or unparseable values are simply skipped — they do not
+        contribute and they do not raise.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            SELECT metadata_json FROM steps
+            WHERE node = ? AND outcome = ? AND output_hash = ?
+            """,
+            (node, outcome, output_hash),
+        )
+        total_tokens = 0
+        total_cost_usd = 0.0
+        total_wall_ms = 0
+        saw_any = False
+        for (raw,) in cur.fetchall():
+            try:
+                meta = json.loads(raw or "{}")
+            except (TypeError, ValueError):
+                continue
+            for key, target in (
+                ("tokens_in", "_in"),
+                ("tokens_out", "_out"),
+                ("tokens_total", "_tot"),
+            ):
+                v = meta.get(key)
+                if v in (None, ""):
+                    continue
+                try:
+                    total_tokens += int(v)
+                    saw_any = True
+                except (TypeError, ValueError):
+                    pass
+            cost = meta.get("cost_usd")
+            if cost not in (None, ""):
+                try:
+                    total_cost_usd += float(cost)
+                    saw_any = True
+                except (TypeError, ValueError):
+                    pass
+            wall = meta.get("wall_ms")
+            if wall not in (None, ""):
+                try:
+                    total_wall_ms += int(wall)
+                    saw_any = True
+                except (TypeError, ValueError):
+                    pass
+        return {
+            "total_tokens": total_tokens if saw_any else None,
+            "total_cost_usd": total_cost_usd if saw_any else None,
+            "total_wall_ms": total_wall_ms if saw_any else None,
+        }
+
     def failed_steps(self) -> Iterable[sqlite3.Row]:
         cur = self._conn.cursor()
         cur.row_factory = sqlite3.Row

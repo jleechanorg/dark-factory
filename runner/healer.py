@@ -24,6 +24,11 @@ class Cluster:
     hits: int
     sample: str
     run_ids: list[str]
+    # Aggregate cost columns (orch-qhez). Each may be None when no member row
+    # of the cluster recorded the corresponding metric — distinct from zero.
+    total_tokens: Optional[int] = None
+    total_cost_usd: Optional[float] = None
+    total_wall_ms: Optional[int] = None
 
     # Heuristic over the Healer's own node-name namespace (not user/model
     # input), so prefix matching here is internal data routing, not ZFC.
@@ -58,6 +63,9 @@ def _clusters(cxdb_path: pathlib.Path) -> list[Cluster]:
     rows = db.failed_steps()
     out: list[Cluster] = []
     for row in rows:
+        agg = db.cluster_aggregates(
+            row["node"], row["outcome"], row["output_hash"]
+        )
         out.append(
             Cluster(
                 node=row["node"],
@@ -66,10 +74,21 @@ def _clusters(cxdb_path: pathlib.Path) -> list[Cluster]:
                 hits=row["hits"],
                 sample=(row["sample"] or "")[:280],
                 run_ids=(row["run_ids"] or "").split(","),
+                total_tokens=agg["total_tokens"],
+                total_cost_usd=agg["total_cost_usd"],
+                total_wall_ms=agg["total_wall_ms"],
             )
         )
     db.close()
     return out
+
+
+def _fmt(value) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value)
 
 
 def report(cxdb_path: pathlib.Path) -> str:
@@ -83,12 +102,21 @@ def report(cxdb_path: pathlib.Path) -> str:
         f"Source CXDB: `{cxdb_path}`",
         f"Failure clusters: **{len(clusters)}**",
         "",
-        "| Hits | Node | Outcome | Hash | Prescription |",
-        "|-----:|------|---------|------|--------------|",
+        "| Hits | Node | Outcome | Hash | Total tokens | Total cost (USD) | Total wall (ms) | Prescription |",
+        "|-----:|------|---------|------|-------------:|-----------------:|----------------:|--------------|",
     ]
     for c in clusters:
         lines.append(
-            f"| {c.hits} | `{c.node}` | `{c.outcome}` | `{c.output_hash}` | {c.prescription()} |"
+            "| {hits} | `{node}` | `{outcome}` | `{hash}` | {tok} | {cost} | {wall} | {rx} |".format(
+                hits=c.hits,
+                node=c.node,
+                outcome=c.outcome,
+                hash=c.output_hash,
+                tok=_fmt(c.total_tokens),
+                cost=_fmt(c.total_cost_usd),
+                wall=_fmt(c.total_wall_ms),
+                rx=c.prescription(),
+            )
         )
     lines.append("")
     lines.append("## Sample output (per cluster, first 280 chars)")
