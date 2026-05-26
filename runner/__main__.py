@@ -54,6 +54,13 @@ def main(argv: list[str] | None = None) -> int:
             "per-step files, single-run CXDB extract). Requires --cxdb."
         ),
     )
+    p.add_argument(
+        "--state",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Pre-seed ctx.state; repeatable. E.g. --state slim.test_command=true",
+    )
     args = p.parse_args(argv)
 
     if args.evidence_bundle is not None and args.cxdb is None:
@@ -70,6 +77,11 @@ def main(argv: list[str] | None = None) -> int:
         backend=args.backend,
         cxdb_path=args.cxdb,
     )
+    for kv in args.state:
+        if "=" not in kv:
+            p.error(f"--state requires KEY=VALUE format, got: {kv!r}")
+        k, v = kv.split("=", 1)
+        ctx.state[k] = v
     if args.feature:
         ctx.state["feature"] = args.feature
     if args.backend == "ao":
