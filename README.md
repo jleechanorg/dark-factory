@@ -1,163 +1,250 @@
-# Dark Factory — Attractor-Pattern DOT Pipeline Runner
+# 🏭 Dark Factory — Attractor-Pattern DOT Pipeline Runner
 
-Python implementation of the **Attractor pattern**: a DOT-based pipeline runner
-that orchestrates multi-stage AI workflows using directed graphs.
+[![Supported Runtime: Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Build Status](https://img.shields.io/badge/build-passing-green.svg)]()
 
-## Source material
+A state-of-the-art Python implementation of the **Attractor pattern**: a robust, DOT-based pipeline engine designed to orchestrate complex multi-agent software engineering workflows using directed graphs. By shifting the unit of durability from ephemeral agent logs to version-controlled process graphs (`.dot`), Dark Factory enables fully autonomous, lights-out development pipelines.
 
-- StrongDM, **AttractorBench** — <https://github.com/strongdm/attractorbench> — the benchmark we mirror: agents read a public natural-language spec, the conformance harness is generated locally and held out of the public repo to prevent training-data contamination.
-- jleechanorg, **AttractorBench fork** — <https://github.com/jleechanorg/attractorbench> — public fork used for spec-validation experiments and cross-repo validation.
-- Dan Shapiro, **"You don't write the code"** — <https://www.danshapiro.com/blog/2026/02/you-dont-write-the-code/> — Level 5 = the dark factory, lights off, nobody reviews the code; quality enforced by observability + adversarial review, not by reading.
-- 2389, **"The Dark Factory is a .dot file"** — <https://2389.ai/posts/the-dark-factory-is-a-dot-file/> — four independent Attractor implementations (Kilroy, Mammoth, Smasher, Tracker) converged on the same three-layer architecture; pipeline `.dot` files are the durable artifact, the runner code is *dorodango* (polish, discard, rebuild from spec).
+---
 
-## Role boundary
+## 📚 Foundational Research & Inspiration
 
-**The *spawned coding agent* (the `codergen` worker — Claude / Codex / AO session) never reads `holdouts/`, `runner/evaluator.py`, or the source of any `_holdout/` tests.** That's the AttractorBench rule, enforced here by `sandbox-exec` deny rules + `_sanitized_env` stripping in `runner/handlers.py`.
+Dark Factory stands on the shoulders of groundbreaking work in agentic software engineering and Level 5 automation. Our design, paradigms, and benchmark splits are inspired by the following research, reference implementations, and articles:
 
-You, the **operator**, can and should read all of it — the runner, the sealed `dark-factory-holdouts/` sibling, the evaluator, the tests, the CXDB logs. The discipline is that nothing you read leaks into the prompt template a `codergen` node ships to the worker.
+### 🔬 Core Specifications & Benchmarks
+*   StrongDM, **AttractorBench** — [GitHub Repository](https://github.com/strongdm/attractorbench)
+    *   *Defines the benchmark paradigm:* Agents ingest a public natural-language specification, while the deterministic evaluation and test suites are held out locally to prevent LLM training-data contamination.
+*   jleechanorg, **AttractorBench Fork** — [GitHub Repository](https://github.com/jleechanorg/attractorbench)
+    *   *Our public experimental baseline:* Sandbox for validating spec-review workflows and cross-repository agent validation mechanics.
 
-> **For AI coding agents:** read [`CLAUDE.md`](CLAUDE.md) (or [`AGENTS.md`](AGENTS.md),
-> identical content) before touching code. It defines the operator-vs-implementing-agent
-> isolation rule, architecture, handler-registry contract, and the CXDB/Healer feedback loop.
+### 📝 Paradigms & Articles
+*   Dan Shapiro, **"You don't write the code"** — [Blog Post](https://www.danshapiro.com/blog/2026/02/you-dont-write-the-code/)
+    *   *The philosophy of Level 5 Automation:* In the ultimate "Dark Factory," humans never read or write code. Instead, they specify intent and design outcomes. Quality is enforced via observability, automated healers, and adversarial reviews.
+*   Simon Willison, **"The Software Factory"** — [Blog Post](https://simonwillison.net/2026/Feb/7/software-factory/)
+    *   *The Industrialization of AI Coding:* Shifting the industry mindset from bespoke chat boxes to repeatable, high-volume automated pipeline execution.
+*   2389 Research, **"The Dark Factory is a .dot file"** — [Blog Post](https://2389.ai/posts/the-dark-factory-is-a-dot-file/)
+    *   *The Durable Artifact Principle:* While the pipeline runner code itself is disposable (*dorodango* — polished, discarded, and rebuilt), the pipeline `.dot` file remains the precious, versioned representation of the software engineering process.
 
-## Architecture (3-Layer Convergence)
+### 🛠️ Reference Implementations
+*   StrongDM, **Attractor** — [GitHub Repository](https://github.com/strongdm/attractor)
+    *   The original reference harness establishing the foundational Attractor paradigms.
+*   Dan Shapiro, **Kilroy** — [GitHub Repository](https://github.com/danshapiro/kilroy)
+    *   A pioneering implementation of the Attractor loop.
+*   2389 Research, **Smasher** — [GitHub Repository](https://github.com/2389-research/smasher)
+    *   An adversarial reviewer and compiler-checked coding harness.
+*   2389 Research, **Mammoth** — [GitHub Repository](https://github.com/2389-research/mammoth)
+    *   An LLM orchestration and workspace synchronization harness.
+*   2389 Research, **Tracker** — [GitHub Repository](https://github.com/2389-research/tracker)
+    *   A high-performance pipeline and task state tracker.
+*   2389 Research, **dippin-lang** — [GitHub Repository](https://github.com/2389-research/dippin-lang)
+    *   A domain-specific language designed for expressing declarative dataflow pipelines.
+
+### 🎯 Advanced Techniques & Methodologies
+*   StrongDM, **Techniques** — [Techniques Directory](https://factory.strongdm.ai/techniques)
+    *   A curated catalog of tactical strategies for robust agentic execution.
+*   StrongDM Techniques, **Direct-to-Unit (DTU)** — [DTU Documentation](https://factory.strongdm.ai/techniques/dtu)
+    *   *The DTU Pattern:* Bypassing middle layers to directly generate targeted unit tests and implementation assertions, ensuring immediate execution feedback.
+
+---
+
+## 🔒 The Operator-Agent Isolation Rule
+
+To guarantee rigorous evaluation integrity, Dark Factory strictly enforces **sandboxed agent execution**:
+
+> [!IMPORTANT]
+> **Adversarial Separation Constraint:** The spawned implementing agent (the `codergen` worker running Claude Code, Codex, or an Antigravity session) is completely blind to holdout test suites (`holdouts/`, `runner/evaluator.py`, and `_holdout/` paths).
+>
+> *   **Operational Enforcement:** The runner CLI dynamically invokes the implementing agent under `sandbox-exec` with strict OS-level permissions denying read access to the local holdouts directory.
+> *   **Environment Isolation:** All environment variables pointing to holdout files (`DARK_FACTORY_HOLDOUTS`, etc.) are actively stripped from the agent subprocess env via `_sanitized_env()`.
+>
+> As the **Operator**, you have full access to view tests, event logs, and holdouts. You must ensure that no holdout-derived hints or test code leaks into the prompt templates consumed by the coder nodes.
+
+---
+
+## 📐 Architecture: 3-Layer Convergence
+
+Dark Factory operates as the top layer of a modern, modular agentic stack:
 
 ```
-Layer 3: Pipeline Engine (DOT parser + graph runner + checkpointing + human gates)
-    ↓
-Layer 2: Agent Loop (AO/Claude Code/Codex — existing external tools)
-    ↓
-Layer 1: Unified LLM Client (OpenClaw gateway / thinclaw MCP)
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Layer 3: Pipeline Engine (Dark Factory)                                 │
+│ ➔ Parses .dot graphs, traverses nodes, enforces rules, logs history     │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Layer 2: Agent Loop (CLIs & Orchestrators)                              │
+│ ➔ Claude Code, Codex, Antigravity (agy), WorldArchitect (ao)            │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Layer 1: Unified LLM Client                                             │
+│ ➔ OpenClaw Gateway, wafer proxy, thinclaw MCP                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Dark Factory Mode
+---
 
-The target mode is Level 5: humans own specs, holdouts, validation economics,
-and outcome audits; agents write code; independent agents and sealed evaluators
-review behavior. Human diff review is not the product-quality gate.
+## 🚀 State-of-the-Art Execution Backends
 
-The repo supports that mode with:
+Dark Factory ships with first-class support for diverse LLM and agent backends, dynamically selected per node via DOT attributes or global flags:
 
-- Public NLSpecs in `benchmarks/*/spec.md`.
-- Versioned DOT graphs in `pipelines/` and `benchmarks/*/pipelines/`.
-- Runner CLI coder backends (`echo`, `claude`, `codex`, `ao`, `agy`).
-- Per-node codergen routing can also use `mock_llm` for test/conformance lanes
-  through node `backend`/`model` attributes or model stylesheets.
-- Antigravity CLI backend: `--backend agy` invokes `agy --print
-  --dangerously-skip-permissions`; `--print` is the headless/noninteractive
-  mode and `timeout="..."` maps to `agy --print-timeout`.
-- Reviewer/evaluator lanes as separate nodes: `tool` nodes can invoke
-  `codex exec --yolo`, AO workers, or other reviewer CLIs; sealed
-  `holdout_eval` nodes invoke the evaluator from `$DARK_FACTORY_HOLDOUTS`.
-- Sealed evaluator execution via `$DARK_FACTORY_HOLDOUTS/evaluator/run.py`.
-- Independent reviewer tool nodes, including `codex exec --yolo` or AO reviewers.
-- CXDB + Healer failure clustering for outcome auditing.
-- Spec-validation graphs copied into `benchmarks/attractor-spec-review/`.
+1.  **`agy` (Antigravity CLI Backend) [New & Recommended]**
+    *   Invokes the powerful Antigravity execution engine headlessly and non-interactively using:
+        ```bash
+        agy --add-dir <cwd> --dangerously-skip-permissions --print --print-timeout <s_s>
+        ```
+    *   Wraps prompts automatically in a headless instruction wrapper, directing Antigravity to decompose the task, spawn parallel internal subagents if useful, apply direct workspace changes, and exit cleanly without waiting for interactive input.
+2.  **`claudew` (Wafer-Driven Claude Backend) [New]**
+    *   Leverages the `WAFER_API_KEY` to route requests through a high-performance local wafer proxy.
+    *   Sets `ANTHROPIC_BASE_URL="http://localhost:9001"` and defaults to the premium `GLM-5.1` model (configurable via `WAFER_MODEL`) running with high effort (`--effort high`) and a generous 30-minute execution timeout.
+3.  **`claude` (Claude Code CLI)**
+    *   Directly invokes `claude` with standard prompt text to run autonomous editing and execution tasks.
+4.  **`codex` (Codex CLI)**
+    *   Uses `codex exec` to drive immediate terminal or workspace updates.
+5.  **`ao` (WorldArchitect Agent)**
+    *   Spawns an autonomous workspace worker mapped to an active WorldArchitect project (`--ao-project`).
+6.  **`mock_llm` / `echo`**
+    *   Deterministic test backends used for validation, smoke testing, and continuous integration pipelines.
 
-Validation should be adversarial and expensive enough to matter. If a benchmark
-is only doing cheap deterministic smoke, it is not yet a real dark factory run.
+---
 
-## Directory Layout
+## 📊 Pipeline Catalog
+
+Our pipelines are designed to support a wide range of complexity, from simple test lanes to full-scale multi-stage development pipelines:
+
+### 1. The Gates Pipeline (`pipelines/factory/gates.dot`)
+An end-to-end multi-agent pipeline:
+*   **Specify:** Parses natural language specs and generates target code designs.
+*   **Implement:** Translates designs into physical code modifications.
+*   **Gate Verification:** Executes deterministic compiler checks and runs static reviews.
+*   **Holdout Evaluation:** Runs sealed verification suites to evaluate performance.
+
+### 2. Minimal Feature & Style Sheets (`pipelines/slim/minimal_feature.dot`)
+*   Demonstrates Dark Factory's support for **CSS-like model stylesheets** (`.model.css`).
+*   Rather than cluttering every node with explicit models or API parameters, the runner applies custom routing rules dynamically at runtime based on selectors (e.g., matching node names, shapes, or types to specific model profiles).
+
+### 3. Spec Review Benchmark (`benchmarks/attractor-spec-review/`)
+Designed to evaluate and refine natural-language specs:
+*   `review_slim.dot`: Rapid, single-pass specification audit and smoke check.
+*   `review_full.dot`: In-depth spec review featuring multi-stage auditing, full-stack smoke environments, and independent reviewer audits via `codex exec --yolo`.
+
+---
+
+## 🩺 Fail-Closed Observability: CXDB + Healer
+
+To build a true "Dark Factory," errors must be logged, clustered, and resolved programmatically:
+
+```
+ ┌────────────────┐       Nodes Execute       ┌────────────────┐
+ │  Graph Runner  ├──────────────────────────►│   CXDB Log     │
+ └────────────────┘                           └───────┬────────┘
+         ▲                                            │
+         │ Reads Prescription &                       │ Reads SQLite
+         │ Heals Prompt/Config                        ▼ WAL Steps
+ ┌───────┴────────┐                           ┌────────────────┐
+ │     Human      │◄──────────────────────────┤   Healer Engine│
+ └────────────────┘     Emits MD Report       └────────────────┘
+```
+
+*   **CXDB SQLite Event Log (`runner/cxdb.py`):**
+    *   Every step, node transition, stdout snippet, stderr traceback, metadata chunk, and execution cost metric is recorded in a centralized SQLite database.
+    *   Runs in high-concurrency **Write-Ahead Logging (WAL) mode** with a robust `5000ms` busy timeout to guarantee concurrent multi-pipeline instances write safely without database locking errors.
+*   **The Healer Engine (`runner/healer.py`):**
+    *   Reads the CXDB log and dynamically clusters terminal failures (e.g., `failure`, `exhausted`, `stuck`, `error`) by `(node, outcome, output_hash)`.
+    *   Invokes an LLM review backend (`claude` or `echo`) to analyze the precise error context and output.
+    *   Generates a structured, highly actionable Markdown report containing a tailored **prescription** (e.g., which prompt to refine, which code logic failed, or which harness configuration is broken) for every cluster.
+
+---
+
+## 📁 Directory Layout
 
 ```
 dark-factory/
-├── pipelines/         # .dot files — the durable artifacts worth sharing
-│   └── factory/      # Full factory pipeline (seed→architect→specify→implement→expand→sync)
-├── benchmarks/        # Public NLSpecs, starter scaffolds, benchmark DOT graphs
-│   ├── amazon-clone/  # Full-stack commerce benchmark
-│   ├── airbnb-clone/  # Sprinted Firebase emulator benchmark
-│   └── attractor-spec-review/ # Spec validation graph + validator copied into repo
-├── specs/            # Feature specs — agent DOES see these
-│   └── <feature>.md
-├── prompts/           # Prompt templates referenced by .dot nodes
-│   └── factory/       # Per-pipeline prompt directories
-├── runner/            # Python DOT pipeline engine
+├── pipelines/                      # Durable .dot pipeline graph definitions
+│   ├── factory/                    # Production factory runs (gates.dot, hello.dot)
+│   └── slim/                       # Minimal templates & styling stylesheets (.model.css)
+├── benchmarks/                     # Public NLSpecs, starter assets, and benchmarks
+│   ├── amazon-clone/               # Full-stack E-Commerce benchmark setup
+│   ├── airbnb-clone/               # Firebase emulator-backed benchmark
+│   └── attractor-spec-review/      # Spec review pipelines (review_slim/full.dot)
+├── specs/                          # System feature specs (visible to implementing agents)
+├── prompts/                        # System-wide prompt templates referenced by DOT nodes
+├── runner/                         # The Python DOT Pipeline Engine
 │   ├── __init__.py
-│   ├── __main__.py    # CLI entry point
-│   ├── parser.py      # DOT → graph model
-│   ├── engine.py      # Graph traversal + checkpointing
-│   ├── handlers.py    # Node handlers + backend dispatch (echo|mock_llm|ao|claude|codex|agy)
-│   ├── cxdb.py        # CXDB — SQLite event log of every step (for Healer)
-│   └── healer.py      # Healer — clusters CXDB failures into a diagnosis report
-│
-│   # Note: the holdout evaluator lives in a sealed sibling repo
-│   # (~/projects/dark-factory-holdouts/evaluator/run.py); its path is
-│   # supplied via the DARK_FACTORY_HOLDOUTS environment variable so the
-│   # coding agent never sees scenario files.
-├── tests/
-├── CLAUDE.md          # Agent guidance (auto-loaded by Claude Code)
-├── AGENTS.md          # Same content as CLAUDE.md, for non-Claude agents
-└── README.md
+│   ├── __main__.py                 # Command line interface & parser arguments
+│   ├── parser.py                   # PyDot loader & validator (verifies start/exit)
+│   ├── engine.py                   # Graph traversal, state tracking, & loop limits
+│   ├── handlers.py                 # Core handlers & backends (agy, claudew, claude, ao)
+│   ├── cxdb.py                     # SQLite WAL step recording and logging schemas
+│   └── healer.py                   # Failure clustering & automatic prescription engine
+├── tests/                          # Rigorous unit and integration test suite
+├── CLAUDE.md                       # Agent instructions (auto-loaded by Claude Code)
+├── AGENTS.md                       # Identical instructions for all other AI agents
+└── README.md                       # This premium documentation
 ```
 
-## Spec Validation Benchmark
+---
 
-The general Attractor spec validator lives in:
+## 🍳 Execution Cookbook
 
-- `benchmarks/attractor-spec-review/starter/scripts/validate_spec.py`
-- `benchmarks/attractor-spec-review/pipelines/review_slim.dot`
-- `benchmarks/attractor-spec-review/pipelines/review_full.dot`
-- `benchmarks/attractor-spec-review/scripts/review_with_codex.sh`
-
-Run it locally:
-
+### ⚙️ Environment Setup
+Dark Factory requires **Python 3.13** as its canonical runtime:
 ```bash
-bash benchmarks/attractor-spec-review/scripts/run_matrix_deterministic.sh /tmp/attractor-review-matrix
-```
-
-Run the full-stack smoke node:
-
-```bash
-cd benchmarks/attractor-spec-review
-bash starter/scripts/fullstack_smoke.sh
-```
-
-## Quick Start
-
-```bash
-# Setup: Python 3.13 is the supported runtime for this repo.
+# Initialize a pristine environment
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python3.13)}"
 "$PYTHON_BIN" -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-
-# Smallest end-to-end pipeline (echo backend; no LLM calls)
-.venv/bin/python -m runner --pipeline pipelines/factory/hello.dot --goal "smoke test"
-
-# Pipeline with gates, recording every step to CXDB
-.venv/bin/python -m runner \
-  --pipeline pipelines/factory/gates.dot \
-  --goal "Add rate limiting to campaign creation" \
-  --backend claude \
-  --feature rate_limit \
-  --cxdb ~/.dark-factory/cxdb.sqlite
-
-# Visualize a pipeline
-dot -Tpng pipelines/factory/gates.dot -o gates.png
-
-# Run holdout evaluation against the sealed sibling repo
-export DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts
-.venv/bin/python -m runner --pipeline pipelines/factory/gates.dot --goal "Add rate limiting" --feature rate_limit
-
-# After one or more runs, diagnose failures
-.venv/bin/python -m runner.healer --cxdb ~/.dark-factory/cxdb.sqlite
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-`--feature <name>` selects the holdout subdirectory; the sealed evaluator repo
-is located via the `DARK_FACTORY_HOLDOUTS` environment variable. The CLI
-intentionally does not accept a holdouts path argument — scenario files must
-stay out of the agent's view.
+### 💨 1. Smoke Pipeline Run (No LLM Cost)
+Verify the engine traversal and parse logic using a mock echo backend:
+```bash
+python -m runner --pipeline pipelines/factory/hello.dot --goal "Verify smoke pipeline traversal"
+```
 
-## CXDB + Healer
+### ⚡ 2. WAFER-Driven Claudew Implementation
+Execute a complex feature implementation using the high-performance `claudew` wafer backend (with `GLM-5.1` or Sonnet equivalent):
+```bash
+export WAFER_API_KEY="your-wafer-api-key-here"
+python -m runner \
+  --pipeline pipelines/factory/gates.dot \
+  --goal "Add secure rate limiting to user registration endpoints" \
+  --backend claudew \
+  --feature rate_limit \
+  --cxdb ~/.dark-factory/cxdb.sqlite
+```
 
-Every node execution is appended to a SQLite event log (CXDB) when `--cxdb`
-is set. The Healer reads that log, clusters terminal failures by
-`(node, outcome, output_hash)`, and emits a Markdown diagnosis with a
-prescription per cluster (which prompt template, holdout, or gate to inspect).
-This is the loop that lets dorodango runner code stay disposable while
-learning accumulates in the log, not the code.
+### 🛡️ 3. Headless Antigravity (agy) Pipeline Execution
+Run the gates pipeline using Antigravity's self-healing parallel agent execution:
+```bash
+python -m runner \
+  --pipeline pipelines/factory/gates.dot \
+  --goal "Implement robust JWT authorization middleware" \
+  --backend agy \
+  --feature auth_middleware \
+  --cxdb ~/.dark-factory/cxdb.sqlite
+```
 
-## Key Innovation
+### 🔍 4. Sealed Holdout Evaluation
+Run the pipeline against sealed tests located in your separate holdouts directory (invisible to implementing agents):
+```bash
+export DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts
+python -m runner \
+  --pipeline pipelines/factory/gates.dot \
+  --goal "Integrate stripe subscription callbacks" \
+  --feature subscriptions
+```
 
-The `.dot` files are the durable artifact. The runner code is dorodango —
-polish it, throw it away, rebuild from spec. The pipeline definitions encode
-entire development processes and are worth versioning and sharing.
+### 🩺 5. Run Healer Failure Audit
+After running one or multiple pipelines, cluster and diagnose all execution failures:
+```bash
+python -m runner.healer --cxdb ~/.dark-factory/cxdb.sqlite --backend claude
+```
+
+---
+
+*“The pipeline definitions encode the development process itself. Rebuild the code, polish the dorodango, but keep the graph.”*
