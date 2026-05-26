@@ -956,9 +956,15 @@ def _tcp_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
 def _holdout_eval(node: Node, ctx: Context) -> Result:
     """Run the sealed holdout evaluator in a separate process.
 
-    Random port allocation per run to avoid conflicts when running multiple benchmarks.
+    Infrastructure invariants (see memory/feedback_2026-05-24_holdout_eval_emulator_infra.md):
+    1. Java on PATH for Firebase emulators (Homebrew openjdk path).
+    2. Poll TCP ports, don't sleep — wait for all emulators to be ready.
+    3. Kill process GROUP on cleanup, not just the wrapper process.
+    4. Strip real GCP credentials from env so Cloud Functions emulator uses local project.
+    5. Pre-clean emulator ports before launching to kill stale JVM holders.
+    6. Run seed script (impl/scripts/seed.ts or npm run seed) after emulators are ready.
     """
-    import random, time
+    import random
 
     repo_path = _holdouts_repo_path()
     node_feature = node.attrs.get("feature")
@@ -990,7 +996,20 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
         return Result(outcome="failure", output=f"implementation missing: {impl}")
 
     port = random.randint(30001, 30999)
+
+    # Build eval env: inherit current environment...
     eval_env = dict(os.environ)
+
+    # Fix 1 — Java PATH: prepend Homebrew openjdk so Firebase emulators can find java.
+    homebrew_java = "/opt/homebrew/opt/java/bin"
+    if os.path.isdir(homebrew_java):
+        eval_env["PATH"] = homebrew_java + ":" + eval_env.get("PATH", "")
+        eval_env["JAVA_HOME"] = "/opt/homebrew/opt/java"
+
+    # Fix 4 — Strip real GCP credentials: Cloud Functions emulator must use local project.
+    for gcp_var in ("GOOGLE_APPLICATION_CREDENTIALS", "GCLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT"):
+        eval_env.pop(gcp_var, None)
+
     eval_env["BENCHMARK_PORT"] = str(port)
     # Strip real GCP credentials so Firebase emulators don't try to reach
     # production — they should use emulator-local auth only.
@@ -1011,6 +1030,7 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
     if has_make_run:
         env_p = dict(eval_env)
         env_p["PORT"] = str(port)
+        # Fix 3 — start_new_session=True so we can killpg the whole JVM tree.
         server_proc = subprocess.Popen(
             ["make", "run"], cwd=str(impl), env=env_p,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
