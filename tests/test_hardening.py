@@ -269,6 +269,20 @@ def test_prompt_references_cannot_escape_workdir():
     assert "invalid prompt" in text
 
 
+def test_prompt_references_allow_absolute_prompt_path(tmp_path):
+    prompt_file = tmp_path / "absolute_prompt.md"
+    prompt_file.write_text("Print exactly: done")
+
+    node = Node(
+        name="implement",
+        attrs={"prompt": f"@{prompt_file}"},
+    )
+    ctx = Context(goal="short", workdir=ROOT, backend="echo")
+    text = _render_prompt(node, ctx)
+
+    assert text == "Print exactly: done"
+
+
 def test_sanitized_env_strips_holdout_paths(monkeypatch):
     monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", "/secret/holdouts")
     monkeypatch.setenv("SOME_HOLDOUT_TOKEN", "secret")

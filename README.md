@@ -40,9 +40,12 @@ The repo supports that mode with:
 
 - Public NLSpecs in `benchmarks/*/spec.md`.
 - Versioned DOT graphs in `pipelines/` and `benchmarks/*/pipelines/`.
-- Runner CLI coder backends (`echo`, `claude`, `codex`, `ao`).
+- Runner CLI coder backends (`echo`, `claude`, `codex`, `ao`, `agy`).
 - Per-node codergen routing can also use `mock_llm` for test/conformance lanes
   through node `backend`/`model` attributes or model stylesheets.
+- Antigravity CLI backend: `--backend agy` invokes `agy --print
+  --dangerously-skip-permissions`; `--print` is the headless/noninteractive
+  mode and `timeout="..."` maps to `agy --print-timeout`.
 - Reviewer/evaluator lanes as separate nodes: `tool` nodes can invoke
   `codex exec --yolo`, AO workers, or other reviewer CLIs; sealed
   `holdout_eval` nodes invoke the evaluator from `$DARK_FACTORY_HOLDOUTS`.
@@ -73,7 +76,7 @@ dark-factory/
 │   ├── __main__.py    # CLI entry point
 │   ├── parser.py      # DOT → graph model
 │   ├── engine.py      # Graph traversal + checkpointing
-│   ├── handlers.py    # Node handlers + backend dispatch (echo|mock_llm|ao|claude|codex)
+│   ├── handlers.py    # Node handlers + backend dispatch (echo|mock_llm|ao|claude|codex|agy)
 │   ├── cxdb.py        # CXDB — SQLite event log of every step (for Healer)
 │   └── healer.py      # Healer — clusters CXDB failures into a diagnosis report
 │

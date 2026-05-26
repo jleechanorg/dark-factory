@@ -1,111 +1,38 @@
-const fs = require('fs');
-const path = require('path');
+const fs = require("fs");
+const path = require("path");
 
-const dbPath = path.join(__dirname, '..', 'data', 'db.json');
+const DB_FILE = path.join(__dirname, "..", "data", "db.json");
 
-const initialProducts = [
-  {
-    id: "p1",
-    title: "Echo Dot (5th Gen) | Smart Speaker with Alexa",
-    category: "Electronics",
-    description: "Our best-sounding Echo Dot yet. Enjoy an improved audio experience compared to any previous Echo Dot with Alexa, for clearer vocals, deeper bass and vibrant sound in any room.",
-    price: 49.99,
-    rating: 4.7,
-    image: "https://images.unsplash.com/photo-1543512214-318c7553f230?w=400&q=80",
-    stock: 25,
-    reviews: [
-      { id: "r1", user: "Alex", rating: 5, comment: "Great sound quality and smart features!", date: "2026-05-18" },
-      { id: "r2", user: "Sarah", rating: 4, comment: "Very responsive Alexa, but speaker could be slightly louder.", date: "2026-05-19" }
-    ]
-  },
-  {
-    id: "p2",
-    title: "Sony WH-1000XM4 Wireless Noise Canceling Headphones",
-    category: "Electronics",
-    description: "Industry-leading noise canceling with Dual Noise Sensor technology. Next-level music with Edge-AI, co-developed with Sony Music Studios Tokyo.",
-    price: 348.00,
-    rating: 4.8,
-    image: "https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=400&q=80",
-    stock: 10,
-    reviews: [
-      { id: "r3", user: "David", rating: 5, comment: "Absolute silence! Best headphones I've ever owned.", date: "2026-05-20" }
-    ]
-  },
-  {
-    id: "p3",
-    title: "Atomic Habits: An Easy & Proven Way to Build Good Habits & Break Bad Ones",
-    category: "Books",
-    description: "No matter your goals, Atomic Habits offers a proven framework for improving—every day. James Clear, one of the world's leading experts on habit formation, reveals practical strategies.",
-    price: 11.98,
-    rating: 4.9,
-    image: "https://images.unsplash.com/photo-1544947950-fa07a98d237f?w=400&q=80",
-    stock: 50,
-    reviews: [
-      { id: "r4", user: "Mark", rating: 5, comment: "Life-changing book. Extremely practical advice.", date: "2026-05-15" }
-    ]
-  },
-  {
-    id: "p4",
-    title: "Champion Men's Powerblend Fleece Pullover Hoodie",
-    category: "Clothing",
-    description: "A warm and comfortable fleece hoodie made from a cotton-polyester blend, featuring iconic Champion logo embroidery on the chest.",
-    price: 29.99,
-    rating: 4.4,
-    image: "https://images.unsplash.com/photo-1556821840-3a63f95609a7?w=400&q=80",
-    stock: 30,
-    reviews: [
-      { id: "r5", user: "Chris", rating: 4, comment: "Very comfortable hoodie, but fits slightly large.", date: "2026-05-17" }
-    ]
-  },
-  {
-    id: "p5",
-    title: "Instant Pot Duo 7-in-1 Electric Pressure Cooker",
-    category: "Home & Kitchen",
-    description: "The best-selling pressure cooker that replaces up to 7 kitchen appliances. It speeds up cooking by 2-6 times and saves up to 70% energy.",
-    price: 99.95,
-    rating: 4.6,
-    image: "https://images.unsplash.com/photo-1584269600464-37b1b58a9fe7?w=400&q=80",
-    stock: 15,
-    reviews: [
-      { id: "r6", user: "Emily", rating: 5, comment: "I use this almost every day! Cooking meals is so fast.", date: "2026-05-16" }
-    ]
-  }
-];
+function clone(data) {
+  return JSON.parse(JSON.stringify(data));
+}
 
 function readDB() {
-  try {
-    if (!fs.existsSync(path.dirname(dbPath))) {
-      fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-    }
-    if (!fs.existsSync(dbPath)) {
-      const data = { products: initialProducts, users: [], carts: {}, orders: [] };
-      fs.writeFileSync(dbPath, JSON.stringify(data, null, 2), 'utf8');
-      return data;
-    }
-    const content = fs.readFileSync(dbPath, 'utf8');
-    return JSON.parse(content);
-  } catch (error) {
-    return { products: initialProducts, users: [], carts: {}, orders: [] };
-  }
+  const raw = fs.readFileSync(DB_FILE, "utf-8");
+  return clone(JSON.parse(raw));
 }
 
 function writeDB(data) {
-  try {
-    if (!fs.existsSync(path.dirname(dbPath))) {
-      fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-    }
-    fs.writeFileSync(dbPath, JSON.stringify(data, null, 2), 'utf8');
-  } catch (error) {
-    // Suppress error or handle
-  }
+  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf-8");
+}
+
+function resetDB() {
+  const fresh = {
+    users: [],
+    products: [],
+    carts: {},
+    orders: [],
+    sessions: {},
+    sellerProfiles: {},
+    moderationEvents: [],
+    notificationPreferences: {},
+  };
+  writeDB(fresh);
+  return fresh;
 }
 
 module.exports = {
   readDB,
   writeDB,
-  resetDB: () => {
-    const data = { products: JSON.parse(JSON.stringify(initialProducts)), users: [], carts: {}, orders: [] };
-    writeDB(data);
-    return data;
-  }
+  resetDB,
 };

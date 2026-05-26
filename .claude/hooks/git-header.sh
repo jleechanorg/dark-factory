@@ -15,7 +15,12 @@ if [ -t 0 ]; then
     [ -r "$_ctx_cache" ] && CONTEXT_PCT=$(cat "$_ctx_cache" 2>/dev/null)
 else
     # stdin has data (or is an empty pipe) — try to parse JSON
-    json_input=$(cat)
+    # Check if stdin actually has data before running cat to prevent hanging in headless background processes
+    if read -t 0 >/dev/null 2>&1; then
+        json_input=$(cat)
+    else
+        json_input=""
+    fi
     if command -v jq >/dev/null 2>&1 && [ -n "$json_input" ]; then
         CONTEXT_PCT=$(printf '%s' "$json_input" | jq -r '.context_window.used_percentage // empty' 2>/dev/null)
         # Cache for manual invocations that lack stdin

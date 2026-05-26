@@ -1,0 +1,16 @@
+digraph amazon_catalog_slice {
+    graph [label="Amazon Catalog Slice - Search/Product Detail/Reviews"]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    implement [type="codergen", label="Implement Catalog", prompt="@benchmarks/amazon-clone/prompts/slices/catalog_search_reviews.md", timeout="600"]
+    public_acceptance [type="tool", label="Catalog Public Gate", command="bash benchmarks/amazon-clone/scripts/public_catalog.sh .", timeout="300", validation="true"]
+    fix [type="codergen", label="Fix Catalog", prompt="@benchmarks/amazon-clone/prompts/slices/fix_catalog.md", timeout="300", max_visits="5"]
+
+    start -> implement -> public_acceptance
+    public_acceptance -> exit [condition="outcome=success"]
+    public_acceptance -> fix [condition="outcome!=success"]
+    fix -> public_acceptance
+}

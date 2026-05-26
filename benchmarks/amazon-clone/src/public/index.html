@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Amazon.com. Spend less. Smile more.</title>
+  <meta name="description" content="Amazon Clone MVP - Explore electronics, books, clothing, and home & kitchen products with fast checkout, wishlists, reviews, and inventory management.">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <!-- Accessibility Skip Link -->
+  <a href="#main-content" id="skip-link" class="skip-link">Skip to main content</a>
+
+  <!-- Global Screen Reader Announcer -->
+  <div id="sr-announcer" class="sr-only" aria-live="polite"></div>
+
+  <!-- Header Section -->
+  <header class="app-header">
+    <div class="header-container">
+      <!-- Logo -->
+      <a href="#" id="brand-logo" class="brand-logo" aria-label="Amazon Homepage">
+        <span class="logo-text">amazon</span><span class="logo-dot">.clone</span>
+      </a>
+
+      <!-- Search Bar -->
+      <form id="search-form" class="search-form" role="search" onsubmit="event.preventDefault();">
+        <label for="category-select" class="sr-only">Choose Category</label>
+        <select id="category-select" class="category-select" aria-label="Filter by category">
+          <option value="All Categories">All Departments</option>
+          <option value="Electronics">Electronics</option>
+          <option value="Books">Books</option>
+          <option value="Clothing">Clothing</option>
+          <option value="Home & Kitchen">Home & Kitchen</option>
+        </select>
+        
+        <div class="search-input-wrapper">
+          <label for="search-input" class="sr-only">Search Amazon Clone</label>
+          <input type="text" id="search-input" class="search-input" placeholder="Search Amazon.clone..." autocomplete="off">
+          <button type="button" id="clear-search-btn" class="clear-search-btn" aria-label="Clear search input" style="display: none;">&times;</button>
+        </div>
+        
+        <button type="submit" id="search-submit-btn" class="search-submit-btn" aria-label="Submit search">
+          <svg class="search-icon" viewBox="0 0 24 24" width="20" height="20">
+            <path fill="currentColor" d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/>
+          </svg>
+        </button>
+      </form>
+
+      <!-- Navigation Links -->
+      <nav class="header-nav" aria-label="User Navigation">
+        <!-- Auth Button -->
+        <button id="auth-nav-btn" class="nav-btn auth-nav-btn" aria-haspopup="dialog" aria-expanded="false">
+          <span class="nav-line-1">Hello, Sign in</span>
+          <span class="nav-line-2">Account & Lists</span>
+        </button>
+
+        <!-- Order History Button -->
+        <button id="orders-nav-btn" class="nav-btn orders-nav-btn" aria-label="View order history">
+          <span class="nav-line-1">Returns</span>
+          <span class="nav-line-2">& Orders</span>
+        </button>
+
+        <!-- Wishlist Button -->
+        <button id="wishlist-nav-btn" class="nav-btn wishlist-nav-btn" aria-label="View wishlist">
+          <span class="nav-line-1">Saved</span>
+          <span class="nav-line-2">Wishlist <span id="wishlist-badge" class="badge">0</span></span>
+        </button>
+
+        <!-- Admin Control Toggle -->
+        <button id="admin-toggle-btn" class="nav-btn admin-toggle-btn" aria-label="Toggle admin inventory dashboard">
+          <span class="nav-line-1">Merchant</span>
+          <span class="nav-line-2">Inventory</span>
+        </button>
+
+        <!-- Cart Button -->
+        <button id="cart-nav-btn" class="nav-btn cart-nav-btn" aria-label="Shopping Cart, 0 items" aria-haspopup="dialog" aria-expanded="false">
+          <div class="cart-icon-wrapper">
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
+              <path d="M7 18c-1.1 0-1.99.9-1.99 2S5.9 22 7 22s2-.9 2-2-.9-2-2-2zM1 2v2h2l3.6 7.59-1.35 2.45c-.16.28-.25.61-.25.96 0 1.1.9 2 2 2h12v-2H7.42c-.14 0-.25-.11-.25-.25l.03-.12.9-1.63h7.45c.75 0 1.41-.41 1.75-1.03l3.58-6.49c.08-.14.12-.31.12-.48 0-.55-.45-1-1-1H5.21l-.94-2H1zm16 16c-1.1 0-1.99.9-1.99 2s.89 2 1.99 2 2-.9 2-2-.9-2-2-2z"/>
+            </svg>
+            <span id="cart-badge" class="cart-badge">0</span>
+          </div>
+          <span class="nav-line-2 cart-text">Cart</span>
+        </button>
+      </nav>
+    </div>
+  </header>
+
+  <!-- Notification Toasts Container -->
+  <div id="toast-container" class="toast-container" aria-live="assertive"></div>
+
+  <!-- Main View Area -->
+  <main id="main-content" class="main-content" tabindex="-1">
+    
+    <!-- View 1: Products Browsing Grid -->
+    <section id="products-view" class="view-section active">
+      <div class="section-header">
+        <h1 id="products-heading">Explore Our Products</h1>
+        <p id="results-counter" class="results-counter" aria-live="polite">Showing 5 of 5 products</p>
+      </div>
+      
+      <!-- Loading indicator -->
+      <div id="products-loading" class="loading-spinner" style="display: none;" aria-label="Loading products">
+        <div class="spinner"></div>
+      </div>
+
+      <!-- No products state -->
+      <div id="no-products-message" class="empty-state" style="display: none;">
+        <h2>No products found</h2>
+        <p>Try checking your spelling or selecting another category department.</p>
+        <button id="reset-filters-btn" class="btn btn-secondary">Clear all filters</button>
+      </div>
+
+      <!-- Products Grid -->
+      <div id="products-grid" class="products-grid">
+        <!-- Dynamic product cards render here -->
+      </div>
+    </section>
+
+    <!-- View 2: Product Detail Page -->
+    <section id="product-detail-view" class="view-section">
+      <div class="back-navigation-container">
+        <button id="back-to-products-btn" class="back-link">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
+          Back to Products
+        </button>
+      </div>
+      
+      <div id="product-detail-content" class="product-detail-layout">
+        <!-- Dynamic detail details render here -->
+      </div>
+
+      <!-- Reviews Section -->
+      <section class="reviews-section">
+        <h2>Customer Reviews & Ratings</h2>
+        <div class="reviews-layout">
+          <!-- Reviews summary / average -->
+          <div class="reviews-summary-card">
+            <div class="average-rating-container">
+              <span id="detail-avg-rating" class="avg-rating-value">4.7</span>
+              <span class="max-rating-value">out of 5</span>
+            </div>
+            <div id="detail-summary-stars" class="stars-display" aria-label="4.7 out of 5 stars"></div>
+            <p id="detail-review-count" class="review-count-label">Based on 2 reviews</p>
+          </div>
+
+          <!-- Add Review Form -->
+          <div class="add-review-card">
+            <h3>Share your thoughts</h3>
+            <p>Tell other customers what you think of this product</p>
+            <form id="add-review-form" class="review-form">
+              <div class="form-group">
+                <label for="review-rating" class="form-label">Overall rating</label>
+                <select id="review-rating" class="form-control" required>
+                  <option value="" disabled selected>Select star rating</option>
+                  <option value="5">5 stars (Excellent)</option>
+                  <option value="4">4 stars (Very Good)</option>
+                  <option value="3">3 stars (Average)</option>
+                  <option value="2">2 stars (Below Average)</option>
+                  <option value="1">1 star (Poor)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="review-username" class="form-label">Your Name (optional)</label>
+                <input type="text" id="review-username" class="form-control" placeholder="Anonymous">
+              </div>
+              <div class="form-group">
+                <label for="review-comment" class="form-label">Review description</label>
+                <textarea id="review-comment" class="form-control" rows="4" placeholder="What did you like or dislike?" required></textarea>
+              </div>
+              <button type="submit" class="btn btn-primary">Submit Review</button>
+            </form>
+          </div>
+        </div>
+
+        <!-- Reviews List -->
+        <div class="reviews-list-container">
+          <h3>Top reviews from customers</h3>
+          <div id="reviews-list" class="reviews-list">
+            <!-- Dynamic comments list -->
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <!-- View 3: Wishlist View -->
+    <section id="wishlist-view" class="view-section">
+      <div class="section-header">
+        <h1>Your Saved Items</h1>
+        <p>Items added to your wishlist. Add to cart at any time.</p>
+      </div>
+
+      <div id="wishlist-empty-state" class="empty-state" style="display: none;">
+        <h2>Your Wishlist is empty.</h2>
+        <p>Save items here while you browse to buy them later.</p>
+        <button class="btn btn-primary navigate-home-btn">Continue Shopping</button>
+      </div>
+
+      <div id="wishlist-items-grid" class="products-grid">
+        <!-- Dynamic wishlist cards render here -->
+      </div>
+    </section>
+
+    <!-- View 4: Order History View -->
+    <section id="orders-view" class="view-section">
+      <div class="section-header">
+        <h1>Your Orders</h1>
+        <p>View invoices and delivery tracking details for your past purchases.</p>
+      </div>
+
+      <div id="orders-empty-state" class="empty-state" style="display: none;">
+        <h2>No orders found.</h2>
+        <p>You haven't placed any orders yet.</p>
+        <button class="btn btn-primary navigate-home-btn">Continue Shopping</button>
+      </div>
+
+      <div id="orders-list" class="orders-list">
+        <!-- Dynamic orders render here -->
+      </div>
+    </section>
+
+    <!-- View 5: Checkout multi-step form view -->
+    <section id="checkout-view" class="view-section">
+      <div class="section-header">
+        <h1>Secure Checkout</h1>
+        <p>Please enter your shipping address and payment method to complete the purchase.</p>
+      </div>
+
+      <div class="checkout-layout">
+        <!-- Checkout Form validation -->
+        <form id="checkout-form" class="checkout-form" novalidate>
+          
+          <!-- Shipping Address -->
+          <fieldset class="checkout-fieldset">
+            <legend>1. Shipping Address</legend>
+            <div class="form-grid">
+              <div class="form-group full-width">
+                <label for="checkout-name" class="form-label">Full Name</label>
+                <input type="text" id="checkout-name" name="fullName" class="form-control" placeholder="John Doe" required minlength="2">
+                <span class="error-msg" id="name-error" aria-live="polite"></span>
+              </div>
+              <div class="form-group full-width">
+                <label for="checkout-email" class="form-label">Email Address</label>
+                <input type="email" id="checkout-email" name="email" class="form-control" placeholder="john@example.com" required>
+                <span class="error-msg" id="email-error" aria-live="polite"></span>
+              </div>
+              <div class="form-group full-width">
+                <label for="checkout-address" class="form-label">Street Address</label>
+                <input type="text" id="checkout-address" name="address" class="form-control" placeholder="1234 Main St, Apt 4B" required minlength="10">
+                <span class="error-msg" id="address-error" aria-live="polite"></span>
+              </div>
+              <div class="form-group">
+                <label for="checkout-city" class="form-label">City</label>
+                <input type="text" id="checkout-city" name="city" class="form-control" placeholder="Seattle" required>
+                <span class="error-msg" id="city-error" aria-live="polite"></span>
+              </div>
+              <div class="form-group">
+                <label for="checkout-state" class="form-label">State / Province</label>
+                <input type="text" id="checkout-state" name="state" class="form-control" placeholder="WA" required>
+                <span class="error-msg" id="state-error" aria-live="polite"></span>
+              </div>
+              <div class="form-group">
+                <label for="checkout-zip" class="form-label">ZIP / Postal Code</label>
+                <input type="text" id="checkout-zip" name="zip" class="form-control" placeholder="98101" required pattern="\d+">
+                <span class="error-msg" id="zip-error" aria-live="polite"></span>
+              </div>
+            </div>
+          </fieldset>
+
+          <!-- Payment Details -->
+          <fieldset class="checkout-fieldset">
+            <legend>2. Payment Details</legend>
+            <div class="form-grid">
+              <div class="form-group full-width">
+                <label for="checkout-card" class="form-label">Credit Card Number</label>
+                <input type="text" id="checkout-card" name="cardNumber" class="form-control" placeholder="4111 1111 1111 1111" required>
+                <span class="error-msg" id="card-error" aria-live="polite"></span>
+              </div>
+              <div class="form-group">
+                <label for="checkout-expiry" class="form-label">Expiration Date</label>
+                <input type="text" id="checkout-expiry" name="expiryDate" class="form-control" placeholder="MM/YY" required pattern="\d{2}/\d{2}">
+                <span class="error-msg" id="expiry-error" aria-live="polite"></span>
+              </div>
+              <div class="form-group">
+                <label for="checkout-cvv" class="form-label">CVV / Security Code</label>
+                <input type="password" id="checkout-cvv" name="cvv" class="form-control" placeholder="123" required maxlength="4" pattern="\d{3,4}">
+                <span class="error-msg" id="cvv-error" aria-live="polite"></span>
+              </div>
+            </div>
+          </fieldset>
+
+          <button type="submit" id="checkout-submit-btn" class="btn btn-primary btn-large btn-block" disabled>Place Order</button>
+        </form>
+
+        <!-- Order Summary Card -->
+        <div class="checkout-summary-card">
+          <h3>Order Summary</h3>
+          <div id="checkout-items-list" class="checkout-items-list">
+            <!-- Dynamic checkout items -->
+          </div>
+          <hr class="summary-divider">
+          <div class="summary-line font-bold">
+            <span>Order Total:</span>
+            <span id="checkout-total-price">$0.00</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- View 6: Order Confirmation View -->
+    <section id="confirmation-view" class="view-section">
+      <div class="confirmation-card">
+        <div class="success-checkmark-wrapper">
+          <div class="checkmark-circle">
+            <svg class="checkmark-icon" viewBox="0 0 24 24" width="48" height="48" fill="currentColor">
+              <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+            </svg>
+          </div>
+        </div>
+        
+        <h1>Order Confirmed!</h1>
+        <p class="lead-text">Thank you for your purchase. Your order has been received.</p>
+        
+        <div class="confirmation-details-box">
+          <div class="detail-row">
+            <span class="detail-label">Order Number:</span>
+            <div class="copyable-id-wrapper">
+              <span id="confirm-order-id" class="order-id-value">AMZN123456</span>
+              <button id="copy-order-id-btn" class="copy-btn" aria-label="Copy order ID to clipboard">Copy</button>
+            </div>
+          </div>
+          <div class="detail-row">
+            <span class="detail-label">Estimated Delivery:</span>
+            <span id="confirm-delivery" class="detail-value">Tuesday, May 26, 2026</span>
+          </div>
+          <div class="detail-row">
+            <span class="detail-label">Shipping To:</span>
+            <span id="confirm-recipient" class="detail-value">John Doe</span>
+          </div>
+          <div class="detail-row">
+            <span class="detail-label">Confirmation Sent To:</span>
+            <span id="confirm-email" class="detail-value">john@example.com</span>
+          </div>
+        </div>
+
+        <div class="confirmation-summary-box">
+          <h3>Order Details</h3>
+          <div id="confirm-items" class="confirm-items-list">
+            <!-- Confirmation items list -->
+          </div>
+          <hr class="summary-divider">
+          <div class="summary-line font-bold">
+            <span>Amount Paid:</span>
+            <span id="confirm-total-price">$0.00</span>
+          </div>
+        </div>
+
+        <button class="btn btn-primary navigate-home-btn">Continue Shopping</button>
+      </div>
+    </section>
+
+    <!-- View 7: Merchant Admin Inventory Dashboard -->
+    <section id="admin-view" class="view-section">
+      <div class="section-header">
+        <h1>Merchant Stock Inventory</h1>
+        <p>Admin stock tracker. View and manage warehouse inventories in real-time.</p>
+      </div>
+
+      <div class="table-responsive">
+        <table class="inventory-table" aria-label="Warehouse Stock Inventory">
+          <thead>
+            <tr>
+              <th scope="col">Thumbnail</th>
+              <th scope="col">Product ID</th>
+              <th scope="col">Title</th>
+              <th scope="col">Category</th>
+              <th scope="col">Price</th>
+              <th scope="col">Current Stock</th>
+              <th scope="col">Modify Stock</th>
+            </tr>
+          </thead>
+          <tbody id="inventory-table-body">
+            <!-- Dynamic inventory updates -->
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <!-- Sidebar Dialog Modal: Shopping Cart Drawer -->
+  <div id="cart-drawer-overlay" class="drawer-overlay" aria-hidden="true"></div>
+  <aside id="cart-drawer" class="cart-drawer" role="dialog" aria-labelledby="cart-drawer-title" aria-modal="true" aria-hidden="true">
+    <div class="drawer-header">
+      <h2 id="cart-drawer-title">Shopping Cart</h2>
+      <button id="close-cart-btn" class="close-btn" aria-label="Close cart side panel">&times;</button>
+    </div>
+    
+    <div id="cart-items-container" class="drawer-content">
+      <!-- Dynamic cart items list -->
+    </div>
+
+    <div class="drawer-footer">
+      <div class="summary-line font-bold">
+        <span>Cart Subtotal:</span>
+        <span id="cart-subtotal">$0.00</span>
+      </div>
+      <button id="proceed-checkout-btn" class="btn btn-primary btn-large btn-block">Proceed to Checkout</button>
+      <button id="clear-cart-btn" class="btn btn-secondary btn-block" style="margin-top: 10px;">Empty Cart</button>
+    </div>
+  </aside>
+
+  <!-- Sidebar Dialog Modal: Authentication Card Drawer -->
+  <div id="auth-drawer-overlay" class="drawer-overlay" aria-hidden="true"></div>
+  <aside id="auth-drawer" class="auth-drawer" role="dialog" aria-labelledby="auth-drawer-title" aria-modal="true" aria-hidden="true">
+    <div class="drawer-header">
+      <h2 id="auth-drawer-title">Your Account</h2>
+      <button id="close-auth-btn" class="close-btn" aria-label="Close authentication panel">&times;</button>
+    </div>
+
+    <!-- State A: Signed In User -->
+    <div id="auth-signed-in-state" class="drawer-content" style="display: none;">
+      <div class="user-profile-summary">
+        <div class="profile-avatar" id="user-avatar-initials">JD</div>
+        <h3 id="user-profile-name">John Doe</h3>
+        <p id="user-profile-email">john@example.com</p>
+      </div>
+      <div class="auth-menu-list">
+        <button class="menu-item" id="menu-orders-btn">Your Orders</button>
+        <button class="menu-item" id="menu-wishlist-btn">Your Wishlist</button>
+      </div>
+      <div class="drawer-footer">
+        <button id="signout-btn" class="btn btn-secondary btn-block">Sign Out</button>
+      </div>
+    </div>
+
+    <!-- State B: Signed Out (Form Panel) -->
+    <div id="auth-signed-out-state" class="drawer-content">
+      
+      <!-- Tab Controls -->
+      <div class="auth-tabs" role="tablist">
+        <button id="tab-signin" class="auth-tab active" role="tab" aria-selected="true" aria-controls="signin-panel">Sign In</button>
+        <button id="tab-signup" class="auth-tab" role="tab" aria-selected="false" aria-controls="signup-panel">Sign Up</button>
+      </div>
+
+      <!-- Sign In Panel -->
+      <div id="signin-panel" class="auth-panel" role="tabpanel" aria-labelledby="tab-signin">
+        <form id="signin-form" class="auth-form">
+          <div class="form-group">
+            <label for="signin-email" class="form-label">Email Address</label>
+            <input type="email" id="signin-email" class="form-control" placeholder="john@example.com" required>
+          </div>
+          <div class="form-group">
+            <label for="signin-password" class="form-label">Password</label>
+            <input type="password" id="signin-password" class="form-control" placeholder="••••••••" required>
+          </div>
+          <button type="submit" class="btn btn-primary btn-block">Sign In</button>
+        </form>
+      </div>
+
+      <!-- Sign Up Panel -->
+      <div id="signup-panel" class="auth-panel" role="tabpanel" aria-labelledby="tab-signup" style="display: none;">
+        <form id="signup-form" class="auth-form">
+          <div class="form-group">
+            <label for="signup-name" class="form-label">Your Name</label>
+            <input type="text" id="signup-name" class="form-control" placeholder="John Doe" required minlength="2">
+          </div>
+          <div class="form-group">
+            <label for="signup-email" class="form-label">Email Address</label>
+            <input type="email" id="signup-email" class="form-control" placeholder="john@example.com" required>
+          </div>
+          <div class="form-group">
+            <label for="signup-password" class="form-label">Password</label>
+            <input type="password" id="signup-password" class="form-control" placeholder="••••••••" required minlength="6">
+          </div>
+          <button type="submit" class="btn btn-primary btn-block">Create Account</button>
+        </form>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Footer Section -->
+  <footer class="app-footer">
+    <div class="footer-container">
+      <div class="footer-back-to-top">
+        <button id="back-to-top-btn" class="back-to-top-btn">Back to top</button>
+      </div>
+      <div class="footer-credits">
+        <p>&copy; 2026 Amazon Clone MVP. All rights reserved. Created for benchmark validation.</p>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

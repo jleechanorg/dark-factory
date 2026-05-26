@@ -31,6 +31,17 @@ make validate-size
 Startup output must print the frontend URL, backend URL, backend health URL,
 emulator UI URL, and diagnostics URL.
 
+The visible public acceptance gate also checks:
+
+- `firebase.json`, `firestore.rules`, and Firebase/Firestore dependencies.
+- `make seed` and `make validate-size`.
+- At least 5,000 non-generated source lines, including at least 2,000 frontend
+  lines under `src/public/`.
+- Runtime HTTP smoke for `/health`, `/api/products`, diagnostics, and adding a
+  product to the cart.
+- Visible coverage for wishlist, seller, admin, notifications, checkout, order
+  history, diagnostics, and Firestore emulator configuration.
+
 ## Implementation Guidance
 
 Prefer a boring, maintainable architecture:
@@ -45,3 +56,10 @@ Prefer a boring, maintainable architecture:
 - Tests that reset local data deterministically.
 
 Complete the product, not only the happy path.
+
+## Parallelization
+
+This is a broad implementation task. If the active backend supports
+subagents or parallel workers, use them to split frontend, backend, Firestore,
+test harness, seed data, and documentation work. You remain responsible for
+integrating the outputs into one runnable full-stack app before exiting.

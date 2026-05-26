@@ -17,6 +17,19 @@ hidden test source.
 3. Root-cause the implementation defect.
 4. Make the smallest durable fix that satisfies the public spec.
 5. Run the relevant local command, usually `make test` or `make validate-size`.
+6. If the public acceptance gate failed, run
+   `bash benchmarks/amazon-clone/scripts/public_acceptance.sh .` locally and
+   repair the first concrete failure without weakening the spec.
+
+## Visible Failure Context
+
+- Last node: `${state._last_node}`
+- Last outcome: `${state._last_outcome}`
+- Last output:
+
+```text
+${state._last_output}
+```
 
 ## Constraints
 
@@ -31,3 +44,9 @@ hidden test source.
 
 The fix is complete when the failing gate is addressed, local validation passes,
 and no product-scope requirement from the public spec has been weakened.
+
+## Parallelization
+
+If the active backend supports subagents or parallel workers, use them for
+independent failure analysis, implementation repair, and validation lanes, then
+integrate the result into the single candidate workspace before exiting.

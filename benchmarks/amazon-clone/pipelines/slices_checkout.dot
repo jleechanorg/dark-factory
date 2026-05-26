@@ -1,0 +1,16 @@
+digraph amazon_checkout_slice {
+    graph [label="Amazon Checkout Slice - Checkout and Orders"]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    implement [type="codergen", label="Implement Checkout", prompt="@benchmarks/amazon-clone/prompts/slices/checkout_orders.md", timeout="600"]
+    public_acceptance [type="tool", label="Checkout Public Gate", command="bash benchmarks/amazon-clone/scripts/public_checkout.sh .", timeout="300", validation="true"]
+    fix [type="codergen", label="Fix Checkout", prompt="@benchmarks/amazon-clone/prompts/slices/fix_checkout.md", timeout="300", max_visits="5"]
+
+    start -> implement -> public_acceptance
+    public_acceptance -> exit [condition="outcome=success"]
+    public_acceptance -> fix [condition="outcome!=success"]
+    fix -> public_acceptance
+}

@@ -19,16 +19,6 @@ BENCHMARK_DIR="$(dirname "$SCRIPT_DIR")"
 PROJECT_ROOT="$(cd "$BENCHMARK_DIR/../.." && pwd)"
 RESULTS_DIR="$WORKDIR/results"
 
-# Define methods and their pipeline files
-declare -A PIPELINES=(
-    ["dark-factory"]="benchmarks/amazon-clone/pipelines/dark_factory.dot"
-    ["df-slim"]="benchmarks/amazon-clone/pipelines/slim.dot"
-    ["kilroy"]="benchmarks/amazon-clone/pipelines/kilroy.dot"
-    ["mammoth"]="benchmarks/amazon-clone/pipelines/mammoth.dot"
-    ["tracker"]="benchmarks/amazon-clone/pipelines/tracker.dot"
-    ["smasher"]="benchmarks/amazon-clone/pipelines/smasher.dot"
-)
-
 echo "============================================"
 echo "Running Candidate"
 echo "============================================"
@@ -38,14 +28,19 @@ echo "Workdir: $WORKDIR"
 echo "Results: $RESULTS_DIR"
 echo ""
 
-# Validate method
-if [ -z "${PIPELINES[$METHOD]:-}" ]; then
-    echo "ERROR: Unknown method: $METHOD"
-    echo "Valid methods: ${!PIPELINES[@]}"
-    exit 1
-fi
-
-PIPELINE="${PIPELINES[$METHOD]}"
+case "$METHOD" in
+    dark-factory) PIPELINE="benchmarks/amazon-clone/pipelines/dark_factory.dot" ;;
+    df-slim) PIPELINE="benchmarks/amazon-clone/pipelines/slim.dot" ;;
+    kilroy) PIPELINE="benchmarks/amazon-clone/pipelines/kilroy.dot" ;;
+    mammoth) PIPELINE="benchmarks/amazon-clone/pipelines/mammoth.dot" ;;
+    tracker) PIPELINE="benchmarks/amazon-clone/pipelines/tracker.dot" ;;
+    smasher) PIPELINE="benchmarks/amazon-clone/pipelines/smasher.dot" ;;
+    *)
+        echo "ERROR: Unknown method: $METHOD"
+        echo "Valid methods: dark-factory df-slim kilroy mammoth tracker smasher"
+        exit 1
+        ;;
+esac
 PIPELINE_PATH="${PROJECT_ROOT}/${PIPELINE}"
 
 # Validate pipeline exists
@@ -60,6 +55,7 @@ if [ -x "$PROJECT_ROOT/.venv/bin/python" ]; then
 fi
 
 : "${DARK_FACTORY_HOLDOUTS:?DARK_FACTORY_HOLDOUTS must point to the sealed holdouts repo}"
+BACKEND="${BACKEND:-agy}"
 AO_AGENT="${AO_AGENT:-antigravity}"
 AO_PROJECT="${AO_PROJECT:-amazon-clone}"
 
@@ -82,6 +78,7 @@ LOG_FILE="$RESULTS_DIR/${METHOD}_${RUN_ID}.log"
 
 echo "Pipeline: $PIPELINE_PATH"
 echo "Goal: $GOAL"
+echo "Backend: $BACKEND"
 echo "Result: $RESULT_FILE"
 echo "Started: $(date)"
 echo ""
@@ -89,15 +86,18 @@ echo ""
 # Run dark-factory runner
 set +e
 cd "$PROJECT_ROOT"
-$PYTHON_BIN -m runner \
+RUNNER_ARGS=(
     --pipeline "$PIPELINE" \
     --workdir "$WORKDIR" \
     --goal "Amazon Clone MVP - implement all features per spec" \
-    --backend ao \
-    --ao-agent "$AO_AGENT" \
-    --ao-project "$AO_PROJECT" \
+    --backend "$BACKEND" \
     --feature amazon-clone \
-    --cxdb "$RESULTS_DIR/cxdb.sqlite" 2>&1 | tee "$LOG_FILE"
+    --cxdb "$RESULTS_DIR/cxdb.sqlite"
+)
+if [ "$BACKEND" = "ao" ]; then
+    RUNNER_ARGS+=(--ao-agent "$AO_AGENT" --ao-project "$AO_PROJECT")
+fi
+$PYTHON_BIN -m runner "${RUNNER_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
 
 EXIT_CODE=$?
 set -e

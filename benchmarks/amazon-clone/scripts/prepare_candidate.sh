@@ -41,6 +41,7 @@ mkdir -p "$WORKDIR/benchmarks/amazon-clone"
 cp "${BENCHMARK_DIR}/spec.md" "$WORKDIR/benchmarks/amazon-clone/spec.md"
 cp "${BENCHMARK_DIR}/visible_acceptance.md" "$WORKDIR/benchmarks/amazon-clone/visible_acceptance.md"
 cp -r "${BENCHMARK_DIR}/prompts" "$WORKDIR/benchmarks/amazon-clone/"
+cp -r "${BENCHMARK_DIR}/scripts" "$WORKDIR/benchmarks/amazon-clone/"
 
 # Copy spec to workdir
 echo "Copying spec to workdir..."

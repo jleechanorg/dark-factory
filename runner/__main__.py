@@ -19,7 +19,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--workdir", type=pathlib.Path, default=pathlib.Path.cwd())
     p.add_argument(
         "--backend",
-        choices=["echo", "claude", "codex", "ao"],
+        choices=["echo", "claude", "codex", "ao", "agy", "claudew"],
         default="echo",
         help="LLM backend for codergen nodes",
     )

@@ -40,7 +40,7 @@ class Context:
     workdir: pathlib.Path
     state: dict[str, str] = field(default_factory=dict)
     history: list[dict[str, str]] = field(default_factory=list)
-    backend: str = "echo"  # echo | mock_llm | ao | claude | codex
+    backend: str = "echo"  # echo | mock_llm | ao | claude | codex | agy
     cxdb_path: Optional[pathlib.Path] = None
     run_id: Optional[str] = None
 
@@ -207,6 +207,7 @@ def _codergen(node: Node, ctx: Context) -> Result:
       - echo: no LLM — just record the rendered prompt. Used in tests.
       - claude: shell out to `claude --print` with --dangerously-skip-permissions
       - codex: shell out to `codex exec --yolo`
+      - agy: shell out to `agy --print --dangerously-skip-permissions`
       - ao: dispatch to an Agent Orchestrator worker. First call spawns a
         session (`ao spawn`); subsequent calls reuse it (`ao send`). The
         worker writes inside its own AO-managed worktree; the path is stored
@@ -384,26 +385,142 @@ def _codergen(node: Node, ctx: Context) -> Result:
         args = _sandboxed_args(["codex", "exec", "--yolo", "--skip-git-repo-check", prompt_text])
         if args is None:
             return Result(outcome="failure", output="sandbox-exec unavailable")
+        timeout_s = int(node.attrs.get("timeout", "1800"))
         proc = subprocess.run(
             args,
             cwd=ctx.workdir,
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=timeout_s,
             check=False,
+            input="",
             env=_sanitized_env(),
         )
+    elif backend == "claudew":
+        wafer_key = os.environ.get("WAFER_API_KEY", "")
+        if not wafer_key:
+            return Result(outcome="failure", output="claudew backend requires WAFER_API_KEY env var")
+        wafer_model = os.environ.get("WAFER_MODEL", "GLM-5.1")
+        env = _sanitized_env()
+        env["WAFER_API_KEY"] = wafer_key
+        env["WAFER_MODEL"] = wafer_model
+        env["ANTHROPIC_BASE_URL"] = "http://localhost:9001"
+        env["ANTHROPIC_AUTH_TOKEN"] = wafer_key
+        env["ANTHROPIC_DEFAULT_MODEL"] = wafer_model
+        env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = wafer_model
+        env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = wafer_model
+        env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = wafer_model
+        env["CLAUDEW_MODE"] = "1"
+        claude_bin = _get_claude_executable()
+        args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", "--setting-sources", "", "--model", wafer_model, "--effort", "high", prompt_text])
+        if args is None:
+            return Result(outcome="failure", output="sandbox-exec unavailable")
+        try:
+            proc = subprocess.run(
+                args,
+                cwd=ctx.workdir,
+                capture_output=True,
+                text=True,
+                timeout=1800,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return Result(outcome="failure", output="claudew backend timed out after 30 minutes")
+        except Exception as e:
+            return Result(outcome="failure", output=f"claudew backend error: {e}")
+    elif backend == "agy":
+        timeout_s = int(node.attrs.get("timeout", "600"))
+        task_dir = ctx.workdir / ".dark-factory"
+        task_dir.mkdir(parents=True, exist_ok=True)
+        task_file = task_dir / f"agy-task-{node.name}.md"
+        agy_prompt = (
+            "You are the implementation agent for a Dark Factory pipeline node.\n"
+            "Run headlessly and non-interactively in the current working directory.\n"
+            "For broad implementation work, decompose the task and use Antigravity "
+            "subagents or parallel internal workers when the CLI makes that available; "
+            "collapse their outputs into direct workspace edits before exiting.\n"
+            "Make the requested file edits directly. "
+            "Do not enter planning mode. Do not ask for approval. "
+            "Do not wait for hooks, screenshots, or operator input. "
+            "When finished, print a concise summary and stop.\n\n"
+            f"{prompt_text}"
+        )
+        task_file.write_text(agy_prompt)
+        launch_prompt = (
+            f"Execute the Dark Factory task in {task_file}. "
+            "Read that file, make the required workspace edits, run the relevant local checks, "
+            "do not enter planning mode, do not ask for approval, "
+            "print a concise completion summary, and stop."
+        )
+        args = _sandboxed_args([
+            "agy",
+            "--add-dir",
+            str(ctx.workdir),
+            "--dangerously-skip-permissions",
+            "--print-timeout",
+            f"{timeout_s}s",
+            "--print",
+            launch_prompt,
+        ])
+        if args is None:
+            return Result(outcome="failure", output="sandbox-exec unavailable")
+        proc = subprocess.Popen(
+            args,
+            cwd=ctx.workdir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            env=_sanitized_env(),
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_s + 30)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                stdout, stderr = proc.communicate(timeout=5)
+            except Exception:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+                stdout, stderr = proc.communicate()
+            output = stdout + ("\nSTDERR:\n" + stderr if stderr else "")
+            wall_ms = int((time.monotonic() - _start_ts) * 1000)
+            metrics = _codergen_metrics(stdout, stderr, wall_ms)
+            meta = {"returncode": str(proc.returncode if proc.returncode is not None else ""), "timed_out": "true"}
+            meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
+            return Result(
+                outcome="failure",
+                output=f"agy backend timed out after {timeout_s + 30}s\n{output}",
+                metadata=meta,
+            )
+        output = stdout + ("\nSTDERR:\n" + stderr if stderr else "")
+        outcome = "success" if proc.returncode == 0 else "failure"
+        if output.strip().startswith("Error: timed out waiting for response"):
+            outcome = "failure"
+        wall_ms = int((time.monotonic() - _start_ts) * 1000)
+        metrics = _codergen_metrics(stdout, stderr, wall_ms)
+        meta = {"returncode": str(proc.returncode)}
+        meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
+        return Result(outcome=outcome, output=output, metadata=meta)
     else:
         return Result(outcome="failure", output=f"unknown backend {backend!r}")
 
+    output = proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
     outcome = "success" if proc.returncode == 0 else "failure"
+    if backend == "agy" and output.strip().startswith("Error: timed out waiting for response"):
+        outcome = "failure"
     wall_ms = int((time.monotonic() - _start_ts) * 1000)
     metrics = _codergen_metrics(proc.stdout, proc.stderr, wall_ms)
     meta = {"returncode": str(proc.returncode)}
     meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
     return Result(
         outcome=outcome,
-        output=proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else ""),
+        output=output,
         metadata=meta,
     )
 
@@ -757,17 +874,35 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
             timeout = int(node.attrs.get("timeout", "1200"))
         except (TypeError, ValueError):
             timeout = 1200
-        args = _sandboxed_args([_get_claude_executable(), "--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt])
-        if args is None:
+
+        # Backend-aware executable selection
+        if ctx.backend == "claudew":
+            claude_bin = _get_claude_executable()
+            wafer_model = os.environ.get("WAFER_MODEL", "GLM-5.1")
+            gate_env = _sanitized_env()
+            gate_env["ANTHROPIC_BASE_URL"] = "http://localhost:9001"
+            gate_env["ANTHROPIC_AUTH_TOKEN"] = os.environ.get("WAFER_API_KEY", "")
+            gate_env["ANTHROPIC_DEFAULT_MODEL"] = wafer_model
+            gate_env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = wafer_model
+            gate_env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = wafer_model
+            gate_env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = wafer_model
+            gate_env["CLAUDEW_MODE"] = "1"
+            sub_args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", "--setting-sources", "", "--model", wafer_model, "--effort", "high", prompt])
+        else:
+            claude_bin = _get_claude_executable()
+            gate_env = _sanitized_env()
+            sub_args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt])
+
+        if sub_args is None:
             return Result(outcome="failure", output="sandbox-exec unavailable")
         proc = subprocess.run(
-            args,
+            sub_args,
             cwd=ctx.workdir,
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
-            env=_sanitized_env(),
+            env=gate_env,
         )
         combined = proc.stdout + "\n" + proc.stderr
         verdict, normalized = _parse_verdict(combined)
@@ -837,7 +972,11 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
         return Result(outcome="failure", output="no feature attribute or state")
 
     eval_script = repo_path / "evaluator" / "run.py"
-    if not eval_script.exists():
+    try:
+        exists = eval_script.exists()
+    except PermissionError:
+        exists = False
+    if not exists:
         return Result(outcome="failure", output=f"holdout evaluator missing: {eval_script}")
 
     impl_attr = node.attrs.get("implementation")
@@ -1006,7 +1145,28 @@ def _render_prompt(node: Node, ctx: Context) -> str:
         return f"# {node.name}\n\nGoal: {ctx.goal}"
     ref_path = pathlib.Path(ref)
     if ref_path.is_absolute():
-        return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
+        resolved_ref = ref_path
+        try:
+            resolved_ref = ref_path.resolve()
+        except FileNotFoundError:
+            return f"# {node.name}\n\nGoal: {ctx.goal}\n(missing prompt: {ref})"
+
+        for deny in _holdout_denied_paths():
+            try:
+                resolved_ref.relative_to(deny)
+            except ValueError:
+                pass
+            else:
+                return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
+
+        text_path = resolved_ref
+        if not text_path.exists():
+            return f"# {node.name}\n\nGoal: {ctx.goal}\n(missing prompt: {ref})"
+        text = text_path.read_text()
+        text = text.replace("${goal}", ctx.goal)
+        for k, v in ctx.state.items():
+            text = text.replace("${state." + k + "}", v)
+        return text
     root = ctx.workdir.resolve()
     p = (root / ref_path).resolve()
     try:

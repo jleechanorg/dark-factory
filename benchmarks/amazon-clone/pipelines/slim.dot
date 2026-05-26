@@ -6,11 +6,14 @@ digraph amazon_slim {
     exit  [shape=Msquare, label="Exit"]
 
     implement [type="codergen", label="Implement", prompt="@benchmarks/amazon-clone/prompts/implement.md"]
+    public_acceptance [type="tool", label="Public Acceptance", command="bash benchmarks/amazon-clone/scripts/public_acceptance.sh .", timeout="300", validation="true"]
     verify    [type="holdout_eval", label="Verify", timeout="300"]
-    fix       [type="codergen", label="Fix", prompt="@benchmarks/amazon-clone/prompts/fix.md", max_visits="3"]
+    fix       [type="codergen", label="Fix", prompt="@benchmarks/amazon-clone/prompts/fix.md", timeout="300", max_visits="5"]
 
-    start -> implement -> verify
+    start -> implement -> public_acceptance
+    public_acceptance -> verify [condition="outcome=success"]
+    public_acceptance -> fix [condition="outcome!=success"]
     verify -> exit [condition="outcome=success"]
     verify -> fix [condition="outcome!=success"]
-    fix -> verify
+    fix -> public_acceptance
 }

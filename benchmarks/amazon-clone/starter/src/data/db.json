@@ -104,10 +104,6 @@
     }
   ],
   "users": [],
-  "carts": {
-    "guest_ncbo68l4h": {
-      "items": []
-    }
-  },
+  "carts": {},
   "orders": []
 }
