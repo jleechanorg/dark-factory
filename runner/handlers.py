@@ -950,17 +950,21 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
     # Firebase emulator ports (Firestore:8080, Auth:9099, Functions:5001)
     emulator_ports = [8080, 9099, 5001]
 
-    # Fix 5 — Pre-clean ports from any stale previous run.
-    _kill_port_holders(emulator_ports)
-
     # Emulator env for seed step (points to local emulators).
     emulator_seed_env = dict(eval_env)
     emulator_seed_env["FIRESTORE_EMULATOR_HOST"] = "localhost:8080"
     emulator_seed_env["FIREBASE_AUTH_EMULATOR_HOST"] = "localhost:9099"
     emulator_seed_env["GCLOUD_PROJECT"] = "airbnb-clone-dev"
 
+    # Detect if this implementation uses Firebase emulators
+    uses_firebase = (impl / "firebase.json").exists()
+
     server_proc = None
     if (impl / "Makefile").exists():
+        # Fix 5 — Pre-clean ports only when starting emulators
+        if uses_firebase:
+            _kill_port_holders(emulator_ports)
+
         env_p = dict(eval_env)
         env_p["PORT"] = str(port)
         # Fix 3 — start_new_session=True so we can killpg the whole JVM tree.
@@ -968,15 +972,19 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
             ["make", "run"], cwd=str(impl), env=env_p,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
 
-        # Fix 2 — Poll ports instead of sleeping a fixed delay.
-        if not _poll_ports_ready(emulator_ports, timeout_s=120):
-            import sys
-            print(
-                "[_holdout_eval] WARNING: emulators not ready after 120s — proceeding anyway",
-                file=sys.stderr)
+        # Fix 2 — Poll emulator ports only when Firebase is used
+        if uses_firebase:
+            if not _poll_ports_ready(emulator_ports, timeout_s=120):
+                import sys
+                print(
+                    "[_holdout_eval] WARNING: emulators not ready after 120s — proceeding anyway",
+                    file=sys.stderr)
+            else:
+                # Seed step — run after emulators confirmed ready.
+                _run_seed_script(impl, emulator_seed_env)
         else:
-            # Seed step — run after emulators confirmed ready.
-            _run_seed_script(impl, emulator_seed_env)
+            # Non-Firebase app: simple delay for server startup
+            time.sleep(5)
 
     try:
         proc = subprocess.run(
