@@ -12,6 +12,8 @@ import pathlib
 import re
 import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -804,12 +806,110 @@ _gate_er = _slash_gate("er")
 _gate_code_standards = _slash_gate("code_standards")
 
 
+def _tcp_port_open(host: str, port: int) -> bool:
+    """Return True if TCP port is accepting connections."""
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def _poll_ports_ready(ports: list[int], host: str = "localhost",
+                      timeout_s: float = 120, interval_s: float = 2.0) -> bool:
+    """Poll until all ports are accepting TCP connections or timeout expires."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if all(_tcp_port_open(host, p) for p in ports):
+            return True
+        time.sleep(interval_s)
+    return False
+
+
+def _kill_port_holders(ports: list[int]) -> None:
+    """SIGTERM any processes holding the given TCP ports (pre-cleanup for stale runs)."""
+    for port in ports:
+        try:
+            result = subprocess.run(
+                ["lsof", "-ti", f":{port}"],
+                capture_output=True, text=True, check=False)
+            for pid_str in result.stdout.strip().splitlines():
+                try:
+                    os.kill(int(pid_str), signal.SIGTERM)
+                except (ProcessLookupError, ValueError):
+                    pass
+        except FileNotFoundError:
+            pass  # lsof not available on this platform
+    if ports:
+        time.sleep(2)
+
+
+def _killpg_proc(proc: subprocess.Popen) -> None:
+    """Kill the process group of proc (covers child JVMs spawned in new session)."""
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _run_seed_script(impl: pathlib.Path, emulator_env: dict) -> None:
+    """Detect and run a seed script if present. Warns on failure, never crashes eval."""
+    seed_ts = impl / "scripts" / "seed.ts"
+    pkg_json = impl / "package.json"
+    has_npm_seed = False
+    if pkg_json.exists():
+        try:
+            data = json.loads(pkg_json.read_text())
+            has_npm_seed = "seed" in (data.get("scripts") or {})
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if not seed_ts.exists() and not has_npm_seed:
+        return  # No seed script — skip silently
+
+    cmd: list[str]
+    if has_npm_seed:
+        cmd = ["npm", "run", "seed"]
+    else:
+        cmd = ["npx", "ts-node", "scripts/seed.ts"]
+
+    try:
+        r = subprocess.run(
+            cmd, cwd=str(impl), env=emulator_env,
+            capture_output=True, text=True, timeout=120, check=False)
+        if r.returncode != 0:
+            import sys
+            print(
+                f"[_holdout_eval] seed script exited {r.returncode}: {r.stderr[:500]}",
+                file=sys.stderr)
+    except subprocess.TimeoutExpired:
+        import sys
+        print("[_holdout_eval] seed script timed out after 120s — continuing", file=sys.stderr)
+    except FileNotFoundError as exc:
+        import sys
+        print(f"[_holdout_eval] seed script command not found: {exc} — continuing", file=sys.stderr)
+
+
 def _holdout_eval(node: Node, ctx: Context) -> Result:
     """Run the sealed holdout evaluator in a separate process.
 
-    Random port allocation per run to avoid conflicts when running multiple benchmarks.
+    Infrastructure invariants (see memory/feedback_2026-05-24_holdout_eval_emulator_infra.md):
+    1. Java on PATH for Firebase emulators (Homebrew openjdk path).
+    2. Poll TCP ports, don't sleep — wait for all emulators to be ready.
+    3. Kill process GROUP on cleanup, not just the wrapper process.
+    4. Strip real GCP credentials from env so Cloud Functions emulator uses local project.
+    5. Pre-clean emulator ports before launching to kill stale JVM holders.
+    6. Run seed script (impl/scripts/seed.ts or npm run seed) after emulators are ready.
     """
-    import random, time
+    import random
 
     repo_path = _holdouts_repo_path()
     feature = ctx.state.get("feature") or node.attrs.get("feature")
@@ -831,17 +931,52 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
         return Result(outcome="failure", output=f"implementation missing: {impl}")
 
     port = random.randint(30001, 30999)
+
+    # Build eval env: inherit current environment...
     eval_env = dict(os.environ)
+
+    # Fix 1 — Java PATH: prepend Homebrew openjdk so Firebase emulators can find java.
+    homebrew_java = "/opt/homebrew/opt/java/bin"
+    if os.path.isdir(homebrew_java):
+        eval_env["PATH"] = homebrew_java + ":" + eval_env.get("PATH", "")
+        eval_env["JAVA_HOME"] = "/opt/homebrew/opt/java"
+
+    # Fix 4 — Strip real GCP credentials: Cloud Functions emulator must use local project.
+    for gcp_var in ("GOOGLE_APPLICATION_CREDENTIALS", "GCLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT"):
+        eval_env.pop(gcp_var, None)
+
     eval_env["BENCHMARK_PORT"] = str(port)
+
+    # Firebase emulator ports (Firestore:8080, Auth:9099, Functions:5001)
+    emulator_ports = [8080, 9099, 5001]
+
+    # Fix 5 — Pre-clean ports from any stale previous run.
+    _kill_port_holders(emulator_ports)
+
+    # Emulator env for seed step (points to local emulators).
+    emulator_seed_env = dict(eval_env)
+    emulator_seed_env["FIRESTORE_EMULATOR_HOST"] = "localhost:8080"
+    emulator_seed_env["FIREBASE_AUTH_EMULATOR_HOST"] = "localhost:9099"
+    emulator_seed_env["GCLOUD_PROJECT"] = "airbnb-clone-dev"
 
     server_proc = None
     if (impl / "Makefile").exists():
         env_p = dict(eval_env)
         env_p["PORT"] = str(port)
+        # Fix 3 — start_new_session=True so we can killpg the whole JVM tree.
         server_proc = subprocess.Popen(
             ["make", "run"], cwd=str(impl), env=env_p,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-        time.sleep(5)
+
+        # Fix 2 — Poll ports instead of sleeping a fixed delay.
+        if not _poll_ports_ready(emulator_ports, timeout_s=120):
+            import sys
+            print(
+                "[_holdout_eval] WARNING: emulators not ready after 120s — proceeding anyway",
+                file=sys.stderr)
+        else:
+            # Seed step — run after emulators confirmed ready.
+            _run_seed_script(impl, emulator_seed_env)
 
     try:
         proc = subprocess.run(
@@ -902,9 +1037,8 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
         )
     finally:
         if server_proc:
-            server_proc.terminate()
-            try: server_proc.wait(5)
-            except: server_proc.kill()
+            # Fix 3 — Kill process group to take down child JVMs (Firestore etc.).
+            _killpg_proc(server_proc)
 
 def _render_prompt(node: Node, ctx: Context) -> str:
     ref = node.prompt_ref
