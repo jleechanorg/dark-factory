@@ -863,10 +863,15 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
             )
 
         sha_directive = (
-            f"\n\nexpected_head_sha: {expected_sha}\n"
-            f"Your verdict response MUST include a line of the exact form "
-            f"`head_sha: {expected_sha}` so the runner can bind this verdict "
-            f"to the worktree commit it was meant to review.\n"
+            f"\n\n"
+            f"<!-- RUNNER BINDING REQUIREMENT (non-negotiable) -->\n"
+            f"expected_head_sha: {expected_sha}\n\n"
+            f"CRITICAL: Your response MUST include the following line verbatim "
+            f"(machine-parsed binding — do NOT omit it, paraphrase it, "
+            f"or put it inside a code block):\n"
+            f"head_sha: {expected_sha}\n\n"
+            f"Place this line near the top of your response, right after any "
+            f"header/context block. The pipeline runner rejects responses missing this line.\n"
         )
         prompt = f"/{slash_command} {args} {target}".strip() + sha_directive
 
