@@ -1,6 +1,6 @@
 digraph ReviewPR {
     graph [
-        goal="PR review: cold review + holdout + evidence gates."
+        goal="PR review: cold review + evidence gates (no holdout — holdouts test feature scenarios not PR diffs)."
         label="ReviewPR"
         rankdir=LR
     ]
@@ -15,19 +15,15 @@ digraph ReviewPR {
         prompt="@prompts/slim/review.md",
         goal_gate=true
     ]
-    holdout [type="holdout_eval", label="Holdout Eval", feature="hello"]
-    gate_es [type="gate_es",      label="/es Evidence Standards"]
-    gate_er [type="gate_er",      label="/er Evidence Review"]
+    gate_es [type="gate_es",  label="/es Evidence Standards"]
+    gate_er [type="gate_er",  label="/er Evidence Review"]
 
-    start  -> review
-    review -> holdout  [condition="outcome=success"]
-    review -> exit     [condition="outcome!=success"]
+    start   -> review
+    review  -> gate_es  [condition="outcome=success"]
+    review  -> exit     [condition="outcome!=success"]
 
-    holdout -> gate_es [condition="outcome=success"]
-    holdout -> exit    [condition="outcome!=success"]
-
-    gate_es -> gate_er [condition="outcome=success"]
-    gate_es -> exit    [condition="outcome!=success"]
+    gate_es -> gate_er  [condition="outcome=success"]
+    gate_es -> exit     [condition="outcome!=success"]
 
     gate_er -> exit
 }
