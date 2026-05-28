@@ -412,7 +412,7 @@ def _codergen(node: Node, ctx: Context) -> Result:
         env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = wafer_model
         env["CLAUDEW_MODE"] = "1"
         claude_bin = _get_claude_executable()
-        args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", "--setting-sources", "", "--model", wafer_model, "--effort", "high", prompt_text])
+        args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", "--model", wafer_model, "--effort", "high", prompt_text])
         if args is None:
             return Result(outcome="failure", output="sandbox-exec unavailable")
         try:
@@ -887,11 +887,11 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
             gate_env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = wafer_model
             gate_env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = wafer_model
             gate_env["CLAUDEW_MODE"] = "1"
-            sub_args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", "--setting-sources", "", "--model", wafer_model, "--effort", "high", prompt])
+            sub_args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", "--model", wafer_model, "--effort", "high", prompt])
         else:
             claude_bin = _get_claude_executable()
             gate_env = _sanitized_env()
-            sub_args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt])
+            sub_args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", prompt])
 
         if sub_args is None:
             return Result(outcome="failure", output="sandbox-exec unavailable")
