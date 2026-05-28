@@ -1,0 +1,33 @@
+digraph ReviewPR {
+    graph [
+        goal="PR review: cold review + holdout + evidence gates."
+        label="ReviewPR"
+        rankdir=LR
+    ]
+
+    start  [shape=Mdiamond, label="Start"]
+    exit   [shape=Msquare,  label="Exit"]
+
+    review  [
+        type="codergen",
+        label="Cold Review",
+        class="review",
+        prompt="@prompts/slim/review.md",
+        goal_gate=true
+    ]
+    holdout [type="holdout_eval", label="Holdout Eval", feature="hello"]
+    gate_es [type="gate_es",      label="/es Evidence Standards"]
+    gate_er [type="gate_er",      label="/er Evidence Review"]
+
+    start  -> review
+    review -> holdout  [condition="outcome=success"]
+    review -> exit     [condition="outcome!=success"]
+
+    holdout -> gate_es [condition="outcome=success"]
+    holdout -> exit    [condition="outcome!=success"]
+
+    gate_es -> gate_er [condition="outcome=success"]
+    gate_es -> exit    [condition="outcome!=success"]
+
+    gate_er -> exit
+}
