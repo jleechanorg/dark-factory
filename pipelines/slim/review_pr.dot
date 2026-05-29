@@ -15,11 +15,16 @@ digraph ReviewPR {
         prompt="@prompts/slim/review.md",
         goal_gate=true
     ]
-    gate_er [type="gate_er",  label="/er Evidence Review (incl. standards)"]
+    evidence [
+        type="codergen",
+        label="Evidence Review",
+        class="review",
+        prompt="@prompts/slim/evidence_review.md"
+    ]
 
-    start   -> review
-    review  -> gate_er  [condition="outcome=success"]
-    review  -> exit     [condition="outcome!=success"]
+    start    -> review
+    review   -> evidence  [condition="outcome=success"]
+    review   -> exit      [condition="outcome!=success"]
 
-    gate_er -> exit
+    evidence -> exit
 }
