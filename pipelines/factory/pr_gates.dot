@@ -1,0 +1,23 @@
+digraph pr_gates {
+    graph [
+        goal="PR validation: 3 adversarial gates (no holdout)."
+        label="PR Gates"
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    gate_es         [type="gate_es",             label="/es Evidence Standards"]
+    gate_er         [type="gate_er",             label="/er Evidence Review"]
+    gate_cs         [type="gate_code_standards", label="/code_standards (ZFC + leveling + RCF)"]
+
+    start -> gate_es
+    gate_es -> gate_er [condition="outcome=success"]
+    gate_es -> exit    [condition="outcome!=success"]
+
+    gate_er -> gate_cs [condition="outcome=success"]
+    gate_er -> exit    [condition="outcome!=success"]
+
+    gate_cs -> exit
+}

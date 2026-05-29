@@ -228,3 +228,48 @@ def test_engine_parallel_fanout_with_join_quorum_and_allow_partial(tmp_path, mon
         "exit",
     ]
     assert history[-1].outcome == "success"
+
+
+def test_recursive_boolean_edge_matching():
+    from runner.engine import _evaluate_expression
+    from runner.handlers import Result, Context
+
+    ctx = Context(goal="test", workdir=None, backend="echo")
+    ctx.state["error_code"] = "404"
+    ctx.state["test_failures"] = "critical, warning"
+
+    last = Result(outcome="success", metadata={"api_key": "valid"})
+
+    # Simple outcome check
+    assert _evaluate_expression("success", last, ctx, False) is True
+    assert _evaluate_expression("fail", last, ctx, False) is False
+
+    # EQ and NEQ comparisons
+    assert _evaluate_expression("outcome = success", last, ctx, False) is True
+    assert _evaluate_expression("outcome != success", last, ctx, False) is False
+
+    # Metadata lookup
+    assert _evaluate_expression("api_key == valid", last, ctx, False) is True
+    assert _evaluate_expression("api_key != invalid", last, ctx, False) is True
+
+    # State lookup
+    assert _evaluate_expression("error_code = 404", last, ctx, True) is True
+    assert _evaluate_expression("error_code != 500", last, ctx, True) is True
+
+    # CONTAINS and NOT CONTAINS
+    assert _evaluate_expression("test_failures contains critical", last, ctx, True) is True
+    assert _evaluate_expression("test_failures not contains blocker", last, ctx, True) is True
+
+    # IN and NOT IN
+    assert _evaluate_expression("error_code in '404, 500'", last, ctx, True) is True
+    assert _evaluate_expression("error_code not in '200, 301'", last, ctx, True) is True
+
+    # Compound boolean expressions (AND, OR, NOT)
+    assert _evaluate_expression("outcome = success && error_code = 404", last, ctx, True) is True
+    assert _evaluate_expression("outcome = success && error_code = 500", last, ctx, True) is False
+    assert _evaluate_expression("outcome = fail || error_code = 404", last, ctx, True) is True
+    assert _evaluate_expression("!(error_code = 500)", last, ctx, True) is True
+
+    # Nested parenthesized expressions
+    assert _evaluate_expression("outcome = success && (error_code = 500 || test_failures contains critical)", last, ctx, True) is True
+    assert _evaluate_expression("outcome = success && !(error_code = 500 || test_failures contains blocker)", last, ctx, True) is True

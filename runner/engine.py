@@ -113,6 +113,152 @@ def _is_decision_node(node: Optional[Node]) -> bool:
     return node.shape == "hexagon" or node.attrs.get("type") == "conditional"
 
 
+def _evaluate_expression(
+    cond: str,
+    last: Result,
+    ctx: Optional[Context],
+    is_decision: bool,
+) -> bool:
+    cond = cond.strip()
+    if not cond:
+        return True
+
+    import re
+
+    token_specification = [
+        ('PAREN', r'[()]'),
+        ('AND', r'&&|and\b'),
+        ('OR', r'\|\||or\b'),
+        ('NOT_CONTAINS', r'not contains\b'),
+        ('CONTAINS', r'contains\b'),
+        ('NOT_IN', r'not in\b'),
+        ('IN', r'in\b'),
+        ('NEQ', r'!='),
+        ('EQ', r'==|='),
+        ('NOT', r'!|not\b'),
+        ('STRING', r'"[^"]*"|\'[^\']*\''),
+        ('WORD', r'[a-zA-Z_0-9\-\.\*]+'),
+        ('SPACE', r'\s+'),
+    ]
+    tok_regex = '|'.join(f'(?P<{name}>{pattern})' for name, pattern in token_specification)
+
+    tokens = []
+    for mo in re.finditer(tok_regex, cond):
+        kind = mo.lastgroup
+        value = mo.group()
+        if kind == 'SPACE':
+            continue
+        elif kind == 'STRING':
+            value = value[1:-1]
+            tokens.append((kind, value))
+        else:
+            tokens.append((kind, value))
+
+    if not tokens:
+        return False
+
+    idx = 0
+
+    def peek() -> Optional[tuple[str, str]]:
+        if idx < len(tokens):
+            return tokens[idx]
+        return None
+
+    def consume(expected_kind: Optional[str] = None) -> tuple[str, str]:
+        nonlocal idx
+        if idx >= len(tokens):
+            raise ValueError("Unexpected end of expression")
+        tok = tokens[idx]
+        if expected_kind and tok[0] != expected_kind:
+            raise ValueError(f"Expected {expected_kind}, got {tok[0]}")
+        idx += 1
+        return tok
+
+    def parse_expression() -> bool:
+        left = parse_term()
+        while True:
+            t = peek()
+            if t and t[0] == 'OR':
+                consume()
+                right = parse_term()
+                left = left or right
+            else:
+                break
+        return left
+
+    def parse_term() -> bool:
+        left = parse_factor()
+        while True:
+            t = peek()
+            if t and t[0] == 'AND':
+                consume()
+                right = parse_factor()
+                left = left and right
+            else:
+                break
+        return left
+
+    def parse_factor() -> bool:
+        t = peek()
+        if t and t[0] == 'NOT':
+            consume()
+            return not parse_factor()
+        if t and t[0] == 'PAREN' and t[1] == '(':
+            consume()
+            val = parse_expression()
+            consume('PAREN')
+            return val
+
+        key_tok = consume('WORD')
+        op_tok = peek()
+        if not op_tok:
+            outcome = _lookup("outcome", last, ctx, is_decision)
+            return outcome == key_tok[1]
+
+        op_kind = op_tok[0]
+        if op_kind not in {'EQ', 'NEQ', 'CONTAINS', 'NOT_CONTAINS', 'IN', 'NOT_IN'}:
+            val = _lookup(key_tok[1], last, ctx, is_decision)
+            return val.lower() in {"true", "1", "yes", "success"}
+
+        consume()
+        val_tok = consume()
+
+        k = key_tok[1]
+        v = val_tok[1]
+        actual_val = _lookup(k, last, ctx, is_decision)
+
+        if op_kind == 'EQ':
+            return actual_val == v
+        elif op_kind == 'NEQ':
+            return actual_val != v
+        elif op_kind == 'CONTAINS':
+            return v in actual_val
+        elif op_kind == 'NOT_CONTAINS':
+            return v not in actual_val
+        elif op_kind == 'IN':
+            parts = [p.strip() for p in v.split(",")]
+            return actual_val in parts
+        elif op_kind == 'NOT_IN':
+            parts = [p.strip() for p in v.split(",")]
+            return actual_val not in parts
+
+        return False
+
+    try:
+        res = parse_expression()
+        if idx < len(tokens):
+            return False
+        return res
+    except Exception:
+        if "!=" in cond:
+            k, v = cond.split("!=", 1)
+            return _lookup(k.strip(), last, ctx, is_decision) != v.strip()
+        if "=" in cond:
+            k, v = cond.split("=", 1)
+            return _lookup(k.strip(), last, ctx, is_decision) == v.strip()
+        return False
+
+
 def _edge_matches(
     edge: Edge,
     last: Result,
@@ -123,14 +269,7 @@ def _edge_matches(
     if not cond:
         return True
     is_decision = _is_decision_node(current)
-    # Support `key=value` and `key!=value`.
-    if "!=" in cond:
-        k, v = cond.split("!=", 1)
-        return _lookup(k.strip(), last, ctx, is_decision) != v.strip()
-    if "=" in cond:
-        k, v = cond.split("=", 1)
-        return _lookup(k.strip(), last, ctx, is_decision) == v.strip()
-    return False
+    return _evaluate_expression(cond, last, ctx, is_decision)
 
 
 def _lookup(
@@ -377,7 +516,7 @@ def run(
                         for branch_index, b_result in enumerate(b_results):
                             b_record = b_records[branch_index]
                             branch_records.append((b_record, b_result.output, b_record.metadata))
-                        branch_results.append(b_records[-1])
+                        branch_results.append(b_results[-1])
 
                 if branch_records:
                     join_outcome = _parallel_join_outcome(current, branch_results, _allow_partial(current))
