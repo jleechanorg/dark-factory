@@ -15,15 +15,11 @@ digraph ReviewPR {
         prompt="@prompts/slim/review.md",
         goal_gate=true
     ]
-    gate_es [type="gate_es",  label="/es Evidence Standards"]
-    gate_er [type="gate_er",  label="/er Evidence Review"]
+    gate_er [type="gate_er",  label="/er Evidence Review (incl. standards)"]
 
     start   -> review
-    review  -> gate_es  [condition="outcome=success"]
+    review  -> gate_er  [condition="outcome=success"]
     review  -> exit     [condition="outcome!=success"]
-
-    gate_es -> gate_er  [condition="outcome=success"]
-    gate_es -> exit     [condition="outcome!=success"]
 
     gate_er -> exit
 }
