@@ -919,9 +919,15 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
         if proc.returncode != 0 and (verdict == "unknown" or normalized == "success"):
             outcome = "error"
         elif not sha_ok:
-            # Echo missing or mismatched — treat as infra error (verdict can
-            # not be safely bound to a commit) regardless of pass/fail content.
-            outcome = "error"
+            # SHA missing/mismatched.  A spoofed PASS is dangerous so we
+            # collapse that to error.  But FAIL/PARTIAL without a SHA echo is
+            # still conservative — keep the real verdict rather than hiding it.
+            if normalized == "success":
+                outcome = "error"
+            elif normalized == "unknown":
+                outcome = "error"
+            else:
+                outcome = normalized  # fail/partial — conservative, keep verdict
         else:
             outcome = normalized
         head_sha_status = (
