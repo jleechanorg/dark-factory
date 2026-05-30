@@ -1122,26 +1122,53 @@ def _run_universal_prompt_gate(prompt_template: str, name: str, node: Node, ctx:
 def _gate_code_standards(node: Node, ctx: Context) -> Result:
     local_cmd = ctx.workdir / ".claude" / "commands" / "code-standards.md"
     local_skill = ctx.workdir / ".claude" / "skills" / "code-standards" / "SKILL.md"
-    
+
     if local_cmd.exists() or local_skill.exists():
-        return _slash_gate("code_standards")(node, ctx)
+        # Slash command name derives from filename: code-standards.md → /code-standards
+        return _slash_gate("code-standards")(node, ctx)
     else:
         return _run_universal_prompt_gate(UNIVERSAL_CODE_STANDARDS_PROMPT, "gate_code_standards", node, ctx)
 
 
 def _gate_evidence_review(node: Node, ctx: Context) -> Result:
-    local_skill = ctx.workdir / ".claude" / "skills" / "evidence-standards.md"
-    local_cmd = ctx.workdir / ".claude" / "commands" / "evidence_review.md"
     local_es = ctx.workdir / ".claude" / "commands" / "es.md"
-    
-    if local_skill.exists() or local_cmd.exists() or local_es.exists():
+    local_er = ctx.workdir / ".claude" / "commands" / "er.md"
+    local_cmd = ctx.workdir / ".claude" / "commands" / "evidence_review.md"
+    local_skill = ctx.workdir / ".claude" / "skills" / "evidence-standards.md"
+
+    # Dispatch to the most specific matching local command; fallback to universal prompt.
+    if local_es.exists():
         return _slash_gate("es")(node, ctx)
+    elif local_er.exists():
+        return _slash_gate("er")(node, ctx)
+    elif local_cmd.exists():
+        return _slash_gate("evidence_review")(node, ctx)
+    elif local_skill.exists():
+        return _slash_gate("evidence-standards")(node, ctx)
     else:
         return _run_universal_prompt_gate(UNIVERSAL_EVIDENCE_REVIEW_PROMPT, "gate_evidence_review", node, ctx)
 
 
-_gate_es = _gate_evidence_review
-_gate_er = _gate_evidence_review
+def _gate_es(node: Node, ctx: Context) -> Result:
+    local_es = ctx.workdir / ".claude" / "commands" / "es.md"
+    local_skill = ctx.workdir / ".claude" / "skills" / "evidence-standards.md"
+
+    if local_es.exists() or local_skill.exists():
+        return _slash_gate("es")(node, ctx)
+    else:
+        return _run_universal_prompt_gate(UNIVERSAL_EVIDENCE_REVIEW_PROMPT, "gate_es", node, ctx)
+
+
+def _gate_er(node: Node, ctx: Context) -> Result:
+    local_er = ctx.workdir / ".claude" / "commands" / "er.md"
+    local_cmd = ctx.workdir / ".claude" / "commands" / "evidence_review.md"
+
+    if local_er.exists():
+        return _slash_gate("er")(node, ctx)
+    elif local_cmd.exists():
+        return _slash_gate("evidence_review")(node, ctx)
+    else:
+        return _run_universal_prompt_gate(UNIVERSAL_EVIDENCE_REVIEW_PROMPT, "gate_er", node, ctx)
 
 
 def _tcp_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
