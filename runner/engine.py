@@ -265,10 +265,11 @@ def _edge_matches(
     ctx: Optional[Context] = None,
     current: Optional[Node] = None,
 ) -> bool:
+    """Return True when the edge condition is satisfied, fail-closed on malformed conditions."""
     cond = edge.condition
     if not cond:
         return True
-    if "=" not in cond:
+    if "=" not in cond and " contains " not in cond and " in " not in cond:
         return False
     is_decision = _is_decision_node(current)
     return _evaluate_expression(cond, last, ctx, is_decision)
