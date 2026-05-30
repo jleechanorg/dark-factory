@@ -268,6 +268,8 @@ def _edge_matches(
     cond = edge.condition
     if not cond:
         return True
+    if "=" not in cond:
+        return False
     is_decision = _is_decision_node(current)
     return _evaluate_expression(cond, last, ctx, is_decision)
 
