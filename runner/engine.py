@@ -12,7 +12,7 @@ from typing import Optional
 # Matches any valid binary operator in an edge condition string.
 # Conditions with NO operator are malformed (e.g. "not-a-condition" tokenizes
 # as NOT + WORD, which incorrectly evaluates to True via double-negation).
-_EDGE_OP_RE = re.compile(r"!=|==|=|(?:not\s+)?(?:contains|in)\b")
+_EDGE_OP_RE = re.compile(r"!=|==|=|(?<!\S)(?:not\s+)?(?:contains|in)\b")
 
 from .cxdb import CXDB
 from .handlers import Context, Result, resolve

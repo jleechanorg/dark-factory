@@ -173,6 +173,13 @@ def test_malformed_edge_condition_fails_closed():
     assert _edge_matches(edge, Result(outcome="success")) is False
 
 
+def test_malformed_hyphenated_edge_conditions_fail_closed():
+    edge_in = Edge(src="a", dst="b", attrs={"condition": "not-in-list"})
+    edge_contains = Edge(src="a", dst="b", attrs={"condition": "not-contains-x"})
+    assert _edge_matches(edge_in, Result(outcome="success")) is False
+    assert _edge_matches(edge_contains, Result(outcome="success")) is False
+
+
 def test_edge_matches_contains_operator():
     result = Result(outcome="success", metadata={"test_failures": "critical,blocker"})
     edge_match = Edge(src="a", dst="b", attrs={"condition": "test_failures contains critical"})
