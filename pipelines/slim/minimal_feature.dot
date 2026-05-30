@@ -32,11 +32,9 @@ digraph MinimalFeatureFactory {
     retry_target="fix"
   ]
 
-  review [
-    type="codergen",
-    label="Fresh Eyes Review",
-    class="review",
-    prompt="@prompts/slim/review.md",
+  code_review [
+    type="gate_code_standards",
+    label="Code Review & Standards",
     goal_gate=true,
     retry_target="fix"
   ]
@@ -49,14 +47,11 @@ digraph MinimalFeatureFactory {
     retry_target="fix"
   ]
 
-  gate_es [
-    type="gate_es",
-    label="/es Evidence Standards"
-  ]
-
-  gate_er [
-    type="gate_er",
-    label="/er Evidence Review"
+  evidence_review [
+    type="gate_evidence_review",
+    label="Evidence Standards Review",
+    goal_gate=true,
+    retry_target="fix"
   ]
 
   fix [
@@ -70,20 +65,17 @@ digraph MinimalFeatureFactory {
   plan -> implement
   implement -> test
 
-  test -> review [condition="outcome=success"]
+  test -> code_review [condition="outcome=success"]
   test -> fix [condition="outcome!=success"]
 
-  review -> holdout [condition="outcome=success"]
-  review -> fix [condition="outcome!=success"]
+  code_review -> holdout [condition="outcome=success"]
+  code_review -> fix [condition="outcome!=success"]
 
-  holdout -> gate_es [condition="outcome=success"]
+  holdout -> evidence_review [condition="outcome=success"]
   holdout -> fix [condition="outcome!=success"]
 
-  gate_es -> gate_er [condition="outcome=success"]
-  gate_es -> fix [condition="outcome!=success"]
-
-  gate_er -> exit [condition="outcome=success"]
-  gate_er -> fix [condition="outcome!=success"]
+  evidence_review -> exit [condition="outcome=success"]
+  evidence_review -> fix [condition="outcome!=success"]
 
   fix -> test
 }

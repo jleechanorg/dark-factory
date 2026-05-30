@@ -27,10 +27,9 @@ def test_minimal_feature_factory_runs_with_deterministic_gates(monkeypatch, tmp_
         "plan",
         "implement",
         "test",
-        "review",
+        "code_review",
         "holdout",
-        "gate_es",
-        "gate_er",
+        "evidence_review",
         "exit",
     ]
 
@@ -49,9 +48,8 @@ def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path)
         "plan",
         "implement",
         "test",
-        "review",
-        "gate_es",
-        "gate_er",
+        "code_review",
+        "evidence_review",
         "exit",
     ]
 
