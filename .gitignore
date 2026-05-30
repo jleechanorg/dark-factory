@@ -25,3 +25,10 @@ results/holdout_results.json
 
 # Misc test artifacts
 *_test.log
+
+# AO worker/orchestrator runtime artifacts (regenerated each run; not canonical)
+.ao/
+.claude/activity-updater.sh
+
+# Playwright MCP browser-test artifacts (console logs, page snapshots)
+.playwright-mcp/
