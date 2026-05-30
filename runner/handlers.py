@@ -1114,6 +1114,7 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
         _seed_pkg = impl / "package.json"
         _seed_ts = impl / "scripts" / "seed.ts"
         _seed_js = impl / "scripts" / "seed.js"
+        _seeded = False
         if _seed_pkg.exists():
             try:
                 _pkg_data = json.loads(_seed_pkg.read_text())
@@ -1122,17 +1123,19 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
                         ["npm", "run", "seed"],
                         cwd=str(impl), env=dict(eval_env),
                         capture_output=True, timeout=30, check=False)
+                    _seeded = True
             except Exception:
                 pass
-        elif _seed_ts.exists():
+        if not _seeded and _seed_ts.exists():
             try:
                 subprocess.run(
                     ["npx", "ts-node", str(_seed_ts)],
                     cwd=str(impl), env=dict(eval_env),
                     capture_output=True, timeout=30, check=False)
+                _seeded = True
             except Exception:
                 pass
-        elif _seed_js.exists():
+        if not _seeded and _seed_js.exists():
             try:
                 subprocess.run(
                     ["node", str(_seed_js)],
