@@ -9,6 +9,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      DISABLE_SANDBOX: "1"
+      DARK_FACTORY_HOLDOUTS: "${{ github.workspace }}/tests/fixtures/holdout-eval"
     steps:
       - uses: actions/checkout@v4
 

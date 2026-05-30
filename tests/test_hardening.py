@@ -28,6 +28,7 @@ from runner.handlers import (  # noqa: E402
     TYPE_REGISTRY,
     _codergen,
     _holdout_eval,
+    _holdouts_repo_path,
     _parse_verdict,
     _render_prompt,
     _sanitized_env,
@@ -272,11 +273,12 @@ def test_checkpoint_includes_synthetic_terminal_record(monkeypatch, tmp_path):
 
 
 def test_prompt_references_cannot_escape_workdir():
+    # Build a path that is within the configured holdouts directory so the
+    # check is correct regardless of platform or DARK_FACTORY_HOLDOUTS value.
+    holdout_path = _holdouts_repo_path() / "holdouts" / "hello" / "scenarios.yaml"
     node = Node(
         name="leak",
-        attrs={
-            "prompt": "@/Users/jleechan/projects/dark-factory-holdouts/holdouts/hello/scenarios.yaml"
-        },
+        attrs={"prompt": f"@{holdout_path}"},
     )
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
 
