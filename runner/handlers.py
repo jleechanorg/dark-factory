@@ -1085,6 +1085,23 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
              "--only", "firestore,auth,storage,functions"],
             cwd=str(impl), env=dict(eval_env),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        # Fix 5b — atexit cleanup so orphan JVMs are reaped even on SIGKILL (orch-2fze).
+        import atexit as _atexit
+        _atexit_pgid: list[int | None] = [None]
+        try:
+            _atexit_pgid[0] = os.getpgid(server_proc.pid)
+        except Exception:
+            pass
+
+        def _kill_emulator_group(_pgid_ref: list = _atexit_pgid) -> None:
+            pgid = _pgid_ref[0]
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGTERM)
+                except Exception:
+                    pass
+
+        _atexit.register(_kill_emulator_group)
         # Poll until all required emulator ports respond or startup_delay expires.
         _emulator_ports = [8080, 9099, 5001]
         _deadline = time.monotonic() + startup_delay
@@ -1092,6 +1109,37 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
             if all(_tcp_port_open("localhost", p) for p in _emulator_ports):
                 break
             time.sleep(2)
+
+        # Fix 6 — seed emulator with baseline data before evaluator runs (orch-0bne).
+        _seed_pkg = impl / "package.json"
+        _seed_ts = impl / "scripts" / "seed.ts"
+        _seed_js = impl / "scripts" / "seed.js"
+        if _seed_pkg.exists():
+            try:
+                _pkg_data = json.loads(_seed_pkg.read_text())
+                if "seed" in _pkg_data.get("scripts", {}):
+                    subprocess.run(
+                        ["npm", "run", "seed"],
+                        cwd=str(impl), env=dict(eval_env),
+                        capture_output=True, timeout=30, check=False)
+            except Exception:
+                pass
+        elif _seed_ts.exists():
+            try:
+                subprocess.run(
+                    ["npx", "ts-node", str(_seed_ts)],
+                    cwd=str(impl), env=dict(eval_env),
+                    capture_output=True, timeout=30, check=False)
+            except Exception:
+                pass
+        elif _seed_js.exists():
+            try:
+                subprocess.run(
+                    ["node", str(_seed_js)],
+                    cwd=str(impl), env=dict(eval_env),
+                    capture_output=True, timeout=30, check=False)
+            except Exception:
+                pass
 
     try:
         proc = subprocess.run(
