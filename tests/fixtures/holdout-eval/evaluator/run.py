@@ -2,7 +2,7 @@
 """Stub holdout evaluator for CI/testing when the sealed holdouts repo is absent.
 
 For the 'hello' feature: imports impl/greet.py from --impl dir and verifies
-hello() returns "Hello, world!".  All other features default to pass.
+hello() returns "Hello, world!". All other features fail with feature_not_found.
 
 Usage: python3 run.py --feature <name> --impl <path>
 Output: one JSON line {"verdict": "pass"|"fail", "scenarios": [...]}
