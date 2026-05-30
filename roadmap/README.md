@@ -15,3 +15,18 @@
 - Closed review beads `orch-s17v` and `orch-0rwy`; implementation remains open in `orch-pf62`, `orch-7z3e`, `orch-ac6q`, `orch-sdy0`, and `orch-rxfs`.
 - Current highest-risk gaps: visible all-nodes benchmark holdout, AO backend mechanical isolation, partial Attractor edge semantics, missing AttractorBench conformance surface, and static Healer/CXDB prescriptions.
 - Live discovery found both `/Users/jleechan/projects/dark-factory` and `/Users/jleechan/projects/dark-factory-holdouts` clean on `main...origin/main`, with no current PRs for `https://github.com/jleechanorg/dark-factory`.
+
+### 2026-05-29 — generic beads implemented, two PRs open
+
+- Resumed session after ~5-day gap; repo stable at HEAD `bd50ded` (AO lifecycle worker patched).
+- All five `_holdout_eval` infra fixes confirmed on main.
+- **orch-0bne + orch-2fze**: [PR #7](https://github.com/jleechanorg/dark-factory/pull/7) `feat/holdout-infra-seed-atexit` — Firebase emulator seed step + atexit SIGKILL cleanup. Both beads → `review`.
+- **orch-2oc6**: [PR #8](https://github.com/jleechanorg/dark-factory/pull/8) `fix/attractor-boundary-audit` — strengthened `check_boundary.py` with agent-facing-dir scan, no-holdouts-dir check, sealed-not-in-specs check. Bead → `review`.
+- **orch-ecwu** (Sprint 1 holdout score capture) now unblocked pending PR #7 merge.
+
+### 2026-05-30 — PR #7 and PR #8 merged; queue clean
+
+- [PR #7](https://github.com/jleechanorg/dark-factory/pull/7) merged — seed step + atexit cleanup (orch-0bne, orch-2fze) → `done`.
+- [PR #8](https://github.com/jleechanorg/dark-factory/pull/8) merged at `c99a119` — boundary audit hardening (orch-2oc6) → `done`.
+- **Main HEAD:** `c99a119`. Follow-up commit `acd39e1` (seed-fallback fix, not in PR #7) is being landed in a new PR off `fix/holdout-seed-fallback`.
+- **Next:** orch-ecwu (Sprint 1 airbnb-clone holdout score capture, now fully unblocked once the seed-fallback PR merges).
