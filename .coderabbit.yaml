@@ -1,6 +1,6 @@
 version: "2"
 reviews:
-  request_changes_workflow: false
+  request_changes_workflow: true
   auto_approve: true
   auto_review:
     enabled: true
