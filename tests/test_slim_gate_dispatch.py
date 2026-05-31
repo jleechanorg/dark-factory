@@ -218,3 +218,101 @@ def test_gate_evidence_review_in_validation_types():
         "gate_evidence_review must be in _VALIDATION_TYPES to clear "
         "_unresolved_failure on success, same as gate_es and gate_er"
     )
+
+
+# ---------------------------------------------------------------------------
+# Bug: _gate_evidence_review must run BOTH /es AND /er when both files exist
+# ---------------------------------------------------------------------------
+
+def test_gate_evidence_review_runs_both_es_and_er_when_both_exist(tmp_path, monkeypatch):
+    """Regression: when es.md AND er.md both exist, _gate_evidence_review must
+    invoke both gates, not silently skip /er after /es succeeds."""
+    cmd_dir = tmp_path / ".claude" / "commands"
+    cmd_dir.mkdir(parents=True)
+    (cmd_dir / "es.md").write_text("# es command")
+    (cmd_dir / "er.md").write_text("# er command")
+
+    captured_cmds: list[str] = []
+    import runner.handlers as handlers_mod
+
+    def mock_slash_gate(cmd: str):
+        captured_cmds.append(cmd)
+        return lambda node, ctx: Result(outcome="success", output=f"ran /{cmd}")
+
+    monkeypatch.setattr(handlers_mod, "_slash_gate", mock_slash_gate)
+
+    from runner.handlers import _gate_evidence_review as ger  # noqa: F401
+
+    result = ger(_make_node(), _make_ctx(tmp_path))
+
+    assert "es" in captured_cmds, f"Expected /es to run but got: {captured_cmds}"
+    assert "er" in captured_cmds, (
+        f"Expected /er to also run when both es.md and er.md exist, but got: {captured_cmds}"
+    )
+    assert result.outcome == "success"
+
+
+def test_gate_evidence_review_fails_when_er_fails_even_if_es_passes(tmp_path, monkeypatch):
+    """Combined result should be 'failure' if /er fails even when /es passes."""
+    cmd_dir = tmp_path / ".claude" / "commands"
+    cmd_dir.mkdir(parents=True)
+    (cmd_dir / "es.md").write_text("# es command")
+    (cmd_dir / "er.md").write_text("# er command")
+
+    import runner.handlers as handlers_mod
+
+    def mock_slash_gate(cmd: str):
+        outcome = "success" if cmd == "es" else "failure"
+        return lambda node, ctx: Result(outcome=outcome, output=f"ran /{cmd}")
+
+    monkeypatch.setattr(handlers_mod, "_slash_gate", mock_slash_gate)
+
+    from runner.handlers import _gate_evidence_review as ger
+
+    result = ger(_make_node(), _make_ctx(tmp_path))
+
+    assert result.outcome == "failure", (
+        f"Expected failure when /er fails, got: {result.outcome}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bug: _gate_es must NOT dispatch to /es when only skill file exists
+# ---------------------------------------------------------------------------
+
+def test_gate_es_uses_universal_fallback_when_only_skill_file_exists(tmp_path, monkeypatch):
+    """Regression: when evidence-standards.md skill exists but es.md does NOT,
+    _gate_es must NOT call _slash_gate('es') — the /es command cannot be resolved
+    from a skill file. It should fall back to the universal prompt gate."""
+    skill_dir = tmp_path / ".claude" / "skills"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "evidence-standards.md").write_text("# skill")
+    # Intentionally do NOT create es.md
+
+    import runner.handlers as handlers_mod
+
+    slash_gate_called: list[str] = []
+    universal_called: list[str] = []
+
+    def mock_slash_gate(cmd: str):
+        slash_gate_called.append(cmd)
+        return lambda node, ctx: Result(outcome="success", output=f"ran /{cmd}")
+
+    def mock_universal(prompt: str, gate_name: str, node, ctx) -> Result:
+        universal_called.append(gate_name)
+        return Result(outcome="success", output="universal fallback")
+
+    monkeypatch.setattr(handlers_mod, "_slash_gate", mock_slash_gate)
+    monkeypatch.setattr(handlers_mod, "_run_universal_prompt_gate", mock_universal)
+
+    from runner.handlers import _gate_es as ges
+
+    ges(_make_node(), _make_ctx(tmp_path))
+
+    assert "es" not in slash_gate_called, (
+        f"_gate_es must NOT call _slash_gate('es') when only skill file exists, "
+        f"got slash_gate calls: {slash_gate_called}"
+    )
+    assert len(universal_called) == 1, (
+        f"Expected universal fallback to be called once, got: {universal_called}"
+    )

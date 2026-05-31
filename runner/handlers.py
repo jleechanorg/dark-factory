@@ -1136,8 +1136,15 @@ def _gate_evidence_review(node: Node, ctx: Context) -> Result:
     local_cmd = ctx.workdir / ".claude" / "commands" / "evidence_review.md"
     local_skill = ctx.workdir / ".claude" / "skills" / "evidence-standards.md"
 
-    # Dispatch to the most specific matching local command; fallback to universal prompt.
-    if local_es.exists():
+    # When both /es and /er are available, run both and return the worst outcome.
+    if local_es.exists() and local_er.exists():
+        es_result = _slash_gate("es")(node, ctx)
+        er_result = _slash_gate("er")(node, ctx)
+        _SEVERITY = {"error": 3, "failure": 2, "partial": 1, "success": 0}
+        if _SEVERITY.get(er_result.outcome, 0) > _SEVERITY.get(es_result.outcome, 0):
+            return er_result
+        return es_result
+    elif local_es.exists():
         return _slash_gate("es")(node, ctx)
     elif local_er.exists():
         return _slash_gate("er")(node, ctx)
@@ -1151,9 +1158,10 @@ def _gate_evidence_review(node: Node, ctx: Context) -> Result:
 
 def _gate_es(node: Node, ctx: Context) -> Result:
     local_es = ctx.workdir / ".claude" / "commands" / "es.md"
-    local_skill = ctx.workdir / ".claude" / "skills" / "evidence-standards.md"
 
-    if local_es.exists() or local_skill.exists():
+    # Only dispatch to the /es slash command when es.md is present.
+    # A skill file alone cannot resolve a /es command invocation.
+    if local_es.exists():
         return _slash_gate("es")(node, ctx)
     else:
         return _run_universal_prompt_gate(UNIVERSAL_EVIDENCE_REVIEW_PROMPT, "gate_es", node, ctx)
