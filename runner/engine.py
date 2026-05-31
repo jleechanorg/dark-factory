@@ -576,6 +576,8 @@ def _handle_node_exception(
     seq: int,
     log: Optional[TextIO],
     visits: dict[str, int],
+    *,
+    skip_perf_exit: bool = False,
 ) -> Optional[Node]:
     """Record a node/transition crash as an `error` step and pick a recovery edge.
 
@@ -585,6 +587,10 @@ def _handle_node_exception(
 
     Returns the next node to route to (a registered retry/fix edge that matches
     `outcome=error`/`outcome!=success`) or None when the run should end.
+
+    ``skip_perf_exit`` must be True when the node already exited successfully
+    before the transition raised; otherwise a second node_exit would be logged
+    for the same enter/seq pair (duplicate).
     """
     tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     _log(log, f"node {current.name!r} raised {type(exc).__name__}: {exc}\n{tb_text}")
@@ -612,14 +618,15 @@ def _handle_node_exception(
         metadata={"exception": type(exc).__name__},
     )
     _append_record(history, checkpoint, cxdb, ctx, seq, record, tb_text, record.metadata)
-    _perf_node_exit(
-        ctx,
-        current.name,
-        seq,
-        "error",
-        visits.get(current.name, 1),
-        record.metadata,
-    )
+    if not skip_perf_exit:
+        _perf_node_exit(
+            ctx,
+            current.name,
+            seq,
+            "error",
+            visits.get(current.name, 1),
+            record.metadata,
+        )
     _emit_event(
         ctx,
         "node_exception",
@@ -855,14 +862,17 @@ def run(
                         for branch_index, b_result in enumerate(b_results):
                             b_record = b_records[branch_index]
                             branch_records.append((b_record, b_result.output, b_record.metadata))
-                            _perf_node_exit(
-                                ctx,
-                                target.name,
-                                branch_seq,
-                                b_result.outcome,
-                                branch_visit,
-                                b_record.metadata,
-                            )
+                        # Emit a single exit for the last result — calling inside the loop
+                        # would produce N exits for one enter when a node retries.
+                        final_b_record = b_records[-1]
+                        _perf_node_exit(
+                            ctx,
+                            target.name,
+                            branch_seq,
+                            b_results[-1].outcome,
+                            branch_visit,
+                            final_b_record.metadata,
+                        )
                         branch_results.append(b_results[-1])
                         _emit_event(
                             ctx,
@@ -972,8 +982,11 @@ def run(
                         chosen = outgoing
                     next_node = _pick_next_from_edges(graph, current, chosen, result, ctx)
             except Exception as exc:  # noqa: BLE001 — transition crash must be recorded, not fatal
+                # Node already exited successfully above; skip the perf exit to avoid a
+                # duplicate node_exit for the same enter/seq pair.
                 next_node = _handle_node_exception(
-                    graph, current, ctx, exc, history, checkpoint, cxdb, seq, log, visits
+                    graph, current, ctx, exc, history, checkpoint, cxdb, seq, log, visits,
+                    skip_perf_exit=True,
                 )
                 seq += 1
                 if next_node is None:
