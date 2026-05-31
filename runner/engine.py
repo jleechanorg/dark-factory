@@ -497,6 +497,7 @@ def _run_branch_until_join(
             last_result = results[-1] if results else Result(outcome="success")
             for i, attempt in enumerate(results):
                 record = records[i]
+                record.metadata = {**record.metadata, "_branch_overhead": "true"}
                 with seq_lock:
                     local_seq = seq_ref[0]
                     seq_ref[0] += 1
@@ -678,10 +679,14 @@ def run(
     visits: dict[str, int] = {}
     current = _start_node(graph)
     seq = 0  # CXDB sequence — independent of history length so refactors can't desync.
+    _resumed_overhead = 0
 
     if resume is not None:
         resumed = _load_checkpoint(resume)
         history.extend(resumed)
+        _resumed_overhead = sum(
+            1 for s in resumed if s.metadata.get("_branch_overhead") == "true"
+        )
         for step in resumed:
             visits[step.node] = visits.get(step.node, 0) + 1
 
@@ -692,7 +697,7 @@ def run(
                 raise ValueError(f"checkpoint node missing from graph: {last.node!r}")
             if is_exit_node(last_node):
                 return history
-            if len(history) >= max_steps:
+            if len(history) - _resumed_overhead >= max_steps:
                 return history
             synthetic = _normalized_result(Result(outcome=last.outcome))
             goal_gate_node = _goal_gate_target(graph, last_node, synthetic, ctx)
@@ -717,8 +722,9 @@ def run(
     try:
         # Branch StepRecords are internal to a fan-out step and should not count
         # against the main pipeline's step budget (max_steps).  Track overhead so
-        # the check uses only main-pipeline steps.
-        _parallel_overhead = 0
+        # the check uses only main-pipeline steps.  On resume, initialize from the
+        # count of branch records already in the checkpoint so the budget is correct.
+        _parallel_overhead = _resumed_overhead
         while True:
             if len(history) - _parallel_overhead >= max_steps:
                 record = StepRecord(

@@ -561,3 +561,74 @@ def test_join_max_visits_enforced(tmp_path):
     assert exhausted[-1].node == "join", (
         f"Exhausted step attributed to {exhausted[-1].node!r}; expected 'join'"
     )
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: resume correctly excludes parallel branch overhead from max_steps
+# ---------------------------------------------------------------------------
+
+def test_resume_parallel_overhead_preserved(tmp_path):
+    """Resuming from a checkpoint that contains parallel branch records must not
+    count those branch records against the main-pipeline max_steps budget.
+
+    Setup:
+      - Graph: start -> fanout -> {branch_a, branch_b} -> join -> work1 -> exit
+      - Checkpoint file has 4 records: start, branch_a(overhead), branch_b(overhead), join
+      - max_steps=4 means 4 main-pipeline slots (start, join, work1, exit)
+      - Branch records are marked with metadata["_branch_overhead"]="true"
+
+    RED (before fix):
+      _parallel_overhead=0 and pre-resume guard len(history) >= max_steps fires:
+      4 >= 4 -> returns immediately; work1 never runs.
+
+    GREEN (after fix):
+      _resumed_overhead=2; guard: 4-2=2 >= 4 -> False; work1 and exit run.
+    """
+    import json
+
+    dot = tmp_path / "resume_fanout.dot"
+    dot.write_text(
+        'digraph resume_fanout {\n'
+        '  graph [goal="resume overhead test"]\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  branch_a\n'
+        '  branch_b\n'
+        '  join [type="join", policy="wait_all"]\n'
+        '  work1\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> fanout\n'
+        '  fanout -> branch_a\n'
+        '  fanout -> branch_b\n'
+        '  branch_a -> join\n'
+        '  branch_b -> join\n'
+        '  join -> work1\n'
+        '  work1 -> exit\n'
+        '}\n'
+    )
+
+    # Checkpoint representing a run that stopped after join.
+    # Branch records are pre-marked with _branch_overhead="true" (as the fix writes them).
+    ckpt_path = tmp_path / "ckpt.json"
+    ckpt_path.write_text(json.dumps([
+        {"node": "start", "outcome": "success", "ts": 0.0, "output_preview": "", "metadata": {}},
+        {"node": "branch_a", "outcome": "success", "ts": 0.0, "output_preview": "",
+         "metadata": {"_branch_overhead": "true"}},
+        {"node": "branch_b", "outcome": "success", "ts": 0.0, "output_preview": "",
+         "metadata": {"_branch_overhead": "true"}},
+        {"node": "join", "outcome": "success", "ts": 0.0, "output_preview": "join wait_all 2 branches",
+         "metadata": {}},
+    ]))
+
+    ctx = _ctx()
+    ctx.state["work1.outcome"] = "success"
+
+    graph = parse(dot)
+    # max_steps=4: exactly enough for start(1) + join(2) + work1(3) + exit(4)
+    history = run(graph, ctx, max_steps=4, resume=ckpt_path)
+
+    nodes = [s.node for s in history]
+    assert "work1" in nodes, (
+        f"work1 should have run on resume when branch overhead is excluded from "
+        f"max_steps budget, but history only has: {nodes}"
+    )
