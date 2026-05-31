@@ -28,6 +28,7 @@ from runner.handlers import (  # noqa: E402
     TYPE_REGISTRY,
     _codergen,
     _holdout_eval,
+    _holdouts_repo_path,
     _parse_verdict,
     _render_prompt,
     _sanitized_env,
@@ -172,6 +173,31 @@ def test_malformed_edge_condition_fails_closed():
     assert _edge_matches(edge, Result(outcome="success")) is False
 
 
+def test_malformed_hyphenated_edge_conditions_fail_closed():
+    edge_in = Edge(src="a", dst="b", attrs={"condition": "not-in-list"})
+    edge_contains = Edge(src="a", dst="b", attrs={"condition": "not-contains-x"})
+    assert _edge_matches(edge_in, Result(outcome="success")) is False
+    assert _edge_matches(edge_contains, Result(outcome="success")) is False
+
+
+def test_edge_matches_contains_operator():
+    result = Result(outcome="success", metadata={"test_failures": "critical,blocker"})
+    edge_match = Edge(src="a", dst="b", attrs={"condition": "test_failures contains critical"})
+    edge_no_match = Edge(src="a", dst="b", attrs={"condition": "test_failures contains missing"})
+    edge_not_contains = Edge(src="a", dst="b", attrs={"condition": "test_failures not contains missing"})
+    assert _edge_matches(edge_match, result) is True
+    assert _edge_matches(edge_no_match, result) is False
+    assert _edge_matches(edge_not_contains, result) is True
+
+
+def test_edge_matches_in_operator():
+    result = Result(outcome="success", metadata={"error_code": "404"})
+    edge_match = Edge(src="a", dst="b", attrs={"condition": "error_code in '404, 500'"})
+    edge_no_match = Edge(src="a", dst="b", attrs={"condition": "error_code in '200, 301'"})
+    assert _edge_matches(edge_match, result) is True
+    assert _edge_matches(edge_no_match, result) is False
+
+
 # ---------------------------------------------------------------------------
 # engine.run finally-block CXDB closure on stuck pipelines
 # ---------------------------------------------------------------------------
@@ -254,11 +280,12 @@ def test_checkpoint_includes_synthetic_terminal_record(monkeypatch, tmp_path):
 
 
 def test_prompt_references_cannot_escape_workdir():
+    # Build a path that is within the configured holdouts directory so the
+    # check is correct regardless of platform or DARK_FACTORY_HOLDOUTS value.
+    holdout_path = _holdouts_repo_path() / "holdouts" / "hello" / "scenarios.yaml"
     node = Node(
         name="leak",
-        attrs={
-            "prompt": "@/Users/jleechan/projects/dark-factory-holdouts/holdouts/hello/scenarios.yaml"
-        },
+        attrs={"prompt": f"@{holdout_path}"},
     )
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
 

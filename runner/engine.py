@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Optional
+
+# Matches any valid binary operator in an edge condition string.
+# Conditions with NO operator are malformed (e.g. "not-a-condition" tokenizes
+# as NOT + WORD, which incorrectly evaluates to True via double-negation).
+_EDGE_OP_RE = re.compile(r"!=|==|=|(?<!\S)(?:not\s+)?(?:contains|in)\b")
 
 from .cxdb import CXDB
 from .handlers import Context, Result, resolve
@@ -123,7 +129,6 @@ def _evaluate_expression(
     if not cond:
         return True
 
-    import re
 
     token_specification = [
         ('PAREN', r'[()]'),
@@ -265,9 +270,12 @@ def _edge_matches(
     ctx: Optional[Context] = None,
     current: Optional[Node] = None,
 ) -> bool:
+    """Return True when the edge condition is satisfied, fail-closed on malformed conditions."""
     cond = edge.condition
     if not cond:
         return True
+    if not _EDGE_OP_RE.search(cond):
+        return False
     is_decision = _is_decision_node(current)
     return _evaluate_expression(cond, last, ctx, is_decision)
 
