@@ -316,3 +316,30 @@ def test_gate_es_uses_universal_fallback_when_only_skill_file_exists(tmp_path, m
     assert len(universal_called) == 1, (
         f"Expected universal fallback to be called once, got: {universal_called}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Bug: _run_universal_prompt_gate must catch TimeoutExpired
+# ---------------------------------------------------------------------------
+
+def test_universal_prompt_gate_returns_error_on_timeout(tmp_path, monkeypatch):
+    """Regression: if subprocess.run raises TimeoutExpired, _run_universal_prompt_gate
+    must return a Result(outcome='error') rather than propagating the exception."""
+    import subprocess
+    import runner.handlers as handlers_mod
+
+    def _raise_timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="claude", timeout=1200)
+
+    monkeypatch.setattr(subprocess, "run", _raise_timeout)
+    monkeypatch.setattr(handlers_mod, "_worktree_head_sha", lambda _: "abc1234")
+
+    from runner.handlers import _run_universal_prompt_gate
+
+    ctx = _make_ctx(tmp_path)
+    ctx.backend = "claude"  # non-echo so subprocess is invoked
+    node = _make_node()
+    result = _run_universal_prompt_gate("Review: {expected_sha}", "gate_test", node, ctx)
+
+    assert result.outcome == "error", f"Expected 'error' outcome on timeout, got {result.outcome!r}"
+    assert "timed out" in result.output.lower(), f"Expected timeout message, got: {result.output!r}"

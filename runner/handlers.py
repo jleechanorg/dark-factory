@@ -1077,15 +1077,22 @@ def _run_universal_prompt_gate(prompt_template: str, name: str, node: Node, ctx:
 
     if sub_args is None:
         return Result(outcome="failure", output="sandbox-exec unavailable")
-    proc = subprocess.run(
-        sub_args,
-        cwd=ctx.workdir,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-        env=gate_env,
-    )
+    try:
+        proc = subprocess.run(
+            sub_args,
+            cwd=ctx.workdir,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=gate_env,
+        )
+    except subprocess.TimeoutExpired:
+        return Result(
+            outcome="error",
+            output=f"gate {name} timed out after {timeout}s",
+            metadata={"slash_command": name, "verdict": "unknown", "head_sha_status": "missing"},
+        )
     combined = proc.stdout + "\n" + proc.stderr
     verdict, normalized = _parse_verdict(combined)
     sha_ok, observed_sha = _verify_head_sha_echo(combined, expected_sha)
