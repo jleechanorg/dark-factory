@@ -444,31 +444,61 @@ def _is_join_node(node: Node) -> bool:
 
 
 def _find_join_node(graph: Graph, fanout: Node) -> Optional[Node]:
-    """BFS from fanout's direct successors to find the nearest join node."""
-    visited: set[str] = set()
-    queue: list[Node] = []
+    """Find the join node that all branches of fanout converge on.
+
+    Separates direct-join edges from branch-node edges. For each branch start,
+    finds its first reachable join via BFS. Returns that join only if ALL
+    branch starts agree; returns None if they diverge (malformed pipeline).
+    Falls back to direct-join edge when there are no intermediate branch nodes.
+    """
+    direct_join: Optional[Node] = None
+    branch_starts: list[Node] = []
     for edge in graph.outgoing(fanout.name):
         n = graph.nodes.get(edge.dst)
-        if n is not None:
-            queue.append(n)
-    while queue:
-        node = queue.pop(0)
-        if node.name in visited:
+        if n is None:
             continue
-        visited.add(node.name)
-        if _is_join_node(node):
-            return node
-        for edge in graph.outgoing(node.name):
-            n = graph.nodes.get(edge.dst)
-            if n is not None and n.name not in visited:
-                queue.append(n)
-    return None
+        if _is_join_node(n):
+            direct_join = n
+        else:
+            branch_starts.append(n)
+
+    if not branch_starts:
+        return direct_join
+
+    def _bfs_first_join(start: Node) -> Optional[str]:
+        visited: set[str] = set()
+        queue: list[Node] = [start]
+        while queue:
+            node = queue.pop(0)
+            if node.name in visited:
+                continue
+            visited.add(node.name)
+            if _is_join_node(node):
+                return node.name
+            for edge in graph.outgoing(node.name):
+                n = graph.nodes.get(edge.dst)
+                if n is not None and n.name not in visited:
+                    queue.append(n)
+        return None
+
+    join_name: Optional[str] = None
+    for bs in branch_starts:
+        first = _bfs_first_join(bs)
+        if first is None:
+            return None
+        if join_name is None:
+            join_name = first
+        elif join_name != first:
+            return None
+
+    return graph.nodes.get(join_name) if join_name else None
 
 
 def _apply_join_policy(join_node: Node, results: list[Result]) -> str:
     """Compute join outcome from branch results using join_node's policy attribute."""
     if not results:
-        return "success"
+        policy = str(join_node.attrs.get("policy", "wait_all")).strip().lower()
+        return "failure" if policy in ("first_success", "k_of_n") else "success"
     policy = str(join_node.attrs.get("policy", "wait_all")).strip().lower()
     successes = sum(1 for r in results if _is_success_result(r.outcome))
     n = len(results)
@@ -976,7 +1006,13 @@ def run(
                                 for _bs in _branch_starts
                             }
                             for _f in as_completed(_futures):
-                                _name_to_br[_futures[_f]] = _f.result()
+                                try:
+                                    _name_to_br[_futures[_f]] = _f.result()
+                                except Exception as _exc:
+                                    _name_to_br[_futures[_f]] = (
+                                        [],
+                                        Result(outcome="failure", output=f"branch exception: {_exc}"),
+                                    )
 
                         seq = _seq_ref[0]
 
@@ -985,8 +1021,16 @@ def run(
                             _branch_flat_records.extend(_b_recs)
                             _branch_results_list.append(_b_res)
                     
-                    # Apply join policy even with zero branches
-                    _join_outcome = _apply_join_policy(_jn, _branch_results_list)
+                    # Apply join policy; fall back to join_quorum on fanout node
+                    # if the join node has no explicit policy (legacy compat).
+                    _fanout_quorum = _attr_int(current, "join_quorum", 0)
+                    _jn_policy = str(_jn.attrs.get("policy", "")).strip().lower()
+                    if _fanout_quorum and not _jn_policy and _branch_results_list:
+                        _n_b = len(_branch_results_list)
+                        _n_ok = sum(1 for _r in _branch_results_list if _is_success_result(_r.outcome))
+                        _join_outcome = "success" if _n_ok >= _fanout_quorum else "failure"
+                    else:
+                        _join_outcome = _apply_join_policy(_jn, _branch_results_list)
                     _join_meta: dict[str, str] = {
                         "policy": str(_jn.attrs.get("policy", "wait_all")),
                         "branches": str(len(_branch_results_list)),
@@ -1038,6 +1082,10 @@ def run(
                             output_preview=f"max_visits={_jn_max} exceeded",
                         )
                         seq = _append_record(history, checkpoint, cxdb, ctx, seq, _ex_rec, "")
+                        ctx.state["_last_node"] = _jn.name
+                        ctx.state["_last_outcome"] = "exhausted"
+                        ctx.state[_jn.name + ".outcome"] = "exhausted"
+                        _update_failure_state(_jn, ctx, Result(outcome="exhausted", output=_ex_rec.output_preview))
                         break
             # --- end parallel fan-out/fan-in ---
 

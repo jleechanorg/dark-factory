@@ -632,3 +632,196 @@ def test_resume_parallel_overhead_preserved(tmp_path):
         f"work1 should have run on resume when branch overhead is excluded from "
         f"max_steps budget, but history only has: {nodes}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: branch thread exception must produce failure, not abort the run
+# ---------------------------------------------------------------------------
+
+def test_branch_exception_produces_failure(tmp_path):
+    """An uncaught exception in a branch worker must produce failure, not propagate."""
+    from runner.handlers import TYPE_REGISTRY
+
+    def _crash_handler(node, ctx):
+        raise RuntimeError("deliberate branch crash")
+
+    dot = tmp_path / "branch_exc.dot"
+    dot.write_text(
+        'digraph branch_exc {\n'
+        '  graph [goal="branch exception test"]\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  exploding_branch [type="crash_test"]\n'
+        '  branch_b\n'
+        '  join [type="join", policy="wait_all"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> fanout\n'
+        '  fanout -> exploding_branch\n'
+        '  fanout -> branch_b\n'
+        '  exploding_branch -> join\n'
+        '  branch_b -> join\n'
+        '  join -> exit\n'
+        '}\n'
+    )
+    ctx = _ctx()
+    ctx.state["branch_b.outcome"] = "success"
+    try:
+        TYPE_REGISTRY["crash_test"] = _crash_handler
+        graph = parse(dot)
+        history = run(graph, ctx, max_steps=20)
+    finally:
+        TYPE_REGISTRY.pop("crash_test", None)
+
+    join_step = next((s for s in history if s.node == "join"), None)
+    assert join_step is not None, "join must appear in history even if a branch crashed"
+    assert join_step.outcome == "failure", (
+        f"join with a crashed branch should produce 'failure', got {join_step.outcome!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: empty branches with first_success/k_of_n must return failure
+# ---------------------------------------------------------------------------
+
+def test_empty_branches_first_success_fails(tmp_path):
+    """When all fan-out edges are filtered, first_success join must return failure."""
+    dot = tmp_path / "empty_branches.dot"
+    dot.write_text(
+        'digraph empty_branches {\n'
+        '  graph [goal="empty branches test"]\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  branch_a\n'
+        '  join [type="join", policy="first_success"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> fanout\n'
+        '  fanout -> branch_a [condition="skip=yes"]\n'
+        '  branch_a -> join\n'
+        '  join -> exit\n'
+        '}\n'
+    )
+    ctx = _ctx()
+    graph = parse(dot)
+    history = run(graph, ctx, max_steps=10)
+    join_step = next((s for s in history if s.node == "join"), None)
+    assert join_step is not None, "join should appear in history"
+    assert join_step.outcome == "failure", (
+        f"first_success with 0 branches should produce failure, got {join_step.outcome!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: join max_visits ctx.state must reflect exhausted outcome
+# ---------------------------------------------------------------------------
+
+def test_join_max_visits_state_consistency(tmp_path):
+    """After join max_visits exhaustion, ctx.state must reflect exhausted."""
+    ctx = _ctx()
+    ctx.state["branch_a.outcome"] = "success"
+    ctx.state["branch_b.outcome"] = "success"
+    ctx.state["retry.outcome"] = "success"
+
+    dot = tmp_path / "jmv_state.dot"
+    dot.write_text(
+        'digraph jmv_state {\n'
+        '  graph [goal="state consistency"]\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  branch_a\n'
+        '  branch_b\n'
+        '  join [type="join", policy="wait_all", max_visits="1"]\n'
+        '  retry\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> fanout\n'
+        '  fanout -> branch_a\n'
+        '  fanout -> branch_b\n'
+        '  branch_a -> join\n'
+        '  branch_b -> join\n'
+        '  join -> retry\n'
+        '  retry -> fanout\n'
+        '  retry -> exit [condition="outcome=done"]\n'
+        '}\n'
+    )
+    graph = parse(dot)
+    run(graph, ctx, max_steps=50)
+    assert ctx.state.get("join.outcome") == "exhausted", (
+        f"ctx.state['join.outcome'] must be 'exhausted' after max_visits exceeded, "
+        f"got {ctx.state.get('join.outcome')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: join_quorum on fanout node must be respected by type=parallel path
+# ---------------------------------------------------------------------------
+
+def test_fanout_join_quorum_respected(tmp_path):
+    """join_quorum on fanout must be used as k_of_n when join has no explicit policy."""
+    dot = tmp_path / "join_quorum.dot"
+    dot.write_text(
+        'digraph join_quorum {\n'
+        '  graph [goal="join_quorum test"]\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel", join_quorum="2"]\n'
+        '  branch_a\n'
+        '  branch_b\n'
+        '  branch_c\n'
+        '  join [type="join"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> fanout\n'
+        '  fanout -> branch_a\n'
+        '  fanout -> branch_b\n'
+        '  fanout -> branch_c\n'
+        '  branch_a -> join\n'
+        '  branch_b -> join\n'
+        '  branch_c -> join\n'
+        '  join -> exit\n'
+        '}\n'
+    )
+    ctx = _ctx()
+    ctx.state["branch_a.outcome"] = "success"
+    ctx.state["branch_b.outcome"] = "success"
+    ctx.state["branch_c.outcome"] = "failure"
+    graph = parse(dot)
+    history = run(graph, ctx, max_steps=20)
+    join_step = next((s for s in history if s.node == "join"), None)
+    assert join_step is not None
+    assert join_step.outcome == "success", (
+        f"join_quorum=2 with 2/3 successes should succeed (k_of_n), got {join_step.outcome!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: _find_join_node must return None for divergent branch topologies
+# ---------------------------------------------------------------------------
+
+def test_find_join_node_divergent_returns_none(tmp_path):
+    """_find_join_node must return None when branches converge on different joins."""
+    from runner.engine import _find_join_node
+
+    dot = tmp_path / "divergent.dot"
+    dot.write_text(
+        'digraph divergent {\n'
+        '  graph [goal="divergent test"]\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  branch_a\n'
+        '  branch_b\n'
+        '  join_a [type="join", policy="wait_all"]\n'
+        '  join_b [type="join", policy="wait_all"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> fanout\n'
+        '  fanout -> branch_a\n'
+        '  fanout -> branch_b\n'
+        '  branch_a -> join_a\n'
+        '  branch_b -> join_b\n'
+        '  join_a -> exit\n'
+        '  join_b -> exit\n'
+        '}\n'
+    )
+    graph = parse(dot)
+    fanout = graph.nodes["fanout"]
+    jn = _find_join_node(graph, fanout)
+    assert jn is None, (
+        f"Divergent branches should make _find_join_node return None, "
+        f"got {jn.name if jn else None!r}"
+    )
