@@ -526,7 +526,12 @@ def _run_branch_until_join(
                 break
             results, records = _run_single_node(current, ctx, graph)
             steps += 1
-            last_result = results[-1] if results else Result(outcome="success")
+            step_result = results[-1] if results else Result(outcome="success")
+            # Preserve first failure: don't let a mid-branch join's success mask it.
+            if not _is_success_result(last_result.outcome):
+                pass
+            else:
+                last_result = step_result
             for i, attempt in enumerate(results):
                 record = records[i]
                 record.metadata = {**record.metadata, "_branch_overhead": "true"}
@@ -950,6 +955,10 @@ def run(
                         ):
                             _seen_branch_names.add(_bn.name)
                             _branch_starts.append(_bn)
+                    
+                    _branch_results_list: list[Result] = []
+                    _branch_flat_records: list[StepRecord] = []
+                    
                     if _branch_starts:
                         _seq_ref: list[int] = [seq]
                         _seq_lock = threading.Lock()
@@ -971,66 +980,65 @@ def run(
 
                         seq = _seq_ref[0]
 
-                        _branch_results_list: list[Result] = []
-                        _branch_flat_records: list[StepRecord] = []
                         for _bs in _branch_starts:
                             _b_recs, _b_res = _name_to_br.get(_bs.name, ([], Result(outcome="failure")))
                             _branch_flat_records.extend(_b_recs)
                             _branch_results_list.append(_b_res)
+                    
+                    # Apply join policy even with zero branches
+                    _join_outcome = _apply_join_policy(_jn, _branch_results_list)
+                    _join_meta: dict[str, str] = {
+                        "policy": str(_jn.attrs.get("policy", "wait_all")),
+                        "branches": str(len(_branch_results_list)),
+                        "successes": str(
+                            sum(1 for _r in _branch_results_list if _is_success_result(_r.outcome))
+                        ),
+                    }
+                    _join_rec = StepRecord(
+                        node=_jn.name,
+                        outcome=_join_outcome,
+                        ts=time.time(),
+                        output_preview=(
+                            f"join {_jn.attrs.get('policy', 'wait_all')} "
+                            f"{len(_branch_results_list)} branches"
+                        ),
+                        metadata=_join_meta,
+                    )
+                    _para_result = Result(outcome=_join_outcome, metadata=_join_meta)
 
-                        _join_outcome = _apply_join_policy(_jn, _branch_results_list)
-                        _join_meta: dict[str, str] = {
-                            "policy": str(_jn.attrs.get("policy", "wait_all")),
-                            "branches": str(len(_branch_results_list)),
-                            "successes": str(
-                                sum(1 for _r in _branch_results_list if _is_success_result(_r.outcome))
-                            ),
-                        }
-                        _join_rec = StepRecord(
+                    ctx.state["_last_node"] = _jn.name
+                    ctx.state["_last_outcome"] = _join_outcome
+                    ctx.state[_jn.name + ".outcome"] = _join_outcome
+
+                    # Branch records already in CXDB (written thread-safely in _run_branch_until_join)
+                    for _br in _branch_flat_records:
+                        history.append(_br)
+                    if checkpoint is not None:
+                        checkpoint.write_text(json.dumps([asdict(r) for r in history], indent=2))
+
+                    seq = _append_record(
+                        history, checkpoint, cxdb, ctx, seq,
+                        _join_rec, _join_rec.output_preview, _join_meta,
+                    )
+                    result = _para_result
+                    _para_jump_to = _jn
+                    # Branch records are internal overhead; don't count them
+                    # against the main pipeline's max_steps budget.
+                    _parallel_overhead += len(_branch_flat_records)
+
+                    # Enforce max_visits on the join node (it's never set as
+                    # `current`, so the top-of-loop visit check never fires).
+                    visits[_jn.name] = visits.get(_jn.name, 0) + 1
+                    _jn_max = _attr_int(_jn, "max_visits", 0)
+                    if _jn_max and visits[_jn.name] > _jn_max:
+                        _ex_rec = StepRecord(
                             node=_jn.name,
-                            outcome=_join_outcome,
+                            outcome="exhausted",
                             ts=time.time(),
-                            output_preview=(
-                                f"join {_jn.attrs.get('policy', 'wait_all')} "
-                                f"{len(_branch_results_list)} branches"
-                            ),
-                            metadata=_join_meta,
+                            output_preview=f"max_visits={_jn_max} exceeded",
                         )
-                        _para_result = Result(outcome=_join_outcome, metadata=_join_meta)
-
-                        ctx.state["_last_node"] = _jn.name
-                        ctx.state["_last_outcome"] = _join_outcome
-                        ctx.state[_jn.name + ".outcome"] = _join_outcome
-
-                        # Branch records already in CXDB (written thread-safely in _run_branch_until_join)
-                        for _br in _branch_flat_records:
-                            history.append(_br)
-                        if checkpoint is not None:
-                            checkpoint.write_text(json.dumps([asdict(r) for r in history], indent=2))
-
-                        seq = _append_record(
-                            history, checkpoint, cxdb, ctx, seq,
-                            _join_rec, _join_rec.output_preview, _join_meta,
-                        )
-                        result = _para_result
-                        _para_jump_to = _jn
-                        # Branch records are internal overhead; don't count them
-                        # against the main pipeline's max_steps budget.
-                        _parallel_overhead += len(_branch_flat_records)
-
-                        # Enforce max_visits on the join node (it's never set as
-                        # `current`, so the top-of-loop visit check never fires).
-                        visits[_jn.name] = visits.get(_jn.name, 0) + 1
-                        _jn_max = _attr_int(_jn, "max_visits", 0)
-                        if _jn_max and visits[_jn.name] > _jn_max:
-                            _ex_rec = StepRecord(
-                                node=_jn.name,
-                                outcome="exhausted",
-                                ts=time.time(),
-                                output_preview=f"max_visits={_jn_max} exceeded",
-                            )
-                            seq = _append_record(history, checkpoint, cxdb, ctx, seq, _ex_rec, "")
-                            break
+                        seq = _append_record(history, checkpoint, cxdb, ctx, seq, _ex_rec, "")
+                        break
             # --- end parallel fan-out/fan-in ---
 
             if records:
