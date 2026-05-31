@@ -4,17 +4,12 @@ from __future__ import annotations
 
 import json
 import pathlib
-import re
+import sys
 import time
 import traceback
 import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Optional, TextIO
-
-# Matches any valid binary operator in an edge condition string.
-# Conditions with NO operator are malformed (e.g. "not-a-condition" tokenizes
-# as NOT + WORD, which incorrectly evaluates to True via double-negation).
-_EDGE_OP_RE = re.compile(r"!=|==|=|(?<!\S)(?:not\s+)?(?:contains|in)\b")
 
 from .cxdb import CXDB
 from .handlers import Context, Result, resolve
@@ -22,18 +17,40 @@ from .parser import Edge, Graph, Node, is_exit_node, is_start_node
 
 _VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards"}
 
-# Reject truly malformed conditions (e.g. "not-a-condition" tokenizes as NOT +
-# WORD("-a-condition"), which double-negates to True). Allow: explicit operators
-# (=, !=), contains/in, and bare-word shorthands (success, not success).
-_EDGE_OP_RE = re.compile(
-    r"!=|==|=|"
-    r"(?<!\S)(?:not\s+)?(?:contains|in)\b|"
-    r"(?:^|\s)(?:not\s+)?[a-zA-Z_]\w*(?:\s|$)"
-)
-
 # Per-run runner logs land here so a crash always leaves a diagnosable
 # traceback on disk even when no CXDB is attached. Monkeypatchable in tests.
 _LOG_DIR = pathlib.Path.home() / ".dark-factory" / "logs"
+_EVENT_DIR = pathlib.Path.home() / ".dark-factory" / "events"
+
+
+def _emit_event(ctx: Context, event: str, payload: dict[str, str], seq: int | None = None) -> None:
+    """Append a structured JSONL event for this run.
+
+    Event logging is best-effort and never fails the run. Invalid event writes are
+    surfaced to stderr so observability is not fully silent.
+    """
+    event_path = getattr(ctx, "event_log_path", None)
+    if event_path is None:
+        return
+    payload_text = str(event)
+    try:
+        path = pathlib.Path(event_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": time.time(),
+            "run_id": ctx.run_id,
+            "event": event,
+        }
+        if seq is not None:
+            record["seq"] = seq
+        record.update(payload)
+        payload_text = json.dumps(record, sort_keys=True)
+        path.open("a", encoding="utf-8").write(payload_text + "\n")
+    except Exception as exc:
+        try:
+            print(f"[runner:emit_event:{type(exc).__name__}] {payload_text}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
 
 def _open_run_log(run_id: str) -> Optional[TextIO]:
@@ -129,6 +146,7 @@ def _clone_context(ctx: Context) -> Context:
         backend=ctx.backend,
         cxdb_path=ctx.cxdb_path,
         run_id=ctx.run_id,
+        event_log_path=getattr(ctx, "event_log_path", None),
     )
 
 
@@ -167,6 +185,8 @@ def _evaluate_expression(
     if not cond:
         return True
 
+    import re
+
     token_specification = [
         ('PAREN', r'[()]'),
         ('AND', r'&&|and\b'),
@@ -177,15 +197,20 @@ def _evaluate_expression(
         ('IN', r'in\b'),
         ('NEQ', r'!='),
         ('EQ', r'==|='),
-        ('NOT', r'!|not\b'),
+        ('NOT', r'!|not\b(?=\s|\(|\)|$)'),
         ('STRING', r'"[^"]*"|\'[^\']*\''),
         ('WORD', r'[a-zA-Z_0-9\-\.\*]+'),
         ('SPACE', r'\s+'),
     ]
     tok_regex = '|'.join(f'(?P<{name}>{pattern})' for name, pattern in token_specification)
 
+    token_re = re.compile(tok_regex)
     tokens = []
-    for mo in re.finditer(tok_regex, cond):
+    pos = 0
+    for mo in token_re.finditer(cond):
+        if mo.start() != pos:
+            return False
+        pos = mo.end()
         kind = mo.lastgroup
         value = mo.group()
         if kind == 'SPACE':
@@ -197,6 +222,8 @@ def _evaluate_expression(
             tokens.append((kind, value))
 
     if not tokens:
+        return False
+    if pos != len(cond):
         return False
 
     idx = 0
@@ -259,8 +286,7 @@ def _evaluate_expression(
 
         op_kind = op_tok[0]
         if op_kind not in {'EQ', 'NEQ', 'CONTAINS', 'NOT_CONTAINS', 'IN', 'NOT_IN'}:
-            val = _lookup(key_tok[1], last, ctx, is_decision)
-            return val.lower() in {"true", "1", "yes", "success"}
+            return _lookup("outcome", last, ctx, is_decision) == key_tok[1]
 
         consume()
         val_tok = consume()
@@ -307,12 +333,9 @@ def _edge_matches(
     ctx: Optional[Context] = None,
     current: Optional[Node] = None,
 ) -> bool:
-    """Return True when the edge condition is satisfied, fail-closed on malformed conditions."""
     cond = edge.condition
     if not cond:
         return True
-    if not _EDGE_OP_RE.search(cond):
-        return False
     is_decision = _is_decision_node(current)
     return _evaluate_expression(cond, last, ctx, is_decision)
 
@@ -392,13 +415,12 @@ def _parallel_join_outcome(
     branch_outcomes: list[Result],
     allow_partial: bool,
 ) -> str:
+    success_count, partial_count, failure_count = _classify_records(branch_outcomes)
+    if failure_count > 0:
+        return _normalize_outcome_only("failure")
+    effective_success = success_count + (partial_count if allow_partial else 0)
     if not branch_outcomes:
         return _normalize_outcome_only("success")
-    for branch in branch_outcomes:
-        if _classify_outcome(branch.outcome) == "error":
-            return "error"
-    success_count, partial_count, _ = _classify_records(branch_outcomes)
-    effective_success = success_count + (partial_count if allow_partial else 0)
     quorum = _attr_int(current, "join_quorum", len(branch_outcomes))
     if quorum <= 0:
         quorum = len(branch_outcomes)
@@ -523,6 +545,16 @@ def _handle_node_exception(
         metadata={"exception": type(exc).__name__},
     )
     _append_record(history, checkpoint, cxdb, ctx, seq, record, tb_text, record.metadata)
+    _emit_event(
+        ctx,
+        "node_exception",
+        {
+            "node": current.name,
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        },
+        seq,
+    )
     _update_failure_state(current, ctx, error_result)
 
     # A crash is a failure: only a deliberate recovery edge may catch it. That
@@ -543,9 +575,6 @@ def _handle_node_exception(
     if matching:
         selected = _choose_edge(matching, error_result)
         next_node = graph.nodes.get(selected.dst)
-        if next_node is None:
-            _log(log, f"fix edge {selected.dst!r} points to unknown node; ending run")
-            return None
         _log(log, f"routing crashed node {current.name!r} -> {selected.dst!r} (fix edge)")
         return next_node
     _log(log, f"no recovery edge for crashed node {current.name!r}; ending run")
@@ -591,18 +620,47 @@ def run(
                 return history
             current = next_node
 
-    cxdb: Optional[CXDB] = None
-    if ctx.cxdb_path is not None:
-        cxdb = CXDB(ctx.cxdb_path)
-        ctx.run_id = cxdb.start_run(pipeline=graph.name, goal=ctx.goal)
-
-    # Always have an addressable run_id so the per-run log file is locatable
-    # even when no CXDB is attached (ad-hoc smoke runs, echo backend, etc.).
+    # Always have an addressable run_id so diagnostics are locatable even when
+    # no CXDB is attached (ad-hoc smoke runs, echo backend, etc.).
     if not ctx.run_id:
         ctx.run_id = uuid.uuid4().hex[:12]
+    event_path_is_default = getattr(ctx, "event_log_path", None) is None
+
+    cxdb: Optional[CXDB] = None
+    if ctx.cxdb_path is not None:
+        try:
+            cxdb = CXDB(ctx.cxdb_path)
+            ctx.run_id = cxdb.start_run(pipeline=graph.name, goal=ctx.goal)
+        except Exception as exc:
+            _emit_event(
+                ctx,
+                "cxdb_init_failed",
+                {
+                    "path": str(ctx.cxdb_path),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                seq,
+            )
+            cxdb = None
+    if event_path_is_default and ctx.run_id is not None:
+        ctx.event_log_path = _EVENT_DIR / f"{ctx.run_id}.jsonl"
 
     log = _open_run_log(ctx.run_id)
     _log(log, f"run start pipeline={graph.name!r} goal={ctx.goal!r} backend={ctx.backend!r}")
+    if ctx.run_id is not None:
+        _emit_event(
+            ctx,
+            "run_start",
+            {
+                "pipeline": graph.name,
+                "goal": ctx.goal,
+                "backend": ctx.backend,
+                "run_id": ctx.run_id,
+            },
+            seq,
+        )
+
+    ended_at_exit = False
 
     try:
         while True:
@@ -629,6 +687,14 @@ def run(
                 break
 
             try:
+                _emit_event(
+                    ctx,
+                    "node_start",
+                    {
+                        "node": current.name,
+                    },
+                    seq,
+                )
                 results, records = _run_single_node(current, ctx, graph)
             except Exception as exc:  # noqa: BLE001 — any node crash must be recorded, not fatal
                 next_node = _handle_node_exception(
@@ -655,34 +721,36 @@ def run(
                         continue
                     try:
                         b_results, b_records = _run_single_node(target, _clone_context(ctx), graph)
-                        if b_records:
-                            for branch_index, b_result in enumerate(b_results):
-                                b_record = b_records[branch_index]
-                                branch_records.append((b_record, b_result.output, b_record.metadata))
-                            branch_results.append(b_results[-1])
-                    except Exception as exc:  # noqa: BLE001 — branch crash must be recorded, not fatal
-                        tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                        _log(log, f"parallel branch {target.name!r} raised {type(exc).__name__}: {exc}\n{tb_text}")
-                        
-                        summary_frame = tb_text.strip().splitlines()[-1] if tb_text.strip() else ""
-                        preview = f"{type(exc).__name__}: {exc} | {summary_frame}"
-                        
-                        error_result = _normalized_result(
-                            Result(
-                                outcome="error",
-                                output=tb_text,
-                                metadata={"exception": type(exc).__name__},
-                            )
-                        )
-                        error_record = StepRecord(
+                    except Exception as exc:  # noqa: BLE001
+                        b_tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                        summary_line = b_tb.strip().splitlines()[-1] if b_tb.strip() else ""
+                        b_record = StepRecord(
                             node=target.name,
                             outcome="error",
                             ts=time.time(),
-                            output_preview=preview[:280],
-                            metadata={"exception": type(exc).__name__},
+                            output_preview=(f"{type(exc).__name__}: {exc} | {summary_line}")[:280],
+                            metadata={"exception": type(exc).__name__, "parallel": "true"},
                         )
-                        branch_records.append((error_record, tb_text, error_record.metadata))
-                        branch_results.append(error_result)
+                        branch_records.append((b_record, b_tb, {"exception": type(exc).__name__, "parallel": "true"}))
+                        branch_results.append(Result(outcome="error", output=b_tb, metadata={"exception": type(exc).__name__}))
+                        _log(log, f"parallel branch {target.name!r} crashed: {type(exc).__name__}: {exc}")
+                        _emit_event(
+                            ctx,
+                            "branch_exception",
+                            {
+                                "node": target.name,
+                                "error_type": type(exc).__name__,
+                                "message": str(exc),
+                            },
+                            seq,
+                        )
+                        continue
+
+                    if b_records:
+                        for branch_index, b_result in enumerate(b_results):
+                            b_record = b_records[branch_index]
+                            branch_records.append((b_record, b_result.output, b_record.metadata))
+                        branch_results.append(b_results[-1])
 
                 if branch_records:
                     join_outcome = _parallel_join_outcome(current, branch_results, _allow_partial(current))
@@ -733,50 +801,20 @@ def run(
             if records:
                 _update_failure_state(current, ctx, result)
 
-            # Handle parallel branch crash: only recovery edges may catch it.
-            # When any branch raises, the join outcome is set to "error", but
-            # unconditional join edges must NOT be followed — that would silently
-            # carry a crashed run onward and let it reach `exit` as success.
-            if current.attrs.get("parallel", False) and result.outcome == "error":
-                gate_target = _goal_gate_target(graph, current, result, ctx)
-                if gate_target is not None:
-                    _log(log, f"routing parallel error {current.name!r} -> {gate_target.name!r} (goal_gate)")
-                    current = gate_target
-                    continue
-                join_edges = _parallel_join_edges(graph.outgoing(current.name))
-                matching = [
-                    edge
-                    for edge in join_edges
-                    if edge.condition and _edge_matches(edge, result, ctx, current)
-                ]
-                if matching:
-                    selected = _choose_edge(matching, result)
-                    next_node = graph.nodes.get(selected.dst)
-                    if next_node is not None:
-                        _log(log, f"routing parallel error {current.name!r} -> {selected.dst!r} (recovery edge)")
-                        current = next_node
-                        continue
-                _log(log, f"no recovery edge for parallel error {current.name!r}; ending run")
-                terminal_record = StepRecord(
-                    node=current.name,
-                    outcome="error",
-                    ts=time.time(),
-                    output_preview="parallel join failed: no recovery edge",
-                    metadata=result.metadata,
-                )
-                seq = _append_record(
-                    history,
-                    checkpoint,
-                    cxdb,
-                    ctx,
-                    seq,
-                    terminal_record,
-                    "parallel join failed: no recovery edge",
-                    result.metadata,
-                )
-                break
+            _emit_event(
+                ctx,
+                "node_complete",
+                {
+                    "node": current.name,
+                    "outcome": _classify_outcome(result.outcome),
+                    "preview": records[-1].output_preview if records else "",
+                    "is_exit": str(is_exit_node(current)),
+                },
+                seq,
+            )
 
             if is_exit_node(current):
+                ended_at_exit = True
                 break
 
             try:
@@ -790,7 +828,17 @@ def run(
                         if current.attrs.get("parallel", False)
                         else []
                     )
-                    chosen = join_edges if join_edges else outgoing
+                    if join_edges:
+                        if _classify_outcome(result.outcome) == "success":
+                            chosen = join_edges
+                        else:
+                            chosen = [
+                                edge
+                                for edge in outgoing
+                                if edge.condition and edge not in join_edges
+                            ]
+                    else:
+                        chosen = outgoing
                     next_node = _pick_next_from_edges(graph, current, chosen, result, ctx)
             except Exception as exc:  # noqa: BLE001 — transition crash must be recorded, not fatal
                 next_node = _handle_node_exception(
@@ -813,23 +861,53 @@ def run(
                     history, checkpoint, cxdb, ctx, seq, record, "no matching outgoing edge"
                 )
                 break
+            _emit_event(
+                ctx,
+                "transition",
+                {
+                    "from": current.name,
+                    "to": next_node.name,
+                    "outcome": _classify_outcome(result.outcome),
+                },
+                seq,
+            )
             current = next_node
     finally:
         final_outcome = history[-1].outcome if history else "empty"
+        if not ended_at_exit and _classify_outcome(final_outcome) == "success":
+            final_outcome = "failure"
+            if history:
+                history[-1].outcome = final_outcome
+        _emit_event(
+            ctx,
+            "run_end",
+            {
+                "pipeline": graph.name,
+                "final_outcome": final_outcome,
+                "ended_at_exit": str(ended_at_exit),
+                "steps": str(len(history)),
+            },
+            seq,
+        )
         _log(log, f"run end final={final_outcome!r} steps={len(history)}")
-        try:
-            if cxdb is not None and ctx.run_id is not None:
+        if cxdb is not None and ctx.run_id is not None:
+            try:
                 cxdb.end_run(
                     ctx.run_id,
                     final=final_outcome,
                 )
-                cxdb.close()
-        finally:
-            if log is not None:
+            except Exception:
+                _emit_event(ctx, "run_end_failed", {"error": "cxdb_write_error"}, seq)
+            finally:
                 try:
-                    log.close()
-                except OSError:
+                    cxdb.close()
+                except Exception:
                     pass
+        if log is not None:
+            try:
+                log.close()
+            except OSError:
+                pass
 
     return history
 
@@ -937,7 +1015,29 @@ def _append_record(
 ) -> int:
     history.append(record)
     if checkpoint is not None:
-        checkpoint.write_text(json.dumps([asdict(r) for r in history], indent=2))
+        try:
+            checkpoint.write_text(json.dumps([asdict(r) for r in history], indent=2))
+        except Exception as exc:
+            _emit_event(
+                ctx,
+                "checkpoint_write_failed",
+                {
+                    "node": record.node,
+                    "seq": str(seq),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                seq,
+            )
+    _emit_event(
+        ctx,
+        "step",
+        {
+            "node": record.node,
+            "outcome": _classify_outcome(record.outcome),
+            "preview": (record.output_preview or "")[:280],
+        },
+        seq,
+    )
     _persist(cxdb, ctx, seq, record, output, metadata)
     return seq + 1
 
@@ -952,15 +1052,27 @@ def _persist(
 ) -> None:
     if cxdb is None or ctx.run_id is None:
         return
-    cxdb.record_step(
-        run_id=ctx.run_id,
-        seq=seq,
-        node=record.node,
-        outcome=record.outcome,
-        ts=record.ts,
-        output=output,
-        metadata=metadata or record.metadata,
-    )
+    try:
+        cxdb.record_step(
+            run_id=ctx.run_id,
+            seq=seq,
+            node=record.node,
+            outcome=record.outcome,
+            ts=record.ts,
+            output=output,
+            metadata=metadata or record.metadata,
+        )
+    except Exception as exc:
+        _emit_event(
+            ctx,
+            "cxdb_record_failed",
+            {
+                "node": record.node,
+                "seq": str(seq),
+                "error": f"{type(exc).__name__}:{exc}",
+            },
+            seq,
+        )
 
 
 def _pick_next(
