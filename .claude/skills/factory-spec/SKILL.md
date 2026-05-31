@@ -11,20 +11,45 @@ Dark Factory runs via the **`dark-factory` binary**, not `python -m runner` from
 a raw checkout:
 
 ```bash
-~/projects/dark-factory/install.sh   # uv python + venv + ~/.local/bin/dark-factory
-export DARK_FACTORY_HOME=~/projects/dark-factory
+./install.sh   # uv python + venv + ~/.local/bin/dark-factory
+export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$(pwd)}"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-- **`/fs` / `/factory-spec`** — read-only graph reference (this skill).
+- **`/fs` / `/factory-spec`** — graph reference + Step 0 classification + pipeline pick.
 - **`/f` / `/factory`** — run pipelines via `dark-factory` (see `dark-factory` skill).
 
 Pipelines and prompts resolve from `$DARK_FACTORY_HOME`; implementation work
 happens in the caller's cwd (`--workdir` defaults to cwd).
 
-**Pipeline selection:** [docs/pipeline-selection.md](../../../docs/pipeline-selection.md) —
-pick the graph for the task; `/f` and `/factory` auto-select when `--pipeline` is
-omitted (never hardcode one default for all runs).
+## Pipeline selection (mandatory before `/f` or `/factory`)
+
+Full decision table:
+[docs/pipeline-selection.md](../../../docs/pipeline-selection.md)
+
+**Do not default every run to one `.dot`.** If the user did not pass `--pipeline`,
+classify the goal (Step 0 below) and pick from this quick guide:
+
+| Task | Pipeline |
+|------|----------|
+| Smoke / wiring | `pipelines/factory/hello.dot` |
+| New feature (full loop) | `pipelines/slim/minimal_feature.dot` |
+| PR iteration (no holdout) | `pipelines/slim/minimal_pr.dot` |
+| Validate diff + holdout | `pipelines/factory/gates.dot` |
+| PR gates only | `pipelines/factory/pr_gates.dot` |
+| Spec review slim | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` |
+| Spec review full | `benchmarks/attractor-spec-review/pipelines/review_full.dot` |
+| Brownfield replace/delete | custom goal + delete-first rules; often `minimal_feature.dot` or custom `.dot` |
+
+Short names for `--pipeline`: `gates`, `hello`, `pr_gates`, `minimal_pr`,
+`minimal_feature`, `review_slim`, `review_full`.
+
+Execution command (from target repo cwd):
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+dark-factory --pipeline pipelines/slim/minimal_pr.dot --goal "..." --backend claude
+```
 
 ## Purpose
 

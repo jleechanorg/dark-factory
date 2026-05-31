@@ -1,30 +1,46 @@
 ---
-description: "/factory-spec — display Dark Factory pipeline node graphs and handler registry"
-type: reference
+description: "/factory-spec — create or review a Dark Factory spec with task-based pipeline selection"
+type: quality
 execution_mode: immediate
 aliases: [fs]
 ---
 
-# /factory-spec — Dark Factory Spec Node Graph
+# /factory-spec — Spec Create & Review Workflow
 
-Show the factory pipeline graph structure — node types, edges, conditions,
-and handler mappings — without running a pipeline.
+Create or review a spec through the Dark Factory pipeline. Classifies the task
+(greenfield vs brownfield), picks the matching `.dot`, then plans — reports
+choices for user approval.
+
+**Install (once):**
+
+```bash
+./install.sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Runs use **`dark-factory`** on PATH — not `python -m runner` from source.
+Pipeline decision table:
+[docs/pipeline-selection.md](../../docs/pipeline-selection.md)
 
 **Usage**:
 
 ```
-/factory-spec        # show all pipelines + handler registry
-/fs                  # alias
+/fs <spec description>          # create / classify (default mode)
+/fs --review <spec_path>        # review an existing spec
+/fs --review                    # review spec/feature.md (default path)
+/fs --show                      # show pipeline graphs (read-only reference)
+/factory --pipeline <dot> ...   # execute after spec is ready
 ```
 
 ## Action
 
-Render the `factory-spec` skill content inline: pipeline ASCII flow diagrams,
-handler type registry, edge condition syntax, and backend routing table.
+Parse `$ARGUMENTS` and execute the `factory-spec` skill workflow:
 
-When the user wants to **run** a pipeline (not just view the graph), use
-`/factory` or `/f` — those invoke **`dark-factory`** and **auto-select** a
-`.dot` from [docs/pipeline-selection.md](../../docs/pipeline-selection.md) unless
-`--pipeline` is passed.
+1. **Detect mode**: `--review` → review; `--show` → graph reference only;
+   otherwise → create/classify mode
+2. **Step 0:** greenfield vs brownfield (mandatory — see skill)
+3. **Select pipeline** from `docs/pipeline-selection.md` when execution is next
+4. **Run workflow** as defined in `.claude/skills/factory-spec/SKILL.md`
+5. Report auto-chosen pipeline + options; ask user to confirm
 
-No side effects for reference-only `/fs` — read-only graph display.
+To **run** after spec approval: `/f` or `/factory` with `--pipeline <chosen>`.
