@@ -392,10 +392,13 @@ def _parallel_join_outcome(
     branch_outcomes: list[Result],
     allow_partial: bool,
 ) -> str:
-    success_count, partial_count, _ = _classify_records(branch_outcomes)
-    effective_success = success_count + (partial_count if allow_partial else 0)
     if not branch_outcomes:
         return _normalize_outcome_only("success")
+    for branch in branch_outcomes:
+        if _classify_outcome(branch.outcome) == "error":
+            return "error"
+    success_count, partial_count, _ = _classify_records(branch_outcomes)
+    effective_success = success_count + (partial_count if allow_partial else 0)
     quorum = _attr_int(current, "join_quorum", len(branch_outcomes))
     if quorum <= 0:
         quorum = len(branch_outcomes)
