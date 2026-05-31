@@ -757,6 +757,23 @@ def run(
                         current = next_node
                         continue
                 _log(log, f"no recovery edge for parallel error {current.name!r}; ending run")
+                terminal_record = StepRecord(
+                    node=current.name,
+                    outcome="error",
+                    ts=time.time(),
+                    output_preview="parallel join failed: no recovery edge",
+                    metadata=result.metadata,
+                )
+                seq = _append_record(
+                    history,
+                    checkpoint,
+                    cxdb,
+                    ctx,
+                    seq,
+                    terminal_record,
+                    "parallel join failed: no recovery edge",
+                    result.metadata,
+                )
                 break
 
             if is_exit_node(current):
