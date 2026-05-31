@@ -85,7 +85,7 @@ export PATH="${LOCAL_BIN}:${PATH}"
 if [[ "${SMOKE}" -eq 1 ]]; then
   echo "==> smoke run via dark-factory binary (echo backend, no LLM)"
   cd "${REPO_ROOT}"
-  dark-factory \
+  "${BIN_DIR}/dark-factory" \
     --pipeline pipelines/factory/hello.dot \
     --goal "install.sh smoke" \
     --no-perf-log \

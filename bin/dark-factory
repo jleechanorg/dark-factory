@@ -5,7 +5,8 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_SCRIPT_REAL="$([ -L "${BASH_SOURCE[0]}" ] && readlink -f "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${_SCRIPT_REAL}")" && pwd)"
 export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 VENV_PYTHON="${DARK_FACTORY_HOME}/.venv/bin/python"
 TARGET_WORKDIR="$(pwd)"
