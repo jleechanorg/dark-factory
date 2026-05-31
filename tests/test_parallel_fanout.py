@@ -791,37 +791,41 @@ def test_fanout_join_quorum_respected(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Bug fix: _find_join_node must return None for divergent branch topologies
+# Bug fix: _find_join_node must work when some branches have edge conditions
+# (a disabled/conditional edge must not prevent join discovery for active branches)
 # ---------------------------------------------------------------------------
 
-def test_find_join_node_divergent_returns_none(tmp_path):
-    """_find_join_node must return None when branches converge on different joins."""
+def test_find_join_node_conditional_branches_handled(tmp_path):
+    """_find_join_node must return the correct join even when some branches have conditions.
+
+    Regression guard: an earlier strict-convergence fix broke graphs where a
+    conditional (filtered-at-runtime) branch leads to a different join — causing
+    _find_join_node to return None and skipping the parallel block entirely.
+    The BFS must find the join from graph structure alone (ignoring conditions),
+    matching the behavior of the runtime parallel executor.
+    """
     from runner.engine import _find_join_node
 
-    dot = tmp_path / "divergent.dot"
+    dot = tmp_path / "conditional_branch.dot"
     dot.write_text(
-        'digraph divergent {\n'
-        '  graph [goal="divergent test"]\n'
+        'digraph conditional_branch {\n'
+        '  graph [goal="conditional branch test"]\n'
         '  start [shape=Mdiamond]\n'
         '  fanout [type="parallel"]\n'
-        '  branch_a\n'
-        '  branch_b\n'
-        '  join_a [type="join", policy="wait_all"]\n'
-        '  join_b [type="join", policy="wait_all"]\n'
+        '  branch_active\n'
+        '  branch_inactive\n'
+        '  join [type="join", policy="wait_all"]\n'
         '  exit [shape=Msquare]\n'
         '  start -> fanout\n'
-        '  fanout -> branch_a\n'
-        '  fanout -> branch_b\n'
-        '  branch_a -> join_a\n'
-        '  branch_b -> join_b\n'
-        '  join_a -> exit\n'
-        '  join_b -> exit\n'
+        '  fanout -> branch_active [condition="active=yes"]\n'
+        '  fanout -> branch_inactive [condition="active=no"]\n'
+        '  branch_active -> join\n'
+        '  branch_inactive -> join\n'
+        '  join -> exit\n'
         '}\n'
     )
     graph = parse(dot)
     fanout = graph.nodes["fanout"]
     jn = _find_join_node(graph, fanout)
-    assert jn is None, (
-        f"Divergent branches should make _find_join_node return None, "
-        f"got {jn.name if jn else None!r}"
-    )
+    assert jn is not None, "_find_join_node must find join even with conditional branches"
+    assert jn.name == "join", f"Expected join, got {jn.name!r}"
