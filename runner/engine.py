@@ -22,6 +22,10 @@ from .parser import Edge, Graph, Node, is_exit_node, is_start_node
 
 _VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards"}
 
+# Conditions with NO operator are malformed (e.g. "not-a-condition" tokenizes
+# as NOT + WORD, which incorrectly evaluates to True via double-negation).
+_EDGE_OP_RE = re.compile(r"!=|==|=|(?<!\S)(?:not\s+)?(?:contains|in)\b")
+
 # Per-run runner logs land here so a crash always leaves a diagnosable
 # traceback on disk even when no CXDB is attached. Monkeypatchable in tests.
 _LOG_DIR = pathlib.Path.home() / ".dark-factory" / "logs"
@@ -157,7 +161,6 @@ def _evaluate_expression(
     cond = cond.strip()
     if not cond:
         return True
-
 
     token_specification = [
         ('PAREN', r'[()]'),
