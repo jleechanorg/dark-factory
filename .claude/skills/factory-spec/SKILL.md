@@ -22,6 +22,10 @@ export PATH="$HOME/.local/bin:$PATH"
 Pipelines and prompts resolve from `$DARK_FACTORY_HOME`; implementation work
 happens in the caller's cwd (`--workdir` defaults to cwd).
 
+**Pipeline selection:** [docs/pipeline-selection.md](../../docs/pipeline-selection.md) —
+pick the graph for the task; `/f` and `/factory` auto-select when `--pipeline` is
+omitted (never hardcode one default for all runs).
+
 ## Purpose
 
 Show the factory pipeline graph structure at a glance — node types, edges,
