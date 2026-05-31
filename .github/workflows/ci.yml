@@ -9,6 +9,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       DISABLE_SANDBOX: "1"
       DARK_FACTORY_HOLDOUTS: "${{ github.workspace }}/tests/fixtures/holdout-eval"

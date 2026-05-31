@@ -22,9 +22,14 @@ from .parser import Edge, Graph, Node, is_exit_node, is_start_node
 
 _VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards"}
 
-# Conditions with NO operator are malformed (e.g. "not-a-condition" tokenizes
-# as NOT + WORD, which incorrectly evaluates to True via double-negation).
-_EDGE_OP_RE = re.compile(r"!=|==|=|(?<!\S)(?:not\s+)?(?:contains|in)\b")
+# Reject truly malformed conditions (e.g. "not-a-condition" tokenizes as NOT +
+# WORD("-a-condition"), which double-negates to True). Allow: explicit operators
+# (=, !=), contains/in, and bare-word shorthands (success, not success).
+_EDGE_OP_RE = re.compile(
+    r"!=|==|=|"
+    r"(?<!\S)(?:not\s+)?(?:contains|in)\b|"
+    r"(?:^|\s)(?:not\s+)?[a-zA-Z_]\w*(?:\s|$)"
+)
 
 # Per-run runner logs land here so a crash always leaves a diagnosable
 # traceback on disk even when no CXDB is attached. Monkeypatchable in tests.
@@ -535,6 +540,9 @@ def _handle_node_exception(
     if matching:
         selected = _choose_edge(matching, error_result)
         next_node = graph.nodes.get(selected.dst)
+        if next_node is None:
+            _log(log, f"fix edge {selected.dst!r} points to unknown node; ending run")
+            return None
         _log(log, f"routing crashed node {current.name!r} -> {selected.dst!r} (fix edge)")
         return next_node
     _log(log, f"no recovery edge for crashed node {current.name!r}; ending run")
@@ -763,17 +771,19 @@ def run(
     finally:
         final_outcome = history[-1].outcome if history else "empty"
         _log(log, f"run end final={final_outcome!r} steps={len(history)}")
-        if cxdb is not None and ctx.run_id is not None:
-            cxdb.end_run(
-                ctx.run_id,
-                final=final_outcome,
-            )
-            cxdb.close()
-        if log is not None:
-            try:
-                log.close()
-            except OSError:
-                pass
+        try:
+            if cxdb is not None and ctx.run_id is not None:
+                cxdb.end_run(
+                    ctx.run_id,
+                    final=final_outcome,
+                )
+                cxdb.close()
+        finally:
+            if log is not None:
+                try:
+                    log.close()
+                except OSError:
+                    pass
 
     return history
 
