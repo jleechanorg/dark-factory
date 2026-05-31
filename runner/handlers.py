@@ -247,7 +247,11 @@ def _codergen(node: Node, ctx: Context) -> Result:
         # Stringify so the metadata dict matches Result's declared type (str
         # values) and round-trips cleanly through the CXDB JSON column.
         meta = {k: ("" if v is None else str(v)) for k, v in metrics.items()}
-        return Result(outcome="success", output=prompt_text, metadata=meta)
+        # Allow tests to drive branch outcomes via ctx.state["<node>.outcome"]
+        # (same convention as human_gate pre-seeding).
+        pre = ctx.state.get(f"{node.name}.outcome")
+        outcome = pre if pre is not None else "success"
+        return Result(outcome=outcome, output=prompt_text, metadata=meta)
 
     if backend == "mock_llm":
         mock_url = str(ctx.state.get("mock_url", "")).rstrip("/")
@@ -1484,12 +1488,30 @@ def _render_prompt(node: Node, ctx: Context) -> str:
     return text
 
 
+def _parallel_fanout(node: Node, ctx: Context) -> Result:
+    """Fan-out handler — records the fan-out step; actual concurrent branching is in engine.py."""
+    return Result(outcome="success", output=f"fanout: {node.name}", metadata={"role": "fanout"})
+
+
+def _join_handler(node: Node, ctx: Context) -> Result:
+    """Join handler — signals the node type; policy evaluation is in engine.py.
+
+    The engine's parallel block calls _apply_join_policy and builds the join
+    StepRecord directly, so this handler is never invoked for join nodes that
+    follow a type=parallel fan-out.  If a join node is reached via normal
+    (non-parallel) traversal, there are no branches to aggregate and
+    returning success is correct.
+    """
+    return Result(outcome="success", output=f"join: {node.name}", metadata={"role": "join"})
+
+
 REGISTRY: dict[str, Handler] = {
     # by shape
     "Mdiamond": _start,
     "Msquare": _exit,
     "hexagon": _conditional,
-    # by explicit type attribute (overrides shape)
+    "component": _parallel_fanout,      # fan-out shape alias (Kilroy: shape=component)
+    "tripleoctagon": _join_handler,     # join shape alias (Kilroy: shape=tripleoctagon)
 }
 
 TYPE_REGISTRY: dict[str, Handler] = {
@@ -1503,6 +1525,8 @@ TYPE_REGISTRY: dict[str, Handler] = {
     "gate_es": _gate_es,
     "gate_er": _gate_er,
     "gate_code_standards": _gate_code_standards,
+    "parallel": _parallel_fanout,       # fan-out type (type=parallel)
+    "join": _join_handler,              # fan-in type (type=join)
 }
 
 

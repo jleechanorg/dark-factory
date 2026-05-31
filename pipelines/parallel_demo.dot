@@ -1,0 +1,50 @@
+// Demo: parallel fan-out / fan-in (Attractor parity, bead orch-kt8m)
+//
+// Topology:
+//   start -> fanout (type=parallel) -> branch_a, branch_b, branch_c
+//                                   -> join (type=join, policy=k_of_n, k=2)
+//                                   -> exit
+//
+// Interpretation:
+//   Three independent work branches execute concurrently.
+//   The join node requires 2-of-3 to succeed (k_of_n policy).
+//   If at least 2 branches succeed the pipeline exits successfully.
+//
+// Run (echo backend, no LLM):
+//   .venv/bin/python -m runner \
+//     --pipeline pipelines/parallel_demo.dot \
+//     --goal "smoke parallel" \
+//     --backend echo
+
+digraph parallel_demo {
+    graph [goal="Parallel fan-out/fan-in demo" rankdir=LR]
+
+    start      [shape=Mdiamond, label="Start"]
+
+    fanout     [type="parallel", label="Fan-out\n(3 branches)",
+                shape=component]
+
+    branch_a   [type="codergen", label="Branch A\n(impl task)",
+                prompt="@prompts/codergen.md"]
+
+    branch_b   [type="codergen", label="Branch B\n(impl task)",
+                prompt="@prompts/codergen.md"]
+
+    branch_c   [type="codergen", label="Branch C\n(impl task)",
+                prompt="@prompts/codergen.md"]
+
+    join       [type="join", label="Join\n(k=2 of 3)",
+                shape=tripleoctagon,
+                policy="k_of_n", k="2"]
+
+    exit       [shape=Msquare, label="Exit"]
+
+    start    -> fanout
+    fanout   -> branch_a
+    fanout   -> branch_b
+    fanout   -> branch_c
+    branch_a -> join
+    branch_b -> join
+    branch_c -> join
+    join     -> exit
+}

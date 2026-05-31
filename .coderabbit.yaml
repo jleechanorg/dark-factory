@@ -1,11 +1,6 @@
-# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-language: "en-US"
+version: "2"
 reviews:
-  profile: "chill"
-  request_changes_workflow: true
-  high_level_summary: true
+  request_changes_workflow: false
   auto_review:
     enabled: true
-    ignore_title_keywords:
-      - "WIP"
-      - "DO NOT MERGE"
+    drafts: false
