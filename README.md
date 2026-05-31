@@ -190,59 +190,82 @@ dark-factory/
 
 ## 🍳 Execution Cookbook
 
-### ⚙️ Environment Setup
-Dark Factory requires **Python 3.13** as its canonical runtime:
+### ⚙️ One-time install (binary, not source)
+
+Dark Factory runs via the **`dark-factory` binary** — not `python -m runner`
+from a raw checkout. Install once with [uv](https://docs.astral.sh/uv/):
+
 ```bash
-# Initialize a pristine environment
-PYTHON_BIN="${PYTHON_BIN:-$(command -v python3.13)}"
-"$PYTHON_BIN" -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+git clone https://github.com/jleechanorg/dark-factory ~/projects/dark-factory
+cd ~/projects/dark-factory
+./install.sh
+
+export DARK_FACTORY_HOME=~/projects/dark-factory
+export DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-### 💨 1. Smoke Pipeline Run (No LLM Cost)
-Verify the engine traversal and parse logic using a mock echo backend:
+This installs a uv-managed Python 3.13 venv, PyPI deps (`pydot`, `PyYAML`), and
+symlinks `dark-factory` + `df-healer` into `~/.local/bin`.
+
+Run pipelines from the **target repo** (implementation workdir = cwd). Graphs and
+prompts load from `$DARK_FACTORY_HOME`. See [docs/pipeline-selection.md](docs/pipeline-selection.md)
+— **pick the `.dot` for the task**, do not always use the same default.
+
+### 💨 1. Smoke pipeline (no LLM cost)
+
 ```bash
-python -m runner --pipeline pipelines/factory/hello.dot --goal "Verify smoke pipeline traversal"
+cd ~/projects/dark-factory   # or any repo; hello resolves via DARK_FACTORY_HOME
+dark-factory --pipeline pipelines/factory/hello.dot --goal "smoke test" --backend echo
 ```
 
-### ⚡ 2. WAFER-Driven Claudew Implementation
-Execute a complex feature implementation using the high-performance `claudew` wafer backend (with `GLM-5.1` or Sonnet equivalent):
+### 🆕 2. New feature (full loop)
+
 ```bash
-export WAFER_API_KEY="your-wafer-api-key-here"
-python -m runner \
-  --pipeline pipelines/factory/gates.dot \
-  --goal "Add secure rate limiting to user registration endpoints" \
-  --backend claudew \
-  --feature rate_limit \
+cd ~/projects/my-app
+dark-factory \
+  --pipeline pipelines/slim/minimal_feature.dot \
+  --goal "Add user-facing feature X" \
+  --backend claude \
+  --feature my_feature \
   --cxdb ~/.dark-factory/cxdb.sqlite
 ```
 
-### 🛡️ 3. Headless Antigravity (agy) Pipeline Execution
-Run the gates pipeline using Antigravity's self-healing parallel agent execution:
+### 🔁 3. In-flight PR iteration (no holdout)
+
 ```bash
-python -m runner \
+cd ~/projects/my-app
+dark-factory \
+  --pipeline pipelines/slim/minimal_pr.dot \
+  --goal "Fix failing tests on PR branch" \
+  --backend claude \
+  --state 'slim.test_command=pytest tests/test_foo.py -v' \
+  --cxdb ~/.dark-factory/cxdb.sqlite
+```
+
+### 🛡️ 4. Gates-only validation (diff already implemented)
+
+```bash
+cd ~/projects/my-app
+dark-factory \
   --pipeline pipelines/factory/gates.dot \
-  --goal "Implement robust JWT authorization middleware" \
-  --backend agy \
+  --goal "Validate JWT middleware diff" \
+  --backend claude \
   --feature auth_middleware \
   --cxdb ~/.dark-factory/cxdb.sqlite
 ```
 
-### 🔍 4. Sealed Holdout Evaluation
-Run the pipeline against sealed tests located in your separate holdouts directory (invisible to implementing agents):
+### 🩺 5. Healer failure audit
+
 ```bash
-export DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts
-python -m runner \
-  --pipeline pipelines/factory/gates.dot \
-  --goal "Integrate stripe subscription callbacks" \
-  --feature subscriptions
+df-healer --cxdb ~/.dark-factory/cxdb.sqlite
 ```
 
-### 🩺 5. Run Healer Failure Audit
-After running one or multiple pipelines, cluster and diagnose all execution failures:
+### 🧪 Tests (dev)
+
 ```bash
-python -m runner.healer --cxdb ~/.dark-factory/cxdb.sqlite --backend claude
+cd ~/projects/dark-factory
+.venv/bin/python -m pytest tests/
 ```
 
 ---

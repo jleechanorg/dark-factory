@@ -5,6 +5,23 @@ description: "Display the Dark Factory pipeline node graphs — spec-review pipe
 
 # /factory_spec — Dark Factory Spec Node Graph Reference
 
+## Install vs source
+
+Dark Factory runs via the **`dark-factory` binary**, not `python -m runner` from
+a raw checkout:
+
+```bash
+~/projects/dark-factory/install.sh   # uv python + venv + ~/.local/bin/dark-factory
+export DARK_FACTORY_HOME=~/projects/dark-factory
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+- **`/fs` / `/factory-spec`** — read-only graph reference (this skill).
+- **`/f` / `/factory`** — run pipelines via `dark-factory` (see `dark-factory` skill).
+
+Pipelines and prompts resolve from `$DARK_FACTORY_HOME`; implementation work
+happens in the caller's cwd (`--workdir` defaults to cwd).
+
 ## Purpose
 
 Show the factory pipeline graph structure at a glance — node types, edges,

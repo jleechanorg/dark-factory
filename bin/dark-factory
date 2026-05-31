@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Dark Factory CLI — installed binary wrapper (not python -m runner from source).
+#
+# Resolves pipelines/prompts from DARK_FACTORY_HOME; implements in --workdir (default: cwd).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+VENV_PYTHON="${DARK_FACTORY_HOME}/.venv/bin/python"
+TARGET_WORKDIR="$(pwd)"
+
+if [[ ! -x "${VENV_PYTHON}" ]]; then
+  echo "ERROR: Dark Factory venv missing at ${DARK_FACTORY_HOME}/.venv" >&2
+  echo "Run: ${DARK_FACTORY_HOME}/install.sh" >&2
+  exit 1
+fi
+
+has_workdir=0
+for arg in "$@"; do
+  if [[ "${arg}" == "--workdir" ]]; then
+    has_workdir=1
+    break
+  fi
+done
+
+args=("$@")
+if [[ "${has_workdir}" -eq 0 ]]; then
+  args=(--workdir "${TARGET_WORKDIR}" "$@")
+fi
+
+exec env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+  "${VENV_PYTHON}" -m runner "${args[@]}"

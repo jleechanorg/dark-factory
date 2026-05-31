@@ -120,35 +120,60 @@ fi
 
 ---
 
-## 8. Common CLI Commands Reference
+## 8. Install & CLI Commands
 
-### Traversal and Execution
-* **Running a Hello Smoke Pipeline (Echo backend, no LLM cost)**:
+### One-time install (binary)
+
+```bash
+cd ~/projects/dark-factory && ./install.sh
+export DARK_FACTORY_HOME=~/projects/dark-factory
+export DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Use **`dark-factory`** and **`df-healer`** on PATH — not `python -m runner` from
+source. Run from the **target repo** cwd; pipelines resolve from `$DARK_FACTORY_HOME`.
+
+### Pipeline selection
+
+Pick the graph for the task ([docs/pipeline-selection.md](docs/pipeline-selection.md)).
+Do not always use `minimal_feature.dot` or `gates.dot` by default.
+
+| Task | Pipeline |
+|------|----------|
+| Smoke | `pipelines/factory/hello.dot` |
+| New feature (full) | `pipelines/slim/minimal_feature.dot` |
+| PR iteration | `pipelines/slim/minimal_pr.dot` |
+| Gates + holdout | `pipelines/factory/gates.dot` |
+| PR gates only | `pipelines/factory/pr_gates.dot` |
+
+### Examples
+
+* **Smoke (echo, no LLM)**:
   ```bash
-  .venv/bin/python -m runner --pipeline pipelines/factory/hello.dot --goal "smoke test"
+  dark-factory --pipeline pipelines/factory/hello.dot --goal "smoke test" --backend echo
   ```
-* **Running a Gate Pipeline (Recording to CXDB)**:
+* **Gated run with CXDB**:
   ```bash
-  .venv/bin/python -m runner \
+  cd ~/projects/target-repo
+  dark-factory \
     --pipeline pipelines/factory/gates.dot \
     --goal "<goal_description>" \
     --backend claude \
     --feature <feature_name> \
     --cxdb ~/.dark-factory/cxdb.sqlite
   ```
-* **Visualize DOT Pipeline**:
+* **Healer**:
+  ```bash
+  df-healer --cxdb ~/.dark-factory/cxdb.sqlite
+  ```
+* **Visualize DOT**:
   ```bash
   dot -Tpng pipelines/factory/gates.dot -o gates.png
   ```
 
-### Diagnosis & Healing
-* **Auditing CXDB failure clusters and generating prescriptions**:
-  ```bash
-  .venv/bin/python -m runner.healer --cxdb ~/.dark-factory/cxdb.sqlite
-  ```
+### Local tests (dev only)
 
-### Local Test Execution (Targeted Only)
-* **Targeted unit testing**:
-  ```bash
-  .venv/bin/python -m pytest tests/test_engine.py -k green
-  ```
+```bash
+.venv/bin/python -m pytest tests/test_engine.py -k green
+```

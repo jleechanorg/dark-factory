@@ -12,6 +12,7 @@ import traceback
 from .engine import run
 from .handlers import Context
 from .parser import parse, validate_pipeline
+from .paths import resolve_factory_path
 
 _PANIC_DIR = pathlib.Path.home() / ".dark-factory" / "panics"
 
@@ -200,12 +201,13 @@ def main(argv: list[str] | None = None) -> int:
             help="Pre-seed ctx.state; repeatable. E.g. --state slim.test_command=true",
         )
         args = p.parse_args(argv)
+        pipeline_path = resolve_factory_path(args.pipeline)
 
         if args.preflight:
-            graph, diagnostics = validate_pipeline(args.pipeline)
+            graph, diagnostics = validate_pipeline(pipeline_path)
             payload = {
-                "pipeline": str(args.pipeline),
-                "pipeline_name": graph.name if graph else args.pipeline.stem,
+                "pipeline": str(pipeline_path),
+                "pipeline_name": graph.name if graph else pipeline_path.stem,
                 "goal": graph.goal if graph else "",
                 "diagnostics": diagnostics,
             }
@@ -226,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
             args.evidence_bundle.mkdir(parents=True, exist_ok=True)
             args.cxdb = args.evidence_bundle / "_run.sqlite"
 
-        graph = parse(args.pipeline)
+        graph = parse(pipeline_path)
         perf_log_root = None if args.no_perf_log else args.perf_log_dir
         ctx = Context(
             goal=args.goal,
@@ -269,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
                 bundle_dir=args.evidence_bundle,
                 cxdb_path=args.cxdb,
                 run_id=ctx.run_id,
-                pipeline_path=args.pipeline,
+                pipeline_path=pipeline_path,
                 graph=graph,
                 workdir=args.workdir,
                 event_log_path=args.events,

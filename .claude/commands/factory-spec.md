@@ -19,8 +19,11 @@ and handler mappings — without running a pipeline.
 
 ## Action
 
-Render the `factory-spec` skill content inline: the three factory pipelines
-(`gates.dot`, `hello.dot`, `minimal_feature.dot`) as ASCII flow diagrams,
-the handler type registry, edge condition syntax, and backend routing table.
+Render the `factory-spec` skill content inline: pipeline ASCII flow diagrams,
+handler type registry, edge condition syntax, and backend routing table.
 
-No side effects — read-only reference.
+When the user wants to **run** a pipeline (not just view the graph), use
+`/factory` or `/f` — those invoke the installed **`dark-factory` binary**
+(`~/projects/dark-factory/install.sh`), not `python -m runner` from source.
+
+No side effects for reference-only `/fs` — read-only graph display.

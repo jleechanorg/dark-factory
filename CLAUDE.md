@@ -57,19 +57,25 @@ Operational rules:
 6. Treat `.dot` graphs as the durable process code. Runner code is disposable;
    graph shape, specs, holdouts, and scoring contracts are the important assets.
 
+## Setup
+
+```bash
+# One-time install (uv-managed Python + venv + binaries on PATH)
+./install.sh
+
+export DARK_FACTORY_HOME=~/projects/dark-factory   # set automatically by install.sh / bin/dark-factory
+export DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts
+export PATH="$HOME/.local/bin:$PATH"
+```
+
 ## Common commands
 
 ```bash
-# Setup
-PYTHON_BIN="${PYTHON_BIN:-$(command -v python3.13)}"
-"$PYTHON_BIN" -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-
 # Smoke pipeline — echo backend, no LLM calls
-.venv/bin/python -m runner --pipeline pipelines/factory/hello.dot --goal "smoke test"
+dark-factory --pipeline pipelines/factory/hello.dot --goal "smoke test" --backend echo
 
-# Full gated pipeline with CXDB recording
-.venv/bin/python -m runner \
+# Full gated pipeline with CXDB recording (run from target repo cwd)
+dark-factory \
   --pipeline pipelines/factory/gates.dot \
   --goal "<feature description>" \
   --backend claude \
@@ -77,7 +83,7 @@ PYTHON_BIN="${PYTHON_BIN:-$(command -v python3.13)}"
   --cxdb ~/.dark-factory/cxdb.sqlite
 
 # Cluster CXDB failures into a Healer diagnosis
-.venv/bin/python -m runner.healer --cxdb ~/.dark-factory/cxdb.sqlite
+df-healer --cxdb ~/.dark-factory/cxdb.sqlite
 
 # Visualize a pipeline graph
 dot -Tpng pipelines/factory/gates.dot -o gates.png
@@ -87,6 +93,27 @@ dot -Tpng pipelines/factory/gates.dot -o gates.png
 .venv/bin/python -m pytest tests/test_engine.py -k green
 .venv/bin/python -m pytest tests/test_gates.py::test_parse_verdict_pass_warn_fail
 ```
+
+Legacy dev-only: `.venv/bin/python -m runner ...` from `$DARK_FACTORY_HOME`.
+
+## Pipeline selection
+
+**Pick the `.dot` for the task** — do not reuse one default for every run.
+Full decision table: [docs/pipeline-selection.md](docs/pipeline-selection.md).
+
+Quick guide:
+
+| Task | Pipeline |
+|------|----------|
+| Smoke / wiring | `pipelines/factory/hello.dot` |
+| New feature (full) | `pipelines/slim/minimal_feature.dot` |
+| PR iteration | `pipelines/slim/minimal_pr.dot` |
+| Gates + holdout | `pipelines/factory/gates.dot` |
+| PR gates only | `pipelines/factory/pr_gates.dot` |
+| Spec review | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` |
+
+`/f` and `/factory` must classify the goal (factory-spec Step 0) and choose a
+pipeline before invoking `dark-factory`, unless the user passed `--pipeline`.
 
 ## Architecture
 

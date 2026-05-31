@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
 from .parser import Node, is_start_node, is_exit_node
+from .paths import factory_home
 
 if TYPE_CHECKING:
     from .perf_log import GitContext, PerfRun
@@ -1477,10 +1478,23 @@ def _render_prompt(node: Node, ctx: Context) -> str:
         return text
     root = ctx.workdir.resolve()
     p = (root / ref_path).resolve()
+    if not p.exists():
+        home = factory_home()
+        if home is not None:
+            alt = (home / ref_path).resolve()
+            if alt.exists():
+                p = alt
     try:
         p.relative_to(root)
     except ValueError:
-        return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
+        home = factory_home()
+        if home is not None:
+            try:
+                p.relative_to(home.resolve())
+            except ValueError:
+                return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
+        else:
+            return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
     if not p.exists():
         return f"# {node.name}\n\nGoal: {ctx.goal}\n(missing prompt: {ref})"
     text = p.read_text()
