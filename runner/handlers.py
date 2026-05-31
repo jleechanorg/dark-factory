@@ -1134,7 +1134,9 @@ def _gate_evidence_review(node: Node, ctx: Context) -> Result:
     local_es = ctx.workdir / ".claude" / "commands" / "es.md"
     local_er = ctx.workdir / ".claude" / "commands" / "er.md"
     local_cmd = ctx.workdir / ".claude" / "commands" / "evidence_review.md"
-    local_skill = ctx.workdir / ".claude" / "skills" / "evidence-standards.md"
+    # Check directory-based layout first (SKILL.md), then legacy flat-file fallback.
+    local_skill = ctx.workdir / ".claude" / "skills" / "evidence-standards" / "SKILL.md"
+    legacy_skill = ctx.workdir / ".claude" / "skills" / "evidence-standards.md"
 
     # When both /es and /er are available, run both and return the worst outcome.
     if local_es.exists() and local_er.exists():
@@ -1150,7 +1152,7 @@ def _gate_evidence_review(node: Node, ctx: Context) -> Result:
         return _slash_gate("er")(node, ctx)
     elif local_cmd.exists():
         return _slash_gate("evidence_review")(node, ctx)
-    elif local_skill.exists():
+    elif local_skill.exists() or legacy_skill.exists():
         return _slash_gate("evidence-standards")(node, ctx)
     else:
         return _run_universal_prompt_gate(UNIVERSAL_EVIDENCE_REVIEW_PROMPT, "gate_evidence_review", node, ctx)
