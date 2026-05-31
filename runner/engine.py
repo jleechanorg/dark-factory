@@ -6,8 +6,10 @@ import json
 import pathlib
 import re
 import time
+import traceback
+import uuid
 from dataclasses import asdict, dataclass, field
-from typing import Optional
+from typing import Optional, TextIO
 
 # Matches any valid binary operator in an edge condition string.
 # Conditions with NO operator are malformed (e.g. "not-a-condition" tokenizes
@@ -19,6 +21,42 @@ from .handlers import Context, Result, resolve
 from .parser import Edge, Graph, Node, is_exit_node, is_start_node
 
 _VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards"}
+
+# Reject truly malformed conditions (e.g. "not-a-condition" tokenizes as NOT +
+# WORD("-a-condition"), which double-negates to True). Allow: explicit operators
+# (=, !=), contains/in, and bare-word shorthands (success, not success).
+_EDGE_OP_RE = re.compile(
+    r"!=|==|=|"
+    r"(?<!\S)(?:not\s+)?(?:contains|in)\b|"
+    r"(?:^|\s)(?:not\s+)?[a-zA-Z_]\w*(?:\s|$)"
+)
+
+# Per-run runner logs land here so a crash always leaves a diagnosable
+# traceback on disk even when no CXDB is attached. Monkeypatchable in tests.
+_LOG_DIR = pathlib.Path.home() / ".dark-factory" / "logs"
+
+
+def _open_run_log(run_id: str) -> Optional[TextIO]:
+    """Open ~/.dark-factory/logs/<run_id>.log for append-mode tee logging.
+
+    Failures to open the log must never take down a run, so this swallows
+    filesystem errors and returns None (logging becomes a no-op).
+    """
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        return (_LOG_DIR / f"{run_id}.log").open("a", encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _log(handle: Optional[TextIO], message: str) -> None:
+    if handle is None:
+        return
+    try:
+        handle.write(f"[{time.time():.3f}] {message}\n")
+        handle.flush()
+    except (OSError, ValueError):
+        pass
 
 
 def _classify_outcome(raw: str) -> str:
@@ -128,7 +166,6 @@ def _evaluate_expression(
     cond = cond.strip()
     if not cond:
         return True
-
 
     token_specification = [
         ('PAREN', r'[()]'),
@@ -355,10 +392,13 @@ def _parallel_join_outcome(
     branch_outcomes: list[Result],
     allow_partial: bool,
 ) -> str:
-    success_count, partial_count, _ = _classify_records(branch_outcomes)
-    effective_success = success_count + (partial_count if allow_partial else 0)
     if not branch_outcomes:
         return _normalize_outcome_only("success")
+    for branch in branch_outcomes:
+        if _classify_outcome(branch.outcome) == "error":
+            return "error"
+    success_count, partial_count, _ = _classify_records(branch_outcomes)
+    effective_success = success_count + (partial_count if allow_partial else 0)
     quorum = _attr_int(current, "join_quorum", len(branch_outcomes))
     if quorum <= 0:
         quorum = len(branch_outcomes)
@@ -437,6 +477,81 @@ def _attr_int(node: Node, key: str, default: int) -> int:
         return default
 
 
+def _handle_node_exception(
+    graph: Graph,
+    current: Node,
+    ctx: Context,
+    exc: Exception,
+    history: list[StepRecord],
+    checkpoint: Optional[pathlib.Path],
+    cxdb: Optional[CXDB],
+    seq: int,
+    log: Optional[TextIO],
+) -> Optional[Node]:
+    """Record a node/transition crash as an `error` step and pick a recovery edge.
+
+    The full traceback is written to the per-run log file; a compact
+    type+message+last-frame summary lands in the StepRecord.output_preview so
+    the crash is visible in CXDB and the CLI trace without a fatal abort.
+
+    Returns the next node to route to (a registered retry/fix edge that matches
+    `outcome=error`/`outcome!=success`) or None when the run should end.
+    """
+    tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    _log(log, f"node {current.name!r} raised {type(exc).__name__}: {exc}\n{tb_text}")
+
+    summary_frame = tb_text.strip().splitlines()[-1] if tb_text.strip() else ""
+    preview = f"{type(exc).__name__}: {exc} | {summary_frame}"
+
+    error_result = _normalized_result(
+        Result(
+            outcome="error",
+            output=tb_text,
+            metadata={"exception": type(exc).__name__},
+        )
+    )
+    ctx.state["_last_node"] = current.name
+    ctx.state["_last_outcome"] = "error"
+    ctx.state["_last_output"] = tb_text[:4000]
+    ctx.history.append({"node": current.name, "outcome": "error"})
+
+    record = StepRecord(
+        node=current.name,
+        outcome="error",
+        ts=time.time(),
+        output_preview=preview[:280],
+        metadata={"exception": type(exc).__name__},
+    )
+    _append_record(history, checkpoint, cxdb, ctx, seq, record, tb_text, record.metadata)
+    _update_failure_state(current, ctx, error_result)
+
+    # A crash is a failure: only a deliberate recovery edge may catch it. That
+    # means a goal_gate `retry_target` or a *conditional* edge that matches the
+    # error outcome (e.g. `outcome!=success` / `outcome=error`). Unconditional
+    # forward edges are NOT recovery — following them would silently carry a
+    # crashed run onward and let it reach `exit` as success. With no recovery
+    # edge, the run ends here on the recorded `error` step.
+    gate_target = _goal_gate_target(graph, current, error_result, ctx)
+    if gate_target is not None:
+        _log(log, f"routing crashed node {current.name!r} -> {gate_target.name!r} (goal_gate)")
+        return gate_target
+    matching = [
+        edge
+        for edge in graph.outgoing(current.name)
+        if edge.condition and _edge_matches(edge, error_result, ctx, current)
+    ]
+    if matching:
+        selected = _choose_edge(matching, error_result)
+        next_node = graph.nodes.get(selected.dst)
+        if next_node is None:
+            _log(log, f"fix edge {selected.dst!r} points to unknown node; ending run")
+            return None
+        _log(log, f"routing crashed node {current.name!r} -> {selected.dst!r} (fix edge)")
+        return next_node
+    _log(log, f"no recovery edge for crashed node {current.name!r}; ending run")
+    return None
+
+
 def run(
     graph: Graph,
     ctx: Context,
@@ -481,6 +596,14 @@ def run(
         cxdb = CXDB(ctx.cxdb_path)
         ctx.run_id = cxdb.start_run(pipeline=graph.name, goal=ctx.goal)
 
+    # Always have an addressable run_id so the per-run log file is locatable
+    # even when no CXDB is attached (ad-hoc smoke runs, echo backend, etc.).
+    if not ctx.run_id:
+        ctx.run_id = uuid.uuid4().hex[:12]
+
+    log = _open_run_log(ctx.run_id)
+    _log(log, f"run start pipeline={graph.name!r} goal={ctx.goal!r} backend={ctx.backend!r}")
+
     try:
         while True:
             if len(history) >= max_steps:
@@ -505,7 +628,18 @@ def run(
                 seq = _append_record(history, checkpoint, cxdb, ctx, seq, record, "")
                 break
 
-            results, records = _run_single_node(current, ctx, graph)
+            try:
+                results, records = _run_single_node(current, ctx, graph)
+            except Exception as exc:  # noqa: BLE001 — any node crash must be recorded, not fatal
+                next_node = _handle_node_exception(
+                    graph, current, ctx, exc, history, checkpoint, cxdb, seq, log
+                )
+                seq += 1
+                if next_node is None:
+                    break
+                current = next_node
+                continue
+
             if records:
                 result = results[-1]
             else:
@@ -519,12 +653,36 @@ def run(
                     target = graph.nodes.get(edge.dst)
                     if target is None:
                         continue
-                    b_results, b_records = _run_single_node(target, _clone_context(ctx), graph)
-                    if b_records:
-                        for branch_index, b_result in enumerate(b_results):
-                            b_record = b_records[branch_index]
-                            branch_records.append((b_record, b_result.output, b_record.metadata))
-                        branch_results.append(b_results[-1])
+                    try:
+                        b_results, b_records = _run_single_node(target, _clone_context(ctx), graph)
+                        if b_records:
+                            for branch_index, b_result in enumerate(b_results):
+                                b_record = b_records[branch_index]
+                                branch_records.append((b_record, b_result.output, b_record.metadata))
+                            branch_results.append(b_results[-1])
+                    except Exception as exc:  # noqa: BLE001 — branch crash must be recorded, not fatal
+                        tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                        _log(log, f"parallel branch {target.name!r} raised {type(exc).__name__}: {exc}\n{tb_text}")
+                        
+                        summary_frame = tb_text.strip().splitlines()[-1] if tb_text.strip() else ""
+                        preview = f"{type(exc).__name__}: {exc} | {summary_frame}"
+                        
+                        error_result = _normalized_result(
+                            Result(
+                                outcome="error",
+                                output=tb_text,
+                                metadata={"exception": type(exc).__name__},
+                            )
+                        )
+                        error_record = StepRecord(
+                            node=target.name,
+                            outcome="error",
+                            ts=time.time(),
+                            output_preview=preview[:280],
+                            metadata={"exception": type(exc).__name__},
+                        )
+                        branch_records.append((error_record, tb_text, error_record.metadata))
+                        branch_results.append(error_result)
 
                 if branch_records:
                     join_outcome = _parallel_join_outcome(current, branch_results, _allow_partial(current))
@@ -575,17 +733,74 @@ def run(
             if records:
                 _update_failure_state(current, ctx, result)
 
+            # Handle parallel branch crash: only recovery edges may catch it.
+            # When any branch raises, the join outcome is set to "error", but
+            # unconditional join edges must NOT be followed — that would silently
+            # carry a crashed run onward and let it reach `exit` as success.
+            if current.attrs.get("parallel", False) and result.outcome == "error":
+                gate_target = _goal_gate_target(graph, current, result, ctx)
+                if gate_target is not None:
+                    _log(log, f"routing parallel error {current.name!r} -> {gate_target.name!r} (goal_gate)")
+                    current = gate_target
+                    continue
+                join_edges = _parallel_join_edges(graph.outgoing(current.name))
+                matching = [
+                    edge
+                    for edge in join_edges
+                    if edge.condition and _edge_matches(edge, result, ctx, current)
+                ]
+                if matching:
+                    selected = _choose_edge(matching, result)
+                    next_node = graph.nodes.get(selected.dst)
+                    if next_node is not None:
+                        _log(log, f"routing parallel error {current.name!r} -> {selected.dst!r} (recovery edge)")
+                        current = next_node
+                        continue
+                _log(log, f"no recovery edge for parallel error {current.name!r}; ending run")
+                terminal_record = StepRecord(
+                    node=current.name,
+                    outcome="error",
+                    ts=time.time(),
+                    output_preview="parallel join failed: no recovery edge",
+                    metadata=result.metadata,
+                )
+                seq = _append_record(
+                    history,
+                    checkpoint,
+                    cxdb,
+                    ctx,
+                    seq,
+                    terminal_record,
+                    "parallel join failed: no recovery edge",
+                    result.metadata,
+                )
+                break
+
             if is_exit_node(current):
                 break
 
-            gate_target = _goal_gate_target(graph, current, result, ctx)
-            if gate_target is not None:
-                next_node = gate_target
-            else:
-                outgoing = graph.outgoing(current.name)
-                join_edges = _parallel_join_edges(outgoing) if current.attrs.get("parallel", False) else []
-                chosen = join_edges if join_edges else outgoing
-                next_node = _pick_next_from_edges(graph, current, chosen, result, ctx)
+            try:
+                gate_target = _goal_gate_target(graph, current, result, ctx)
+                if gate_target is not None:
+                    next_node = gate_target
+                else:
+                    outgoing = graph.outgoing(current.name)
+                    join_edges = (
+                        _parallel_join_edges(outgoing)
+                        if current.attrs.get("parallel", False)
+                        else []
+                    )
+                    chosen = join_edges if join_edges else outgoing
+                    next_node = _pick_next_from_edges(graph, current, chosen, result, ctx)
+            except Exception as exc:  # noqa: BLE001 — transition crash must be recorded, not fatal
+                next_node = _handle_node_exception(
+                    graph, current, ctx, exc, history, checkpoint, cxdb, seq, log
+                )
+                seq += 1
+                if next_node is None:
+                    break
+                current = next_node
+                continue
 
             if next_node is None:
                 record = StepRecord(
@@ -600,12 +815,21 @@ def run(
                 break
             current = next_node
     finally:
-        if cxdb is not None and ctx.run_id is not None:
-            cxdb.end_run(
-                ctx.run_id,
-                final=history[-1].outcome if history else "empty",
-            )
-            cxdb.close()
+        final_outcome = history[-1].outcome if history else "empty"
+        _log(log, f"run end final={final_outcome!r} steps={len(history)}")
+        try:
+            if cxdb is not None and ctx.run_id is not None:
+                cxdb.end_run(
+                    ctx.run_id,
+                    final=final_outcome,
+                )
+                cxdb.close()
+        finally:
+            if log is not None:
+                try:
+                    log.close()
+                except OSError:
+                    pass
 
     return history
 
