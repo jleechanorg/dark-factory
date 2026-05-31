@@ -412,54 +412,31 @@ def _is_join_node(node: Node) -> bool:
 
 
 def _find_join_node(graph: Graph, fanout: Node) -> Optional[Node]:
-    """Find the join node that all branches of fanout converge on.
+    """BFS from fanout's direct successors to find the nearest join node.
 
-    Separates direct-join edges from branch-node edges. For each branch start,
-    finds its first reachable join via BFS. Returns that join only if ALL
-    branch starts agree; returns None if they diverge (malformed pipeline).
-    Falls back to direct-join edge when there are no intermediate branch nodes.
+    Uses graph structure only (ignores edge conditions), so branches that are
+    filtered out at runtime by _edge_matches do not affect discovery. For
+    well-formed pipelines all active branches converge on the same join; truly
+    divergent topologies (branches wired to different joins) are not supported.
     """
-    direct_join: Optional[Node] = None
-    branch_starts: list[Node] = []
+    visited: set[str] = set()
+    queue: list[Node] = []
     for edge in graph.outgoing(fanout.name):
         n = graph.nodes.get(edge.dst)
-        if n is None:
+        if n is not None:
+            queue.append(n)
+    while queue:
+        node = queue.pop(0)
+        if node.name in visited:
             continue
-        if _is_join_node(n):
-            direct_join = n
-        else:
-            branch_starts.append(n)
-
-    if not branch_starts:
-        return direct_join
-
-    def _bfs_first_join(start: Node) -> Optional[str]:
-        visited: set[str] = set()
-        queue: list[Node] = [start]
-        while queue:
-            node = queue.pop(0)
-            if node.name in visited:
-                continue
-            visited.add(node.name)
-            if _is_join_node(node):
-                return node.name
-            for edge in graph.outgoing(node.name):
-                n = graph.nodes.get(edge.dst)
-                if n is not None and n.name not in visited:
-                    queue.append(n)
-        return None
-
-    join_name: Optional[str] = None
-    for bs in branch_starts:
-        first = _bfs_first_join(bs)
-        if first is None:
-            return None
-        if join_name is None:
-            join_name = first
-        elif join_name != first:
-            return None
-
-    return graph.nodes.get(join_name) if join_name else None
+        visited.add(node.name)
+        if _is_join_node(node):
+            return node
+        for edge in graph.outgoing(node.name):
+            n = graph.nodes.get(edge.dst)
+            if n is not None and n.name not in visited:
+                queue.append(n)
+    return None
 
 
 def _apply_join_policy(join_node: Node, results: list[Result]) -> str:
