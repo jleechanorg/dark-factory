@@ -173,7 +173,7 @@ Use this benchmark as the template for general spec-validation lanes.
 
 Enabled by default. Logs are organized by **target workdir git identity** (prefers `ao.worktree` when set):
 
-```
+```text
 /tmp/dark-factory/<repo-slug>/<branch-slug>/
   <run_id>.jsonl          # structured node_enter / node_exit / transition / run_end
   <run_id>.log              # human-readable ENTER/EXIT lines with outcome + duration_ms

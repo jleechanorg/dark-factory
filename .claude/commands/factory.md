@@ -12,7 +12,7 @@ Dispatches to the `dark-factory` skill → **`dark-factory` binary**
 
 **Usage**:
 
-```
+```bash
 /factory <goal>                          # auto-select pipeline
 /factory --pipeline gates <goal>
 /factory --pipeline minimal_pr <goal>

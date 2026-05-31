@@ -14,7 +14,7 @@ Uses the installed **`dark-factory` binary** (`~/projects/dark-factory/install.s
 
 **Usage**:
 
-```
+```bash
 /f <goal description>               # auto-select pipeline + claude backend
 /f --backend echo <goal>            # dry-run wiring smoke (no LLM)
 /f --feature <name> <goal>          # override holdout feature key
