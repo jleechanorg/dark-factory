@@ -733,6 +733,32 @@ def run(
             if records:
                 _update_failure_state(current, ctx, result)
 
+            # Handle parallel branch crash: only recovery edges may catch it.
+            # When any branch raises, the join outcome is set to "error", but
+            # unconditional join edges must NOT be followed — that would silently
+            # carry a crashed run onward and let it reach `exit` as success.
+            if current.attrs.get("parallel", False) and result.outcome == "error":
+                gate_target = _goal_gate_target(graph, current, result, ctx)
+                if gate_target is not None:
+                    _log(log, f"routing parallel error {current.name!r} -> {gate_target.name!r} (goal_gate)")
+                    current = gate_target
+                    continue
+                join_edges = _parallel_join_edges(graph.outgoing(current.name))
+                matching = [
+                    edge
+                    for edge in join_edges
+                    if edge.condition and _edge_matches(edge, result, ctx, current)
+                ]
+                if matching:
+                    selected = _choose_edge(matching, result)
+                    next_node = graph.nodes.get(selected.dst)
+                    if next_node is not None:
+                        _log(log, f"routing parallel error {current.name!r} -> {selected.dst!r} (recovery edge)")
+                        current = next_node
+                        continue
+                _log(log, f"no recovery edge for parallel error {current.name!r}; ending run")
+                break
+
             if is_exit_node(current):
                 break
 
