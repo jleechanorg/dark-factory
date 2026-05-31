@@ -17,9 +17,12 @@ import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from .parser import Node, is_start_node, is_exit_node
+
+if TYPE_CHECKING:
+    from .perf_log import GitContext, PerfRun
 
 
 @dataclass
@@ -44,6 +47,9 @@ class Context:
     cxdb_path: Optional[pathlib.Path] = None
     run_id: Optional[str] = None
     event_log_path: Optional[pathlib.Path] = None
+    perf_log_root: Optional[pathlib.Path] = None
+    git_ctx: Optional["GitContext"] = None
+    perf_run: Optional["PerfRun"] = None
 
 
 _TIMEOUT_MIN_SECONDS = 5
