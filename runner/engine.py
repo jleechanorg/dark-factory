@@ -789,7 +789,8 @@ def run(
                     },
                     seq,
                 )
-                _perf_node_enter(ctx, current, seq, visits[current.name])
+                enter_seq = seq  # capture before _append_record increments seq
+                _perf_node_enter(ctx, current, enter_seq, visits[current.name])
                 results, records = _run_single_node(current, ctx, graph)
             except Exception as exc:  # noqa: BLE001 — any node crash must be recorded, not fatal
                 next_node = _handle_node_exception(
@@ -937,7 +938,7 @@ def run(
             _perf_node_exit(
                 ctx,
                 current.name,
-                seq,
+                enter_seq,  # use enter_seq so key matches node_enter_ts entry
                 result.outcome,
                 visits[current.name],
                 records[-1].metadata if records else result.metadata,

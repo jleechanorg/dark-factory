@@ -178,7 +178,10 @@ def open_run(
 ) -> PerfRun:
     """Open per-run JSONL + text log under root/<repo>/<branch>/."""
     directory = run_dir(root, git_ctx)
-    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass  # best-effort; file-open calls below will silently fail too
 
     jsonl_path = directory / f"{run_id}.jsonl"
     log_path = directory / f"{run_id}.log"
