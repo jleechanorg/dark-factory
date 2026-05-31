@@ -639,12 +639,36 @@ def run(
                     target = graph.nodes.get(edge.dst)
                     if target is None:
                         continue
-                    b_results, b_records = _run_single_node(target, _clone_context(ctx), graph)
-                    if b_records:
-                        for branch_index, b_result in enumerate(b_results):
-                            b_record = b_records[branch_index]
-                            branch_records.append((b_record, b_result.output, b_record.metadata))
-                        branch_results.append(b_results[-1])
+                    try:
+                        b_results, b_records = _run_single_node(target, _clone_context(ctx), graph)
+                        if b_records:
+                            for branch_index, b_result in enumerate(b_results):
+                                b_record = b_records[branch_index]
+                                branch_records.append((b_record, b_result.output, b_record.metadata))
+                            branch_results.append(b_results[-1])
+                    except Exception as exc:  # noqa: BLE001 — branch crash must be recorded, not fatal
+                        tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                        _log(log, f"parallel branch {target.name!r} raised {type(exc).__name__}: {exc}\n{tb_text}")
+                        
+                        summary_frame = tb_text.strip().splitlines()[-1] if tb_text.strip() else ""
+                        preview = f"{type(exc).__name__}: {exc} | {summary_frame}"
+                        
+                        error_result = _normalized_result(
+                            Result(
+                                outcome="error",
+                                output=tb_text,
+                                metadata={"exception": type(exc).__name__},
+                            )
+                        )
+                        error_record = StepRecord(
+                            node=target.name,
+                            outcome="error",
+                            ts=time.time(),
+                            output_preview=preview[:280],
+                            metadata={"exception": type(exc).__name__},
+                        )
+                        branch_records.append((error_record, tb_text, error_record.metadata))
+                        branch_results.append(error_result)
 
                 if branch_records:
                     join_outcome = _parallel_join_outcome(current, branch_results, _allow_partial(current))
