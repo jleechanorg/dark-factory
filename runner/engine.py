@@ -858,14 +858,20 @@ def run(
             if _is_parallel_node(current):
                 _jn = _find_join_node(graph, current)
                 if _jn is not None:
-                    # Filter by edge conditions (fix P2: don't launch disabled branches)
-                    _branch_starts = [
-                        _bn
-                        for _e in graph.outgoing(current.name)
-                        if (_bn := graph.nodes.get(_e.dst))
-                        and not _is_join_node(_bn)
-                        and _edge_matches(_e, result, ctx, current)
-                    ]
+                    # Filter by edge conditions; deduplicate by node name so multiple
+                    # edges to the same target don't launch duplicate branch workers.
+                    _seen_branch_names: set[str] = set()
+                    _branch_starts = []
+                    for _e in graph.outgoing(current.name):
+                        _bn = graph.nodes.get(_e.dst)
+                        if (
+                            _bn is not None
+                            and not _is_join_node(_bn)
+                            and _edge_matches(_e, result, ctx, current)
+                            and _bn.name not in _seen_branch_names
+                        ):
+                            _seen_branch_names.add(_bn.name)
+                            _branch_starts.append(_bn)
                     if _branch_starts:
                         _seq_ref: list[int] = [seq]
                         _seq_lock = threading.Lock()
