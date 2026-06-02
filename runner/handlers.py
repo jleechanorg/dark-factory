@@ -980,7 +980,7 @@ def _verify_head_sha_echo(text: str, expected_sha: str) -> tuple[bool, str]:
 # Anchored regex: keyword must follow a marker like "verdict:", "overall:", or "normalized:"
 # and stand on its own word boundary. Avoids substring hits inside "passes warnings".
 _MARKER_RE = re.compile(
-    r"(?:verdict|overall|normalized)\s*:\s*(pass|warn|fail|partial|inconclusive)\b",
+    r"(?:verdict|overall|normalized)\s*:\s*\*{0,2}(pass|warn|fail|partial|inconclusive)\b",
     re.IGNORECASE,
 )
 
