@@ -1047,3 +1047,43 @@ def test_join_as_exit_node_reports_success(tmp_path):
         f"Pipeline with join==exit reported '{final}' instead of 'success'. "
         "ended_at_exit was not set before break in parallel jump-to-exit path."
     )
+
+
+def test_last_output_updated_after_parallel_join(tmp_path):
+    """After parallel fan-out, ctx.state['_last_output'] must reflect the join node.
+
+    Bug: the parallel block updates _last_node and _last_outcome to the join node's
+    values but never sets _last_output, leaving it at the fanout handler's output.
+    Downstream decision nodes or handlers reading _last_output would see stale data.
+
+    Uses join-as-exit (node named 'exit' with type='join') so the exit handler does
+    not subsequently overwrite _last_output, letting us assert the join's output.
+    """
+    dot_path = tmp_path / "join_exit_last_output.dot"
+    dot_path.write_text(
+        'digraph join_exit_last_output {\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  branch_a\n'
+        '  branch_b\n'
+        '  exit [type="join", policy="wait_all"]\n'
+        '  start -> fanout\n'
+        '  fanout -> branch_a\n'
+        '  fanout -> branch_b\n'
+        '  branch_a -> exit\n'
+        '  branch_b -> exit\n'
+        '}\n'
+    )
+    ctx = _ctx()
+    ctx.state["branch_a.outcome"] = "success"
+    ctx.state["branch_b.outcome"] = "success"
+
+    graph = parse(dot_path)
+    run(graph, ctx, max_steps=20)
+
+    # The join-as-exit node's output_preview is "join wait_all 2 branches"
+    last_output = ctx.state.get("_last_output", "")
+    assert "join" in last_output or "wait_all" in last_output or "branch" in last_output, (
+        f"_last_output should reflect the join step output, got: '{last_output!r}'. "
+        "The parallel block must set ctx.state['_last_output'] when it sets _last_node/_last_outcome."
+    )

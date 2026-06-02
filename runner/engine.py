@@ -1187,6 +1187,7 @@ def run(
 
                     ctx.state["_last_node"] = _jn.name
                     ctx.state["_last_outcome"] = _join_outcome
+                    ctx.state["_last_output"] = _join_rec.output_preview
                     ctx.state[_jn.name + ".outcome"] = _join_outcome
 
                     # Branch records already in CXDB (written thread-safely in _run_branch_until_join)
