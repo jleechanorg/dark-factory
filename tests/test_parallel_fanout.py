@@ -1139,3 +1139,44 @@ def test_explicit_type_overrides_shape_for_parallel_detection():
     assert _is_join_node(explicit_join), (
         "_is_join_node must return True when type='join'."
     )
+
+
+def test_stuck_branch_returns_failure_not_stale_success(tmp_path):
+    """A branch that loses routing (no outgoing edge to the join) must contribute failure.
+
+    Bug: _run_branch_until_join exited the loop with last_result="success" when
+    _pick_next returned None mid-branch. The join would then see 2/2 successes and
+    produce a spurious "success" outcome even though one branch never reached the join.
+
+    Fix: after the loop, if current is None (no successor), override last_result to
+    "failure" with a "branch stuck" message before returning.
+    """
+    dot_path = tmp_path / "stuck_branch.dot"
+    dot_path.write_text(
+        'digraph stuck_branch {\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  good_branch\n'
+        '  dead_end\n'
+        '  join [type="join", policy="wait_all"]\n'
+        '  finish [shape=Msquare]\n'
+        '  start -> fanout\n'
+        '  fanout -> good_branch\n'
+        '  fanout -> dead_end\n'
+        '  good_branch -> join\n'
+        # dead_end has no edge to join; it will get stuck
+        '  join -> finish\n'
+        '}\n'
+    )
+    ctx = _ctx()
+    ctx.state["good_branch.outcome"] = "success"
+    ctx.state["dead_end.outcome"] = "success"
+
+    graph = parse(dot_path)
+    results = run(graph, ctx, max_steps=20)
+    final = results[-1].outcome if results else "empty"
+    assert final == "failure", (
+        f"Pipeline with stuck branch reported '{final}' instead of 'failure'. "
+        "_run_branch_until_join must set outcome='failure' when a branch has no successor "
+        "before reaching the join node."
+    )
