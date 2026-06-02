@@ -1018,3 +1018,32 @@ def test_branch_routing_uses_current_step_result_not_frozen_failure(tmp_path):
         f"after_ok was never called — ok_step routing used stale failure result "
         f"and skipped the condition='outcome=success' edge. calls={calls}"
     )
+
+
+def test_join_as_exit_node_reports_success(tmp_path):
+    """When the join node IS the exit node, a successful pipeline must report success.
+
+    Bug: _para_jump_to is found as join; is_exit_node(_para_jump_to)==True triggers a
+    break at engine.py without setting ended_at_exit=True. The finally block then
+    downgrades any 'success' outcome to 'failure' because it thinks we left early.
+    """
+    dot_path = tmp_path / "join_is_exit.dot"
+    dot_path.write_text(
+        'digraph join_is_exit {\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  branch_a\n'
+        '  exit [type="join", policy="wait_all"]\n'
+        '  start -> fanout\n'
+        '  fanout -> branch_a\n'
+        '  branch_a -> exit\n'
+        '}\n'
+    )
+    ctx = _ctx()
+    graph = parse(dot_path)
+    results = run(graph, ctx, max_steps=20)
+    final = results[-1].outcome if results else "empty"
+    assert final == "success", (
+        f"Pipeline with join==exit reported '{final}' instead of 'success'. "
+        "ended_at_exit was not set before break in parallel jump-to-exit path."
+    )

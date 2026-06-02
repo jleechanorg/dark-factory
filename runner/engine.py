@@ -1256,6 +1256,7 @@ def run(
             try:
                 if _para_jump_to is not None:
                     if is_exit_node(_para_jump_to):
+                        ended_at_exit = True
                         break
                     gate_target = _goal_gate_target(graph, _para_jump_to, _para_result, ctx)
                     if gate_target is not None:
