@@ -17,9 +17,13 @@ import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from .parser import Node, is_start_node, is_exit_node
+from .paths import factory_home
+
+if TYPE_CHECKING:
+    from .perf_log import GitContext, PerfRun
 
 
 @dataclass
@@ -43,6 +47,31 @@ class Context:
     backend: str = "echo"  # echo | mock_llm | ao | claude | codex | agy
     cxdb_path: Optional[pathlib.Path] = None
     run_id: Optional[str] = None
+    event_log_path: Optional[pathlib.Path] = None
+    perf_log_root: Optional[pathlib.Path] = None
+    git_ctx: Optional["GitContext"] = None
+    perf_run: Optional["PerfRun"] = None
+
+
+_TIMEOUT_MIN_SECONDS = 5
+_TIMEOUT_MAX_SECONDS = 3600
+
+
+def _coerce_timeout(value: object, default: int, *, minimum: int = _TIMEOUT_MIN_SECONDS, maximum: int = _TIMEOUT_MAX_SECONDS) -> int:
+    """Parse and clamp timeout values to the policy envelope.
+
+    Invalid values fall back to `default`. Very small / very large values are
+    clamped to prevent pathological zero-timeout runs or runaway hangs.
+    """
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < minimum:
+        return minimum
+    if parsed > maximum:
+        return maximum
+    return parsed
 
 
 Handler = Callable[[Node, Context], Result]
@@ -288,19 +317,55 @@ def _codergen(node: Node, ctx: Context) -> Result:
             spawn_args = _sandboxed_args(spawn_args)
             if spawn_args is None:
                 return Result(outcome="failure", output="sandbox-exec unavailable")
-            proc = subprocess.run(
-                spawn_args,
-                cwd=ctx.workdir,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                check=False,
-                env=_sanitized_env(),
-            )
+            ao_spawn_timeout = _coerce_timeout(node.attrs.get("timeout", "300"), 300)
+            try:
+                proc = subprocess.run(
+                    spawn_args,
+                    cwd=ctx.workdir,
+                    capture_output=True,
+                    text=True,
+                    timeout=ao_spawn_timeout,
+                    check=False,
+                    env=_sanitized_env(),
+                )
+            except subprocess.TimeoutExpired as exc:
+                stdout = exc.stdout or ""
+                stderr = exc.stderr or ""
+                return Result(
+                    outcome="failure",
+                    output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
+                    or f"ao spawn timed out after {ao_spawn_timeout} seconds",
+                    metadata={
+                        "session": "",
+                        "activity": "timeout",
+                        "timed_out": "true",
+                        "timeout": str(ao_spawn_timeout),
+                        "returncode": "",
+                    },
+                )
+            except Exception as exc:
+                return Result(
+                    outcome="failure",
+                    output=f"ao spawn failed: {exc}",
+                    metadata={
+                        "session": "",
+                        "activity": "error",
+                        "timed_out": "false",
+                        "timeout": str(ao_spawn_timeout),
+                        "returncode": "",
+                    },
+                )
             if proc.returncode != 0:
                 return Result(
                     outcome="failure",
                     output=f"ao spawn failed (rc={proc.returncode})\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+                    metadata={
+                        "session": "",
+                        "returncode": str(proc.returncode),
+                        "timed_out": "false",
+                        "timeout": str(ao_spawn_timeout),
+                        "activity": "spawn_failed",
+                    },
                 )
             sess_name = None
             worktree = None
@@ -315,11 +380,19 @@ def _codergen(node: Node, ctx: Context) -> Result:
             ctx.state["ao.session"] = sess_name
             if worktree:
                 ctx.state["ao.worktree"] = worktree
-            activity = _ao_wait_idle(sess_name, ctx.workdir, timeout=900, project=project)
+            ao_wait_timeout = _coerce_timeout(node.attrs.get("wait_timeout", "900"), 900)
+            activity = _ao_wait_idle(sess_name, ctx.workdir, timeout=ao_wait_timeout, project=project)
             outcome = "success" if activity in ("exited", "ready") else "failure"
             wall_ms = int((time.monotonic() - _start_ts) * 1000)
             metrics = _codergen_metrics(proc.stdout, proc.stderr, wall_ms)
-            meta = {"session": sess_name, "worktree": worktree or "", "activity": activity}
+            meta = {
+                "session": sess_name,
+                "worktree": worktree or "",
+                "activity": activity,
+                "timed_out": "true" if activity == "timeout" else "false",
+                "timeout": str(ao_wait_timeout),
+                "returncode": str(proc.returncode),
+            }
             meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
             return Result(
                 outcome=outcome,
@@ -327,18 +400,54 @@ def _codergen(node: Node, ctx: Context) -> Result:
                 metadata=meta,
             )
 
-        send_args = _sandboxed_args(["ao", "send", session, prompt_text, "--timeout", "900"])
+        ao_send_timeout = _coerce_timeout(node.attrs.get("timeout", "960"), 960)
+        send_args = _sandboxed_args([
+            "ao",
+            "send",
+            session,
+            prompt_text,
+            "--timeout",
+            str(ao_send_timeout),
+        ])
         if send_args is None:
             return Result(outcome="failure", output="sandbox-exec unavailable")
-        proc = subprocess.run(
-            send_args,
-            cwd=ctx.workdir,
-            capture_output=True,
-            text=True,
-            timeout=960,
-            check=False,
-            env=_sanitized_env(),
-        )
+        try:
+            proc = subprocess.run(
+                send_args,
+                cwd=ctx.workdir,
+                capture_output=True,
+                text=True,
+                timeout=ao_send_timeout + 120,
+                check=False,
+                env=_sanitized_env(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            return Result(
+                outcome="failure",
+                output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
+                or f"ao send timed out after {ao_send_timeout} seconds",
+                metadata={
+                    "session": session,
+                    "activity": "timeout",
+                    "timed_out": "true",
+                    "timeout": str(ao_send_timeout),
+                    "returncode": "",
+                },
+            )
+        except Exception as exc:
+            return Result(
+                outcome="failure",
+                output=f"ao send failed: {exc}",
+                metadata={
+                    "session": session,
+                    "activity": "error",
+                    "timed_out": "false",
+                    "timeout": str(ao_send_timeout),
+                    "returncode": "",
+                },
+            )
         if proc.returncode != 0:
             if "does not exist" in proc.stdout or "does not exist" in proc.stderr:
                 if "ao.session" in ctx.state:
@@ -348,12 +457,26 @@ def _codergen(node: Node, ctx: Context) -> Result:
             return Result(
                 outcome="failure",
                 output=f"ao send failed (rc={proc.returncode})\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+                metadata={
+                    "session": session,
+                    "activity": "send_failed",
+                    "timed_out": "false",
+                    "timeout": str(ao_send_timeout),
+                    "returncode": str(proc.returncode),
+                },
             )
-        activity = _ao_wait_idle(session, ctx.workdir, timeout=900, project=project)
+        ao_wait_timeout = _coerce_timeout(node.attrs.get("wait_timeout", "900"), 900)
+        activity = _ao_wait_idle(session, ctx.workdir, timeout=ao_wait_timeout, project=project)
         outcome = "success" if activity in ("exited", "ready") else "failure"
         wall_ms = int((time.monotonic() - _start_ts) * 1000)
         metrics = _codergen_metrics(proc.stdout, proc.stderr, wall_ms)
-        meta = {"session": session, "activity": activity}
+        meta = {
+            "session": session,
+            "activity": activity,
+            "timed_out": "true" if activity == "timeout" else "false",
+            "timeout": str(ao_wait_timeout),
+            "returncode": str(proc.returncode),
+        }
         meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
         return Result(
             outcome=outcome,
@@ -366,36 +489,77 @@ def _codergen(node: Node, ctx: Context) -> Result:
         if args is None:
             return Result(outcome="failure", output="sandbox-exec unavailable")
         try:
+            timeout_s = _coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
             proc = subprocess.run(
                 args,
                 cwd=ctx.workdir,
                 capture_output=True,
                 text=True,
-                timeout=1800,  # 30 min timeout for complex tasks
+                timeout=timeout_s,
                 check=False,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
                 env=_sanitized_env(),
             )
         except subprocess.TimeoutExpired:
-            return Result(outcome="failure", output="claude backend timed out after 30 minutes")
+            return Result(
+                outcome="failure",
+                output=f"claude backend timed out after {timeout_s} seconds",
+                metadata={
+                    "timed_out": "true",
+                    "timeout": str(timeout_s),
+                    "returncode": "",
+                },
+            )
         except Exception as e:
-            return Result(outcome="failure", output=f"claude backend error: {e}")
+            return Result(
+                outcome="failure",
+                output=f"claude backend error: {e}",
+                metadata={
+                    "timed_out": "false",
+                    "timeout": str(timeout_s),
+                    "returncode": "",
+                },
+            )
     elif backend == "codex":
         args = _sandboxed_args(["codex", "exec", "--yolo", "--skip-git-repo-check", prompt_text])
         if args is None:
             return Result(outcome="failure", output="sandbox-exec unavailable")
-        timeout_s = int(node.attrs.get("timeout", "1800"))
-        proc = subprocess.run(
-            args,
-            cwd=ctx.workdir,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-            input="",
-            env=_sanitized_env(),
-        )
+        timeout_s = _coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
+        try:
+            proc = subprocess.run(
+                args,
+                cwd=ctx.workdir,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                check=False,
+                input="",
+                env=_sanitized_env(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            return Result(
+                outcome="failure",
+                output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
+                or f"codex backend timed out after {timeout_s} seconds",
+                metadata={
+                    "timed_out": "true",
+                    "timeout": str(timeout_s),
+                    "returncode": "",
+                },
+            )
+        except Exception as exc:
+            return Result(
+                outcome="error",
+                output=f"codex backend error: {exc}",
+                metadata={
+                    "timed_out": "false",
+                    "timeout": str(timeout_s),
+                    "returncode": "",
+                },
+            )
     elif backend == "claudew":
         wafer_key = os.environ.get("WAFER_API_KEY", "")
         if not wafer_key:
@@ -416,23 +580,40 @@ def _codergen(node: Node, ctx: Context) -> Result:
         if args is None:
             return Result(outcome="failure", output="sandbox-exec unavailable")
         try:
+            timeout_s = _coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
             proc = subprocess.run(
                 args,
                 cwd=ctx.workdir,
                 capture_output=True,
                 text=True,
-                timeout=1800,
+                timeout=timeout_s,
                 check=False,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
                 env=env,
             )
         except subprocess.TimeoutExpired:
-            return Result(outcome="failure", output="claudew backend timed out after 30 minutes")
+            return Result(
+                outcome="failure",
+                output=f"claudew backend timed out after {timeout_s} seconds",
+                metadata={
+                    "timed_out": "true",
+                    "timeout": str(timeout_s),
+                    "returncode": "",
+                },
+            )
         except Exception as e:
-            return Result(outcome="failure", output=f"claudew backend error: {e}")
+            return Result(
+                outcome="failure",
+                output=f"claudew backend error: {e}",
+                metadata={
+                    "timeout": str(timeout_s),
+                    "timed_out": "false",
+                    "returncode": "",
+                },
+            )
     elif backend == "agy":
-        timeout_s = int(node.attrs.get("timeout", "600"))
+        timeout_s = _coerce_timeout(node.attrs.get("timeout", "600"), 600)
         task_dir = ctx.workdir / ".dark-factory"
         task_dir.mkdir(parents=True, exist_ok=True)
         task_file = task_dir / f"agy-task-{node.name}.md"
@@ -573,10 +754,7 @@ def _tool(node: Node, ctx: Context) -> Result:
     if not cmd:
         return Result(outcome="failure", output="no command attribute")
     cmd = _substitute_state(cmd, ctx)
-    try:
-        timeout = int(node.attrs.get("timeout", "300"))
-    except (TypeError, ValueError):
-        timeout = 300
+    timeout = _coerce_timeout(node.attrs.get("timeout", "300"), 300)
     cwd_attr = node.attrs.get("cwd")
     if cwd_attr:
         cwd_attr = _substitute_state(cwd_attr, ctx)
@@ -594,20 +772,49 @@ def _tool(node: Node, ctx: Context) -> Result:
     args = _sandboxed_args(shlex.split(cmd))
     if args is None:
         return Result(outcome="failure", output="sandbox-exec unavailable")
-    proc = subprocess.run(
-        args,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-        env=_sanitized_env(),
-    )
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=_sanitized_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        return Result(
+            outcome="failure",
+            output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip() or f"tool command timed out after {timeout} seconds",
+            metadata={
+                "command": cmd,
+                "timeout": str(timeout),
+                "timed_out": "true",
+                "returncode": "",
+            },
+        )
+    except Exception as exc:
+        return Result(
+            outcome="error",
+            output=f"tool command failed: {exc}",
+            metadata={
+                "command": cmd,
+                "timed_out": "false",
+                "timeout": str(timeout),
+                "returncode": "",
+            },
+        )
     outcome = "success" if proc.returncode == 0 else "failure"
     return Result(
         outcome=outcome,
         output=proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else ""),
-        metadata={"returncode": str(proc.returncode)},
+        metadata={
+            "command": cmd,
+            "returncode": str(proc.returncode),
+            "timed_out": "false",
+        },
     )
 
 
@@ -724,6 +931,10 @@ _VERDICT_NORMALIZE = {
     "fail": "failure",
     "partial": "failure",
     "inconclusive": "failure",
+    "insufficient": "failure",
+    "invalid": "failure",
+    "incomplete": "failure",
+    "conditional": "failure",  # non-standard verdict (architectural concern) → failure
 }
 
 # A gate response must echo back `head_sha: <40-hex>` so we can bind the
@@ -771,9 +982,10 @@ def _verify_head_sha_echo(text: str, expected_sha: str) -> tuple[bool, str]:
     return observed == expected_sha.lower(), observed
 
 # Anchored regex: keyword must follow a marker like "verdict:", "overall:", or "normalized:"
-# and stand on its own word boundary. Avoids substring hits inside "passes warnings".
+# Token must follow verdict: directly (optional whitespace only). No [^\n]* backtracking —
+# that would lift embedded words out of compound phrases like "verdict: not a fail".
 _MARKER_RE = re.compile(
-    r"(?:verdict|overall|normalized)\s*:\s*(pass|warn|fail|partial|inconclusive)\b",
+    r"(?:verdict|overall|normalized)\s*:\s*(pass|warn|fail|partial|inconclusive|insufficient|invalid|incomplete|conditional)\b",
     re.IGNORECASE,
 )
 
@@ -791,7 +1003,7 @@ _MARKER_PRESENT_RE = re.compile(
 # trailing punctuation). Stricter than a free `\b` scan so prose like
 # "not a fail" doesn't slip through.
 _STANDALONE_RE = re.compile(
-    r"^\s*(pass|warn|fail|partial|inconclusive)\b[\s.!:]*$",
+    r"^\s*(pass|warn|fail|partial|inconclusive|conditional)\b[\s.!:]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -874,11 +1086,7 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
             f"header/context block. The pipeline runner rejects responses missing this line.\n"
         )
         prompt = f"/{slash_command} {args} {target}".strip() + sha_directive
-
-        try:
-            timeout = int(node.attrs.get("timeout", "1200"))
-        except (TypeError, ValueError):
-            timeout = 1200
+        timeout = _coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
 
         # Backend-aware executable selection
         if ctx.backend == "claudew":
@@ -900,15 +1108,39 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
 
         if sub_args is None:
             return Result(outcome="failure", output="sandbox-exec unavailable")
-        proc = subprocess.run(
-            sub_args,
-            cwd=ctx.workdir,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            env=gate_env,
-        )
+        try:
+            proc = subprocess.run(
+                sub_args,
+                cwd=ctx.workdir,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                env=gate_env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            combined = (exc.stdout or "") + "\n" + (exc.stderr or "")
+            return Result(
+                outcome="failure",
+                output=combined.strip() or f"/{slash_command} timed out after {timeout} seconds",
+                metadata={
+                    "slash_command": slash_command,
+                    "returncode": "",
+                    "timeout": str(timeout),
+                    "timed_out": "true",
+                },
+            )
+        except Exception as exc:
+            return Result(
+                outcome="error",
+                output=f"slash gate {slash_command} command failed: {exc}",
+                metadata={
+                    "slash_command": slash_command,
+                    "timeout": str(timeout),
+                    "timed_out": "false",
+                    "returncode": "",
+                },
+            )
         combined = proc.stdout + "\n" + proc.stderr
         verdict, normalized = _parse_verdict(combined)
         # SHA binding check — must come BEFORE collapsing to pass/fail so a
@@ -1483,10 +1715,23 @@ def _render_prompt(node: Node, ctx: Context) -> str:
         return text
     root = ctx.workdir.resolve()
     p = (root / ref_path).resolve()
+    if not p.exists():
+        home = factory_home()
+        if home is not None:
+            alt = (home / ref_path).resolve()
+            if alt.exists():
+                p = alt
     try:
         p.relative_to(root)
     except ValueError:
-        return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
+        home = factory_home()
+        if home is not None:
+            try:
+                p.relative_to(home.resolve())
+            except ValueError:
+                return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
+        else:
+            return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
     if not p.exists():
         return f"# {node.name}\n\nGoal: {ctx.goal}\n(missing prompt: {ref})"
     text = p.read_text()

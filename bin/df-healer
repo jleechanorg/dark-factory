@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Dark Factory Healer — CXDB failure clustering.
+
+set -euo pipefail
+
+_SCRIPT_REAL="$([ -L "${BASH_SOURCE[0]}" ] && readlink -f "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${_SCRIPT_REAL}")" && pwd)"
+export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+VENV_PYTHON="${DARK_FACTORY_HOME}/.venv/bin/python"
+
+if [[ ! -x "${VENV_PYTHON}" ]]; then
+  echo "ERROR: Dark Factory venv missing at ${DARK_FACTORY_HOME}/.venv" >&2
+  echo "Run: ${DARK_FACTORY_HOME}/install.sh" >&2
+  exit 1
+fi
+
+exec env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+  "${VENV_PYTHON}" -m runner.healer "$@"
