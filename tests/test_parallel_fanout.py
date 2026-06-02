@@ -1087,3 +1087,55 @@ def test_last_output_updated_after_parallel_join(tmp_path):
         f"_last_output should reflect the join step output, got: '{last_output!r}'. "
         "The parallel block must set ctx.state['_last_output'] when it sets _last_node/_last_outcome."
     )
+
+
+def test_explicit_type_overrides_shape_for_parallel_detection():
+    """_is_parallel_node and _is_join_node must respect explicit type over shape.
+
+    Bug: both functions checked the shape attribute unconditionally, so a node with
+    type='codergen' and shape='component' returned True for _is_parallel_node, while
+    resolve() dispatches the node to the codergen handler (type wins over shape).
+    This inconsistency triggers the parallel fan-out block for non-parallel nodes.
+
+    Fix: when an explicit 'type' attribute is present, only the type determines
+    parallel/join identity — same priority rule as resolve().
+    """
+    from runner.engine import _is_parallel_node, _is_join_node
+    from runner.parser import Node
+
+    # type=codergen + shape=component → NOT parallel (type overrides shape)
+    codergen_component = Node(name="impl", attrs={"type": "codergen", "shape": "component"})
+    assert not _is_parallel_node(codergen_component), (
+        "_is_parallel_node must return False when type='codergen' (explicit non-parallel type). "
+        "resolve() gives this node the codergen handler; the parallel block must not fire."
+    )
+
+    # type=tool + shape=tripleoctagon → NOT join (type overrides shape)
+    tool_tripleoctagon = Node(name="t", attrs={"type": "tool", "shape": "tripleoctagon"})
+    assert not _is_join_node(tool_tripleoctagon), (
+        "_is_join_node must return False when type='tool' (explicit non-join type)."
+    )
+
+    # no explicit type + shape=component → parallel (shape-based detection still works)
+    shape_only_component = Node(name="fanout", attrs={"shape": "component"})
+    assert _is_parallel_node(shape_only_component), (
+        "_is_parallel_node must return True for shape=component when no explicit type is set."
+    )
+
+    # no explicit type + shape=tripleoctagon → join (shape-based detection still works)
+    shape_only_triple = Node(name="join", attrs={"shape": "tripleoctagon"})
+    assert _is_join_node(shape_only_triple), (
+        "_is_join_node must return True for shape=tripleoctagon when no explicit type is set."
+    )
+
+    # explicit type=parallel → parallel regardless of shape
+    explicit_parallel = Node(name="fanout2", attrs={"type": "parallel"})
+    assert _is_parallel_node(explicit_parallel), (
+        "_is_parallel_node must return True when type='parallel'."
+    )
+
+    # explicit type=join → join regardless of shape
+    explicit_join = Node(name="join2", attrs={"type": "join"})
+    assert _is_join_node(explicit_join), (
+        "_is_join_node must return True when type='join'."
+    )

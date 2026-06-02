@@ -522,13 +522,28 @@ def _parallel_join_outcome(
 
 
 def _is_parallel_node(node: Node) -> bool:
-    """Fan-out node: type='parallel' or shape='component'."""
-    return node.attrs.get("type") == "parallel" or node.shape == "component"
+    """Fan-out node: type='parallel' or (no explicit type and shape='component').
+
+    When an explicit 'type' attribute is present, only the type is checked —
+    same priority rule as resolve().  This prevents nodes like type='codergen'
+    shape='component' from triggering the parallel block.
+    """
+    explicit_type = node.attrs.get("type")
+    if explicit_type:
+        return explicit_type == "parallel"
+    return node.shape == "component"
 
 
 def _is_join_node(node: Node) -> bool:
-    """Fan-in barrier: type='join' or shape='tripleoctagon'."""
-    return node.attrs.get("type") == "join" or node.shape == "tripleoctagon"
+    """Fan-in barrier: type='join' or (no explicit type and shape='tripleoctagon').
+
+    When an explicit 'type' attribute is present, only the type is checked —
+    same priority rule as resolve().
+    """
+    explicit_type = node.attrs.get("type")
+    if explicit_type:
+        return explicit_type == "join"
+    return node.shape == "tripleoctagon"
 
 
 def _find_join_node(graph: Graph, fanout: Node) -> Optional[Node]:
