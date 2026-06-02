@@ -934,6 +934,7 @@ _VERDICT_NORMALIZE = {
     "insufficient": "failure",
     "invalid": "failure",
     "incomplete": "failure",
+    "conditional": "failure",  # non-standard verdict (architectural concern) → failure
 }
 
 # A gate response must echo back `head_sha: <40-hex>` so we can bind the
@@ -985,7 +986,7 @@ def _verify_head_sha_echo(text: str, expected_sha: str) -> tuple[bool, str]:
 # (e.g. "CONDITIONAL PASS", "PARTIAL PASS") — backtracking finds the LAST verdict word on
 # the line. Avoids false-positives because "verdict:" prefix is required.
 _MARKER_RE = re.compile(
-    r"(?:verdict|overall|normalized)\s*:\s*[^\n]*(pass|warn|fail|partial|inconclusive|insufficient|invalid|incomplete)\b",
+    r"(?:verdict|overall|normalized)\s*:\s*[^\n]*(pass|warn|fail|partial|inconclusive|insufficient|invalid|incomplete|conditional)\b",
     re.IGNORECASE,
 )
 
@@ -1003,7 +1004,7 @@ _MARKER_PRESENT_RE = re.compile(
 # trailing punctuation). Stricter than a free `\b` scan so prose like
 # "not a fail" doesn't slip through.
 _STANDALONE_RE = re.compile(
-    r"^\s*(pass|warn|fail|partial|inconclusive)\b[\s.!:]*$",
+    r"^\s*(pass|warn|fail|partial|inconclusive|conditional)\b[\s.!:]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
