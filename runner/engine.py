@@ -635,7 +635,9 @@ def _run_branch_until_join(
                     seq_ref[0] += 1
                 _persist(thread_cxdb, ctx, local_seq, record, attempt.output, record.metadata)
                 branch_records.append(record)
-            current = _pick_next(graph, current, last_result, ctx)
+            # Route using current step's actual result, not the preserved first failure.
+            # last_result still tracks the first failure for branch outcome attribution.
+            current = _pick_next(graph, current, step_result, ctx)
     finally:
         if thread_cxdb is not None:
             thread_cxdb.close()

@@ -937,3 +937,84 @@ def test_parallel_exit_runs_when_max_steps_tight(tmp_path):
     assert "exit" in nodes, (
         f"exit node must run even with tight max_steps=4; history nodes: {nodes}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: branch routing must use current step result, not frozen first failure
+# RED: _pick_next(current, last_result) → last_result frozen at first failure;
+#      a subsequent successful step with a condition="outcome=success" edge would
+#      never match, causing the branch to report stuck.
+# GREEN: _pick_next(current, step_result) → routing uses current step's result.
+# ---------------------------------------------------------------------------
+
+def test_branch_routing_uses_current_step_result_not_frozen_failure(tmp_path):
+    """Branch routing must use current step result, not the preserved first failure.
+
+    Branch: fanout → fail_step → ok_step -[outcome=success]→ after_ok → join
+    - fail_step returns failure
+    - ok_step returns success
+    - ok_step has a conditional edge condition="outcome=success" to after_ok
+    - after_ok is an unconditional step before join
+
+    With stale-failure bug: _pick_next(ok_step, last=failure) skips the success
+    edge → ok_step stuck → after_ok is NEVER called.
+    With fix: _pick_next(ok_step, step_result=success) → success edge matches →
+    after_ok is called → branch walks through to join.
+    """
+    calls: list[str] = []
+    lock = threading.Lock()
+
+    def _fail_step_handler(node, ctx):
+        with lock:
+            calls.append("fail_step")
+        return Result(outcome="failure", output="deliberate failure")
+
+    def _ok_step_handler(node, ctx):
+        with lock:
+            calls.append("ok_step")
+        return Result(outcome="success", output="recovered ok")
+
+    def _after_ok_handler(node, ctx):
+        with lock:
+            calls.append("after_ok")
+        return Result(outcome="success", output="after ok ran")
+
+    # Branch: fail_step -[unconditional]→ ok_step -[outcome=success]→ after_ok -[unconditional]→ join
+    # after_ok is the canary: it only runs if ok_step's routing uses step_result=success.
+    dot_path = tmp_path / "stale_failure.dot"
+    dot_path.write_text(
+        'digraph stale_failure {\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  fail_step [type="fail_step_type"]\n'
+        '  ok_step [type="ok_step_type"]\n'
+        '  after_ok [type="after_ok_type"]\n'
+        '  join [type="join", policy="wait_all"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> fanout\n'
+        '  fanout -> fail_step\n'
+        '  fail_step -> ok_step\n'
+        '  ok_step -> after_ok [condition="outcome=success"]\n'
+        '  after_ok -> join\n'
+        '  join -> exit\n'
+        '}\n'
+    )
+    try:
+        TYPE_REGISTRY["fail_step_type"] = _fail_step_handler
+        TYPE_REGISTRY["ok_step_type"] = _ok_step_handler
+        TYPE_REGISTRY["after_ok_type"] = _after_ok_handler
+        ctx = _ctx()
+        graph = parse(dot_path)
+        run(graph, ctx, max_steps=20)
+    finally:
+        TYPE_REGISTRY.pop("fail_step_type", None)
+        TYPE_REGISTRY.pop("ok_step_type", None)
+        TYPE_REGISTRY.pop("after_ok_type", None)
+
+    # Canary: after_ok must be called only if routing used step_result=success,
+    # not the frozen last_result=failure from fail_step.
+    assert "ok_step" in calls, f"ok_step was never executed; calls={calls}"
+    assert "after_ok" in calls, (
+        f"after_ok was never called — ok_step routing used stale failure result "
+        f"and skipped the condition='outcome=success' edge. calls={calls}"
+    )
