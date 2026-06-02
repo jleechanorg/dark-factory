@@ -17,9 +17,13 @@ import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from .parser import Node, is_start_node, is_exit_node
+from .paths import factory_home
+
+if TYPE_CHECKING:
+    from .perf_log import GitContext, PerfRun
 
 
 @dataclass
@@ -44,6 +48,9 @@ class Context:
     cxdb_path: Optional[pathlib.Path] = None
     run_id: Optional[str] = None
     event_log_path: Optional[pathlib.Path] = None
+    perf_log_root: Optional[pathlib.Path] = None
+    git_ctx: Optional["GitContext"] = None
+    perf_run: Optional["PerfRun"] = None
 
 
 _TIMEOUT_MIN_SECONDS = 5
@@ -928,6 +935,10 @@ _VERDICT_NORMALIZE = {
     "fail": "failure",
     "partial": "failure",
     "inconclusive": "failure",
+    "insufficient": "failure",
+    "invalid": "failure",
+    "incomplete": "failure",
+    "conditional": "failure",  # non-standard verdict (architectural concern) → failure
 }
 
 # A gate response must echo back `head_sha: <40-hex>` so we can bind the
@@ -975,9 +986,14 @@ def _verify_head_sha_echo(text: str, expected_sha: str) -> tuple[bool, str]:
     return observed == expected_sha.lower(), observed
 
 # Anchored regex: keyword must follow a marker like "verdict:", "overall:", or "normalized:"
-# and stand on its own word boundary. Avoids substring hits inside "passes warnings".
+# and stand on its own word boundary. Optional qualifier group handles "CONDITIONAL PASS" /
+# "PARTIAL PASS" without the [^\n]* greedy scan that caused "verdict: not a fail" → "fail".
 _MARKER_RE = re.compile(
-    r"(?:verdict|overall|normalized)\s*:\s*(pass|warn|fail|partial|inconclusive)\b",
+    r"(?:verdict|overall|normalized)\s*:\s*"
+    r"\*{0,2}"
+    r"(?:(?:conditional|partial|insufficient|invalid|incomplete)\s+\*{0,2})?"
+    r"(pass|warn|fail|partial|inconclusive|insufficient|invalid|incomplete|conditional)"
+    r"\b",
     re.IGNORECASE,
 )
 
@@ -995,7 +1011,7 @@ _MARKER_PRESENT_RE = re.compile(
 # trailing punctuation). Stricter than a free `\b` scan so prose like
 # "not a fail" doesn't slip through.
 _STANDALONE_RE = re.compile(
-    r"^\s*(pass|warn|fail|partial|inconclusive)\b[\s.!:]*$",
+    r"^\s*(pass|warn|fail|partial|inconclusive|conditional)\b[\s.!:]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -1177,7 +1193,7 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
 
 _gate_es = _slash_gate("es")
 _gate_er = _slash_gate("er")
-_gate_code_standards = _slash_gate("code_standards")
+_gate_code_standards = _slash_gate("code-standards")
 
 
 def _tcp_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -1475,10 +1491,23 @@ def _render_prompt(node: Node, ctx: Context) -> str:
         return text
     root = ctx.workdir.resolve()
     p = (root / ref_path).resolve()
+    if not p.exists():
+        home = factory_home()
+        if home is not None:
+            alt = (home / ref_path).resolve()
+            if alt.exists():
+                p = alt
     try:
         p.relative_to(root)
     except ValueError:
-        return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
+        home = factory_home()
+        if home is not None:
+            try:
+                p.relative_to(home.resolve())
+            except ValueError:
+                return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
+        else:
+            return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
     if not p.exists():
         return f"# {node.name}\n\nGoal: {ctx.goal}\n(missing prompt: {ref})"
     text = p.read_text()
