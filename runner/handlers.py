@@ -981,9 +981,11 @@ def _verify_head_sha_echo(text: str, expected_sha: str) -> tuple[bool, str]:
     return observed == expected_sha.lower(), observed
 
 # Anchored regex: keyword must follow a marker like "verdict:", "overall:", or "normalized:"
-# and stand on its own word boundary. Avoids substring hits inside "passes warnings".
+# and stand on its own word boundary. [^\n]* allows qualifiers before the verdict token
+# (e.g. "CONDITIONAL PASS", "PARTIAL PASS") — backtracking finds the LAST verdict word on
+# the line. Avoids false-positives because "verdict:" prefix is required.
 _MARKER_RE = re.compile(
-    r"(?:verdict|overall|normalized)\s*:\s*[\*❌⚠️✅🟡🔴🟢]{0,4}\s*(pass|warn|fail|partial|inconclusive|insufficient|invalid|incomplete)\b",
+    r"(?:verdict|overall|normalized)\s*:\s*[^\n]*(pass|warn|fail|partial|inconclusive|insufficient|invalid|incomplete)\b",
     re.IGNORECASE,
 )
 
