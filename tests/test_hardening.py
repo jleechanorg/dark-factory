@@ -191,6 +191,42 @@ def test_parser_rejects_condition_with_unmatched_characters(tmp_path):
         parse(dot)
 
 
+def test_bare_word_factor_in_compound_expression_checks_outcome():
+    """A bare word as the first factor in a compound expression (e.g. 'success && k=v')
+    must compare against outcome, not look the word up as a state key."""
+    edge_match = Edge(src="a", dst="b", attrs={"condition": "success && retry_count=0"})
+    edge_fail = Edge(src="a", dst="b", attrs={"condition": "success && retry_count=0"})
+    result_success = Result(outcome="success", metadata={"retry_count": "0"})
+    result_fail = Result(outcome="failure", metadata={"retry_count": "0"})
+    assert _edge_matches(edge_match, result_success) is True
+    assert _edge_matches(edge_fail, result_fail) is False
+
+
+def test_malformed_hyphenated_edge_conditions_fail_closed():
+    edge_in = Edge(src="a", dst="b", attrs={"condition": "not-in-list"})
+    edge_contains = Edge(src="a", dst="b", attrs={"condition": "not-contains-x"})
+    assert _edge_matches(edge_in, Result(outcome="success")) is False
+    assert _edge_matches(edge_contains, Result(outcome="success")) is False
+
+
+def test_edge_matches_contains_operator():
+    result = Result(outcome="success", metadata={"test_failures": "critical,blocker"})
+    edge_match = Edge(src="a", dst="b", attrs={"condition": "test_failures contains critical"})
+    edge_no_match = Edge(src="a", dst="b", attrs={"condition": "test_failures contains missing"})
+    edge_not_contains = Edge(src="a", dst="b", attrs={"condition": "test_failures not contains missing"})
+    assert _edge_matches(edge_match, result) is True
+    assert _edge_matches(edge_no_match, result) is False
+    assert _edge_matches(edge_not_contains, result) is True
+
+
+def test_edge_matches_in_operator():
+    result = Result(outcome="success", metadata={"error_code": "404"})
+    edge_match = Edge(src="a", dst="b", attrs={"condition": "error_code in '404, 500'"})
+    edge_no_match = Edge(src="a", dst="b", attrs={"condition": "error_code in '200, 301'"})
+    assert _edge_matches(edge_match, result) is True
+    assert _edge_matches(edge_no_match, result) is False
+
+
 # ---------------------------------------------------------------------------
 # engine.run finally-block CXDB closure on stuck pipelines
 # ---------------------------------------------------------------------------

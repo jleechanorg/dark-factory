@@ -379,8 +379,8 @@ def _evaluate_expression(
 
         op_kind = op_tok[0]
         if op_kind not in {'EQ', 'NEQ', 'CONTAINS', 'NOT_CONTAINS', 'IN', 'NOT_IN'}:
-            val = _lookup(k_val, last, ctx, is_decision)
-            return val.lower() in {"true", "1", "yes", "success"}
+            outcome = _lookup("outcome", last, ctx, is_decision)
+            return outcome == k_val
 
         consume()
         val_tok = consume()
