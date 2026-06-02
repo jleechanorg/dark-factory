@@ -1186,7 +1186,7 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
 
 _gate_es = _slash_gate("es")
 _gate_er = _slash_gate("er")
-_gate_code_standards = _slash_gate("code_standards")
+_gate_code_standards = _slash_gate("code-standards")
 
 
 def _tcp_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
