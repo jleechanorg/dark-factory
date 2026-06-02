@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -150,6 +151,27 @@ def _clone_context(ctx: Context) -> Context:
         run_id=ctx.run_id,
         event_log_path=getattr(ctx, "event_log_path", None),
     )
+
+
+def _branch_context(ctx: Context, branch_name: str) -> Context:
+    """Clone ctx and assign a unique per-branch workdir subdirectory.
+
+    File-writing backends (claude, codex, agy) spawn subprocesses with
+    cwd=ctx.workdir; without isolation concurrent branches would race on
+    shared files.  Each branch gets its own tempdir under the parent workdir
+    so their file operations are independent.  If the parent workdir is not a
+    valid directory (e.g. None or a non-existent path) fall back to a
+    system-managed tmp dir.
+    """
+    cloned = _clone_context(ctx)
+    parent = pathlib.Path(ctx.workdir) if ctx.workdir else None
+    try:
+        base = parent if (parent and parent.is_dir()) else None
+        branch_dir = pathlib.Path(tempfile.mkdtemp(prefix=f"branch_{branch_name}_", dir=base))
+        cloned.workdir = branch_dir
+    except OSError:
+        pass  # keep parent workdir on filesystem failure
+    return cloned
 
 
 def _load_checkpoint(path: pathlib.Path) -> list[StepRecord]:
@@ -976,7 +998,7 @@ def run(
                             _futures = {
                                 _executor.submit(
                                     _run_branch_until_join,
-                                    graph, _bs, _clone_context(ctx), _jn,
+                                    graph, _bs, _branch_context(ctx, _bs.name), _jn,
                                     _seq_ref, _seq_lock, _cxdb_path,
                                     max_steps,  # pass outer limit to prevent branch hangs
                                 ): _bs.name

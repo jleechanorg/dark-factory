@@ -829,3 +829,111 @@ def test_find_join_node_conditional_branches_handled(tmp_path):
     jn = _find_join_node(graph, fanout)
     assert jn is not None, "_find_join_node must find join even with conditional branches"
     assert jn.name == "join", f"Expected join, got {jn.name!r}"
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: concurrent branches must use distinct workdirs to prevent subprocess
+# collisions when file-writing backends (claude/codex/agy) are in use
+# ---------------------------------------------------------------------------
+
+def test_parallel_branches_get_distinct_workdirs(tmp_path):
+    """Each parallel branch must receive a unique workdir subdirectory.
+
+    RED: _clone_context passes ctx.workdir as-is; all branches share the same
+         directory, so any backend that writes to cwd causes races/conflicts.
+    GREEN: the fan-out block creates a per-branch tmp subdir under ctx.workdir.
+    """
+    recorded_workdirs: list[str] = []
+    lock = threading.Lock()
+
+    def _record_workdir_handler(node, ctx):
+        with lock:
+            recorded_workdirs.append(str(ctx.workdir))
+        return Result(outcome="success", output=f"workdir={ctx.workdir}")
+
+    dot = tmp_path / "workdir_isolation.dot"
+    dot.write_text(
+        'digraph workdir_isolation {\n'
+        '  graph [goal="workdir isolation test"]\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  branch_a [type="record_wd"]\n'
+        '  branch_b [type="record_wd"]\n'
+        '  join [type="join", policy="wait_all"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> fanout\n'
+        '  fanout -> branch_a\n'
+        '  fanout -> branch_b\n'
+        '  branch_a -> join\n'
+        '  branch_b -> join\n'
+        '  join -> exit\n'
+        '}\n'
+    )
+    ctx = _ctx()
+    ctx.workdir = tmp_path
+    try:
+        TYPE_REGISTRY["record_wd"] = _record_workdir_handler
+        graph = parse(dot)
+        run(graph, ctx, max_steps=20)
+    finally:
+        TYPE_REGISTRY.pop("record_wd", None)
+
+    assert len(recorded_workdirs) == 2, f"Expected 2 branch workdir records, got {recorded_workdirs}"
+    assert recorded_workdirs[0] != recorded_workdirs[1], (
+        f"Both branches used the same workdir {recorded_workdirs[0]!r}; "
+        "concurrent file-writing backends would race. Each branch must get a unique subdir."
+    )
+    # Each branch workdir must be inside the parent workdir
+    for wd in recorded_workdirs:
+        assert wd.startswith(str(tmp_path)), (
+            f"Branch workdir {wd!r} is not under parent workdir {tmp_path!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: exit node must run even when max_steps is tight and fan-out adds
+# many branch steps (the join step itself must not consume the last slot)
+# ---------------------------------------------------------------------------
+
+def test_parallel_exit_runs_when_max_steps_tight(tmp_path):
+    """exit node must execute even if join step pushes history len == max_steps.
+
+    Graph: start(1) -> fanout(2) -> [branch_a(3), branch_b(4)] -> join(5) -> exit(6)
+    max_steps=5 means 5 main-pipeline slots; branch records are overhead and
+    must not count. Without the _parallel_overhead fix, start+join = 2 main
+    steps but history has start + branch_a + branch_b + join = 4 entries,
+    and the next iteration's guard 4 >= 5 fails to block exit prematurely.
+
+    This tests the tight edge case: branch steps must be excluded from the
+    main-pipeline step budget so the exit node always gets its slot.
+    """
+    dot = tmp_path / "tight_max_steps.dot"
+    dot.write_text(
+        'digraph tight_max_steps {\n'
+        '  graph [goal="tight max_steps test"]\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  branch_a\n'
+        '  branch_b\n'
+        '  join [type="join", policy="wait_all"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> fanout\n'
+        '  fanout -> branch_a\n'
+        '  fanout -> branch_b\n'
+        '  branch_a -> join\n'
+        '  branch_b -> join\n'
+        '  join -> exit\n'
+        '}\n'
+    )
+    ctx = _ctx()
+    ctx.state["branch_a.outcome"] = "success"
+    ctx.state["branch_b.outcome"] = "success"
+    graph = parse(dot)
+    # max_steps=4: start(1) + fanout(2) + join(3) + exit(4)
+    # branch_a and branch_b are overhead and must NOT count
+    history = run(graph, ctx, max_steps=4)
+
+    nodes = [s.node for s in history]
+    assert "exit" in nodes, (
+        f"exit node must run even with tight max_steps=4; history nodes: {nodes}"
+    )
