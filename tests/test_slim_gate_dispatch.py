@@ -70,28 +70,38 @@ def test_gate_code_standards_uses_hyphenated_command_when_local_cmd_exists(
     )
 
 
-def test_gate_code_standards_uses_hyphenated_command_when_local_skill_exists(
+def test_gate_code_standards_uses_universal_fallback_when_only_skill_exists(
     tmp_path, monkeypatch
 ):
+    """Skill file alone cannot resolve a /code-standards slash command; use universal prompt."""
     skill_dir = tmp_path / ".claude" / "skills" / "code-standards"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("# code standards skill")
 
     captured_cmds: list[str] = []
+    captured_universal: list[str] = []
     import runner.handlers as handlers_mod
 
     def mock_slash_gate(cmd: str):
         captured_cmds.append(cmd)
         return lambda node, ctx: Result(outcome="success", output=f"ran /{cmd}")
 
+    def mock_universal(prompt_template: str, name: str, node, ctx):
+        captured_universal.append(name)
+        return Result(outcome="success", output=f"universal:{name}")
+
     monkeypatch.setattr(handlers_mod, "_slash_gate", mock_slash_gate)
+    monkeypatch.setattr(handlers_mod, "_run_universal_prompt_gate", mock_universal)
 
     from runner.handlers import _gate_code_standards as gcs  # noqa: F401
 
     gcs(_make_node(), _make_ctx(tmp_path))
 
-    assert "code-standards" in captured_cmds, (
-        f"Expected 'code-standards' but got: {captured_cmds}"
+    assert not captured_cmds, (
+        f"_slash_gate must NOT be called when only skill file exists, got: {captured_cmds}"
+    )
+    assert "gate_code_standards" in captured_universal, (
+        f"Expected universal prompt fallback, got: {captured_universal}"
     )
 
 
