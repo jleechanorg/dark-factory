@@ -931,6 +931,9 @@ _VERDICT_NORMALIZE = {
     "fail": "failure",
     "partial": "failure",
     "inconclusive": "failure",
+    "insufficient": "failure",
+    "invalid": "failure",
+    "incomplete": "failure",
 }
 
 # A gate response must echo back `head_sha: <40-hex>` so we can bind the
@@ -980,7 +983,7 @@ def _verify_head_sha_echo(text: str, expected_sha: str) -> tuple[bool, str]:
 # Anchored regex: keyword must follow a marker like "verdict:", "overall:", or "normalized:"
 # and stand on its own word boundary. Avoids substring hits inside "passes warnings".
 _MARKER_RE = re.compile(
-    r"(?:verdict|overall|normalized)\s*:\s*\*{0,2}(pass|warn|fail|partial|inconclusive)\b",
+    r"(?:verdict|overall|normalized)\s*:\s*[\*❌⚠️✅🟡🔴🟢]{0,4}\s*(pass|warn|fail|partial|inconclusive|insufficient|invalid|incomplete)\b",
     re.IGNORECASE,
 )
 
