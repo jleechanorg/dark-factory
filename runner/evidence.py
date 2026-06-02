@@ -8,6 +8,7 @@ Layout:
         README.md              # human-readable summary table
         pipeline.dot           # verbatim copy of the source DOT
         pipeline.dot.sha256    # sidecar checksum
+        events.jsonl           # structured JSONL event stream (optional)
         cxdb-<run_id>.sqlite   # single-run extract from the parent CXDB
         steps/
             <seq>-<node>.txt   # per-step output capture
@@ -250,6 +251,20 @@ def _write_step_files(
         (steps_dir / fname).write_text(content)
 
 
+def _copy_events(event_log_path: Optional[pathlib.Path], bundle_dir: pathlib.Path) -> Optional[pathlib.Path]:
+    if not event_log_path:
+        return None
+    source = pathlib.Path(event_log_path)
+    if not source.exists():
+        return None
+    target = bundle_dir / "events.jsonl"
+    try:
+        shutil.copy2(source, target)
+    except Exception:
+        return None
+    return target
+
+
 def _readme(
     pipeline_name: str,
     run_id: str,
@@ -294,6 +309,7 @@ def write_bundle(
     pipeline_path: pathlib.Path,
     graph,
     workdir: pathlib.Path,
+    event_log_path: Optional[pathlib.Path] = None,
 ) -> dict:
     """Materialise the evidence bundle for `run_id` under `bundle_dir`.
 
@@ -316,6 +332,7 @@ def write_bundle(
     steps, totals = _summarise_run(cxdb_path, run_id)
     holdout_nodes = _holdout_nodes_in_graph(graph)
     _write_step_files(bundle_dir, cxdb_path, run_id, steps, holdout_nodes)
+    events_path = _copy_events(event_log_path, bundle_dir)
 
     manifest = {
         "run_id": run_id,
@@ -326,6 +343,7 @@ def write_bundle(
         "ended_ts": totals.get("ended_ts"),
         "final_outcome": totals.get("final_outcome"),
         "steps": len(steps),
+        "events_path": str(events_path) if events_path is not None else None,
         "dark_factory_head_sha": _dark_factory_head_sha(workdir),
         "total_tokens": totals.get("total_tokens"),
         "total_cost_usd": totals.get("total_cost_usd"),

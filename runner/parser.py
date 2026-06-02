@@ -24,6 +24,8 @@ _STYLE_RULE_RE = re.compile(
     r"(?P<selector>[^\n{]+)\{\s*(?P<body>[^}]*)\}",
     re.MULTILINE | re.DOTALL,
 )
+_VALIDATION_TIMEOUT_MIN_SECONDS = 60
+_VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards"}
 
 
 @dataclass
@@ -210,13 +212,135 @@ def _is_builtin_stmt(name: str) -> bool:
 
 
 def _validate_condition(condition: str, context: str) -> None:
-    if "!=" in condition:
-        left, right = condition.split("!=", 1)
-    elif "=" in condition:
-        left, right = condition.split("=", 1)
-    else:
+    condition = (condition or "").strip()
+    if not condition:
         raise ValueError(f"{context}: malformed condition {condition!r}")
-    if not left.strip() or not right.strip():
+
+    token_specification = [
+        ('PAREN', r'[()]'),
+        ('AND', r'&&|\band\b'),
+        ('OR', r'\|\||\bor\b'),
+        ('NOT_CONTAINS', r'not\s+contains\b'),
+        ('CONTAINS', r'contains\b'),
+        ('NOT_IN', r'not\s+in\b'),
+        ('IN', r'\bin\b'),
+        ('NEQ', r'!='),
+        ('EQ', r'==|='),
+        ('NOT', r'!|not\b(?=\s|\(|\)|$)'),
+        ('STRING', r'"[^"]*"|\'[^\']*\''),
+        ('WORD', r'[a-zA-Z_0-9\-\.\*]+'),
+        ('SPACE', r'\s+'),
+    ]
+    pattern = re.compile('|'.join(f'(?P<{kind}>{expr})' for kind, expr in token_specification))
+    tokens: list[tuple[str, str]] = []
+
+    pos = 0
+    for match in pattern.finditer(condition):
+        if match.start() != pos:
+            raise ValueError(f"{context}: malformed condition {condition!r}")
+        pos = match.end()
+        kind = match.lastgroup
+        value = match.group()
+        if kind == 'SPACE':
+            continue
+        if kind == 'STRING':
+            value = value[1:-1]
+            tokens.append((kind, value))
+        else:
+            tokens.append((kind, value))
+
+    if not tokens:
+        raise ValueError(f"{context}: malformed condition {condition!r}")
+    if pos != len(condition):
+        raise ValueError(f"{context}: malformed condition {condition!r}")
+
+    index = 0
+
+    def peek() -> tuple[str, str] | None:
+        nonlocal index
+        if index < len(tokens):
+            return tokens[index]
+        return None
+
+    def consume(expected_kind: str | None = None) -> tuple[str, str]:
+        nonlocal index
+        if index >= len(tokens):
+            raise ValueError(f"{context}: malformed condition {condition!r}")
+        token = tokens[index]
+        index += 1
+        if expected_kind is not None and token[0] != expected_kind:
+            raise ValueError(f"{context}: malformed condition {condition!r}")
+        return token
+
+    def parse_factor() -> None:
+        token = peek()
+        if token is None:
+            raise ValueError(f"{context}: malformed condition {condition!r}")
+        if token[0] == 'NOT':
+            consume()
+            parse_factor()
+            return
+        if token[0] in {'NOT_IN', 'NOT_CONTAINS', 'CONTAINS', 'IN', 'NEQ', 'EQ', 'AND', 'OR'}:
+            raise ValueError(f"{context}: malformed condition {condition!r}")
+
+        if token[0] == 'PAREN' and token[1] == '(':
+            consume()
+            parse_expression()
+            closing = peek()
+            if closing is None or closing[0] != 'PAREN' or closing[1] != ')':
+                raise ValueError(f"{context}: malformed condition {condition!r}")
+            consume()
+            return
+
+        consume('WORD')
+        token = peek()
+        if token is None:
+            return
+        if token[0] in {'PAREN', 'AND', 'OR'}:
+            return
+        if token[0] in {'NEQ', 'EQ', 'CONTAINS', 'NOT_CONTAINS', 'IN', 'NOT_IN'}:
+            consume()
+            if peek() is None:
+                raise ValueError(f"{context}: malformed condition {condition!r}")
+            if peek()[0] == 'PAREN':
+                consume('PAREN')
+                parse_expression()
+                close = peek()
+                if close is None or close[0] != 'PAREN' or close[1] != ')':
+                    raise ValueError(f"{context}: malformed condition {condition!r}")
+                consume()
+                return
+            consume()
+            return
+        if token[0] == 'NOT':
+            consume()
+            parse_factor()
+            return
+        if token[0] != 'SPACE':
+            raise ValueError(f"{context}: malformed condition {condition!r}")
+
+    def parse_expression() -> None:
+        parse_term()
+        while True:
+            token = peek()
+            if token is None:
+                return
+            if token[0] != 'OR':
+                return
+            consume()
+            parse_term()
+
+    def parse_term() -> None:
+        parse_factor()
+        while True:
+            token = peek()
+            if token is None or token[0] != 'AND':
+                return
+            consume()
+            parse_factor()
+
+    parse_expression()
+    if peek() is not None:
         raise ValueError(f"{context}: malformed condition {condition!r}")
 
 
@@ -370,3 +494,98 @@ def _validate_retry_targets(
             raise ValueError(
                 f"{path}: goal_gate node {node.name!r} retry_target {target!r} must be an outgoing edge"
             )
+
+
+def _node_has_validation(node: Node) -> bool:
+    if node.attrs.get("type") in _VALIDATION_TYPES:
+        return True
+    raw = node.attrs.get("validation", False)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in {"true", "1", "yes"}
+
+
+def validate_pipeline(path: pathlib.Path) -> tuple[Optional[Graph], list[dict[str, str]]]:
+    """Validate a pipeline and emit machine-readable diagnostics.
+
+    Returns `(graph, diagnostics)`. When parsing/validation fails, `graph` is
+    `None` and diagnostics contain at least one error entry.
+    """
+    pipeline_path = pathlib.Path(path)
+    diagnostics: list[dict[str, str]] = []
+
+    if not pipeline_path.exists():
+        diagnostics.append(
+            {
+                "code": "DF_PIPELINE_NOT_FOUND",
+                "severity": "error",
+                "node": "<pipeline>",
+                "message": f"pipeline file does not exist: {pipeline_path}",
+            }
+        )
+        return None, diagnostics
+
+    try:
+        graph = parse(pipeline_path)
+    except Exception as exc:
+        diagnostics.append(
+            {
+                "code": "DF_PIPELINE_PARSE_ERROR",
+                "severity": "error",
+                "node": "<pipeline>",
+                "message": f"failed to parse pipeline: {type(exc).__name__}: {exc}",
+            }
+        )
+        return None, diagnostics
+
+    for node in graph.nodes.values():
+        if node.attrs.get("type") == "codergen":
+            prompt_ref = node.prompt_ref
+            if not prompt_ref:
+                diagnostics.append(
+                    {
+                        "code": "DF_MISSING_PROMPT",
+                        "severity": "error",
+                        "node": node.name,
+                        "message": "codergen node missing prompt path",
+                    }
+                )
+            else:
+                prompt_path = pathlib.Path(prompt_ref)
+                if not prompt_path.is_absolute():
+                    prompt_path = (pipeline_path.parent / prompt_path).resolve()
+                if not prompt_path.exists():
+                    diagnostics.append(
+                        {
+                            "code": "DF_MISSING_PROMPT",
+                            "severity": "error",
+                            "node": node.name,
+                            "message": f"codergen prompt file not found: {prompt_path}",
+                        }
+                    )
+
+        if _node_has_validation(node):
+            timeout = node.attrs.get("timeout")
+            if timeout is None:
+                diagnostics.append(
+                    {
+                        "code": "DF_MISSING_VALIDATION_TIMEOUT",
+                        "severity": "error",
+                        "node": node.name,
+                        "message": "validation node missing timeout",
+                    }
+                )
+            elif isinstance(timeout, int) and timeout < _VALIDATION_TIMEOUT_MIN_SECONDS:
+                diagnostics.append(
+                    {
+                        "code": "DF_VALIDATION_TIMEOUT_TOO_LOW",
+                        "severity": "error",
+                        "node": node.name,
+                        "message": (
+                            f"validation timeout too low: {timeout}s < "
+                            f"minimum {_VALIDATION_TIMEOUT_MIN_SECONDS}s"
+                        ),
+                    }
+                )
+
+    return graph, diagnostics

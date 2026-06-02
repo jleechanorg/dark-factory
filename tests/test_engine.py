@@ -107,6 +107,29 @@ def test_successful_validation_clears_prior_failure(monkeypatch):
     assert history[-1].outcome == "success"
 
 
+def test_default_event_log_path_uses_final_cxdb_run_id(monkeypatch, tmp_path):
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="fake pass")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    graph = parse(_pipeline("hello.dot"))
+    ctx = Context(goal="event path", workdir=ROOT, backend="echo", cxdb_path=tmp_path / "cxdb.sqlite")
+
+    history = run(graph, ctx, max_steps=50)
+
+    assert history[-1].outcome == "success"
+    assert ctx.run_id
+    assert ctx.event_log_path is not None
+    assert ctx.event_log_path.name == f"{ctx.run_id}.jsonl"
+    events = [
+        json.loads(line)
+        for line in ctx.event_log_path.read_text().splitlines()
+        if line.strip()
+    ]
+    assert events
+    assert {event["run_id"] for event in events} == {ctx.run_id}
+
+
 def test_cli_invocation_green():
     """End-to-end: run the CLI with the real holdout evaluator against the impl tree."""
     proc = subprocess.run(

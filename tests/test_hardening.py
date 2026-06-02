@@ -33,7 +33,7 @@ from runner.handlers import (  # noqa: E402
     _render_prompt,
     _sanitized_env,
 )
-from runner.parser import Edge  # noqa: E402
+from runner.parser import Edge, parse  # noqa: E402
 from runner.parser import Node, parse  # noqa: E402
 
 
@@ -171,6 +171,24 @@ def test_attr_int_fallback():
 def test_malformed_edge_condition_fails_closed():
     edge = Edge(src="a", dst="b", attrs={"condition": "not-a-condition"})
     assert _edge_matches(edge, Result(outcome="success")) is False
+    edge = Edge(src="a", dst="b", attrs={"condition": "outcome=success@"})
+    assert _edge_matches(edge, Result(outcome="success")) is False
+
+
+def test_parser_rejects_condition_with_unmatched_characters(tmp_path):
+    dot = tmp_path / "bad-condition.dot"
+    dot.write_text(
+        'digraph bad_condition {\n'
+        '  start [shape=Mdiamond]\n'
+        '  work [type="tool", command="echo ok"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> work\n'
+        '  work -> exit [condition="outcome=success@"]\n'
+        '}\n'
+    )
+
+    with pytest.raises(ValueError, match="malformed condition"):
+        parse(dot)
 
 
 def test_malformed_hyphenated_edge_conditions_fail_closed():

@@ -57,19 +57,25 @@ Operational rules:
 6. Treat `.dot` graphs as the durable process code. Runner code is disposable;
    graph shape, specs, holdouts, and scoring contracts are the important assets.
 
+## Setup
+
+```bash
+# One-time install (uv-managed Python + venv + binaries on PATH)
+./install.sh
+
+export DARK_FACTORY_HOME=~/projects/dark-factory   # set automatically by install.sh / bin/dark-factory
+export DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts
+export PATH="$HOME/.local/bin:$PATH"
+```
+
 ## Common commands
 
 ```bash
-# Setup
-PYTHON_BIN="${PYTHON_BIN:-$(command -v python3.13)}"
-"$PYTHON_BIN" -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-
 # Smoke pipeline — echo backend, no LLM calls
-.venv/bin/python -m runner --pipeline pipelines/factory/hello.dot --goal "smoke test"
+dark-factory --pipeline pipelines/factory/hello.dot --goal "smoke test" --backend echo
 
-# Full gated pipeline with CXDB recording
-.venv/bin/python -m runner \
+# Full gated pipeline with CXDB recording (run from target repo cwd)
+dark-factory \
   --pipeline pipelines/factory/gates.dot \
   --goal "<feature description>" \
   --backend claude \
@@ -77,7 +83,7 @@ PYTHON_BIN="${PYTHON_BIN:-$(command -v python3.13)}"
   --cxdb ~/.dark-factory/cxdb.sqlite
 
 # Cluster CXDB failures into a Healer diagnosis
-.venv/bin/python -m runner.healer --cxdb ~/.dark-factory/cxdb.sqlite
+df-healer --cxdb ~/.dark-factory/cxdb.sqlite
 
 # Visualize a pipeline graph
 dot -Tpng pipelines/factory/gates.dot -o gates.png
@@ -87,6 +93,27 @@ dot -Tpng pipelines/factory/gates.dot -o gates.png
 .venv/bin/python -m pytest tests/test_engine.py -k green
 .venv/bin/python -m pytest tests/test_gates.py::test_parse_verdict_pass_warn_fail
 ```
+
+Legacy dev-only: `.venv/bin/python -m runner ...` from `$DARK_FACTORY_HOME`.
+
+## Pipeline selection
+
+**Pick the `.dot` for the task** — do not reuse one default for every run.
+Full decision table: [docs/pipeline-selection.md](docs/pipeline-selection.md).
+
+Quick guide:
+
+| Task | Pipeline |
+|------|----------|
+| Smoke / wiring | `pipelines/factory/hello.dot` |
+| New feature (full) | `pipelines/slim/minimal_feature.dot` |
+| PR iteration | `pipelines/slim/minimal_pr.dot` |
+| Gates + holdout | `pipelines/factory/gates.dot` |
+| PR gates only | `pipelines/factory/pr_gates.dot` |
+| Spec review | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` |
+
+`/f` and `/factory` must classify the goal (factory-spec Step 0) and choose a
+pipeline before invoking `dark-factory`, unless the user passed `--pipeline`.
 
 ## Architecture
 
@@ -141,6 +168,32 @@ Use this benchmark as the template for general spec-validation lanes.
 ### CXDB + Healer feedback loop
 - `runner/cxdb.py` records `(run_id, seq, node, outcome, ts, output_hash, output_head, metadata)` per step. WAL mode + 5s busy_timeout so concurrent pipelines into one CXDB don't collide on `database is locked`.
 - `runner/healer.py` reads CXDB, clusters terminal failures (`failure | fail | exhausted | stuck | partial | inconclusive`) by `(node, outcome, output_hash)`, and emits a Markdown report with a per-cluster prescription. The Healer's prefix logic (`gate_*`, `plan|implement|fix`, `holdout`) is internal data routing over its own node namespace — not user input — so it is not a ZFC violation.
+
+### Performance logging (`/tmp/dark-factory`)
+
+Enabled by default. Logs are organized by **target workdir git identity** (prefers `ao.worktree` when set):
+
+```text
+/tmp/dark-factory/<repo-slug>/<branch-slug>/
+  <run_id>.jsonl          # structured node_enter / node_exit / transition / run_end
+  <run_id>.log              # human-readable ENTER/EXIT lines with outcome + duration_ms
+  latest.jsonl -> <run_id>.jsonl
+  latest.log -> <run_id>.log
+  runs.index.jsonl          # one summary line per run (branch rollup)
+```
+
+- **Disable:** `--no-perf-log`
+- **Custom root:** `--perf-log-dir /path/to/root` (default `/tmp/dark-factory`)
+- CLI JSON summary includes `perf_log.jsonl`, `perf_log.log`, `repo`, `branch` when enabled.
+
+Monitor a branch in real time:
+
+```bash
+tail -f /tmp/dark-factory/worldarchitect.ai/feat_my-feature/latest.log
+tail -f /tmp/dark-factory/worldarchitect.ai/feat_my-feature/runs.index.jsonl
+```
+
+Each node emits `ENTER` on visit and `EXIT` with classified outcome (`success`, `failure`, `error`, `partial`) plus engine-level `duration_ms`. Parallel branch nodes are included.
 
 ### Adding a new node type
 1. Implement `_my_handler(node, ctx) -> Result` in `runner/handlers.py`.

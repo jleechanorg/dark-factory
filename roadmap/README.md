@@ -2,6 +2,13 @@
 
 ## Recent activity (rolling)
 
+### 2026-05-31 - runner crash-resilience and reviewer-gate roadmap
+
+- Opened/organized the crash-resilience roadmap under [jleechan-o8q](br show jleechan-o8q), with PR #13 at `411676d5c634ec6d5902529dd8d50dfbffbf6428` for the first engine boundary/per-run-log slice.
+- Added [jleechan-x33](br show jleechan-x33) for a repo-agnostic reviewer-node miss class: file-backed current-head diff/evidence audits require `target_repo`, `target_pr`, `target_head_sha`, `base_sha`, PR description snapshot, evidence paths/SHA, and fail-closed checks for brownfield delete-first, net-LOC, and dead-code in any target repo. PR #7178 is evidence only, not scope.
+- Verification: targeted crash/engine tests passed (`17 passed`); full suite remains at `101 passed, 2 failed` on conformance score and malformed-edge fail-closed hardening.
+- Handoff: `/Users/jleechan/roadmap/nextsteps-2026-05-31-dark-factory-resilience.md`.
+
 ### 2026-05-24 — airbnb-clone Sprint 1 holdout debug
 
 - Wrote `/Users/jleechan/roadmap/nextsteps-2026-05-24-darkfactory-airbnb-holdout.md` as the handoff for the airbnb-clone holdout bootstrap.
