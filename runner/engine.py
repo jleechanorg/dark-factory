@@ -1124,7 +1124,28 @@ def run(
 
             if _is_parallel_node(current):
                 _jn = _find_join_node(graph, current)
-                if _jn is not None:
+                if _jn is None:
+                    # No join node reachable — miswired graph; report failure and stop.
+                    _err_msg = f"parallel node '{current.name}' has no reachable join node"
+                    _err_rec = StepRecord(
+                        node=current.name,
+                        outcome="failure",
+                        ts=time.time(),
+                        output_preview=_err_msg,
+                        metadata={"error": "no_join_node"},
+                    )
+                    seq = _append_record(
+                        history, checkpoint, cxdb, ctx, seq, _err_rec, _err_msg,
+                        {"error": "no_join_node"},
+                    )
+                    ctx.state["_last_node"] = current.name
+                    ctx.state["_last_outcome"] = "failure"
+                    ctx.state[current.name + ".outcome"] = "failure"
+                    _update_failure_state(
+                        current, ctx, Result(outcome="failure", output=_err_msg)
+                    )
+                    break
+                else:
                     # Filter by edge conditions; deduplicate by node name so multiple
                     # edges to the same target don't launch duplicate branch workers.
                     _seen_branch_names: set[str] = set()

@@ -1217,3 +1217,42 @@ def test_parallel_branch_exit_before_join_returns_failure(tmp_path):
         "_run_branch_until_join must set outcome='failure' when a branch reaches "
         "an exit node before the join barrier."
     )
+
+
+def test_parallel_no_join_node_returns_failure(tmp_path):
+    """Parallel node with no reachable join must return failure, not silently skip fan-out.
+
+    Topology: start -> fanout(type=parallel) -> {branch_a, branch_b} -> exit
+    No join node exists in the graph, so _find_join_node returns None.
+    Without this fix, the engine silently treats fanout as a normal node and
+    follows one unconditional edge, ending with success. With the fix it must
+    detect the miswired graph and report failure.
+    """
+    dot_path = tmp_path / "no_join.dot"
+    dot_path.write_text(
+        'digraph no_join {\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  branch_a\n'
+        '  branch_b\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> fanout\n'
+        '  fanout -> branch_a\n'
+        '  fanout -> branch_b\n'
+        '  branch_a -> exit\n'
+        '  branch_b -> exit\n'
+        '}\n'
+    )
+    ctx = _ctx()
+    ctx.state["fanout.outcome"] = "success"
+    ctx.state["branch_a.outcome"] = "success"
+    ctx.state["branch_b.outcome"] = "success"
+
+    graph = parse(dot_path)
+    results = run(graph, ctx, max_steps=20)
+    final = results[-1].outcome if results else "empty"
+    assert final == "failure", (
+        f"Parallel node with no join reported '{final}' instead of 'failure'. "
+        "When _find_join_node returns None, the engine must return failure "
+        "to alert about the miswired graph instead of silently skipping fan-out."
+    )
