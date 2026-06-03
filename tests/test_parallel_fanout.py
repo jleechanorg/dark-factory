@@ -1256,3 +1256,29 @@ def test_parallel_no_join_node_returns_failure(tmp_path):
         "When _find_join_node returns None, the engine must return failure "
         "to alert about the miswired graph instead of silently skipping fan-out."
     )
+
+
+def test_branch_context_warns_when_mkdtemp_fails(tmp_path):
+    """_branch_context must emit a RuntimeWarning when mkdtemp falls back to parent workdir.
+
+    Isolation is silently disabled when mkdtemp raises OSError. A RuntimeWarning makes
+    the degraded isolation observable so operators know file-writing backends may race.
+    """
+    import warnings
+    from unittest.mock import patch
+    from runner.engine import _branch_context
+
+    ctx = _ctx(workdir=tmp_path)
+
+    with patch("tempfile.mkdtemp", side_effect=OSError("disk full")):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = _branch_context(ctx, "my_branch")
+
+    assert any("isolation" in str(w.message).lower() for w in caught), (
+        "Expected a RuntimeWarning mentioning 'isolation' when mkdtemp fails. "
+        "_branch_context must warn callers that branch isolation is degraded."
+    )
+    assert result.workdir == ctx.workdir, (
+        "Fallback workdir should equal parent workdir when mkdtemp fails."
+    )

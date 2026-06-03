@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 import uuid
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from typing import Optional, TextIO
@@ -235,8 +236,12 @@ def _branch_context(ctx: Context, branch_name: str) -> Context:
         base = parent if (parent and parent.is_dir()) else None
         branch_dir = pathlib.Path(tempfile.mkdtemp(prefix=f"branch_{branch_name}_", dir=base))
         cloned.workdir = branch_dir
-    except OSError:
-        pass  # keep parent workdir on filesystem failure
+    except OSError as exc:
+        warnings.warn(
+            f"_branch_context: mkdtemp failed for '{branch_name}', branch isolation disabled: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return cloned
 
 
