@@ -353,3 +353,60 @@ def test_universal_prompt_gate_returns_error_on_timeout(tmp_path, monkeypatch):
 
     assert result.outcome == "error", f"Expected 'error' outcome on timeout, got {result.outcome!r}"
     assert "timed out" in result.output.lower(), f"Expected timeout message, got: {result.output!r}"
+
+
+def test_universal_prompt_gate_returns_error_on_generic_exception(tmp_path, monkeypatch):
+    """_run_universal_prompt_gate must catch generic OSError/RuntimeError, not just TimeoutExpired."""
+    import subprocess
+    import runner.handlers as handlers_mod
+
+    def _raise_oserror(*args, **kwargs):
+        raise OSError("claude binary not found")
+
+    monkeypatch.setattr(subprocess, "run", _raise_oserror)
+    monkeypatch.setattr(handlers_mod, "_worktree_head_sha", lambda _: "abc1234")
+
+    from runner.handlers import _run_universal_prompt_gate
+
+    ctx = _make_ctx(tmp_path)
+    ctx.backend = "claude"
+    node = _make_node()
+    result = _run_universal_prompt_gate("Review: {expected_sha}", "gate_test", node, ctx)
+
+    assert result.outcome == "error", f"Expected 'error' outcome on OSError, got {result.outcome!r}"
+
+
+def test_universal_prompt_gate_clamps_timeout_below_minimum(tmp_path, monkeypatch):
+    """_run_universal_prompt_gate must use _coerce_timeout to clamp pathological zero/negative values."""
+    import subprocess
+    import runner.handlers as handlers_mod
+
+    captured: list[dict] = []
+
+    def _capture_run(*args, **kwargs):
+        captured.append({"timeout": kwargs.get("timeout")})
+        import types, subprocess as sp
+        proc = types.SimpleNamespace(
+            stdout="verdict: pass\nhead_sha: abc1234\n",
+            stderr="",
+            returncode=0,
+        )
+        return proc
+
+    monkeypatch.setattr(subprocess, "run", _capture_run)
+    monkeypatch.setattr(handlers_mod, "_worktree_head_sha", lambda _: "abc1234")
+    monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
+    monkeypatch.setattr(handlers_mod, "_verify_head_sha_echo", lambda text, sha: (True, sha))
+
+    from runner.handlers import _run_universal_prompt_gate, _TIMEOUT_MIN_SECONDS
+
+    ctx = _make_ctx(tmp_path)
+    ctx.backend = "claude"
+    node = Node(name="test_gate", attrs={"timeout": "0"})  # pathological zero
+    _run_universal_prompt_gate("Review: {expected_sha}", "gate_test", node, ctx)
+
+    assert captured, "subprocess.run was not called"
+    actual_timeout = captured[0]["timeout"]
+    assert actual_timeout >= _TIMEOUT_MIN_SECONDS, (
+        f"timeout {actual_timeout} below minimum {_TIMEOUT_MIN_SECONDS} — clamping not applied"
+    )

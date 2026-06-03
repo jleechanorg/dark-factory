@@ -1284,10 +1284,7 @@ def _run_universal_prompt_gate(prompt_template: str, name: str, node: Node, ctx:
 
     prompt = prompt_template.format(expected_sha=expected_sha)
 
-    try:
-        timeout = int(node.attrs.get("timeout", "1200"))
-    except (TypeError, ValueError):
-        timeout = 1200
+    timeout = _coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
 
     # Backend-aware executable selection
     if ctx.backend == "claudew":
@@ -1323,6 +1320,12 @@ def _run_universal_prompt_gate(prompt_template: str, name: str, node: Node, ctx:
         return Result(
             outcome="error",
             output=f"gate {name} timed out after {timeout}s",
+            metadata={"slash_command": name, "verdict": "unknown", "head_sha_status": "missing"},
+        )
+    except Exception as exc:
+        return Result(
+            outcome="error",
+            output=f"gate {name} subprocess failed: {exc}",
             metadata={"slash_command": name, "verdict": "unknown", "head_sha_status": "missing"},
         )
     combined = proc.stdout + "\n" + proc.stderr
