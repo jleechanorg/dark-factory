@@ -1149,6 +1149,20 @@ def run(
                     _update_failure_state(
                         current, ctx, Result(outcome="failure", output=_err_msg)
                     )
+                    _perf_node_exit(
+                        ctx, current.name, enter_seq, "failure",
+                        visits[current.name], {"error": "no_join_node"},
+                    )
+                    _emit_event(
+                        ctx, "node_complete",
+                        {
+                            "node": current.name,
+                            "outcome": "failure",
+                            "preview": _err_msg,
+                            "is_exit": str(is_exit_node(current)),
+                        },
+                        seq,
+                    )
                     break
                 else:
                     # Filter by edge conditions; deduplicate by node name so multiple
@@ -1265,6 +1279,20 @@ def run(
                         ctx.state["_last_outcome"] = "exhausted"
                         ctx.state[_jn.name + ".outcome"] = "exhausted"
                         _update_failure_state(_jn, ctx, Result(outcome="exhausted", output=_ex_rec.output_preview))
+                        _perf_node_exit(
+                            ctx, current.name, enter_seq, "exhausted",
+                            visits[current.name], {},
+                        )
+                        _emit_event(
+                            ctx, "node_complete",
+                            {
+                                "node": current.name,
+                                "outcome": "exhausted",
+                                "preview": _ex_rec.output_preview,
+                                "is_exit": str(is_exit_node(current)),
+                            },
+                            seq,
+                        )
                         break
             # --- end parallel fan-out/fan-in ---
 

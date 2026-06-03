@@ -1282,3 +1282,52 @@ def test_branch_context_warns_when_mkdtemp_fails(tmp_path):
     assert result.workdir == ctx.workdir, (
         "Fallback workdir should equal parent workdir when mkdtemp fails."
     )
+
+
+def test_parallel_no_join_emits_node_complete_event(tmp_path):
+    """Parallel early-break (no join) must still emit a node_complete event.
+
+    When _find_join_node returns None the engine breaks early, skipping the
+    normal _emit_event("node_complete") at the bottom of the main loop.  The
+    perf/event log then has a dangling node_enter with no matching node_exit.
+
+    Fix: call _emit_event("node_complete") before the break so every node_enter
+    has a corresponding event even on the error path.
+    """
+    import json
+
+    event_log = tmp_path / "events.jsonl"
+    dot_path = tmp_path / "no_join_evt.dot"
+    dot_path.write_text(
+        'digraph no_join_evt {\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  branch_a\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> fanout\n'
+        '  fanout -> branch_a\n'
+        '  branch_a -> exit\n'
+        '}\n'
+    )
+
+    ctx = _ctx()
+    ctx.event_log_path = event_log
+    ctx.run_id = "test-perf-break"
+
+    graph = parse(dot_path)
+    run(graph, ctx, max_steps=20)
+
+    events = [
+        json.loads(line)
+        for line in event_log.read_text().splitlines()
+        if line.strip()
+    ]
+    node_complete_nodes = {
+        e["node"] for e in events if e.get("event") == "node_complete"
+    }
+    assert "fanout" in node_complete_nodes, (
+        "Expected a node_complete event for 'fanout' even when no join node "
+        "exists. The early break at line ~1152 skips _emit_event('node_complete'), "
+        "leaving an orphaned node_enter in the perf log. Fix: add _emit_event "
+        "before the break."
+    )
