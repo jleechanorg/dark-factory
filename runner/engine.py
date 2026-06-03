@@ -619,6 +619,10 @@ def _run_branch_until_join(
     try:
         while current is not None and current.name != join_node.name:
             if is_exit_node(current):
+                last_result = Result(
+                    outcome="failure",
+                    output=f"branch reached exit before join '{join_node.name}'",
+                )
                 break
             if steps >= max_branch_steps:
                 last_result = Result(
@@ -1208,9 +1212,7 @@ def run(
                     # Branch records already in CXDB (written thread-safely in _run_branch_until_join)
                     for _br in _branch_flat_records:
                         history.append(_br)
-                    if checkpoint is not None:
-                        checkpoint.write_text(json.dumps([asdict(r) for r in history], indent=2))
-
+                    # _append_record writes the checkpoint atomically including the join step.
                     seq = _append_record(
                         history, checkpoint, cxdb, ctx, seq,
                         _join_rec, _join_rec.output_preview, _join_meta,

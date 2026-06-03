@@ -1180,3 +1180,40 @@ def test_stuck_branch_returns_failure_not_stale_success(tmp_path):
         "_run_branch_until_join must set outcome='failure' when a branch has no successor "
         "before reaching the join node."
     )
+
+
+def test_parallel_branch_exit_before_join_returns_failure(tmp_path):
+    """Branch that routes to exit before the join barrier must return failure, not success.
+
+    Topology: fanout -> {good_branch -> join, early_exit -> exit}.
+    The early_exit branch hits an exit-shaped node before the join.
+    With wait_all policy, one branch failing means the join should fail.
+    """
+    dot_path = tmp_path / "exit_before_join.dot"
+    dot_path.write_text(
+        'digraph exit_before_join {\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  good_branch\n'
+        '  early_exit [shape=Msquare]\n'
+        '  join [type="join", policy="wait_all"]\n'
+        '  finish [shape=Msquare]\n'
+        '  start -> fanout\n'
+        '  fanout -> good_branch\n'
+        '  fanout -> early_exit\n'
+        '  good_branch -> join\n'
+        '  join -> finish\n'
+        '}\n'
+    )
+    ctx = _ctx()
+    ctx.state["good_branch.outcome"] = "success"
+    ctx.state["early_exit.outcome"] = "success"
+
+    graph = parse(dot_path)
+    results = run(graph, ctx, max_steps=20)
+    final = results[-1].outcome if results else "empty"
+    assert final == "failure", (
+        f"Branch-exits-before-join reported '{final}' instead of 'failure'. "
+        "_run_branch_until_join must set outcome='failure' when a branch reaches "
+        "an exit node before the join barrier."
+    )
