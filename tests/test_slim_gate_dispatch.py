@@ -410,3 +410,37 @@ def test_universal_prompt_gate_clamps_timeout_below_minimum(tmp_path, monkeypatc
     assert actual_timeout >= _TIMEOUT_MIN_SECONDS, (
         f"timeout {actual_timeout} below minimum {_TIMEOUT_MIN_SECONDS} — clamping not applied"
     )
+
+
+# ---------------------------------------------------------------------------
+# Bug: dual gate _gate_evidence_review must not drop secondary output on tie
+# ---------------------------------------------------------------------------
+
+def test_gate_evidence_review_merges_output_on_severity_tie(tmp_path, monkeypatch):
+    """When both /es and /er fail with same severity, secondary (/er) output must
+    appear in the returned Result so callers can diagnose both failures."""
+    cmd_dir = tmp_path / ".claude" / "commands"
+    cmd_dir.mkdir(parents=True)
+    (cmd_dir / "es.md").write_text("# es")
+    (cmd_dir / "er.md").write_text("# er")
+
+    import runner.handlers as handlers_mod
+
+    es_result = Result(outcome="failure", output="es check: missing artifact")
+    er_result = Result(outcome="failure", output="er check: stale evidence")
+
+    call_order: list[str] = []
+
+    def mock_slash_gate(cmd: str):
+        def _gate(node, ctx):
+            call_order.append(cmd)
+            return es_result if cmd == "es" else er_result
+        return _gate
+
+    monkeypatch.setattr(handlers_mod, "_slash_gate", mock_slash_gate)
+
+    from runner.handlers import _gate_evidence_review
+    result = _gate_evidence_review(_make_node(), _make_ctx(tmp_path))
+
+    assert "es check" in result.output, f"/es output lost in tie case: {result.output!r}"
+    assert "er check" in result.output, f"/er output lost in tie case: {result.output!r}"

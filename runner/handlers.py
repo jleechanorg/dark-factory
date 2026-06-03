@@ -1378,13 +1378,24 @@ def _gate_evidence_review(node: Node, ctx: Context) -> Result:
     local_cmd = ctx.workdir / ".claude" / "commands" / "evidence_review.md"
 
     # When both /es and /er are available, run both and return the worst outcome.
+    # On a severity tie, merge outputs so both are visible to callers.
     if local_es.exists() and local_er.exists():
         es_result = _slash_gate("es")(node, ctx)
         er_result = _slash_gate("er")(node, ctx)
         _SEVERITY = {"error": 3, "failure": 2, "partial": 1, "success": 0}
-        if _SEVERITY.get(er_result.outcome, 0) > _SEVERITY.get(es_result.outcome, 0):
+        es_sev = _SEVERITY.get(es_result.outcome, 0)
+        er_sev = _SEVERITY.get(er_result.outcome, 0)
+        if er_sev > es_sev:
             return er_result
-        return es_result
+        if es_sev > er_sev:
+            return es_result
+        # Tie: merge outputs so neither result is silently dropped.
+        merged_output = f"[/es]\n{es_result.output}\n\n[/er]\n{er_result.output}"
+        return Result(
+            outcome=es_result.outcome,
+            output=merged_output,
+            metadata={**(es_result.metadata or {}), **{"er_outcome": er_result.outcome}},
+        )
     elif local_es.exists():
         return _slash_gate("es")(node, ctx)
     elif local_er.exists():
