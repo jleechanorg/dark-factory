@@ -13,7 +13,10 @@ ROOT = pathlib.Path(__file__).parent.parent
 
 def test_minimal_feature_factory_runs_with_deterministic_gates(monkeypatch, tmp_path):
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
-    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", lambda node, ctx: Result(outcome="success", output="ok"))
+    _ok = lambda node, ctx: Result(outcome="success", output="ok")
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", _ok)
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_code_standards", _ok)
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_evidence_review", _ok)
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_feature.dot")
     ctx = Context(goal="ship a tiny feature", workdir=ROOT, backend="echo")
     ctx.state["feature"] = "hello"
@@ -27,16 +30,18 @@ def test_minimal_feature_factory_runs_with_deterministic_gates(monkeypatch, tmp_
         "plan",
         "implement",
         "test",
-        "review",
+        "code_review",
         "holdout",
-        "gate_es",
-        "gate_er",
+        "evidence_review",
         "exit",
     ]
 
 
 def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path):
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
+    _ok = lambda node, ctx: Result(outcome="success", output="ok")
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_code_standards", _ok)
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_evidence_review", _ok)
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_pr.dot")
     ctx = Context(goal="refactor a tiny thing in-flight", workdir=ROOT, backend="echo")
     ctx.state["slim.test_command"] = f"{sys.executable} -c \"print('tests ok')\""
@@ -49,9 +54,8 @@ def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path)
         "plan",
         "implement",
         "test",
-        "review",
-        "gate_es",
-        "gate_er",
+        "code_review",
+        "evidence_review",
         "exit",
     ]
 
