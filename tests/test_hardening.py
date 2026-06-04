@@ -191,6 +191,17 @@ def test_parser_rejects_condition_with_unmatched_characters(tmp_path):
         parse(dot)
 
 
+def test_bare_word_factor_in_compound_expression_checks_outcome():
+    """A bare word as the first factor in a compound expression (e.g. 'success && k=v')
+    must compare against outcome, not look the word up as a state key."""
+    edge_match = Edge(src="a", dst="b", attrs={"condition": "success && retry_count=0"})
+    edge_fail = Edge(src="a", dst="b", attrs={"condition": "success && retry_count=0"})
+    result_success = Result(outcome="success", metadata={"retry_count": "0"})
+    result_fail = Result(outcome="failure", metadata={"retry_count": "0"})
+    assert _edge_matches(edge_match, result_success) is True
+    assert _edge_matches(edge_fail, result_fail) is False
+
+
 def test_malformed_hyphenated_edge_conditions_fail_closed():
     edge_in = Edge(src="a", dst="b", attrs={"condition": "not-in-list"})
     edge_contains = Edge(src="a", dst="b", attrs={"condition": "not-contains-x"})
