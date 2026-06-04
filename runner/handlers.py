@@ -1316,11 +1316,18 @@ def _run_universal_prompt_gate(prompt_template: str, name: str, node: Node, ctx:
             check=False,
             env=gate_env,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        combined = (exc.stdout or "") + "\n" + (exc.stderr or "")
         return Result(
-            outcome="error",
-            output=f"gate {name} timed out after {timeout}s",
-            metadata={"slash_command": name, "verdict": "unknown", "head_sha_status": "missing"},
+            outcome="failure",
+            output=combined.strip() or f"gate {name} timed out after {timeout}s",
+            metadata={
+                "slash_command": name,
+                "verdict": "unknown",
+                "head_sha_status": "missing",
+                "timed_out": "true",
+                "timeout": str(timeout),
+            },
         )
     except Exception as exc:
         return Result(

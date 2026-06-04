@@ -332,9 +332,10 @@ def test_gate_es_uses_universal_fallback_when_only_skill_file_exists(tmp_path, m
 # Bug: _run_universal_prompt_gate must catch TimeoutExpired
 # ---------------------------------------------------------------------------
 
-def test_universal_prompt_gate_returns_error_on_timeout(tmp_path, monkeypatch):
-    """Regression: if subprocess.run raises TimeoutExpired, _run_universal_prompt_gate
-    must return a Result(outcome='error') rather than propagating the exception."""
+def test_universal_prompt_gate_returns_failure_on_timeout(tmp_path, monkeypatch):
+    """Consistency: _run_universal_prompt_gate must return outcome='failure' (not 'error')
+    on TimeoutExpired, matching _slash_gate behaviour.  Timeout is a gate failure,
+    not an infrastructure crash; the Healer groups them differently."""
     import subprocess
     import runner.handlers as handlers_mod
 
@@ -351,8 +352,11 @@ def test_universal_prompt_gate_returns_error_on_timeout(tmp_path, monkeypatch):
     node = _make_node()
     result = _run_universal_prompt_gate("Review: {expected_sha}", "gate_test", node, ctx)
 
-    assert result.outcome == "error", f"Expected 'error' outcome on timeout, got {result.outcome!r}"
+    assert result.outcome == "failure", f"Expected 'failure' outcome on timeout, got {result.outcome!r}"
     assert "timed out" in result.output.lower(), f"Expected timeout message, got: {result.output!r}"
+    assert (result.metadata or {}).get("timed_out") == "true", (
+        f"Expected timed_out='true' in metadata, got: {result.metadata!r}"
+    )
 
 
 def test_universal_prompt_gate_returns_error_on_generic_exception(tmp_path, monkeypatch):
