@@ -1165,6 +1165,39 @@ def run(
                     )
                     break
                 else:
+                    # Pre-check join max_visits before running branches.
+                    # If already exceeded, skip branch workers entirely — prevents
+                    # spurious join-success records followed immediately by exhausted.
+                    _jn_max = _attr_int(_jn, "max_visits", 0)
+                    _jn_visit_next = visits.get(_jn.name, 0) + 1
+                    if _jn_max and _jn_visit_next > _jn_max:
+                        visits[_jn.name] = _jn_visit_next
+                        _ex_rec = StepRecord(
+                            node=_jn.name,
+                            outcome="exhausted",
+                            ts=time.time(),
+                            output_preview=f"max_visits={_jn_max} exceeded",
+                        )
+                        seq = _append_record(history, checkpoint, cxdb, ctx, seq, _ex_rec, "")
+                        ctx.state["_last_node"] = _jn.name
+                        ctx.state["_last_outcome"] = "exhausted"
+                        ctx.state[_jn.name + ".outcome"] = "exhausted"
+                        _update_failure_state(_jn, ctx, Result(outcome="exhausted", output=_ex_rec.output_preview))
+                        _perf_node_exit(
+                            ctx, current.name, enter_seq, "exhausted",
+                            visits[current.name], {},
+                        )
+                        _emit_event(
+                            ctx, "node_complete",
+                            {
+                                "node": current.name,
+                                "outcome": "exhausted",
+                                "preview": _ex_rec.output_preview,
+                                "is_exit": str(is_exit_node(current)),
+                            },
+                            seq,
+                        )
+                        break
                     # Filter by edge conditions; deduplicate by node name so multiple
                     # edges to the same target don't launch duplicate branch workers.
                     _seen_branch_names: set[str] = set()
@@ -1263,37 +1296,9 @@ def run(
                     # against the main pipeline's max_steps budget.
                     _parallel_overhead += len(_branch_flat_records)
 
-                    # Enforce max_visits on the join node (it's never set as
-                    # `current`, so the top-of-loop visit check never fires).
-                    visits[_jn.name] = visits.get(_jn.name, 0) + 1
-                    _jn_max = _attr_int(_jn, "max_visits", 0)
-                    if _jn_max and visits[_jn.name] > _jn_max:
-                        _ex_rec = StepRecord(
-                            node=_jn.name,
-                            outcome="exhausted",
-                            ts=time.time(),
-                            output_preview=f"max_visits={_jn_max} exceeded",
-                        )
-                        seq = _append_record(history, checkpoint, cxdb, ctx, seq, _ex_rec, "")
-                        ctx.state["_last_node"] = _jn.name
-                        ctx.state["_last_outcome"] = "exhausted"
-                        ctx.state[_jn.name + ".outcome"] = "exhausted"
-                        _update_failure_state(_jn, ctx, Result(outcome="exhausted", output=_ex_rec.output_preview))
-                        _perf_node_exit(
-                            ctx, current.name, enter_seq, "exhausted",
-                            visits[current.name], {},
-                        )
-                        _emit_event(
-                            ctx, "node_complete",
-                            {
-                                "node": current.name,
-                                "outcome": "exhausted",
-                                "preview": _ex_rec.output_preview,
-                                "is_exit": str(is_exit_node(current)),
-                            },
-                            seq,
-                        )
-                        break
+                    # Record this join visit (pre-check already ran above; if we
+                    # reach here, the limit was not yet exceeded on this cycle).
+                    visits[_jn.name] = _jn_visit_next
             # --- end parallel fan-out/fan-in ---
 
             if records:

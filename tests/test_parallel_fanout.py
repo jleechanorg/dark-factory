@@ -563,6 +563,59 @@ def test_join_max_visits_enforced(tmp_path):
     )
 
 
+def test_join_max_visits_no_spurious_success_before_exhausted(tmp_path):
+    """Join max_visits pre-check: branches must NOT run on the over-limit cycle.
+
+    With max_visits=1 on the join, the second fan-out cycle should emit ONLY
+    an exhausted step — no spurious join-success record and no branch workers.
+
+    Bug: engine checked max_visits AFTER running branches and appending the
+    join success record, producing contradictory history [success, exhausted].
+    Fix: pre-check max_visits before launching branch workers.
+    """
+    ctx = _ctx()
+    ctx.state["branch_a.outcome"] = "success"
+    ctx.state["branch_b.outcome"] = "success"
+    ctx.state["retry.outcome"] = "success"
+
+    dot = tmp_path / "join_max_visits_pre.dot"
+    dot.write_text(
+        'digraph join_max_visits_pre {\n'
+        '  graph [goal="join max_visits pre-check"]\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  branch_a\n'
+        '  branch_b\n'
+        '  join [type="join", policy="wait_all", max_visits="1"]\n'
+        '  retry\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> fanout\n'
+        '  fanout -> branch_a\n'
+        '  fanout -> branch_b\n'
+        '  branch_a -> join\n'
+        '  branch_b -> join\n'
+        '  join -> retry\n'
+        '  retry -> fanout\n'
+        '  retry -> exit [condition="outcome=done"]\n'
+        '}\n'
+    )
+    graph = parse(dot)
+    history = run(graph, ctx, max_steps=50)
+
+    join_records = [s for s in history if s.node == "join"]
+    # Exactly 2: one success (cycle 1) + one exhausted (cycle 2 pre-check)
+    assert len(join_records) == 2, (
+        f"Expected 2 join records (success + exhausted), got {len(join_records)}: "
+        f"{[(s.outcome, s.node) for s in join_records]}"
+    )
+    assert join_records[0].outcome == "success", (
+        f"First join record must be success, got {join_records[0].outcome!r}"
+    )
+    assert join_records[1].outcome == "exhausted", (
+        f"Second join record must be exhausted, got {join_records[1].outcome!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bug fix: resume correctly excludes parallel branch overhead from max_steps
 # ---------------------------------------------------------------------------
