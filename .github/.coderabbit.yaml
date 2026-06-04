@@ -1,0 +1,6 @@
+version: "2"
+reviews:
+  request_changes_workflow: false
+  auto_review:
+    enabled: true
+    drafts: false
