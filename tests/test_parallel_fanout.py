@@ -1384,3 +1384,68 @@ def test_parallel_no_join_emits_node_complete_event(tmp_path):
         "leaving an orphaned node_enter in the perf log. Fix: add _emit_event "
         "before the break."
     )
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: resume from incomplete parallel fan-out must re-run branches
+# ---------------------------------------------------------------------------
+
+def test_resume_from_incomplete_parallel_fanout_reruns_branches(tmp_path):
+    """When a checkpoint ends at the fan-out step (branches never ran),
+    resume must re-execute all branches instead of routing to a single successor.
+
+    RED: current resume path calls _pick_next(fanout, ...) which returns one
+    branch start node; the other branch and the parallel block are skipped.
+
+    GREEN: resume detects the incomplete fan-out (last step has role=fanout),
+    re-runs from the parallel node so both branches execute concurrently.
+    """
+    import json
+
+    dot = tmp_path / "resume_fanout2.dot"
+    dot.write_text(
+        'digraph resume_fanout2 {\n'
+        '  graph [goal="resume incomplete fanout"]\n'
+        '  start [shape=Mdiamond]\n'
+        '  fanout [type="parallel"]\n'
+        '  branch_a\n'
+        '  branch_b\n'
+        '  join [type="join", policy="wait_all"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> fanout\n'
+        '  fanout -> branch_a\n'
+        '  fanout -> branch_b\n'
+        '  branch_a -> join\n'
+        '  branch_b -> join\n'
+        '  join -> exit\n'
+        '}\n'
+    )
+
+    # Incomplete checkpoint: fan-out step was recorded, but branches never ran.
+    ckpt = tmp_path / "ckpt.json"
+    ckpt.write_text(json.dumps([
+        {"node": "start", "outcome": "success", "ts": 0.0, "output_preview": "", "metadata": {}},
+        {"node": "fanout", "outcome": "success", "ts": 0.0,
+         "output_preview": "fanout: fanout", "metadata": {"role": "fanout"}},
+    ]))
+
+    ctx = _ctx()
+    ctx.state["branch_a.outcome"] = "success"
+    ctx.state["branch_b.outcome"] = "success"
+
+    graph = parse(dot)
+    history = run(graph, ctx, max_steps=20, resume=ckpt)
+
+    nodes = [s.node for s in history]
+    assert "branch_a" in nodes, (
+        f"branch_a must run after resuming from incomplete fan-out, got: {nodes}"
+    )
+    assert "branch_b" in nodes, (
+        f"branch_b must run after resuming from incomplete fan-out, got: {nodes}"
+    )
+    assert "join" in nodes, (
+        f"join must run after resuming from incomplete fan-out, got: {nodes}"
+    )
+    assert "exit" in nodes, (
+        f"exit must run after resuming from incomplete fan-out, got: {nodes}"
+    )

@@ -881,11 +881,21 @@ def run(
             if len(history) - _resumed_overhead >= max_steps:
                 return history
             synthetic = _normalized_result(Result(outcome=last.outcome))
-            goal_gate_node = _goal_gate_target(graph, last_node, synthetic, ctx)
-            next_node = goal_gate_node or _pick_next(graph, last_node, synthetic, ctx)
-            if next_node is None:
-                return history
-            current = next_node
+            # Detect incomplete parallel fan-out: the fan-out step was checkpointed
+            # but branches never ran (job was interrupted between the fan-out record
+            # write and the ThreadPoolExecutor completing).  Re-run from the parallel
+            # node so all branches execute; remove the incomplete record first to
+            # avoid a duplicate fan-out step in the history.
+            if _is_parallel_node(last_node) and last.metadata.get("role") == "fanout":
+                history.pop()
+                visits[last_node.name] = max(0, visits.get(last_node.name, 1) - 1)
+                current = last_node
+            else:
+                goal_gate_node = _goal_gate_target(graph, last_node, synthetic, ctx)
+                next_node = goal_gate_node or _pick_next(graph, last_node, synthetic, ctx)
+                if next_node is None:
+                    return history
+                current = next_node
 
     # Always have an addressable run_id so diagnostics are locatable even when
     # no CXDB is attached (ad-hoc smoke runs, echo backend, etc.).

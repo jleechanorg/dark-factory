@@ -1191,9 +1191,182 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
     return handler
 
 
-_gate_es = _slash_gate("es")
-_gate_er = _slash_gate("er")
-_gate_code_standards = _slash_gate("code-standards")
+UNIVERSAL_CODE_STANDARDS_PROMPT = """\
+You are performing an automated, repository-agnostic Code Standards & Quality Review.
+Analyze the active repository changes and diff in the current workspace.
+
+You MUST audit the implementation against the following core principles:
+
+1. ZERO FRAMEWORK COGNITION (ZFC):
+   - Avoid dependency/framework bloat. Prioritize lightweight, native logical primitives.
+   - Do not pull in heavy abstractions or third-party wrappers unnecessarily.
+   - Ensure the solution uses standard library/native features where applicable.
+
+2. ROOT-CAUSE-FIRST ENGINEERING:
+   - Verify that the changes directly address the true root cause of the feature request or bug.
+   - Look for and reject "workaround" logic, such as generic try/catch suppression, defensive
+     fallback values, sanitizers, or clamp layers that merely mask upstream errors.
+   - Prohibit fixing symptoms when upstream prompts, schemas, or instructions should be corrected.
+
+3. CLEAN CODE & CODE QUALITY:
+   - Readability, proper modularity, clean interface boundaries, and appropriate type annotations.
+   - No trailing debugging logs/comments or placeholders.
+
+Provide a detailed review report listing:
+- A brief summary of scope.
+- Audit results for ZFC, Root-Cause-First, and Clean Code.
+- A bulleted list of any blockers and required fixes.
+
+CRITICAL FORMATTING INSTRUCTIONS:
+1. You MUST include a binding verification line:
+   head_sha: {expected_sha}
+
+2. You MUST conclude your review with:
+   verdict: <pass|warn|fail>
+"""
+
+
+UNIVERSAL_EVIDENCE_REVIEW_PROMPT = """\
+You are performing an automated, repository-agnostic Evidence Standards & Review check.
+Analyze the active repository changes, diff, and any generated evidence files in the workspace.
+
+You MUST audit the implementation's evidence against the following core standards:
+
+1. GIT PROVENANCE & STALENESS:
+   - Check if metadata captures the exact git HEAD SHA, branch, and merge base.
+   - Confirm that the SHA of the recorded evidence matches the current HEAD: {expected_sha}
+
+2. METRICS & TELEMETRY:
+   - Confirm that token usage, execution duration, and costs are accurately logged.
+
+3. RESULT INVARIANTS:
+   - Ensure all executed scenarios are explicitly marked as passed with no silent failures.
+
+4. CHECKSUM INTEGRITY:
+   - Confirm that generated files are accompanied by valid checksums or integrity metadata.
+
+CRITICAL FORMATTING INSTRUCTIONS:
+1. You MUST include a binding verification line:
+   head_sha: {expected_sha}
+
+2. You MUST conclude your review with:
+   verdict: <pass|fail>
+"""
+
+
+def _run_universal_prompt_gate(
+    prompt_template: str, name: str, node: "Node", ctx: "Context"
+) -> "Result":
+    """Run a gate review using an embedded universal prompt (no local slash command file)."""
+    if ctx.backend in ("echo", "mock_llm"):
+        hint = ctx.state.get(f"{node.name}.outcome", "success")
+        return Result(
+            outcome=hint,
+            output=f"echo gate {name}: pre-seeded {hint}",
+            metadata={"slash_command": name, "verdict": "echo:" + hint},
+        )
+
+    expected_sha = _worktree_head_sha(ctx.workdir)
+    if expected_sha is None:
+        return Result(
+            outcome="error",
+            output=f"gate {name} cannot resolve HEAD SHA for {ctx.workdir}",
+            metadata={"slash_command": name, "verdict": "unknown", "head_sha_status": "missing"},
+        )
+
+    sha_directive = (
+        f"\n\n<!-- RUNNER BINDING REQUIREMENT (non-negotiable) -->\n"
+        f"expected_head_sha: {expected_sha}\n\n"
+        f"CRITICAL: Your response MUST include the following line verbatim:\n"
+        f"head_sha: {expected_sha}\n"
+    )
+    prompt = prompt_template.format(expected_sha=expected_sha) + sha_directive
+    timeout = _coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
+
+    if ctx.backend == "claudew":
+        claude_bin = _get_claude_executable()
+        wafer_model = os.environ.get("WAFER_MODEL", "GLM-5.1")
+        gate_env = _sanitized_env()
+        gate_env["ANTHROPIC_BASE_URL"] = "http://localhost:9001"
+        gate_env["ANTHROPIC_AUTH_TOKEN"] = os.environ.get("WAFER_API_KEY", "")
+        gate_env["ANTHROPIC_DEFAULT_MODEL"] = wafer_model
+        for _mk in ("OPUS", "SONNET", "HAIKU"):
+            gate_env[f"ANTHROPIC_DEFAULT_{_mk}_MODEL"] = wafer_model
+        gate_env["CLAUDEW_MODE"] = "1"
+        sub_args = _sandboxed_args([
+            claude_bin, "--print", "--dangerously-skip-permissions",
+            "--model", wafer_model, "--effort", "high", prompt,
+        ])
+    else:
+        claude_bin = _get_claude_executable()
+        gate_env = _sanitized_env()
+        sub_args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", prompt])
+
+    if sub_args is None:
+        return Result(outcome="failure", output="sandbox-exec unavailable")
+    try:
+        proc = subprocess.run(
+            sub_args, cwd=ctx.workdir, capture_output=True, text=True,
+            timeout=timeout, check=False, env=gate_env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        combined = (exc.stdout or "") + "\n" + (exc.stderr or "")
+        return Result(
+            outcome="failure",
+            output=combined.strip() or f"gate {name} timed out after {timeout}s",
+            metadata={"slash_command": name, "verdict": "unknown",
+                      "head_sha_status": "missing", "timed_out": "true"},
+        )
+    except Exception as exc:
+        return Result(
+            outcome="error",
+            output=f"gate {name} subprocess failed: {exc}",
+            metadata={"slash_command": name, "verdict": "unknown", "head_sha_status": "missing"},
+        )
+    combined = proc.stdout + "\n" + proc.stderr
+    verdict, normalized = _parse_verdict(combined)
+    sha_ok, observed_sha = _verify_head_sha_echo(combined, expected_sha)
+    if proc.returncode != 0 and (verdict == "unknown" or normalized == "success"):
+        outcome = "error"
+    elif not sha_ok:
+        outcome = "error" if normalized in ("success", "unknown") else normalized
+    else:
+        outcome = normalized
+    head_sha_status = "matched" if sha_ok and observed_sha else ("mismatched" if observed_sha else "missing")
+    return Result(
+        outcome=outcome,
+        output=proc.stdout,
+        metadata={
+            "slash_command": name, "verdict": verdict,
+            "returncode": str(proc.returncode),
+            "expected_head_sha": expected_sha, "observed_head_sha": observed_sha,
+            "head_sha_status": head_sha_status,
+        },
+    )
+
+
+def _gate_es(node: "Node", ctx: "Context") -> "Result":
+    local_es = ctx.workdir / ".claude" / "commands" / "es.md"
+    if local_es.exists():
+        return _slash_gate("es")(node, ctx)
+    return _run_universal_prompt_gate(UNIVERSAL_EVIDENCE_REVIEW_PROMPT, "gate_es", node, ctx)
+
+
+def _gate_er(node: "Node", ctx: "Context") -> "Result":
+    local_er = ctx.workdir / ".claude" / "commands" / "er.md"
+    local_cmd = ctx.workdir / ".claude" / "commands" / "evidence_review.md"
+    if local_er.exists():
+        return _slash_gate("er")(node, ctx)
+    if local_cmd.exists():
+        return _slash_gate("evidence_review")(node, ctx)
+    return _run_universal_prompt_gate(UNIVERSAL_EVIDENCE_REVIEW_PROMPT, "gate_er", node, ctx)
+
+
+def _gate_code_standards(node: "Node", ctx: "Context") -> "Result":
+    local_cmd = ctx.workdir / ".claude" / "commands" / "code-standards.md"
+    if local_cmd.exists():
+        return _slash_gate("code-standards")(node, ctx)
+    return _run_universal_prompt_gate(UNIVERSAL_CODE_STANDARDS_PROMPT, "gate_code_standards", node, ctx)
 
 
 def _tcp_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
