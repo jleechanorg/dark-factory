@@ -267,7 +267,12 @@ def _run_one_inner(
     if holdout_evaluator is not None:
         try:
             conf = holdout_evaluator(workdir, feature, baseline_ref, head_ref)
-            conformance = {"available": True, **conf}
+            # Soft-error dicts (e.g. subprocess crash returning {pass:0, error:...})
+            # must not be treated as real 0% conformance — they are missing data.
+            if conf.get("error"):
+                conformance = {"available": False, "error": conf["error"]}
+            else:
+                conformance = {"available": True, **conf}
         except Exception as exc:  # noqa: BLE001 - record, don't crash the smoke
             conformance = {"available": False, "error": str(exc)}
     else:

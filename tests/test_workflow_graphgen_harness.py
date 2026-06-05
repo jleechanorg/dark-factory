@@ -410,3 +410,36 @@ def test_mode_a_unvisited_middle_node_means_failure(repo, tmp_path, monkeypatch)
     dot_dir.mkdir()
     _, middle_ok = _run_middle_mode_a(ir, ctx, dot_dir)
     assert middle_ok is False, "missing middle node must make middle_ok=False"
+
+
+def test_evaluator_subprocess_error_yields_unavailable_conformance(repo, monkeypatch):
+    """Evaluator subprocess errors must be recorded as available=False, not 0% conformance.
+
+    Bugbot #3365267637 — when conformance_local.evaluate() returns
+    {'pass': 0, 'error': '...'} (subprocess crash / no JSON output),
+    _run_one_inner wraps it with available=True, scoring a real 0% conformance
+    rather than missing data. This distorts A-vs-A+B aggregation.
+    """
+    import os
+    os.environ.setdefault("DARK_FACTORY_HOME", str(ROOT))
+    from benchmarks.workflow_graphgen import conformance_local
+
+    def fake_evaluator_error(workdir, feature, baseline_ref, head_ref):
+        return {"pass": 0, "total": 5, "error": "no json from child (rc=1): 'crashed'"}
+
+    ir = harness.generate_ir("smoke goal", backend="echo", model_name=None)
+    rec = harness.run_one(
+        ir=ir,
+        mode="A",
+        feature="hello",
+        goal="smoke goal",
+        workdir=repo,
+        backend="echo",
+        model_name=None,
+        trial=1,
+        holdout_evaluator=fake_evaluator_error,
+    )
+    conf = rec["conformance"]
+    assert conf["available"] is False, (
+        "evaluator subprocess errors must be recorded as available=False, not real 0% conformance"
+    )
