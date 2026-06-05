@@ -1062,15 +1062,24 @@ def _verify_head_sha_echo(text: str, expected_sha: str) -> tuple[bool, str]:
     observed = matches[-1].group(1).lower()
     return observed == expected_sha.lower(), observed
 
-# Anchored regex: keyword must follow a marker like "verdict:", "overall:", or "normalized:"
-# and stand on its own word boundary. Optional qualifier group handles "CONDITIONAL PASS" /
-# "PARTIAL PASS" without the [^\n]* greedy scan that caused "verdict: not a fail" → "fail".
+# The set of recognized verdict tokens, shared by the marker + standalone regexes.
+_VERDICT_TOKEN = (
+    r"(?:pass|warn|fail|partial|inconclusive|insufficient|invalid|incomplete|conditional)"
+)
+
+# Anchored regex: a verdict token must follow a marker ("verdict:", "overall:",
+# "normalized:") on the same line. The gap between the marker and the captured
+# token may contain ONLY decoration (whitespace, markdown like ``**``, emoji —
+# any non-word char) and *qualifier verdict-tokens* (e.g. "CONDITIONAL PASS",
+# "PARTIAL PASS"); backtracking captures the LAST token. It must NOT contain
+# arbitrary alphabetic prose — a bare ``[^\n]*`` wildcard would lift "fail" out
+# of "verdict: not a fail", which is precisely the misclassification the
+# hardening tests forbid. Non-token word runs ("not", "a") break the match, so
+# the caller falls through to the "marker present but invalid" → unknown path.
 _MARKER_RE = re.compile(
     r"(?:verdict|overall|normalized)\s*:\s*"
-    r"\*{0,2}"
-    r"(?:(?:conditional|partial|insufficient|invalid|incomplete)\s+\*{0,2})?"
-    r"(pass|warn|fail|partial|inconclusive|insufficient|invalid|incomplete|conditional)"
-    r"\b",
+    r"(?:" + _VERDICT_TOKEN + r"\b|[^\w\n])*"
+    r"(" + _VERDICT_TOKEN + r")\b",
     re.IGNORECASE,
 )
 
