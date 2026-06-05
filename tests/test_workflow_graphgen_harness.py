@@ -225,3 +225,35 @@ def test_mode_a_token_records_deduped_by_node(repo, tmp_path):
     # One record per unique middle node — no duplicates.
     middle_names = [n.name for n in ir.middle_chain()]
     assert len(token_records) == len(middle_names)
+
+
+def test_mode_a_unvisited_middle_node_means_failure(repo, tmp_path, monkeypatch):
+    """Mode A middle_ok must be False when any expected middle node was never visited.
+
+    If the runner stops early (e.g. max_steps exhausted) before visiting every
+    middle node, the missing node must count as a failure — not be silently ignored
+    by an empty all() returning True.  Mode A+B always executes the full chain, so
+    the two modes must agree on what 'incomplete execution' means.
+    """
+    import os
+    os.environ.setdefault("DARK_FACTORY_HOME", str(ROOT))
+    ir = harness.generate_ir("smoke goal", backend="echo", model_name=None)
+    middle_names = {n.name for n in ir.middle_chain()}
+    assert len(middle_names) >= 1, "IR must have at least one middle node"
+
+    import runner.engine as engine_mod_real
+    original_run = engine_mod_real.run
+
+    def _run_missing_last(*args, **kwargs):
+        full = original_run(*args, **kwargs)
+        # Drop ALL steps for the last middle node to simulate it never running.
+        last_middle = ir.middle_chain()[-1].name
+        return [s for s in full if s.node != last_middle]
+
+    monkeypatch.setattr(engine_mod_real, "run", _run_missing_last)
+
+    ctx = Context(goal="smoke goal", workdir=repo, backend="echo", state={})
+    dot_dir = tmp_path / "dots"
+    dot_dir.mkdir()
+    _, middle_ok = _run_middle_mode_a(ir, ctx, dot_dir)
+    assert middle_ok is False, "missing middle node must make middle_ok=False"

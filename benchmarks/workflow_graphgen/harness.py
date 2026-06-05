@@ -126,9 +126,12 @@ def _run_middle_mode_a(ir: GraphIR, ctx: Context, dot_dir: pathlib.Path) -> tupl
         for n in ir.middle_chain()
         if n.name in last_by_node
     ]
-    middle_ok = all(
-        s.outcome in ("success", "warn")
-        for s in last_by_node.values()
+    # All expected middle nodes must have appeared in history — a missing node
+    # (runner stopped early, max_steps exhausted) is treated as a failure, not
+    # silently ignored by a vacuous all(). Mode A+B always executes the full chain.
+    middle_ok = (
+        set(last_by_node.keys()) >= middle_names
+        and all(s.outcome in ("success", "warn") for s in last_by_node.values())
     )
     return token_records, middle_ok
 
