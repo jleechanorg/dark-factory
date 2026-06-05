@@ -121,10 +121,15 @@ def _run_middle_mode_a(ir: GraphIR, ctx: Context, dot_dir: pathlib.Path) -> tupl
     for s in history:
         if s.node in middle_names:
             last_by_node[s.node] = s
+    # Build one token record per middle node in chain order.  When a node was
+    # never visited (runner stopped early) insert a zero-record so both modes
+    # always charge len(middle_chain) entries — symmetric token accounting.
+    _ZERO_TOKEN = {"tokens_in": None, "tokens_out": None, "wall_ms": 0}
     token_records = [
         read_token_record(last_by_node[n.name].metadata)
-        for n in ir.middle_chain()
         if n.name in last_by_node
+        else _ZERO_TOKEN
+        for n in ir.middle_chain()
     ]
     # All expected middle nodes must have appeared in history — a missing node
     # (runner stopped early, max_steps exhausted) is treated as a failure, not

@@ -227,6 +227,44 @@ def test_mode_a_token_records_deduped_by_node(repo, tmp_path):
     assert len(token_records) == len(middle_names)
 
 
+def test_mode_a_token_records_zero_padded_for_missing_nodes(repo, tmp_path, monkeypatch):
+    """Mode A token_records must have len(middle_chain) entries even when a node
+    was never visited (e.g. runner hit max_steps before reaching it).
+
+    Bugbot #3365197802: omitting missing nodes from token_records lets Mode A
+    report artificially low tokens_total in failed runs while Mode A+B always
+    charges one record per middle_chain() node — asymmetric cost accounting.
+    Missing nodes must be padded with a zero-record so both modes charge the
+    same number of entries regardless of execution completeness.
+    """
+    import os
+    os.environ.setdefault("DARK_FACTORY_HOME", str(ROOT))
+    ir = harness.generate_ir("smoke goal", backend="echo", model_name=None)
+    middle_names = [n.name for n in ir.middle_chain()]
+    assert len(middle_names) >= 2, "need ≥2 middle nodes to drop one"
+
+    import runner.engine as engine_mod_real
+    original_run = engine_mod_real.run
+
+    def _run_drop_last(*args, **kwargs):
+        full = original_run(*args, **kwargs)
+        last_middle = ir.middle_chain()[-1].name
+        return [s for s in full if s.node != last_middle]
+
+    monkeypatch.setattr(engine_mod_real, "run", _run_drop_last)
+
+    ctx = Context(goal="smoke goal", workdir=repo, backend="echo", state={})
+    dot_dir = tmp_path / "dots"
+    dot_dir.mkdir()
+    token_records, middle_ok = _run_middle_mode_a(ir, ctx, dot_dir)
+
+    assert middle_ok is False, "missing node must make middle_ok=False"
+    # CRITICAL: token_records must still have one entry per middle node.
+    assert len(token_records) == len(middle_names), (
+        f"expected {len(middle_names)} token records (zero-padded), got {len(token_records)}"
+    )
+
+
 def test_run_benchmark_passes_exploratory_flag_through_to_records(tmp_path, monkeypatch):
     """run_benchmark must accept and forward exploratory=True to each run_one call.
 

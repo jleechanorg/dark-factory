@@ -271,12 +271,3 @@ def render_middle_only_dot(ir: GraphIR, name: str = "wfgg_middle") -> str:
         lines.append(f"    {a} -> {b}")
     lines.append("}")
     return "\n".join(lines) + "\n"
-
-
-def write_and_parse(dot_text: str, path: pathlib.Path):
-    """Write dot_text to path and parse it with the real runner parser, returning
-    the parsed Graph. Raises if the rendered graph is not parser-valid."""
-    import runner.parser as parser_mod
-
-    path.write_text(dot_text)
-    return parser_mod.parse(path)
