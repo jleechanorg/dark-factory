@@ -45,7 +45,20 @@ def test_sum_token_records_none_vs_zero():
 
 
 def test_aggregate_tokens_separated_lower_is_better():
-    # A's middle is consistently cheaper than A+B's, ranges disjoint -> A wins.
+    # A's middle is consistently cheaper than A+B's, ranges disjoint, and BOTH
+    # modes have >= MIN_N_FOR_WINNER trials -> A is credited the winner.
+    records = []
+    for i in range(5):
+        records.append(_rec("roman", "A", tok_in=100 + i, tok_out=10))
+        records.append(_rec("roman", "A+B", tok_in=300 + i, tok_out=50))
+    agg = aggregate_axis(records, "roman", "tokens_total")
+    assert agg["result"] == "separated"
+    assert agg["winner"] == "A"
+
+
+def test_aggregate_separated_but_underpowered_at_low_n():
+    # Disjoint ranges but only 2 trials each -> apparent direction reported, NO
+    # winner credited (guards against n=1/n=2 noise crowning a false winner).
     records = [
         _rec("roman", "A", tok_in=100, tok_out=10),
         _rec("roman", "A", tok_in=110, tok_out=10),
@@ -53,8 +66,9 @@ def test_aggregate_tokens_separated_lower_is_better():
         _rec("roman", "A+B", tok_in=320, tok_out=50),
     ]
     agg = aggregate_axis(records, "roman", "tokens_total")
-    assert agg["result"] == "separated"
-    assert agg["winner"] == "A"
+    assert agg["winner"] is None
+    assert agg["apparent_winner"] == "A"
+    assert "underpowered" in agg["result"]
 
 
 def test_aggregate_overlap_reports_no_separation():
@@ -70,11 +84,10 @@ def test_aggregate_overlap_reports_no_separation():
 
 
 def test_aggregate_graph_quality_higher_is_better_separated():
-    records = [
-        _rec("hello", "A", gq=60.0),
-        _rec("hello", "A+B", gq=90.0),
-        _rec("hello", "A+B", gq=95.0),
-    ]
+    records = []
+    for i in range(5):
+        records.append(_rec("hello", "A", gq=60.0 + i))
+        records.append(_rec("hello", "A+B", gq=90.0 + i))
     agg = aggregate_axis(records, "hello", "graph_quality")
     assert agg["result"] == "separated"
     assert agg["winner"] == "A+B"  # higher score wins

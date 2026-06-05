@@ -124,6 +124,7 @@ def run_one(
     holdout_evaluator=None,
     exploratory: bool = False,
     dot_dir: pathlib.Path | None = None,
+    run_spine: bool = True,
 ) -> dict:
     """Run a single (feature, mode, trial) and return one benchmark record.
 
@@ -143,6 +144,7 @@ def run_one(
             ir=ir, mode=mode, feature=feature, goal=goal, workdir=workdir,
             backend=backend, model_name=model_name, trial=trial, fit_score=fit_score,
             holdout_evaluator=holdout_evaluator, exploratory=exploratory, dot_dir=dot_dir,
+            run_spine=run_spine,
         )
     finally:
         if owns_dot_dir:
@@ -163,6 +165,7 @@ def _run_one_inner(
     holdout_evaluator,
     exploratory: bool,
     dot_dir: pathlib.Path,
+    run_spine: bool = True,
 ) -> dict:
     baseline_ref = _head(workdir)
     notes = ""
@@ -188,8 +191,14 @@ def _run_one_inner(
     if diff_empty:
         notes = "empty diff against baseline_ref — recorded as failed run"
 
-    # Reviewer spine (identical for both modes) grades the committed diff.
-    reached_exit_spine = _run_spine(ir, ctx, dot_dir)
+    # Reviewer spine (identical for both modes) grades the committed diff. The
+    # spine is mode-invariant and terminal (unconditional edges to exit), so it
+    # cannot separate A from A+B; the core measurement skips it (run_spine=False)
+    # to isolate the independent variable (the middle) and make large-n feasible.
+    # When skipped, reached_exit_spine is neutral-True (the spine would always
+    # have reached exit), so zero_touch reflects the middle + non-empty diff only.
+    reached_exit_spine = _run_spine(ir, ctx, dot_dir) if run_spine else True
+    spine_ran = run_spine
 
     # axis 1: conformance via sealed evaluator (operator-run, optional).
     if holdout_evaluator is not None:
@@ -211,6 +220,8 @@ def _run_one_inner(
     # axis 4: robustness / zero-touch.
     zero_touch = bool(middle_ok and reached_exit_spine and not diff_empty)
     loop_bounds_held = True  # linear smoke middle has no loops
+    spine_note = "spine=on" if spine_ran else "spine=off(mode-invariant,isolating middle)"
+    notes = f"{notes}; {spine_note}".lstrip("; ") if notes else spine_note
 
     return assemble_record(
         feature=feature,
@@ -283,6 +294,7 @@ def run_benchmark(
     workroot: pathlib.Path,
     out_path: pathlib.Path | None = None,
     holdout_evaluator=None,
+    run_spine: bool = True,
 ) -> list[dict]:
     """Run the A vs A+B benchmark over ``features`` x ``modes`` x ``trials``.
 
@@ -316,6 +328,7 @@ def run_benchmark(
                     model_name=model_name,
                     trial=trial,
                     holdout_evaluator=holdout_evaluator,
+                    run_spine=run_spine,
                 )
                 records.append(rec)
                 if out_path is not None:

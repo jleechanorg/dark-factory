@@ -34,6 +34,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--modes", type=_csv, default=["A", "A+B"],
                     help="comma-separated modes (default: A,A+B)")
     ap.add_argument("--trials", type=int, default=1)
+    ap.add_argument("--conformance", choices=["none", "local"], default="none",
+                    help="'local' grades hello/roman against their public acceptance "
+                         "criteria (lights up the conformance axis without the sealed repo)")
+    ap.add_argument("--spine", dest="spine", action="store_true", default=False,
+                    help="run the terminal reviewer spine (mode-invariant; off by default "
+                         "so the core measurement isolates the middle and runs at large n)")
+    ap.add_argument("--no-spine", dest="spine", action="store_false",
+                    help="skip the reviewer spine (default)")
     ap.add_argument("--backend", default="claude")
     ap.add_argument("--model", dest="model_name", default="claude-sonnet-4-6")
     ap.add_argument("--workroot", type=pathlib.Path, default=pathlib.Path("/tmp/wfgg-smoke"))
@@ -46,6 +54,10 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"no smoke goal defined for: {', '.join(unknown)} "
                  f"(known: {', '.join(sorted(SMOKE_GOALS))})")
 
+    holdout_evaluator = None
+    if args.conformance == "local":
+        from .conformance_local import evaluate as holdout_evaluator
+
     records = run_benchmark(
         features=args.features,
         modes=args.modes,
@@ -54,26 +66,35 @@ def main(argv: list[str] | None = None) -> int:
         model_name=args.model_name,
         workroot=args.workroot,
         out_path=args.out_path,
+        holdout_evaluator=holdout_evaluator,
+        run_spine=args.spine,
     )
 
     # Compact human-readable rollup to stderr; machine records went to --out.
     print(f"wrote {len(records)} records -> {args.out_path}", file=sys.stderr)
     for r in records:
         tok = r["tokens"]
+        conf = r.get("conformance") or {}
+        conf_str = (f"{conf.get('pass')}/{conf.get('total')}"
+                    if conf.get("available") else "n/a")
         print(
             f"  {r['feature']:6s} mode={r['mode']:3s} trial={r['trial']} "
-            f"zero_touch={r['zero_touch']!s:5s} diff_empty={r['diff_empty']!s:5s} "
+            f"conf={conf_str:5s} zero_touch={r['zero_touch']!s:5s} diff_empty={r['diff_empty']!s:5s} "
             f"gq70={r['graph_quality']['deterministic_70']} "
-            f"tok_in={tok['tokens_in']} tok_out={tok['tokens_out']} wall_ms={tok['wall_ms']}",
+            f"tok_in={tok['tokens_in']} tok_out={tok['tokens_out']} wall_ms={r['wall_ms']}",
             file=sys.stderr,
         )
     # §11.4 directional-signal aggregation (winner only on non-overlapping ranges).
     agg = aggregate(records)
     print("aggregation (directional signal):", file=sys.stderr)
     for row in agg["results"]:
+        suffix = ""
+        if row.get("winner"):
+            suffix = f" (winner={row['winner']})"
+        elif row.get("apparent_winner"):
+            suffix = f" (apparent={row['apparent_winner']}, not credited)"
         print(
-            f"  {row['feature']:6s} {row['axis']:14s} -> {row['result']}"
-            + (f" (winner={row['winner']})" if row.get("winner") else ""),
+            f"  {row['feature']:6s} {row['axis']:14s} -> {row['result']}{suffix}",
             file=sys.stderr,
         )
     if args.out_path is not None:

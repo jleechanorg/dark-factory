@@ -17,6 +17,7 @@ Key fairness rules encoded here:
 from __future__ import annotations
 
 import pathlib
+import statistics
 import tempfile
 
 from .graph_ir import GUARANTEED_NODES, GraphIR, render_full_dot
@@ -215,6 +216,8 @@ def _axis_value(record: dict, axis: str):
     if axis == "zero_touch":
         v = record.get("zero_touch")
         return 1.0 if v is True else (0.0 if v is False else None)
+    if axis == "wall_ms":
+        return _coerce_num(record.get("wall_ms"))  # lower is better
     return None
 
 
@@ -224,7 +227,28 @@ _AXIS_HIGHER_BETTER = {
     "tokens_total": False,
     "graph_quality": True,
     "zero_touch": True,
+    "wall_ms": False,
 }
+
+# A per-axis winner is only declared once each mode has at least this many
+# trials. Below it, even non-overlapping ranges are statistically underpowered
+# (at n=1 two distinct points ALWAYS "fail to overlap" — pure noise can manufacture
+# a confident-looking winner), so we refuse to name one.
+MIN_N_FOR_WINNER = 5
+
+
+def _stats(values: list) -> dict | None:
+    """Summary stats over the present (non-None) values of one mode/axis."""
+    present = [v for v in values if v is not None]
+    if not present:
+        return None
+    return {
+        "n": len(present),
+        "mean": round(statistics.fmean(present), 4),
+        "stdev": round(statistics.stdev(present), 4) if len(present) > 1 else 0.0,
+        "min": min(present),
+        "max": max(present),
+    }
 
 
 def _range(values: list):
@@ -248,8 +272,14 @@ def aggregate_axis(records: list[dict], feature: str, axis: str) -> dict:
         if r.get("mode") in by_mode:
             by_mode[r["mode"]].append(_axis_value(r, axis))
     ra, rb = _range(by_mode["A"]), _range(by_mode["A+B"])
-    n = min(len(by_mode["A"]), len(by_mode["A+B"]))
-    out = {"feature": feature, "axis": axis, "range_A": ra, "range_AB": rb, "n": n}
+    n_a = len([v for v in by_mode["A"] if v is not None])
+    n_b = len([v for v in by_mode["A+B"] if v is not None])
+    n = min(n_a, n_b)
+    out = {
+        "feature": feature, "axis": axis,
+        "range_A": ra, "range_AB": rb, "n": n,
+        "stats_A": _stats(by_mode["A"]), "stats_AB": _stats(by_mode["A+B"]),
+    }
     if ra is None or rb is None:
         out["winner"] = None
         out["result"] = "insufficient data"
@@ -262,8 +292,15 @@ def aggregate_axis(records: list[dict], feature: str, axis: str) -> dict:
         out["winner"] = None
         out["result"] = f"no separation at n={n}"
         return out
-    a_wins = (a_above_b and higher_better) or (b_above_a and not higher_better)
-    out["winner"] = "A" if a_wins else "A+B"
+    # Ranges separate — but a winner is only credible with enough trials. Below
+    # MIN_N_FOR_WINNER, report the apparent direction WITHOUT crowning a winner.
+    apparent = "A" if ((a_above_b and higher_better) or (b_above_a and not higher_better)) else "A+B"
+    if n < MIN_N_FOR_WINNER:
+        out["winner"] = None
+        out["apparent_winner"] = apparent
+        out["result"] = f"separated but underpowered (n={n} < {MIN_N_FOR_WINNER})"
+        return out
+    out["winner"] = apparent
     out["result"] = "separated"
     return out
 
@@ -271,7 +308,7 @@ def aggregate_axis(records: list[dict], feature: str, axis: str) -> dict:
 def aggregate(records: list[dict]) -> dict:
     """Per-feature, per-axis directional-signal aggregation over all records."""
     features = sorted({r.get("feature") for r in records if r.get("feature")})
-    axes = ("conformance", "tokens_total", "graph_quality", "zero_touch")
+    axes = ("conformance", "tokens_total", "graph_quality", "zero_touch", "wall_ms")
     return {
         "features": features,
         "axes": list(axes),

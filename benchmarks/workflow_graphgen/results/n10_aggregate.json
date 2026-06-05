@@ -1,0 +1,269 @@
+{
+  "features": [
+    "hello",
+    "roman"
+  ],
+  "axes": [
+    "conformance",
+    "tokens_total",
+    "graph_quality",
+    "zero_touch",
+    "wall_ms"
+  ],
+  "results": [
+    {
+      "feature": "hello",
+      "axis": "conformance",
+      "range_A": [
+        1.0,
+        1.0
+      ],
+      "range_AB": [
+        1.0,
+        1.0
+      ],
+      "n": 10,
+      "stats_A": {
+        "n": 10,
+        "mean": 1.0,
+        "stdev": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "stats_AB": {
+        "n": 10,
+        "mean": 1.0,
+        "stdev": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "winner": null,
+      "result": "no separation at n=10"
+    },
+    {
+      "feature": "hello",
+      "axis": "tokens_total",
+      "range_A": [
+        241130,
+        323448
+      ],
+      "range_AB": [
+        240830,
+        364808
+      ],
+      "n": 10,
+      "stats_A": {
+        "n": 10,
+        "mean": 281910.4,
+        "stdev": 27174.8214,
+        "min": 241130,
+        "max": 323448
+      },
+      "stats_AB": {
+        "n": 10,
+        "mean": 281397.9,
+        "stdev": 38754.6648,
+        "min": 240830,
+        "max": 364808
+      },
+      "winner": null,
+      "result": "no separation at n=10"
+    },
+    {
+      "feature": "hello",
+      "axis": "graph_quality",
+      "range_A": null,
+      "range_AB": null,
+      "n": 0,
+      "stats_A": null,
+      "stats_AB": null,
+      "winner": null,
+      "result": "insufficient data"
+    },
+    {
+      "feature": "hello",
+      "axis": "zero_touch",
+      "range_A": [
+        1.0,
+        1.0
+      ],
+      "range_AB": [
+        1.0,
+        1.0
+      ],
+      "n": 10,
+      "stats_A": {
+        "n": 10,
+        "mean": 1.0,
+        "stdev": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "stats_AB": {
+        "n": 10,
+        "mean": 1.0,
+        "stdev": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "winner": null,
+      "result": "no separation at n=10"
+    },
+    {
+      "feature": "hello",
+      "axis": "wall_ms",
+      "range_A": [
+        34877,
+        49010
+      ],
+      "range_AB": [
+        36297,
+        52921
+      ],
+      "n": 10,
+      "stats_A": {
+        "n": 10,
+        "mean": 41373.2,
+        "stdev": 3872.6989,
+        "min": 34877,
+        "max": 49010
+      },
+      "stats_AB": {
+        "n": 10,
+        "mean": 43550.2,
+        "stdev": 6030.2288,
+        "min": 36297,
+        "max": 52921
+      },
+      "winner": null,
+      "result": "no separation at n=10"
+    },
+    {
+      "feature": "roman",
+      "axis": "conformance",
+      "range_A": [
+        1.0,
+        1.0
+      ],
+      "range_AB": [
+        1.0,
+        1.0
+      ],
+      "n": 10,
+      "stats_A": {
+        "n": 10,
+        "mean": 1.0,
+        "stdev": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "stats_AB": {
+        "n": 10,
+        "mean": 1.0,
+        "stdev": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "winner": null,
+      "result": "no separation at n=10"
+    },
+    {
+      "feature": "roman",
+      "axis": "tokens_total",
+      "range_A": [
+        244697,
+        367441
+      ],
+      "range_AB": [
+        245519,
+        367032
+      ],
+      "n": 10,
+      "stats_A": {
+        "n": 10,
+        "mean": 304747.7,
+        "stdev": 39946.0281,
+        "min": 244697,
+        "max": 367441
+      },
+      "stats_AB": {
+        "n": 10,
+        "mean": 313718.7,
+        "stdev": 38618.2845,
+        "min": 245519,
+        "max": 367032
+      },
+      "winner": null,
+      "result": "no separation at n=10"
+    },
+    {
+      "feature": "roman",
+      "axis": "graph_quality",
+      "range_A": null,
+      "range_AB": null,
+      "n": 0,
+      "stats_A": null,
+      "stats_AB": null,
+      "winner": null,
+      "result": "insufficient data"
+    },
+    {
+      "feature": "roman",
+      "axis": "zero_touch",
+      "range_A": [
+        1.0,
+        1.0
+      ],
+      "range_AB": [
+        1.0,
+        1.0
+      ],
+      "n": 10,
+      "stats_A": {
+        "n": 10,
+        "mean": 1.0,
+        "stdev": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "stats_AB": {
+        "n": 10,
+        "mean": 1.0,
+        "stdev": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "winner": null,
+      "result": "no separation at n=10"
+    },
+    {
+      "feature": "roman",
+      "axis": "wall_ms",
+      "range_A": [
+        42467,
+        54247
+      ],
+      "range_AB": [
+        46990,
+        63913
+      ],
+      "n": 10,
+      "stats_A": {
+        "n": 10,
+        "mean": 48700.2,
+        "stdev": 3637.0015,
+        "min": 42467,
+        "max": 54247
+      },
+      "stats_AB": {
+        "n": 10,
+        "mean": 53189.9,
+        "stdev": 4868.159,
+        "min": 46990,
+        "max": 63913
+      },
+      "winner": null,
+      "result": "no separation at n=10"
+    }
+  ]
+}
