@@ -443,3 +443,27 @@ def test_evaluator_subprocess_error_yields_unavailable_conformance(repo, monkeyp
     assert conf["available"] is False, (
         "evaluator subprocess errors must be recorded as available=False, not real 0% conformance"
     )
+
+
+def test_conformance_local_propagates_child_error_field(tmp_path):
+    """conformance_local.evaluate() must preserve the child's error field.
+
+    Bugbot #3365286174 — when the child subprocess returns JSON with an 'error'
+    field (e.g. module import failure: {'pass':0,'total':5,'error':'import:...'}),
+    evaluate() was parsing the JSON but only returning {pass, total}, silently
+    dropping the error. Without the error field, _run_one_inner's conf.get('error')
+    check returns None and the run is incorrectly marked available=True.
+    """
+    import os
+    import subprocess
+    from benchmarks.workflow_graphgen import conformance_local
+
+    # Plant an empty workdir (no hello.py) so the child reports an import error.
+    # That produces JSON: {"pass": 0, "total": N, "error": "import: ..."}
+    wd = tmp_path / "empty_repo"
+    wd.mkdir()
+    result = conformance_local.evaluate(wd, "hello")
+    # evaluate() must propagate the error field from the child JSON.
+    assert "error" in result, (
+        "evaluate() must forward the child's 'error' field when the module import fails"
+    )

@@ -126,4 +126,7 @@ def evaluate(workdir, feature: str, baseline_ref: str = "", head_ref: str = "") 
         return {"pass": 0, "total": spec and len(spec["cases"]) or 0,
                 "error": f"no json from child (rc={proc.returncode}): {proc.stderr[-200:]!r}"}
     data = json.loads(last)
-    return {"pass": int(data.get("pass", 0)), "total": int(data.get("total", len(spec["cases"])))}
+    result = {"pass": int(data.get("pass", 0)), "total": int(data.get("total", len(spec["cases"])))}
+    if "error" in data:
+        result["error"] = data["error"]
+    return result
