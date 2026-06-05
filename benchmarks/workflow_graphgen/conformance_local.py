@@ -51,6 +51,8 @@ _CASES: dict[str, dict] = {
             {"func": "to_roman", "args": [0], "raises": "ValueError"},
             {"func": "to_roman", "args": [4000], "raises": "ValueError"},
             {"func": "to_roman", "args": [-1], "raises": "ValueError"},
+            {"func": "to_roman", "args": [1.5], "raises": "ValueError"},
+            {"func": "to_roman", "args": ["X"], "raises": "ValueError"},
         ],
     },
 }
