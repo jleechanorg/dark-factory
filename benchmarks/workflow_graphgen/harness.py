@@ -24,6 +24,7 @@ import runner.parser as parser_mod
 from runner.handlers import Context, _codergen
 from runner.parser import Node
 
+from .catalog import validate_node_prompts
 from .generator import DEFAULT_CODER_BACKEND, DEFAULT_CODER_MODEL, deterministic_generator
 from .graph_ir import (
     GraphIR,
@@ -69,7 +70,7 @@ def assert_no_retry_wiring(graph) -> None:
 
 def _run_middle_mode_a(ir: GraphIR, ctx: Context, dot_dir: pathlib.Path) -> tuple[list[dict], bool]:
     """Mode A middle: runner walks start -> middle -> exit. Returns per-node token
-    records and whether the runner reached exit (zero_touch signal)."""
+    records and whether all middle nodes succeeded (same semantics as Mode A+B ok)."""
     dot_path = dot_dir / "mode_a_middle.dot"
     dot_path.write_text(render_middle_only_dot(ir))
     graph = parser_mod.parse(dot_path)
@@ -77,8 +78,14 @@ def _run_middle_mode_a(ir: GraphIR, ctx: Context, dot_dir: pathlib.Path) -> tupl
     history = engine_mod.run(graph, ctx, max_steps=100)
     middle_names = {n.name for n in ir.middle_chain()}
     token_records = [read_token_record(s.metadata) for s in history if s.node in middle_names]
-    reached_exit = any(parser_mod.is_exit_node(graph.nodes[s.node]) for s in history if s.node in graph.nodes)
-    return token_records, reached_exit
+    # Check all middle nodes succeeded — mirrors Mode A+B's `ok` check so zero_touch
+    # is symmetric. Unconditional edges on a linear middle graph let the runner visit
+    # exit even after a failed coder node; relying on reached_exit would overcount.
+    middle_ok = all(
+        s.outcome in ("success", "warn")
+        for s in history if s.node in middle_names
+    )
+    return token_records, middle_ok
 
 
 def _run_middle_mode_apb(ir: GraphIR, ctx: Context) -> tuple[list[dict], bool]:
@@ -87,7 +94,10 @@ def _run_middle_mode_apb(ir: GraphIR, ctx: Context) -> tuple[list[dict], bool]:
     token_records: list[dict] = []
     ok = True
     for nir in ir.middle_chain():
-        attrs = {"type": nir.type, "prompt": "@" + nir.prompt, "label": nir.name}
+        # nir.prompt is documented as no-leading-@ but validate() accepts both forms,
+        # so strip any existing @ before prepending to avoid "@@prompts/..." double-prefix.
+        prompt_ref = nir.prompt if nir.prompt.startswith("@") else "@" + nir.prompt
+        attrs = {"type": nir.type, "prompt": prompt_ref, "label": nir.name}
         if nir.backend:
             attrs["backend"] = nir.backend
         if nir.model_name:
@@ -247,6 +257,7 @@ def generate_ir(goal: str, backend: str, model_name: str | None) -> GraphIR:
     """Generate the shared graph-IR once per goal (deterministic default)."""
     ir = deterministic_generator(goal, backend=backend, model_name=model_name)
     ir.validate()
+    validate_node_prompts(n.prompt for n in ir.nodes)
     return ir
 
 

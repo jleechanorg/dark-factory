@@ -22,6 +22,8 @@ sys.path.insert(0, str(ROOT))
 
 from benchmarks.workflow_graphgen import harness  # noqa: E402
 from benchmarks.workflow_graphgen.graph_ir import GUARANTEED_NODES  # noqa: E402
+from benchmarks.workflow_graphgen.harness import _run_middle_mode_a, _run_middle_mode_apb  # noqa: E402
+from runner.handlers import Context  # noqa: E402
 
 _HEX40 = lambda s: isinstance(s, str) and len(s) == 40 and all(c in "0123456789abcdef" for c in s)
 
@@ -107,3 +109,51 @@ def test_record_json_serializable(repo):
     rec = _run("A+B", repo)
     json.dumps(rec)  # must not raise — records are emitted as JSONL
     assert set(GUARANTEED_NODES) == {"code_reviewer", "gate_es", "gate_er"}
+
+
+def test_mode_a_zero_touch_not_credited_on_middle_failure(repo, tmp_path):
+    """Mode A must not credit middle_ok=True when a middle coder node fails.
+
+    Regression guard: Mode A uses unconditional edges so the runner visits exit
+    even after a failed plan/implement.  The old reached_exit approach would return
+    True; the outcome-based check must return False, matching Mode A+B semantics.
+    """
+    monkeypatch_env = {"DARK_FACTORY_HOME": str(ROOT)}
+    import os
+    saved = {k: os.environ.get(k) for k in monkeypatch_env}
+    os.environ.update(monkeypatch_env)
+    try:
+        ir = harness.generate_ir("smoke goal", backend="echo", model_name=None)
+        first_middle = ir.middle_chain()[0]
+        ctx = Context(
+            goal="smoke goal",
+            workdir=repo,
+            backend="echo",
+            state={f"{first_middle.name}.outcome": "failure"},
+        )
+        dot_dir = tmp_path / "dots"
+        dot_dir.mkdir()
+        _, middle_ok = _run_middle_mode_a(ir, ctx, dot_dir)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert middle_ok is False, "Mode A must propagate node failure to middle_ok"
+
+
+def test_mode_apb_middle_ok_false_on_failure(repo):
+    """Mode A+B ok must be False when any middle node fails (baseline for symmetry)."""
+    import os
+    os.environ.setdefault("DARK_FACTORY_HOME", str(ROOT))
+    ir = harness.generate_ir("smoke goal", backend="echo", model_name=None)
+    first_middle = ir.middle_chain()[0]
+    ctx = Context(
+        goal="smoke goal",
+        workdir=repo,
+        backend="echo",
+        state={f"{first_middle.name}.outcome": "failure"},
+    )
+    _, ok = _run_middle_mode_apb(ir, ctx)
+    assert ok is False
