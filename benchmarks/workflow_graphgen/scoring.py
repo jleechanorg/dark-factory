@@ -269,6 +269,8 @@ def aggregate_axis(records: list[dict], feature: str, axis: str) -> dict:
     for r in records:
         if r.get("feature") != feature:
             continue
+        if r.get("exploratory"):
+            continue
         if r.get("mode") in by_mode:
             by_mode[r["mode"]].append(_axis_value(r, axis))
     ra, rb = _range(by_mode["A"]), _range(by_mode["A+B"])

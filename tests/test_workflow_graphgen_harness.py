@@ -227,6 +227,59 @@ def test_mode_a_token_records_deduped_by_node(repo, tmp_path):
     assert len(token_records) == len(middle_names)
 
 
+def test_run_benchmark_passes_exploratory_flag_through_to_records(tmp_path, monkeypatch):
+    """run_benchmark must accept and forward exploratory=True to each run_one call.
+
+    Cursor Bugbot #3365141196 — run_benchmark always hardcodes exploratory=False,
+    so exploratory runs via run_benchmark are silently mis-labelled in the output
+    records and contaminate downstream aggregation.
+    """
+    import os
+    os.environ.setdefault("DARK_FACTORY_HOME", str(ROOT))
+    captured: list[dict] = []
+
+    def fake_run_one(**kwargs):
+        captured.append(kwargs)
+        return {
+            "feature": kwargs["feature"],
+            "mode": kwargs["mode"],
+            "trial": kwargs["trial"],
+            "exploratory": kwargs.get("exploratory", False),
+            "tokens": {"tokens_in": 0, "tokens_out": 0, "wall_ms": 0},
+            "graph_quality": {
+                "score": None, "unscored": True, "presence": True,
+                "edge_validity": True, "deterministic_70": 70.0,
+            },
+            "zero_touch": False,
+            "conformance": {"available": False},
+            "baseline_ref": "a" * 40,
+            "head_ref": "b" * 40,
+            "diff_empty": True,
+            "loop_bounds_held": True,
+            "backend": "echo",
+            "model_name": None,
+            "notes": "",
+        }
+
+    monkeypatch.setattr(harness, "_seed_repo", lambda p: None)
+    monkeypatch.setattr(harness, "run_one", fake_run_one)
+
+    records = harness.run_benchmark(
+        features=["hello"],
+        modes=["A"],
+        trials=1,
+        backend="echo",
+        model_name=None,
+        workroot=tmp_path,
+        exploratory=True,
+    )
+    assert len(captured) == 1, "run_benchmark should have called run_one once"
+    assert captured[0]["exploratory"] is True, (
+        "run_benchmark must forward exploratory=True to run_one"
+    )
+    assert records[0]["exploratory"] is True
+
+
 def test_mode_a_unvisited_middle_node_means_failure(repo, tmp_path, monkeypatch):
     """Mode A middle_ok must be False when any expected middle node was never visited.
 

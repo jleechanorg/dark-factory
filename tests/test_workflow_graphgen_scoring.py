@@ -98,3 +98,30 @@ def test_aggregate_conformance_unavailable_is_insufficient():
     agg = aggregate_axis(records, "hello", "conformance")
     assert agg["winner"] is None
     assert agg["result"] == "insufficient data"
+
+
+def test_aggregate_axis_excludes_exploratory_records():
+    """Exploratory records must not contaminate range computation or winner declaration.
+
+    Cursor Bugbot #3365141204 — aggregate_axis includes every record without
+    checking the exploratory flag, so a cheap exploratory A+B run would make A+B
+    look better than it is and block the real winner from being credited.
+    """
+    records = []
+    # 5 fair A records: tokens_in 100–104 (cheaper)
+    for i in range(5):
+        records.append(_rec("hello", "A", tok_in=100 + i, tok_out=10))
+    # 5 fair A+B records: tokens_in 300–304 (more expensive → A should win)
+    for i in range(5):
+        records.append(_rec("hello", "A+B", tok_in=300 + i, tok_out=50))
+    # 5 exploratory A+B records with artificially cheap tokens — if included
+    # they would pull A+B range down to [50,54], overlapping A's [100,104]
+    # and blocking the A winner.  They must be excluded.
+    for i in range(5):
+        r = _rec("hello", "A+B", tok_in=50 + i, tok_out=5)
+        r["exploratory"] = True
+        records.append(r)
+    agg = aggregate_axis(records, "hello", "tokens_total")
+    assert agg["winner"] == "A", (
+        f"exploratory records contaminated aggregation: {agg}"
+    )

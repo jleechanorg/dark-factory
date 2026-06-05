@@ -354,6 +354,7 @@ def run_benchmark(
     out_path: pathlib.Path | None = None,
     holdout_evaluator=None,
     run_spine: bool = True,
+    exploratory: bool = False,
 ) -> list[dict]:
     """Run the A vs A+B benchmark over ``features`` x ``modes`` x ``trials``.
 
@@ -387,6 +388,7 @@ def run_benchmark(
                     model_name=model_name,
                     trial=trial,
                     holdout_evaluator=holdout_evaluator,
+                    exploratory=exploratory,
                     run_spine=run_spine,
                 )
                 records.append(rec)
