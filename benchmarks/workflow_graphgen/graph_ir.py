@@ -79,7 +79,12 @@ class GraphIR:
             for n in d["nodes"]
         ]
         edges = [
-            EdgeIR(src=e["src"], dst=e["dst"], condition=e.get("condition"))
+            # Accept both spec-documented {from, to} and internal {src, dst} forms.
+            EdgeIR(
+                src=e.get("src") or e["from"],
+                dst=e.get("dst") or e["to"],
+                condition=e.get("condition"),
+            )
             for e in d["edges"]
         ]
         return cls(
