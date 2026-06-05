@@ -1,4 +1,4 @@
-"""Echo-backend plumbing test for the workflow_graphgen harness.
+"""Echo-backend plumbing tests for the workflow_graphgen harness.
 
 Proves the full Mode A / Mode A+B machinery end-to-end without an LLM:
   * a shared graph-IR is generated once and drives both modes,
