@@ -20,9 +20,9 @@ Score from 0 to 100 based on:
 
 ## Output format
 
-Respond with ONLY a JSON object on a single line:
+Respond with ONLY a JSON object on a single line (no newlines inside the object):
 
-```json
+```
 {"score": <integer 0-100>, "rationale": "<one sentence>"}
 ```
 
