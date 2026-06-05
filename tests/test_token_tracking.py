@@ -17,7 +17,13 @@ sys.path.insert(0, str(ROOT))
 
 from runner.cxdb import CXDB
 from runner.engine import run
-from runner.handlers import Context, Result, TYPE_REGISTRY, _codergen_metrics
+from runner.handlers import (
+    Context,
+    Result,
+    TYPE_REGISTRY,
+    _claude_json_result,
+    _codergen_metrics,
+)
 from runner.healer import _clusters
 from runner.parser import parse
 
@@ -73,6 +79,57 @@ def test_metrics_parser_tolerates_thousands_separators():
     m = _codergen_metrics("input_tokens=12,345 output_tokens=6_789\n", "", wall_ms=1)
     assert m["tokens_in"] == 12345
     assert m["tokens_out"] == 6789
+
+
+# ---------------------------------------------------------------------------
+# claude --output-format json envelope parsing
+# ---------------------------------------------------------------------------
+
+
+def test_claude_json_result_extracts_usage_and_cost():
+    """The JSON envelope is the authoritative source for coder tokens + cost.
+
+    Mirrors the real `claude --print --output-format json` shape (usage carries
+    input_tokens/output_tokens; total_cost_usd is the dollar figure).
+    """
+    envelope = {
+        "type": "result",
+        "result": "wrote hello.py",
+        "usage": {"input_tokens": 1642, "output_tokens": 4,
+                  "cache_read_input_tokens": 0,
+                  "cache_creation_input_tokens": 38108},
+        "total_cost_usd": 0.24648,
+    }
+    text, m = _claude_json_result(json.dumps(envelope), "", wall_ms=5000)
+    assert text == "wrote hello.py"  # output is the readable result, not raw JSON
+    # tokens_in counts ALL input the model processed (fresh + cache), since
+    # `input_tokens` alone undercounts when prompt caching is active.
+    assert m["tokens_in"] == 1642 + 0 + 38108
+    assert m["tokens_in_fresh"] == 1642
+    assert m["tokens_cache_create"] == 38108
+    assert m["tokens_out"] == 4
+    assert abs(m["cost_usd"] - 0.24648) < 1e-9
+    assert m["wall_ms"] == 5000
+
+
+def test_claude_json_result_falls_back_on_non_json():
+    """A non-JSON stdout (older CLI / crash preamble) degrades gracefully:
+    raw text is preserved and tokens stay None (not a silent zero)."""
+    text, m = _claude_json_result("plain text, no envelope\n", "", wall_ms=12)
+    assert text == "plain text, no envelope\n"
+    assert m["wall_ms"] == 12
+    assert m["tokens_in"] is None
+    assert m["tokens_out"] is None
+    assert m["cost_usd"] is None
+
+
+def test_claude_json_result_missing_usage_keeps_tokens_none():
+    """A well-formed envelope lacking `usage` must not fabricate token counts."""
+    envelope = {"type": "result", "result": "ok"}
+    text, m = _claude_json_result(json.dumps(envelope), "", wall_ms=7)
+    assert text == "ok"
+    assert m["tokens_in"] is None
+    assert m["tokens_out"] is None
 
 
 # ---------------------------------------------------------------------------
