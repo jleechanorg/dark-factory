@@ -19,6 +19,7 @@ import json
 import pathlib
 import sys
 
+from .generator import DEFAULT_CODER_BACKEND
 from .harness import SMOKE_GOALS, run_benchmark
 from .scoring import aggregate
 
@@ -58,6 +59,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.conformance == "local":
         from .conformance_local import evaluate as holdout_evaluator
 
+    # Non-canonical backends (anything other than the designated fair-lane claude
+    # backend) produce exploratory runs that must be excluded from per-axis winner
+    # aggregation so they cannot skew or block credited winners.
+    exploratory = args.backend != DEFAULT_CODER_BACKEND
+
     records = run_benchmark(
         features=args.features,
         modes=args.modes,
@@ -68,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
         out_path=args.out_path,
         holdout_evaluator=holdout_evaluator,
         run_spine=args.spine,
+        exploratory=exploratory,
     )
 
     # Compact human-readable rollup to stderr; machine records went to --out.

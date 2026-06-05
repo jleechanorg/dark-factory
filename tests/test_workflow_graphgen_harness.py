@@ -318,6 +318,68 @@ def test_run_benchmark_passes_exploratory_flag_through_to_records(tmp_path, monk
     assert records[0]["exploratory"] is True
 
 
+def test_cli_sets_exploratory_true_for_non_claude_backend(tmp_path, monkeypatch):
+    """CLI must auto-infer exploratory=True for non-claude backends.
+
+    Bugbot #3365232430 — __main__.main() always calls run_benchmark with the
+    default exploratory=False even for --backend codex or other non-canonical
+    backends. Non-claude runs are not fair-lane comparisons; they must be labeled
+    exploratory so aggregate_axis excludes them from winner computation.
+    """
+    import os
+    os.environ.setdefault("DARK_FACTORY_HOME", str(ROOT))
+    from benchmarks.workflow_graphgen import __main__ as cli_mod
+
+    captured: dict = {}
+
+    def fake_run_benchmark(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cli_mod, "run_benchmark", fake_run_benchmark)
+
+    cli_mod.main([
+        "--features", "hello",
+        "--modes", "A",
+        "--trials", "1",
+        "--backend", "codex",
+        "--workroot", str(tmp_path),
+        "--out", str(tmp_path / "out.jsonl"),
+    ])
+
+    assert captured.get("exploratory") is True, (
+        "CLI must set exploratory=True for non-claude (non-canonical fair-lane) backends"
+    )
+
+
+def test_cli_sets_exploratory_false_for_canonical_backend(tmp_path, monkeypatch):
+    """CLI must keep exploratory=False for the canonical claude backend."""
+    import os
+    os.environ.setdefault("DARK_FACTORY_HOME", str(ROOT))
+    from benchmarks.workflow_graphgen import __main__ as cli_mod
+
+    captured: dict = {}
+
+    def fake_run_benchmark(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cli_mod, "run_benchmark", fake_run_benchmark)
+
+    cli_mod.main([
+        "--features", "hello",
+        "--modes", "A",
+        "--trials", "1",
+        "--backend", "claude",
+        "--workroot", str(tmp_path),
+        "--out", str(tmp_path / "out.jsonl"),
+    ])
+
+    assert captured.get("exploratory") is False, (
+        "CLI must keep exploratory=False for the canonical claude backend"
+    )
+
+
 def test_mode_a_unvisited_middle_node_means_failure(repo, tmp_path, monkeypatch):
     """Mode A middle_ok must be False when any expected middle node was never visited.
 
