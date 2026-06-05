@@ -157,3 +157,71 @@ def test_mode_apb_middle_ok_false_on_failure(repo):
     )
     _, ok = _run_middle_mode_apb(ir, ctx)
     assert ok is False
+
+
+# ── Regression guards for cursor review comments (PR #16) ──────────────────
+
+
+def test_assert_no_retry_wiring_rejects_max_visits_gt_1():
+    """assert_no_retry_wiring must reject nodes with max_visits>1.
+
+    When a middle node carries max_visits>1 the runner may visit it multiple
+    times, inflating Mode A's token totals and breaking A/A+B symmetry.
+    """
+    from runner.parser import Edge, Graph, Node
+    graph = Graph(
+        name="test", goal="",
+        nodes={
+            "start": Node("start"),
+            "implement": Node("implement", attrs={"max_visits": "3"}),
+            "exit": Node("exit"),
+        },
+        edges=[Edge("start", "implement"), Edge("implement", "exit")],
+    )
+    with pytest.raises(AssertionError, match="max_visits"):
+        harness.assert_no_retry_wiring(graph)
+
+
+def test_assert_no_retry_wiring_rejects_cycles():
+    """assert_no_retry_wiring must detect cyclic fix-loops.
+
+    Mode A's runner follows cyclic edges (plan -> fix -> plan), revisiting
+    nodes, while Mode A+B iterates middle_chain() once per node — the two
+    modes would execute different numbers of codergen calls, breaking symmetry.
+    """
+    from runner.parser import Edge, Graph, Node
+    graph = Graph(
+        name="test", goal="",
+        nodes={
+            "start": Node("start"),
+            "plan": Node("plan"),
+            "fix": Node("fix"),
+            "exit": Node("exit"),
+        },
+        edges=[
+            Edge("start", "plan"),
+            Edge("plan", "fix"),
+            Edge("fix", "plan"),  # cycle: fix -> plan
+            Edge("plan", "exit"),
+        ],
+    )
+    with pytest.raises(AssertionError, match="cycle"):
+        harness.assert_no_retry_wiring(graph)
+
+
+def test_mode_a_token_records_deduped_by_node(repo, tmp_path):
+    """Mode A token_records must contain exactly one record per middle node.
+
+    Defensive guard: even if a node appears twice in engine history (e.g. due
+    to a race or bug), the harness must not double-count its tokens.
+    """
+    import os
+    os.environ.setdefault("DARK_FACTORY_HOME", str(ROOT))
+    ir = harness.generate_ir("smoke goal", backend="echo", model_name=None)
+    ctx = Context(goal="smoke goal", workdir=repo, backend="echo", state={})
+    dot_dir = tmp_path / "dots"
+    dot_dir.mkdir()
+    token_records, _ = _run_middle_mode_a(ir, ctx, dot_dir)
+    # One record per unique middle node — no duplicates.
+    middle_names = [n.name for n in ir.middle_chain()]
+    assert len(token_records) == len(middle_names)

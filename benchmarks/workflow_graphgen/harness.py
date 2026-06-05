@@ -57,9 +57,36 @@ def _head(workdir: pathlib.Path) -> str:
     return _git(workdir, "rev-parse", "HEAD")
 
 
+def _assert_no_cycles(graph) -> None:
+    """DFS cycle check — cyclic graphs allow Mode A to revisit nodes while Mode A+B
+    iterates middle_chain() once, breaking A/A+B call-count symmetry."""
+    visited: set[str] = set()
+    rec_stack: set[str] = set()
+
+    def dfs(name: str) -> None:
+        visited.add(name)
+        rec_stack.add(name)
+        for edge in graph.edges:
+            if edge.src == name:
+                if edge.dst not in visited:
+                    dfs(edge.dst)
+                elif edge.dst in rec_stack:
+                    raise AssertionError(
+                        f"graph has cycle through {name!r} → {edge.dst!r} — "
+                        "Mode A runner would revisit nodes, breaking A/A+B symmetry"
+                    )
+        rec_stack.discard(name)
+
+    for node_name in graph.nodes:
+        if node_name not in visited:
+            dfs(node_name)
+
+
 def assert_no_retry_wiring(graph) -> None:
     """Fairness assertion (spec §5): in BOTH modes neither any guaranteed reviewer
-    node nor the graph itself may enable a goal_gate or declare a retry_target."""
+    node nor the graph itself may enable a goal_gate, declare a retry_target,
+    use max_visits>1, or contain cycles — all of which let Mode A visit a node
+    more than once while Mode A+B executes each middle node exactly once."""
     if str(graph.attrs.get("retry_target", "")):
         raise AssertionError("graph declares a retry_target — breaks A/A+B symmetry")
     for name, node in graph.nodes.items():
@@ -70,6 +97,12 @@ def assert_no_retry_wiring(graph) -> None:
             raise AssertionError(f"node {name!r} enables goal_gate — breaks A/A+B symmetry")
         if str(node.attrs.get("retry_target", "")):
             raise AssertionError(f"node {name!r} declares retry_target — breaks A/A+B symmetry")
+        if str(node.attrs.get("max_visits", "")) not in ("", "1"):
+            raise AssertionError(
+                f"node {name!r} has max_visits={node.attrs['max_visits']} — "
+                "breaks A/A+B symmetry"
+            )
+    _assert_no_cycles(graph)
 
 
 def _run_middle_mode_a(ir: GraphIR, ctx: Context, dot_dir: pathlib.Path) -> tuple[list[dict], bool]:
@@ -81,13 +114,21 @@ def _run_middle_mode_a(ir: GraphIR, ctx: Context, dot_dir: pathlib.Path) -> tupl
     assert_no_retry_wiring(graph)
     history = engine_mod.run(graph, ctx, max_steps=100)
     middle_names = {n.name for n in ir.middle_chain()}
-    token_records = [read_token_record(s.metadata) for s in history if s.node in middle_names]
-    # Check all middle nodes succeeded — mirrors Mode A+B's `ok` check so zero_touch
-    # is symmetric. Unconditional edges on a linear middle graph let the runner visit
-    # exit even after a failed coder node; relying on reached_exit would overcount.
+    # Keep only the LAST StepRecord per middle node — matches Mode A+B's
+    # one-record-per-node semantics. assert_no_retry_wiring prevents max_visits>1
+    # and cycles, so there is normally exactly one visit; this dedup is a defensive guard.
+    last_by_node: dict[str, object] = {}
+    for s in history:
+        if s.node in middle_names:
+            last_by_node[s.node] = s
+    token_records = [
+        read_token_record(last_by_node[n.name].metadata)
+        for n in ir.middle_chain()
+        if n.name in last_by_node
+    ]
     middle_ok = all(
         s.outcome in ("success", "warn")
-        for s in history if s.node in middle_names
+        for s in last_by_node.values()
     )
     return token_records, middle_ok
 
