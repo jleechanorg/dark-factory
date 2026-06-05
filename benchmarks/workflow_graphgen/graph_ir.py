@@ -127,7 +127,6 @@ class GraphIR:
         if not self.nodes:
             raise ValueError("graph-IR has no dynamic-middle nodes")
         catalog = load_catalog()["prompts"]
-        approved = set(catalog.values())
         names = [n.name for n in self.nodes]
         if len(names) != len(set(names)):
             raise ValueError(f"duplicate middle node names: {names}")
@@ -138,8 +137,14 @@ class GraphIR:
             if n.name in reserved:
                 raise ValueError(f"middle node {n.name!r} collides with a reserved/guaranteed name")
             ref = n.prompt[1:] if n.prompt.startswith("@") else n.prompt
-            if ref not in approved:
-                raise ValueError(f"node {n.name!r} prompt {n.prompt!r} not in catalog")
+            expected = catalog.get(n.type)
+            if expected is None:
+                raise ValueError(f"node type {n.type!r} not in catalog")
+            if ref != expected:
+                raise ValueError(
+                    f"node {n.name!r} (type={n.type!r}) prompt {n.prompt!r} "
+                    f"does not match catalog entry {expected!r}"
+                )
         if list(self.guaranteed) != list(GUARANTEED_NODES):
             raise ValueError(
                 f"guaranteed must be the pinned set {GUARANTEED_NODES}, got {self.guaranteed}"

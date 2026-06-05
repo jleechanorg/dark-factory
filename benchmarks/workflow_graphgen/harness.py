@@ -46,6 +46,10 @@ def _git(workdir: pathlib.Path, *args: str) -> str:
         text=True,
         check=False,
     )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git {list(args)} failed in {workdir} (rc={proc.returncode}): {proc.stderr.strip()}"
+        )
     return proc.stdout.strip()
 
 

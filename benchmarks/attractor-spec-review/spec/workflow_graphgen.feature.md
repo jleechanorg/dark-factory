@@ -191,7 +191,8 @@ thirty five percent, is computed in code as a binary check that both reviewer
 nodes are present and reachable. The edge validity part, weight thirty five
 percent, is computed in code as a binary check that the description renders to a
 parser valid graph. The node selection fit part, weight thirty percent, is a zero
-to one hundred judgment from the cold reviewer using a fixed rubric prompt. When the reviewer score cannot be parsed, the fit part is recorded
+to one hundred judgment from the cold reviewer using a fixed rubric prompt
+at prompts/graph_quality_rubric.md. When the reviewer score cannot be parsed, the fit part is recorded
 as unscored and the run reports the deterministic seventy percent partial with an
 unscored flag rather than a silent zero.
 

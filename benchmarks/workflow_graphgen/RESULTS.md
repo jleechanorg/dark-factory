@@ -56,7 +56,7 @@ No axis crosses the §11.4 non-overlap bar, so **zero winners are credited** at 
 ## What this measurement can and cannot prove
 
 - **Can prove:** conformance (self-contained public acceptance criteria — no sealed repo, no
-  isolation break), token cost (uncounfounded — byte-identical prompt), wall-clock, zero-touch.
+  isolation break), token cost (unconfounded — byte-identical prompt), wall-clock, zero-touch.
 - **Cannot prove (structural):** `graph_quality` can *never* separate A from A+B — both consume the
   same IR. Any graph-quality claim is mode-invariant and must not be cited as an A-vs-A+B difference.
 - **Honest scope:** hello/roman are easy, self-contained tasks. A null result here means the dispatch
