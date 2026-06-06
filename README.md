@@ -87,6 +87,78 @@ Dark Factory operates as the top layer of a modern, modular agentic stack:
 
 ---
 
+## 🧭 How Dark Factory works
+
+### System architecture (three-layer convergence + isolation + CXDB/Healer)
+
+```mermaid
+flowchart TB
+  subgraph OP["Operator / human — sees everything"]
+    SPEC["specs/*.md + prompts/ + pipelines/*.dot"]
+    HOLD["sealed holdouts (sibling repo)<br/>DARK_FACTORY_HOLDOUTS"]
+  end
+  subgraph L1["Layer 1 — Pipeline engine (this repo · runner/)"]
+    PARSE["parser.py<br/>DOT to Graph(nodes, edges)"]
+    ENGINE["engine.py · run()<br/>walk start to exit · _edge_matches · max_visits"]
+    HAND["handlers.py · resolve(node)<br/>type to name to shape to _codergen"]
+    CXDB[("CXDB · cxdb.py<br/>SQLite WAL event log")]
+    HEAL["healer.py<br/>cluster failures to diagnosis.md"]
+  end
+  subgraph L2["Layer 2 — Agent loop (external CLIs)"]
+    CODER["codergen node<br/>claude · codex · ao · agy"]
+    REVIEW["reviewer / tool node<br/>codex exec --yolo"]
+    EVAL["holdout_eval node<br/>sealed evaluator run.py"]
+  end
+  subgraph L3["Layer 3 — LLM client"]
+    GW["OpenClaw gateway / thinclaw MCP"]
+  end
+  SPEC --> PARSE --> ENGINE --> HAND
+  HAND --> CODER & REVIEW & EVAL
+  CODER --> GW
+  ENGINE -- per step --> CXDB --> HEAL
+  HOLD -. sealed · sandbox-exec deny file-read .-> EVAL
+  CODER -. cannot read (isolation) .-x HOLD
+```
+
+The durable artifact is the `.dot` graph — version it, review it in PRs, and treat the
+Python under `runner/` as disposable *dorodango* (polish, discard, rebuild from spec).
+The isolation guarantee is structural: the implementing/`codergen` agent only ever sees
+the spec, prompts, and its own worktree — never `holdouts/` or the sealed evaluator,
+which are enforced via `sandbox-exec` file-read denial plus a sanitized subprocess env.
+Every node visit is written to the **CXDB** SQLite event log, and the **Healer** reads
+that log to cluster terminal failures into an actionable `diagnosis.md` — learning
+accumulates in the event log, not in the runner code.
+
+### Pipeline execution flow (one step of the walk)
+
+```mermaid
+flowchart TD
+  S(["start"]) --> R{"resolve(node)"}
+  R -->|type=codergen| CG["render prompt @path<br/>${goal} / ${state.*} to backend"]
+  R -->|type=tool| T["shell: command=…"]
+  R -->|gate_es / gate_er / gate_cs| G["claude --print /slash<br/>_parse_verdict to success/failure/error"]
+  R -->|holdout_eval| H["sealed evaluator<br/>parse last JSON line {verdict}"]
+  R -->|human_gate| HG["stdin · or ctx.state outcome"]
+  R -->|conditional| C["hexagon · ctx.state[decision_key]"]
+  CG & T & G & H & HG & C --> REC[("append step to history + CXDB seq")]
+  REC --> E{"_edge_matches<br/>conditional beats unconditional"}
+  E -->|max_visits exceeded| EX["synthetic 'exhausted' step"]
+  E -->|next node| R
+  E -->|to exit| Z(["exit"])
+  EX --> Z
+```
+
+`engine.run()` walks from `start`, calls the handler that `resolve(node)` picks
+(`type=` → `start`/`exit` name → DOT shape → default `_codergen`), records the step to
+`history` and the CXDB sequence, then chooses the next edge with `_edge_matches` —
+conditional edges (`condition="key=value"` / `key!=value`) always win over
+unconditional ones. A node's `max_visits` bounds loops: exceeding it emits a synthetic
+`exhausted` step and routes to `exit`. Gate verdicts are normalized to
+`success`/`failure`/`error` so the Healer can cluster real failures separately from
+infra crashes; `holdout_eval` reads the last JSON line of the sealed evaluator's stdout.
+
+---
+
 ## 🚀 State-of-the-Art Execution Backends
 
 Dark Factory ships with first-class support for diverse LLM and agent backends, dynamically selected per node via DOT attributes or global flags:
@@ -184,6 +256,50 @@ dark-factory/
 ├── CLAUDE.md                       # Agent instructions (auto-loaded by Claude Code)
 ├── AGENTS.md                       # Identical instructions for all other AI agents
 └── README.md                       # This premium documentation
+```
+
+---
+
+## ⭐ Recommended default: Claude-based factories
+
+For day-to-day work, run the factory with `--backend claude` and **pick the `.dot`
+for the task** — do not default every run to a single pipeline. The full decision
+table is [docs/pipeline-selection.md](docs/pipeline-selection.md); the common picks:
+
+| Task | Pipeline |
+|------|----------|
+| Smoke / wiring (no LLM cost) | `pipelines/factory/hello.dot` |
+| New feature (full loop) | `pipelines/slim/minimal_feature.dot` |
+| In-flight PR iteration | `pipelines/slim/minimal_pr.dot` |
+| Diff + sealed holdout validation | `pipelines/factory/gates.dot` |
+
+**Operating discipline:**
+
+*   **Always record outcomes.** Pass `--cxdb ~/.dark-factory/cxdb.sqlite` and
+    `--feature <name>` on every real run, then run `df-healer --cxdb ~/.dark-factory/cxdb.sqlite`
+    afterward to cluster failures into a diagnosis. Merge confidence comes from
+    outcome artifacts (holdouts, gates, CXDB history), not from reading the diff.
+*   **Keep adversarial cross-review independent.** Every non-trivial pipeline should
+    contain at least one reviewer node that is *separate* from the Claude coder —
+    e.g. an independent reviewer `tool` node invoking `codex exec --yolo`. Because that
+    reviewer never saw the implementation prompt, its verdict is genuinely adversarial.
+*   **Route models by role, not by hand.** Use a heavier model for plan/review and a
+    faster one for implement. Set this per-node (`backend="…"` / `model="…"`) or, better,
+    once per graph via `model_stylesheet="….model.css"` — never by editing every node.
+
+Concrete copy-paste (gated run with sealed holdout, from the target repo cwd):
+
+```bash
+cd ~/projects/my-app
+dark-factory \
+  --pipeline pipelines/factory/gates.dot \
+  --goal "<feature description>" \
+  --backend claude \
+  --feature <feature_name> \
+  --cxdb ~/.dark-factory/cxdb.sqlite
+
+# After the run, cluster any failures into a Healer diagnosis:
+df-healer --cxdb ~/.dark-factory/cxdb.sqlite
 ```
 
 ---

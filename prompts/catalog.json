@@ -1,0 +1,24 @@
+{
+  "description": "Prompt catalog for workflow_graphgen. Maps each of the 8 allowed dynamic node vocabulary types to exactly one prompt template under prompts/. The generator Workflow may only reference a node prompt path that appears in this catalog; the benchmark harness validates every generated node's prompt path against this file AND against on-disk existence before any agent runs in either mode. Paths are relative to DARK_FACTORY_HOME.",
+  "spec": "specs/workflow_graphgen.md (§4a Prompt catalog) / benchmarks/attractor-spec-review/spec/workflow_graphgen.feature.md (Prompt catalog requirement)",
+  "vocabulary": [
+    "plan",
+    "implement",
+    "test",
+    "fix",
+    "review",
+    "refactor",
+    "research",
+    "stack_smoke"
+  ],
+  "prompts": {
+    "plan": "prompts/catalog/plan.md",
+    "implement": "prompts/catalog/implement.md",
+    "test": "prompts/catalog/test.md",
+    "fix": "prompts/catalog/fix.md",
+    "review": "prompts/catalog/review.md",
+    "refactor": "prompts/catalog/refactor.md",
+    "research": "prompts/catalog/research.md",
+    "stack_smoke": "prompts/catalog/stack_smoke.md"
+  }
+}

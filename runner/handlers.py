@@ -489,7 +489,20 @@ def _codergen(node: Node, ctx: Context) -> Result:
         )
 
     if backend == "claude":
-        args = _sandboxed_args([_get_claude_executable(), "--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt_text])
+        # `--output-format json` makes coder token usage + dollar cost observable
+        # (the cost axis is blind under plain `--print`). The envelope is parsed
+        # by `_claude_json_result`; `output` is still the readable result text.
+        claude_cmd = [_get_claude_executable(), "--print", "--output-format", "json",
+                      "--dangerously-skip-permissions", "--setting-sources", ""]
+        # `model_name` (not `model`) pins the coder model via --model. `model` is
+        # deliberately NOT read here: line ~246 already treats a bare `model`
+        # attr as a backend alias, so reusing it would misroute a node that sets
+        # only `model` to a nonexistent backend named after the model string.
+        model_name = node.attrs.get("model_name")
+        if model_name:
+            claude_cmd += ["--model", str(model_name)]
+        claude_cmd.append(prompt_text)
+        args = _sandboxed_args(claude_cmd)
         if args is None:
             return Result(outcome="failure", output="sandbox-exec unavailable")
         try:
@@ -525,6 +538,15 @@ def _codergen(node: Node, ctx: Context) -> Result:
                     "returncode": "",
                 },
             )
+        # Success path: parse the JSON envelope for output text + token/cost
+        # metrics, then return directly (codex/agy keep the regex-based tail).
+        wall_ms = int((time.monotonic() - _start_ts) * 1000)
+        output_text, metrics = _claude_json_result(proc.stdout, proc.stderr, wall_ms)
+        outcome = "success" if proc.returncode == 0 else "failure"
+        output = output_text + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
+        meta = {"returncode": str(proc.returncode)}
+        meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
+        return Result(outcome=outcome, output=output, metadata=meta)
     elif backend == "codex":
         args = _sandboxed_args(["codex", "exec", "--yolo", "--skip-git-repo-check", prompt_text])
         if args is None:
@@ -929,6 +951,61 @@ def _codergen_metrics(stdout: str, stderr: str, wall_ms: int) -> dict:
     return metrics
 
 
+def _claude_json_result(stdout: str, stderr: str, wall_ms: int) -> tuple[str, dict]:
+    """Parse a ``claude --print --output-format json`` envelope.
+
+    The codergen claude branch requests JSON output specifically so the coder's
+    token usage and dollar cost are observable (plain ``--print`` text emits no
+    usage banner, leaving the cost axis blind). Returns ``(output_text, metrics)``
+    where ``output_text`` is the human-readable ``result`` field and ``metrics``
+    carries authoritative ``tokens_in`` / ``tokens_out`` / ``cost_usd`` pulled
+    from the envelope's ``usage`` / ``total_cost_usd``.
+
+    Robust fallback: when stdout is not the expected JSON object (older CLI, an
+    error preamble, a non-JSON crash), we fall back to the raw text plus the
+    regex-based ``_codergen_metrics`` so the contract (wall_ms always, tokens
+    None-not-zero when absent) still holds.
+    """
+    metrics = _codergen_metrics(stdout, stderr, wall_ms)
+    output_text = stdout
+    stripped = stdout.strip()
+    if stripped.startswith("{"):
+        try:
+            envelope = json.loads(stripped)
+        except (ValueError, TypeError):
+            envelope = None
+        if isinstance(envelope, dict):
+            result_text = envelope.get("result")
+            if isinstance(result_text, str):
+                output_text = result_text
+            usage = envelope.get("usage")
+            if isinstance(usage, dict):
+                # `input_tokens` is only the FRESH (uncached) input; with prompt
+                # caching most input lands in cache_read / cache_creation. The
+                # honest "tokens the coder made the model process" is the sum, so
+                # tokens_in counts all three. The cache split is kept separately
+                # for transparency. (cost_usd below is the cache-priced truth.)
+                fresh = usage.get("input_tokens")
+                cache_read = usage.get("cache_read_input_tokens")
+                cache_create = usage.get("cache_creation_input_tokens")
+                parts = [v for v in (fresh, cache_read, cache_create) if isinstance(v, int)]
+                if parts:
+                    metrics["tokens_in"] = sum(parts)
+                    if isinstance(fresh, int):
+                        metrics["tokens_in_fresh"] = fresh
+                    if isinstance(cache_read, int):
+                        metrics["tokens_cache_read"] = cache_read
+                    if isinstance(cache_create, int):
+                        metrics["tokens_cache_create"] = cache_create
+                to = usage.get("output_tokens")
+                if isinstance(to, int):
+                    metrics["tokens_out"] = to
+            cost = envelope.get("total_cost_usd")
+            if isinstance(cost, (int, float)):
+                metrics["cost_usd"] = float(cost)
+    return output_text, metrics
+
+
 _VERDICT_NORMALIZE = {
     "pass": "success",
     "warn": "success",
@@ -985,15 +1062,24 @@ def _verify_head_sha_echo(text: str, expected_sha: str) -> tuple[bool, str]:
     observed = matches[-1].group(1).lower()
     return observed == expected_sha.lower(), observed
 
-# Anchored regex: keyword must follow a marker like "verdict:", "overall:", or "normalized:"
-# and stand on its own word boundary. Optional qualifier group handles "CONDITIONAL PASS" /
-# "PARTIAL PASS" without the [^\n]* greedy scan that caused "verdict: not a fail" → "fail".
+# The set of recognized verdict tokens, shared by the marker + standalone regexes.
+_VERDICT_TOKEN = (
+    r"(?:pass|warn|fail|partial|inconclusive|insufficient|invalid|incomplete|conditional)"
+)
+
+# Anchored regex: a verdict token must follow a marker ("verdict:", "overall:",
+# "normalized:") on the same line. The gap between the marker and the captured
+# token may contain ONLY decoration (whitespace, markdown like ``**``, emoji —
+# any non-word char) and *qualifier verdict-tokens* (e.g. "CONDITIONAL PASS",
+# "PARTIAL PASS"); backtracking captures the LAST token. It must NOT contain
+# arbitrary alphabetic prose — a bare ``[^\n]*`` wildcard would lift "fail" out
+# of "verdict: not a fail", which is precisely the misclassification the
+# hardening tests forbid. Non-token word runs ("not", "a") break the match, so
+# the caller falls through to the "marker present but invalid" → unknown path.
 _MARKER_RE = re.compile(
     r"(?:verdict|overall|normalized)\s*:\s*"
-    r"\*{0,2}"
-    r"(?:(?:conditional|partial|insufficient|invalid|incomplete)\s+\*{0,2})?"
-    r"(pass|warn|fail|partial|inconclusive|insufficient|invalid|incomplete|conditional)"
-    r"\b",
+    r"(?:" + _VERDICT_TOKEN + r"\b|[^\w\n])*"
+    r"(" + _VERDICT_TOKEN + r")\b",
     re.IGNORECASE,
 )
 
