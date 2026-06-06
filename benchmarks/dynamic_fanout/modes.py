@@ -75,12 +75,34 @@ def _schema_result(workdir, calls: int) -> dict:
 
 
 def run_mode_a_schema(workdir: str | pathlib.Path, schema_columns: list[str]) -> dict:
-    """No state: node 1 writes the real schema; node 2 (migration) sees only the
-    goal, so it falls back to ``DEFAULT_SCHEMA_COLUMNS`` and drifts unless the
-    trial's schema happens to equal the default."""
+    """NAIVE Mode A — node 2's prompt interpolates only ``${goal}``.
+
+    Node 1 writes the real schema; node 2 (migration) sees only the goal, so it
+    falls back to ``DEFAULT_SCHEMA_COLUMNS`` and drifts unless the trial's schema
+    happens to equal the default. This is Mode A's *worst* honest config and is
+    kept only as a contrast against ``run_mode_a_schema_threaded``.
+    """
     make_dir(workdir)
     write_schema(workdir, schema_columns)            # node 1 output
     write_migration(workdir, DEFAULT_SCHEMA_COLUMNS)  # node 2: blind to node 1
+    return _schema_result(workdir, calls=2)
+
+
+def run_mode_a_schema_threaded(workdir: str | pathlib.Path, schema_columns: list[str]) -> dict:
+    """HONEST Mode A — node 2's prompt interpolates ``${state._last_output}``.
+
+    This models a static ``.dot`` whose migration node references the previous
+    node's output via the runner's ``${state._last_output}`` placeholder (engine
+    writes it after every node — proven by
+    ``tests/test_state_threading.py::test_last_output_threads_into_next_node``).
+    Adjacent inter-node data flow therefore needs **no engine change**; it is a
+    prompt-authoring choice. Given this best honest config, Mode A matches the
+    schema and **ties Mode A+B** — demonstrating G1 is an authoring gap, not a
+    paradigm gap. (Only G3, runtime-determined node count, survives an honest A.)
+    """
+    make_dir(workdir)
+    threaded = write_schema(workdir, schema_columns)  # node 1 output -> _last_output
+    write_migration(workdir, threaded)                # node 2 reads ${state._last_output}
     return _schema_result(workdir, calls=2)
 
 
@@ -102,14 +124,16 @@ def make_dir(workdir):
 def run_mode_a(scenario: str, workdir, **kw) -> dict:
     if scenario == "validate":
         return run_mode_a_validate(workdir, k=kw["k"], fixed=kw.get("fixed", FIXED_NODES))
-    if scenario == "schema":
+    if scenario == "schema":  # naive A: ${goal}-only prompt
         return run_mode_a_schema(workdir, schema_columns=kw["schema_columns"])
+    if scenario == "schema_threaded":  # honest A: ${state._last_output} prompt
+        return run_mode_a_schema_threaded(workdir, schema_columns=kw["schema_columns"])
     raise ValueError(f"unknown scenario {scenario!r}")
 
 
 def run_mode_apb(scenario: str, workdir, **kw) -> dict:
     if scenario == "validate":
         return run_mode_apb_validate(workdir, k=kw["k"])
-    if scenario == "schema":
+    if scenario in ("schema", "schema_threaded"):
         return run_mode_apb_schema(workdir, schema_columns=kw["schema_columns"])
     raise ValueError(f"unknown scenario {scenario!r}")

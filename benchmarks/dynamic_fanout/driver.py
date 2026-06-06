@@ -33,6 +33,14 @@ FEATURES = {
         "G1",
         lambda t: {"schema_columns": ["id", f"field_{t}", "updated_at"]},
     ),
+    # G1 with Mode A given its BEST honest config (${state._last_output} threading):
+    # A now matches the schema and TIES A+B -> the G1 win evaporates, proving it is
+    # an authoring gap, not a paradigm gap. Contrast with `schema_migration` above.
+    "schema_migration_threaded": (
+        "schema_threaded",
+        "G1",
+        lambda t: {"schema_columns": ["id", f"field_{t}", "updated_at"]},
+    ),
 }
 
 
@@ -40,12 +48,7 @@ def _one(feature: str, mode: str, trial: int, workroot: pathlib.Path) -> dict:
     scenario, _tier, kw_builder = FEATURES[feature]
     kw = kw_builder(trial)
     workdir = pathlib.Path(tempfile.mkdtemp(prefix=f"{feature}_{mode}_{trial}_", dir=workroot))
-    if mode == "A":
-        runner = modes.run_mode_a
-    elif mode == "A+B":
-        runner = modes.run_mode_apb
-    else:
-        raise ValueError(f"unknown mode {mode!r} — expected 'A' or 'A+B'")
+    runner = modes.run_mode_a if mode == "A" else modes.run_mode_apb
     t0 = time.perf_counter()
     res = runner(scenario, workdir, **kw)
     wall_ms = int((time.perf_counter() - t0) * 1000)

@@ -58,10 +58,33 @@ to a static default → **drift (0.00)**. Mode A+B threads `state["schema.column
 → **match (1.00)**. Tokens tie (both run 2 nodes), so the win is *purely* the gap.
 Because A **structurally cannot** thread state today, the win is 100% attributable.
 
-> **Tier honesty:** G1 is an **engine-fixable** gap — wiring `ctx.state["node.output"]`
-> + `${state.*}` interpolation into the runner would let a static Mode A graph thread
-> state and close it. G3 is a **paradigm** gap — no engine setting lets a fixed `.dot`
-> size itself to a runtime K. Label any future "A+B wins" result by which tier it is.
+> **Tier honesty (corrected after empirical check):** G1-adjacent is **NOT even an
+> engine gap — it is an authoring choice that works in the runner TODAY.** The engine
+> already writes `ctx.state["_last_output"]` after every node (`engine.py` `_run_single_node`)
+> and `_render_prompt` already substitutes `${state._last_output}`. A static `.dot` whose
+> migration node prompt contains `${state._last_output}` threads node 1's output into node 2
+> with **no engine change** — proven by `tests/test_state_threading.py`. So the naive
+> `schema_migration` win above is an artifact of giving Mode A its *worst* honest config.
+> G3 is the **only** genuine paradigm gap — no engine setting or prompt trick lets a fixed
+> `.dot` size itself to a runtime K. Label every "A+B wins" result by tier.
+
+## The G1 win evaporates once Mode A is honest
+
+`schema_migration_threaded` is the same scenario with Mode A given its **best**
+honest config: its migration prompt threads `${state._last_output}` instead of
+reading only `${goal}`.
+
+| Feature | Gap | Axis | A (honest) | A+B | Verdict |
+|---------|-----|------|-----------|-----|---------|
+| `schema_migration_threaded` | G1 | conformance | **1.00** | 1.00 | **tie — no winner** |
+| `schema_migration_threaded` | G1 | tokens_total | 2 700 | 2 700 | tie |
+
+The **same aggregator** that crowns A+B on naive `schema_migration` crowns **no
+winner** here (`test_g1_win_evaporates_when_mode_a_is_honest`). Adjacent inter-node
+data flow is a prompt-authoring decision, not a Mode A+B capability. (Only
+*non-adjacent* threading — node N reading node N−5's named output — needs a 1-line
+engine change to store per-node `.output`; that is the most A+B could honestly
+claim on the data-flow axis, and it is an engine gap, not a paradigm one.)
 
 ## Fairness: Mode A is given its best static config and is still dominated
 
@@ -81,6 +104,17 @@ No single static `F` is on the Pareto frontier across K: small `F` under-covers
 at large K; large `F` (e.g. `F=8` "over-provision to be safe") reaches coverage
 but burns 4× the calls at `K=2`. Mode A+B's "exactly K" dispatch dominates every
 fixed choice. That is the paradigm gap stated rigorously.
+
+A full parametric sweep (`sweep.py` → [`SWEEP.md`](SWEEP.md)) generalizes this to a
+value model `net = V·covered − C·calls` over arbitrary K-distributions and derives
+the decision rule analytically:
+
+- **Constant K (spread 0):** the best static `F = K` *ties* A+B exactly for all V/C —
+  dynamic fan-out earns nothing. Stay static.
+- **K varies at runtime (spread ≥ 1):** A+B beats the best static `F` for **any V/C > 1**.
+  The breakeven is governed by **spread, not a large value/cost threshold** — once a
+  covered endpoint is worth more than one dispatch, exact-K fan-out wins.
+- **Rule:** use Mode A+B iff K is runtime-determined **and** V/C > 1; otherwise static A.
 
 ## What this proves — and does not
 

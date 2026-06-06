@@ -102,6 +102,17 @@ def test_mode_apb_schema_matches_with_state():
         assert consistency(d)["pass"] == 1
 
 
+def test_honest_mode_a_threaded_matches_schema():
+    # Mode A given its BEST honest config (${state._last_output} threading, proven
+    # in tests/test_state_threading.py) matches the schema just like A+B. The G1
+    # "win" was an authoring choice, not a paradigm gap.
+    with tempfile.TemporaryDirectory() as d:
+        cols = ["id", "field_X", "updated_at"]
+        res = run_mode_a("schema_threaded", d, schema_columns=cols)
+        assert res["conformance"]["pass"] == 1
+        assert consistency(d)["pass"] == 1
+
+
 # ---- the calibration proof: same aggregator credits winners --------------
 
 def _records(trials=5):
@@ -138,6 +149,16 @@ def test_aggregator_credits_apb_on_conformance_for_g1_gap():
     assert agg["winner"] == "A+B"
     # tokens tie for G1 (both modes run 2 nodes) -> the win is purely the gap.
     assert aggregate_axis(recs, "schema_migration", "tokens_total")["winner"] is None
+
+
+def test_g1_win_evaporates_when_mode_a_is_honest():
+    # The fairness proof: the SAME aggregator that credits A+B on the naive G1
+    # scenario crowns NO winner once Mode A threads state (schema_migration_threaded).
+    # Disjoint ranges vanish -> no separation -> G1 is an authoring gap, not paradigm.
+    recs = _records()
+    agg = aggregate_axis(recs, "schema_migration_threaded", "conformance")
+    assert agg["winner"] is None
+    assert aggregate_axis(recs, "schema_migration_threaded", "tokens_total")["winner"] is None
 
 
 def test_underpowered_below_min_n_even_when_deterministic():
