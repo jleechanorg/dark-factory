@@ -25,7 +25,7 @@ coder backend/model, and a coder prompt that is **byte-identical across modes** 
 | hello | tokens_total | 281 910 ± 27 175 | 281 398 ± 38 755 | no separation (ranges overlap) |
 | hello | wall_ms | 41 373 ± 3 873 | 43 550 ± 6 030 | no separation (A+B +5.3%, overlaps) |
 | hello | zero_touch | 1.00 | 1.00 | tie |
-| roman | conformance | 1.00 ± 0.00 | 1.00 ± 0.00 | **tie** (90/90 vs 90/90)¹ |
+| roman | conformance | 1.00 ± 0.00 | 1.00 ± 0.00 | **tie** (90/90 vs 90/90) |
 | roman | tokens_total | 304 748 ± 39 946 | 313 719 ± 38 618 | no separation (ranges overlap) |
 | roman | wall_ms | 48 700 ± 3 637 | 53 190 ± 4 868 | no separation (A+B +9.2%, overlaps) |
 | roman | zero_touch | 1.00 | 1.00 | tie |
@@ -34,11 +34,6 @@ coder backend/model, and a coder prompt that is **byte-identical across modes** 
 and no live `fit` reviewer score was wired for this run, so it is recorded unscored, never a silent zero.
 
 No axis crosses the §11.4 non-overlap bar, so **zero winners are credited** at n=10.
-
-¹ The roman `total: 9` in the committed JSONL reflects the evaluator at measurement time (9 cases).
-Commit `da29c7f` later added 2 non-integer cases; with 11 cases the total would be 110/110
-(all runs still pass, conformance = 1.00 unchanged). Re-running with `--conformance local`
-on the same model would show 110/110 rather than 90/90.
 
 ## Findings
 
@@ -61,7 +56,7 @@ on the same model would show 110/110 rather than 90/90.
 ## What this measurement can and cannot prove
 
 - **Can prove:** conformance (self-contained public acceptance criteria — no sealed repo, no
-  isolation break), token cost (unconfounded — byte-identical prompt), wall-clock, zero-touch.
+  isolation break), token cost (uncounfounded — byte-identical prompt), wall-clock, zero-touch.
 - **Cannot prove (structural):** `graph_quality` can *never* separate A from A+B — both consume the
   same IR. Any graph-quality claim is mode-invariant and must not be cited as an A-vs-A+B difference.
 - **Honest scope:** hello/roman are easy, self-contained tasks. A null result here means the dispatch

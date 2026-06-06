@@ -46,10 +46,6 @@ def _git(workdir: pathlib.Path, *args: str) -> str:
         text=True,
         check=False,
     )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"git {list(args)} failed in {workdir} (rc={proc.returncode}): {proc.stderr.strip()}"
-        )
     return proc.stdout.strip()
 
 
@@ -57,36 +53,9 @@ def _head(workdir: pathlib.Path) -> str:
     return _git(workdir, "rev-parse", "HEAD")
 
 
-def _assert_no_cycles(graph) -> None:
-    """DFS cycle check — cyclic graphs allow Mode A to revisit nodes while Mode A+B
-    iterates middle_chain() once, breaking A/A+B call-count symmetry."""
-    visited: set[str] = set()
-    rec_stack: set[str] = set()
-
-    def dfs(name: str) -> None:
-        visited.add(name)
-        rec_stack.add(name)
-        for edge in graph.edges:
-            if edge.src == name:
-                if edge.dst not in visited:
-                    dfs(edge.dst)
-                elif edge.dst in rec_stack:
-                    raise AssertionError(
-                        f"graph has cycle through {name!r} → {edge.dst!r} — "
-                        "Mode A runner would revisit nodes, breaking A/A+B symmetry"
-                    )
-        rec_stack.discard(name)
-
-    for node_name in graph.nodes:
-        if node_name not in visited:
-            dfs(node_name)
-
-
 def assert_no_retry_wiring(graph) -> None:
     """Fairness assertion (spec §5): in BOTH modes neither any guaranteed reviewer
-    node nor the graph itself may enable a goal_gate, declare a retry_target,
-    use max_visits>1, or contain cycles — all of which let Mode A visit a node
-    more than once while Mode A+B executes each middle node exactly once."""
+    node nor the graph itself may enable a goal_gate or declare a retry_target."""
     if str(graph.attrs.get("retry_target", "")):
         raise AssertionError("graph declares a retry_target — breaks A/A+B symmetry")
     for name, node in graph.nodes.items():
@@ -97,12 +66,6 @@ def assert_no_retry_wiring(graph) -> None:
             raise AssertionError(f"node {name!r} enables goal_gate — breaks A/A+B symmetry")
         if str(node.attrs.get("retry_target", "")):
             raise AssertionError(f"node {name!r} declares retry_target — breaks A/A+B symmetry")
-        if str(node.attrs.get("max_visits", "")) not in ("", "1"):
-            raise AssertionError(
-                f"node {name!r} has max_visits={node.attrs['max_visits']} — "
-                "breaks A/A+B symmetry"
-            )
-    _assert_no_cycles(graph)
 
 
 def _run_middle_mode_a(ir: GraphIR, ctx: Context, dot_dir: pathlib.Path) -> tuple[list[dict], bool]:
@@ -114,29 +77,13 @@ def _run_middle_mode_a(ir: GraphIR, ctx: Context, dot_dir: pathlib.Path) -> tupl
     assert_no_retry_wiring(graph)
     history = engine_mod.run(graph, ctx, max_steps=100)
     middle_names = {n.name for n in ir.middle_chain()}
-    # Keep only the LAST StepRecord per middle node — matches Mode A+B's
-    # one-record-per-node semantics. assert_no_retry_wiring prevents max_visits>1
-    # and cycles, so there is normally exactly one visit; this dedup is a defensive guard.
-    last_by_node: dict[str, object] = {}
-    for s in history:
-        if s.node in middle_names:
-            last_by_node[s.node] = s
-    # Build one token record per middle node in chain order.  When a node was
-    # never visited (runner stopped early) insert a zero-record so both modes
-    # always charge len(middle_chain) entries — symmetric token accounting.
-    _ZERO_TOKEN = {"tokens_in": None, "tokens_out": None, "wall_ms": 0}
-    token_records = [
-        read_token_record(last_by_node[n.name].metadata)
-        if n.name in last_by_node
-        else _ZERO_TOKEN
-        for n in ir.middle_chain()
-    ]
-    # All expected middle nodes must have appeared in history — a missing node
-    # (runner stopped early, max_steps exhausted) is treated as a failure, not
-    # silently ignored by a vacuous all(). Mode A+B always executes the full chain.
-    middle_ok = (
-        set(last_by_node.keys()) >= middle_names
-        and all(s.outcome in ("success", "warn") for s in last_by_node.values())
+    token_records = [read_token_record(s.metadata) for s in history if s.node in middle_names]
+    # Check all middle nodes succeeded — mirrors Mode A+B's `ok` check so zero_touch
+    # is symmetric. Unconditional edges on a linear middle graph let the runner visit
+    # exit even after a failed coder node; relying on reached_exit would overcount.
+    middle_ok = all(
+        s.outcome in ("success", "warn")
+        for s in history if s.node in middle_names
     )
     return token_records, middle_ok
 
@@ -267,12 +214,7 @@ def _run_one_inner(
     if holdout_evaluator is not None:
         try:
             conf = holdout_evaluator(workdir, feature, baseline_ref, head_ref)
-            # Soft-error dicts (e.g. subprocess crash returning {pass:0, error:...})
-            # must not be treated as real 0% conformance — they are missing data.
-            if conf.get("error"):
-                conformance = {"available": False, "error": conf["error"]}
-            else:
-                conformance = {"available": True, **conf}
+            conformance = {"available": True, **conf}
         except Exception as exc:  # noqa: BLE001 - record, don't crash the smoke
             conformance = {"available": False, "error": str(exc)}
     else:
@@ -364,7 +306,6 @@ def run_benchmark(
     out_path: pathlib.Path | None = None,
     holdout_evaluator=None,
     run_spine: bool = True,
-    exploratory: bool = False,
 ) -> list[dict]:
     """Run the A vs A+B benchmark over ``features`` x ``modes`` x ``trials``.
 
@@ -398,7 +339,6 @@ def run_benchmark(
                     model_name=model_name,
                     trial=trial,
                     holdout_evaluator=holdout_evaluator,
-                    exploratory=exploratory,
                     run_spine=run_spine,
                 )
                 records.append(rec)

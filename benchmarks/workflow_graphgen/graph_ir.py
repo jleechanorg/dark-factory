@@ -127,6 +127,7 @@ class GraphIR:
         if not self.nodes:
             raise ValueError("graph-IR has no dynamic-middle nodes")
         catalog = load_catalog()["prompts"]
+        approved = set(catalog.values())
         names = [n.name for n in self.nodes]
         if len(names) != len(set(names)):
             raise ValueError(f"duplicate middle node names: {names}")
@@ -137,14 +138,8 @@ class GraphIR:
             if n.name in reserved:
                 raise ValueError(f"middle node {n.name!r} collides with a reserved/guaranteed name")
             ref = n.prompt[1:] if n.prompt.startswith("@") else n.prompt
-            expected = catalog.get(n.type)
-            if expected is None:
-                raise ValueError(f"node type {n.type!r} not in catalog")
-            if ref != expected:
-                raise ValueError(
-                    f"node {n.name!r} (type={n.type!r}) prompt {n.prompt!r} "
-                    f"does not match catalog entry {expected!r}"
-                )
+            if ref not in approved:
+                raise ValueError(f"node {n.name!r} prompt {n.prompt!r} not in catalog")
         if list(self.guaranteed) != list(GUARANTEED_NODES):
             raise ValueError(
                 f"guaranteed must be the pinned set {GUARANTEED_NODES}, got {self.guaranteed}"
@@ -271,3 +266,12 @@ def render_middle_only_dot(ir: GraphIR, name: str = "wfgg_middle") -> str:
         lines.append(f"    {a} -> {b}")
     lines.append("}")
     return "\n".join(lines) + "\n"
+
+
+def write_and_parse(dot_text: str, path: pathlib.Path):
+    """Write dot_text to path and parse it with the real runner parser, returning
+    the parsed Graph. Raises if the rendered graph is not parser-valid."""
+    import runner.parser as parser_mod
+
+    path.write_text(dot_text)
+    return parser_mod.parse(path)

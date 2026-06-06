@@ -154,7 +154,7 @@ def test_summarize_matches_report_claims():
     assert s["constant K=4 (spread 0)"]["apb_on_frontier"] is True
     assert s["constant K=4 (spread 0)"]["apb_beats_best_at_r2"] is False
     # every spread>0 distribution: A+B beats best static at r=2 and is on frontier
-    for label, info in s.items():
+    for _, info in s.items():
         if info["spread"] > 0:
             assert info["apb_beats_best_at_r2"] is True
             assert info["apb_on_frontier"] is True
