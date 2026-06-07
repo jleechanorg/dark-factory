@@ -92,12 +92,14 @@ Dark Factory operates as the top layer of a modern, modular agentic stack:
 ### System architecture (three-layer convergence + isolation + CXDB/Healer)
 
 ```mermaid
-flowchart TB
+flowchart LR
   subgraph OP["Operator / human — sees everything"]
+    direction TB
     SPEC["specs/*.md + prompts/ + pipelines/*.dot"]
     HOLD["sealed holdouts (sibling repo)<br/>DARK_FACTORY_HOLDOUTS"]
   end
   subgraph L1["Layer 1 — Pipeline engine (this repo · runner/)"]
+    direction TB
     PARSE["parser.py<br/>DOT to Graph(nodes, edges)"]
     ENGINE["engine.py · run()<br/>walk start to exit · _edge_matches · max_visits"]
     HAND["handlers.py · resolve(node)<br/>type to name to shape to _codergen"]
@@ -105,6 +107,7 @@ flowchart TB
     HEAL["healer.py<br/>cluster failures to diagnosis.md"]
   end
   subgraph L2["Layer 2 — Agent loop (external CLIs)"]
+    direction TB
     CODER["codergen node<br/>claude · codex · ao · agy"]
     REVIEW["reviewer / tool node<br/>codex exec --yolo"]
     EVAL["holdout_eval node<br/>sealed evaluator run.py"]
@@ -132,7 +135,7 @@ accumulates in the event log, not in the runner code.
 ### Pipeline execution flow (one step of the walk)
 
 ```mermaid
-flowchart TD
+flowchart LR
   S(["start"]) --> R{"resolve(node)"}
   R -->|type=codergen| CG["render prompt @path<br/>${goal} / ${state.*} to backend"]
   R -->|type=tool| T["shell: command=…"]
@@ -283,9 +286,20 @@ table is [docs/pipeline-selection.md](docs/pipeline-selection.md); the common pi
     contain at least one reviewer node that is *separate* from the Claude coder —
     e.g. an independent reviewer `tool` node invoking `codex exec --yolo`. Because that
     reviewer never saw the implementation prompt, its verdict is genuinely adversarial.
+    The slim pipelines (`minimal_feature.dot`, `minimal_pr.dot`) now ship this **by
+    default**: their `review` node pins `backend="codex"`, so the reviewer runs on a
+    different backend than the coder out of the box (precedence: explicit node attr >
+    `model_stylesheet` > `--backend`, so this is independent and non-overridable by the
+    coder's `--backend`). Requires `codex` installed; override path is in
+    [docs/pipeline-selection.md](docs/pipeline-selection.md#independent-reviewer-adversarial-by-default).
 *   **Route models by role, not by hand.** Use a heavier model for plan/review and a
     faster one for implement. Set this per-node (`backend="…"` / `model="…"`) or, better,
     once per graph via `model_stylesheet="….model.css"` — never by editing every node.
+*   **Author dynamically, run statically.** The engine executes static `.dot` graphs
+    only; any "dynamic / NL-generated workflow" advantage lives at *authoring* time, not
+    runtime (benchmarks show execution dispatch is a wash, ~5–9% slower for the dynamic
+    harness). The one structural exception is runtime-determined fan-out. Full decision
+    guide: [docs/dynamic-vs-deterministic-workflow.md](docs/dynamic-vs-deterministic-workflow.md).
 
 Concrete copy-paste (gated run with sealed holdout, from the target repo cwd):
 

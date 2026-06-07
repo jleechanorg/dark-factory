@@ -15,6 +15,8 @@ def test_minimal_feature_factory_runs_with_deterministic_gates(monkeypatch, tmp_
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", lambda node, ctx: Result(outcome="success", output="ok"))
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_feature.dot")
+    # production default is codex (independent reviewer); pin echo here for offline determinism
+    graph.nodes["review"].attrs["backend"] = "echo"
     ctx = Context(goal="ship a tiny feature", workdir=ROOT, backend="echo")
     ctx.state["feature"] = "hello"
     ctx.state["slim.test_command"] = f"{sys.executable} -c \"print('tests ok')\""
@@ -38,6 +40,8 @@ def test_minimal_feature_factory_runs_with_deterministic_gates(monkeypatch, tmp_
 def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path):
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_pr.dot")
+    # production default is codex (independent reviewer); pin echo here for offline determinism
+    graph.nodes["review"].attrs["backend"] = "echo"
     ctx = Context(goal="refactor a tiny thing in-flight", workdir=ROOT, backend="echo")
     ctx.state["slim.test_command"] = f"{sys.executable} -c \"print('tests ok')\""
 

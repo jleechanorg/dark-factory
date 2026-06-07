@@ -1,15 +1,18 @@
-* {
-  backend: echo
-}
-
+/*
+ * Production model stylesheet for the slim pipelines
+ * (minimal_feature.dot, minimal_pr.dot).
+ *
+ * Coder nodes (plan/implement/fix/test) intentionally carry NO backend rule
+ * here, so they honor the run-level --backend (or per-node backend attr).
+ * Adding a blanket `* { backend: echo }` would silently override --backend and
+ * make these pipelines un-runnable with a real coder backend.
+ *
+ * The review node defaults to an INDEPENDENT codex reviewer. The node already
+ * sets `backend="codex"` directly in the .dot (an explicit node attr wins over
+ * the stylesheet per parser precedence), so this rule is defense/documentation
+ * — it states the adversarial-by-default intent and survives if the node attr
+ * is ever dropped.
+ */
 .review {
-  backend: echo
-}
-
-.plan {
-  backend: echo
-}
-
-.implement {
-  backend: echo
+  backend: codex;
 }
