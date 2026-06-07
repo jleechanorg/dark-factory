@@ -7,26 +7,28 @@ This document presents a comprehensive architectural analysis and improvement ro
 ## 🗺️ Architectural Reliability Model
 
 ```mermaid
-graph TD
+graph LR
   subgraph Pre-Flight
+    direction TB
     p_parse[Parser AST Check] --> p_validate[Pre-Flight Schema Guard]
     p_validate --> p_exist[Resolve Paths & Handlers]
   end
 
   subgraph Runtime Execution Boundary
+    direction TB
     p_exist --> r_start[Run Start]
     r_start --> r_wal[WAL Checkpoint]
     r_wal --> r_exec[Node Handler Execution]
-    
+
     r_exec -- Exception --o r_panic[Global Panic Hook]
-    r_exec -- Success --▶ r_route[Edge Condition Evaluator]
-    
+    r_exec -- Success --> r_route[Edge Condition Evaluator]
+
     r_panic --> r_cxdb[CXDB Panic Step]
     r_cxdb --> r_log[JSONL Log Capture]
     r_log --> r_exit_fail[Exit Code 128]
-    
-    r_route -- Next Node --▶ r_wal
-    r_route -- Exit --▶ r_exit_ok[Exit Code 0]
+
+    r_route -- Next Node --> r_wal
+    r_route -- Exit --> r_exit_ok[Exit Code 0]
   end
 ```
 

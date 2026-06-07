@@ -36,6 +36,7 @@ digraph MinimalPRFactory {
     type="codergen",
     label="Fresh Eyes Review",
     class="review",
+    backend="codex",
     prompt="@prompts/slim/review.md",
     goal_gate=true,
     retry_target="fix"
