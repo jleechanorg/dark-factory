@@ -8,43 +8,204 @@ A state-of-the-art Python implementation of the **Attractor pattern**: a robust,
 
 ---
 
-## 📚 Foundational Research & Inspiration
+## 📋 Executive Summary
 
-Dark Factory stands on the shoulders of groundbreaking work in agentic software engineering and Level 5 automation. Our design, paradigms, and benchmark splits are inspired by the following research, reference implementations, and articles:
+**Dark Factory turns a natural-language spec into reviewed, tested code — with no human
+reading the diff.** It is an implementation of the [Attractor pattern](#-sources--references)
+where the durable artifact is a version-controlled process graph (`.dot`), not an agent
+transcript. Work flows through **two phases**:
 
-### 🔬 Core Specifications & Benchmarks
-*   StrongDM, **AttractorBench** — [GitHub Repository](https://github.com/strongdm/attractorbench)
-    *   *Defines the benchmark paradigm:* Agents ingest a public natural-language specification, while the deterministic evaluation and test suites are held out locally to prevent LLM training-data contamination.
-*   jleechanorg, **AttractorBench Fork** — [GitHub Repository](https://github.com/jleechanorg/attractorbench)
-    *   *Our public experimental baseline:* Sandbox for validating spec-review workflows and cross-repository agent validation mechanics.
+```mermaid
+flowchart LR
+  subgraph P1["Phase 1 · Spec generation"]
+    direction TB
+    INTENT["intent / requirements"] --> SPEC["spec.md<br/>natural-language spec"]
+    SPEC --> SREV["spec review (optional)<br/>review_slim / review_full.dot"]
+  end
+  subgraph P2["Phase 2 · Factory execution"]
+    direction TB
+    PLAN["plan"] --> IMPL["implement"] --> TEST["test"] --> REV["adversarial review<br/>(independent backend)"] --> GATE["gates / sealed holdout"]
+  end
+  SREV --> PLAN
+  GATE --> OUT[("CXDB log + Healer diagnosis")]
+```
 
-### 📝 Paradigms & Articles
-*   Dan Shapiro, **"You don't write the code"** — [Blog Post](https://www.danshapiro.com/blog/2026/02/you-dont-write-the-code/)
-    *   *The philosophy of Level 5 Automation:* In the ultimate "Dark Factory," humans never read or write code. Instead, they specify intent and design outcomes. Quality is enforced via observability, automated healers, and adversarial reviews.
-*   Simon Willison, **"The Software Factory"** — [Blog Post](https://simonwillison.net/2026/Feb/7/software-factory/)
-    *   *The Industrialization of AI Coding:* Shifting the industry mindset from bespoke chat boxes to repeatable, high-volume automated pipeline execution.
-*   2389 Research, **"The Dark Factory is a .dot file"** — [Blog Post](https://2389.ai/posts/the-dark-factory-is-a-dot-file/)
-    *   *The Durable Artifact Principle:* While the pipeline runner code itself is disposable (*dorodango* — polished, discarded, and rebuilt), the pipeline `.dot` file remains the precious, versioned representation of the software engineering process.
+1. **Spec generation — the scarce artifact.** You author a detailed `spec.md` (under
+   `specs/` or `benchmarks/<project>/`) — or let the pipeline's `plan` node generate it
+   from your `--goal`. Make it complete enough that a coding agent can build with **no
+   hidden product requirements**. Optionally validate it first with the spec-review
+   pipeline before spending build tokens.
+2. **Factory execution — agents build, agents review.** `dark-factory` walks a `.dot`
+   graph sized to the project: `plan → implement → test → adversarial review → gates /
+   sealed holdout`, looping through `fix` on failure. Every node visit is recorded to an
+   SQLite event log (**CXDB**); the **Healer** clusters failures into an actionable
+   diagnosis.
 
-### 🛠️ Reference Implementations
-*   StrongDM, **Attractor** — [GitHub Repository](https://github.com/strongdm/attractor)
-    *   The original reference harness establishing the foundational Attractor paradigms.
-*   Dan Shapiro, **Kilroy** — [GitHub Repository](https://github.com/danshapiro/kilroy)
-    *   A pioneering implementation of the Attractor loop.
-*   2389 Research, **Smasher** — [GitHub Repository](https://github.com/2389-research/smasher)
-    *   An adversarial reviewer and compiler-checked coding harness.
-*   2389 Research, **Mammoth** — [GitHub Repository](https://github.com/2389-research/mammoth)
-    *   An LLM orchestration and workspace synchronization harness.
-*   2389 Research, **Tracker** — [GitHub Repository](https://github.com/2389-research/tracker)
-    *   A high-performance pipeline and task state tracker.
-*   2389 Research, **dippin-lang** — [GitHub Repository](https://github.com/2389-research/dippin-lang)
-    *   A domain-specific language designed for expressing declarative dataflow pipelines.
+**Why it's different.** Merge confidence comes from *outcome artifacts* — sealed
+holdouts, adversarial cross-review, CXDB history — not from a human reading the diff. The
+implementing agent is **structurally blind** to the holdouts and evaluator
+([isolation rule](#-the-operator-agent-isolation-rule)), so it cannot pass tests by
+reading them. You version the `.dot` graph and the specs/holdouts/scoring contracts; the
+Python under `runner/` is disposable *dorodango* — polish, discard, rebuild from spec.
 
-### 🎯 Advanced Techniques & Methodologies
-*   StrongDM, **Techniques** — [Techniques Directory](https://factory.strongdm.ai/techniques)
-    *   A curated catalog of tactical strategies for robust agentic execution.
-*   StrongDM Techniques, **Direct-to-Unit (DTU)** — [DTU Documentation](https://factory.strongdm.ai/techniques/dtu)
-    *   *The DTU Pattern:* Bypassing middle layers to directly generate targeted unit tests and implementation assertions, ensuring immediate execution feedback.
+| | |
+|---|---|
+| **Two phases** | spec generation → factory execution |
+| **Runtime** | Python 3.13 (uv-managed) |
+| **Entry point** | `dark-factory` binary (not `python -m runner`) |
+| **Backends** | `claude`, `codex`, `agy`, `ao`, `claudew` (wafer), `mock_llm`/`echo` |
+| **Durable artifacts** | `.dot` pipeline graphs + `spec.md` (process + intent) |
+| **Observability** | CXDB SQLite event log + `df-healer` failure clustering |
+
+---
+
+## 📑 Table of Contents
+
+1. [Executive Summary](#-executive-summary)
+2. [Quick Start](#-quick-start)
+3. [Example Projects at a Glance](#-example-projects-at-a-glance)
+4. [The Operator-Agent Isolation Rule](#-the-operator-agent-isolation-rule)
+5. [Architecture: 3-Layer Convergence](#-architecture-3-layer-convergence)
+6. [How Dark Factory works](#-how-dark-factory-works)
+7. [State-of-the-Art Execution Backends](#-state-of-the-art-execution-backends)
+8. [Pipeline Catalog](#-pipeline-catalog)
+9. [Fail-Closed Observability: CXDB + Healer](#-fail-closed-observability-cxdb--healer)
+10. [Directory Layout](#-directory-layout)
+11. [Recommended default: Claude-based factories](#-recommended-default-claude-based-factories)
+12. [Execution Cookbook](#-execution-cookbook)
+13. [Sources & References](#-sources--references)
+
+---
+
+## ⚡ Quick Start
+
+Dark Factory runs in **two phases — generate the spec, then execute the factory.**
+
+```bash
+# 0. Install once (uv-managed Python 3.13 venv + binaries on PATH)
+git clone https://github.com/jleechanorg/dark-factory ~/projects/dark-factory
+cd ~/projects/dark-factory && ./install.sh
+export DARK_FACTORY_HOME=~/projects/dark-factory
+export DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts
+export PATH="$HOME/.local/bin:$PATH"
+
+# Smoke test the install — echo backend, no LLM cost
+dark-factory --pipeline pipelines/factory/hello.dot --goal "smoke test" --backend echo
+```
+
+**Phase 1 — generate (or author) the spec.** Write a complete natural-language spec the
+coding agent can build from with no hidden requirements. Either commit it to
+`specs/<feature>.md`, or let the pipeline's `plan` node generate `spec.md` from your
+`--goal`. Optionally validate it before spending build tokens:
+
+```bash
+dark-factory \
+  --pipeline benchmarks/attractor-spec-review/pipelines/review_slim.dot \
+  --goal "Review specs/my_feature.md for completeness and ambiguity" \
+  --backend claude
+```
+
+**Phase 2 — run the factory.** Pick the `.dot` sized to the project (see
+[Example Projects](#-example-projects-at-a-glance)), run from the target repo cwd, and
+record outcomes to CXDB:
+
+```bash
+cd ~/projects/my-app
+dark-factory \
+  --pipeline pipelines/slim/minimal_feature.dot \
+  --goal "Implement specs/my_feature.md" \
+  --backend claude \
+  --feature my_feature \
+  --cxdb ~/.dark-factory/cxdb.sqlite
+
+# Cluster any failures into a Healer diagnosis
+df-healer --cxdb ~/.dark-factory/cxdb.sqlite
+```
+
+> **Pick the `.dot` for the task — do not default every run to one pipeline.** See
+> [Example Projects](#-example-projects-at-a-glance), the [Pipeline Catalog](#-pipeline-catalog),
+> and the full decision table in [docs/pipeline-selection.md](docs/pipeline-selection.md).
+
+---
+
+## 📦 Example Projects at a Glance
+
+**Scale the graph to the project.** A one-file utility needs a linear plan→build→score
+lane; a full-stack app needs staged build nodes, multiple gates, an independent reviewer,
+and a sealed holdout. All three examples below ship in `benchmarks/` as concrete,
+runnable projects — each driven by its own committed spec (`benchmarks/<project>/spec.md`)
+and `.dot` graph.
+
+| Scale | Example project | Pipeline(s) | Shape |
+|-------|-----------------|-------------|-------|
+| **Small** | [`benchmarks/fibonacci`](benchmarks/fibonacci) — a Fibonacci CLI | `pipelines/slim.dot` | Linear: plan → implement → public acceptance → sealed score, one `fix` loop |
+| **Medium** | [`benchmarks/airbnb-clone`](benchmarks/airbnb-clone) — 3-sprint app | `airbnb-clone.dot` (+ `sprint-{1,2,3}-*.dot`) | Three sealed-gated sprints (Data → Backend → Frontend), each with a `fix` loop |
+| **Large** | [`benchmarks/amazon-clone`](benchmarks/amazon-clone) — full-stack commerce | `dark_factory.dot` (+ `slices_*.dot`) | Spec-review → architecture → 6 build nodes (mixed backends) → smoke/size → `/es`+`/er` → independent review → sealed holdout |
+
+### 🟢 Small — `fibonacci` (single algorithm, single spec)
+
+```mermaid
+flowchart LR
+  s([Start]) --> plan[Plan] --> impl[Implement] --> acc{"Public<br/>acceptance"}
+  acc -- pass --> score{"Sealed<br/>score"}
+  score -- pass --> e([Exit])
+  acc -- fail --> fix[Fix]
+  score -- fail --> fix
+  fix --> acc
+```
+
+One spec, one build, two checks (a visible acceptance command plus a redacted sealed
+score). Reach for this shape for scripts, single modules, and pure-logic katas.
+
+### 🟡 Medium — `airbnb-clone` (sprinted: Data → Backend → Frontend)
+
+```mermaid
+flowchart LR
+  s([Start]) --> p1
+  subgraph S1["Sprint 1 · Data"]
+    direction TB
+    p1[Plan] --> i1[Implement] --> v1{Verify}
+    v1 -- fail --> f1[Fix] --> v1
+  end
+  subgraph S2["Sprint 2 · Backend"]
+    direction TB
+    p2[Plan] --> i2[Implement] --> v2{Verify}
+    v2 -- fail --> f2[Fix] --> v2
+  end
+  subgraph S3["Sprint 3 · Frontend"]
+    direction TB
+    p3[Plan] --> i3[Implement] --> v3{Verify}
+    v3 -- fail --> f3[Fix] --> v3
+  end
+  v1 -- pass --> p2
+  v2 -- pass --> p3
+  v3 -- pass --> e([Exit])
+```
+
+Each sprint is its own plan→implement→verify loop gated by a **sealed holdout
+evaluator**; a sprint must pass before the next begins. Reach for this shape for
+multi-layer features and apps you want delivered in reviewable increments.
+
+### 🔴 Large — `amazon-clone` (full-stack, multi-gate, sliced)
+
+```mermaid
+flowchart LR
+  s([Start]) --> sr["Spec review<br/>codex"] --> arch["Architecture<br/>claude"] --> build
+  subgraph build["Build · specialized codergen nodes (mixed backends)"]
+    direction TB
+    dm[Data model] --> be[Backend API] --> fe[Frontend] --> fr[Firestore rules] --> sd[Seed + reset] --> vh[Validation harness]
+  end
+  build --> sm[Local smoke] --> sz[Size check] --> es["es gate"] --> er["er gate"] --> ir["Independent review<br/>codex"] --> ho{"Sealed<br/>holdout"}
+  ho -- pass --> e([Exit])
+  ho -- fail --> fx[Fix] --> sm
+```
+
+A built-in `spec_review` node opens the run; specialized build nodes split backend
+(`codex`) from frontend (`claude`); evidence gates (`/es`, `/er`), an independent
+adversarial reviewer, and a sealed holdout all guard the exit. The same project also
+ships **vertical-slice** graphs (`slices_foundation → catalog → cart → checkout`) when
+you'd rather ship one feature column end-to-end at a time. Reach for this shape for
+production full-stack work.
 
 ---
 
@@ -397,6 +558,46 @@ df-healer --cxdb ~/.dark-factory/cxdb.sqlite
 cd ~/projects/dark-factory
 .venv/bin/python -m pytest tests/
 ```
+
+---
+
+## 📚 Sources & References
+
+Dark Factory stands on the shoulders of groundbreaking work in agentic software engineering and Level 5 automation. Our design, paradigms, and benchmark splits are inspired by the following research, reference implementations, and articles:
+
+### 🔬 Core Specifications & Benchmarks
+*   StrongDM, **AttractorBench** — [GitHub Repository](https://github.com/strongdm/attractorbench)
+    *   *Defines the benchmark paradigm:* Agents ingest a public natural-language specification, while the deterministic evaluation and test suites are held out locally to prevent LLM training-data contamination.
+*   jleechanorg, **AttractorBench Fork** — [GitHub Repository](https://github.com/jleechanorg/attractorbench)
+    *   *Our public experimental baseline:* Sandbox for validating spec-review workflows and cross-repository agent validation mechanics.
+
+### 📝 Paradigms & Articles
+*   Dan Shapiro, **"You don't write the code"** — [Blog Post](https://www.danshapiro.com/blog/2026/02/you-dont-write-the-code/)
+    *   *The philosophy of Level 5 Automation:* In the ultimate "Dark Factory," humans never read or write code. Instead, they specify intent and design outcomes. Quality is enforced via observability, automated healers, and adversarial reviews.
+*   Simon Willison, **"The Software Factory"** — [Blog Post](https://simonwillison.net/2026/Feb/7/software-factory/)
+    *   *The Industrialization of AI Coding:* Shifting the industry mindset from bespoke chat boxes to repeatable, high-volume automated pipeline execution.
+*   2389 Research, **"The Dark Factory is a .dot file"** — [Blog Post](https://2389.ai/posts/the-dark-factory-is-a-dot-file/)
+    *   *The Durable Artifact Principle:* While the pipeline runner code itself is disposable (*dorodango* — polished, discarded, and rebuilt), the pipeline `.dot` file remains the precious, versioned representation of the software engineering process.
+
+### 🛠️ Reference Implementations
+*   StrongDM, **Attractor** — [GitHub Repository](https://github.com/strongdm/attractor)
+    *   The original reference harness establishing the foundational Attractor paradigms.
+*   Dan Shapiro, **Kilroy** — [GitHub Repository](https://github.com/danshapiro/kilroy)
+    *   A pioneering implementation of the Attractor loop.
+*   2389 Research, **Smasher** — [GitHub Repository](https://github.com/2389-research/smasher)
+    *   An adversarial reviewer and compiler-checked coding harness.
+*   2389 Research, **Mammoth** — [GitHub Repository](https://github.com/2389-research/mammoth)
+    *   An LLM orchestration and workspace synchronization harness.
+*   2389 Research, **Tracker** — [GitHub Repository](https://github.com/2389-research/tracker)
+    *   A high-performance pipeline and task state tracker.
+*   2389 Research, **dippin-lang** — [GitHub Repository](https://github.com/2389-research/dippin-lang)
+    *   A domain-specific language designed for expressing declarative dataflow pipelines.
+
+### 🎯 Advanced Techniques & Methodologies
+*   StrongDM, **Techniques** — [Techniques Directory](https://factory.strongdm.ai/techniques)
+    *   A curated catalog of tactical strategies for robust agentic execution.
+*   StrongDM Techniques, **Direct-to-Unit (DTU)** — [DTU Documentation](https://factory.strongdm.ai/techniques/dtu)
+    *   *The DTU Pattern:* Bypassing middle layers to directly generate targeted unit tests and implementation assertions, ensuring immediate execution feedback.
 
 ---
 
