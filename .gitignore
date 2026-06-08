@@ -25,3 +25,6 @@ results/holdout_results.json
 
 # Misc test artifacts
 *_test.log
+
+# But: rendered diagram PNGs in diagrams/png/ are canonical docs, not test artifacts
+!diagrams/png/*.png

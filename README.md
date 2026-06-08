@@ -4,6 +4,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Build Status](https://img.shields.io/badge/build-passing-green.svg)]()
 
+> **📖 A prettier, diagram-rich HTML version of this README is available at
+> [`README.html`](README.html).** The diagrams follow the shared color
+> semantics documented in
+> [`docs/diagram-color-semantics.md`](docs/diagram-color-semantics.md) — every
+> color carries meaning (engine teal, agent blue, LLM purple, gate amber,
+> holdout red, human slate).
+
 A state-of-the-art Python implementation of the **Attractor pattern**: a robust, DOT-based pipeline engine designed to orchestrate complex multi-agent software engineering workflows using directed graphs. By shifting the unit of durability from ephemeral agent logs to version-controlled process graphs (`.dot`), Dark Factory enables fully autonomous, lights-out development pipelines.
 
 ---

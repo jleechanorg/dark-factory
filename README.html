@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dark Factory — Attractor-Pattern DOT Pipeline Runner</title>
+  <style>
+:root {
+  --bg: #f2efe7;
+  --panel: #fffdf8;
+  --ink: #1f1a16;
+  --muted: #6f6357;
+  --brand: #165a72;
+  --brand-soft: #d8e7ec;
+  --line: #dfd3c2;
+  --code-bg: #1a1714;
+  --code-fg: #e7d9c4;
+  --pass: #15803d;
+  --warn: #a16207;
+  --fail: #b91c1c;
+  --error: #6d28d9;
+  --max-w: 920px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+               "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 16.5px;
+  line-height: 1.62;
+  color: var(--ink);
+  background: var(--bg);
+}
+.layout {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 48px;
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 48px 32px 96px;
+}
+.toc {
+  position: sticky;
+  top: 32px;
+  align-self: start;
+  font-size: 14px;
+  line-height: 1.5;
+  border-left: 2px solid var(--line);
+  padding: 12px 0 12px 20px;
+  max-height: calc(100vh - 64px);
+  overflow: auto;
+}
+.toc h4 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin: 0 0 10px;
+  font-weight: 600;
+}
+.toc ol { list-style: decimal; padding-left: 18px; margin: 0; }
+.toc ol ol { padding-left: 16px; margin-top: 4px; }
+.toc li { margin: 3px 0; }
+.toc a {
+  color: var(--ink);
+  text-decoration: none;
+  border-bottom: 1px dashed transparent;
+  transition: border-color 0.12s, color 0.12s;
+}
+.toc a:hover {
+  color: var(--brand);
+  border-bottom-color: var(--brand);
+}
+main { max-width: var(--max-w); }
+h1, h2, h3, h4 { color: var(--ink); line-height: 1.25; }
+h1 {
+  font-size: 38px;
+  margin: 0 0 8px;
+  letter-spacing: -0.01em;
+}
+h1 + p { color: var(--muted); margin-top: 0; }
+h2 {
+  font-size: 26px;
+  margin: 56px 0 14px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+h2:first-of-type { border-top: 0; padding-top: 0; }
+h3 { font-size: 20px; margin: 32px 0 10px; }
+h4 { font-size: 16px; margin: 20px 0 6px; }
+p { margin: 12px 0; }
+hr { border: 0; border-top: 1px solid var(--line); margin: 36px 0; }
+ul { padding-left: 22px; }
+li { margin: 4px 0; }
+a { color: var(--brand); }
+a:hover { text-decoration: underline; }
+code {
+  font-family: "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  font-size: 0.92em;
+  background: rgba(22, 90, 114, 0.08);
+  color: var(--brand);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+pre.code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 18px 20px;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 13.5px;
+  line-height: 1.55;
+  margin: 18px 0;
+  border: 1px solid #2a2520;
+}
+pre.code code { background: transparent; color: inherit; padding: 0; }
+.diagram-figure {
+  margin: 24px -12px;
+  text-align: center;
+}
+.diagram-figure .diagram {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  box-shadow: 0 1px 2px rgba(31, 26, 22, 0.04);
+}
+.diagram-figure .diagram-wide { max-width: 110%; }
+table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 14.5px; }
+th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+tr:hover td { background: var(--brand-soft); }
+blockquote {
+  border-left: 3px solid var(--brand);
+  margin: 18px 0;
+  padding: 4px 16px;
+  color: var(--muted);
+  background: var(--panel);
+  border-radius: 0 4px 4px 0;
+}
+@media (max-width: 980px) {
+  .layout { grid-template-columns: 1fr; }
+  .toc { position: static; max-height: none; border-left: 0; padding-left: 0; }
+  .diagram-figure { margin: 24px 0; }
+}
+img.emoji, h1 img, h2 img { height: 1em; vertical-align: -0.15em; }
+</style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="toc"><h4>On this page</h4><ol>
+<li><a href="#executive-summary">Executive Summary</a>
+<li><a href="#quick-start">Quick Start</a>
+<li><a href="#example-projects-at-a-glance">Example Projects at a Glance</a>
+<li><a href="#the-operator-agent-isolation-rule">The Operator-Agent Isolation Rule</a>
+<li><a href="#architecture-3-layer-convergence">Architecture: 3-Layer Convergence</a>
+<li><a href="#how-dark-factory-works">How Dark Factory works</a>
+<li><a href="#state-of-the-art-execution-backends">State-of-the-Art Execution Backends</a>
+<li><a href="#pipeline-catalog">Pipeline Catalog</a>
+<li><a href="#fail-closed-observability-cxdb-healer">Fail-Closed Observability: CXDB + Healer</a>
+<li><a href="#directory-layout">Directory Layout</a>
+<li><a href="#recommended-default-claude-based-factories">Recommended default: Claude-based factories</a>
+<li><a href="#execution-cookbook">Execution Cookbook</a>
+<li><a href="#sources-references">Sources &amp; References</a>
+</li></ol></aside>
+    <main>
+      <h1 id="dark-factory-attractor-pattern-dot-pipeline-runner">🏭 Dark Factory — Attractor-Pattern DOT Pipeline Runner</h1>
+<p><a href="https://img.shields.io/badge/python-3.13-blue.svg">![Supported Runtime: Python 3.13</a>](https://www.python.org/) <a href="https://img.shields.io/badge/License-MIT-yellow.svg">![License: MIT</a>](https://opensource.org/licenses/MIT) <a href="https://img.shields.io/badge/build-passing-green.svg">![Build Status</a>]()</p>
+<p>A state-of-the-art Python implementation of the <strong>Attractor pattern</strong>: a robust, DOT-based pipeline engine designed to orchestrate complex multi-agent software engineering workflows using directed graphs. By shifting the unit of durability from ephemeral agent logs to version-controlled process graphs (<code>.dot</code>), Dark Factory enables fully autonomous, lights-out development pipelines.</p>
+<hr />
+<h2 id="executive-summary">📋 Executive Summary</h2>
+<p><strong>Dark Factory turns a natural-language spec into reviewed, tested code — with no human reading the diff.</strong> It is an implementation of the <a href="#-sources--references">Attractor pattern</a> where the durable artifact is a version-controlled process graph (<code>.dot</code>), not an agent transcript. Work flows through <strong>two phases</strong>:</p>
+<pre class="code" data-lang="mermaid"><code>
+flowchart LR
+  subgraph P1[&quot;Phase 1 · Spec generation&quot;]
+    direction TB
+    INTENT[&quot;intent / requirements&quot;] --&gt; SPEC[&quot;spec.md&lt;br/&gt;natural-language spec&quot;]
+    SPEC --&gt; SREV[&quot;spec review (optional)&lt;br/&gt;review_slim / review_full.dot&quot;]
+  end
+  subgraph P2[&quot;Phase 2 · Factory execution&quot;]
+    direction TB
+    PLAN[&quot;plan&quot;] --&gt; IMPL[&quot;implement&quot;] --&gt; TEST[&quot;test&quot;] --&gt; REV[&quot;adversarial review&lt;br/&gt;(independent backend)&quot;] --&gt; GATE[&quot;gates / sealed holdout&quot;]
+  end
+  SREV --&gt; PLAN
+  GATE --&gt; OUT[(&quot;CXDB log + Healer diagnosis&quot;)]
+</code></pre>
+<p>1. <strong>Spec generation — the scarce artifact.</strong> You author a detailed <code>spec.md</code> (under    <code>specs/</code> or <code>benchmarks/&lt;project&gt;/</code>) — or let the pipeline's <code>plan</code> node generate it    from your <code>--goal</code>. Make it complete enough that a coding agent can build with <strong>no    hidden product requirements</strong>. Optionally validate it first with the spec-review    pipeline before spending build tokens. 2. <strong>Factory execution — agents build, agents review.</strong> <code>dark-factory</code> walks a <code>.dot</code>    graph sized to the project: <code>plan → implement → test → adversarial review → gates /    sealed holdout</code>, looping through <code>fix</code> on failure. Every node visit is recorded to an    SQLite event log (<strong>CXDB</strong>); the <strong>Healer</strong> clusters failures into an actionable    diagnosis.</p>
+<p><strong>Why it's different.</strong> Merge confidence comes from <em>outcome artifacts</em> — sealed holdouts, adversarial cross-review, CXDB history — not from a human reading the diff. The implementing agent is <strong>structurally blind</strong> to the holdouts and evaluator (<a href="#-the-operator-agent-isolation-rule">isolation rule</a>), so it cannot pass tests by reading them. You version the <code>.dot</code> graph and the specs/holdouts/scoring contracts; the Python under <code>runner/</code> is disposable <em>dorodango</em> — polish, discard, rebuild from spec.</p>
+<p>| | | |---|---| | <strong>Two phases</strong> | spec generation → factory execution | | <strong>Runtime</strong> | Python 3.13 (uv-managed) | | <strong>Entry point</strong> | <code>dark-factory</code> binary (not <code>python -m runner</code>) | | <strong>Backends</strong> | <code>claude</code>, <code>codex</code>, <code>agy</code>, <code>ao</code>, <code>claudew</code> (wafer), <code>mock_llm</code>/<code>echo</code> | | <strong>Durable artifacts</strong> | <code>.dot</code> pipeline graphs + <code>spec.md</code> (process + intent) | | <strong>Observability</strong> | CXDB SQLite event log + <code>df-healer</code> failure clustering |</p>
+<hr />
+<h2 id="table-of-contents">📑 Table of Contents</h2>
+<p>1. <a href="#-executive-summary">Executive Summary</a> 2. <a href="#-quick-start">Quick Start</a> 3. <a href="#-example-projects-at-a-glance">Example Projects at a Glance</a> 4. <a href="#-the-operator-agent-isolation-rule">The Operator-Agent Isolation Rule</a> 5. <a href="#-architecture-3-layer-convergence">Architecture: 3-Layer Convergence</a> 6. <a href="#-how-dark-factory-works">How Dark Factory works</a> 7. <a href="#-state-of-the-art-execution-backends">State-of-the-Art Execution Backends</a> 8. <a href="#-pipeline-catalog">Pipeline Catalog</a> 9. <a href="#-fail-closed-observability-cxdb--healer">Fail-Closed Observability: CXDB + Healer</a> 10. <a href="#-directory-layout">Directory Layout</a> 11. <a href="#-recommended-default-claude-based-factories">Recommended default: Claude-based factories</a> 12. <a href="#-execution-cookbook">Execution Cookbook</a> 13. <a href="#-sources--references">Sources &amp; References</a></p>
+<hr />
+<h2 id="quick-start">⚡ Quick Start</h2>
+<p>Dark Factory runs in <strong>two phases — generate the spec, then execute the factory.</strong></p>
+<pre class="code" data-lang="bash"><code>
+# 0. Install once (uv-managed Python 3.13 venv + binaries on PATH)
+git clone https://github.com/jleechanorg/dark-factory ~/projects/dark-factory
+cd ~/projects/dark-factory &amp;&amp; ./install.sh
+export DARK_FACTORY_HOME=~/projects/dark-factory
+export DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts
+export PATH=&quot;$HOME/.local/bin:$PATH&quot;
+
+# Smoke test the install — echo backend, no LLM cost
+dark-factory --pipeline pipelines/factory/hello.dot --goal &quot;smoke test&quot; --backend echo
+</code></pre>
+<p><strong>Phase 1 — generate (or author) the spec.</strong> Write a complete natural-language spec the coding agent can build from with no hidden requirements. Either commit it to <code>specs/&lt;feature&gt;.md</code>, or let the pipeline's <code>plan</code> node generate <code>spec.md</code> from your <code>--goal</code>. Optionally validate it before spending build tokens:</p>
+<pre class="code" data-lang="bash"><code>
+dark-factory \
+  --pipeline benchmarks/attractor-spec-review/pipelines/review_slim.dot \
+  --goal &quot;Review specs/my_feature.md for completeness and ambiguity&quot; \
+  --backend claude
+</code></pre>
+<p><strong>Phase 2 — run the factory.</strong> Pick the <code>.dot</code> sized to the project (see <a href="#-example-projects-at-a-glance">Example Projects</a>), run from the target repo cwd, and record outcomes to CXDB:</p>
+<pre class="code" data-lang="bash"><code>
+cd ~/projects/my-app
+dark-factory \
+  --pipeline pipelines/slim/minimal_feature.dot \
+  --goal &quot;Implement specs/my_feature.md&quot; \
+  --backend claude \
+  --feature my_feature \
+  --cxdb ~/.dark-factory/cxdb.sqlite
+
+# Cluster any failures into a Healer diagnosis
+df-healer --cxdb ~/.dark-factory/cxdb.sqlite
+</code></pre>
+<p>&gt; <strong>Pick the <code>.dot</code> for the task — do not default every run to one pipeline.</strong> See &gt; <a href="#-example-projects-at-a-glance">Example Projects</a>, the <a href="#-pipeline-catalog">Pipeline Catalog</a>, &gt; and the full decision table in <a href="docs/pipeline-selection.md">docs/pipeline-selection.md</a>.</p>
+<hr />
+<h2 id="example-projects-at-a-glance">📦 Example Projects at a Glance</h2>
+<p><strong>Scale the graph to the project.</strong> A one-file utility needs a linear plan→build→score lane; a full-stack app needs staged build nodes, multiple gates, an independent reviewer, and a sealed holdout. All three examples below ship in <code>benchmarks/</code> as concrete, runnable projects — each driven by its own committed spec (<code>benchmarks/&lt;project&gt;/spec.md</code>) and <code>.dot</code> graph.</p>
+<p>| Scale | Example project | Pipeline(s) | Shape | |-------|-----------------|-------------|-------| | <strong>Small</strong> | <a href="benchmarks/fibonacci"><code>benchmarks/fibonacci</code></a> — a Fibonacci CLI | <code>pipelines/slim.dot</code> | Linear: plan → implement → public acceptance → sealed score, one <code>fix</code> loop | | <strong>Medium</strong> | <a href="benchmarks/airbnb-clone"><code>benchmarks/airbnb-clone</code></a> — 3-sprint app | <code>airbnb-clone.dot</code> (+ <code>sprint-{1,2,3}-<em>.dot</code>) | Three sealed-gated sprints (Data → Backend → Frontend), each with a <code>fix</code> loop | | <strong>Large</strong> | <a href="benchmarks/amazon-clone"><code>benchmarks/amazon-clone</code></a> — full-stack commerce | <code>dark_factory.dot</code> (+ <code>slices_</em>.dot</code>) | Spec-review → architecture → 6 build nodes (mixed backends) → smoke/size → <code>/es</code>+<code>/er</code> → independent review → sealed holdout |</p>
+<h3 id="small-fibonacci-single-algorithm-single-spec">🟢 Small — <code>fibonacci</code> (single algorithm, single spec)</h3>
+<pre class="code" data-lang="mermaid"><code>
+flowchart LR
+  s([Start]) --&gt; plan[Plan] --&gt; impl[Implement] --&gt; acc{&quot;Public&lt;br/&gt;acceptance&quot;}
+  acc -- pass --&gt; score{&quot;Sealed&lt;br/&gt;score&quot;}
+  score -- pass --&gt; e([Exit])
+  acc -- fail --&gt; fix[Fix]
+  score -- fail --&gt; fix
+  fix --&gt; acc
+</code></pre>
+<p>One spec, one build, two checks (a visible acceptance command plus a redacted sealed score). Reach for this shape for scripts, single modules, and pure-logic katas.</p>
+<h3 id="medium-airbnb-clone-sprinted-data-backend-frontend">🟡 Medium — <code>airbnb-clone</code> (sprinted: Data → Backend → Frontend)</h3>
+<pre class="code" data-lang="mermaid"><code>
+flowchart LR
+  s([Start]) --&gt; p1
+  subgraph S1[&quot;Sprint 1 · Data&quot;]
+    direction TB
+    p1[Plan] --&gt; i1[Implement] --&gt; v1{Verify}
+    v1 -- fail --&gt; f1[Fix] --&gt; v1
+  end
+  subgraph S2[&quot;Sprint 2 · Backend&quot;]
+    direction TB
+    p2[Plan] --&gt; i2[Implement] --&gt; v2{Verify}
+    v2 -- fail --&gt; f2[Fix] --&gt; v2
+  end
+  subgraph S3[&quot;Sprint 3 · Frontend&quot;]
+    direction TB
+    p3[Plan] --&gt; i3[Implement] --&gt; v3{Verify}
+    v3 -- fail --&gt; f3[Fix] --&gt; v3
+  end
+  v1 -- pass --&gt; p2
+  v2 -- pass --&gt; p3
+  v3 -- pass --&gt; e([Exit])
+</code></pre>
+<p>Each sprint is its own plan→implement→verify loop gated by a <strong>sealed holdout evaluator</strong>; a sprint must pass before the next begins. Reach for this shape for multi-layer features and apps you want delivered in reviewable increments.</p>
+<h3 id="large-amazon-clone-full-stack-multi-gate-sliced">🔴 Large — <code>amazon-clone</code> (full-stack, multi-gate, sliced)</h3>
+<pre class="code" data-lang="mermaid"><code>
+flowchart LR
+  s([Start]) --&gt; sr[&quot;Spec review&lt;br/&gt;codex&quot;] --&gt; arch[&quot;Architecture&lt;br/&gt;claude&quot;] --&gt; build
+  subgraph build[&quot;Build · specialized codergen nodes (mixed backends)&quot;]
+    direction TB
+    dm[Data model] --&gt; be[Backend API] --&gt; fe[Frontend] --&gt; fr[Firestore rules] --&gt; sd[Seed + reset] --&gt; vh[Validation harness]
+  end
+  build --&gt; sm[Local smoke] --&gt; sz[Size check] --&gt; es[&quot;es gate&quot;] --&gt; er[&quot;er gate&quot;] --&gt; ir[&quot;Independent review&lt;br/&gt;codex&quot;] --&gt; ho{&quot;Sealed&lt;br/&gt;holdout&quot;}
+  ho -- pass --&gt; e([Exit])
+  ho -- fail --&gt; fx[Fix] --&gt; sm
+</code></pre>
+<p>A built-in <code>spec_review</code> node opens the run; specialized build nodes split backend (<code>codex</code>) from frontend (<code>claude</code>); evidence gates (<code>/es</code>, <code>/er</code>), an independent adversarial reviewer, and a sealed holdout all guard the exit. The same project also ships <strong>vertical-slice</strong> graphs (<code>slices_foundation → catalog → cart → checkout</code>) when you'd rather ship one feature column end-to-end at a time. Reach for this shape for production full-stack work.</p>
+<hr />
+<h2 id="the-operator-agent-isolation-rule">🔒 The Operator-Agent Isolation Rule</h2>
+<p>To guarantee rigorous evaluation integrity, Dark Factory strictly enforces <strong>sandboxed agent execution</strong>:</p>
+<p>&gt; [!IMPORTANT] &gt; <strong>Adversarial Separation Constraint:</strong> The spawned implementing agent (the <code>codergen</code> worker running Claude Code, Codex, or an Antigravity session) is completely blind to holdout test suites (<code>holdouts/</code>, <code>runner/evaluator.py</code>, and <code>_holdout/</code> paths). &gt; &gt; <em>   <strong>Operational Enforcement:</strong> The runner CLI dynamically invokes the implementing agent under <code>sandbox-exec</code> with strict OS-level permissions denying read access to the local holdouts directory. &gt; </em>   <strong>Environment Isolation:</strong> All environment variables pointing to holdout files (<code>DARK_FACTORY_HOLDOUTS</code>, etc.) are actively stripped from the agent subprocess env via <code>_sanitized_env()</code>. &gt; &gt; As the <strong>Operator</strong>, you have full access to view tests, event logs, and holdouts. You must ensure that no holdout-derived hints or test code leaks into the prompt templates consumed by the coder nodes.</p>
+<hr />
+<h2 id="architecture-3-layer-convergence">📐 Architecture: 3-Layer Convergence</h2>
+<p>Dark Factory operates as the top layer of a modern, modular agentic stack:</p>
+<figure class="diagram-figure"><img class="diagram" src="diagrams/png/01-3-layer-convergence.png" alt="3-layer convergence + operator isolation" loading="lazy" /></figure>
+<hr />
+<h2 id="how-dark-factory-works">🧭 How Dark Factory works</h2>
+<h3 id="system-architecture-three-layer-convergence-isolation-cxdbhealer">System architecture (three-layer convergence + isolation + CXDB/Healer)</h3>
+<figure class="diagram-figure"><img class="diagram diagram-wide" src="diagrams/png/01-3-layer-convergence.png" alt="3-layer convergence + operator isolation + CXDB/Healer" loading="lazy" /></figure>
+<p>The durable artifact is the <code>.dot</code> graph — version it, review it in PRs, and treat the Python under <code>runner/</code> as disposable <em>dorodango</em> (polish, discard, rebuild from spec). The isolation guarantee is structural: the implementing/<code>codergen</code> agent only ever sees the spec, prompts, and its own worktree — never <code>holdouts/</code> or the sealed evaluator, which are enforced via <code>sandbox-exec</code> file-read denial plus a sanitized subprocess env. Every node visit is written to the <strong>CXDB</strong> SQLite event log, and the <strong>Healer</strong> reads that log to cluster terminal failures into an actionable <code>diagnosis.md</code> — learning accumulates in the event log, not in the runner code.</p>
+<h3 id="pipeline-execution-flow-one-step-of-the-walk">Pipeline execution flow (one step of the walk)</h3>
+<figure class="diagram-figure"><img class="diagram" src="diagrams/png/02-pipeline-execution.png" alt="Pipeline execution — one step of the walk" loading="lazy" /></figure>
+<p><code>engine.run()</code> walks from <code>start</code>, calls the handler that <code>resolve(node)</code> picks (<code>type=</code> → <code>start</code>/<code>exit</code> name → DOT shape → default <code>_codergen</code>), records the step to <code>history</code> and the CXDB sequence, then chooses the next edge with <code>_edge_matches</code> — conditional edges (<code>condition="key=value"</code> / <code>key!=value</code>) always win over unconditional ones. A node's <code>max_visits</code> bounds loops: exceeding it emits a synthetic <code>exhausted</code> step and routes to <code>exit</code>. Gate verdicts are normalized to <code>success</code>/<code>failure</code>/<code>error</code> so the Healer can cluster real failures separately from infra crashes; <code>holdout_eval</code> reads the last JSON line of the sealed evaluator's stdout.</p>
+<hr />
+<h2 id="state-of-the-art-execution-backends">🚀 State-of-the-Art Execution Backends</h2>
+<p>Dark Factory ships with first-class support for diverse LLM and agent backends, dynamically selected per node via DOT attributes or global flags:</p>
+<p>1.  <strong><code>agy</code> (Antigravity CLI Backend) [New &amp; Recommended]</strong></p>
+<ul><li>Invokes the powerful Antigravity execution engine headlessly and non-interactively using:</li></ul>
+<p>        ``<code>bash         agy --add-dir &lt;cwd&gt; --dangerously-skip-permissions --print --print-timeout &lt;s_s&gt;         </code>``</p>
+<ul><li>Wraps prompts automatically in a headless instruction wrapper, directing Antigravity to decompose the task, spawn parallel internal subagents if useful, apply direct workspace changes, and exit cleanly without waiting for interactive input.</li></ul>
+<p>2.  <strong><code>claudew</code> (Wafer-Driven Claude Backend) [New]</strong></p>
+<ul><li>Leverages the <code>WAFER_API_KEY</code> to route requests through a high-performance local wafer proxy.</li><li>Sets <code>ANTHROPIC_BASE_URL="http://localhost:9001"</code> and defaults to the premium <code>GLM-5.1</code> model (configurable via <code>WAFER_MODEL</code>) running with high effort (<code>--effort high</code>) and a generous 30-minute execution timeout.</li></ul>
+<p>3.  <strong><code>claude</code> (Claude Code CLI)</strong></p>
+<ul><li>Directly invokes <code>claude</code> with standard prompt text to run autonomous editing and execution tasks.</li></ul>
+<p>4.  <strong><code>codex</code> (Codex CLI)</strong></p>
+<ul><li>Uses <code>codex exec</code> to drive immediate terminal or workspace updates.</li></ul>
+<p>5.  <strong><code>ao</code> (WorldArchitect Agent)</strong></p>
+<ul><li>Spawns an autonomous workspace worker mapped to an active WorldArchitect project (<code>--ao-project</code>).</li></ul>
+<p>6.  <strong><code>mock_llm</code> / <code>echo</code></strong></p>
+<ul><li>Deterministic test backends used for validation, smoke testing, and continuous integration pipelines.</li></ul>
+<hr />
+<h2 id="pipeline-catalog">📊 Pipeline Catalog</h2>
+<p>Our pipelines are designed to support a wide range of complexity, from simple test lanes to full-scale multi-stage development pipelines:</p>
+<h3 id="1-the-gates-pipeline-pipelinesfactorygatesdot">1. The Gates Pipeline (<code>pipelines/factory/gates.dot</code>)</h3>
+<p>An end-to-end multi-agent pipeline:</p>
+<ul><li><strong>Specify:</strong> Parses natural language specs and generates target code designs.</li><li><strong>Implement:</strong> Translates designs into physical code modifications.</li><li><strong>Gate Verification:</strong> Executes deterministic compiler checks and runs static reviews.</li><li><strong>Holdout Evaluation:</strong> Runs sealed verification suites to evaluate performance.</li></ul>
+<h3 id="2-minimal-feature-amp-style-sheets-pipelinesslimminimal-featuredot">2. Minimal Feature &amp; Style Sheets (<code>pipelines/slim/minimal_feature.dot</code>)</h3>
+<ul><li>Demonstrates Dark Factory's support for <strong>CSS-like model stylesheets</strong> (<code>.model.css</code>).</li><li>Rather than cluttering every node with explicit models or API parameters, the runner applies custom routing rules dynamically at runtime based on selectors (e.g., matching node names, shapes, or types to specific model profiles).</li></ul>
+<h3 id="3-spec-review-benchmark-benchmarksattractor-spec-review">3. Spec Review Benchmark (<code>benchmarks/attractor-spec-review/</code>)</h3>
+<p>Designed to evaluate and refine natural-language specs:</p>
+<ul><li><code>review_slim.dot</code>: Rapid, single-pass specification audit and smoke check.</li><li><code>review_full.dot</code>: In-depth spec review featuring multi-stage auditing, full-stack smoke environments, and independent reviewer audits via <code>codex exec --yolo</code>.</li></ul>
+<hr />
+<h2 id="fail-closed-observability-cxdb-healer">🩺 Fail-Closed Observability: CXDB + Healer</h2>
+<p>To build a true "Dark Factory," errors must be logged, clustered, and resolved programmatically:</p>
+<figure class="diagram-figure"><img class="diagram" src="diagrams/png/03-cxdb-healer-loop.png" alt="CXDB + Healer feedback loop" loading="lazy" /></figure>
+<ul><li><strong>CXDB SQLite Event Log (<code>runner/cxdb.py</code>):</strong></li><li>Every step, node transition, stdout snippet, stderr traceback, metadata chunk, and execution cost metric is recorded in a centralized SQLite database.</li><li>Runs in high-concurrency <strong>Write-Ahead Logging (WAL) mode</strong> with a robust <code>5000ms</code> busy timeout to guarantee concurrent multi-pipeline instances write safely without database locking errors.</li><li><strong>The Healer Engine (<code>runner/healer.py</code>):</strong></li><li>Reads the CXDB log and dynamically clusters terminal failures (e.g., <code>failure</code>, <code>exhausted</code>, <code>stuck</code>, <code>error</code>) by <code>(node, outcome, output_hash)</code>.</li><li>Invokes an LLM review backend (<code>claude</code> or <code>echo</code>) to analyze the precise error context and output.</li><li>Generates a structured, highly actionable Markdown report containing a tailored <strong>prescription</strong> (e.g., which prompt to refine, which code logic failed, or which harness configuration is broken) for every cluster.</li></ul>
+<hr />
+<h2 id="directory-layout">📁 Directory Layout</h2>
+<pre class="code" data-lang=""><code>
+dark-factory/
+├── pipelines/                      # Durable .dot pipeline graph definitions
+│   ├── factory/                    # Production factory runs (gates.dot, hello.dot)
+│   └── slim/                       # Minimal templates &amp; styling stylesheets (.model.css)
+├── benchmarks/                     # Public NLSpecs, starter assets, and benchmarks
+│   ├── amazon-clone/               # Full-stack E-Commerce benchmark setup
+│   ├── airbnb-clone/               # Firebase emulator-backed benchmark
+│   └── attractor-spec-review/      # Spec review pipelines (review_slim/full.dot)
+├── specs/                          # System feature specs (visible to implementing agents)
+├── prompts/                        # System-wide prompt templates referenced by DOT nodes
+├── runner/                         # The Python DOT Pipeline Engine
+│   ├── __init__.py
+│   ├── __main__.py                 # Command line interface &amp; parser arguments
+│   ├── parser.py                   # PyDot loader &amp; validator (verifies start/exit)
+│   ├── engine.py                   # Graph traversal, state tracking, &amp; loop limits
+│   ├── handlers.py                 # Core handlers &amp; backends (agy, claudew, claude, ao)
+│   ├── cxdb.py                     # SQLite WAL step recording and logging schemas
+│   └── healer.py                   # Failure clustering &amp; automatic prescription engine
+├── tests/                          # Rigorous unit and integration test suite
+├── CLAUDE.md                       # Agent instructions (auto-loaded by Claude Code)
+├── AGENTS.md                       # Identical instructions for all other AI agents
+└── README.md                       # This premium documentation
+</code></pre>
+<hr />
+<h2 id="recommended-default-claude-based-factories">⭐ Recommended default: Claude-based factories</h2>
+<p>For day-to-day work, run the factory with <code>--backend claude</code> and <strong>pick the <code>.dot</code> for the task</strong> — do not default every run to a single pipeline. The full decision table is <a href="docs/pipeline-selection.md">docs/pipeline-selection.md</a>; the common picks:</p>
+<p>| Task | Pipeline | |------|----------| | Smoke / wiring (no LLM cost) | <code>pipelines/factory/hello.dot</code> | | New feature (full loop) | <code>pipelines/slim/minimal_feature.dot</code> | | In-flight PR iteration | <code>pipelines/slim/minimal_pr.dot</code> | | Diff + sealed holdout validation | <code>pipelines/factory/gates.dot</code> |</p>
+<p><strong>Operating discipline:</strong></p>
+<ul><li><strong>Always record outcomes.</strong> Pass <code>--cxdb ~/.dark-factory/cxdb.sqlite</code> and</li></ul>
+<p>    <code>--feature &lt;name&gt;</code> on every real run, then run <code>df-healer --cxdb ~/.dark-factory/cxdb.sqlite</code>     afterward to cluster failures into a diagnosis. Merge confidence comes from     outcome artifacts (holdouts, gates, CXDB history), not from reading the diff.</p>
+<ul><li><strong>Keep adversarial cross-review independent.</strong> Every non-trivial pipeline should</li></ul>
+<p>    contain at least one reviewer node that is <em>separate</em> from the Claude coder —     e.g. an independent reviewer <code>tool</code> node invoking <code>codex exec --yolo</code>. Because that     reviewer never saw the implementation prompt, its verdict is genuinely adversarial.     The slim pipelines (<code>minimal_feature.dot</code>, <code>minimal_pr.dot</code>) now ship this <strong>by     default</strong>: their <code>review</code> node pins <code>backend="codex"</code>, so the reviewer runs on a     different backend than the coder out of the box (precedence: explicit node attr &gt;     <code>model_stylesheet</code> &gt; <code>--backend</code>, so this is independent and non-overridable by the     coder's <code>--backend</code>). Requires <code>codex</code> installed; override path is in     <a href="docs/pipeline-selection.md#independent-reviewer-adversarial-by-default">docs/pipeline-selection.md</a>.</p>
+<ul><li><strong>Route models by role, not by hand.</strong> Use a heavier model for plan/review and a</li></ul>
+<p>    faster one for implement. Set this per-node (<code>backend="…"</code> / <code>model="…"</code>) or, better,     once per graph via <code>model_stylesheet="….model.css"</code> — never by editing every node.</p>
+<ul><li><strong>Author dynamically, run statically.</strong> The engine executes static <code>.dot</code> graphs</li></ul>
+<p>    only; any "dynamic / NL-generated workflow" advantage lives at <em>authoring</em> time, not     runtime (benchmarks show execution dispatch is a wash, ~5–9% slower for the dynamic     harness). The one structural exception is runtime-determined fan-out. Full decision     guide: <a href="docs/dynamic-vs-deterministic-workflow.md">docs/dynamic-vs-deterministic-workflow.md</a>.</p>
+<p>Concrete copy-paste (gated run with sealed holdout, from the target repo cwd):</p>
+<pre class="code" data-lang="bash"><code>
+cd ~/projects/my-app
+dark-factory \
+  --pipeline pipelines/factory/gates.dot \
+  --goal &quot;&lt;feature description&gt;&quot; \
+  --backend claude \
+  --feature &lt;feature_name&gt; \
+  --cxdb ~/.dark-factory/cxdb.sqlite
+
+# After the run, cluster any failures into a Healer diagnosis:
+df-healer --cxdb ~/.dark-factory/cxdb.sqlite
+</code></pre>
+<hr />
+<h2 id="execution-cookbook">🍳 Execution Cookbook</h2>
+<h3 id="one-time-install-binary-not-source">⚙️ One-time install (binary, not source)</h3>
+<p>Dark Factory runs via the <strong><code>dark-factory</code> binary</strong> — not <code>python -m runner</code> from a raw checkout. Install once with <a href="https://docs.astral.sh/uv/">uv</a>:</p>
+<pre class="code" data-lang="bash"><code>
+git clone https://github.com/jleechanorg/dark-factory ~/projects/dark-factory
+cd ~/projects/dark-factory
+./install.sh
+
+export DARK_FACTORY_HOME=~/projects/dark-factory
+export DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts
+export PATH=&quot;$HOME/.local/bin:$PATH&quot;
+</code></pre>
+<p>This installs a uv-managed Python 3.13 venv, PyPI deps (<code>pydot</code>, <code>PyYAML</code>), and symlinks <code>dark-factory</code> + <code>df-healer</code> into <code>~/.local/bin</code>.</p>
+<p>Run pipelines from the <strong>target repo</strong> (implementation workdir = cwd). Graphs and prompts load from <code>$DARK_FACTORY_HOME</code>. See <a href="docs/pipeline-selection.md">docs/pipeline-selection.md</a> — <strong>pick the <code>.dot</code> for the task</strong>, do not always use the same default.</p>
+<h3 id="1-smoke-pipeline-no-llm-cost">💨 1. Smoke pipeline (no LLM cost)</h3>
+<pre class="code" data-lang="bash"><code>
+cd ~/projects/dark-factory   # or any repo; hello resolves via DARK_FACTORY_HOME
+dark-factory --pipeline pipelines/factory/hello.dot --goal &quot;smoke test&quot; --backend echo
+</code></pre>
+<h3 id="2-new-feature-full-loop">🆕 2. New feature (full loop)</h3>
+<pre class="code" data-lang="bash"><code>
+cd ~/projects/my-app
+dark-factory \
+  --pipeline pipelines/slim/minimal_feature.dot \
+  --goal &quot;Add user-facing feature X&quot; \
+  --backend claude \
+  --feature my_feature \
+  --cxdb ~/.dark-factory/cxdb.sqlite
+</code></pre>
+<h3 id="3-in-flight-pr-iteration-no-holdout">🔁 3. In-flight PR iteration (no holdout)</h3>
+<pre class="code" data-lang="bash"><code>
+cd ~/projects/my-app
+dark-factory \
+  --pipeline pipelines/slim/minimal_pr.dot \
+  --goal &quot;Fix failing tests on PR branch&quot; \
+  --backend claude \
+  --state &#x27;slim.test_command=pytest tests/test_foo.py -v&#x27; \
+  --cxdb ~/.dark-factory/cxdb.sqlite
+</code></pre>
+<h3 id="4-gates-only-validation-diff-already-implemented">🛡️ 4. Gates-only validation (diff already implemented)</h3>
+<pre class="code" data-lang="bash"><code>
+cd ~/projects/my-app
+dark-factory \
+  --pipeline pipelines/factory/gates.dot \
+  --goal &quot;Validate JWT middleware diff&quot; \
+  --backend claude \
+  --feature auth_middleware \
+  --cxdb ~/.dark-factory/cxdb.sqlite
+</code></pre>
+<h3 id="5-healer-failure-audit">🩺 5. Healer failure audit</h3>
+<pre class="code" data-lang="bash"><code>
+df-healer --cxdb ~/.dark-factory/cxdb.sqlite
+</code></pre>
+<h3 id="tests-dev">🧪 Tests (dev)</h3>
+<pre class="code" data-lang="bash"><code>
+cd ~/projects/dark-factory
+.venv/bin/python -m pytest tests/
+</code></pre>
+<hr />
+<h2 id="sources-amp-references">📚 Sources &amp; References</h2>
+<p>Dark Factory stands on the shoulders of groundbreaking work in agentic software engineering and Level 5 automation. Our design, paradigms, and benchmark splits are inspired by the following research, reference implementations, and articles:</p>
+<h3 id="core-specifications-amp-benchmarks">🔬 Core Specifications &amp; Benchmarks</h3>
+<ul><li>StrongDM, <strong>AttractorBench</strong> — <a href="https://github.com/strongdm/attractorbench">GitHub Repository</a></li><li><em>Defines the benchmark paradigm:</em> Agents ingest a public natural-language specification, while the deterministic evaluation and test suites are held out locally to prevent LLM training-data contamination.</li><li>jleechanorg, <strong>AttractorBench Fork</strong> — <a href="https://github.com/jleechanorg/attractorbench">GitHub Repository</a></li><li><em>Our public experimental baseline:</em> Sandbox for validating spec-review workflows and cross-repository agent validation mechanics.</li></ul>
+<h3 id="paradigms-amp-articles">📝 Paradigms &amp; Articles</h3>
+<ul><li>Dan Shapiro, <strong>"You don't write the code"</strong> — <a href="https://www.danshapiro.com/blog/2026/02/you-dont-write-the-code/">Blog Post</a></li><li><em>The philosophy of Level 5 Automation:</em> In the ultimate "Dark Factory," humans never read or write code. Instead, they specify intent and design outcomes. Quality is enforced via observability, automated healers, and adversarial reviews.</li><li>Simon Willison, <strong>"The Software Factory"</strong> — <a href="https://simonwillison.net/2026/Feb/7/software-factory/">Blog Post</a></li><li><em>The Industrialization of AI Coding:</em> Shifting the industry mindset from bespoke chat boxes to repeatable, high-volume automated pipeline execution.</li><li>2389 Research, <strong>"The Dark Factory is a .dot file"</strong> — <a href="https://2389.ai/posts/the-dark-factory-is-a-dot-file/">Blog Post</a></li><li><em>The Durable Artifact Principle:</em> While the pipeline runner code itself is disposable (<em>dorodango</em> — polished, discarded, and rebuilt), the pipeline <code>.dot</code> file remains the precious, versioned representation of the software engineering process.</li></ul>
+<h3 id="reference-implementations">🛠️ Reference Implementations</h3>
+<ul><li>StrongDM, <strong>Attractor</strong> — <a href="https://github.com/strongdm/attractor">GitHub Repository</a></li><li>The original reference harness establishing the foundational Attractor paradigms.</li><li>Dan Shapiro, <strong>Kilroy</strong> — <a href="https://github.com/danshapiro/kilroy">GitHub Repository</a></li><li>A pioneering implementation of the Attractor loop.</li><li>2389 Research, <strong>Smasher</strong> — <a href="https://github.com/2389-research/smasher">GitHub Repository</a></li><li>An adversarial reviewer and compiler-checked coding harness.</li><li>2389 Research, <strong>Mammoth</strong> — <a href="https://github.com/2389-research/mammoth">GitHub Repository</a></li><li>An LLM orchestration and workspace synchronization harness.</li><li>2389 Research, <strong>Tracker</strong> — <a href="https://github.com/2389-research/tracker">GitHub Repository</a></li><li>A high-performance pipeline and task state tracker.</li><li>2389 Research, <strong>dippin-lang</strong> — <a href="https://github.com/2389-research/dippin-lang">GitHub Repository</a></li><li>A domain-specific language designed for expressing declarative dataflow pipelines.</li></ul>
+<h3 id="advanced-techniques-amp-methodologies">🎯 Advanced Techniques &amp; Methodologies</h3>
+<ul><li>StrongDM, <strong>Techniques</strong> — <a href="https://factory.strongdm.ai/techniques">Techniques Directory</a></li><li>A curated catalog of tactical strategies for robust agentic execution.</li><li>StrongDM Techniques, <strong>Direct-to-Unit (DTU)</strong> — <a href="https://factory.strongdm.ai/techniques/dtu">DTU Documentation</a></li><li><em>The DTU Pattern:</em> Bypassing middle layers to directly generate targeted unit tests and implementation assertions, ensuring immediate execution feedback.</li></ul>
+<hr />
+<p><em>“The pipeline definitions encode the development process itself. Rebuild the code, polish the dorodango, but keep the graph.”</em></p>
+    </main>
+  </div>
+</body>
+</html>
