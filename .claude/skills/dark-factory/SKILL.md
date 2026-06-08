@@ -38,8 +38,8 @@ pipeline; use `/h` when you want an interactive in-session loop.
 | `pipelines/factory/hello.dot` | plan → implement → holdout → fix-loop → exit | Add a new feature with a holdout scenario |
 | `pipelines/factory/gates.dot` | start → holdout → /es → /er → /code_standards → exit | Validate an already-implemented diff (Attractor-style 4-gate harness as `.dot`) |
 | `pipelines/factory/pr_gates.dot` | start → /es → /er → /code_standards → exit | Validate an already-implemented in-flight PR diff (bypasses holdouts) |
-| `pipelines/slim/minimal_feature.dot` | plan → implement → test → review → holdout → gates → exit | Full production pipeline from scratch with a holdout |
-| `pipelines/slim/minimal_pr.dot` | plan → implement → test → review → gates → exit | Slim in-flight PR iteration loop with parameterized tests (bypasses holdouts) |
+| `pipelines/slim/minimal_feature.dot` | explore → plan → implement → test → review → holdout → gates → exit | Full production pipeline from scratch with a holdout |
+| `pipelines/slim/minimal_pr.dot` | explore → plan → implement → test → review → gates → exit | Slim in-flight PR iteration loop with parameterized tests (bypasses holdouts) |
 
 You can also write your own `.dot` and pass it via `--pipeline`.
 

@@ -167,7 +167,7 @@ start ──▶ plan ──▶ implement ──▶ holdout_eval ──(success)�
 ### 5. `minimal_feature.dot` — Full Feature Factory (Slim)
 
 ```
-start ──▶ plan ──▶ implement ──▶ test ──(success)──▶ review ──(success)──▶ holdout ──(success)──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ exit
+start ──▶ explore ──▶ plan ──▶ implement ──▶ test ──(success)──▶ review ──(success)──▶ holdout ──(success)──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ exit
                                     │                  │                  │                  │
                                     └──(fail)──▶ fix ◀─┘                  │                  │
                                                           └──(fail)──▶ fix ┘                  │
@@ -181,7 +181,7 @@ fix ──▶ test (loop)
 ### 6. `minimal_pr.dot` — Slim PR Iteration Factory (No Holdout)
 
 ```
-start ──▶ plan ──▶ implement ──▶ test ──(success)──▶ review ──(success)──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ exit
+start ──▶ explore ──▶ plan ──▶ implement ──▶ test ──(success)──▶ review ──(success)──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ exit
                                     │                  │                  │                  │
                                     └──(fail)──▶ fix ◀─┘                  │                  │
                                                           └──(fail)──▶ fix ┘                  │

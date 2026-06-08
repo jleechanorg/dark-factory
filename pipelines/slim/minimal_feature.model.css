@@ -1,18 +1,22 @@
 /*
- * Production model stylesheet for the slim pipelines
+ * Role-based model routing for slim pipelines
  * (minimal_feature.dot, minimal_pr.dot).
  *
- * Coder nodes (plan/implement/fix/test) intentionally carry NO backend rule
- * here, so they honor the run-level --backend (or per-node backend attr).
- * Adding a blanket `* { backend: echo }` would silently override --backend and
- * make these pipelines un-runnable with a real coder backend.
+ * Coder tier (explore / implement / fix): intentionally NO rules here — nodes
+ * honor the run-level --backend (or a per-node backend attr). Explore uses the
+ * same CLI/model as implement/fix.
  *
- * The review node defaults to an INDEPENDENT codex reviewer. The node already
- * sets `backend="codex"` directly in the .dot (an explicit node attr wins over
- * the stylesheet per parser precedence), so this rule is defense/documentation
- * — it states the adversarial-by-default intent and survives if the node attr
- * is ever dropped.
+ * Plan tier: heavier Claude model for architecture/spec work (design phase).
+ * Explicit node attrs win over stylesheet rules; tests pin plan to echo.
+ *
+ * Review tier: independent adversarial backend (Antigravity), separate from
+ * the coder --backend.
  */
+.plan {
+  backend: claude;
+  model_name: claude-opus-4-6;
+}
+
 .review {
-  backend: codex;
+  backend: agy;
 }

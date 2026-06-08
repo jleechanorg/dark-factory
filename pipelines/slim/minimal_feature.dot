@@ -8,6 +8,13 @@ digraph MinimalFeatureFactory {
   start [shape=Mdiamond, label="Start"]
   exit  [shape=Msquare, label="Exit - Ready to Merge"]
 
+  explore [
+    type="codergen",
+    label="Explore & Map",
+    class="explore",
+    prompt="@prompts/slim/explore.md"
+  ]
+
   plan [
     type="codergen",
     label="Plan & Spec",
@@ -29,6 +36,7 @@ digraph MinimalFeatureFactory {
     command="${state.slim.test_command}",
     validation=true,
     goal_gate=true,
+    timeout=600,
     retry_target="fix"
   ]
 
@@ -36,7 +44,6 @@ digraph MinimalFeatureFactory {
     type="codergen",
     label="Fresh Eyes Review",
     class="review",
-    backend="codex",
     prompt="@prompts/slim/review.md",
     goal_gate=true,
     retry_target="fix"
@@ -47,27 +54,32 @@ digraph MinimalFeatureFactory {
     label="Behavioral Holdouts",
     validation=true,
     goal_gate=true,
+    timeout=600,
     retry_target="fix"
   ]
 
   gate_es [
     type="gate_es",
-    label="/es Evidence Standards"
+    label="/es Evidence Standards",
+    timeout=600
   ]
 
   gate_er [
     type="gate_er",
-    label="/er Evidence Review"
+    label="/er Evidence Review",
+    timeout=600
   ]
 
   fix [
     type="codergen",
     label="Fix & Iterate",
+    class="fix",
     prompt="@prompts/slim/fix.md",
     max_retries=2
   ]
 
-  start -> plan
+  start -> explore
+  explore -> plan
   plan -> implement
   implement -> test
 

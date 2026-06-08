@@ -11,11 +11,40 @@ from runner.parser import parse
 ROOT = pathlib.Path(__file__).parent.parent
 
 
+def test_slim_stylesheet_routes_roles_by_class():
+    graph = parse(ROOT / "pipelines" / "slim" / "minimal_feature.dot")
+    explore = graph.nodes["explore"].attrs
+    plan = graph.nodes["plan"].attrs
+    implement = graph.nodes["implement"].attrs
+    fix = graph.nodes["fix"].attrs
+    review = graph.nodes["review"].attrs
+
+    assert explore.get("class") == "explore"
+    assert "backend" not in explore
+    assert "model_name" not in explore
+
+    assert plan.get("class") == "plan"
+    assert plan["backend"] == "claude"
+    assert plan["model_name"] == "claude-opus-4-6"
+
+    assert implement.get("class") == "implement"
+    assert "backend" not in implement
+    assert "model_name" not in implement
+
+    assert fix.get("class") == "fix"
+    assert "backend" not in fix
+    assert "model_name" not in fix
+
+    assert review.get("class") == "review"
+    assert review["backend"] == "agy"
+
+
 def test_minimal_feature_factory_runs_with_deterministic_gates(monkeypatch, tmp_path):
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", lambda node, ctx: Result(outcome="success", output="ok"))
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_feature.dot")
-    # production default is codex (independent reviewer); pin echo here for offline determinism
+    # production routes plan→claude opus and review→agy; pin echo for offline determinism
+    graph.nodes["plan"].attrs["backend"] = "echo"
     graph.nodes["review"].attrs["backend"] = "echo"
     ctx = Context(goal="ship a tiny feature", workdir=ROOT, backend="echo")
     ctx.state["feature"] = "hello"
@@ -26,6 +55,7 @@ def test_minimal_feature_factory_runs_with_deterministic_gates(monkeypatch, tmp_
     assert history[-1].outcome == "success"
     assert [step.node for step in history] == [
         "start",
+        "explore",
         "plan",
         "implement",
         "test",
@@ -40,7 +70,8 @@ def test_minimal_feature_factory_runs_with_deterministic_gates(monkeypatch, tmp_
 def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path):
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_pr.dot")
-    # production default is codex (independent reviewer); pin echo here for offline determinism
+    # production routes plan→claude opus and review→agy; pin echo for offline determinism
+    graph.nodes["plan"].attrs["backend"] = "echo"
     graph.nodes["review"].attrs["backend"] = "echo"
     ctx = Context(goal="refactor a tiny thing in-flight", workdir=ROOT, backend="echo")
     ctx.state["slim.test_command"] = f"{sys.executable} -c \"print('tests ok')\""
@@ -50,6 +81,7 @@ def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path)
     assert history[-1].outcome == "success"
     assert [step.node for step in history] == [
         "start",
+        "explore",
         "plan",
         "implement",
         "test",

@@ -9,29 +9,31 @@ task. If the user passes `--pipeline`, use it. Otherwise classify the goal first
 | Task | Pipeline | Notes |
 |------|----------|-------|
 | Wiring smoke / install verify | `pipelines/factory/hello.dot` | `--backend echo` |
-| New feature, full production loop | `pipelines/slim/minimal_feature.dot` | plan → test → review → holdout → gates |
+| New feature, full production loop | `pipelines/slim/minimal_feature.dot` | explore → plan → test → review → holdout → gates |
 | New feature, minimal loop | `pipelines/factory/hello.dot` | plan → implement → holdout → fix |
-| In-flight PR iteration | `pipelines/slim/minimal_pr.dot` | no holdout; set `--state slim.test_command=...` |
+| In-flight PR iteration | `pipelines/slim/minimal_pr.dot` | explore → plan → …; no holdout; set `--state slim.test_command=...` |
 | Validate diff + sealed holdout | `pipelines/factory/gates.dot` | code already implemented |
 | Validate in-flight PR (no holdout) | `pipelines/factory/pr_gates.dot` | evidence gates only |
 | Spec review (line-aware, slim) | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | acceptance + codex reviewer |
 | Spec review (+ stack smoke) | `benchmarks/attractor-spec-review/pipelines/review_full.dot` | adds fullstack smoke |
 | Brownfield replace / delete | **custom goal + often `minimal_feature.dot` or custom `.dot`** | apply factory-spec delete-first rules; never treat as greenfield additive |
 
-## Independent reviewer (adversarial-by-default)
+## Role-based model routing (slim pipelines)
 
-The slim pipelines (`minimal_feature.dot`, `minimal_pr.dot`) pin the `review`
-node to `backend="codex"` so the reviewer is an **independent agent on a
-different backend than the coder** by default — `--backend claude` (or any coder
-backend) does **not** override it, because an explicit node `backend` attr wins
-over both the model stylesheet and `--backend`/`ctx.backend`. **`codex` must be
-installed** for these pipelines to run end-to-end.
+`minimal_feature.model.css` routes by node class:
 
-To override the reviewer backend, either edit `backend=` on the review node in
-the `.dot`, or supply a `model_stylesheet` whose `.review` rule sets a different
-backend (note: a stylesheet rule only applies if the node has no explicit
-`backend` attr, so removing the node attr is required for the stylesheet to win).
-Coder nodes (plan/implement/fix/test) carry no backend rule and honor `--backend`.
+| Class | Nodes | Default routing |
+|-------|-------|-----------------|
+| *(none)* | `explore`, `implement`, `fix` | Honor run-level `--backend` (coder tier) |
+| `.plan` | `plan` | `claude` + `claude-opus-4-6` (design/spec tier) |
+| `.review` | `review` | `agy` (independent adversarial reviewer) |
+
+Explore uses the **same CLI/model as the coder** (`--backend`). Plan uses a
+heavier model for architecture work. Review stays on a separate backend.
+
+To override, set `backend=` / `model_name=` on the node in the `.dot` (explicit
+attrs win over the stylesheet). Tests pin `plan` and `review` to `echo` for
+offline determinism.
 
 ## Short names (expanded by skill)
 
