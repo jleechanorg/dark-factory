@@ -495,3 +495,47 @@ def test_adversarial_priority_falls_through_to_claude_sonnet_when_nothing_else(m
     # (the gate's missing-binary path is the real signal).
     assert meta["adversarial_skipped"] == "codex,minimax,agy,claude-sonnet"
     assert meta["adversarial_priority"] == "codex,minimax,agy,claude-sonnet"
+
+
+def test_adversarial_priority_pinned_across_visits(monkeypatch):
+    """Cross-visit pin: once `_resolve_gate_backend` resolves a node via the
+    priority queue, re-visits to the same node name return the same backend
+    even when `_probe_backend_installed` would resolve differently. This
+    honors the design-doc promise in
+    `roadmap/agy-reviewer-and-base-dot-2026-06-09.md` §5.2 ("the runner
+    pins the reviewer for the entire run") and the no-reviewer-shopping
+    rule (a real fail from one backend is never re-resolved onto a
+    different one on a re-visit). Regression test for the verifier's
+    Concern 1 in `agy-task-review.md`."""
+    from runner.handlers import _resolve_gate_backend, Context as HCtx
+
+    node = _priority_node(["codex", "minimax", "agy", "claude-sonnet"], name="evidence")
+    ctx = HCtx(goal="test", workdir=pathlib.Path("/tmp"), backend="claude")
+
+    # First visit: `codex` is the only entry installed → it is the
+    # chosen backend. The pin is recorded in ctx.state.
+    monkeypatch.setattr(
+        "runner.handlers._probe_backend_installed",
+        lambda name: name == "codex",
+    )
+    first, first_meta = _resolve_gate_backend(node, ctx)
+    assert first == "codex"
+    assert first_meta["reviewer_backend_resolution"] == "priority_queue"
+    assert ctx.state["evidence.resolved_backend"] == "codex"
+
+    # Now `codex` disappears from PATH (e.g. uninstalled mid-run).
+    # Only `agy` is installed. Without the cross-visit pin, the
+    # resolver would fall through to `agy` — a different vendor, a
+    # different verdict. With the pin, the second visit returns the
+    # *same* backend (`codex`) and the same metadata, honoring the
+    # "pinned for the entire run" promise.
+    monkeypatch.setattr(
+        "runner.handlers._probe_backend_installed",
+        lambda name: name == "agy",
+    )
+    second, second_meta = _resolve_gate_backend(node, ctx)
+    assert second == "codex", (
+        f"cross-visit pin broken: re-visit must return pinned backend, got {second!r}"
+    )
+    assert second_meta["reviewer_backend_resolution"] == "priority_queue"
+    assert second_meta == first_meta
