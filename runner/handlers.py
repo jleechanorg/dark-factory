@@ -1660,9 +1660,15 @@ def _run_pytest_test(node: "Node", ctx: "Context", *, label: str) -> "Result":
                    f"(set state.bug_fix.test_path before this gate)",
         )
     pytest_args = str(node.attrs.get("pytest_args", "-x")).strip()
-    cmd = f"{sys.executable} -m pytest {test_path} {pytest_args}".strip()
+    # Build argv as a list (not a string + shlex.split) so paths with spaces
+    # in sys.executable or test_path are preserved verbatim. shlex.split on
+    # `/Applications/cmux DEV may-18.app/.../python` would break the path on
+    # the space; list-form argv avoids that whole class of bug.
+    args_list: list[str] = [sys.executable, "-m", "pytest", test_path]
+    if pytest_args:
+        args_list.extend(shlex.split(pytest_args))
     timeout = _coerce_timeout(node.attrs.get("timeout", "300"), 300)
-    args = _sandboxed_args(shlex.split(cmd))
+    args = _sandboxed_args(args_list)
     if args is None:
         return Result(outcome="error", output=f"{label}: sandbox-exec unavailable")
     try:
@@ -1693,7 +1699,7 @@ def _run_pytest_test(node: "Node", ctx: "Context", *, label: str) -> "Result":
         ).strip(),
         metadata={
             "test_path": test_path,
-            "command": cmd,
+            "command": " ".join(args_list),
             "returncode": str(proc.returncode),
             "label": label,
         },

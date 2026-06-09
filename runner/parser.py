@@ -350,6 +350,7 @@ def _resolve_includes(
     edges: list[Edge],
     graph_attrs: dict[str, AttrValue],
     require_start_exit: bool,
+    visited: tuple[pathlib.Path, ...] = (),
 ) -> None:
     """Process graph-attr ``include="@path[@;path...]"`` on the parent.
 
@@ -368,6 +369,12 @@ def _resolve_includes(
       3. Relative to the current working directory.
 
     The leading ``@`` is optional and stripped.
+
+    Cycle detection: ``visited`` is the chain of resolved include paths
+    leading to the current call. If a path tries to re-include any
+    ancestor in that chain, we raise a parse error rather than recurse
+    forever. The first call from ``_parse`` passes an empty tuple; every
+    recursive call appends the resolved ``include_path`` before recursing.
     """
     raw_attr = str(graph_attrs.get("include") or "")
     if not raw_attr:
@@ -395,7 +402,12 @@ def _resolve_includes(
                 f"{path}: include not found: {ref!r} "
                 f"(tried parent-relative {tried[0]} and cwd-relative {tried[1]})"
             )
-        sub = _parse(include_path, require_start_exit=False)
+        if include_path in visited:
+            chain = " -> ".join(str(p) for p in (*visited, include_path))
+            raise ValueError(
+                f"{path}: include cycle detected: {chain}"
+            )
+        sub = _parse(include_path, require_start_exit=False, visited=(*visited, include_path))
         # Reject any start/exit in the included graph — libraries must
         # be runnable-only-when-wired-into-a-lane, not standalone.
         for nm, node in sub.nodes.items():
@@ -436,12 +448,19 @@ def parse(path: pathlib.Path, require_start_exit: bool = True) -> Graph:
     return _parse(path, require_start_exit=require_start_exit)
 
 
-def _parse(path: pathlib.Path, require_start_exit: bool) -> Graph:
+def _parse(
+    path: pathlib.Path,
+    require_start_exit: bool,
+    visited: tuple[pathlib.Path, ...] = (),
+) -> Graph:
     """Internal: load a .dot file and return a Graph.
 
     When ``require_start_exit`` is False (used for graph-library includes),
     the start/exit presence check is skipped — the included file is a
     library, not a runnable pipeline, so it does not need them.
+
+    ``visited`` is the chain of resolved include paths leading here, used
+    by ``_resolve_includes`` to detect cycles (see its docstring).
     """
     raw = pydot.graph_from_dot_file(str(path))
     if not raw:
@@ -519,7 +538,9 @@ def _parse(path: pathlib.Path, require_start_exit: bool) -> Graph:
     # the parent's node and edge sets. The parent's start/exit requirement
     # still applies; the included graph must not declare its own.
     if graph_attrs.get("include"):
-        _resolve_includes(path, nodes, edges, graph_attrs, require_start_exit)
+        _resolve_includes(
+            path, nodes, edges, graph_attrs, require_start_exit, visited
+        )
 
     _apply_model_stylesheet(path, nodes, graph_attrs.get("model_stylesheet"))
 

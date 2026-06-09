@@ -97,7 +97,7 @@ def test_include_rejects_node_name_collision(tmp_path):
         f'start [shape=Mdiamond] exit [shape=Msquare] '
         f'shared [type="codergen"] start -> shared -> exit }}\n'
     )
-    with pytest.raises(ValueError, match="collides|collision"):
+    with pytest.raises(ValueError, match=r"collides|collision"):
         parse(lane)
 
 
