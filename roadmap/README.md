@@ -2,6 +2,14 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-09 — /fs spec-generation lane SHIPPED: PRs #39/#37/#38 merged, suite 309/309
+
+- **[PR #39](https://github.com/jleechanorg/dark-factory/pull/39) MERGED at [`a5ec9e2`](https://github.com/jleechanorg/dark-factory/commit/a5ec9e2fc2a4ece846c050758df6827e4ece31e9)** — `pipelines/slim/spec_gen.dot` (explore fanout → plan → cold spec review → fix loop, no implement node) + `prompts/slim/spec_review.md` / `fix_spec.md`. Bugbot HIGH fixed in-flight: gate handlers (`gate_es`/`gate_er`/`gate_code_standards`) now honor a node-level `prompt="@path"` attr via `_run_custom_prompt_gate` (custom template + machine contract + SHA binding, dispatched through the adversarial backend priority queue); spec_review verdict contract rewritten `VERDICT: success|failure` → `verdict: pass|fail` (old tokens proven unparseable by a RED test against `_parse_verdict`).
+- **[PR #37](https://github.com/jleechanorg/dark-factory/pull/37) MERGED at [`09734ca`](https://github.com/jleechanorg/dark-factory/commit/09734ca6e20fa34f826db9a7fbe3da81465312a0)** — `prompts/slim/plan.md` lane-independence requirement: parallel-lane specs must carry a file-ownership matrix (single-writer rule + overlap pre-flight).
+- **[PR #38](https://github.com/jleechanorg/dark-factory/pull/38) MERGED at [`7e062ee`](https://github.com/jleechanorg/dark-factory/commit/7e062ee7a96031fd23ccea95b8e7d900e9fe567d)** — `/fs` create mode now invokes `dark-factory --pipeline pipelines/slim/spec_gen.dot` (repo + user-scope command/skill files). 3 Bugbot rounds: confirm step scoped to create mode; create mode **pinned** to spec_gen.dot (selection table is /f//factory-only); confirm reordered before any pipeline invocation.
+- Issues #34/#35/#36 auto-closed; beads jleechan-6a6/86d/hv1 closed with merge SHAs; suite **309/309** on merged main; `df-wt-*` worktrees removed.
+- Next: end-to-end `/fs` run on the airbnb-clone benchmark (bead `orch-ecwu`).
+
 ### 2026-06-09 — /fs spec-generation gap: design doc + 3 beads filed, parallel implementation dispatched
 
 - **Gap:** `/fs` never invokes `dark-factory`; Phase-1 spec generation (explore fanout + plan) exists only fused into feature lanes; the cold codex reviewer only reviews implementations — there is no standalone reviewed-spec lane. Motivating incident: worldarchitect.ai level-up chain shipped 7 divergent blobs of one module because no spec reviewer enforced lane independence.
