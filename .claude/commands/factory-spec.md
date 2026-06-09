@@ -41,7 +41,10 @@ Parse `$ARGUMENTS` and execute the `factory-spec` skill workflow:
    otherwise → create mode
 2. **Step 0 (create mode only):** classify greenfield vs brownfield — feeds the
    goal/context string passed to the pipeline (see skill)
-3. **Run workflow** as defined in `.claude/skills/factory-spec/SKILL.md`
+3. **Run workflow** as defined in `.claude/skills/factory-spec/SKILL.md`.
+   Create mode is **pinned to `pipelines/slim/spec_gen.dot`** — the skill's
+   pipeline-selection table applies to `/f` / `/factory` implementation runs
+   only; never re-classify a `/fs` spec request into a feature pipeline.
 4. **Create mode only:** report auto-chosen options and ask user to confirm
    before pipeline invocation. Review (`--review`) and show (`--show`) modes
    are in-session and read-only — no pipeline is invoked, so no confirmation

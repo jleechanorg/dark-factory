@@ -27,6 +27,13 @@ happens in the caller's cwd (`--workdir` defaults to cwd).
 Full decision table:
 [docs/pipeline-selection.md](../../../docs/pipeline-selection.md)
 
+**`/fs` create mode is pinned to `pipelines/slim/spec_gen.dot`.** This table
+classifies goals for `/f` / `/factory` (implementation runs) only. A `/fs`
+spec-creation request must never be re-classified into a feature pipeline
+(e.g. `minimal_feature.dot`) just because the description reads like a new
+feature — Step 0 classification feeds the **goal string**, not the pipeline
+choice, in create mode.
+
 **Do not default every run to one `.dot`.** If the user did not pass `--pipeline`,
 classify the goal (Step 0 below) and pick from this quick guide:
 
