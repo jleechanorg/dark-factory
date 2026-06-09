@@ -15,6 +15,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
@@ -586,58 +587,6 @@ def _codergen(node: Node, ctx: Context) -> Result:
                     "returncode": "",
                 },
             )
-    elif backend == "claudew":
-        wafer_key = os.environ.get("WAFER_API_KEY", "")
-        if not wafer_key:
-            return Result(outcome="failure", output="claudew backend requires WAFER_API_KEY env var")
-        wafer_model = os.environ.get("WAFER_MODEL", "GLM-5.1")
-        env = _sanitized_env()
-        env["WAFER_API_KEY"] = wafer_key
-        env["WAFER_MODEL"] = wafer_model
-        env["ANTHROPIC_BASE_URL"] = "http://localhost:9001"
-        env["ANTHROPIC_AUTH_TOKEN"] = wafer_key
-        env["ANTHROPIC_DEFAULT_MODEL"] = wafer_model
-        env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = wafer_model
-        env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = wafer_model
-        env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = wafer_model
-        env["CLAUDEW_MODE"] = "1"
-        claude_bin = _get_claude_executable()
-        args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", "--model", wafer_model, "--effort", "high", prompt_text])
-        if args is None:
-            return Result(outcome="failure", output="sandbox-exec unavailable")
-        try:
-            timeout_s = _coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
-            proc = subprocess.run(
-                args,
-                cwd=ctx.workdir,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                check=False,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            return Result(
-                outcome="failure",
-                output=f"claudew backend timed out after {timeout_s} seconds",
-                metadata={
-                    "timed_out": "true",
-                    "timeout": str(timeout_s),
-                    "returncode": "",
-                },
-            )
-        except Exception as e:
-            return Result(
-                outcome="failure",
-                output=f"claudew backend error: {e}",
-                metadata={
-                    "timeout": str(timeout_s),
-                    "timed_out": "false",
-                    "returncode": "",
-                },
-            )
     elif backend == "agy":
         timeout_s = _coerce_timeout(node.attrs.get("timeout", "600"), 600)
         task_dir = ctx.workdir / ".dark-factory"
@@ -1134,8 +1083,161 @@ def _parse_verdict(text: str) -> tuple[str, str]:
     return "unknown", "failure"
 
 
+def _gate_subprocess_args(backend: str, prompt: str, ctx: "Context", timeout: int) -> Optional[list[str]]:
+    """Build the sandboxed argv for a *reviewer* gate on the given backend.
+
+    Reviewer gates are read-only: agy gets ``--add-dir`` so it can read the
+    diff/evidence in the worktree but never enters planning mode. Any backend
+    other than ``agy`` runs the SHA-bound prompt through ``claude`` (the
+    historical default; ``codex``/``ao``/unset all map here). Returns ``None``
+    when sandbox-exec is unavailable.
+    """
+    if backend == "agy":
+        return _sandboxed_args([
+            "agy",
+            "--add-dir", str(ctx.workdir),
+            "--dangerously-skip-permissions",
+            "--print-timeout", f"{timeout}s",
+            "--print",
+            prompt,
+        ])
+    claude_bin = _get_claude_executable()
+    return _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", prompt])
+
+
+def _run_gate_once(
+    backend: str, prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str
+) -> "Result":
+    """Run one reviewer-gate attempt on ``backend`` and classify the result.
+
+    SHA binding, verdict parsing, and infra-vs-real-failure classification are
+    identical across backends, so the only backend-specific part is the argv
+    (built by ``_gate_subprocess_args``). ``reviewer_backend`` is recorded in
+    metadata so the operator/CXDB can see what actually graded the diff.
+    """
+    reviewer_backend = "agy" if backend == "agy" else "claude"
+    sub_args = _gate_subprocess_args(backend, prompt, ctx, timeout)
+    if sub_args is None:
+        return Result(
+            outcome="failure",
+            output="sandbox-exec unavailable",
+            metadata={"slash_command": name, "verdict": "unknown",
+                      "reviewer_backend": reviewer_backend, "sandbox": "unavailable"},
+        )
+    # agy enforces its own --print-timeout; give the outer wait a small buffer
+    # so we read agy's timeout message rather than killing it first.
+    run_timeout = timeout + 30 if backend == "agy" else timeout
+    try:
+        proc = subprocess.run(
+            sub_args, cwd=ctx.workdir, capture_output=True, text=True,
+            timeout=run_timeout, check=False, env=_sanitized_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        combined = (exc.stdout or "") + "\n" + (exc.stderr or "")
+        return Result(
+            outcome="failure",
+            output=combined.strip() or f"gate {name} timed out after {run_timeout}s",
+            metadata={"slash_command": name, "verdict": "unknown",
+                      "head_sha_status": "missing", "timed_out": "true",
+                      "reviewer_backend": reviewer_backend},
+        )
+    except FileNotFoundError as exc:
+        return Result(
+            outcome="error",
+            output=f"gate {name} backend {reviewer_backend!r} not found: {exc}",
+            metadata={"slash_command": name, "verdict": "unknown",
+                      "head_sha_status": "missing", "reviewer_backend": reviewer_backend,
+                      "backend_missing": "true"},
+        )
+    except Exception as exc:
+        return Result(
+            outcome="error",
+            output=f"gate {name} subprocess failed: {exc}",
+            metadata={"slash_command": name, "verdict": "unknown",
+                      "head_sha_status": "missing", "reviewer_backend": reviewer_backend},
+        )
+    combined = proc.stdout + "\n" + proc.stderr
+    verdict, normalized = _parse_verdict(combined)
+    # SHA binding check comes BEFORE collapsing to pass/fail so a spoofed-pass
+    # with the wrong SHA collapses to `error`, not `success`.
+    sha_ok, observed_sha = _verify_head_sha_echo(combined, expected_sha)
+    if proc.returncode != 0 and (verdict == "unknown" or normalized == "success"):
+        outcome = "error"
+    elif not sha_ok:
+        # Spoofed PASS / unknown without a SHA echo → error. A real FAIL/PARTIAL
+        # without a SHA echo is kept (conservative — never hide a real verdict).
+        outcome = "error" if normalized in ("success", "unknown") else normalized
+    else:
+        outcome = normalized
+    head_sha_status = (
+        "matched" if sha_ok and observed_sha
+        else ("mismatched" if observed_sha else "missing")
+    )
+    return Result(
+        outcome=outcome,
+        output=proc.stdout,
+        metadata={
+            "slash_command": name, "verdict": verdict,
+            "returncode": str(proc.returncode),
+            "expected_head_sha": expected_sha, "observed_head_sha": observed_sha,
+            "head_sha_status": head_sha_status,
+            "reviewer_backend": reviewer_backend,
+        },
+    )
+
+
+def _is_gate_infra_failure(result: "Result") -> bool:
+    """True when a gate result is an *infrastructure* failure (not a real verdict).
+
+    Only infra failures justify the agy→claude fallback. A genuine
+    ``verdict: fail|partial`` is a real review result and must never trigger a
+    retry on a different backend (that would be reviewer-shopping).
+    """
+    if result.outcome == "error":
+        return True
+    md = result.metadata or {}
+    return md.get("sandbox") == "unavailable" or md.get("timed_out") == "true" or md.get("backend_missing") == "true"
+
+
+def _resolve_gate_backend(node: "Node", ctx: "Context") -> str:
+    """Resolve the reviewer backend for a gate node.
+
+    Mirrors ``_codergen``: an explicit per-node ``backend`` attr (set directly
+    or by a ``.review`` model-stylesheet rule, e.g. ``backend: agy``) wins over
+    the run-level ``ctx.backend``. Without this, a stylesheet routing reviewer
+    nodes to agy would be silently ignored by gates (they would run on the CLI
+    ``--backend``) — a label that lies about behavior.
+    """
+    return str(node.attrs.get("backend", ctx.backend))
+
+
+def _execute_gate(
+    prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str, backend: str
+) -> "Result":
+    """Run a reviewer gate on ``backend``; agy falls back to claude on infra failure.
+
+    Reviewer/evaluator nodes route to agy when ``backend == "agy"`` (per-node
+    ``backend=agy`` or a ``.review`` model-stylesheet class). agy reviews the
+    SHA-bound diff; if agy is missing/unsandboxable/times out or returns
+    unparseable garbage, we fall back to ``claude`` so the gate still produces a
+    real verdict. A real agy ``fail``/``partial`` verdict is kept as-is (never
+    reviewer-shopped onto a second backend).
+    """
+    if backend == "agy":
+        result = _run_gate_once("agy", prompt, expected_sha, timeout, ctx, name)
+        if _is_gate_infra_failure(result):
+            fallback = _run_gate_once("claude", prompt, expected_sha, timeout, ctx, name)
+            fallback.metadata["fallback_used"] = "true"
+            fallback.metadata["fallback_from"] = "agy"
+            return fallback
+        result.metadata.setdefault("fallback_used", "false")
+        return result
+    # claude / codex / ao / unset → claude reviewer (historical default).
+    return _run_gate_once("claude", prompt, expected_sha, timeout, ctx, name)
+
+
 def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
-    """Build a handler that shells out to `claude --print /<command> <args>`."""
+    """Build a handler that shells out to the reviewer backend with `/<command> <args>`."""
 
     def handler(node: Node, ctx: Context) -> Result:
         args = node.attrs.get("args", default_args)
@@ -1182,96 +1284,11 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
         prompt = f"/{slash_command} {args} {target}".strip() + sha_directive
         timeout = _coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
 
-        # Backend-aware executable selection
-        if ctx.backend == "claudew":
-            claude_bin = _get_claude_executable()
-            wafer_model = os.environ.get("WAFER_MODEL", "GLM-5.1")
-            gate_env = _sanitized_env()
-            gate_env["ANTHROPIC_BASE_URL"] = "http://localhost:9001"
-            gate_env["ANTHROPIC_AUTH_TOKEN"] = os.environ.get("WAFER_API_KEY", "")
-            gate_env["ANTHROPIC_DEFAULT_MODEL"] = wafer_model
-            gate_env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = wafer_model
-            gate_env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = wafer_model
-            gate_env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = wafer_model
-            gate_env["CLAUDEW_MODE"] = "1"
-            sub_args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", "--model", wafer_model, "--effort", "high", prompt])
-        else:
-            claude_bin = _get_claude_executable()
-            gate_env = _sanitized_env()
-            sub_args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", prompt])
-
-        if sub_args is None:
-            return Result(outcome="failure", output="sandbox-exec unavailable")
-        try:
-            proc = subprocess.run(
-                sub_args,
-                cwd=ctx.workdir,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-                env=gate_env,
-            )
-        except subprocess.TimeoutExpired as exc:
-            combined = (exc.stdout or "") + "\n" + (exc.stderr or "")
-            return Result(
-                outcome="failure",
-                output=combined.strip() or f"/{slash_command} timed out after {timeout} seconds",
-                metadata={
-                    "slash_command": slash_command,
-                    "returncode": "",
-                    "timeout": str(timeout),
-                    "timed_out": "true",
-                },
-            )
-        except Exception as exc:
-            return Result(
-                outcome="error",
-                output=f"slash gate {slash_command} command failed: {exc}",
-                metadata={
-                    "slash_command": slash_command,
-                    "timeout": str(timeout),
-                    "timed_out": "false",
-                    "returncode": "",
-                },
-            )
-        combined = proc.stdout + "\n" + proc.stderr
-        verdict, normalized = _parse_verdict(combined)
-        # SHA binding check — must come BEFORE collapsing to pass/fail so a
-        # spoofed-pass-with-wrong-SHA collapses to `error`, not `success`.
-        sha_ok, observed_sha = _verify_head_sha_echo(combined, expected_sha)
-        # Distinguish infra failures (claude crashed / not installed / network)
-        # from real "FAIL" verdicts so the Healer can group them separately.
-        if proc.returncode != 0 and (verdict == "unknown" or normalized == "success"):
-            outcome = "error"
-        elif not sha_ok:
-            # SHA missing/mismatched.  A spoofed PASS is dangerous so we
-            # collapse that to error.  But FAIL/PARTIAL without a SHA echo is
-            # still conservative — keep the real verdict rather than hiding it.
-            if normalized == "success":
-                outcome = "error"
-            elif normalized == "unknown":
-                outcome = "error"
-            else:
-                outcome = normalized  # fail/partial — conservative, keep verdict
-        else:
-            outcome = normalized
-        head_sha_status = (
-            "matched" if sha_ok and observed_sha
-            else ("mismatched" if observed_sha else "missing")
-        )
-        return Result(
-            outcome=outcome,
-            output=proc.stdout,
-            metadata={
-                "slash_command": slash_command,
-                "verdict": verdict,
-                "returncode": str(proc.returncode),
-                "expected_head_sha": expected_sha,
-                "observed_head_sha": observed_sha,
-                "head_sha_status": head_sha_status,
-            },
-        )
+        # Reviewer backend routing + agy→claude infra fallback live in
+        # _execute_gate. The gate is read-only and SHA-bound regardless of
+        # which backend grades the diff.
+        backend = _resolve_gate_backend(node, ctx)
+        return _execute_gate(prompt, expected_sha, timeout, ctx, slash_command, backend)
 
     handler.__name__ = f"_gate_{slash_command}"  # noqa: WPS125
     return handler
@@ -1369,66 +1386,10 @@ def _run_universal_prompt_gate(
     prompt = prompt_template.format(expected_sha=expected_sha) + sha_directive
     timeout = _coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
 
-    if ctx.backend == "claudew":
-        claude_bin = _get_claude_executable()
-        wafer_model = os.environ.get("WAFER_MODEL", "GLM-5.1")
-        gate_env = _sanitized_env()
-        gate_env["ANTHROPIC_BASE_URL"] = "http://localhost:9001"
-        gate_env["ANTHROPIC_AUTH_TOKEN"] = os.environ.get("WAFER_API_KEY", "")
-        gate_env["ANTHROPIC_DEFAULT_MODEL"] = wafer_model
-        for _mk in ("OPUS", "SONNET", "HAIKU"):
-            gate_env[f"ANTHROPIC_DEFAULT_{_mk}_MODEL"] = wafer_model
-        gate_env["CLAUDEW_MODE"] = "1"
-        sub_args = _sandboxed_args([
-            claude_bin, "--print", "--dangerously-skip-permissions",
-            "--model", wafer_model, "--effort", "high", prompt,
-        ])
-    else:
-        claude_bin = _get_claude_executable()
-        gate_env = _sanitized_env()
-        sub_args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", prompt])
-
-    if sub_args is None:
-        return Result(outcome="failure", output="sandbox-exec unavailable")
-    try:
-        proc = subprocess.run(
-            sub_args, cwd=ctx.workdir, capture_output=True, text=True,
-            timeout=timeout, check=False, env=gate_env,
-        )
-    except subprocess.TimeoutExpired as exc:
-        combined = (exc.stdout or "") + "\n" + (exc.stderr or "")
-        return Result(
-            outcome="failure",
-            output=combined.strip() or f"gate {name} timed out after {timeout}s",
-            metadata={"slash_command": name, "verdict": "unknown",
-                      "head_sha_status": "missing", "timed_out": "true"},
-        )
-    except Exception as exc:
-        return Result(
-            outcome="error",
-            output=f"gate {name} subprocess failed: {exc}",
-            metadata={"slash_command": name, "verdict": "unknown", "head_sha_status": "missing"},
-        )
-    combined = proc.stdout + "\n" + proc.stderr
-    verdict, normalized = _parse_verdict(combined)
-    sha_ok, observed_sha = _verify_head_sha_echo(combined, expected_sha)
-    if proc.returncode != 0 and (verdict == "unknown" or normalized == "success"):
-        outcome = "error"
-    elif not sha_ok:
-        outcome = "error" if normalized in ("success", "unknown") else normalized
-    else:
-        outcome = normalized
-    head_sha_status = "matched" if sha_ok and observed_sha else ("mismatched" if observed_sha else "missing")
-    return Result(
-        outcome=outcome,
-        output=proc.stdout,
-        metadata={
-            "slash_command": name, "verdict": verdict,
-            "returncode": str(proc.returncode),
-            "expected_head_sha": expected_sha, "observed_head_sha": observed_sha,
-            "head_sha_status": head_sha_status,
-        },
-    )
+    # Reviewer backend routing + agy→claude infra fallback live in
+    # _execute_gate (shared with _slash_gate).
+    backend = _resolve_gate_backend(node, ctx)
+    return _execute_gate(prompt, expected_sha, timeout, ctx, name, backend)
 
 
 def _gate_es(node: "Node", ctx: "Context") -> "Result":
@@ -1453,6 +1414,112 @@ def _gate_code_standards(node: "Node", ctx: "Context") -> "Result":
     if local_cmd.exists():
         return _slash_gate("code-standards")(node, ctx)
     return _run_universal_prompt_gate(UNIVERSAL_CODE_STANDARDS_PROMPT, "gate_code_standards", node, ctx)
+
+
+def _run_pytest_test(node: "Node", ctx: "Context", *, label: str) -> "Result":
+    """Run pytest against the test path stored in node attrs or state.
+
+    Returns a Result with ``outcome=success`` only if pytest exits 0.
+    The caller maps 0/non-0 to its own semantics (red vs green).
+    """
+    raw_path = node.attrs.get("test_path", "${state.bug_fix.test_path}")
+    test_path = _substitute_state(str(raw_path), ctx)
+    if "${state." in test_path or not test_path.strip():
+        return Result(
+            outcome="error",
+            output=f"{label}: unresolved test_path: {raw_path!r} "
+                   f"(set state.bug_fix.test_path before this gate)",
+        )
+    pytest_args = str(node.attrs.get("pytest_args", "-x")).strip()
+    cmd = f"{sys.executable} -m pytest {test_path} {pytest_args}".strip()
+    timeout = _coerce_timeout(node.attrs.get("timeout", "300"), 300)
+    args = _sandboxed_args(shlex.split(cmd))
+    if args is None:
+        return Result(outcome="error", output=f"{label}: sandbox-exec unavailable")
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=ctx.workdir,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=_sanitized_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return Result(
+            outcome="failure",
+            output=f"{label}: pytest timed out after {timeout}s on {test_path}",
+        )
+    except Exception as exc:
+        return Result(
+            outcome="error",
+            output=f"{label}: pytest invocation failed: {exc}",
+        )
+    return Result(
+        outcome="success" if proc.returncode == 0 else "failure",
+        output=(
+            proc.stdout
+            + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
+        ).strip(),
+        metadata={
+            "test_path": test_path,
+            "command": cmd,
+            "returncode": str(proc.returncode),
+            "label": label,
+        },
+    )
+
+
+def _gate_red(node: "Node", ctx: "Context") -> "Result":
+    """Red gate: the test MUST fail (rc != 0). Used by bug_fix.dot after the
+    reproduce node writes a fresh failing test. Outcome=success means the
+    bug is reproduced; outcome=failure means the test passed (bug not
+    reproduced — agent shortcut or the bug report was wrong).
+    """
+    result = _run_pytest_test(node, ctx, label="gate_red")
+    if result.outcome == "error":
+        # Infra error (unresolved test_path, timeout, invocation failure) —
+        # NOT a successful reproduction. Surface as failure.
+        return Result(
+            outcome="failure",
+            output="RED FAIL: gate could not run pytest (infra error); "
+                   f"this is not a successful reproduction.\n{result.output}",
+        )
+    if result.outcome == "success":
+        # pytest exited 0 — the test passed, so the bug was NOT reproduced.
+        return Result(
+            outcome="failure",
+            output="RED FAIL: test passed but bug was not reproduced. "
+                   f"Original pytest output:\n{result.output}",
+        )
+    # pytest exited non-zero — the test failed as expected.
+    return Result(
+        outcome="success",
+        output=f"RED OK: test failed as expected (rc={result.metadata.get('returncode')}).\n{result.output}",
+    )
+
+
+def _gate_green(node: "Node", ctx: "Context") -> "Result":
+    """Green gate: the test MUST pass (rc == 0). Used by bug_fix.dot after
+    the fix node applies the change. Outcome=success means the fix works;
+    outcome=failure means the test is still failing.
+    """
+    result = _run_pytest_test(node, ctx, label="gate_green")
+    if result.outcome == "error":
+        return Result(
+            outcome="error",
+            output=f"GREEN ERROR: gate could not run pytest (infra error).\n{result.output}",
+        )
+    if result.outcome == "success":
+        return Result(
+            outcome="success",
+            output=f"GREEN OK: test passed after fix (rc=0).\n{result.output}",
+        )
+    return Result(
+        outcome="failure",
+        output=f"GREEN FAIL: test still failing after fix (rc={result.metadata.get('returncode')}).\n{result.output}",
+    )
 
 
 def _tcp_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -1813,6 +1880,8 @@ TYPE_REGISTRY: dict[str, Handler] = {
     "gate_es": _gate_es,
     "gate_er": _gate_er,
     "gate_code_standards": _gate_code_standards,
+    "gate_red": _gate_red,
+    "gate_green": _gate_green,
     "parallel": _parallel_fanout,       # fan-out type (type=parallel)
     "join": _join_handler,              # fan-in type (type=join)
 }

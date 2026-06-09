@@ -13,7 +13,8 @@ ROOT = pathlib.Path(__file__).parent.parent
 
 def test_slim_stylesheet_routes_roles_by_class():
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_feature.dot")
-    explore = graph.nodes["explore"].attrs
+    # explore is now a 4-way fanout from _base.dot; pick the concept sub-agent
+    explore = graph.nodes["explore_concept"].attrs
     plan = graph.nodes["plan"].attrs
     implement = graph.nodes["implement"].attrs
     fix = graph.nodes["fix"].attrs
@@ -55,7 +56,14 @@ def test_minimal_feature_factory_runs_with_deterministic_gates(monkeypatch, tmp_
     assert history[-1].outcome == "success"
     assert [step.node for step in history] == [
         "start",
-        "explore",
+        "explore_in",
+        "explore_fanout",
+        "explore_concept",
+        "explore_auth",
+        "explore_reuse",
+        "explore_risks",
+        "explore_join",
+        "explore_out",
         "plan",
         "implement",
         "test",
@@ -81,7 +89,14 @@ def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path)
     assert history[-1].outcome == "success"
     assert [step.node for step in history] == [
         "start",
-        "explore",
+        "explore_in",
+        "explore_fanout",
+        "explore_concept",
+        "explore_auth",
+        "explore_reuse",
+        "explore_risks",
+        "explore_join",
+        "explore_out",
         "plan",
         "implement",
         "test",

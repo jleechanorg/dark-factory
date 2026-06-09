@@ -60,7 +60,7 @@ Python under `runner/` is disposable *dorodango* — polish, discard, rebuild fr
 | **Two phases** | spec generation → factory execution |
 | **Runtime** | Python 3.13 (uv-managed) |
 | **Entry point** | `dark-factory` binary (not `python -m runner`) |
-| **Backends** | `claude`, `codex`, `agy`, `ao`, `claudew` (wafer), `mock_llm`/`echo` |
+| **Backends** | `claude`, `codex`, `agy`, `ao`, `mock_llm`/`echo` |
 | **Durable artifacts** | `.dot` pipeline graphs + `spec.md` (process + intent) |
 | **Observability** | CXDB SQLite event log + `df-healer` failure clustering |
 
@@ -249,7 +249,7 @@ Dark Factory operates as the top layer of a modern, modular agentic stack:
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │ Layer 1: Unified LLM Client                                             │
-│ ➔ OpenClaw Gateway, wafer proxy, thinclaw MCP                          │
+│ ➔ Claude Code CLI, Antigravity (agy), Codex CLI                        │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -340,16 +340,14 @@ Dark Factory ships with first-class support for diverse LLM and agent backends, 
         agy --add-dir <cwd> --dangerously-skip-permissions --print --print-timeout <s_s>
         ```
     *   Wraps prompts automatically in a headless instruction wrapper, directing Antigravity to decompose the task, spawn parallel internal subagents if useful, apply direct workspace changes, and exit cleanly without waiting for interactive input.
-2.  **`claudew` (Wafer-Driven Claude Backend) [New]**
-    *   Leverages the `WAFER_API_KEY` to route requests through a high-performance local wafer proxy.
-    *   Sets `ANTHROPIC_BASE_URL="http://localhost:9001"` and defaults to the premium `GLM-5.1` model (configurable via `WAFER_MODEL`) running with high effort (`--effort high`) and a generous 30-minute execution timeout.
-3.  **`claude` (Claude Code CLI)**
+2.  **`claude` (Claude Code CLI)**
     *   Directly invokes `claude` with standard prompt text to run autonomous editing and execution tasks.
-4.  **`codex` (Codex CLI)**
+    *   Also the automatic fallback reviewer when an `agy` review gate hits an infra failure (missing binary, sandbox unavailable, timeout, or unparseable output).
+3.  **`codex` (Codex CLI)**
     *   Uses `codex exec` to drive immediate terminal or workspace updates.
-5.  **`ao` (WorldArchitect Agent)**
+4.  **`ao` (WorldArchitect Agent)**
     *   Spawns an autonomous workspace worker mapped to an active WorldArchitect project (`--ao-project`).
-6.  **`mock_llm` / `echo`**
+5.  **`mock_llm` / `echo`**
     *   Deterministic test backends used for validation, smoke testing, and continuous integration pipelines.
 
 ---
@@ -420,7 +418,7 @@ dark-factory/
 │   ├── __main__.py                 # Command line interface & parser arguments
 │   ├── parser.py                   # PyDot loader & validator (verifies start/exit)
 │   ├── engine.py                   # Graph traversal, state tracking, & loop limits
-│   ├── handlers.py                 # Core handlers & backends (agy, claudew, claude, ao)
+│   ├── handlers.py                 # Core handlers & backends (agy, claude, codex, ao)
 │   ├── cxdb.py                     # SQLite WAL step recording and logging schemas
 │   └── healer.py                   # Failure clustering & automatic prescription engine
 ├── tests/                          # Rigorous unit and integration test suite

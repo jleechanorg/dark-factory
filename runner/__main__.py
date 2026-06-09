@@ -141,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--preflight", action="store_true", help="Validate pipeline and emit diagnostics, then exit.")
         p.add_argument(
             "--backend",
-            choices=["echo", "claude", "codex", "ao", "agy", "claudew"],
+            choices=["echo", "claude", "codex", "ao", "agy"],
             default="echo",
             help="LLM backend for codergen nodes",
         )

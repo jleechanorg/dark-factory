@@ -27,7 +27,7 @@ def _pipeline(name: str) -> pathlib.Path:
 def test_parser_round_trip():
     g = parse(_pipeline("hello.dot"))
     assert g.name == "hello"
-    assert g.goal == "Minimal smoke pipeline — plan, implement, holdout-eval, exit."
+    assert g.goal == "Minimal smoke pipeline — explore, plan, implement, holdout-eval, exit."
     assert "start" in g.nodes
     assert "exit" in g.nodes
     assert "holdout" in g.nodes
@@ -84,7 +84,21 @@ def test_echo_backend_green_path(monkeypatch):
     history = run(g, ctx, max_steps=50)
 
     nodes = [r.node for r in history]
-    assert nodes == ["start", "plan", "implement", "holdout", "exit"]
+    assert nodes == [
+        "start",
+        "explore_in",
+        "explore_fanout",
+        "explore_concept",
+        "explore_auth",
+        "explore_reuse",
+        "explore_risks",
+        "explore_join",
+        "explore_out",
+        "plan",
+        "implement",
+        "holdout",
+        "exit",
+    ]
     assert history[-1].outcome == "success"
 
 

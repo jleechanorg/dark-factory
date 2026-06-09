@@ -12,6 +12,7 @@ task. If the user passes `--pipeline`, use it. Otherwise classify the goal first
 | New feature, full production loop | `pipelines/slim/minimal_feature.dot` | explore → plan → test → review → holdout → gates |
 | New feature, minimal loop | `pipelines/factory/hello.dot` | plan → implement → holdout → fix |
 | In-flight PR iteration | `pipelines/slim/minimal_pr.dot` | explore → plan → …; no holdout; set `--state slim.test_command=...` |
+| Bug fix with red/green discipline | `pipelines/bug_fix.dot` | reproduce (fresh test) → red gate → fix → green gate; max 3 fix visits |
 | Validate diff + sealed holdout | `pipelines/factory/gates.dot` | code already implemented |
 | Validate in-flight PR (no holdout) | `pipelines/factory/pr_gates.dot` | evidence gates only |
 | Spec review (line-aware, slim) | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | acceptance + codex reviewer |
@@ -37,7 +38,7 @@ offline determinism.
 
 ## Short names (expanded by skill)
 
-`gates`, `hello`, `pr_gates`, `minimal_pr`, `minimal_feature`, `review_slim`, `review_full`
+`gates`, `hello`, `pr_gates`, `minimal_pr`, `minimal_feature`, `bug_fix`, `review_slim`, `review_full`
 
 ## Invocation
 

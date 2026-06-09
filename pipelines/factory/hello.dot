@@ -1,6 +1,7 @@
 digraph hello {
     graph [
-        goal="Minimal smoke pipeline — plan, implement, holdout-eval, exit."
+        include="@pipelines/_base.dot",
+        goal="Minimal smoke pipeline — explore, plan, implement, holdout-eval, exit."
         label="Hello"
     ]
     rankdir=LR
@@ -8,13 +9,18 @@ digraph hello {
     start [shape=Mdiamond, label="Start"]
     exit  [shape=Msquare,  label="Exit"]
 
+    // _base.dot provides: explore_in, explore_fanout, explore_{concept,auth,
+    // reuse,risks}, explore_join, explore_out.
+
     plan      [type="codergen", label="Plan",      prompt="@prompts/hello/plan.md"]
     implement [type="codergen", label="Implement", prompt="@prompts/hello/implement.md"]
     holdout   [type="holdout_eval", label="Holdout Eval", feature="hello"]
     fix       [type="codergen", label="Fix",       prompt="@prompts/hello/fix.md", max_visits="3"]
 
-    start -> plan -> implement -> holdout
-    holdout -> exit [condition="outcome=success"]
-    holdout -> fix  [condition="outcome!=success"]
-    fix     -> holdout
+    start       -> explore_in
+    explore_out -> plan
+    plan        -> implement -> holdout
+    holdout     -> exit [condition="outcome=success"]
+    holdout     -> fix  [condition="outcome!=success"]
+    fix         -> holdout
 }

@@ -2,6 +2,15 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-08 — explore-phase rollout and PR review
+
+- Reviewed commit `6c6a2a3` ("feat(slim): add explore phase and role-based model routing"). Verdict: ship it. Concerns 2 (class=plan) and 3 (plan.md reads explore artifact) from the first read were false alarms after a second look.
+- User follow-up ask, verbatim: **"i want explore for all the pipelines not just one."** 5 of 7 `.dot` files currently lack `explore`; the slim-only rollout is now a tracked P1 rollout.
+- New beads (with linked GitHub issues): [jleechan-2wx](https://github.com/jleechanorg/dark-factory/issues/18) (P1, propagate to `factory/hello.dot` and selectively `factory/gates.dot`), [jleechan-80r](https://github.com/jleechanorg/dark-factory/issues/19) (P3, explore early-exit on infeasible verdict), [jleechan-x57](https://github.com/jleechanorg/dark-factory/issues/20) (P3, `DARK_FACTORY_PLAN_MODEL` env var), [jleechan-4gx](https://github.com/jleechanorg/dark-factory/issues/21) (P3, clean up untracked leftovers from prior sessions).
+- Diagram pipeline work landed: 3 semantic-color Excalidraw diagrams + an HTML README (commits `802fdb4`, `1f4443a`). Color contract doc at `docs/diagram-color-semantics.md`.
+- Full suite baseline on `6c6a2a3`: 2 pre-existing failures (`test_conformance_score_is_deterministic_mock_surface`, `test_parallel_branches_run_in_separate_threads`) on a clean main checkout. Documented in the nextsteps doc; not blocking the rollout PR.
+- Handoff: `/Users/jleechan/roadmap/nextsteps-2026-06-08-dark-factory-explore-rollout.md`.
+
 ### 2026-05-31 - runner crash-resilience and reviewer-gate roadmap
 
 - Opened/organized the crash-resilience roadmap under [jleechan-o8q](br show jleechan-o8q), with PR #13 at `411676d5c634ec6d5902529dd8d50dfbffbf6428` for the first engine boundary/per-run-log slice.

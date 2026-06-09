@@ -249,3 +249,107 @@ def test_gate_code_standards_uses_universal_prompt_when_local_file_absent(tmp_pa
         f"When code-standards.md is absent, _gate_code_standards must use "
         f"universal prompt. Got: {prompt_used[:60]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# agy reviewer backend + claude fallback (review_pr.dot evidence gate).
+#
+# A reviewer gate node with backend="agy" (explicit or via a .review model
+# stylesheet) must (a) actually invoke agy, (b) fall back to claude only on agy
+# *infrastructure* failure, and (c) NEVER reviewer-shop a real agy fail/partial
+# verdict onto claude. These three properties are what make "agy reviews, falls
+# back to claude if it doesn't work" honest rather than a label.
+# ---------------------------------------------------------------------------
+
+def _agy_gate_node():
+    return type("Node", (), {"name": "evidence", "attrs": {"backend": "agy"}, "shape": ""})()
+
+
+def test_gate_er_runs_agy_when_backend_agy(tmp_path, monkeypatch):
+    """backend=agy → the reviewer subprocess is `agy --print ...`, not claude."""
+    import subprocess as _sp
+    from runner.handlers import _gate_er, Context as HCtx
+
+    node = _agy_gate_node()
+    # ctx.backend is the run-level CLI backend; the per-node backend=agy must win.
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+    fake_sha = "a" * 40
+    seen: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        return _sp.CompletedProcess(cmd, 0, stdout=f"head_sha: {fake_sha}\nverdict: pass\n", stderr="")
+
+    monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    result = _gate_er(node, ctx)
+
+    assert result.outcome == "success"
+    assert seen, "subprocess.run must have been called"
+    assert seen[0][0] == "agy", f"expected agy reviewer argv, got {seen[0][:1]!r}"
+    assert result.metadata["reviewer_backend"] == "agy"
+    assert result.metadata["fallback_used"] == "false"
+    # No reviewer-shopping: a passing agy verdict must not also call claude.
+    assert not any("claude" in c[0] for c in seen)
+
+
+def test_gate_agy_falls_back_to_claude_on_infra_failure(tmp_path, monkeypatch):
+    """agy missing (FileNotFoundError) → fall back to claude; result is the claude verdict."""
+    import subprocess as _sp
+    from runner.handlers import _gate_er, Context as HCtx
+
+    node = _agy_gate_node()
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+    fake_sha = "c" * 40
+    seen: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        if cmd[0] == "agy":
+            raise FileNotFoundError("agy: command not found")
+        return _sp.CompletedProcess(cmd, 0, stdout=f"head_sha: {fake_sha}\nverdict: pass\n", stderr="")
+
+    monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    result = _gate_er(node, ctx)
+
+    assert result.outcome == "success"
+    assert result.metadata["fallback_used"] == "true"
+    assert result.metadata["fallback_from"] == "agy"
+    assert result.metadata["reviewer_backend"] == "claude"
+    # agy was tried first, then claude.
+    assert seen[0][0] == "agy"
+    assert any("claude" in c[0] for c in seen), "claude fallback must have been invoked"
+
+
+def test_gate_agy_real_fail_verdict_not_retried(tmp_path, monkeypatch):
+    """A genuine agy `verdict: fail` (matching SHA) is kept — claude is never called."""
+    import subprocess as _sp
+    from runner.handlers import _gate_er, Context as HCtx
+
+    node = _agy_gate_node()
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+    fake_sha = "d" * 40
+    seen: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        # agy returns a real review verdict (rc 0, SHA echoed): this is NOT an
+        # infra failure, so the fallback must not fire.
+        return _sp.CompletedProcess(cmd, 0, stdout=f"head_sha: {fake_sha}\nverdict: fail\n", stderr="")
+
+    monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    result = _gate_er(node, ctx)
+
+    assert result.outcome == "failure"
+    assert result.metadata["reviewer_backend"] == "agy"
+    assert result.metadata["fallback_used"] == "false"
+    # Reviewer-shopping guard: claude must NEVER be consulted for a real verdict.
+    assert all(c[0] == "agy" for c in seen), f"claude must not be retried; saw {[c[0] for c in seen]!r}"

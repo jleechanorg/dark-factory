@@ -1,0 +1,83 @@
+// pipelines/bug_fix.dot
+//
+// Bug-fix lane with /rg (red/green) discipline.
+//
+//   start -> explore_in -> [4-way explore fanout] -> explore_join
+//         -> explore_out -> plan -> reproduce -> gate_red
+//         -> fix (max 3) -> gate_green
+//         -> exit
+//
+// The discipline: a fresh test reproduces the bug, fails under the current
+// code, then passes after the fix. The agent is forbidden from reading the
+// bug report to derive the test (see prompts/bug_fix/reproduce.md).
+//
+// The red gate is a goal-gate: if the test does not fail, the pipeline
+// exits early — no fix is attempted because the bug was not reproduced.
+
+digraph BugFix {
+    graph [
+        include="@pipelines/_base.dot",
+        goal="Bug fix with red/green discipline: reproduce -> red gate -> fix -> green gate -> exit",
+        label="Bug Fix (RG)"
+    ]
+    rankdir=LR
+
+    start  [shape=Mdiamond, label="Start"]
+    exit   [shape=Msquare,  label="Exit"]
+
+    // The base provides: explore_in, explore_fanout, explore_{concept,auth,
+    // reuse,risks}, explore_join, explore_out.
+
+    plan [
+        type="codergen",
+        class="plan",
+        label="Plan",
+        prompt="@prompts/slim/plan.md"
+    ]
+
+    reproduce [
+        type="codergen",
+        class="implement",
+        label="Reproduce (fresh failing test)",
+        prompt="@prompts/bug_fix/reproduce.md",
+        goal_gate=true
+    ]
+
+    gate_red [
+        type="gate_red",
+        label="/es Red: test must FAIL",
+        test_path="${state.bug_fix.test_path}",
+        timeout=300
+    ]
+
+    fix [
+        type="codergen",
+        class="fix",
+        label="Fix",
+        prompt="@prompts/bug_fix/fix.md",
+        max_visits="3"
+    ]
+
+    gate_green [
+        type="gate_green",
+        label="/es Green: test must PASS",
+        test_path="${state.bug_fix.test_path}",
+        timeout=300
+    ]
+
+    // Wiring: start enters explore, explore exits to plan, plan → reproduce.
+    start      -> explore_in
+    explore_out -> plan
+    plan       -> reproduce
+    reproduce  -> gate_red
+
+    // Red gate: success means bug reproduced; failure means we couldn't
+    // reproduce — exit early instead of pretending to fix.
+    gate_red   -> fix          [condition="outcome=success"]
+    gate_red   -> exit         [condition="outcome!=success"]
+
+    // Fix loop: green on success, back to fix on failure (max 3 visits).
+    fix        -> gate_green
+    gate_green -> exit         [condition="outcome=success"]
+    gate_green -> fix          [condition="outcome!=success"]
+}

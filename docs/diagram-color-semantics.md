@@ -26,7 +26,7 @@ The pipeline engine runs `.dot` via Graphviz and the README uses Excalidraw. Bot
 |------|------------|----------------------|-----------------|-------------------|---------|
 | **Engine** | `--color-engine` | `#d1fae5` | `#d1fae5` | `#065f46` | Pipeline engine / runner — `runner/*.py`, `.dot` parser, CXDB writer, Healer. Layer 1 of the 3-layer convergence. |
 | **Agent** | `--color-agent` | `#dbeafe` | `#dbeafe` | `#1e3a8a` | External coding agent — Claude Code, Codex CLI, Antigravity, AO worker. Layer 2 of the convergence. |
-| **LLM** | `--color-llm` | `#ede9fe` | `#ede9fe` | `#5b21b6` | LLM client / inference gateway — OpenClaw, wafer, thinclaw MCP. Layer 3 of the convergence. |
+| **LLM** | `--color-llm` | `#ede9fe` | `#ede9fe` | `#5b21b6` | LLM client / inference gateway — OpenClaw, thinclaw MCP. Layer 3 of the convergence. |
 | **Gate** | `--color-gate` | `#fef3c7` | `#fef3c7` | `#92400e` | Gate / verdict node — `gate_es`, `gate_er`, `gate_code_standards`, public acceptance. Where the system *decides*. |
 | **Holdout** | `--color-holdout` | `#fee2e2` | `#fee2e2` | `#991b1b` | Sealed holdout / evaluator — `holdout_eval` node, sibling repo at `$DARK_FACTORY_HOLDOUTS`. Adversarial, structurally blind to the implementer. |
 | **Human** | `--color-human` | `#e5e7eb` | `#e5e7eb` | `#374151` | Human operator — `human_gate` node, the engineer reading this. |

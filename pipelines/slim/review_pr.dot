@@ -1,6 +1,6 @@
 digraph ReviewPR {
     graph [
-        goal="PR review: cold review + evidence gates (no holdout — holdouts test feature scenarios not PR diffs)."
+        goal="PR review: cold codergen review + a real SHA-bound evidence gate (gate_er on agy, claude fallback). No holdout — holdouts test feature scenarios, not PR diffs."
         label="ReviewPR"
         rankdir=LR
     ]
@@ -8,6 +8,9 @@ digraph ReviewPR {
     start  [shape=Mdiamond, label="Start"]
     exit   [shape=Msquare,  label="Exit"]
 
+    // Cold fresh-eyes review. type=codergen → honors the run-level --backend
+    // (set --backend agy for an independent adversarial pass). It can edit, so
+    // it is NOT the merge-confidence reviewer; the gate below is.
     review  [
         type="codergen",
         label="Cold Review",
@@ -15,11 +18,18 @@ digraph ReviewPR {
         prompt="@prompts/slim/review.md",
         goal_gate=true
     ]
+
+    // Real evidence reviewer: SHA-bound, read-only, verdict-parsed. Pinned to
+    // agy (independent of the coder backend) and falls back to claude only on
+    // agy infrastructure failure (never reviewer-shops a real fail/partial).
+    // gate_er echo-short-circuits on the run-level backend, so --backend echo
+    // smoke still pre-seeds via ctx.state["evidence.outcome"].
     evidence [
-        type="codergen",
-        label="Evidence Review",
+        type="gate_er",
+        label="Evidence Review (gate_er)",
         class="review",
-        prompt="@prompts/slim/evidence_review.md"
+        backend="agy",
+        timeout=600
     ]
 
     start    -> review
