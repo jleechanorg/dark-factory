@@ -29,20 +29,16 @@ Read `spec.md` from the repository root (or `.dark-factory/spec.md` if present).
 
 ## Verdict contract
 
-Return a concise verdict:
-- `success` only if ALL five blocking steps above pass.
-- `failure` if any blocking step fails.
+Return a concise verdict, parsed by the runner from the LAST `verdict:` marker line in your response:
+- Conclude with `verdict: pass` only if ALL five blocking steps above pass (the non-blocking evidence warning does not block a pass).
+- Conclude with `verdict: fail` if any blocking step fails.
 
-Begin your response with exactly one of:
-```
-VERDICT: success
-```
-or
-```
-VERDICT: failure
-```
+The runner appends a binding requirement to this prompt: you must also echo the
+`head_sha: <sha>` line it provides, verbatim. Only `pass` and `fail` are valid
+verdict tokens — do not use `success`, `failure`, or any other word on the
+verdict line.
 
-Then list concrete findings with:
+Before the verdict line, list concrete findings with:
 - Step number and step name
 - Pass / Fail status
 - For failures: exact quote from spec that is missing or incorrect, and the remediation required.

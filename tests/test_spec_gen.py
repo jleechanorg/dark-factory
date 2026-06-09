@@ -301,11 +301,20 @@ def test_fix_spec_prompt_exists():
 
 def test_spec_review_prompt_contains_verdict_contract():
     content = (ROOT / "prompts" / "slim" / "spec_review.md").read_text()
-    assert "VERDICT: success" in content or "VERDICT:" in content, (
-        "spec_review.md must contain a VERDICT contract"
+    # The contract must use the runner-parseable tokens (verdict: pass|fail).
+    assert "verdict: pass" in content, (
+        "spec_review.md must instruct concluding with 'verdict: pass'"
     )
-    assert "failure" in content.lower(), (
-        "spec_review.md must describe a failure verdict"
+    assert "verdict: fail" in content, (
+        "spec_review.md must instruct concluding with 'verdict: fail'"
+    )
+    # The old contract tokens are unparseable by _parse_verdict — 'success'
+    # is not a valid verdict token and 'failure' fails the fail\b boundary.
+    assert "VERDICT: success" not in content, (
+        "spec_review.md must not use the unparseable 'VERDICT: success' token"
+    )
+    assert "VERDICT: failure" not in content, (
+        "spec_review.md must not use the unparseable 'VERDICT: failure' token"
     )
 
 
