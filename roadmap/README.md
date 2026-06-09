@@ -2,6 +2,18 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-09 — Level-5 autonomy review (3-agent team) + bead hygiene
+
+- **Team review** (2× sonnet + 1× haiku subagents) of all 28 `.dot` graphs, the full runner, and prompts/docs against the Level-5 rubric (limited human steering, autonomous coding, adversarial review, sealed holdouts). Verdict: **structurally sound** — zero `human_gate` nodes anywhere, honest cross-vendor dispatch (re-verified), real sandbox isolation, no ZFC violations, explore-stitch gap confirmed resolved. All high-severity findings independently spot-verified before filing.
+- **Gaps filed as beads** (4 new, GH issues for the P1s):
+  - [jleechan-7je / #28](https://github.com/jleechanorg/dark-factory/issues/28) (P1, HIGH): `bug_fix.dot` has no adversarial reviewer — only gate_red/gate_green test runners. Add `gate_er` after `gate_green` mirroring review_pr.dot's evidence node.
+  - [jleechan-4pa / #29](https://github.com/jleechanorg/dark-factory/issues/29) (P1, MEDIUM): holdout isolation hardening — `_holdout_eval` `eval_env` keeps `DARK_FACTORY_HOLDOUTS` (handlers.py:1813) while running agent-authored seed scripts (exfil path into the fix loop); minimax gate env bypasses `_sanitized_env` (handlers.py:1136).
+  - jleechan-bt3 (P2): graph-level loop bounds — `max_visits` on slim fix nodes (max_retries=2 is handler-level only), kilroy/tracker loops, `hello.dot` exhausted-exit edge.
+  - jleechan-ua8 (P3 batch): parallel_demo dangling `prompts/codergen.md`; silent CXDB init failure (engine.py:907); pipeline-selection.md missing review_pr/parallel_demo rows; CLAUDE.md missing gate_red/gate_green; healer infra-vs-real discriminator; dorodango debt (emulator bootstrap + embedded reviewer prompts).
+- **Bead hygiene**: closed 5 done P1 beads (jleechan-u8e/qb7/n3m/81l/gqe) + GH issues [#23](https://github.com/jleechanorg/dark-factory/issues/23)/[#24](https://github.com/jleechanorg/dark-factory/issues/24)/[#25](https://github.com/jleechanorg/dark-factory/issues/25) — all shipped in PR #26 and verified by the audit.
+- Amazon-clone kilroy/mammoth/smasher/tracker confirmed as faithful baseline ports of the four Attractor implementations; `dark_factory.dot` is the intentional "what this factory adds" contrast (gates + codex independent review on the same holdout layer).
+- Handoff: [`/Users/jleechan/roadmap/nextsteps-2026-06-09-dark-factory-pr26-dispatch.md`](file:///Users/jleechan/roadmap/nextsteps-2026-06-09-dark-factory-pr26-dispatch.md) (session-2 section).
+
 ### 2026-06-09 — adversarial-review priority queue dispatch fix (PR #26)
 
 - **[PR #26](https://github.com/jleechanorg/dark-factory/pull/26) MERGED at `7ef9f91`** (squash, admin-merge). The conformance walker fix + cherry-picked PR #22 work + dispatch fix + polish. CI test + skeptic PASS, Bugbot skipping, CodeRabbit perpetual-nitpick stall (per [`feedback_2026-05-31_pr10_coderabbit_stall.md`](file:///Users/jleechan/.claude/projects/-Users-jleechan-projects-dark-factory/memory/feedback_2026-05-31_pr10_coderabbit_stall.md)) → admin-merged on operator OK.
