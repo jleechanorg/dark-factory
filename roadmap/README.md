@@ -2,6 +2,14 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-09 — P1 gap fixes shipped (PR #30): bug_fix adversarial reviewer + holdout env isolation
+
+- **[PR #30](https://github.com/jleechanorg/dark-factory/pull/30) MERGED at [`2ae5aa6`](https://github.com/jleechanorg/dark-factory/commit/2ae5aa66b727ef52084754563ae8d377081144f2)** (squash, admin-merge; CI 4/4 + Skeptic Gate PASS; CodeRabbit rate-limited, codex-connector out of credits — no actionable findings after a 10-min watch window).
+- **jleechan-7je / [#28](https://github.com/jleechanorg/dark-factory/issues/28) CLOSED**: `bug_fix.dot` gained an `evidence` `gate_er` node after `gate_green`, mirroring review_pr.dot (cross-vendor priority queue, `prefer_adversarial=true`, SHA-bound). A fail verdict propagates through `exit` as the terminal outcome — reviewed-and-rejected fixes never ship silently green.
+- **jleechan-4pa / [#29](https://github.com/jleechanorg/dark-factory/issues/29) CLOSED**: `_holdout_eval` `eval_env` now built from `_sanitized_env()` (was raw `os.environ` — agent-authored server/seed subprocesses could read `DARK_FACTORY_HOLDOUTS`); minimax reviewer env layers `ANTHROPIC_BASE_URL` on `_sanitized_env()`. Verified the sealed evaluator does not need the variable.
+- Tests 268 → **272/272 green** (+4 regressions: evidence-fail terminal outcome, evidence-node structure, holdout subprocess env sanitization, minimax env sanitization). `bin/conformance validate` clean.
+- Remaining open gap beads: jleechan-bt3 (P2 loop bounds), jleechan-ua8 (P3 batch).
+
 ### 2026-06-09 — Level-5 autonomy review (3-agent team) + bead hygiene
 
 - **Team review** (2× sonnet + 1× haiku subagents) of all 28 `.dot` graphs, the full runner, and prompts/docs against the Level-5 rubric (limited human steering, autonomous coding, adversarial review, sealed holdouts). Verdict: **structurally sound** — zero `human_gate` nodes anywhere, honest cross-vendor dispatch (re-verified), real sandbox isolation, no ZFC violations, explore-stitch gap confirmed resolved. All high-severity findings independently spot-verified before filing.
