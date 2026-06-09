@@ -26,7 +26,18 @@ from runner.parser import is_exit_node, is_start_node, parse  # noqa: E402
 
 
 def _pipelines() -> list[pathlib.Path]:
-    return sorted((ROOT / "pipelines").rglob("*.dot")) + sorted((ROOT / "benchmarks").rglob("*.dot"))
+    # Library fragments (`_*.dot`) are included by lanes via `include="@..."` and
+    # are intentionally free of `start`/`exit` (the parser loads them with
+    # `require_start_exit=False` — see `runner.parser.parse`). Walking them in
+    # `validate` would produce a spurious "missing start/exit" error and flip
+    # `conformance score` RED, which in turn trips the test + Skeptic CI gates.
+    # Filter them out at the walker so the parser invariant stays strict.
+    def _walk(top: pathlib.Path) -> list[pathlib.Path]:
+        return sorted(
+            p for p in top.rglob("*.dot") if not p.name.startswith("_")
+        )
+
+    return _walk(ROOT / "pipelines") + _walk(ROOT / "benchmarks")
 
 
 def _graph_payload(path: pathlib.Path) -> dict:
