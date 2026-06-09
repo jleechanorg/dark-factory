@@ -540,6 +540,35 @@ def test_holdout_eval_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path
     assert result.outcome != "success"
 
 
+def test_holdout_eval_subprocess_env_is_sanitized(monkeypatch, tmp_path):
+    """The eval subprocess env must not carry DARK_FACTORY_HOLDOUTS or any
+    *HOLDOUT* variable — the same eval_env dict feeds agent-authored server
+    and seed subprocesses (make run, npm seed, scripts/seed.*), which is a
+    holdout exfiltration vector (jleechan-4pa / issue #29)."""
+    fake_repo = tmp_path / "fake-holdouts"
+    evaluator = fake_repo / "evaluator"
+    evaluator.mkdir(parents=True)
+    # The fake evaluator passes only if its own env is clean: a leak flips
+    # the verdict to fail, which the assertion below catches.
+    (evaluator / "run.py").write_text(
+        "import json, os\n"
+        "leaked = [k for k in os.environ if 'HOLDOUT' in k.upper()]\n"
+        "verdict = 'fail' if leaked else 'pass'\n"
+        "print(json.dumps({'verdict': verdict, 'scenarios': [], 'leaked': leaked}))\n"
+    )
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(fake_repo))
+    monkeypatch.setenv("MY_HOLDOUT_SECRET", "sealed")
+
+    node = Node(name="holdout", attrs={"type": "holdout_eval", "feature": "hello"})
+    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+
+    result = _holdout_eval(node, ctx)
+
+    assert result.outcome == "success", (
+        f"holdout vars leaked into the eval subprocess env: {result.output}"
+    )
+
+
 def test_holdout_eval_uses_state_substituted_implementation(monkeypatch, tmp_path):
     fake_repo = tmp_path / "fake-holdouts"
     evaluator = fake_repo / "evaluator"
