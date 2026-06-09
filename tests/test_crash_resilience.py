@@ -54,7 +54,9 @@ def test_node_exception_is_recorded_not_raised(monkeypatch):
     error_records = [r for r in history if r.outcome == "error"]
     assert error_records, f"expected an error StepRecord, got {[ (r.node, r.outcome) for r in history]}"
     rec = error_records[0]
-    assert rec.node in {"plan", "implement", "fix"}
+    # explore_stitch is a codergen in the explore phase; it may also raise
+    # before the plan node if the stub fires on the very first codergen visit.
+    assert rec.node in {"plan", "implement", "fix", "explore_stitch"}
     # Exception type + message + a traceback fragment land in output_preview.
     assert "RuntimeError" in rec.output_preview
     assert "backend exploded" in rec.output_preview

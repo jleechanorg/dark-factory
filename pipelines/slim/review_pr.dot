@@ -19,16 +19,23 @@ digraph ReviewPR {
         goal_gate=true
     ]
 
-    // Real evidence reviewer: SHA-bound, read-only, verdict-parsed. Pinned to
-    // agy (independent of the coder backend) and falls back to claude only on
-    // agy infrastructure failure (never reviewer-shops a real fail/partial).
-    // gate_er echo-short-circuits on the run-level backend, so --backend echo
-    // smoke still pre-seeds via ctx.state["evidence.outcome"].
+    // Real evidence reviewer: SHA-bound, read-only, verdict-parsed. Resolves
+    // via the adversarial-review priority queue (codex > minimax > agy >
+    // claude-sonnet) so the reviewer is a *different vendor* from the
+    // implementing coder. prefer_adversarial: true guarantees the run-level
+    // coder backend is excluded from the queue (a `claude` coder run cannot
+    // accidentally get a `claude` reviewer). The agy→claude infra fallback
+    // still applies (never reviewer-shops a real fail/partial). Priority list
+    // comes from backend_priority= here; overridable per-run via
+    // DARK_FACTORY_ADVERSARIAL_PRIORITY. gate_er echo-short-circuits on the
+    // run-level backend, so --backend echo smoke still pre-seeds via
+    // ctx.state["evidence.outcome"].
     evidence [
         type="gate_er",
         label="Evidence Review (gate_er)",
         class="review",
-        backend="agy",
+        backend_priority="codex,minimax,agy,claude-sonnet",
+        prefer_adversarial="true",
         timeout=600
     ]
 

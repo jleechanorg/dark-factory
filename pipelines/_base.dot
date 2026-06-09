@@ -11,12 +11,15 @@
 //                                    explore_reuse,
 //                                    explore_risks}
 //              -> explore_join (policy=wait_all)
+//              -> explore_stitch (codergen; reads 4 partials,
+//                                  writes explore-findings.md)
 //              -> explore_out
 //
 // Each sub-agent writes a distinct partial file under
-// .dark-factory/explore-<angle>.md. The lane's `plan` node is expected
-// to read those partials and stitch them into the final
-// .dark-factory/explore-findings.md before plan begins.
+// .dark-factory/explore-<angle>.md. The `explore_stitch` node then
+// consolidates the four partials into the final
+// .dark-factory/explore-findings.md that the lane's `plan` node
+// hard-requires (`prompts/slim/plan.md:6`).
 //
 // Lanes wire the base into their own topology with two edges:
 //
@@ -62,6 +65,13 @@ digraph _base {
                      label="Explore Join (all 4)",
                      shape=tripleoctagon]
 
+    // Stitch: reads the 4 partials and writes the consolidated
+    // .dark-factory/explore-findings.md that the lane's `plan` node requires.
+    // Prompts/slim/explore.md is repurposed as the stitch prompt.
+    explore_stitch  [type="codergen", class="explore",
+                     label="Explore Stitch",
+                     prompt="@prompts/slim/explore.md"]
+
     // Wiring.
     explore_in     -> explore_fanout
     explore_fanout -> explore_concept
@@ -72,5 +82,6 @@ digraph _base {
     explore_auth    -> explore_join
     explore_reuse   -> explore_join
     explore_risks   -> explore_join
-    explore_join    -> explore_out
+    explore_join    -> explore_stitch
+    explore_stitch  -> explore_out
 }
