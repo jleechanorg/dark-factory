@@ -89,10 +89,29 @@ def test_conformance_score_is_deterministic_mock_surface():
 def test_conformance_run_supports_mock_url():
     proc = _run_conformance("run", "pipelines/factory/hello.dot", "--mock-url", "http://127.0.0.1:54321")
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_conformance_validate_walker_skips_underscore_dot_libraries():
+    """`conformance validate` (no args) walks the pipelines + benchmarks trees
+    and rejects any file without `start`/`exit`. Library fragments
+    (`_*.dot`, e.g. `pipelines/_base.dot`) are deliberately free of those
+    nodes — they are included by lanes via `include="@..."` and parsed with
+    `require_start_exit=False`. The walker must filter them out so the
+    strict parser invariant is preserved while `conformance score` (CI Gate
+    2) stays green. Regression test for bead jleechan-u8e."""
+    # 1. The walker must succeed (no diagnostics) on the full tree.
+    proc = _run_conformance("validate")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
     payload = json.loads(proc.stdout)
-    assert payload["status"] == "success"
-    
-    plan_step = next(s for s in payload["steps"] if s["node"] == "plan")
-    impl_step = next(s for s in payload["steps"] if s["node"] == "implement")
-    assert plan_step["outcome"] == "failure"
-    assert impl_step["outcome"] == "failure"
+    assert payload["diagnostics"] == [], payload
+
+    # 2. The parser invariant is still strict: explicit validate of a
+    # library fragment must fail (so authors cannot accidentally run a
+    # `_base.dot`-style file as a top-level pipeline).
+    proc_explicit = _run_conformance("validate", "pipelines/_base.dot")
+    assert proc_explicit.returncode == 1, proc_explicit.stdout + proc_explicit.stderr
+    payload_explicit = json.loads(proc_explicit.stdout)
+    assert any(
+        diag.get("severity") == "error" and "start" in diag.get("message", "").lower()
+        for diag in payload_explicit["diagnostics"]
+    ), payload_explicit

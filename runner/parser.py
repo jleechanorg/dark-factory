@@ -344,8 +344,124 @@ def _validate_condition(condition: str, context: str) -> None:
         raise ValueError(f"{context}: malformed condition {condition!r}")
 
 
-def parse(path: pathlib.Path) -> Graph:
-    """Load a .dot file and return a Graph."""
+def _resolve_includes(
+    path: pathlib.Path,
+    nodes: dict[str, Node],
+    edges: list[Edge],
+    graph_attrs: dict[str, AttrValue],
+    require_start_exit: bool,
+    visited: tuple[pathlib.Path, ...] = (),
+) -> None:
+    """Process graph-attr ``include="@path[@;path...]"`` on the parent.
+
+    For each path (one or more, semicolon-separated), parse the included
+    .dot file as a *library* and merge its nodes and edges into the
+    parent's ``nodes`` and ``edges`` collections. The included file must
+    not contain ``start`` or ``exit`` nodes (libraries don't run directly);
+    node names must not collide with the parent's already-declared nodes
+    (lanes must not redefine library nodes).
+
+    Path resolution order (mirrors the ``prompt="@..."`` convention so
+    lanes in subdirectories can write repo-root-relative paths):
+
+      1. Absolute path.
+      2. Relative to the parent .dot file's directory.
+      3. Relative to the current working directory.
+
+    The leading ``@`` is optional and stripped.
+
+    Cycle detection: ``visited`` is the chain of resolved include paths
+    leading to the current call. If a path tries to re-include any
+    ancestor in that chain, we raise a parse error rather than recurse
+    forever. The first call from ``_parse`` passes an empty tuple; every
+    recursive call appends the resolved ``include_path`` before recursing.
+    """
+    raw_attr = str(graph_attrs.get("include") or "")
+    if not raw_attr:
+        return
+    parent_dir = path.resolve().parent
+    cwd = pathlib.Path.cwd()
+    for raw in raw_attr.split(";"):
+        ref = raw.strip()
+        if not ref:
+            continue
+        if ref.startswith("@"):
+            ref = ref[1:]
+        if not ref:
+            continue
+        include_path: pathlib.Path | None = None
+        tried: list[pathlib.Path] = []
+        for base in (parent_dir, cwd):
+            candidate = (base / ref).resolve()
+            tried.append(candidate)
+            if candidate.exists():
+                include_path = candidate
+                break
+        if include_path is None:
+            raise ValueError(
+                f"{path}: include not found: {ref!r} "
+                f"(tried parent-relative {tried[0]} and cwd-relative {tried[1]})"
+            )
+        if include_path in visited:
+            chain = " -> ".join(str(p) for p in (*visited, include_path))
+            raise ValueError(
+                f"{path}: include cycle detected: {chain}"
+            )
+        sub = _parse(include_path, require_start_exit=False, visited=(*visited, include_path))
+        # Reject any start/exit in the included graph — libraries must
+        # be runnable-only-when-wired-into-a-lane, not standalone.
+        for nm, node in sub.nodes.items():
+            if is_start_node(node) or is_exit_node(node):
+                raise ValueError(
+                    f"{include_path}: included file declares {nm!r} node; "
+                    f"library .dot files must not declare start or exit"
+                )
+            if nm in nodes:
+                raise ValueError(
+                    f"{path}: include {ref!r} declares node {nm!r} which "
+                    f"collides with a parent node — lanes must not redefine "
+                    f"library nodes"
+                )
+            nodes[nm] = node
+        # Edges from the included graph are appended. They may reference
+        # either library nodes (already merged) or parent-declared nodes
+        # (which are wired in by the parent graph's own edges).
+        for e in sub.edges:
+            if e.src in nodes and e.dst in nodes:
+                edges.append(e)
+            else:
+                # Edges that reference a node the parent hasn't declared
+                # and the include didn't declare are silently dropped —
+                # they will be re-declared by the parent as wiring edges.
+                # This lets a library expose `in -> out` point nodes and
+                # the parent wire them up.
+                pass
+
+
+def parse(path: pathlib.Path, require_start_exit: bool = True) -> Graph:
+    """Load a .dot file and return a Graph.
+
+    By default pipelines must contain both ``start`` and ``exit`` nodes.
+    Pass ``require_start_exit=False`` to load a graph *library* (used by
+    ``include="@path"`` and by tests that want to inspect a library directly).
+    """
+    return _parse(path, require_start_exit=require_start_exit)
+
+
+def _parse(
+    path: pathlib.Path,
+    require_start_exit: bool,
+    visited: tuple[pathlib.Path, ...] = (),
+) -> Graph:
+    """Internal: load a .dot file and return a Graph.
+
+    When ``require_start_exit`` is False (used for graph-library includes),
+    the start/exit presence check is skipped — the included file is a
+    library, not a runnable pipeline, so it does not need them.
+
+    ``visited`` is the chain of resolved include paths leading here, used
+    by ``_resolve_includes`` to detect cycles (see its docstring).
+    """
     raw = pydot.graph_from_dot_file(str(path))
     if not raw:
         raise ValueError(f"no graphs parsed from {path}")
@@ -417,10 +533,20 @@ def parse(path: pathlib.Path) -> Graph:
 
     collect_edges(g)
 
+    # Resolve graph-attr `include="@path[@;path...]"` BEFORE start/exit
+    # validation. Included files are libraries; their content is merged into
+    # the parent's node and edge sets. The parent's start/exit requirement
+    # still applies; the included graph must not declare its own.
+    if graph_attrs.get("include"):
+        _resolve_includes(
+            path, nodes, edges, graph_attrs, require_start_exit, visited
+        )
+
     _apply_model_stylesheet(path, nodes, graph_attrs.get("model_stylesheet"))
 
-    if not any(is_start_node(node) for node in nodes.values()) or not any(
-        is_exit_node(node) for node in nodes.values()
+    if require_start_exit and (
+        not any(is_start_node(node) for node in nodes.values())
+        or not any(is_exit_node(node) for node in nodes.values())
     ):
         raise ValueError(
             f"{path}: pipeline must contain both 'start' and 'exit' nodes"
@@ -439,10 +565,11 @@ def parse(path: pathlib.Path) -> Graph:
             raise ValueError(f"{path}: exit node must not have outgoing edges")
 
     start_name = _start_node_name(nodes)
-    reachable = _reachable_from_start(start_name, edges)
-    unreachable = sorted(set(nodes) - reachable)
-    if unreachable:
-        raise ValueError(f"{path}: unreachable nodes from start: {', '.join(unreachable)}")
+    if require_start_exit:
+        reachable = _reachable_from_start(start_name, edges)
+        unreachable = sorted(set(nodes) - reachable)
+        if unreachable:
+            raise ValueError(f"{path}: unreachable nodes from start: {', '.join(unreachable)}")
     _validate_retry_targets(path, graph_attrs, nodes, edges)
 
     return Graph(name=name, goal=goal, nodes=nodes, edges=edges, attrs=graph_attrs)

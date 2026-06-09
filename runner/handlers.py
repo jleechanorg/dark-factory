@@ -15,6 +15,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
@@ -586,58 +587,6 @@ def _codergen(node: Node, ctx: Context) -> Result:
                     "returncode": "",
                 },
             )
-    elif backend == "claudew":
-        wafer_key = os.environ.get("WAFER_API_KEY", "")
-        if not wafer_key:
-            return Result(outcome="failure", output="claudew backend requires WAFER_API_KEY env var")
-        wafer_model = os.environ.get("WAFER_MODEL", "GLM-5.1")
-        env = _sanitized_env()
-        env["WAFER_API_KEY"] = wafer_key
-        env["WAFER_MODEL"] = wafer_model
-        env["ANTHROPIC_BASE_URL"] = "http://localhost:9001"
-        env["ANTHROPIC_AUTH_TOKEN"] = wafer_key
-        env["ANTHROPIC_DEFAULT_MODEL"] = wafer_model
-        env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = wafer_model
-        env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = wafer_model
-        env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = wafer_model
-        env["CLAUDEW_MODE"] = "1"
-        claude_bin = _get_claude_executable()
-        args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", "--model", wafer_model, "--effort", "high", prompt_text])
-        if args is None:
-            return Result(outcome="failure", output="sandbox-exec unavailable")
-        try:
-            timeout_s = _coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
-            proc = subprocess.run(
-                args,
-                cwd=ctx.workdir,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                check=False,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            return Result(
-                outcome="failure",
-                output=f"claudew backend timed out after {timeout_s} seconds",
-                metadata={
-                    "timed_out": "true",
-                    "timeout": str(timeout_s),
-                    "returncode": "",
-                },
-            )
-        except Exception as e:
-            return Result(
-                outcome="failure",
-                output=f"claudew backend error: {e}",
-                metadata={
-                    "timeout": str(timeout_s),
-                    "timed_out": "false",
-                    "returncode": "",
-                },
-            )
     elif backend == "agy":
         timeout_s = _coerce_timeout(node.attrs.get("timeout", "600"), 600)
         task_dir = ctx.workdir / ".dark-factory"
@@ -1134,8 +1083,382 @@ def _parse_verdict(text: str) -> tuple[str, str]:
     return "unknown", "failure"
 
 
+def _gate_subprocess_args(backend: str, prompt: str, ctx: "Context", timeout: int) -> Optional[list[str]]:
+    """Build the sandboxed argv for a *reviewer* gate on the given backend.
+
+    Supported backends:
+      - ``agy`` — Google Antigravity / Gemini CLI. Gets ``--add-dir`` so it
+        can read the diff/evidence in the worktree but never enters planning
+        mode.
+      - ``codex`` — OpenAI Codex CLI (``codex exec --yolo``).
+      - ``minimax`` — Anthropic Claude CLI routed through the minimax
+        gateway (env override handled by ``_gate_subprocess_env``).
+      - ``claude-sonnet`` (or bare ``claude``) — Anthropic Claude CLI.
+
+    The historical default mapped every non-``agy`` name to ``claude``; that
+    made the adversarial-review priority queue decorative (a resolved
+    ``codex`` still ran the Claude subprocess). The dispatch now honors the
+    resolved name end-to-end so cross-vendor review is a real subprocess
+    rather than a metadata label.
+
+    Returns ``None`` when sandbox-exec is unavailable.
+    """
+    if backend == "agy":
+        return _sandboxed_args([
+            "agy",
+            "--add-dir", str(ctx.workdir),
+            "--dangerously-skip-permissions",
+            "--print-timeout", f"{timeout}s",
+            "--print",
+            prompt,
+        ])
+    if backend == "codex":
+        return _sandboxed_args([
+            "codex", "exec", "--yolo", "--skip-git-repo-check", prompt,
+        ])
+    # ``claude-sonnet`` (priority-queue name), bare ``claude`` (run-level
+    # default), and any other claude-routed backend → Anthropic Claude CLI.
+    # ``minimax`` is a special case of this path with a different base URL
+    # (see ``_gate_subprocess_env``).
+    claude_bin = _get_claude_executable()
+    return _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", prompt])
+
+
+def _gate_subprocess_env(backend: str) -> dict[str, str]:
+    """Env overrides for a reviewer-gate subprocess on ``backend``.
+
+    For ``minimax`` the Claude CLI must route through the minimax Anthropic-
+    compatible gateway; ``ANTHROPIC_BASE_URL`` is the only override needed
+    (the key is whatever is already in ``os.environ``). All other backends
+    use ``_sanitized_env`` unchanged.
+    """
+    if backend == "minimax":
+        return {**os.environ, "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic"}
+    return _sanitized_env()
+
+
+def _run_gate_once(
+    backend: str, prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str
+) -> "Result":
+    """Run one reviewer-gate attempt on ``backend`` and classify the result.
+
+    SHA binding, verdict parsing, and infra-vs-real-failure classification are
+    identical across backends, so the only backend-specific parts are the
+    argv (built by ``_gate_subprocess_args``) and the env (built by
+    ``_gate_subprocess_env``). ``reviewer_backend`` is recorded in metadata
+    so the operator/CXDB can see what actually graded the diff — the
+    recorded name matches the resolved priority-queue name end-to-end
+    (e.g. ``codex`` means a codex subprocess really ran, not just a label).
+    """
+    # The recorded name must match the subprocess that actually ran. agy is
+    # passed through as-is; minimax is recorded as ``minimax`` even though it
+    # invokes the Claude CLI (the review is graded by the minimax-routed
+    # model, which is the cross-vendor intent). Everything else is whatever
+    # the priority queue / run-level config chose.
+    reviewer_backend = backend
+    sub_args = _gate_subprocess_args(backend, prompt, ctx, timeout)
+    sub_env = _gate_subprocess_env(backend)
+    if sub_args is None:
+        return Result(
+            outcome="failure",
+            output="sandbox-exec unavailable",
+            metadata={"slash_command": name, "verdict": "unknown",
+                      "reviewer_backend": reviewer_backend, "sandbox": "unavailable"},
+        )
+    # agy enforces its own --print-timeout; give the outer wait a small buffer
+    # so we read agy's timeout message rather than killing it first.
+    run_timeout = timeout + 30 if backend == "agy" else timeout
+    try:
+        proc = subprocess.run(
+            sub_args, cwd=ctx.workdir, capture_output=True, text=True,
+            timeout=run_timeout, check=False, env=sub_env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        combined = (exc.stdout or "") + "\n" + (exc.stderr or "")
+        return Result(
+            outcome="failure",
+            output=combined.strip() or f"gate {name} timed out after {run_timeout}s",
+            metadata={"slash_command": name, "verdict": "unknown",
+                      "head_sha_status": "missing", "timed_out": "true",
+                      "reviewer_backend": reviewer_backend},
+        )
+    except FileNotFoundError as exc:
+        return Result(
+            outcome="error",
+            output=f"gate {name} backend {reviewer_backend!r} not found: {exc}",
+            metadata={"slash_command": name, "verdict": "unknown",
+                      "head_sha_status": "missing", "reviewer_backend": reviewer_backend,
+                      "backend_missing": "true"},
+        )
+    except Exception as exc:
+        return Result(
+            outcome="error",
+            output=f"gate {name} subprocess failed: {exc}",
+            metadata={"slash_command": name, "verdict": "unknown",
+                      "head_sha_status": "missing", "reviewer_backend": reviewer_backend},
+        )
+    combined = proc.stdout + "\n" + proc.stderr
+    verdict, normalized = _parse_verdict(combined)
+    # SHA binding check comes BEFORE collapsing to pass/fail so a spoofed-pass
+    # with the wrong SHA collapses to `error`, not `success`.
+    sha_ok, observed_sha = _verify_head_sha_echo(combined, expected_sha)
+    if proc.returncode != 0 and (verdict == "unknown" or normalized == "success"):
+        outcome = "error"
+    elif not sha_ok:
+        # Spoofed PASS / unknown without a SHA echo → error. A real FAIL/PARTIAL
+        # without a SHA echo is kept (conservative — never hide a real verdict).
+        outcome = "error" if normalized in ("success", "unknown") else normalized
+    else:
+        outcome = normalized
+    head_sha_status = (
+        "matched" if sha_ok and observed_sha
+        else ("mismatched" if observed_sha else "missing")
+    )
+    return Result(
+        outcome=outcome,
+        output=proc.stdout,
+        metadata={
+            "slash_command": name, "verdict": verdict,
+            "returncode": str(proc.returncode),
+            "expected_head_sha": expected_sha, "observed_head_sha": observed_sha,
+            "head_sha_status": head_sha_status,
+            "reviewer_backend": reviewer_backend,
+        },
+    )
+
+
+def _is_gate_infra_failure(result: "Result") -> bool:
+    """True when a gate result is an *infrastructure* failure (not a real verdict).
+
+    Only infra failures justify the agy→claude fallback. A genuine
+    ``verdict: fail|partial`` is a real review result and must never trigger a
+    retry on a different backend (that would be reviewer-shopping).
+    """
+    if result.outcome == "error":
+        return True
+    md = result.metadata or {}
+    return md.get("sandbox") == "unavailable" or md.get("timed_out") == "true" or md.get("backend_missing") == "true"
+
+
+# Default adversarial-review priority queue. Read at run-config time
+# (DARK_FACTORY_ADVERSARIAL_PRIORITY env var, comma-separated); chosen for the
+# whole run, NOT a retry cascade. A real fail|partial from one reviewer is
+# authoritative and must never be retried on a different model — see
+# feedback_2026-05-31_runner_resilience_reviewer_gates.md for the
+# no-reviewer-shopping rule.
+_DEFAULT_ADVERSARIAL_PRIORITY = ["codex", "minimax", "agy", "claude-sonnet"]
+
+
+def _parse_priority_env(raw: str) -> list[str]:
+    """Parse a comma-separated priority list from the env var. Whitespace and
+    empty entries are stripped. Order is preserved (left = highest priority).
+    """
+    out: list[str] = []
+    for entry in raw.split(","):
+        name = entry.strip()
+        if name:
+            out.append(name)
+    return out
+
+
+def _probe_backend_installed(name: str) -> bool:
+    """True when ``<name>`` is on PATH and responds to ``--version``.
+
+    The probe is intentionally cheap (which + a quick --version) so that the
+    resolver can be called from gate dispatch without adding noticeable
+    latency. A backend that hangs on --version would block; we rely on the
+    existing ``subprocess.run(timeout=...)`` envelope in ``_run_gate_once`` to
+    catch the hang, but the probe itself uses a 5s ceiling.
+    """
+    bin_path = shutil.which(name)
+    if not bin_path:
+        return False
+    try:
+        proc = subprocess.run(
+            [bin_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+    return proc.returncode == 0
+
+
+def _resolve_adversarial_backend(
+    priority: list[str] | None,
+    ctx: "Context",
+) -> tuple[str, dict[str, str]]:
+    """Pick the first installed backend from the adversarial priority queue.
+
+    Resolution order:
+      1. Per-call ``priority`` argument (e.g. from a ``backend_priority=...``
+         node attribute) — the lane-specified queue for this gate.
+      2. ``DARK_FACTORY_ADVERSARIAL_PRIORITY`` env var, comma-separated.
+      3. ``_DEFAULT_ADVERSARIAL_PRIORITY`` (the dark-factory default).
+
+    Each entry is probed (``which <name>`` + ``<name> --version``); the first
+    one that responds is returned. The returned tuple is
+    ``(backend_name, metadata)`` where ``metadata`` records the priority
+    list, the resolved backend, and the entries that were skipped because
+    they are not installed. The metadata is meant to be merged into the gate
+    ``Result.metadata`` so the operator/CXDB can see why a particular backend
+    was picked (or why the resolver fell all the way through to claude-sonnet).
+
+    This is the FIRST adversarial pass selector — *not* a retry cascade. A
+    real fail|partial from the chosen backend is kept (the no-reviewer-shopping
+    rule is load-bearing in ``_execute_gate``).
+    """
+    if priority is None:
+        raw = os.environ.get("DARK_FACTORY_ADVERSARIAL_PRIORITY", "")
+        priority = _parse_priority_env(raw) if raw else list(_DEFAULT_ADVERSARIAL_PRIORITY)
+    else:
+        priority = [str(p) for p in priority if p]
+
+    skipped: list[str] = []
+    resolved: str | None = None
+    for name in priority:
+        if _probe_backend_installed(name):
+            resolved = name
+            break
+        skipped.append(name)
+
+    # Fall through to the last entry even if uninstalled (the gate machinery
+    # will report backend_missing=true, which is a real infra failure that
+    # _execute_gate can route to claude on agy, or surface honestly otherwise).
+    # This keeps "nothing installed" honest: the resolver still returns a
+    # named backend so the gate runs, the gate's missing-binary path fires,
+    # and the operator sees the full skip list in metadata.
+    if resolved is None:
+        resolved = priority[-1] if priority else _DEFAULT_ADVERSARIAL_PRIORITY[-1]
+
+    meta = {
+        "adversarial_priority": ",".join(priority),
+        "adversarial_resolved": resolved,
+        "adversarial_skipped": ",".join(skipped),
+    }
+    return resolved, meta
+
+
+def _resolve_gate_backend(node: "Node", ctx: "Context") -> tuple[str, dict[str, str]]:
+    """Resolve the reviewer backend for a gate node.
+
+    Resolution order:
+      1. ``backend_priority=...`` node attribute — adversarial-review queue.
+         Triggers ``_resolve_adversarial_backend``; the first installed entry
+         wins. With ``prefer_adversarial: true`` the run-level coder backend
+         is also skipped so the reviewer is always a different vendor.
+      2. Explicit per-node ``backend`` attr (set directly or by a ``.review``
+         model-stylesheet rule, e.g. ``backend: agy``) — wins over the
+         run-level ``ctx.backend``.
+      3. Run-level ``ctx.backend``.
+
+    Returns ``(backend_name, metadata)``. ``metadata`` is the priority-queue
+    audit trail (priority list, resolved name, skipped entries, and the
+    prefer_adversarial flag) when ``backend_priority`` was used, else
+    ``{"reviewer_backend_resolution": "explicit"}`` or
+    ``{"reviewer_backend_resolution": "run_level"}``. Callers merge this into
+    the gate ``Result.metadata`` so the operator/CXDB can see exactly why a
+    particular backend was picked.
+    """
+    bp = node.attrs.get("backend_priority")
+    if bp:
+        priority = [p.strip() for p in str(bp).split(",") if p.strip()]
+        if priority:
+            prefer_adversarial = _coerce_bool_attr(node.attrs.get("prefer_adversarial", False))
+            # Cross-visit pin: once a node's reviewer backend has been
+            # resolved via the priority queue, the same name resolves to the
+            # same backend on every subsequent visit — even if the PATH
+            # changes between visits (e.g. `codex` is uninstalled mid-run).
+            # This honors the design-doc promise "the runner pins the
+            # reviewer for the entire run" (see
+            # `roadmap/agy-reviewer-and-base-dot-2026-06-09.md` §5.2 and
+            # the no-reviewer-shopping rule in
+            # `feedback_2026-06-09_adversarial_review_real_llm.md`).
+            # The first-write-wins rule also means a *real* fail from one
+            # backend is never re-tried on a different one — the gate keeps
+            # the verdict, not the resolver.
+            prior_key = f"{node.name}.resolved_backend"
+            prior = ctx.state.get(prior_key)
+            prior_meta = ctx.state.get(f"{node.name}.resolved_backend_meta") or {}
+            if prior and prior_meta.get("reviewer_backend_resolution") == "priority_queue":
+                return prior, prior_meta
+            # When prefer_adversarial is set, exclude the run-level coder
+            # backend from the priority list (so a `claude` run with an
+            # `agy` coder cannot accidentally get a `claude` reviewer).
+            if prefer_adversarial and ctx.backend and ctx.backend in priority:
+                priority = [p for p in priority if p != ctx.backend]
+            # Empty post-filter list (e.g. lane says ``backend_priority=agy``
+            # and the coder is agy) must NOT short-circuit straight to
+            # ``claude-sonnet`` — that would skip probing codex / minimax /
+            # agy in the default queue and silently collapse cross-vendor
+            # review back onto Anthropic. Fall back to the full default
+            # priority so every entry gets a real ``which``/``--version`` probe.
+            if not priority:
+                priority = list(_DEFAULT_ADVERSARIAL_PRIORITY)
+            resolved, pq_meta = _resolve_adversarial_backend(priority, ctx)
+            ctx.state[prior_key] = resolved
+            pq_meta["prefer_adversarial"] = "true" if prefer_adversarial else "false"
+            pq_meta["reviewer_backend_resolution"] = "priority_queue"
+            ctx.state[f"{node.name}.resolved_backend_meta"] = dict(pq_meta)
+            return resolved, pq_meta
+    if "backend" in node.attrs:
+        return str(node.attrs["backend"]), {"reviewer_backend_resolution": "explicit"}
+    return str(ctx.backend), {"reviewer_backend_resolution": "run_level"}
+
+
+def _coerce_bool_attr(value: object) -> bool:
+    """Parse common boolean spellings from a DOT attribute. ``True`` / ``"true"``
+    / ``"1"`` / ``"yes"`` are truthy; everything else is falsy. Missing
+    attributes resolve to ``False``.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return False
+
+
+def _execute_gate(
+    prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str, backend: str
+) -> "Result":
+    """Run a reviewer gate on ``backend``; agy falls back to claude on infra failure.
+
+    Routing rules:
+      - ``backend == "agy"`` → run agy; if the result is an infra failure
+        (missing binary, sandbox unavailable, timeout, unparseable output,
+        SHA mismatch with no real verdict), fall back to ``claude``. A real
+        agy ``fail``/``partial`` is kept as-is (no-reviewer-shopping).
+      - Any other resolved name (``codex``, ``minimax``, ``claude-sonnet``,
+        ``claude``) → run on that backend. No silent re-routing to a
+        different vendor.
+
+    ``_run_gate_once`` is the single point that builds the argv + env per
+    backend, so the dispatch is end-to-end: a priority-queue resolution of
+    ``codex`` actually invokes the codex subprocess, with
+    ``reviewer_backend: codex`` recorded in the result metadata.
+    """
+    if backend == "agy":
+        result = _run_gate_once("agy", prompt, expected_sha, timeout, ctx, name)
+        if _is_gate_infra_failure(result):
+            fallback = _run_gate_once("claude", prompt, expected_sha, timeout, ctx, name)
+            fallback.metadata["fallback_used"] = "true"
+            fallback.metadata["fallback_from"] = "agy"
+            return fallback
+        result.metadata.setdefault("fallback_used", "false")
+        return result
+    # codex / minimax / claude-sonnet / bare "claude" → run on the
+    # resolved backend. No silent re-routing to a different vendor.
+    return _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name)
+
+
 def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
-    """Build a handler that shells out to `claude --print /<command> <args>`."""
+    """Build a handler that shells out to the reviewer backend with `/<command> <args>`."""
 
     def handler(node: Node, ctx: Context) -> Result:
         args = node.attrs.get("args", default_args)
@@ -1182,96 +1505,15 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
         prompt = f"/{slash_command} {args} {target}".strip() + sha_directive
         timeout = _coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
 
-        # Backend-aware executable selection
-        if ctx.backend == "claudew":
-            claude_bin = _get_claude_executable()
-            wafer_model = os.environ.get("WAFER_MODEL", "GLM-5.1")
-            gate_env = _sanitized_env()
-            gate_env["ANTHROPIC_BASE_URL"] = "http://localhost:9001"
-            gate_env["ANTHROPIC_AUTH_TOKEN"] = os.environ.get("WAFER_API_KEY", "")
-            gate_env["ANTHROPIC_DEFAULT_MODEL"] = wafer_model
-            gate_env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = wafer_model
-            gate_env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = wafer_model
-            gate_env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = wafer_model
-            gate_env["CLAUDEW_MODE"] = "1"
-            sub_args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", "--model", wafer_model, "--effort", "high", prompt])
-        else:
-            claude_bin = _get_claude_executable()
-            gate_env = _sanitized_env()
-            sub_args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", prompt])
-
-        if sub_args is None:
-            return Result(outcome="failure", output="sandbox-exec unavailable")
-        try:
-            proc = subprocess.run(
-                sub_args,
-                cwd=ctx.workdir,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-                env=gate_env,
-            )
-        except subprocess.TimeoutExpired as exc:
-            combined = (exc.stdout or "") + "\n" + (exc.stderr or "")
-            return Result(
-                outcome="failure",
-                output=combined.strip() or f"/{slash_command} timed out after {timeout} seconds",
-                metadata={
-                    "slash_command": slash_command,
-                    "returncode": "",
-                    "timeout": str(timeout),
-                    "timed_out": "true",
-                },
-            )
-        except Exception as exc:
-            return Result(
-                outcome="error",
-                output=f"slash gate {slash_command} command failed: {exc}",
-                metadata={
-                    "slash_command": slash_command,
-                    "timeout": str(timeout),
-                    "timed_out": "false",
-                    "returncode": "",
-                },
-            )
-        combined = proc.stdout + "\n" + proc.stderr
-        verdict, normalized = _parse_verdict(combined)
-        # SHA binding check — must come BEFORE collapsing to pass/fail so a
-        # spoofed-pass-with-wrong-SHA collapses to `error`, not `success`.
-        sha_ok, observed_sha = _verify_head_sha_echo(combined, expected_sha)
-        # Distinguish infra failures (claude crashed / not installed / network)
-        # from real "FAIL" verdicts so the Healer can group them separately.
-        if proc.returncode != 0 and (verdict == "unknown" or normalized == "success"):
-            outcome = "error"
-        elif not sha_ok:
-            # SHA missing/mismatched.  A spoofed PASS is dangerous so we
-            # collapse that to error.  But FAIL/PARTIAL without a SHA echo is
-            # still conservative — keep the real verdict rather than hiding it.
-            if normalized == "success":
-                outcome = "error"
-            elif normalized == "unknown":
-                outcome = "error"
-            else:
-                outcome = normalized  # fail/partial — conservative, keep verdict
-        else:
-            outcome = normalized
-        head_sha_status = (
-            "matched" if sha_ok and observed_sha
-            else ("mismatched" if observed_sha else "missing")
-        )
-        return Result(
-            outcome=outcome,
-            output=proc.stdout,
-            metadata={
-                "slash_command": slash_command,
-                "verdict": verdict,
-                "returncode": str(proc.returncode),
-                "expected_head_sha": expected_sha,
-                "observed_head_sha": observed_sha,
-                "head_sha_status": head_sha_status,
-            },
-        )
+        # Reviewer backend routing + agy→claude infra fallback live in
+        # _execute_gate. The gate is read-only and SHA-bound regardless of
+        # which backend grades the diff.
+        backend, gate_meta = _resolve_gate_backend(node, ctx)
+        result = _execute_gate(prompt, expected_sha, timeout, ctx, slash_command, backend)
+        if gate_meta:
+            for k, v in gate_meta.items():
+                result.metadata.setdefault(k, v)
+        return result
 
     handler.__name__ = f"_gate_{slash_command}"  # noqa: WPS125
     return handler
@@ -1369,66 +1611,14 @@ def _run_universal_prompt_gate(
     prompt = prompt_template.format(expected_sha=expected_sha) + sha_directive
     timeout = _coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
 
-    if ctx.backend == "claudew":
-        claude_bin = _get_claude_executable()
-        wafer_model = os.environ.get("WAFER_MODEL", "GLM-5.1")
-        gate_env = _sanitized_env()
-        gate_env["ANTHROPIC_BASE_URL"] = "http://localhost:9001"
-        gate_env["ANTHROPIC_AUTH_TOKEN"] = os.environ.get("WAFER_API_KEY", "")
-        gate_env["ANTHROPIC_DEFAULT_MODEL"] = wafer_model
-        for _mk in ("OPUS", "SONNET", "HAIKU"):
-            gate_env[f"ANTHROPIC_DEFAULT_{_mk}_MODEL"] = wafer_model
-        gate_env["CLAUDEW_MODE"] = "1"
-        sub_args = _sandboxed_args([
-            claude_bin, "--print", "--dangerously-skip-permissions",
-            "--model", wafer_model, "--effort", "high", prompt,
-        ])
-    else:
-        claude_bin = _get_claude_executable()
-        gate_env = _sanitized_env()
-        sub_args = _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", prompt])
-
-    if sub_args is None:
-        return Result(outcome="failure", output="sandbox-exec unavailable")
-    try:
-        proc = subprocess.run(
-            sub_args, cwd=ctx.workdir, capture_output=True, text=True,
-            timeout=timeout, check=False, env=gate_env,
-        )
-    except subprocess.TimeoutExpired as exc:
-        combined = (exc.stdout or "") + "\n" + (exc.stderr or "")
-        return Result(
-            outcome="failure",
-            output=combined.strip() or f"gate {name} timed out after {timeout}s",
-            metadata={"slash_command": name, "verdict": "unknown",
-                      "head_sha_status": "missing", "timed_out": "true"},
-        )
-    except Exception as exc:
-        return Result(
-            outcome="error",
-            output=f"gate {name} subprocess failed: {exc}",
-            metadata={"slash_command": name, "verdict": "unknown", "head_sha_status": "missing"},
-        )
-    combined = proc.stdout + "\n" + proc.stderr
-    verdict, normalized = _parse_verdict(combined)
-    sha_ok, observed_sha = _verify_head_sha_echo(combined, expected_sha)
-    if proc.returncode != 0 and (verdict == "unknown" or normalized == "success"):
-        outcome = "error"
-    elif not sha_ok:
-        outcome = "error" if normalized in ("success", "unknown") else normalized
-    else:
-        outcome = normalized
-    head_sha_status = "matched" if sha_ok and observed_sha else ("mismatched" if observed_sha else "missing")
-    return Result(
-        outcome=outcome,
-        output=proc.stdout,
-        metadata={
-            "slash_command": name, "verdict": verdict,
-            "returncode": str(proc.returncode),
-            "expected_head_sha": expected_sha, "observed_head_sha": observed_sha,
-            "head_sha_status": head_sha_status,
-        },
-    )
+    # Reviewer backend routing + agy→claude infra fallback live in
+    # _execute_gate (shared with _slash_gate).
+    backend, gate_meta = _resolve_gate_backend(node, ctx)
+    result = _execute_gate(prompt, expected_sha, timeout, ctx, name, backend)
+    if gate_meta:
+        for k, v in gate_meta.items():
+            result.metadata.setdefault(k, v)
+    return result
 
 
 def _gate_es(node: "Node", ctx: "Context") -> "Result":
@@ -1453,6 +1643,118 @@ def _gate_code_standards(node: "Node", ctx: "Context") -> "Result":
     if local_cmd.exists():
         return _slash_gate("code-standards")(node, ctx)
     return _run_universal_prompt_gate(UNIVERSAL_CODE_STANDARDS_PROMPT, "gate_code_standards", node, ctx)
+
+
+def _run_pytest_test(node: "Node", ctx: "Context", *, label: str) -> "Result":
+    """Run pytest against the test path stored in node attrs or state.
+
+    Returns a Result with ``outcome=success`` only if pytest exits 0.
+    The caller maps 0/non-0 to its own semantics (red vs green).
+    """
+    raw_path = node.attrs.get("test_path", "${state.bug_fix.test_path}")
+    test_path = _substitute_state(str(raw_path), ctx)
+    if "${state." in test_path or not test_path.strip():
+        return Result(
+            outcome="error",
+            output=f"{label}: unresolved test_path: {raw_path!r} "
+                   f"(set state.bug_fix.test_path before this gate)",
+        )
+    pytest_args = str(node.attrs.get("pytest_args", "-x")).strip()
+    # Build argv as a list (not a string + shlex.split) so paths with spaces
+    # in sys.executable or test_path are preserved verbatim. shlex.split on
+    # `/Applications/cmux DEV may-18.app/.../python` would break the path on
+    # the space; list-form argv avoids that whole class of bug.
+    args_list: list[str] = [sys.executable, "-m", "pytest", test_path]
+    if pytest_args:
+        args_list.extend(shlex.split(pytest_args))
+    timeout = _coerce_timeout(node.attrs.get("timeout", "300"), 300)
+    args = _sandboxed_args(args_list)
+    if args is None:
+        return Result(outcome="error", output=f"{label}: sandbox-exec unavailable")
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=ctx.workdir,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=_sanitized_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return Result(
+            outcome="failure",
+            output=f"{label}: pytest timed out after {timeout}s on {test_path}",
+        )
+    except Exception as exc:
+        return Result(
+            outcome="error",
+            output=f"{label}: pytest invocation failed: {exc}",
+        )
+    return Result(
+        outcome="success" if proc.returncode == 0 else "failure",
+        output=(
+            proc.stdout
+            + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
+        ).strip(),
+        metadata={
+            "test_path": test_path,
+            "command": " ".join(args_list),
+            "returncode": str(proc.returncode),
+            "label": label,
+        },
+    )
+
+
+def _gate_red(node: "Node", ctx: "Context") -> "Result":
+    """Red gate: the test MUST fail (rc != 0). Used by bug_fix.dot after the
+    reproduce node writes a fresh failing test. Outcome=success means the
+    bug is reproduced; outcome=failure means the test passed (bug not
+    reproduced — agent shortcut or the bug report was wrong).
+    """
+    result = _run_pytest_test(node, ctx, label="gate_red")
+    if result.outcome == "error":
+        # Infra error (unresolved test_path, timeout, invocation failure) —
+        # NOT a successful reproduction. Surface as failure.
+        return Result(
+            outcome="failure",
+            output="RED FAIL: gate could not run pytest (infra error); "
+                   f"this is not a successful reproduction.\n{result.output}",
+        )
+    if result.outcome == "success":
+        # pytest exited 0 — the test passed, so the bug was NOT reproduced.
+        return Result(
+            outcome="failure",
+            output="RED FAIL: test passed but bug was not reproduced. "
+                   f"Original pytest output:\n{result.output}",
+        )
+    # pytest exited non-zero — the test failed as expected.
+    return Result(
+        outcome="success",
+        output=f"RED OK: test failed as expected (rc={result.metadata.get('returncode')}).\n{result.output}",
+    )
+
+
+def _gate_green(node: "Node", ctx: "Context") -> "Result":
+    """Green gate: the test MUST pass (rc == 0). Used by bug_fix.dot after
+    the fix node applies the change. Outcome=success means the fix works;
+    outcome=failure means the test is still failing.
+    """
+    result = _run_pytest_test(node, ctx, label="gate_green")
+    if result.outcome == "error":
+        return Result(
+            outcome="error",
+            output=f"GREEN ERROR: gate could not run pytest (infra error).\n{result.output}",
+        )
+    if result.outcome == "success":
+        return Result(
+            outcome="success",
+            output=f"GREEN OK: test passed after fix (rc=0).\n{result.output}",
+        )
+    return Result(
+        outcome="failure",
+        output=f"GREEN FAIL: test still failing after fix (rc={result.metadata.get('returncode')}).\n{result.output}",
+    )
 
 
 def _tcp_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -1813,6 +2115,8 @@ TYPE_REGISTRY: dict[str, Handler] = {
     "gate_es": _gate_es,
     "gate_er": _gate_er,
     "gate_code_standards": _gate_code_standards,
+    "gate_red": _gate_red,
+    "gate_green": _gate_green,
     "parallel": _parallel_fanout,       # fan-out type (type=parallel)
     "join": _join_handler,              # fan-in type (type=join)
 }

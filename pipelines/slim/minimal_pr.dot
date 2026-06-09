@@ -1,5 +1,6 @@
 digraph MinimalPRFactory {
   graph [
+    include="@pipelines/_base.dot",
     goal="Iterate on an in-flight PR: passes tests, review, and evidence gates"
     rankdir=LR
     model_stylesheet="minimal_feature.model.css"
@@ -8,12 +9,8 @@ digraph MinimalPRFactory {
   start [shape=Mdiamond, label="Start"]
   exit  [shape=Msquare, label="Exit - Ready to Merge"]
 
-  explore [
-    type="codergen",
-    label="Explore & Map",
-    class="explore",
-    prompt="@prompts/slim/explore.md"
-  ]
+  // _base.dot provides: explore_in, explore_fanout, explore_{concept,auth,
+  // reuse,risks}, explore_join, explore_out.
 
   plan [
     type="codergen",
@@ -69,8 +66,8 @@ digraph MinimalPRFactory {
     max_retries=2
   ]
 
-  start -> explore
-  explore -> plan
+  start -> explore_in
+  explore_out -> plan
   plan -> implement
   implement -> test
 

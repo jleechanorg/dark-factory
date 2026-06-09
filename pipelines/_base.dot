@@ -1,0 +1,87 @@
+// pipelines/_base.dot
+//
+// Shared subgraph library for dark-factory feature lanes.
+// Every feature lane (lanes that have a plan/implement step) must
+// `include="@pipelines/_base.dot"` at the graph level.
+//
+// Provides the explore phase as a 4-way parallel fanout (Attractor parity):
+//
+//   explore_in -> explore_fanout -> {explore_concept,
+//                                    explore_auth,
+//                                    explore_reuse,
+//                                    explore_risks}
+//              -> explore_join (policy=wait_all)
+//              -> explore_stitch (codergen; reads 4 partials,
+//                                  writes explore-findings.md)
+//              -> explore_out
+//
+// Each sub-agent writes a distinct partial file under
+// .dark-factory/explore-<angle>.md. The `explore_stitch` node then
+// consolidates the four partials into the final
+// .dark-factory/explore-findings.md that the lane's `plan` node
+// hard-requires (`prompts/slim/plan.md:6`).
+//
+// Lanes wire the base into their own topology with two edges:
+//
+//   start -> explore_in            // enter the explore phase
+//   explore_out -> <lane-next>     // exit the explore phase
+//
+// Exempt lanes (do NOT include this base):
+//   - pipelines/parallel_demo.dot  (fanout-topology demo)
+//   - pipelines/slim/review_pr.dot (review-only, no plan/implement)
+//
+// This file must NOT declare `start` or `exit`; the parser rejects any
+// included graph that does. Run the base directly will fail.
+
+digraph _base {
+    graph [goal="base library — explore fanout; not directly runnable"]
+    rankdir=LR
+
+    // I/O anchor points (zero-width). Lanes wire to these.
+    explore_in     [shape=point, width=0, height=0, label=""]
+    explore_out    [shape=point, width=0, height=0, label=""]
+
+    // 4-way parallel explore fanout.
+    explore_fanout [type="parallel", label="Explore Fan-out", shape=component]
+
+    explore_concept [type="codergen", class="explore",
+                     label="Explore: Concepts",
+                     prompt="@prompts/slim/explore_concept.md"]
+
+    explore_auth    [type="codergen", class="explore",
+                     label="Explore: Authorities",
+                     prompt="@prompts/slim/explore_authorities.md"]
+
+    explore_reuse   [type="codergen", class="explore",
+                     label="Explore: Reuse",
+                     prompt="@prompts/slim/explore_reuse.md"]
+
+    explore_risks   [type="codergen", class="explore",
+                     label="Explore: Risks",
+                     prompt="@prompts/slim/explore_risks.md"]
+
+    // All 4 sub-agents must succeed before the lane proceeds.
+    explore_join    [type="join", policy="wait_all",
+                     label="Explore Join (all 4)",
+                     shape=tripleoctagon]
+
+    // Stitch: reads the 4 partials and writes the consolidated
+    // .dark-factory/explore-findings.md that the lane's `plan` node requires.
+    // Prompts/slim/explore.md is repurposed as the stitch prompt.
+    explore_stitch  [type="codergen", class="explore",
+                     label="Explore Stitch",
+                     prompt="@prompts/slim/explore.md"]
+
+    // Wiring.
+    explore_in     -> explore_fanout
+    explore_fanout -> explore_concept
+    explore_fanout -> explore_auth
+    explore_fanout -> explore_reuse
+    explore_fanout -> explore_risks
+    explore_concept -> explore_join
+    explore_auth    -> explore_join
+    explore_reuse   -> explore_join
+    explore_risks   -> explore_join
+    explore_join    -> explore_stitch
+    explore_stitch  -> explore_out
+}
