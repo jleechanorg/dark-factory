@@ -590,6 +590,18 @@ def test_gate_subprocess_env_routes_minimax_through_minimax_gateway(monkeypatch)
     assert env.get("ANTHROPIC_BASE_URL") == "https://api.minimax.io/anthropic"
 
 
+def test_gate_subprocess_env_minimax_is_sanitized(monkeypatch):
+    """The minimax override must layer on _sanitized_env, not raw os.environ —
+    holdout vars must never reach a reviewer subprocess (jleechan-4pa)."""
+    from runner.handlers import _gate_subprocess_env
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", "/secret/holdouts")
+    monkeypatch.setenv("MY_HOLDOUT_SECRET", "sealed")
+    env = _gate_subprocess_env("minimax")
+    assert "DARK_FACTORY_HOLDOUTS" not in env
+    assert "MY_HOLDOUT_SECRET" not in env
+    assert env.get("ANTHROPIC_BASE_URL") == "https://api.minimax.io/anthropic"
+
+
 def test_gate_subprocess_env_does_not_set_minimax_for_other_backends(monkeypatch):
     """backend='agy' / 'codex' / 'claude-sonnet' / 'claude' → no minimax override."""
     from runner.handlers import _gate_subprocess_env

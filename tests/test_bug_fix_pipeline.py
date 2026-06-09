@@ -47,8 +47,11 @@ def test_bug_fix_runs_red_to_green_to_exit(tmp_path, monkeypatch):
 
     nodes = [r.node for r in history]
     assert history[-1].outcome == "success", f"final history: {history}"
-    # expected trajectory: start, explore_*, plan, reproduce, gate_red, fix, gate_green, exit
-    expected_post_explore = ["plan", "reproduce", "gate_red", "fix", "gate_green", "exit"]
+    # expected trajectory: start, explore_*, plan, reproduce, gate_red, fix,
+    # gate_green, evidence (adversarial review), exit
+    expected_post_explore = [
+        "plan", "reproduce", "gate_red", "fix", "gate_green", "evidence", "exit",
+    ]
     assert nodes[-len(expected_post_explore):] == expected_post_explore
     assert nodes[0] == "start"
 
@@ -107,6 +110,51 @@ def test_bug_fix_fix_loops_back_when_green_fails(tmp_path, monkeypatch):
     assert fix_visits["n"] >= 1
     # green gate always fails → the last visited fix hits max_visits and is exhausted
     assert history[-1].outcome in ("exhausted", "failure", "error")
+
+
+def test_bug_fix_evidence_fail_terminates_as_failure(tmp_path, monkeypatch):
+    """A real adversarial-review fail must surface as the run's terminal
+    outcome — reviewed-and-rejected code never exits silently green."""
+    test_path = tmp_path / "tests" / "test_repro.py"
+    test_path.parent.mkdir(parents=True, exist_ok=True)
+    test_path.write_text("def test_x():\n    assert 1 == 2\n")
+
+    def fake_codergen(node, ctx):
+        if node.name == "reproduce":
+            ctx.state["bug_fix.test_path"] = str(test_path)
+        return Result(outcome="success", output=f"fake {node.name}")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
+    monkeypatch.setitem(
+        TYPE_REGISTRY, "gate_red",
+        lambda node, ctx: Result(outcome="success", output="RED OK (mocked)"))
+    monkeypatch.setitem(
+        TYPE_REGISTRY, "gate_green",
+        lambda node, ctx: Result(outcome="success", output="GREEN OK (mocked)"))
+
+    g = parse(BUG_FIX)
+    ctx = Context(goal="fix the bug", workdir=tmp_path, backend="echo")
+    ctx.state["bug_fix.test_path"] = str(test_path)
+    ctx.state["evidence.outcome"] = "failure"  # echo gate_er pre-seed
+    history = run(g, ctx, max_steps=80)
+
+    nodes = [r.node for r in history]
+    assert "evidence" in nodes
+    assert history[-1].node == "exit"
+    assert history[-1].outcome == "failure", (
+        f"evidence fail must propagate to the terminal outcome; history: {history}"
+    )
+
+
+def test_bug_fix_has_adversarial_evidence_node():
+    """bug_fix.dot must carry a gate_er reviewer with prefer_adversarial=true
+    — the lane never ships unreviewed code (jleechan-7je / issue #28)."""
+    g = parse(BUG_FIX)
+    evidence = g.nodes.get("evidence")
+    assert evidence is not None, "bug_fix.dot is missing the evidence reviewer node"
+    assert evidence.attrs.get("type") == "gate_er"
+    assert str(evidence.attrs.get("prefer_adversarial")).lower() == "true"
+    assert "codex" in str(evidence.attrs.get("backend_priority", ""))
 
 
 def test_bug_fix_max_visits_is_three():

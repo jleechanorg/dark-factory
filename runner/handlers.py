@@ -1128,12 +1128,13 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
     """Env overrides for a reviewer-gate subprocess on ``backend``.
 
     For ``minimax`` the Claude CLI must route through the minimax Anthropic-
-    compatible gateway; ``ANTHROPIC_BASE_URL`` is the only override needed
-    (the key is whatever is already in ``os.environ``). All other backends
-    use ``_sanitized_env`` unchanged.
+    compatible gateway; ``ANTHROPIC_BASE_URL`` is the only override, layered
+    on top of ``_sanitized_env`` (never raw ``os.environ`` — holdout vars
+    must not reach any reviewer subprocess). All other backends use
+    ``_sanitized_env`` unchanged.
     """
     if backend == "minimax":
-        return {**os.environ, "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic"}
+        return {**_sanitized_env(), "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic"}
     return _sanitized_env()
 
 
@@ -1809,8 +1810,14 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
 
     port = random.randint(30001, 30999)
 
-    # Build eval env: inherit current environment...
-    eval_env = dict(os.environ)
+    # Build eval env from the sanitized environment: the server/seed
+    # subprocesses below run agent-authored code (make run, npm seed,
+    # scripts/seed.*), so DARK_FACTORY_HOLDOUTS / *HOLDOUT* must never reach
+    # them — a seed script could copy holdout content into the worktree for
+    # the next fix-loop iteration. The sealed evaluator does not need the
+    # variable either (it resolves scenarios relative to its own repo path
+    # and strips holdout vars from its own children).
+    eval_env = _sanitized_env()
 
     # Fix 1 — Java PATH: prepend Homebrew openjdk so Firebase emulators can find java.
     homebrew_java = "/opt/homebrew/opt/java/bin"
