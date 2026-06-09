@@ -1622,7 +1622,85 @@ def _run_universal_prompt_gate(
     return result
 
 
+def _node_prompt_ref(node: "Node") -> Optional[str]:
+    """Prompt template ref from node attrs (mirrors ``Node.prompt_ref``).
+
+    Reads ``attrs`` directly so gate routing also works for duck-typed test
+    nodes that don't carry the parser property.
+    """
+    ref = node.attrs.get("prompt")
+    if not ref:
+        return None
+    ref = str(ref)
+    return ref[1:] if ref.startswith("@") else ref
+
+
+def _run_custom_prompt_gate(node: "Node", ctx: "Context", name: str) -> "Result":
+    """Run a gate review using the node's own prompt template (``prompt="@path"``).
+
+    A graph that authors review instructions on a gate node owns the review
+    *content*; the runner still owns the machine contract — SHA binding and
+    the ``verdict: <pass|fail>`` marker are appended here so
+    ``_parse_verdict`` / ``_verify_head_sha_echo`` grade a custom gate
+    exactly like the slash and universal gates.
+    """
+    if ctx.backend in ("echo", "mock_llm"):
+        hint = ctx.state.get(f"{node.name}.outcome", "success")
+        return Result(
+            outcome=hint,
+            output=f"echo gate {name}: pre-seeded {hint}",
+            metadata={"slash_command": name, "verdict": "echo:" + hint},
+        )
+
+    expected_sha = _worktree_head_sha(ctx.workdir)
+    if expected_sha is None:
+        return Result(
+            outcome="error",
+            output=f"gate {name} cannot resolve HEAD SHA for {ctx.workdir}",
+            metadata={"slash_command": name, "verdict": "unknown", "head_sha_status": "missing"},
+        )
+
+    rendered = _render_prompt(node, ctx)
+    # _render_prompt degrades to a goal-only stub when the template is
+    # missing or outside the allowed roots. A coder node can limp along on
+    # the stub; a review gate must not silently grade with no instructions.
+    ref = _node_prompt_ref(node)
+    if f"(missing prompt: {ref})" in rendered or f"(invalid prompt: {ref})" in rendered:
+        return Result(
+            outcome="error",
+            output=f"gate {name}: prompt template unavailable: {ref}",
+            metadata={"slash_command": name, "verdict": "unknown", "prompt_status": "missing"},
+        )
+
+    contract = (
+        f"\n\nCRITICAL FORMATTING INSTRUCTIONS:\n"
+        f"1. You MUST include a binding verification line:\n"
+        f"   head_sha: {expected_sha}\n\n"
+        f"2. You MUST conclude your review with:\n"
+        f"   verdict: <pass|fail>\n"
+    )
+    sha_directive = (
+        f"\n\n<!-- RUNNER BINDING REQUIREMENT (non-negotiable) -->\n"
+        f"expected_head_sha: {expected_sha}\n\n"
+        f"CRITICAL: Your response MUST include the following line verbatim:\n"
+        f"head_sha: {expected_sha}\n"
+    )
+    prompt = rendered + contract + sha_directive
+    timeout = _coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
+
+    # Reviewer backend routing + agy→claude infra fallback live in
+    # _execute_gate (shared with _slash_gate / _run_universal_prompt_gate).
+    backend, gate_meta = _resolve_gate_backend(node, ctx)
+    result = _execute_gate(prompt, expected_sha, timeout, ctx, name, backend)
+    if gate_meta:
+        for k, v in gate_meta.items():
+            result.metadata.setdefault(k, v)
+    return result
+
+
 def _gate_es(node: "Node", ctx: "Context") -> "Result":
+    if _node_prompt_ref(node):
+        return _run_custom_prompt_gate(node, ctx, "gate_es")
     local_es = ctx.workdir / ".claude" / "commands" / "es.md"
     if local_es.exists():
         return _slash_gate("es")(node, ctx)
@@ -1630,6 +1708,8 @@ def _gate_es(node: "Node", ctx: "Context") -> "Result":
 
 
 def _gate_er(node: "Node", ctx: "Context") -> "Result":
+    if _node_prompt_ref(node):
+        return _run_custom_prompt_gate(node, ctx, "gate_er")
     local_er = ctx.workdir / ".claude" / "commands" / "er.md"
     local_cmd = ctx.workdir / ".claude" / "commands" / "evidence_review.md"
     if local_er.exists():
@@ -1640,6 +1720,8 @@ def _gate_er(node: "Node", ctx: "Context") -> "Result":
 
 
 def _gate_code_standards(node: "Node", ctx: "Context") -> "Result":
+    if _node_prompt_ref(node):
+        return _run_custom_prompt_gate(node, ctx, "gate_code_standards")
     local_cmd = ctx.workdir / ".claude" / "commands" / "code-standards.md"
     if local_cmd.exists():
         return _slash_gate("code-standards")(node, ctx)

@@ -1,0 +1,56 @@
+digraph SpecGenFactory {
+  graph [
+    include="@pipelines/_base.dot",
+    goal="Produce a reviewed, ready-to-execute spec.md without implementing anything"
+    rankdir=LR
+    model_stylesheet="minimal_feature.model.css"
+  ]
+
+  start [shape=Mdiamond, label="Start"]
+  exit  [shape=Msquare, label="Exit - Spec Ready"]
+
+  // _base.dot provides: explore_in, explore_fanout, explore_{concept,auth,
+  // reuse,risks}, explore_join, explore_stitch, explore_out.
+  // Lanes wire the base with: start -> explore_in and explore_out -> <next>.
+
+  plan [
+    type="codergen",
+    label="Plan & Spec",
+    class="plan",
+    prompt="@prompts/slim/plan.md"
+  ]
+
+  // Cold adversarial spec reviewer: a different vendor than the coder that
+  // wrote the spec. Uses the adversarial-review priority queue
+  // (codex > minimax > agy > claude-sonnet) via backend_priority= so the
+  // reviewer is never the run-level coder backend. goal_gate=true means a
+  // "failure" verdict routes to fix_spec; "success" routes to exit.
+  spec_review [
+    type="gate_er",
+    label="Cold Spec Review",
+    class="review",
+    backend_priority="codex,minimax,agy,claude-sonnet",
+    prefer_adversarial="true",
+    prompt="@prompts/slim/spec_review.md",
+    goal_gate=true,
+    retry_target="fix_spec",
+    timeout=600
+  ]
+
+  fix_spec [
+    type="codergen",
+    label="Revise Spec",
+    class="fix",
+    prompt="@prompts/slim/fix_spec.md",
+    max_retries=2
+  ]
+
+  start -> explore_in
+  explore_out -> plan
+  plan -> spec_review
+
+  spec_review -> exit     [condition="outcome=success"]
+  spec_review -> fix_spec [condition="outcome!=success"]
+
+  fix_spec -> spec_review
+}
