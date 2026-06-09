@@ -46,6 +46,15 @@ digraph MinimalPRFactory {
     retry_target="fix"
   ]
 
+  holdout [
+    type="holdout_eval",
+    label="Behavioral Holdouts",
+    validation=true,
+    goal_gate=true,
+    timeout=600,
+    retry_target="fix"
+  ]
+
   gate_es [
     type="gate_es",
     label="/es Evidence Standards",
@@ -74,8 +83,11 @@ digraph MinimalPRFactory {
   test -> review [condition="outcome=success"]
   test -> fix [condition="outcome!=success"]
 
-  review -> gate_es [condition="outcome=success"]
+  review -> holdout [condition="outcome=success"]
   review -> fix [condition="outcome!=success"]
+
+  holdout -> gate_es [condition="outcome=success"]
+  holdout -> fix [condition="outcome!=success"]
 
   gate_es -> gate_er [condition="outcome=success"]
   gate_es -> fix [condition="outcome!=success"]
