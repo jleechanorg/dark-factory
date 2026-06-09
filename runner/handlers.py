@@ -1086,11 +1086,22 @@ def _parse_verdict(text: str) -> tuple[str, str]:
 def _gate_subprocess_args(backend: str, prompt: str, ctx: "Context", timeout: int) -> Optional[list[str]]:
     """Build the sandboxed argv for a *reviewer* gate on the given backend.
 
-    Reviewer gates are read-only: agy gets ``--add-dir`` so it can read the
-    diff/evidence in the worktree but never enters planning mode. Any backend
-    other than ``agy`` runs the SHA-bound prompt through ``claude`` (the
-    historical default; ``codex``/``ao``/unset all map here). Returns ``None``
-    when sandbox-exec is unavailable.
+    Supported backends:
+      - ``agy`` — Google Antigravity / Gemini CLI. Gets ``--add-dir`` so it
+        can read the diff/evidence in the worktree but never enters planning
+        mode.
+      - ``codex`` — OpenAI Codex CLI (``codex exec --yolo``).
+      - ``minimax`` — Anthropic Claude CLI routed through the minimax
+        gateway (env override handled by ``_gate_subprocess_env``).
+      - ``claude-sonnet`` (or bare ``claude``) — Anthropic Claude CLI.
+
+    The historical default mapped every non-``agy`` name to ``claude``; that
+    made the adversarial-review priority queue decorative (a resolved
+    ``codex`` still ran the Claude subprocess). The dispatch now honors the
+    resolved name end-to-end so cross-vendor review is a real subprocess
+    rather than a metadata label.
+
+    Returns ``None`` when sandbox-exec is unavailable.
     """
     if backend == "agy":
         return _sandboxed_args([
@@ -1101,8 +1112,29 @@ def _gate_subprocess_args(backend: str, prompt: str, ctx: "Context", timeout: in
             "--print",
             prompt,
         ])
+    if backend == "codex":
+        return _sandboxed_args([
+            "codex", "exec", "--yolo", "--skip-git-repo-check", prompt,
+        ])
+    # ``claude-sonnet`` (priority-queue name), bare ``claude`` (run-level
+    # default), and any other claude-routed backend → Anthropic Claude CLI.
+    # ``minimax`` is a special case of this path with a different base URL
+    # (see ``_gate_subprocess_env``).
     claude_bin = _get_claude_executable()
     return _sandboxed_args([claude_bin, "--print", "--dangerously-skip-permissions", prompt])
+
+
+def _gate_subprocess_env(backend: str) -> dict[str, str]:
+    """Env overrides for a reviewer-gate subprocess on ``backend``.
+
+    For ``minimax`` the Claude CLI must route through the minimax Anthropic-
+    compatible gateway; ``ANTHROPIC_BASE_URL`` is the only override needed
+    (the key is whatever is already in ``os.environ``). All other backends
+    use ``_sanitized_env`` unchanged.
+    """
+    if backend == "minimax":
+        return {**os.environ, "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic"}
+    return _sanitized_env()
 
 
 def _run_gate_once(
@@ -1111,12 +1143,21 @@ def _run_gate_once(
     """Run one reviewer-gate attempt on ``backend`` and classify the result.
 
     SHA binding, verdict parsing, and infra-vs-real-failure classification are
-    identical across backends, so the only backend-specific part is the argv
-    (built by ``_gate_subprocess_args``). ``reviewer_backend`` is recorded in
-    metadata so the operator/CXDB can see what actually graded the diff.
+    identical across backends, so the only backend-specific parts are the
+    argv (built by ``_gate_subprocess_args``) and the env (built by
+    ``_gate_subprocess_env``). ``reviewer_backend`` is recorded in metadata
+    so the operator/CXDB can see what actually graded the diff — the
+    recorded name matches the resolved priority-queue name end-to-end
+    (e.g. ``codex`` means a codex subprocess really ran, not just a label).
     """
-    reviewer_backend = "agy" if backend == "agy" else "claude"
+    # The recorded name must match the subprocess that actually ran. agy is
+    # passed through as-is; minimax is recorded as ``minimax`` even though it
+    # invokes the Claude CLI (the review is graded by the minimax-routed
+    # model, which is the cross-vendor intent). Everything else is whatever
+    # the priority queue / run-level config chose.
+    reviewer_backend = backend
     sub_args = _gate_subprocess_args(backend, prompt, ctx, timeout)
+    sub_env = _gate_subprocess_env(backend)
     if sub_args is None:
         return Result(
             outcome="failure",
@@ -1130,7 +1171,7 @@ def _run_gate_once(
     try:
         proc = subprocess.run(
             sub_args, cwd=ctx.workdir, capture_output=True, text=True,
-            timeout=run_timeout, check=False, env=_sanitized_env(),
+            timeout=run_timeout, check=False, env=sub_env,
         )
     except subprocess.TimeoutExpired as exc:
         combined = (exc.stdout or "") + "\n" + (exc.stderr or "")
@@ -1348,6 +1389,14 @@ def _resolve_gate_backend(node: "Node", ctx: "Context") -> tuple[str, dict[str, 
             # `agy` coder cannot accidentally get a `claude` reviewer).
             if prefer_adversarial and ctx.backend and ctx.backend in priority:
                 priority = [p for p in priority if p != ctx.backend]
+            # Empty post-filter list (e.g. lane says ``backend_priority=agy``
+            # and the coder is agy) must NOT short-circuit straight to
+            # ``claude-sonnet`` — that would skip probing codex / minimax /
+            # agy in the default queue and silently collapse cross-vendor
+            # review back onto Anthropic. Fall back to the full default
+            # priority so every entry gets a real ``which``/``--version`` probe.
+            if not priority:
+                priority = list(_DEFAULT_ADVERSARIAL_PRIORITY)
             resolved, pq_meta = _resolve_adversarial_backend(priority, ctx)
             ctx.state[prior_key] = resolved
             pq_meta["prefer_adversarial"] = "true" if prefer_adversarial else "false"
@@ -1380,12 +1429,19 @@ def _execute_gate(
 ) -> "Result":
     """Run a reviewer gate on ``backend``; agy falls back to claude on infra failure.
 
-    Reviewer/evaluator nodes route to agy when ``backend == "agy"`` (per-node
-    ``backend=agy`` or a ``.review`` model-stylesheet class). agy reviews the
-    SHA-bound diff; if agy is missing/unsandboxable/times out or returns
-    unparseable garbage, we fall back to ``claude`` so the gate still produces a
-    real verdict. A real agy ``fail``/``partial`` verdict is kept as-is (never
-    reviewer-shopped onto a second backend).
+    Routing rules:
+      - ``backend == "agy"`` → run agy; if the result is an infra failure
+        (missing binary, sandbox unavailable, timeout, unparseable output,
+        SHA mismatch with no real verdict), fall back to ``claude``. A real
+        agy ``fail``/``partial`` is kept as-is (no-reviewer-shopping).
+      - Any other resolved name (``codex``, ``minimax``, ``claude-sonnet``,
+        ``claude``) → run on that backend. No silent re-routing to a
+        different vendor.
+
+    ``_run_gate_once`` is the single point that builds the argv + env per
+    backend, so the dispatch is end-to-end: a priority-queue resolution of
+    ``codex`` actually invokes the codex subprocess, with
+    ``reviewer_backend: codex`` recorded in the result metadata.
     """
     if backend == "agy":
         result = _run_gate_once("agy", prompt, expected_sha, timeout, ctx, name)
@@ -1396,8 +1452,9 @@ def _execute_gate(
             return fallback
         result.metadata.setdefault("fallback_used", "false")
         return result
-    # claude / codex / ao / unset → claude reviewer (historical default).
-    return _run_gate_once("claude", prompt, expected_sha, timeout, ctx, name)
+    # codex / minimax / claude-sonnet / bare "claude" → run on the
+    # resolved backend. No silent re-routing to a different vendor.
+    return _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name)
 
 
 def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
