@@ -1,9 +1,9 @@
 ---
 name: factory-spec
-description: "Display the Dark Factory pipeline node graphs — spec-review pipelines, factory gates, node types, edge conditions, and handler mappings. Use /factory_spec or /fs to quickly reference the spec graph structure without running a pipeline."
+description: "Dark Factory spec workflow (/factory-spec, /fs): create a reviewed spec via the spec_gen pipeline, review an existing spec, or display the pipeline node graphs. Create mode runs the pipeline; review and show modes are in-session only."
 ---
 
-# /factory_spec — Dark Factory Spec Node Graph Reference
+# /factory_spec — Dark Factory Spec Workflow & Node Graph Reference
 
 ## Install vs source
 
@@ -16,8 +16,8 @@ export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$(pwd)}"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-- **`/fs` / `/factory-spec`** — graph reference + Step 0 classification + pipeline pick.
-- **`/f` / `/factory`** — run pipelines via `dark-factory` (see `dark-factory` skill).
+- **`/fs` / `/factory-spec`** — spec creation (via pipeline), review, or graph reference.
+- **`/f` / `/factory`** — run feature/implementation pipelines via `dark-factory`.
 
 Pipelines and prompts resolve from `$DARK_FACTORY_HOME`; implementation work
 happens in the caller's cwd (`--workdir` defaults to cwd).
@@ -32,6 +32,7 @@ classify the goal (Step 0 below) and pick from this quick guide:
 
 | Task | Pipeline |
 |------|----------|
+| **Create a reviewed spec** | `pipelines/slim/spec_gen.dot` ← `/fs` create mode |
 | Smoke / wiring | `pipelines/factory/hello.dot` |
 | New feature (full loop) | `pipelines/slim/minimal_feature.dot` |
 | PR iteration (no holdout) | `pipelines/slim/minimal_pr.dot` |
@@ -41,7 +42,7 @@ classify the goal (Step 0 below) and pick from this quick guide:
 | Spec review full | `benchmarks/attractor-spec-review/pipelines/review_full.dot` |
 | Brownfield replace/delete | custom goal + delete-first rules; often `minimal_feature.dot` or custom `.dot` |
 
-Short names for `--pipeline`: `gates`, `hello`, `pr_gates`, `minimal_pr`,
+Short names for `--pipeline`: `spec_gen`, `gates`, `hello`, `pr_gates`, `minimal_pr`,
 `minimal_feature`, `review_slim`, `review_full`.
 
 Execution command (from target repo cwd):
