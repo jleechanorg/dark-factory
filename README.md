@@ -458,6 +458,13 @@ table is [docs/pipeline-selection.md](docs/pipeline-selection.md); the common pi
     `model_stylesheet` > `--backend`, so this is independent and non-overridable by the
     coder's `--backend`). Requires `codex` installed; override path is in
     [docs/pipeline-selection.md](docs/pipeline-selection.md#independent-reviewer-adversarial-by-default).
+*   **Adversarial-review priority queue:** `codex > minimax > agy > claude-sonnet` (set
+    `DARK_FACTORY_ADVERSARIAL_PRIORITY` env var to override). The queue is the **first**
+    adversarial pass — chosen at run-config time, *not* a retry cascade. A real
+    `fail|partial` from the chosen reviewer is authoritative and is never retried on a
+    different model (no-reviewer-shopping rule). Use `backend_priority=...` and
+    `prefer_adversarial: true` on `gate_er` / `gate_es` nodes; the resolver audit lands
+    in the gate's `Result.metadata` (priority list, resolved name, skipped entries).
 *   **Route models by role, not by hand.** Use a heavier model for plan/review and a
     faster one for implement. Set this per-node (`backend="…"` / `model="…"`) or, better,
     once per graph via `model_stylesheet="….model.css"` — never by editing every node.

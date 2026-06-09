@@ -1199,16 +1199,162 @@ def _is_gate_infra_failure(result: "Result") -> bool:
     return md.get("sandbox") == "unavailable" or md.get("timed_out") == "true" or md.get("backend_missing") == "true"
 
 
-def _resolve_gate_backend(node: "Node", ctx: "Context") -> str:
+# Default adversarial-review priority queue. Read at run-config time
+# (DARK_FACTORY_ADVERSARIAL_PRIORITY env var, comma-separated); chosen for the
+# whole run, NOT a retry cascade. A real fail|partial from one reviewer is
+# authoritative and must never be retried on a different model — see
+# feedback_2026-05-31_runner_resilience_reviewer_gates.md for the
+# no-reviewer-shopping rule.
+_DEFAULT_ADVERSARIAL_PRIORITY = ["codex", "minimax", "agy", "claude-sonnet"]
+
+
+def _parse_priority_env(raw: str) -> list[str]:
+    """Parse a comma-separated priority list from the env var. Whitespace and
+    empty entries are stripped. Order is preserved (left = highest priority).
+    """
+    out: list[str] = []
+    for entry in raw.split(","):
+        name = entry.strip()
+        if name:
+            out.append(name)
+    return out
+
+
+def _probe_backend_installed(name: str) -> bool:
+    """True when ``<name>`` is on PATH and responds to ``--version``.
+
+    The probe is intentionally cheap (which + a quick --version) so that the
+    resolver can be called from gate dispatch without adding noticeable
+    latency. A backend that hangs on --version would block; we rely on the
+    existing ``subprocess.run(timeout=...)`` envelope in ``_run_gate_once`` to
+    catch the hang, but the probe itself uses a 5s ceiling.
+    """
+    bin_path = shutil.which(name)
+    if not bin_path:
+        return False
+    try:
+        proc = subprocess.run(
+            [bin_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+    return proc.returncode == 0
+
+
+def _resolve_adversarial_backend(
+    priority: list[str] | None,
+    ctx: "Context",
+) -> tuple[str, dict[str, str]]:
+    """Pick the first installed backend from the adversarial priority queue.
+
+    Resolution order:
+      1. Per-call ``priority`` argument (e.g. from a ``backend_priority=...``
+         node attribute) — the lane-specified queue for this gate.
+      2. ``DARK_FACTORY_ADVERSARIAL_PRIORITY`` env var, comma-separated.
+      3. ``_DEFAULT_ADVERSARIAL_PRIORITY`` (the dark-factory default).
+
+    Each entry is probed (``which <name>`` + ``<name> --version``); the first
+    one that responds is returned. The returned tuple is
+    ``(backend_name, metadata)`` where ``metadata`` records the priority
+    list, the resolved backend, and the entries that were skipped because
+    they are not installed. The metadata is meant to be merged into the gate
+    ``Result.metadata`` so the operator/CXDB can see why a particular backend
+    was picked (or why the resolver fell all the way through to claude-sonnet).
+
+    This is the FIRST adversarial pass selector — *not* a retry cascade. A
+    real fail|partial from the chosen backend is kept (the no-reviewer-shopping
+    rule is load-bearing in ``_execute_gate``).
+    """
+    if priority is None:
+        raw = os.environ.get("DARK_FACTORY_ADVERSARIAL_PRIORITY", "")
+        priority = _parse_priority_env(raw) if raw else list(_DEFAULT_ADVERSARIAL_PRIORITY)
+    else:
+        priority = [str(p) for p in priority if p]
+
+    skipped: list[str] = []
+    resolved: str | None = None
+    for name in priority:
+        if _probe_backend_installed(name):
+            resolved = name
+            break
+        skipped.append(name)
+
+    # Fall through to the last entry even if uninstalled (the gate machinery
+    # will report backend_missing=true, which is a real infra failure that
+    # _execute_gate can route to claude on agy, or surface honestly otherwise).
+    # This keeps "nothing installed" honest: the resolver still returns a
+    # named backend so the gate runs, the gate's missing-binary path fires,
+    # and the operator sees the full skip list in metadata.
+    if resolved is None:
+        resolved = priority[-1] if priority else _DEFAULT_ADVERSARIAL_PRIORITY[-1]
+
+    meta = {
+        "adversarial_priority": ",".join(priority),
+        "adversarial_resolved": resolved,
+        "adversarial_skipped": ",".join(skipped),
+    }
+    return resolved, meta
+
+
+def _resolve_gate_backend(node: "Node", ctx: "Context") -> tuple[str, dict[str, str]]:
     """Resolve the reviewer backend for a gate node.
 
-    Mirrors ``_codergen``: an explicit per-node ``backend`` attr (set directly
-    or by a ``.review`` model-stylesheet rule, e.g. ``backend: agy``) wins over
-    the run-level ``ctx.backend``. Without this, a stylesheet routing reviewer
-    nodes to agy would be silently ignored by gates (they would run on the CLI
-    ``--backend``) — a label that lies about behavior.
+    Resolution order:
+      1. ``backend_priority=...`` node attribute — adversarial-review queue.
+         Triggers ``_resolve_adversarial_backend``; the first installed entry
+         wins. With ``prefer_adversarial: true`` the run-level coder backend
+         is also skipped so the reviewer is always a different vendor.
+      2. Explicit per-node ``backend`` attr (set directly or by a ``.review``
+         model-stylesheet rule, e.g. ``backend: agy``) — wins over the
+         run-level ``ctx.backend``.
+      3. Run-level ``ctx.backend``.
+
+    Returns ``(backend_name, metadata)``. ``metadata`` is the priority-queue
+    audit trail (priority list, resolved name, skipped entries, and the
+    prefer_adversarial flag) when ``backend_priority`` was used, else
+    ``{"reviewer_backend_resolution": "explicit"}`` or
+    ``{"reviewer_backend_resolution": "run_level"}``. Callers merge this into
+    the gate ``Result.metadata`` so the operator/CXDB can see exactly why a
+    particular backend was picked.
     """
-    return str(node.attrs.get("backend", ctx.backend))
+    bp = node.attrs.get("backend_priority")
+    if bp:
+        priority = [p.strip() for p in str(bp).split(",") if p.strip()]
+        if priority:
+            prefer_adversarial = _coerce_bool_attr(node.attrs.get("prefer_adversarial", False))
+            # When prefer_adversarial is set, exclude the run-level coder
+            # backend from the priority list (so a `claude` run with an
+            # `agy` coder cannot accidentally get a `claude` reviewer).
+            if prefer_adversarial and ctx.backend and ctx.backend in priority:
+                priority = [p for p in priority if p != ctx.backend]
+            resolved, pq_meta = _resolve_adversarial_backend(priority, ctx)
+            ctx.state[f"{node.name}.resolved_backend"] = resolved
+            pq_meta["prefer_adversarial"] = "true" if prefer_adversarial else "false"
+            pq_meta["reviewer_backend_resolution"] = "priority_queue"
+            return resolved, pq_meta
+    if "backend" in node.attrs:
+        return str(node.attrs["backend"]), {"reviewer_backend_resolution": "explicit"}
+    return str(ctx.backend), {"reviewer_backend_resolution": "run_level"}
+
+
+def _coerce_bool_attr(value: object) -> bool:
+    """Parse common boolean spellings from a DOT attribute. ``True`` / ``"true"``
+    / ``"1"`` / ``"yes"`` are truthy; everything else is falsy. Missing
+    attributes resolve to ``False``.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return False
 
 
 def _execute_gate(
@@ -1287,8 +1433,12 @@ def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
         # Reviewer backend routing + agy→claude infra fallback live in
         # _execute_gate. The gate is read-only and SHA-bound regardless of
         # which backend grades the diff.
-        backend = _resolve_gate_backend(node, ctx)
-        return _execute_gate(prompt, expected_sha, timeout, ctx, slash_command, backend)
+        backend, gate_meta = _resolve_gate_backend(node, ctx)
+        result = _execute_gate(prompt, expected_sha, timeout, ctx, slash_command, backend)
+        if gate_meta:
+            for k, v in gate_meta.items():
+                result.metadata.setdefault(k, v)
+        return result
 
     handler.__name__ = f"_gate_{slash_command}"  # noqa: WPS125
     return handler
@@ -1388,8 +1538,12 @@ def _run_universal_prompt_gate(
 
     # Reviewer backend routing + agy→claude infra fallback live in
     # _execute_gate (shared with _slash_gate).
-    backend = _resolve_gate_backend(node, ctx)
-    return _execute_gate(prompt, expected_sha, timeout, ctx, name, backend)
+    backend, gate_meta = _resolve_gate_backend(node, ctx)
+    result = _execute_gate(prompt, expected_sha, timeout, ctx, name, backend)
+    if gate_meta:
+        for k, v in gate_meta.items():
+            result.metadata.setdefault(k, v)
+    return result
 
 
 def _gate_es(node: "Node", ctx: "Context") -> "Result":

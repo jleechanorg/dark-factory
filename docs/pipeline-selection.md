@@ -36,6 +36,33 @@ To override, set `backend=` / `model_name=` on the node in the `.dot` (explicit
 attrs win over the stylesheet). Tests pin `plan` and `review` to `echo` for
 offline determinism.
 
+## Adversarial-review priority queue (`gate_er` and `gate_es`)
+
+For real-LLM reviews (not webhook pings), reviewer-gate nodes (`gate_er`,
+`gate_es`) accept a **`backend_priority=...`** attribute (comma-separated
+list) that picks the **first installed** entry via `which <name> +
+<name> --version`. The default dark-factory priority is
+`codex > minimax > agy > claude-sonnet`; set
+`DARK_FACTORY_ADVERSARIAL_PRIORITY` (comma-separated) to override per-run.
+Setting **`prefer_adversarial: true`** drops the run-level coder backend
+from the queue so a `claude` coder run never gets a `claude` reviewer
+(guarantees the reviewer is a different vendor). The priority queue is the
+**first** adversarial pass selector — it is NOT a retry cascade. A real
+`fail|partial` from the chosen backend is kept (no-reviewer-shopping rule).
+
+```dot
+evidence [
+    type="gate_er",
+    backend_priority="codex,minimax,agy,claude-sonnet",
+    prefer_adversarial="true"
+]
+```
+
+Resolver audit metadata lands in the gate's `Result.metadata`:
+`adversarial_priority`, `adversarial_resolved`, `adversarial_skipped`,
+`prefer_adversarial`, `reviewer_backend_resolution` — so the operator/CXDB
+can see exactly which backend graded the diff and why.
+
 ## Short names (expanded by skill)
 
 `gates`, `hello`, `pr_gates`, `minimal_pr`, `minimal_feature`, `bug_fix`, `review_slim`, `review_full`

@@ -69,3 +69,43 @@ def test_base_dot_subagents_prompt_under_prompts_slim():
         assert g.nodes[sub].attrs.get("prompt") == f"@{prompt}", (
             f"{sub} should prompt {prompt!r}"
         )
+
+
+def test_base_dot_has_explore_stitch_between_join_and_out():
+    """explore_stitch closes the 4-way fanout: it reads the partials and
+    writes the consolidated .dark-factory/explore-findings.md that the
+    lane's `plan` node hard-requires (`prompts/slim/plan.md:6`).
+
+    Without this node, the first run of any feature lane that includes
+    _base.dot aborts at `plan` with "explore artifact missing".
+    """
+    g = parse(BASE, require_start_exit=False)
+
+    # The node exists, is a codergen, and points at the (repurposed) stitch prompt.
+    assert "explore_stitch" in g.nodes, "explore_stitch node must exist in _base.dot"
+    stitch = g.nodes["explore_stitch"]
+    assert stitch.attrs.get("type") == "codergen", "explore_stitch must be type=codergen"
+    assert stitch.attrs.get("prompt") == "@prompts/slim/explore.md", (
+        "explore_stitch must prompt the (repurposed) explore.md stitch prompt"
+    )
+
+    # Topology: explore_join -> explore_stitch -> explore_out, in that order.
+    join_to_stitch = [
+        e for e in g.edges if e.src == "explore_join" and e.dst == "explore_stitch"
+    ]
+    stitch_to_out = [
+        e for e in g.edges if e.src == "explore_stitch" and e.dst == "explore_out"
+    ]
+    assert len(join_to_stitch) == 1, (
+        f"explore_join must feed explore_stitch exactly once, found {len(join_to_stitch)}"
+    )
+    assert len(stitch_to_out) == 1, (
+        f"explore_stitch must feed explore_out exactly once, found {len(stitch_to_out)}"
+    )
+
+    # No other edges leave explore_join (the join must be a single successor
+    # now that the stitch owns the post-join step).
+    join_succs = {e.dst for e in g.edges if e.src == "explore_join"}
+    assert join_succs == {"explore_stitch"}, (
+        f"explore_join must have explore_stitch as its only successor, got {join_succs!r}"
+    )

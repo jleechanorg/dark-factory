@@ -1,44 +1,53 @@
-Explore the codebase before any design or implementation. Produce a durable
+// prompts/slim/explore.md
+//
+// NOTE: This prompt was repurposed in the PR #22 follow-up. It used to be
+// the "explore — write explore-findings.md directly" prompt (a single agent
+// that wrote the consolidated artifact). After the 4-way parallel explore
+// fanout shipped in _base.dot, the 4 sub-agents each write a partial
+// (`explore-concepts.md`, `explore-authorities.md`, `explore-reuse.md`,
+// `explore-risks.md`) and this node stitches them into the consolidated
+// `.dark-factory/explore-findings.md` that `prompts/slim/plan.md` requires.
+//
+// No lane references `prompt="@prompts/slim/explore.md"` for the old direct
+// explore path anymore; only the `_base.dot` `explore_stitch` node does.
+
+Stitch the four parallel-explore partial files into a single consolidated
 findings artifact the plan node will consume.
 
 Goal:
 ${goal}
 
-## Mandatory workflow (do not skip steps)
+## Input (must read all four)
 
-1. **Map concepts** — Identify the fields, flags, modules, routes, and state keys
-   this goal touches. Grep/search the repo for every reference; list writers and
-   readers with `path:line` citations.
+- `.dark-factory/explore-concepts.md`
+- `.dark-factory/explore-authorities.md`
+- `.dark-factory/explore-reuse.md`
+- `.dark-factory/explore-risks.md`
 
-2. **Authorities map** — For each concept, state which component is currently
-   authoritative (or note conflicting authorities). Call out implicit state
-   machines, legacy projection fields, god-mode paths, streaming vs non-streaming
-   branches, and persistence boundaries.
+If any of the four is missing, stop and report which file is missing.
+Do not invent a design from scratch.
 
-3. **Reuse & centralization** — Surface existing modules, reducers, helpers, or
-   patterns to extend instead of reimplementing. Propose where a single authority
-   should live and which legacy surfaces become projections only.
+## Output (must write)
 
-4. **Risks & invariants** — List edge cases, race/finish-commit concerns, and
-   invariants the design must preserve. Flag localized-patch temptations to
-   reject.
+`.dark-factory/explore-findings.md` in the target repo, with these four
+sections in this order. Each section is the verbatim content of the
+corresponding partial, prefixed by a level-2 heading:
 
-## Output contract
+- `## Authors / Authorities` — copy from `.dark-factory/explore-authorities.md`
+- `## Concepts` — copy from `.dark-factory/explore-concepts.md`
+- `## Reuse` — copy from `.dark-factory/explore-reuse.md`
+- `## Risks` — copy from `.dark-factory/explore-risks.md`
 
-Write `.dark-factory/explore-findings.md` in the target repo with these sections:
+After the four sections, append a one-line summary derived ONLY from the
+content of the four partials (no new claims, no new design).
 
-- **Concepts & grep coverage** (terms searched, files hit)
-- **Writers / readers table** (concept → locations)
-- **Current authorities** (who owns what today)
-- **Centralization proposal** (recommended single authority + migration notes)
-- **Reuse candidates** (existing code to extend)
-- **Risks & invariants**
+## Rules (load-bearing)
 
-End your response with: `explore written: .dark-factory/explore-findings.md`
-
-## Rules
-
-- Read-only: do not modify production code or write `spec.md` in this node.
+- The four partials are the only source of truth. Do not invent new content.
+- Do not modify production code or write `spec.md` in this node.
 - Do not seek out, read, or summarize sealed holdout scenarios or evaluator
-  internals; work only from the visible goal and repository.
-- Do not propose implementation diffs yet — exploration and mapping only.
+  internals; work only from the four partials and the visible goal.
+- If two partials disagree, surface the disagreement under the relevant
+  section but do not resolve it.
+
+End your response with: `explore stitched: .dark-factory/explore-findings.md`

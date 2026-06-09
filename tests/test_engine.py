@@ -93,6 +93,7 @@ def test_echo_backend_green_path(monkeypatch):
         "explore_reuse",
         "explore_risks",
         "explore_join",
+        "explore_stitch",
         "explore_out",
         "plan",
         "implement",
