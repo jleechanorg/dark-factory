@@ -1326,15 +1326,33 @@ def _resolve_gate_backend(node: "Node", ctx: "Context") -> tuple[str, dict[str, 
         priority = [p.strip() for p in str(bp).split(",") if p.strip()]
         if priority:
             prefer_adversarial = _coerce_bool_attr(node.attrs.get("prefer_adversarial", False))
+            # Cross-visit pin: once a node's reviewer backend has been
+            # resolved via the priority queue, the same name resolves to the
+            # same backend on every subsequent visit — even if the PATH
+            # changes between visits (e.g. `codex` is uninstalled mid-run).
+            # This honors the design-doc promise "the runner pins the
+            # reviewer for the entire run" (see
+            # `roadmap/agy-reviewer-and-base-dot-2026-06-09.md` §5.2 and
+            # the no-reviewer-shopping rule in
+            # `feedback_2026-06-09_adversarial_review_real_llm.md`).
+            # The first-write-wins rule also means a *real* fail from one
+            # backend is never re-tried on a different one — the gate keeps
+            # the verdict, not the resolver.
+            prior_key = f"{node.name}.resolved_backend"
+            prior = ctx.state.get(prior_key)
+            prior_meta = ctx.state.get(f"{node.name}.resolved_backend_meta") or {}
+            if prior and prior_meta.get("reviewer_backend_resolution") == "priority_queue":
+                return prior, prior_meta
             # When prefer_adversarial is set, exclude the run-level coder
             # backend from the priority list (so a `claude` run with an
             # `agy` coder cannot accidentally get a `claude` reviewer).
             if prefer_adversarial and ctx.backend and ctx.backend in priority:
                 priority = [p for p in priority if p != ctx.backend]
             resolved, pq_meta = _resolve_adversarial_backend(priority, ctx)
-            ctx.state[f"{node.name}.resolved_backend"] = resolved
+            ctx.state[prior_key] = resolved
             pq_meta["prefer_adversarial"] = "true" if prefer_adversarial else "false"
             pq_meta["reviewer_backend_resolution"] = "priority_queue"
+            ctx.state[f"{node.name}.resolved_backend_meta"] = dict(pq_meta)
             return resolved, pq_meta
     if "backend" in node.attrs:
         return str(node.attrs["backend"]), {"reviewer_backend_resolution": "explicit"}
