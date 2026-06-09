@@ -2,6 +2,24 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-09 — adversarial-review priority queue dispatch fix (PR #26)
+
+- **Bugbot high-severity finding, fixed in commit `81b9ea6` on branch [`fix/conformance-walker-skip-underscore-dot`](https://github.com/jleechanorg/dark-factory/pull/26) (off `423530f`).** Cursor Bugbot thread 6: the priority queue `codex > minimax > agy > claude-sonnet` was decorative. `_execute_gate` only handled `agy` specially and forced `claude` for every other name. A resolved `codex` / `minimax` still ran the Claude subprocess. End-to-end dispatch now honors the resolved name:
+  - `_gate_subprocess_args` routes 4 backends: `agy` (`--add-dir`), `codex` (`codex exec --yolo --skip-git-repo-check`), `minimax` (Claude CLI + `ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic`), and `claude-sonnet` / bare `claude` (Claude CLI).
+  - new `_gate_subprocess_env(backend)` overrides `ANTHROPIC_BASE_URL` only for `minimax`; other backends use `_sanitized_env()` unchanged.
+  - `_run_gate_once` records the resolved backend in `Result.metadata["reviewer_backend"]` (was hard-coded to `claude` for non-agy). CXDB now shows what actually graded the diff.
+  - `_execute_gate` no longer collapses to claude. agy keeps its infra-fallback (claude); codex / minimax / claude-sonnet / claude do not fall back silently.
+- **Empty-list fallback** in `_resolve_gate_backend` (commit `81b9ea6`): when `prefer_adversarial` empties the post-filter list (e.g. lane says `backend_priority=claude`, coder is `claude`), fall back to `_DEFAULT_ADVERSARIAL_PRIORITY` so the queue is re-probed (codex > minimax > agy > claude-sonnet) instead of short-circuiting to `claude-sonnet` and silently dropping cross-vendor review. Resolves Bugbot thread 7.
+- **Tests** (`tests/test_gates.py`, 26 total now; 8 new in this push):
+  - `test_gate_subprocess_args_routes_{codex,claude_sonnet,bare_claude}_to_*_cli`
+  - `test_gate_subprocess_env_routes_minimax_through_minimax_gateway`
+  - `test_gate_subprocess_env_does_not_set_minimax_for_other_backends` (stubs `_sanitized_env` to a clean baseline so a stray `ANTHROPIC_BASE_URL` in the test runner's env cannot leak in)
+  - `test_execute_gate_runs_codex_subprocess_when_priority_resolves_codex`
+  - `test_execute_gate_runs_minimax_with_correct_env`
+  - `test_resolve_adversarial_backend_falls_back_to_default_when_post_filter_empty`
+- **Cross-vendor intent = real subprocess** (per [`feedback_2026-06-09_adversarial_review_real_llm.md`](file:///Users/jleechan/.claude/projects/-Users-jleechan-projects-dark-factory/memory/feedback_2026-06-09_adversarial_review_real_llm.md)). The priority queue is chosen at run-config time, not a retry cascade. A real `fail|partial` from one reviewer is authoritative and never re-tried on a different model.
+- **Local full suite on `81b9ea6`:** 268 passed / 0 failed (was 252 passed / 1 failed pre-fix; the dispatch fix is in `runner/handlers.py` which is the new code that closed the dispatch gap, no test churn from the conformance walker). CI `test` + `skeptic` both passed on push; CodeRabbit + Bugbot review pending. Bead: [jleechan-qb7](https://github.com/jleechanorg/dark-factory/issues/25).
+
 ### 2026-06-09 — PR #22 follow-up: explore-stitch + adversarial-review priority queue
 
 - Landed the PR #22 follow-up on branch `fix/pr22-explore-stitch-and-adversarial-priority` (off `1220ef2083`). **Two coupled changes** driven by beads [jleechan-n3m](https://github.com/jleechanorg/dark-factory/issues/24) and [jleechan-qb7](https://github.com/jleechanorg/dark-factory/issues/25):
