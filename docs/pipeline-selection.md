@@ -17,6 +17,7 @@ task. If the user passes `--pipeline`, use it. Otherwise classify the goal first
 | Validate in-flight PR (no holdout) | `pipelines/factory/pr_gates.dot` | evidence gates only |
 | Spec review (line-aware, slim) | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | acceptance + codex reviewer |
 | Spec review (+ stack smoke) | `benchmarks/attractor-spec-review/pipelines/review_full.dot` | adds fullstack smoke |
+| Produce a reviewed spec only (no implementation) | `pipelines/slim/spec_gen.dot` | explore → plan → cold spec review → fix loop; no implement node; rejects specs with parallel lanes lacking a file-ownership matrix |
 | Brownfield replace / delete | **custom goal + often `minimal_feature.dot` or custom `.dot`** | apply factory-spec delete-first rules; never treat as greenfield additive |
 
 ## Role-based model routing (slim pipelines)
@@ -65,7 +66,7 @@ can see exactly which backend graded the diff and why.
 
 ## Short names (expanded by skill)
 
-`gates`, `hello`, `pr_gates`, `minimal_pr`, `minimal_feature`, `bug_fix`, `review_slim`, `review_full`
+`gates`, `hello`, `pr_gates`, `minimal_pr`, `minimal_feature`, `bug_fix`, `review_slim`, `review_full`, `spec_gen`
 
 ## Invocation
 
