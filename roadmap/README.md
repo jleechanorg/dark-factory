@@ -2,6 +2,12 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-09 — /fs spec-generation gap: design doc + 3 beads filed, parallel implementation dispatched
+
+- **Gap:** `/fs` never invokes `dark-factory`; Phase-1 spec generation (explore fanout + plan) exists only fused into feature lanes; the cold codex reviewer only reviews implementations — there is no standalone reviewed-spec lane. Motivating incident: worldarchitect.ai level-up chain shipped 7 divergent blobs of one module because no spec reviewer enforced lane independence.
+- **Design doc:** [`roadmap/spec-gen-pipeline-2026-06-09.md`](spec-gen-pipeline-2026-06-09.md) — full handoff spec with .dot sketch + acceptance criteria.
+- **Beads (file-disjoint, parallelizable):** `jleechan-6a6` (P1: `pipelines/slim/spec_gen.dot` + `prompts/slim/spec_review.md` + `fix_spec.md`, no implement node), `jleechan-86d` (P1: /fs rewire to run the pipeline, repo + user-scope command files), `jleechan-hv1` (P1: `prompts/slim/plan.md` lane-independence / file-ownership matrix requirement).
+
 ### 2026-06-09 — P1 gap fixes shipped (PR #30): bug_fix adversarial reviewer + holdout env isolation
 
 - **[PR #30](https://github.com/jleechanorg/dark-factory/pull/30) MERGED at [`2ae5aa6`](https://github.com/jleechanorg/dark-factory/commit/2ae5aa66b727ef52084754563ae8d377081144f2)** (squash, admin-merge; CI 4/4 + Skeptic Gate PASS; CodeRabbit rate-limited, codex-connector out of credits — no actionable findings after a 10-min watch window).
