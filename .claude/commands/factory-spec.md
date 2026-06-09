@@ -7,14 +7,15 @@ aliases: [fs]
 
 # /factory-spec — Spec Create & Review Workflow
 
-Create or review a spec through the Dark Factory pipeline. Classifies the task
-(greenfield vs brownfield), picks the matching `.dot`, then plans — reports
-choices for user approval.
+Create a reviewed spec via the `spec_gen` pipeline, or review / browse an
+existing one. Classifies the task (greenfield vs brownfield), then either
+**runs the pipeline** (create mode) or inspects in-session (review/show modes).
 
 **Install (once):**
 
 ```bash
 ./install.sh
+export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$(pwd)}"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
@@ -25,22 +26,27 @@ Pipeline decision table:
 **Usage**:
 
 ```
-/fs <spec description>          # create / classify (default mode)
-/fs --review <spec_path>        # review an existing spec
+/fs <spec description>          # create mode — runs spec_gen pipeline
+/fs --review <spec_path>        # review an existing spec (no pipeline run)
 /fs --review                    # review spec/feature.md (default path)
 /fs --show                      # show pipeline graphs (read-only reference)
-/factory --pipeline <dot> ...   # execute after spec is ready
+/factory --pipeline <dot> ...   # execute feature pipeline after spec is ready
 ```
 
 ## Action
 
 Parse `$ARGUMENTS` and execute the `factory-spec` skill workflow:
 
-1. **Detect mode**: `--review` → review; `--show` → graph reference only;
-   otherwise → create/classify mode
-2. **Step 0:** greenfield vs brownfield (mandatory — see skill)
-3. **Select pipeline** from `docs/pipeline-selection.md` when execution is next
-4. **Run workflow** as defined in `.claude/skills/factory-spec/SKILL.md`
-5. Report auto-chosen pipeline + options; ask user to confirm
-
-To **run** after spec approval: `/f` or `/factory` with `--pipeline <chosen>`.
+1. **Detect mode**: `--review` → review mode; `--show` → graph reference only;
+   otherwise → create mode
+2. **Step 0 (create mode only):** classify greenfield vs brownfield — feeds the
+   goal/context string passed to the pipeline (see skill)
+3. **Create mode only:** report auto-chosen options (pinned pipeline + goal
+   string) and ask user to confirm **before any pipeline invocation**. Review
+   (`--review`) and show (`--show`) modes are in-session and read-only — no
+   pipeline is invoked, so no confirmation step applies.
+4. **Run workflow** as defined in `.claude/skills/factory-spec/SKILL.md`.
+   Create mode is **pinned to `pipelines/slim/spec_gen.dot`** and runs it only
+   after the step-3 confirmation — the skill's pipeline-selection table
+   applies to `/f` / `/factory` implementation runs only; never re-classify a
+   `/fs` spec request into a feature pipeline.
