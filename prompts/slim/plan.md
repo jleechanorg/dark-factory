@@ -7,6 +7,10 @@ Read `.dark-factory/explore-findings.md` from the explore phase. The spec must
 align with its authorities map and centralization proposal. If the explore
 artifact is missing, stop and report that — do not invent a design from scratch.
 
+If `.dark-factory/research-findings.md` exists (lanes with a research node
+write it between explore and plan), read it too and fold its deeper analysis
+into the spec. Its absence is fine — only lanes with a research node emit it.
+
 Include:
 - acceptance criteria
 - non-goals
