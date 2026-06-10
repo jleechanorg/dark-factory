@@ -18,6 +18,7 @@ task. If the user passes `--pipeline`, use it. Otherwise classify the goal first
 | Spec review (line-aware, slim) | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | acceptance + codex reviewer |
 | Spec review (+ stack smoke) | `benchmarks/attractor-spec-review/pipelines/review_full.dot` | adds fullstack smoke |
 | Produce a reviewed spec only (no implementation) | `pipelines/slim/spec_gen.dot` | explore → plan → cold spec review → fix loop; no implement node; rejects specs with parallel lanes lacking a file-ownership matrix |
+| Research report only (no implementation) | `pipelines/slim/minimal_research.dot` | explore fanout → research → exit; writes `.dark-factory/research-findings.md`; no implement node |
 | Brownfield replace / delete | **custom goal + often `minimal_feature.dot` or custom `.dot`** | apply factory-spec delete-first rules; never treat as greenfield additive |
 
 ## Holdout-always policy
@@ -33,6 +34,8 @@ Current coverage: `gates.dot`, `pr_gates.dot`, `hello.dot`,
 Deliberate exceptions:
 
 - `pipelines/slim/spec_gen.dot` — no implement node; nothing to evaluate.
+- `pipelines/slim/minimal_research.dot` — no implement node; research report
+  only.
 - `pipelines/slim/review_pr.dot` — holdouts test feature scenarios, not PR
   diffs (see its header comment).
 
@@ -82,7 +85,7 @@ can see exactly which backend graded the diff and why.
 
 ## Short names (expanded by skill)
 
-`gates`, `hello`, `pr_gates`, `minimal_pr`, `minimal_feature`, `bug_fix`, `review_slim`, `review_full`, `spec_gen`
+`gates`, `hello`, `pr_gates`, `minimal_pr`, `minimal_feature`, `minimal_research`, `bug_fix`, `review_slim`, `review_full`, `spec_gen`
 
 ## Invocation
 

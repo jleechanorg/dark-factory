@@ -123,3 +123,28 @@ def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path)
         "exit",
     ]
 
+
+def test_minimal_research_factory_runs_with_deterministic_gates(monkeypatch, tmp_path):
+    monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
+    graph = parse(ROOT / "pipelines" / "slim" / "minimal_research.dot")
+    ctx = Context(goal="research some code", workdir=ROOT, backend="echo")
+
+    history = run(graph, ctx, checkpoint=tmp_path / "checkpoint.json")
+
+    assert history[-1].outcome == "success"
+    assert [step.node for step in history] == [
+        "start",
+        "explore_in",
+        "explore_fanout",
+        "explore_concept",
+        "explore_auth",
+        "explore_reuse",
+        "explore_risks",
+        "explore_join",
+        "explore_stitch",
+        "explore_out",
+        "research",
+        "exit",
+    ]
+
+
