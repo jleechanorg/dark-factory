@@ -42,7 +42,7 @@ classify the goal (Step 0 below) and pick from this quick guide:
 | **Create a reviewed spec** | `pipelines/slim/spec_gen.dot` ← `/fs` create mode |
 | Smoke / wiring | `pipelines/factory/hello.dot` |
 | New feature (full loop) | `pipelines/slim/minimal_feature.dot` |
-| PR iteration (no holdout) | `pipelines/slim/minimal_pr.dot` |
+| PR iteration (research + holdout) | `pipelines/slim/minimal_pr.dot` |
 | Validate diff + holdout | `pipelines/factory/gates.dot` |
 | PR gates only | `pipelines/factory/pr_gates.dot` |
 | Spec review slim | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` |
@@ -189,16 +189,14 @@ fix ──▶ test (loop)
 ### 6. `minimal_pr.dot` — Slim PR Iteration Factory (No Holdout)
 
 ```
-start ──▶ explore ──▶ plan ──▶ implement ──▶ test ──(success)──▶ review ──(success)──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ exit
-                                    │                  │                  │                  │
-                                    └──(fail)──▶ fix ◀─┘                  │                  │
-                                                          └──(fail)──▶ fix ┘                  │
-                                                                               └──(fail)──▶ fix ┘
+start ──▶ explore ──▶ research ──▶ plan ──▶ implement ──▶ test ──(success)──▶ review ──(success)──▶ holdout ──(success)──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ exit
+                                                            │                  │                       │                      │                      │
+                                                            └──(fail)──▶ fix ◀─┴───────────────────────┴──────────────────────┴──────────────────────┘
 
 fix ──▶ test (loop)
 ```
 
-**Use when:** in-flight PR iteration loop with parameterized test commands (`--state slim.test_command="..."`) and evidence checks, bypassing behavioral holdout scenarios.
+**Use when:** in-flight PR iteration loop with parameterized test commands (`--state slim.test_command="..."`) and evidence checks. Holdout-always policy: this lane runs the sealed behavioral holdouts (requires `$DARK_FACTORY_HOLDOUTS`), and a classless `research` node (coder tier) digests explore findings before plan.
 
 ## Handler type registry
 

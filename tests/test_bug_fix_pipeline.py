@@ -39,6 +39,9 @@ def test_bug_fix_runs_red_to_green_to_exit(tmp_path, monkeypatch):
     monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
     monkeypatch.setitem(TYPE_REGISTRY, "gate_red", fake_gate_red)
     monkeypatch.setitem(TYPE_REGISTRY, "gate_green", fake_gate_green)
+    monkeypatch.setitem(
+        TYPE_REGISTRY, "holdout_eval",
+        lambda node, ctx: Result(outcome="success", output="holdout ok (mocked)"))
 
     g = parse(BUG_FIX)
     ctx = Context(goal="fix the bug", workdir=tmp_path, backend="echo")
@@ -48,9 +51,10 @@ def test_bug_fix_runs_red_to_green_to_exit(tmp_path, monkeypatch):
     nodes = [r.node for r in history]
     assert history[-1].outcome == "success", f"final history: {history}"
     # expected trajectory: start, explore_*, plan, reproduce, gate_red, fix,
-    # gate_green, evidence (adversarial review), exit
+    # gate_green, holdout (sealed scenarios), evidence (adversarial review), exit
     expected_post_explore = [
-        "plan", "reproduce", "gate_red", "fix", "gate_green", "evidence", "exit",
+        "plan", "reproduce", "gate_red", "fix", "gate_green", "holdout",
+        "evidence", "exit",
     ]
     assert nodes[-len(expected_post_explore):] == expected_post_explore
     assert nodes[0] == "start"
@@ -131,6 +135,9 @@ def test_bug_fix_evidence_fail_terminates_as_failure(tmp_path, monkeypatch):
     monkeypatch.setitem(
         TYPE_REGISTRY, "gate_green",
         lambda node, ctx: Result(outcome="success", output="GREEN OK (mocked)"))
+    monkeypatch.setitem(
+        TYPE_REGISTRY, "holdout_eval",
+        lambda node, ctx: Result(outcome="success", output="holdout ok (mocked)"))
 
     g = parse(BUG_FIX)
     ctx = Context(goal="fix the bug", workdir=tmp_path, backend="echo")
@@ -155,6 +162,60 @@ def test_bug_fix_has_adversarial_evidence_node():
     assert evidence.attrs.get("type") == "gate_er"
     assert str(evidence.attrs.get("prefer_adversarial")).lower() == "true"
     assert "codex" in str(evidence.attrs.get("backend_priority", ""))
+
+
+def test_bug_fix_has_holdout_node_between_green_and_evidence():
+    """Holdout-always policy: every implement-bearing lane runs the sealed
+    behavioral holdouts. bug_fix wires gate_green -> holdout -> evidence,
+    with holdout failure routing back to fix."""
+    g = parse(BUG_FIX)
+    holdout = g.nodes.get("holdout")
+    assert holdout is not None, "bug_fix.dot is missing the holdout node"
+    assert holdout.attrs.get("type") == "holdout_eval"
+
+    edges = {(e.src, e.dst, e.attrs.get("condition")) for e in g.edges}
+    assert ("gate_green", "holdout", "outcome=success") in edges
+    assert ("holdout", "evidence", "outcome=success") in edges
+    assert ("holdout", "fix", "outcome!=success") in edges
+
+
+def test_bug_fix_holdout_fail_routes_back_to_fix(tmp_path, monkeypatch):
+    """A holdout failure must loop back to fix, not exit green."""
+    test_path = tmp_path / "tests" / "test_repro.py"
+    test_path.parent.mkdir(parents=True, exist_ok=True)
+    test_path.write_text("def test_x():\n    assert 1 == 2\n")
+
+    post_holdout_fix = {"n": 0}
+
+    def fake_codergen(node, ctx):
+        if node.name == "reproduce":
+            ctx.state["bug_fix.test_path"] = str(test_path)
+        if node.name == "fix":
+            post_holdout_fix["n"] += 1
+        return Result(outcome="success", output=f"fake {node.name}")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
+    monkeypatch.setitem(
+        TYPE_REGISTRY, "gate_red",
+        lambda node, ctx: Result(outcome="success", output="RED OK (mocked)"))
+    monkeypatch.setitem(
+        TYPE_REGISTRY, "gate_green",
+        lambda node, ctx: Result(outcome="success", output="GREEN OK (mocked)"))
+    monkeypatch.setitem(
+        TYPE_REGISTRY, "holdout_eval",
+        lambda node, ctx: Result(outcome="failure", output="holdout FAIL (mocked)"))
+
+    g = parse(BUG_FIX)
+    ctx = Context(goal="fix the bug", workdir=tmp_path, backend="echo")
+    ctx.state["bug_fix.test_path"] = str(test_path)
+    history = run(g, ctx, max_steps=80)
+
+    nodes = [r.node for r in history]
+    assert "holdout" in nodes
+    # fix runs more than once: the initial pass plus holdout-driven retries,
+    # bounded by max_visits=3 → terminal outcome is non-success
+    assert post_holdout_fix["n"] >= 2
+    assert history[-1].outcome in ("exhausted", "failure", "error")
 
 
 def test_bug_fix_max_visits_is_three():

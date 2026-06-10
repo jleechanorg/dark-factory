@@ -76,13 +76,26 @@ def test_minimal_feature_factory_runs_with_deterministic_gates(monkeypatch, tmp_
     ]
 
 
+def test_minimal_pr_has_research_node_on_coder_tier():
+    """minimal_pr.dot wires explore_out -> research -> plan; research is
+    classless so it honors the run-level --backend (coder tier)."""
+    graph = parse(ROOT / "pipelines" / "slim" / "minimal_pr.dot")
+    research = graph.nodes.get("research")
+    assert research is not None, "minimal_pr.dot is missing the research node"
+    assert research.attrs.get("type") == "codergen"
+    assert "class" not in research.attrs, "research must ride the coder tier"
+    assert research.attrs.get("prompt") == "@prompts/slim/research.md"
+
+
 def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path):
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", lambda node, ctx: Result(outcome="success", output="ok"))
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_pr.dot")
     # production routes plan→claude opus and review→agy; pin echo for offline determinism
     graph.nodes["plan"].attrs["backend"] = "echo"
     graph.nodes["review"].attrs["backend"] = "echo"
     ctx = Context(goal="refactor a tiny thing in-flight", workdir=ROOT, backend="echo")
+    ctx.state["feature"] = "hello"
     ctx.state["slim.test_command"] = f"{sys.executable} -c \"print('tests ok')\""
 
     history = run(graph, ctx, checkpoint=tmp_path / "checkpoint.json")
@@ -99,10 +112,12 @@ def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path)
         "explore_join",
         "explore_stitch",
         "explore_out",
+        "research",
         "plan",
         "implement",
         "test",
         "review",
+        "holdout",
         "gate_es",
         "gate_er",
         "exit",
