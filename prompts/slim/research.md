@@ -1,8 +1,3 @@
-// prompts/slim/research.md
-//
-// Research node: reads the consolidated explore-findings.md and performs
-// in-depth codebase research/investigation to produce a detailed research report.
-
 Investigate the codebase and produce a detailed research report for this goal.
 
 Goal:

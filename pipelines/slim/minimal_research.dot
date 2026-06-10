@@ -12,10 +12,11 @@ digraph MinimalResearchFactory {
   // _base.dot provides: explore_in, explore_fanout, explore_{concept,auth,
   // reuse,risks}, explore_join, explore_out.
 
+  // Research rides the coder backend (no class → run-level --backend),
+  // same convention as minimal_pr.dot's research node.
   research [
     type="codergen",
     label="Codebase Research",
-    class="research",
     prompt="@prompts/slim/research.md"
   ]
 

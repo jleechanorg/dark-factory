@@ -43,6 +43,7 @@ classify the goal (Step 0 below) and pick from this quick guide:
 | Smoke / wiring | `pipelines/factory/hello.dot` |
 | New feature (full loop) | `pipelines/slim/minimal_feature.dot` |
 | PR iteration (research + holdout) | `pipelines/slim/minimal_pr.dot` |
+| Research report only | `pipelines/slim/minimal_research.dot` |
 | Validate diff + holdout | `pipelines/factory/gates.dot` |
 | PR gates only | `pipelines/factory/pr_gates.dot` |
 | Spec review slim | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` |
@@ -50,7 +51,7 @@ classify the goal (Step 0 below) and pick from this quick guide:
 | Brownfield replace/delete | custom goal + delete-first rules; often `minimal_feature.dot` or custom `.dot` |
 
 Short names for `--pipeline`: `spec_gen`, `gates`, `hello`, `pr_gates`, `minimal_pr`,
-`minimal_feature`, `review_slim`, `review_full`.
+`minimal_feature`, `minimal_research`, `review_slim`, `review_full`.
 
 Execution command (from target repo cwd):
 
