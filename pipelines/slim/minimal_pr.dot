@@ -12,6 +12,15 @@ digraph MinimalPRFactory {
   // _base.dot provides: explore_in, explore_fanout, explore_{concept,auth,
   // reuse,risks}, explore_join, explore_out.
 
+  // Research rides the coder backend (no class → run-level --backend),
+  // read-only: digests explore findings into .dark-factory/research-findings.md
+  // before the heavier plan model runs.
+  research [
+    type="codergen",
+    label="Research (read-only)",
+    prompt="@prompts/slim/research.md"
+  ]
+
   plan [
     type="codergen",
     label="Plan & Spec",
@@ -76,7 +85,8 @@ digraph MinimalPRFactory {
   ]
 
   start -> explore_in
-  explore_out -> plan
+  explore_out -> research
+  research -> plan
   plan -> implement
   implement -> test
 

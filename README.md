@@ -534,7 +534,7 @@ dark-factory \
   --cxdb ~/.dark-factory/cxdb.sqlite
 ```
 
-### 🔁 3. In-flight PR iteration (no holdout)
+### 🔁 3. In-flight PR iteration (research + holdout)
 
 ```bash
 cd ~/projects/my-app
@@ -542,6 +542,7 @@ dark-factory \
   --pipeline pipelines/slim/minimal_pr.dot \
   --goal "Fix failing tests on PR branch" \
   --backend claude \
+  --feature my_feature \
   --state 'slim.test_command=pytest tests/test_foo.py -v' \
   --cxdb ~/.dark-factory/cxdb.sqlite
 ```
