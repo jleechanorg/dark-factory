@@ -5,6 +5,7 @@
 //   start -> explore_in -> [4-way explore fanout] -> explore_join
 //         -> explore_out -> plan -> reproduce -> gate_red
 //         -> fix (max 3) -> gate_green
+//         -> holdout (sealed behavioral holdouts)
 //         -> evidence (gate_er, adversarial cross-vendor review)
 //         -> exit
 //
@@ -66,6 +67,19 @@ digraph BugFix {
         timeout=300
     ]
 
+    // Sealed behavioral holdouts (holdout-always policy): a green repro test
+    // proves the reported symptom is gone, not that the fix preserved the
+    // feature's sealed behavioral contract. Failure routes back to fix
+    // (bounded by fix's max_visits=3).
+    holdout [
+        type="holdout_eval",
+        label="Behavioral Holdouts",
+        validation=true,
+        goal_gate=true,
+        timeout=600,
+        retry_target="fix"
+    ]
+
     // Adversarial reviewer, mirroring review_pr.dot's evidence node: a
     // green test alone is not merge confidence — an independent, SHA-bound,
     // cross-vendor reviewer must grade the diff before the lane exits.
@@ -93,11 +107,14 @@ digraph BugFix {
     gate_red   -> fix          [condition="outcome=success"]
     gate_red   -> exit         [condition="outcome!=success"]
 
-    // Fix loop: adversarial review on success, back to fix on failure
-    // (max 3 visits).
+    // Fix loop: sealed holdouts then adversarial review on success, back to
+    // fix on failure (max 3 visits).
     fix        -> gate_green
-    gate_green -> evidence     [condition="outcome=success"]
+    gate_green -> holdout      [condition="outcome=success"]
     gate_green -> fix          [condition="outcome!=success"]
+
+    holdout    -> evidence     [condition="outcome=success"]
+    holdout    -> fix          [condition="outcome!=success"]
 
     // Evidence verdict is recorded in CXDB either way; exit propagates a
     // non-success review outcome as the run's terminal outcome.
