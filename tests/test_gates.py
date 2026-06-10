@@ -51,6 +51,41 @@ def test_gate_echo_seeded_outcome(monkeypatch):
     assert history[-1].outcome == "success"
 
 
+def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
+    """Holdout-always policy: pr_gates.dot runs sealed holdouts before the
+    three adversarial gates, mirroring gates.dot."""
+    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+
+    g = parse(_pipeline("pr_gates.dot"))
+    assert g.nodes["holdout"].attrs.get("type") == "holdout_eval"
+
+    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx.state["gate_es.outcome"] = "success"
+    ctx.state["gate_er.outcome"] = "success"
+    ctx.state["gate_cs.outcome"] = "success"
+
+    history = run(g, ctx, max_steps=20)
+    nodes = [r.node for r in history]
+    assert nodes == ["start", "holdout", "gate_es", "gate_er", "gate_cs", "exit"]
+    assert history[-1].outcome == "success"
+
+
+def test_pr_gates_holdout_failure_short_circuits(monkeypatch):
+    """A holdout failure in pr_gates exits immediately — no evidence gates run."""
+    fake_holdout = lambda node, ctx: Result(outcome="failure", output="holdout FAIL")
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+
+    g = parse(_pipeline("pr_gates.dot"))
+    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+
+    history = run(g, ctx, max_steps=20)
+    nodes = [r.node for r in history]
+    assert "gate_es" not in nodes
+    assert history[-1].node == "exit"
+    assert history[-1].outcome == "failure"
+
+
 def test_gate_failure_short_circuits(monkeypatch):
     fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)

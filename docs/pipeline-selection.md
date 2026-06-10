@@ -14,7 +14,7 @@ task. If the user passes `--pipeline`, use it. Otherwise classify the goal first
 | In-flight PR iteration | `pipelines/slim/minimal_pr.dot` | explore → research → plan → … → review → holdout → gates; set `--state slim.test_command=...`; requires `$DARK_FACTORY_HOLDOUTS` |
 | Bug fix with red/green discipline | `pipelines/bug_fix.dot` | reproduce (fresh test) → red gate → fix → green gate → holdout → adversarial evidence; max 3 fix visits |
 | Validate diff + sealed holdout | `pipelines/factory/gates.dot` | code already implemented |
-| Validate in-flight PR (no holdout) | `pipelines/factory/pr_gates.dot` | evidence gates only |
+| Validate in-flight PR | `pipelines/factory/pr_gates.dot` | holdout + evidence gates (no fix loop) |
 | Spec review (line-aware, slim) | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | acceptance + codex reviewer |
 | Spec review (+ stack smoke) | `benchmarks/attractor-spec-review/pipelines/review_full.dot` | adds fullstack smoke |
 | Produce a reviewed spec only (no implementation) | `pipelines/slim/spec_gen.dot` | explore → plan → cold spec review → fix loop; no implement node; rejects specs with parallel lanes lacking a file-ownership matrix |
@@ -28,15 +28,13 @@ green tests + a fresh-eyes review prove the diff matches its own intent, not
 that it preserved the feature's sealed behavioral contract. Lanes with an
 `implement`/`fix` node and no holdout are a policy gap, not a variant.
 
-Current coverage: `gates.dot`, `hello.dot`, `minimal_feature.dot`,
-`minimal_pr.dot`, `bug_fix.dot` all carry holdout. Deliberate exceptions:
+Current coverage: `gates.dot`, `pr_gates.dot`, `hello.dot`,
+`minimal_feature.dot`, `minimal_pr.dot`, `bug_fix.dot` all carry holdout.
+Deliberate exceptions:
 
 - `pipelines/slim/spec_gen.dot` — no implement node; nothing to evaluate.
 - `pipelines/slim/review_pr.dot` — holdouts test feature scenarios, not PR
   diffs (see its header comment).
-- `pipelines/factory/pr_gates.dot` — explicit no-holdout variant of
-  `gates.dot`; use only when the operator has a stated reason to skip the
-  sealed evaluator (e.g. the target repo has no holdout scenarios yet).
 
 ## Role-based model routing (slim pipelines)
 
