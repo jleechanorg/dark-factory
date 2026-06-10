@@ -78,11 +78,13 @@ def test_minimal_feature_factory_runs_with_deterministic_gates(monkeypatch, tmp_
 
 def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path):
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", lambda node, ctx: Result(outcome="success", output="ok"))
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_pr.dot")
     # production routes plan→claude opus and review→agy; pin echo for offline determinism
     graph.nodes["plan"].attrs["backend"] = "echo"
     graph.nodes["review"].attrs["backend"] = "echo"
     ctx = Context(goal="refactor a tiny thing in-flight", workdir=ROOT, backend="echo")
+    ctx.state["feature"] = "hello"
     ctx.state["slim.test_command"] = f"{sys.executable} -c \"print('tests ok')\""
 
     history = run(graph, ctx, checkpoint=tmp_path / "checkpoint.json")
@@ -103,8 +105,34 @@ def test_minimal_pr_factory_runs_with_deterministic_gates(monkeypatch, tmp_path)
         "implement",
         "test",
         "review",
+        "holdout",
         "gate_es",
         "gate_er",
         "exit",
     ]
+
+
+def test_minimal_research_factory_runs_with_deterministic_gates(monkeypatch, tmp_path):
+    monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
+    graph = parse(ROOT / "pipelines" / "slim" / "minimal_research.dot")
+    ctx = Context(goal="research some code", workdir=ROOT, backend="echo")
+
+    history = run(graph, ctx, checkpoint=tmp_path / "checkpoint.json")
+
+    assert history[-1].outcome == "success"
+    assert [step.node for step in history] == [
+        "start",
+        "explore_in",
+        "explore_fanout",
+        "explore_concept",
+        "explore_auth",
+        "explore_reuse",
+        "explore_risks",
+        "explore_join",
+        "explore_stitch",
+        "explore_out",
+        "research",
+        "exit",
+    ]
+
 

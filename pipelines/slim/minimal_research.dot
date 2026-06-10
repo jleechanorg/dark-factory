@@ -1,0 +1,25 @@
+digraph MinimalResearchFactory {
+  graph [
+    include="@pipelines/_base.dot",
+    goal="Investigate the codebase and produce detailed research findings for a goal"
+    rankdir=LR
+    model_stylesheet="minimal_feature.model.css"
+  ]
+
+  start [shape=Mdiamond, label="Start"]
+  exit  [shape=Msquare, label="Exit - Research Complete"]
+
+  // _base.dot provides: explore_in, explore_fanout, explore_{concept,auth,
+  // reuse,risks}, explore_join, explore_out.
+
+  research [
+    type="codergen",
+    label="Codebase Research",
+    class="research",
+    prompt="@prompts/slim/research.md"
+  ]
+
+  start -> explore_in
+  explore_out -> research
+  research -> exit
+}

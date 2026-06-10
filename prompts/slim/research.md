@@ -1,0 +1,28 @@
+// prompts/slim/research.md
+//
+// Research node: reads the consolidated explore-findings.md and performs
+// in-depth codebase research/investigation to produce a detailed research report.
+
+Investigate the codebase and produce a detailed research report for this goal.
+
+Goal:
+${goal}
+
+## Inputs
+- `.dark-factory/explore-findings.md` (consolidated explore results)
+- Codebase files referenced or relevant to the goal.
+
+## Rules
+- Read-only: Do not modify production code in this node.
+- Identify the exact files, functions, and call sites the change must touch, with `path:line` references.
+- Surface existing modules or helpers to reuse rather than reimplement.
+- Call out constraints, edge cases, and prior art relevant to the goal.
+- Do not seek out, read, or summarize sealed holdout scenarios or evaluator internals; work only from the visible spec and repository.
+
+## Output
+Write `.dark-factory/research-findings.md` in the target repo containing:
+1. Executive summary of the findings.
+2. Codebase analysis with exact file paths and line ranges.
+3. Recommended implementation plan.
+
+End your response with: `research complete: .dark-factory/research-findings.md`
