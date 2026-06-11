@@ -958,6 +958,8 @@ def _claude_json_result(stdout: str, stderr: str, wall_ms: int) -> tuple[str, di
 _VERDICT_NORMALIZE = {
     "pass": "success",
     "warn": "success",
+    "approve": "success",   # review-style vocabulary ("Verdict: APPROVE")
+    "approved": "success",
     "fail": "failure",
     "partial": "failure",
     "inconclusive": "failure",
@@ -965,6 +967,9 @@ _VERDICT_NORMALIZE = {
     "invalid": "failure",
     "incomplete": "failure",
     "conditional": "failure",  # non-standard verdict (architectural concern) → failure
+    "reject": "failure",
+    "rejected": "failure",
+    "blocker": "failure",
 }
 
 # A gate response must echo back `head_sha: <40-hex>` so we can bind the
@@ -1013,7 +1018,8 @@ def _verify_head_sha_echo(text: str, expected_sha: str) -> tuple[bool, str]:
 
 # The set of recognized verdict tokens, shared by the marker + standalone regexes.
 _VERDICT_TOKEN = (
-    r"(?:pass|warn|fail|partial|inconclusive|insufficient|invalid|incomplete|conditional)"
+    r"(?:pass|warn|approved?|fail|partial|inconclusive|insufficient|invalid"
+    r"|incomplete|conditional|rejected?|blocker)"
 )
 
 # Anchored regex: a verdict token must follow a marker ("verdict:", "overall:",
@@ -1175,7 +1181,16 @@ def _run_gate_once(
             timeout=run_timeout, check=False, env=sub_env,
         )
     except subprocess.TimeoutExpired as exc:
-        combined = (exc.stdout or "") + "\n" + (exc.stderr or "")
+        # TimeoutExpired carries bytes for stdout/stderr even when the run
+        # used text=True — coerce before concatenating.
+        def _as_text(v: "str | bytes | None") -> str:
+            if v is None:
+                return ""
+            if isinstance(v, bytes):
+                return v.decode("utf-8", errors="replace")
+            return v
+
+        combined = _as_text(exc.stdout) + "\n" + _as_text(exc.stderr)
         return Result(
             outcome="failure",
             output=combined.strip() or f"gate {name} timed out after {run_timeout}s",
@@ -1428,34 +1443,40 @@ def _coerce_bool_attr(value: object) -> bool:
 def _execute_gate(
     prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str, backend: str
 ) -> "Result":
-    """Run a reviewer gate on ``backend``; agy falls back to claude on infra failure.
+    """Run a reviewer gate on ``backend``; infra failures fall back to claude.
 
     Routing rules:
-      - ``backend == "agy"`` → run agy; if the result is an infra failure
-        (missing binary, sandbox unavailable, timeout, unparseable output,
-        SHA mismatch with no real verdict), fall back to ``claude``. A real
-        agy ``fail``/``partial`` is kept as-is (no-reviewer-shopping).
-      - Any other resolved name (``codex``, ``minimax``, ``claude-sonnet``,
-        ``claude``) → run on that backend. No silent re-routing to a
-        different vendor.
+      - Run the resolved backend. If the result is an *infrastructure*
+        failure (missing binary, sandbox unavailable, timeout, unparseable
+        output, SHA mismatch with no real verdict) and the backend is not
+        already claude-routed, fall back to ``claude`` — recorded in
+        metadata (``fallback_used`` / ``fallback_from``), never silent.
+      - A real ``fail``/``partial`` verdict from any backend is kept as-is
+        (no-reviewer-shopping): only non-verdicts trigger the fallback.
+      - Any result that is still an infra failure after routing carries
+        ``verdict: infra_failure`` so operators and downstream conditions can
+        distinguish "the reviewer never graded the diff" from a real FAIL.
 
     ``_run_gate_once`` is the single point that builds the argv + env per
     backend, so the dispatch is end-to-end: a priority-queue resolution of
     ``codex`` actually invokes the codex subprocess, with
     ``reviewer_backend: codex`` recorded in the result metadata.
     """
-    if backend == "agy":
-        result = _run_gate_once("agy", prompt, expected_sha, timeout, ctx, name)
-        if _is_gate_infra_failure(result):
-            fallback = _run_gate_once("claude", prompt, expected_sha, timeout, ctx, name)
-            fallback.metadata["fallback_used"] = "true"
-            fallback.metadata["fallback_from"] = "agy"
-            return fallback
-        result.metadata.setdefault("fallback_used", "false")
-        return result
-    # codex / minimax / claude-sonnet / bare "claude" → run on the
-    # resolved backend. No silent re-routing to a different vendor.
-    return _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name)
+    result = _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name)
+    # minimax shares the claude CLI binary but grades via a different
+    # gateway/model, so claude is still a genuine infra fallback for it.
+    claude_routed = backend in ("claude", "claude-sonnet")
+    if _is_gate_infra_failure(result) and not claude_routed:
+        fallback = _run_gate_once("claude", prompt, expected_sha, timeout, ctx, name)
+        fallback.metadata["fallback_used"] = "true"
+        fallback.metadata["fallback_from"] = backend
+        if _is_gate_infra_failure(fallback):
+            fallback.metadata["verdict"] = "infra_failure"
+        return fallback
+    result.metadata.setdefault("fallback_used", "false")
+    if _is_gate_infra_failure(result):
+        result.metadata["verdict"] = "infra_failure"
+    return result
 
 
 def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
@@ -1726,6 +1747,109 @@ def _gate_code_standards(node: "Node", ctx: "Context") -> "Result":
     if local_cmd.exists():
         return _slash_gate("code-standards")(node, ctx)
     return _run_universal_prompt_gate(UNIVERSAL_CODE_STANDARDS_PROMPT, "gate_code_standards", node, ctx)
+
+
+def _gate_slash(node: "Node", ctx: "Context") -> "Result":
+    """Generic single-lane reviewer gate: ``type="gate_slash" command="zfc"``.
+
+    Runs ``/<command>`` on the reviewer backend with the same SHA binding and
+    verdict parsing as the named gates. Built for decomposing orchestrator
+    slash commands into per-lane pipeline nodes: a command like
+    ``/code-standards`` instructs the *agent* to fan out several sub-reviews,
+    which single-subprocess backends (``codex exec``) cannot do — they burn
+    the gate timeout ingesting every lane's skill text and die before any
+    verdict. With ``gate_slash`` the .dot graph owns the fan-out
+    (``type=parallel`` → one ``gate_slash`` node per lane → ``type=join``),
+    so each subprocess loads exactly one lane's skill.
+
+    The named command must exist in the target repo
+    (``.claude/commands/<command>.md``); otherwise the gate errors rather
+    than letting the backend free-associate a review.
+    """
+    command = str(node.attrs.get("command", "")).strip().lstrip("/")
+    if not command:
+        return Result(
+            outcome="error",
+            output=f"gate_slash node {node.name!r} missing required command attr",
+            metadata={"verdict": "unknown", "slash_command": ""},
+        )
+    if _node_prompt_ref(node):
+        return _run_custom_prompt_gate(node, ctx, f"gate_{command}")
+    # Echo/mock backends never shell out, so the command-file requirement
+    # doesn't apply — let the echo branch in _slash_gate seed the outcome.
+    if ctx.backend in ("echo", "mock_llm"):
+        return _slash_gate(command)(node, ctx)
+    local_cmd = ctx.workdir / ".claude" / "commands" / f"{command}.md"
+    if not local_cmd.exists():
+        # User-scope commands (~/.claude/commands/) are resolvable by the
+        # claude CLI but not by every reviewer backend (codex resolves
+        # in-repo files only). Materialize the command into the target
+        # workdir so all backends see it repo-local.
+        user_cmd = pathlib.Path.home() / ".claude" / "commands" / f"{command}.md"
+        if user_cmd.exists():
+            try:
+                local_cmd.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(user_cmd, local_cmd)
+            except OSError as exc:
+                return Result(
+                    outcome="error",
+                    output=f"gate_slash: failed to materialize /{command} into workdir: {exc}",
+                    metadata={"verdict": "unknown", "slash_command": command},
+                )
+        else:
+            return Result(
+                outcome="error",
+                output=(
+                    f"gate_slash: /{command} not found in target repo "
+                    f"({local_cmd}) or user scope ({user_cmd}) — "
+                    f"refusing to run an undefined review lane"
+                ),
+                metadata={"verdict": "unknown", "slash_command": command},
+            )
+
+    # Inline the command file's content instead of sending a literal
+    # "/<command>" prompt. Each reviewer CLI resolves slash commands from a
+    # different namespace (claude: project + user commands; codex:
+    # ~/.codex/prompts), so "/cmd" prompts are backend-dependent — observed
+    # live as codex/claude "Unknown command: /zfc" lane failures. Inlined
+    # instructions are universal across backends.
+    expected_sha = _worktree_head_sha(ctx.workdir)
+    if expected_sha is None:
+        return Result(
+            outcome="error",
+            output=f"gate /{command} cannot resolve HEAD SHA for {ctx.workdir}",
+            metadata={"slash_command": command, "verdict": "unknown",
+                      "head_sha_status": "missing"},
+        )
+    try:
+        cmd_text = local_cmd.read_text()
+    except OSError as exc:
+        return Result(
+            outcome="error",
+            output=f"gate_slash: cannot read {local_cmd}: {exc}",
+            metadata={"verdict": "unknown", "slash_command": command},
+        )
+    target = node.attrs.get("target", str(ctx.workdir))
+    prompt = (
+        f"You are the /{command} review lane, running as a READ-ONLY reviewer "
+        f"gate. Do not modify any files.\n\n"
+        f"Target under review: {target}\n\n"
+        f"--- /{command} instructions ---\n{cmd_text}\n--- end instructions ---\n"
+        f"\n<!-- RUNNER BINDING REQUIREMENT (non-negotiable) -->\n"
+        f"expected_head_sha: {expected_sha}\n\n"
+        f"CRITICAL: Your response MUST include BOTH of the following lines "
+        f"verbatim (machine-parsed; do not omit, paraphrase, or put inside a "
+        f"code block):\n"
+        f"head_sha: {expected_sha}\n"
+        f"verdict: <pass|warn|fail|partial>\n"
+    )
+    timeout = _coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
+    backend, gate_meta = _resolve_gate_backend(node, ctx)
+    result = _execute_gate(prompt, expected_sha, timeout, ctx, command, backend)
+    if gate_meta:
+        for k, v in gate_meta.items():
+            result.metadata.setdefault(k, v)
+    return result
 
 
 def _run_pytest_test(node: "Node", ctx: "Context", *, label: str) -> "Result":
@@ -2204,6 +2328,7 @@ TYPE_REGISTRY: dict[str, Handler] = {
     "gate_es": _gate_es,
     "gate_er": _gate_er,
     "gate_code_standards": _gate_code_standards,
+    "gate_slash": _gate_slash,
     "gate_red": _gate_red,
     "gate_green": _gate_green,
     "parallel": _parallel_fanout,       # fan-out type (type=parallel)

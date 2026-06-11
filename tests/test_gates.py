@@ -26,6 +26,8 @@ def test_parse_verdict_pass_warn_fail():
     assert _parse_verdict("blah\nVERDICT: PASS\n")[1] == "success"
     assert _parse_verdict("Overall: WARN — minor")[1] == "success"
     assert _parse_verdict("verdict: FAIL")[1] == "failure"
+    assert _parse_verdict("**Verdict: APPROVE.** Clean deletion commit.")[1] == "success"
+    assert _parse_verdict("Verdict: REQUEST CHANGES — presumptive blocker.")[1] == "failure"
     assert _parse_verdict("Verdict: PARTIAL")[1] == "failure"
     assert _parse_verdict("verdict: INCONCLUSIVE")[1] == "failure"
     # Standalone-line fallback fires when no marker is present.
@@ -36,7 +38,8 @@ def test_parse_verdict_pass_warn_fail():
 
 def test_gate_echo_seeded_outcome(monkeypatch):
     """Gate handlers in echo mode pull outcome from ctx.state."""
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     g = parse(_pipeline("gates.dot"))
@@ -54,7 +57,8 @@ def test_gate_echo_seeded_outcome(monkeypatch):
 def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
     """Holdout-always policy: pr_gates.dot runs sealed holdouts before the
     three adversarial gates, mirroring gates.dot."""
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     g = parse(_pipeline("pr_gates.dot"))
@@ -73,7 +77,8 @@ def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
 
 def test_pr_gates_holdout_failure_short_circuits(monkeypatch):
     """A holdout failure in pr_gates exits immediately — no evidence gates run."""
-    fake_holdout = lambda node, ctx: Result(outcome="failure", output="holdout FAIL")
+    def fake_holdout(node, ctx):
+        return Result(outcome="failure", output="holdout FAIL")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     g = parse(_pipeline("pr_gates.dot"))
@@ -87,7 +92,8 @@ def test_pr_gates_holdout_failure_short_circuits(monkeypatch):
 
 
 def test_gate_failure_short_circuits(monkeypatch):
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     g = parse(_pipeline("gates.dot"))
@@ -103,7 +109,8 @@ def test_gate_failure_short_circuits(monkeypatch):
 
 
 def test_gate_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path):
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     bin_dir = tmp_path / "bin"
@@ -123,7 +130,8 @@ def test_gate_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path):
 
 
 def test_cxdb_records_steps(tmp_path, monkeypatch):
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     db_path = tmp_path / "cxdb.sqlite"
@@ -149,7 +157,8 @@ def test_cxdb_records_steps(tmp_path, monkeypatch):
 
 
 def test_healer_reports_failures(tmp_path, monkeypatch):
-    fake_holdout = lambda node, ctx: Result(outcome="fail", output="boom")
+    def fake_holdout(node, ctx):
+        return Result(outcome="fail", output="boom")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     db_path = tmp_path / "cxdb.sqlite"
@@ -165,7 +174,8 @@ def test_healer_reports_failures(tmp_path, monkeypatch):
 
 def test_healer_reports_gate_infra_errors(tmp_path, monkeypatch):
     """Gate infra errors are terminal failures and must be diagnosable."""
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     g = parse(_pipeline("gates.dot"))
@@ -182,7 +192,8 @@ def test_healer_reports_gate_infra_errors(tmp_path, monkeypatch):
 
 
 def test_healer_no_failures(tmp_path, monkeypatch):
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     db_path = tmp_path / "cxdb.sqlite"
@@ -923,3 +934,281 @@ def test_gate_es_and_cs_with_prompt_attr_route_custom_prompt(monkeypatch, tmp_pa
     for _, prompt in seen:
         assert "CUSTOM REVIEW BODY xyz" in prompt
         assert "head_sha: feedc0de" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Universal infra fallback (codex/minimax/etc → claude) + infra_failure tag
+# ---------------------------------------------------------------------------
+
+
+def test_execute_gate_codex_infra_failure_falls_back_to_claude(tmp_path, monkeypatch):
+    """codex missing (FileNotFoundError) → claude fallback, recorded in metadata."""
+    import subprocess as _sp
+    from runner.handlers import _execute_gate, Context as HCtx
+
+    fake_sha = "f" * 40
+    seen: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        if os.path.basename(cmd[0]) == "codex":
+            raise FileNotFoundError("codex: command not found")
+        return _sp.CompletedProcess(
+            cmd, 0, stdout=f"head_sha: {fake_sha}\nverdict: pass\n", stderr=""
+        )
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+    result = _execute_gate("PROMPT", fake_sha, 300, ctx, "evidence", "codex")
+
+    assert result.outcome == "success"
+    assert result.metadata["fallback_used"] == "true"
+    assert result.metadata["fallback_from"] == "codex"
+    assert result.metadata["reviewer_backend"] == "claude"
+    assert os.path.basename(seen[0][0]) == "codex"
+    assert any(os.path.basename(c[0]) == "claude" for c in seen), (
+        "claude fallback must have been invoked after codex infra failure"
+    )
+
+
+def test_execute_gate_codex_real_fail_not_retried(tmp_path, monkeypatch):
+    """A genuine codex `verdict: fail` (matching SHA) is kept — no reviewer-shopping."""
+    import subprocess as _sp
+    from runner.handlers import _execute_gate, Context as HCtx
+
+    fake_sha = "a" * 40
+    seen: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        return _sp.CompletedProcess(
+            cmd, 0, stdout=f"head_sha: {fake_sha}\nverdict: fail\n", stderr=""
+        )
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+    result = _execute_gate("PROMPT", fake_sha, 300, ctx, "evidence", "codex")
+
+    assert result.outcome == "failure"
+    assert result.metadata["fallback_used"] == "false"
+    assert len(seen) == 1, "real FAIL verdict must not trigger a second backend"
+    assert os.path.basename(seen[0][0]) == "codex"
+
+
+def test_execute_gate_tags_infra_failure_when_all_backends_die(tmp_path, monkeypatch):
+    """codex times out AND the claude fallback times out → verdict: infra_failure,
+    so the operator can tell 'no reviewer ever graded the diff' from a real FAIL."""
+    import subprocess as _sp
+    from runner.handlers import _execute_gate, Context as HCtx
+
+    fake_sha = "b" * 40
+    seen: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        raise _sp.TimeoutExpired(cmd, 300, output=b"partial", stderr=None)
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+    result = _execute_gate("PROMPT", fake_sha, 300, ctx, "evidence", "codex")
+
+    assert result.outcome == "failure"
+    assert result.metadata["verdict"] == "infra_failure"
+    assert result.metadata["fallback_used"] == "true"
+    assert result.metadata["fallback_from"] == "codex"
+    assert os.path.basename(seen[0][0]) == "codex"
+    assert any(os.path.basename(c[0]) == "claude" for c in seen), (
+        "claude fallback must have been invoked after codex timeout"
+    )
+
+
+# ---------------------------------------------------------------------------
+# gate_slash — generic single-lane reviewer gate
+# ---------------------------------------------------------------------------
+
+
+def _slash_node(command: str | None):
+    attrs = {} if command is None else {"command": command}
+    return type("Node", (), {"name": "lane", "attrs": attrs, "shape": ""})()
+
+
+def test_gate_slash_missing_command_errors(tmp_path):
+    from runner.handlers import _gate_slash, Context as HCtx
+
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+    result = _gate_slash(_slash_node(None), ctx)
+    assert result.outcome == "error"
+    assert "missing required command attr" in result.output
+
+
+def test_gate_slash_unknown_command_errors(tmp_path, monkeypatch):
+    """Command absent from BOTH the target repo and user scope → error,
+    not a free-associated review."""
+    import pathlib as _pl
+    from runner.handlers import _gate_slash, Context as HCtx
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(_pl.Path, "home", staticmethod(lambda: fake_home))
+
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+    result = _gate_slash(_slash_node("zfc"), ctx)
+    assert result.outcome == "error"
+    assert "refusing to run an undefined review lane" in result.output
+
+
+def test_gate_slash_materializes_user_scope_command(tmp_path, monkeypatch):
+    """Command in ~/.claude/commands/ but not the repo → copied into the
+    workdir so every reviewer backend (incl. codex) resolves it repo-local."""
+    import pathlib as _pl
+    import subprocess as _sp
+    from runner.handlers import _gate_slash, Context as HCtx
+
+    fake_home = tmp_path / "home"
+    user_cmds = fake_home / ".claude" / "commands"
+    user_cmds.mkdir(parents=True)
+    (user_cmds / "zfc.md").write_text("# /zfc user-scope review")
+    monkeypatch.setattr(_pl.Path, "home", staticmethod(lambda: fake_home))
+
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    fake_sha = "d" * 40
+
+    def _fake_run(cmd, **kwargs):
+        return _sp.CompletedProcess(
+            cmd, 0, stdout=f"head_sha: {fake_sha}\nverdict: pass\n", stderr=""
+        )
+
+    monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    ctx = HCtx(goal="test", workdir=workdir, backend="claude")
+    result = _gate_slash(_slash_node("zfc"), ctx)
+
+    assert result.outcome == "success"
+    materialized = workdir / ".claude" / "commands" / "zfc.md"
+    assert materialized.exists(), "user-scope command must be copied into the workdir"
+    assert materialized.read_text() == "# /zfc user-scope review"
+
+
+def test_branch_context_keeps_parent_workdir_for_readonly_gates(tmp_path):
+    """Parallel branch isolation must NOT apply to read-only reviewer gates:
+    they need the real repo (SHA binding, .claude/commands/, the diff).
+    File-writing branch types still get tempdir isolation."""
+    from runner.engine import _branch_context
+    from runner.handlers import Context as HCtx
+
+    ctx = HCtx(goal="t", workdir=tmp_path, backend="claude")
+
+    for gate_type in ("gate_slash", "gate_es", "gate_er", "gate_code_standards", "holdout_eval"):
+        cloned = _branch_context(ctx, "lane", gate_type)
+        assert pathlib.Path(cloned.workdir) == tmp_path, (
+            f"{gate_type} branch must keep the parent workdir"
+        )
+
+    isolated = _branch_context(ctx, "impl", "codergen")
+    assert pathlib.Path(isolated.workdir) != tmp_path
+    assert str(isolated.workdir).startswith(str(tmp_path)), (
+        "codergen branch keeps tempdir isolation under the parent"
+    )
+
+
+def test_gate_slash_runs_named_command(tmp_path, monkeypatch):
+    """With .claude/commands/<cmd>.md present, the gate shells out `/cmd` with
+    SHA binding, identical to the named gates."""
+    import subprocess as _sp
+    from runner.handlers import _gate_slash, Context as HCtx
+
+    cmd_dir = tmp_path / ".claude" / "commands"
+    cmd_dir.mkdir(parents=True)
+    (cmd_dir / "zfc.md").write_text("# /zfc review")
+
+    fake_sha = "c" * 40
+    seen_prompts: list[str] = []
+
+    def _fake_run(cmd, **kwargs):
+        seen_prompts.append(cmd[-1])
+        return _sp.CompletedProcess(
+            cmd, 0, stdout=f"head_sha: {fake_sha}\nverdict: pass\n", stderr=""
+        )
+
+    monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+    result = _gate_slash(_slash_node("zfc"), ctx)
+
+    assert result.outcome == "success"
+    assert result.metadata["slash_command"] == "zfc"
+    # The command file content must be INLINED into the prompt — a literal
+    # "/zfc" prompt is backend-dependent (claude vs codex resolve slash
+    # commands from different namespaces).
+    assert seen_prompts and "--- /zfc instructions ---" in seen_prompts[0]
+    assert "# /zfc review" in seen_prompts[0]
+    assert f"head_sha: {fake_sha}" in seen_prompts[0]
+    assert "verdict: <pass|warn|fail|partial>" in seen_prompts[0]
+
+
+def test_gate_slash_registered_in_type_registry():
+    from runner.handlers import TYPE_REGISTRY as REG
+
+    assert "gate_slash" in REG
+
+
+def test_pr_gates_split_cs_pipeline_parses_and_fans_out():
+    """The split-CS pipeline must parse, route through parallel CS lanes, and
+    join with wait_all semantics."""
+    g = parse(_pipeline("pr_gates_split_cs.dot"))
+    names = set(g.nodes)
+    for expected in ("cs_fanout", "gate_zfc", "gate_zfclevel", "gate_thermo", "cs_join"):
+        assert expected in names, f"missing node {expected}"
+    assert g.nodes["cs_fanout"].attrs.get("type") == "parallel"
+    assert g.nodes["cs_join"].attrs.get("type") == "join"
+    assert g.nodes["cs_join"].attrs.get("policy") == "wait_all"
+    for lane in ("gate_zfc", "gate_zfclevel", "gate_thermo"):
+        assert g.nodes[lane].attrs.get("type") == "gate_slash"
+        assert g.nodes[lane].attrs.get("command")
+
+
+def test_pr_gates_split_cs_echo_run_executes_parallel_lanes(monkeypatch):
+    """Engine-level echo run: the split-CS pipeline routes through the parallel
+    CS lanes and joins wait_all → success when every lane passes."""
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+
+    g = parse(_pipeline("pr_gates_split_cs.dot"))
+    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    for n in ("gate_es", "gate_er", "gate_zfc", "gate_zfclevel", "gate_thermo"):
+        ctx.state[f"{n}.outcome"] = "success"
+
+    history = run(g, ctx, max_steps=30)
+    nodes = [r.node for r in history]
+    assert history[-1].outcome == "success"
+    for lane in ("gate_zfc", "gate_zfclevel", "gate_thermo"):
+        assert lane in nodes, f"lane {lane} never executed"
+    assert "cs_join" in nodes
+
+
+def test_pr_gates_split_cs_echo_run_fails_when_one_lane_fails(monkeypatch):
+    """wait_all join: a single failing CS lane fails the pipeline."""
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+
+    g = parse(_pipeline("pr_gates_split_cs.dot"))
+    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    for n in ("gate_es", "gate_er", "gate_zfc", "gate_thermo"):
+        ctx.state[f"{n}.outcome"] = "success"
+    ctx.state["gate_zfclevel.outcome"] = "failure"
+
+    history = run(g, ctx, max_steps=30)
+    assert history[-1].outcome == "failure"

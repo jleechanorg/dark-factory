@@ -220,7 +220,25 @@ def _clone_context(ctx: Context) -> Context:
     )
 
 
-def _branch_context(ctx: Context, branch_name: str) -> Context:
+# Branch-start node types that must run against the REAL parent workdir.
+# Reviewer gates are read-only and SHA-bound (they review the repo at
+# ctx.workdir's HEAD); holdout_eval resolves the implementation path from
+# ctx.workdir. Handing these an empty isolation tempdir breaks them — the
+# gate can't resolve a HEAD SHA, find .claude/commands/, or see the diff.
+# Only file-WRITING branches (codergen, tool) need tempdir isolation.
+#
+# NOTE: gate_red / gate_green are intentionally excluded. They run pytest
+# in ctx.workdir and write .pyc / .pytest_cache / coverage artifacts; two
+# parallel branches sharing the parent workdir would race on those writes.
+# If you ever need to parallelize them, give them their own per-branch
+# tempdir and have the gate bind to ctx.workdir's HEAD SHA explicitly.
+_READ_ONLY_BRANCH_TYPES = frozenset({
+    "gate_es", "gate_er", "gate_code_standards", "gate_slash",
+    "holdout_eval",
+})
+
+
+def _branch_context(ctx: Context, branch_name: str, node_type: str = "") -> Context:
     """Clone ctx and assign a unique per-branch workdir subdirectory.
 
     File-writing backends (claude, codex, agy) spawn subprocesses with
@@ -229,8 +247,14 @@ def _branch_context(ctx: Context, branch_name: str) -> Context:
     so their file operations are independent.  If the parent workdir is not a
     valid directory (e.g. None or a non-existent path) fall back to a
     system-managed tmp dir.
+
+    Branches that start at a read-only node type (reviewer gates,
+    holdout_eval) skip isolation and keep the parent workdir — they need the
+    real repo, and being read-only they cannot race each other.
     """
     cloned = _clone_context(ctx)
+    if node_type in _READ_ONLY_BRANCH_TYPES:
+        return cloned
     parent = pathlib.Path(ctx.workdir) if ctx.workdir else None
     try:
         base = parent if (parent and parent.is_dir()) else None
@@ -1236,7 +1260,12 @@ def run(
                             _futures = {
                                 _executor.submit(
                                     _run_branch_until_join,
-                                    graph, _bs, _branch_context(ctx, _bs.name), _jn,
+                                    graph, _bs,
+                                    _branch_context(
+                                        ctx, _bs.name,
+                                        str(_bs.attrs.get("type", "")),
+                                    ),
+                                    _jn,
                                     _seq_ref, _seq_lock, _cxdb_path,
                                     max_steps,  # pass outer limit to prevent branch hangs
                                 ): _bs.name
