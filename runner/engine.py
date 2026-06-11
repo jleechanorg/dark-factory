@@ -226,9 +226,15 @@ def _clone_context(ctx: Context) -> Context:
 # ctx.workdir. Handing these an empty isolation tempdir breaks them — the
 # gate can't resolve a HEAD SHA, find .claude/commands/, or see the diff.
 # Only file-WRITING branches (codergen, tool) need tempdir isolation.
+#
+# NOTE: gate_red / gate_green are intentionally excluded. They run pytest
+# in ctx.workdir and write .pyc / .pytest_cache / coverage artifacts; two
+# parallel branches sharing the parent workdir would race on those writes.
+# If you ever need to parallelize them, give them their own per-branch
+# tempdir and have the gate bind to ctx.workdir's HEAD SHA explicitly.
 _READ_ONLY_BRANCH_TYPES = frozenset({
     "gate_es", "gate_er", "gate_code_standards", "gate_slash",
-    "gate_red", "gate_green", "holdout_eval",
+    "holdout_eval",
 })
 
 
