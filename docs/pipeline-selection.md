@@ -20,7 +20,7 @@ task. If the user passes `--pipeline`, use it. Otherwise classify the goal first
 | Produce a reviewed spec only (no implementation) | `pipelines/slim/spec_gen.dot` | explore → plan → cold spec review → fix loop; no implement node; rejects specs with parallel lanes lacking a file-ownership matrix |
 | Research report only (no implementation) | `pipelines/slim/minimal_research.dot` | explore fanout → research → exit; writes `.dark-factory/research-findings.md`; no implement node |
 | Brownfield replace / delete | **custom goal + often `minimal_feature.dot` or custom `.dot`** | apply factory-spec delete-first rules; never treat as greenfield additive |
-| Repo-specific pipeline (in the target repo itself) | `<target_repo>/dark-factory/pipelines/<name>.dot` | dark-factory's runner also looks up `--pipeline <name>` under `<workdir>/dark-factory/pipelines/`; use this for graphs that hardcode the target repo's slash commands (e.g. worldarchitect's `pr_gates_split_cs.dot` uses `/zfc`, `/zfclevel`, `/thermo`). The runner tries this **before** falling through to `$DARK_FACTORY_HOME/pipelines/`. |
+| Repo-specific pipeline (in the target repo itself) | `<target_repo>/dark-factory/pipelines/<name>.dot` | dark-factory's runner looks up `--pipeline <name>` (bare filename only) under `<workdir>/dark-factory/pipelines/` **before** delegating to `resolve_factory_path(<name>)`, which itself checks cwd → `$DARK_FACTORY_HOME/<name>`. Use this for graphs that hardcode the target repo's slash commands (e.g. worldarchitect's `pr_gates_split_cs.dot` uses `/zfc`, `/zfclevel`, `/thermo`). The `<workdir>/dark-factory/pipelines/` lookup is the target-repo subdir convention; see `runner/paths.py::resolve_pipeline_path` for the canonical order. |
 
 ## Holdout-always policy
 
