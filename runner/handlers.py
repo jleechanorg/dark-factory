@@ -1175,7 +1175,16 @@ def _run_gate_once(
             timeout=run_timeout, check=False, env=sub_env,
         )
     except subprocess.TimeoutExpired as exc:
-        combined = (exc.stdout or "") + "\n" + (exc.stderr or "")
+        # TimeoutExpired carries bytes for stdout/stderr even when the run
+        # used text=True — coerce before concatenating.
+        def _as_text(v: "str | bytes | None") -> str:
+            if v is None:
+                return ""
+            if isinstance(v, bytes):
+                return v.decode("utf-8", errors="replace")
+            return v
+
+        combined = _as_text(exc.stdout) + "\n" + _as_text(exc.stderr)
         return Result(
             outcome="failure",
             output=combined.strip() or f"gate {name} timed out after {run_timeout}s",
