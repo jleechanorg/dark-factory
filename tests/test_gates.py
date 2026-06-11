@@ -36,7 +36,8 @@ def test_parse_verdict_pass_warn_fail():
 
 def test_gate_echo_seeded_outcome(monkeypatch):
     """Gate handlers in echo mode pull outcome from ctx.state."""
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     g = parse(_pipeline("gates.dot"))
@@ -54,7 +55,8 @@ def test_gate_echo_seeded_outcome(monkeypatch):
 def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
     """Holdout-always policy: pr_gates.dot runs sealed holdouts before the
     three adversarial gates, mirroring gates.dot."""
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     g = parse(_pipeline("pr_gates.dot"))
@@ -73,7 +75,8 @@ def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
 
 def test_pr_gates_holdout_failure_short_circuits(monkeypatch):
     """A holdout failure in pr_gates exits immediately — no evidence gates run."""
-    fake_holdout = lambda node, ctx: Result(outcome="failure", output="holdout FAIL")
+    def fake_holdout(node, ctx):
+        return Result(outcome="failure", output="holdout FAIL")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     g = parse(_pipeline("pr_gates.dot"))
@@ -87,7 +90,8 @@ def test_pr_gates_holdout_failure_short_circuits(monkeypatch):
 
 
 def test_gate_failure_short_circuits(monkeypatch):
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     g = parse(_pipeline("gates.dot"))
@@ -103,7 +107,8 @@ def test_gate_failure_short_circuits(monkeypatch):
 
 
 def test_gate_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path):
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     bin_dir = tmp_path / "bin"
@@ -123,7 +128,8 @@ def test_gate_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path):
 
 
 def test_cxdb_records_steps(tmp_path, monkeypatch):
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     db_path = tmp_path / "cxdb.sqlite"
@@ -149,7 +155,8 @@ def test_cxdb_records_steps(tmp_path, monkeypatch):
 
 
 def test_healer_reports_failures(tmp_path, monkeypatch):
-    fake_holdout = lambda node, ctx: Result(outcome="fail", output="boom")
+    def fake_holdout(node, ctx):
+        return Result(outcome="fail", output="boom")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     db_path = tmp_path / "cxdb.sqlite"
@@ -165,7 +172,8 @@ def test_healer_reports_failures(tmp_path, monkeypatch):
 
 def test_healer_reports_gate_infra_errors(tmp_path, monkeypatch):
     """Gate infra errors are terminal failures and must be diagnosable."""
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     g = parse(_pipeline("gates.dot"))
@@ -182,7 +190,8 @@ def test_healer_reports_gate_infra_errors(tmp_path, monkeypatch):
 
 
 def test_healer_no_failures(tmp_path, monkeypatch):
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     db_path = tmp_path / "cxdb.sqlite"
@@ -957,6 +966,9 @@ def test_execute_gate_codex_infra_failure_falls_back_to_claude(tmp_path, monkeyp
     assert result.metadata["fallback_from"] == "codex"
     assert result.metadata["reviewer_backend"] == "claude"
     assert os.path.basename(seen[0][0]) == "codex"
+    assert any(os.path.basename(c[0]) == "claude" for c in seen), (
+        "claude fallback must have been invoked after codex infra failure"
+    )
 
 
 def test_execute_gate_codex_real_fail_not_retried(tmp_path, monkeypatch):
@@ -992,8 +1004,10 @@ def test_execute_gate_tags_infra_failure_when_all_backends_die(tmp_path, monkeyp
     from runner.handlers import _execute_gate, Context as HCtx
 
     fake_sha = "b" * 40
+    seen: list[list[str]] = []
 
     def _fake_run(cmd, **kwargs):
+        seen.append(cmd)
         raise _sp.TimeoutExpired(cmd, 300, output=b"partial", stderr=None)
 
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
@@ -1006,6 +1020,10 @@ def test_execute_gate_tags_infra_failure_when_all_backends_die(tmp_path, monkeyp
     assert result.metadata["verdict"] == "infra_failure"
     assert result.metadata["fallback_used"] == "true"
     assert result.metadata["fallback_from"] == "codex"
+    assert os.path.basename(seen[0][0]) == "codex"
+    assert any(os.path.basename(c[0]) == "claude" for c in seen), (
+        "claude fallback must have been invoked after codex timeout"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1156,7 +1174,8 @@ def test_pr_gates_split_cs_pipeline_parses_and_fans_out():
 def test_pr_gates_split_cs_echo_run_executes_parallel_lanes(monkeypatch):
     """Engine-level echo run: the split-CS pipeline routes through the parallel
     CS lanes and joins wait_all → success when every lane passes."""
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     g = parse(_pipeline("pr_gates_split_cs.dot"))
@@ -1174,7 +1193,8 @@ def test_pr_gates_split_cs_echo_run_executes_parallel_lanes(monkeypatch):
 
 def test_pr_gates_split_cs_echo_run_fails_when_one_lane_fails(monkeypatch):
     """wait_all join: a single failing CS lane fails the pipeline."""
-    fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
 
     g = parse(_pipeline("pr_gates_split_cs.dot"))
