@@ -1437,34 +1437,40 @@ def _coerce_bool_attr(value: object) -> bool:
 def _execute_gate(
     prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str, backend: str
 ) -> "Result":
-    """Run a reviewer gate on ``backend``; agy falls back to claude on infra failure.
+    """Run a reviewer gate on ``backend``; infra failures fall back to claude.
 
     Routing rules:
-      - ``backend == "agy"`` → run agy; if the result is an infra failure
-        (missing binary, sandbox unavailable, timeout, unparseable output,
-        SHA mismatch with no real verdict), fall back to ``claude``. A real
-        agy ``fail``/``partial`` is kept as-is (no-reviewer-shopping).
-      - Any other resolved name (``codex``, ``minimax``, ``claude-sonnet``,
-        ``claude``) → run on that backend. No silent re-routing to a
-        different vendor.
+      - Run the resolved backend. If the result is an *infrastructure*
+        failure (missing binary, sandbox unavailable, timeout, unparseable
+        output, SHA mismatch with no real verdict) and the backend is not
+        already claude-routed, fall back to ``claude`` — recorded in
+        metadata (``fallback_used`` / ``fallback_from``), never silent.
+      - A real ``fail``/``partial`` verdict from any backend is kept as-is
+        (no-reviewer-shopping): only non-verdicts trigger the fallback.
+      - Any result that is still an infra failure after routing carries
+        ``verdict: infra_failure`` so operators and downstream conditions can
+        distinguish "the reviewer never graded the diff" from a real FAIL.
 
     ``_run_gate_once`` is the single point that builds the argv + env per
     backend, so the dispatch is end-to-end: a priority-queue resolution of
     ``codex`` actually invokes the codex subprocess, with
     ``reviewer_backend: codex`` recorded in the result metadata.
     """
-    if backend == "agy":
-        result = _run_gate_once("agy", prompt, expected_sha, timeout, ctx, name)
-        if _is_gate_infra_failure(result):
-            fallback = _run_gate_once("claude", prompt, expected_sha, timeout, ctx, name)
-            fallback.metadata["fallback_used"] = "true"
-            fallback.metadata["fallback_from"] = "agy"
-            return fallback
-        result.metadata.setdefault("fallback_used", "false")
-        return result
-    # codex / minimax / claude-sonnet / bare "claude" → run on the
-    # resolved backend. No silent re-routing to a different vendor.
-    return _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name)
+    result = _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name)
+    # minimax shares the claude CLI binary but grades via a different
+    # gateway/model, so claude is still a genuine infra fallback for it.
+    claude_routed = backend in ("claude", "claude-sonnet")
+    if _is_gate_infra_failure(result) and not claude_routed:
+        fallback = _run_gate_once("claude", prompt, expected_sha, timeout, ctx, name)
+        fallback.metadata["fallback_used"] = "true"
+        fallback.metadata["fallback_from"] = backend
+        if _is_gate_infra_failure(fallback):
+            fallback.metadata["verdict"] = "infra_failure"
+        return fallback
+    result.metadata.setdefault("fallback_used", "false")
+    if _is_gate_infra_failure(result):
+        result.metadata["verdict"] = "infra_failure"
+    return result
 
 
 def _slash_gate(slash_command: str, default_args: str = "") -> Handler:
@@ -1735,6 +1741,49 @@ def _gate_code_standards(node: "Node", ctx: "Context") -> "Result":
     if local_cmd.exists():
         return _slash_gate("code-standards")(node, ctx)
     return _run_universal_prompt_gate(UNIVERSAL_CODE_STANDARDS_PROMPT, "gate_code_standards", node, ctx)
+
+
+def _gate_slash(node: "Node", ctx: "Context") -> "Result":
+    """Generic single-lane reviewer gate: ``type="gate_slash" command="zfc"``.
+
+    Runs ``/<command>`` on the reviewer backend with the same SHA binding and
+    verdict parsing as the named gates. Built for decomposing orchestrator
+    slash commands into per-lane pipeline nodes: a command like
+    ``/code-standards`` instructs the *agent* to fan out several sub-reviews,
+    which single-subprocess backends (``codex exec``) cannot do — they burn
+    the gate timeout ingesting every lane's skill text and die before any
+    verdict. With ``gate_slash`` the .dot graph owns the fan-out
+    (``type=parallel`` → one ``gate_slash`` node per lane → ``type=join``),
+    so each subprocess loads exactly one lane's skill.
+
+    The named command must exist in the target repo
+    (``.claude/commands/<command>.md``); otherwise the gate errors rather
+    than letting the backend free-associate a review.
+    """
+    command = str(node.attrs.get("command", "")).strip().lstrip("/")
+    if not command:
+        return Result(
+            outcome="error",
+            output=f"gate_slash node {node.name!r} missing required command attr",
+            metadata={"verdict": "unknown", "slash_command": ""},
+        )
+    if _node_prompt_ref(node):
+        return _run_custom_prompt_gate(node, ctx, f"gate_{command}")
+    # Echo/mock backends never shell out, so the command-file requirement
+    # doesn't apply — let the echo branch in _slash_gate seed the outcome.
+    if ctx.backend in ("echo", "mock_llm"):
+        return _slash_gate(command)(node, ctx)
+    local_cmd = ctx.workdir / ".claude" / "commands" / f"{command}.md"
+    if not local_cmd.exists():
+        return Result(
+            outcome="error",
+            output=(
+                f"gate_slash: /{command} not found in target repo "
+                f"({local_cmd}) — refusing to run an undefined review lane"
+            ),
+            metadata={"verdict": "unknown", "slash_command": command},
+        )
+    return _slash_gate(command)(node, ctx)
 
 
 def _run_pytest_test(node: "Node", ctx: "Context", *, label: str) -> "Result":
@@ -2213,6 +2262,7 @@ TYPE_REGISTRY: dict[str, Handler] = {
     "gate_es": _gate_es,
     "gate_er": _gate_er,
     "gate_code_standards": _gate_code_standards,
+    "gate_slash": _gate_slash,
     "gate_red": _gate_red,
     "gate_green": _gate_green,
     "parallel": _parallel_fanout,       # fan-out type (type=parallel)

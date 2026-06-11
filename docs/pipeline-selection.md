@@ -15,6 +15,7 @@ task. If the user passes `--pipeline`, use it. Otherwise classify the goal first
 | Bug fix with red/green discipline | `pipelines/bug_fix.dot` | reproduce (fresh test) → red gate → fix → green gate → holdout → adversarial evidence; max 3 fix visits |
 | Validate diff + sealed holdout | `pipelines/factory/gates.dot` | code already implemented |
 | Validate in-flight PR | `pipelines/factory/pr_gates.dot` | holdout + evidence gates (no fix loop) |
+| Validate PR with codex/single-subprocess reviewers | `pipelines/factory/pr_gates_split_cs.dot` | code-standards decomposed into parallel `gate_slash` lanes (`/zfc`, `/zfclevel`, `/thermo`); use when the reviewer backend cannot fan out subagents — `/code-standards` monolith times out on `codex exec` |
 | Spec review (line-aware, slim) | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | acceptance + codex reviewer |
 | Spec review (+ stack smoke) | `benchmarks/attractor-spec-review/pipelines/review_full.dot` | adds fullstack smoke |
 | Produce a reviewed spec only (no implementation) | `pipelines/slim/spec_gen.dot` | explore → plan → cold spec review → fix loop; no implement node; rejects specs with parallel lanes lacking a file-ownership matrix |
