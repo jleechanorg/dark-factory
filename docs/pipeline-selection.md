@@ -15,12 +15,12 @@ task. If the user passes `--pipeline`, use it. Otherwise classify the goal first
 | Bug fix with red/green discipline | `pipelines/bug_fix.dot` | reproduce (fresh test) → red gate → fix → green gate → holdout → adversarial evidence; max 3 fix visits |
 | Validate diff + sealed holdout | `pipelines/factory/gates.dot` | code already implemented |
 | Validate in-flight PR | `pipelines/factory/pr_gates.dot` | holdout + evidence gates (no fix loop) |
-| Validate PR with codex/single-subprocess reviewers | `pipelines/factory/pr_gates_split_cs.dot` | code-standards decomposed into parallel `gate_slash` lanes (`/zfc`, `/zfclevel`, `/thermo`); use when the reviewer backend cannot fan out subagents — `/code-standards` monolith times out on `codex exec` |
 | Spec review (line-aware, slim) | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | acceptance + codex reviewer |
 | Spec review (+ stack smoke) | `benchmarks/attractor-spec-review/pipelines/review_full.dot` | adds fullstack smoke |
 | Produce a reviewed spec only (no implementation) | `pipelines/slim/spec_gen.dot` | explore → plan → cold spec review → fix loop; no implement node; rejects specs with parallel lanes lacking a file-ownership matrix |
 | Research report only (no implementation) | `pipelines/slim/minimal_research.dot` | explore fanout → research → exit; writes `.dark-factory/research-findings.md`; no implement node |
 | Brownfield replace / delete | **custom goal + often `minimal_feature.dot` or custom `.dot`** | apply factory-spec delete-first rules; never treat as greenfield additive |
+| Repo-specific pipeline (in the target repo itself) | `<target_repo>/dark-factory/pipelines/<name>.dot` | dark-factory's runner also looks up `--pipeline <name>` under `<workdir>/dark-factory/pipelines/`; use this for graphs that hardcode the target repo's slash commands (e.g. worldarchitect's `pr_gates_split_cs.dot` uses `/zfc`, `/zfclevel`, `/thermo`). The runner tries this **before** falling through to `$DARK_FACTORY_HOME/pipelines/`. |
 
 ## Holdout-always policy
 

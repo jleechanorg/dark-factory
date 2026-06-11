@@ -1163,52 +1163,11 @@ def test_gate_slash_registered_in_type_registry():
     assert "gate_slash" in REG
 
 
-def test_pr_gates_split_cs_pipeline_parses_and_fans_out():
-    """The split-CS pipeline must parse, route through parallel CS lanes, and
-    join with wait_all semantics."""
-    g = parse(_pipeline("pr_gates_split_cs.dot"))
-    names = set(g.nodes)
-    for expected in ("cs_fanout", "gate_zfc", "gate_zfclevel", "gate_thermo", "cs_join"):
-        assert expected in names, f"missing node {expected}"
-    assert g.nodes["cs_fanout"].attrs.get("type") == "parallel"
-    assert g.nodes["cs_join"].attrs.get("type") == "join"
-    assert g.nodes["cs_join"].attrs.get("policy") == "wait_all"
-    for lane in ("gate_zfc", "gate_zfclevel", "gate_thermo"):
-        assert g.nodes[lane].attrs.get("type") == "gate_slash"
-        assert g.nodes[lane].attrs.get("command")
-
-
-def test_pr_gates_split_cs_echo_run_executes_parallel_lanes(monkeypatch):
-    """Engine-level echo run: the split-CS pipeline routes through the parallel
-    CS lanes and joins wait_all → success when every lane passes."""
-    def fake_holdout(node, ctx):
-        return Result(outcome="success", output="ok")
-    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
-
-    g = parse(_pipeline("pr_gates_split_cs.dot"))
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
-    for n in ("gate_es", "gate_er", "gate_zfc", "gate_zfclevel", "gate_thermo"):
-        ctx.state[f"{n}.outcome"] = "success"
-
-    history = run(g, ctx, max_steps=30)
-    nodes = [r.node for r in history]
-    assert history[-1].outcome == "success"
-    for lane in ("gate_zfc", "gate_zfclevel", "gate_thermo"):
-        assert lane in nodes, f"lane {lane} never executed"
-    assert "cs_join" in nodes
-
-
-def test_pr_gates_split_cs_echo_run_fails_when_one_lane_fails(monkeypatch):
-    """wait_all join: a single failing CS lane fails the pipeline."""
-    def fake_holdout(node, ctx):
-        return Result(outcome="success", output="ok")
-    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
-
-    g = parse(_pipeline("pr_gates_split_cs.dot"))
-    ctx = Context(goal="t", workdir=ROOT, backend="echo")
-    for n in ("gate_es", "gate_er", "gate_zfc", "gate_thermo"):
-        ctx.state[f"{n}.outcome"] = "success"
-    ctx.state["gate_zfclevel.outcome"] = "failure"
-
-    history = run(g, ctx, max_steps=30)
-    assert history[-1].outcome == "failure"
+# NOTE: \ was removed in the
+# "remove worldarchitect-specific leak" follow-up. That graph hardcoded
+# worldarchitect.ai slash commands (\, \, \) and now
+# lives at \ in
+# the worldarchitect.ai repo (target-repo subdir convention). Engine-level
+# mechanics of parallel gate_slash fan-outs are exercised by the
+# \ tests above and the general parallel/join engine
+# tests in tests/test_engine.py.
