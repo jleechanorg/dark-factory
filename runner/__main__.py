@@ -285,7 +285,22 @@ def main(argv: list[str] | None = None) -> int:
             "steps": len(history),
             "final_outcome": history[-1].outcome if history else "empty",
             "trace": [
-                {"node": r.node, "outcome": r.outcome, "preview": r.output_preview[:120]}
+                {
+                    "node": r.node,
+                    "outcome": r.outcome,
+                    "preview": r.output_preview[:120],
+                    # Reviewer-gate audit fields — without these every gate
+                    # failure needs transcript forensics to attribute infra
+                    # vs a real FAIL verdict.
+                    **{
+                        k: v
+                        for k, v in (r.metadata or {}).items()
+                        if k in (
+                            "verdict", "reviewer_backend", "fallback_used",
+                            "fallback_from", "head_sha_status", "timed_out",
+                        )
+                    },
+                }
                 for r in history
             ],
         }

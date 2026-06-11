@@ -26,6 +26,8 @@ def test_parse_verdict_pass_warn_fail():
     assert _parse_verdict("blah\nVERDICT: PASS\n")[1] == "success"
     assert _parse_verdict("Overall: WARN — minor")[1] == "success"
     assert _parse_verdict("verdict: FAIL")[1] == "failure"
+    assert _parse_verdict("**Verdict: APPROVE.** Clean deletion commit.")[1] == "success"
+    assert _parse_verdict("Verdict: REQUEST CHANGES — presumptive blocker.")[1] == "failure"
     assert _parse_verdict("Verdict: PARTIAL")[1] == "failure"
     assert _parse_verdict("verdict: INCONCLUSIVE")[1] == "failure"
     # Standalone-line fallback fires when no marker is present.
@@ -1146,8 +1148,13 @@ def test_gate_slash_runs_named_command(tmp_path, monkeypatch):
 
     assert result.outcome == "success"
     assert result.metadata["slash_command"] == "zfc"
-    assert seen_prompts and seen_prompts[0].startswith("/zfc ")
+    # The command file content must be INLINED into the prompt — a literal
+    # "/zfc" prompt is backend-dependent (claude vs codex resolve slash
+    # commands from different namespaces).
+    assert seen_prompts and "--- /zfc instructions ---" in seen_prompts[0]
+    assert "# /zfc review" in seen_prompts[0]
     assert f"head_sha: {fake_sha}" in seen_prompts[0]
+    assert "verdict: <pass|warn|fail|partial>" in seen_prompts[0]
 
 
 def test_gate_slash_registered_in_type_registry():

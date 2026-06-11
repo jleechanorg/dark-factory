@@ -958,6 +958,8 @@ def _claude_json_result(stdout: str, stderr: str, wall_ms: int) -> tuple[str, di
 _VERDICT_NORMALIZE = {
     "pass": "success",
     "warn": "success",
+    "approve": "success",   # review-style vocabulary ("Verdict: APPROVE")
+    "approved": "success",
     "fail": "failure",
     "partial": "failure",
     "inconclusive": "failure",
@@ -965,6 +967,9 @@ _VERDICT_NORMALIZE = {
     "invalid": "failure",
     "incomplete": "failure",
     "conditional": "failure",  # non-standard verdict (architectural concern) → failure
+    "reject": "failure",
+    "rejected": "failure",
+    "blocker": "failure",
 }
 
 # A gate response must echo back `head_sha: <40-hex>` so we can bind the
@@ -1013,7 +1018,8 @@ def _verify_head_sha_echo(text: str, expected_sha: str) -> tuple[bool, str]:
 
 # The set of recognized verdict tokens, shared by the marker + standalone regexes.
 _VERDICT_TOKEN = (
-    r"(?:pass|warn|fail|partial|inconclusive|insufficient|invalid|incomplete|conditional)"
+    r"(?:pass|warn|approved?|fail|partial|inconclusive|insufficient|invalid"
+    r"|incomplete|conditional|rejected?|blocker)"
 )
 
 # Anchored regex: a verdict token must follow a marker ("verdict:", "overall:",
@@ -1800,7 +1806,50 @@ def _gate_slash(node: "Node", ctx: "Context") -> "Result":
                 ),
                 metadata={"verdict": "unknown", "slash_command": command},
             )
-    return _slash_gate(command)(node, ctx)
+
+    # Inline the command file's content instead of sending a literal
+    # "/<command>" prompt. Each reviewer CLI resolves slash commands from a
+    # different namespace (claude: project + user commands; codex:
+    # ~/.codex/prompts), so "/cmd" prompts are backend-dependent — observed
+    # live as codex/claude "Unknown command: /zfc" lane failures. Inlined
+    # instructions are universal across backends.
+    expected_sha = _worktree_head_sha(ctx.workdir)
+    if expected_sha is None:
+        return Result(
+            outcome="error",
+            output=f"gate /{command} cannot resolve HEAD SHA for {ctx.workdir}",
+            metadata={"slash_command": command, "verdict": "unknown",
+                      "head_sha_status": "missing"},
+        )
+    try:
+        cmd_text = local_cmd.read_text()
+    except OSError as exc:
+        return Result(
+            outcome="error",
+            output=f"gate_slash: cannot read {local_cmd}: {exc}",
+            metadata={"verdict": "unknown", "slash_command": command},
+        )
+    target = node.attrs.get("target", str(ctx.workdir))
+    prompt = (
+        f"You are the /{command} review lane, running as a READ-ONLY reviewer "
+        f"gate. Do not modify any files.\n\n"
+        f"Target under review: {target}\n\n"
+        f"--- /{command} instructions ---\n{cmd_text}\n--- end instructions ---\n"
+        f"\n<!-- RUNNER BINDING REQUIREMENT (non-negotiable) -->\n"
+        f"expected_head_sha: {expected_sha}\n\n"
+        f"CRITICAL: Your response MUST include BOTH of the following lines "
+        f"verbatim (machine-parsed; do not omit, paraphrase, or put inside a "
+        f"code block):\n"
+        f"head_sha: {expected_sha}\n"
+        f"verdict: <pass|warn|fail|partial>\n"
+    )
+    timeout = _coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
+    backend, gate_meta = _resolve_gate_backend(node, ctx)
+    result = _execute_gate(prompt, expected_sha, timeout, ctx, command, backend)
+    if gate_meta:
+        for k, v in gate_meta.items():
+            result.metadata.setdefault(k, v)
+    return result
 
 
 def _run_pytest_test(node: "Node", ctx: "Context", *, label: str) -> "Result":
