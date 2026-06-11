@@ -12,7 +12,7 @@ import traceback
 from .engine import run
 from .handlers import Context
 from .parser import parse, validate_pipeline
-from .paths import resolve_factory_path
+from .paths import resolve_factory_path, resolve_pipeline_path
 
 _PANIC_DIR = pathlib.Path.home() / ".dark-factory" / "panics"
 
@@ -201,7 +201,10 @@ def main(argv: list[str] | None = None) -> int:
             help="Pre-seed ctx.state; repeatable. E.g. --state slim.test_command=true",
         )
         args = p.parse_args(argv)
-        pipeline_path = resolve_factory_path(args.pipeline)
+        # --workdir defaults to cwd in the argparse setup above; the resolver
+        # uses it to also look up <workdir>/dark-factory/pipelines/<name> for
+        # bare-filename --pipeline values (target-repo subdir convention).
+        pipeline_path = resolve_pipeline_path(args.pipeline, workdir=args.workdir)
 
         if args.preflight:
             graph, diagnostics = validate_pipeline(pipeline_path)
