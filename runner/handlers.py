@@ -1775,14 +1775,31 @@ def _gate_slash(node: "Node", ctx: "Context") -> "Result":
         return _slash_gate(command)(node, ctx)
     local_cmd = ctx.workdir / ".claude" / "commands" / f"{command}.md"
     if not local_cmd.exists():
-        return Result(
-            outcome="error",
-            output=(
-                f"gate_slash: /{command} not found in target repo "
-                f"({local_cmd}) — refusing to run an undefined review lane"
-            ),
-            metadata={"verdict": "unknown", "slash_command": command},
-        )
+        # User-scope commands (~/.claude/commands/) are resolvable by the
+        # claude CLI but not by every reviewer backend (codex resolves
+        # in-repo files only). Materialize the command into the target
+        # workdir so all backends see it repo-local.
+        user_cmd = pathlib.Path.home() / ".claude" / "commands" / f"{command}.md"
+        if user_cmd.exists():
+            try:
+                local_cmd.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(user_cmd, local_cmd)
+            except OSError as exc:
+                return Result(
+                    outcome="error",
+                    output=f"gate_slash: failed to materialize /{command} into workdir: {exc}",
+                    metadata={"verdict": "unknown", "slash_command": command},
+                )
+        else:
+            return Result(
+                outcome="error",
+                output=(
+                    f"gate_slash: /{command} not found in target repo "
+                    f"({local_cmd}) or user scope ({user_cmd}) — "
+                    f"refusing to run an undefined review lane"
+                ),
+                metadata={"verdict": "unknown", "slash_command": command},
+            )
     return _slash_gate(command)(node, ctx)
 
 

@@ -1027,15 +1027,77 @@ def test_gate_slash_missing_command_errors(tmp_path):
     assert "missing required command attr" in result.output
 
 
-def test_gate_slash_unknown_command_errors(tmp_path):
-    """Command not present in the target repo's .claude/commands/ → error,
+def test_gate_slash_unknown_command_errors(tmp_path, monkeypatch):
+    """Command absent from BOTH the target repo and user scope → error,
     not a free-associated review."""
+    import pathlib as _pl
     from runner.handlers import _gate_slash, Context as HCtx
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(_pl.Path, "home", staticmethod(lambda: fake_home))
 
     ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
     result = _gate_slash(_slash_node("zfc"), ctx)
     assert result.outcome == "error"
     assert "refusing to run an undefined review lane" in result.output
+
+
+def test_gate_slash_materializes_user_scope_command(tmp_path, monkeypatch):
+    """Command in ~/.claude/commands/ but not the repo → copied into the
+    workdir so every reviewer backend (incl. codex) resolves it repo-local."""
+    import pathlib as _pl
+    import subprocess as _sp
+    from runner.handlers import _gate_slash, Context as HCtx
+
+    fake_home = tmp_path / "home"
+    user_cmds = fake_home / ".claude" / "commands"
+    user_cmds.mkdir(parents=True)
+    (user_cmds / "zfc.md").write_text("# /zfc user-scope review")
+    monkeypatch.setattr(_pl.Path, "home", staticmethod(lambda: fake_home))
+
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    fake_sha = "d" * 40
+
+    def _fake_run(cmd, **kwargs):
+        return _sp.CompletedProcess(
+            cmd, 0, stdout=f"head_sha: {fake_sha}\nverdict: pass\n", stderr=""
+        )
+
+    monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    ctx = HCtx(goal="test", workdir=workdir, backend="claude")
+    result = _gate_slash(_slash_node("zfc"), ctx)
+
+    assert result.outcome == "success"
+    materialized = workdir / ".claude" / "commands" / "zfc.md"
+    assert materialized.exists(), "user-scope command must be copied into the workdir"
+    assert materialized.read_text() == "# /zfc user-scope review"
+
+
+def test_branch_context_keeps_parent_workdir_for_readonly_gates(tmp_path):
+    """Parallel branch isolation must NOT apply to read-only reviewer gates:
+    they need the real repo (SHA binding, .claude/commands/, the diff).
+    File-writing branch types still get tempdir isolation."""
+    from runner.engine import _branch_context
+    from runner.handlers import Context as HCtx
+
+    ctx = HCtx(goal="t", workdir=tmp_path, backend="claude")
+
+    for gate_type in ("gate_slash", "gate_es", "gate_er", "gate_code_standards", "holdout_eval"):
+        cloned = _branch_context(ctx, "lane", gate_type)
+        assert pathlib.Path(cloned.workdir) == tmp_path, (
+            f"{gate_type} branch must keep the parent workdir"
+        )
+
+    isolated = _branch_context(ctx, "impl", "codergen")
+    assert pathlib.Path(isolated.workdir) != tmp_path
+    assert str(isolated.workdir).startswith(str(tmp_path)), (
+        "codergen branch keeps tempdir isolation under the parent"
+    )
 
 
 def test_gate_slash_runs_named_command(tmp_path, monkeypatch):
