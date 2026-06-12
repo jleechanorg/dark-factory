@@ -9,6 +9,7 @@
 #   ./install.sh --clear      # recreate .venv from scratch
 #   ./install.sh --no-smoke   # install only, skip smoke run
 #   ./install.sh --no-link    # skip ~/.local/bin symlinks
+#   ./install.sh --no-cmds    # skip ~/.claude/ commands+skills symlinks
 #
 # Requires: uv on PATH (https://docs.astral.sh/uv/)
 
@@ -23,9 +24,10 @@ LOCAL_BIN="${HOME}/.local/bin"
 CLEAR=0
 SMOKE=1
 LINK=1
+CMDS=1
 
 usage() {
-  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -33,6 +35,7 @@ while [[ $# -gt 0 ]]; do
     --clear) CLEAR=1; shift ;;
     --no-smoke) SMOKE=0; shift ;;
     --no-link) LINK=0; shift ;;
+    --no-cmds) CMDS=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -77,6 +80,39 @@ if [[ "${LINK}" -eq 1 ]]; then
   ln -sf "${BIN_DIR}/df-healer" "${LOCAL_BIN}/df-healer"
   echo "==> linked ${LOCAL_BIN}/dark-factory"
   echo "==> linked ${LOCAL_BIN}/df-healer"
+fi
+
+# Mirror repo-scope commands + skills to user-scope (~/.claude/) so /f /fs
+# /factory /factory-spec and the dark-factory / factory-spec skills resolve
+# from any cwd. The repo is the single source of truth — any drift in
+# ~/.claude/ is overwritten on re-run. Pass --no-cmds to skip.
+if [[ "${CMDS}" -eq 1 ]]; then
+  CLAUDE_DIR="${HOME}/.claude"
+  mkdir -p "${CLAUDE_DIR}/commands" "${CLAUDE_DIR}/skills"
+
+  # 4 factory commands — file symlinks so edits land in the repo
+  for cmd in f fs factory factory-spec; do
+    src="${REPO_ROOT}/.claude/commands/${cmd}.md"
+    dst="${CLAUDE_DIR}/commands/${cmd}.md"
+    if [[ -f "${src}" ]]; then
+      ln -sf "${src}" "${dst}"
+      echo "==> linked ${dst} -> ${src}"
+    else
+      echo "==> SKIP: ${src} not found" >&2
+    fi
+  done
+
+  # 2 factory skills — directory symlinks (cp -R would break on next run)
+  for skill in dark-factory factory-spec; do
+    src="${REPO_ROOT}/.claude/skills/${skill}"
+    dst="${CLAUDE_DIR}/skills/${skill}"
+    if [[ -d "${src}" ]]; then
+      ln -sfn "${src}" "${dst}"
+      echo "==> linked ${dst} -> ${src}"
+    else
+      echo "==> SKIP: ${src} not found" >&2
+    fi
+  done
 fi
 
 export DARK_FACTORY_HOME="${REPO_ROOT}"
