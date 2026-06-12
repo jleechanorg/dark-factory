@@ -20,15 +20,14 @@ import sys
 
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from runner.engine import run
-from runner.evidence import write_bundle, _HOLDOUT_PATH_TOKEN
-from runner.handlers import Context, Result, TYPE_REGISTRY
-from runner.parser import parse
+from conftest import _pipeline  # noqa: E402
 
-
-def _pipeline(name: str) -> pathlib.Path:
-    return ROOT / "pipelines" / "factory" / name
+from runner.engine import run  # noqa: E402
+from runner.evidence import write_bundle, _HOLDOUT_PATH_TOKEN  # noqa: E402
+from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
+from runner.parser import parse  # noqa: E402
 
 
 def _drive_run(tmp_path: pathlib.Path, monkeypatch) -> tuple[pathlib.Path, str, object]:

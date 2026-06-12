@@ -18,6 +18,9 @@ import pytest
 
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+
+from conftest import _pipeline  # noqa: E402
 
 import runner.handlers as handlers_mod  # noqa: E402
 from runner.cxdb import CXDB  # noqa: E402
@@ -37,8 +40,10 @@ from runner.parser import Edge, parse  # noqa: E402
 from runner.parser import Node, parse  # noqa: E402
 
 
-def _pipeline(name: str) -> pathlib.Path:
-    return ROOT / "pipelines" / "factory" / name
+# Resolved once; the hardcoded /Users/jleechan/... was a CLAUDE.md
+# discipline violation (path unreachable on dev machines without the
+# sealed repo; non-portable).
+SEALED_HOLDOUTS_REPO = pathlib.Path.home() / "projects" / "dark-factory-holdouts"
 
 
 # ---------------------------------------------------------------------------
@@ -354,8 +359,8 @@ def test_sanitized_env_strips_holdout_paths(monkeypatch):
 def test_tool_nodes_cannot_read_holdout_files():
     from runner.handlers import _tool
 
-    scenarios = (
-        "/Users/jleechan/projects/dark-factory-holdouts/holdouts/hello/scenarios.yaml"
+    scenarios = str(
+        SEALED_HOLDOUTS_REPO / "holdouts" / "hello" / "scenarios.yaml"
     )
     node = Node(
         name="tool_leak",
@@ -382,8 +387,8 @@ def test_tool_sandbox_still_denies_real_holdouts_when_env_overridden(monkeypatch
     fake_holdouts = tmp_path / "fake-holdouts"
     fake_holdouts.mkdir()
     monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(fake_holdouts))
-    scenarios = (
-        "/Users/jleechan/projects/dark-factory-holdouts/holdouts/hello/scenarios.yaml"
+    scenarios = str(
+        SEALED_HOLDOUTS_REPO / "holdouts" / "hello" / "scenarios.yaml"
     )
     node = Node(
         name="tool_leak",

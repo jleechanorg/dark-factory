@@ -22,14 +22,13 @@ import sys
 
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+
+from conftest import _pipeline  # noqa: E402
 
 from runner.engine import run  # noqa: E402
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.parser import parse  # noqa: E402
-
-
-def _pipeline(name: str) -> pathlib.Path:
-    return ROOT / "pipelines" / "factory" / name
 
 
 def _head_sha() -> str:

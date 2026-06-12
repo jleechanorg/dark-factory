@@ -30,10 +30,42 @@ from __future__ import annotations
 
 import os
 import pathlib
+import subprocess
+import sys
 
 import pytest
 
+from runner.parser import Node as _Node
+
 FIXTURE_HOLDOUTS = pathlib.Path(__file__).resolve().parent / "fixtures" / "holdout-eval"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def _pipeline(name: str) -> pathlib.Path:
+    """Return the absolute path to a pipeline .dot file in pipelines/factory/."""
+    return ROOT / "pipelines" / "factory" / name
+
+
+def run_conformance(*args: str, timeout: int = 60, env: dict | None = None) -> "subprocess.CompletedProcess[str]":
+    """Run `bin/conformance` with the given args, return CompletedProcess."""
+    return subprocess.run(
+        [sys.executable, str(ROOT / "bin" / "conformance"), *args],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+        check=False,
+    )
+
+
+def make_node(name: str = "test", **attrs) -> _Node:
+    """Build a real runner.parser.Node instance for tests that need a stub.
+
+    The audit found that test_gates.py and a few other tests used
+    type("Node", (), {...})() ad-hoc stubs. Use this helper instead.
+    """
+    return _Node(name=name, attrs=attrs)
 
 
 @pytest.fixture(autouse=True, scope="session")

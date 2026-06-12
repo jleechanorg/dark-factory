@@ -9,6 +9,9 @@ import sys
 
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+
+from conftest import _pipeline, make_node  # noqa: E402
 
 from runner.cxdb import CXDB  # noqa: E402
 from runner.engine import run  # noqa: E402
@@ -16,10 +19,6 @@ from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.handlers import _parse_verdict  # noqa: E402
 from runner.healer import report  # noqa: E402
 from runner.parser import parse  # noqa: E402
-
-
-def _pipeline(name: str) -> pathlib.Path:
-    return ROOT / "pipelines" / "factory" / name
 
 
 def test_parse_verdict_pass_warn_fail():
@@ -226,7 +225,7 @@ def test_gate_es_uses_universal_prompt_when_local_es_md_absent(tmp_path, monkeyp
     import subprocess as _sp
     from runner.handlers import _gate_es, Context as HCtx
 
-    node = type("Node", (), {"name": "gate_es", "attrs": {}, "shape": ""})()
+    node = make_node(name="gate_es")
     ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
 
     # tmp_path has no .claude/commands/es.md
@@ -270,7 +269,7 @@ def test_gate_code_standards_uses_universal_prompt_when_local_file_absent(tmp_pa
     import subprocess as _sp
     from runner.handlers import _gate_code_standards, Context as HCtx
 
-    node = type("Node", (), {"name": "gate_cs", "attrs": {}, "shape": ""})()
+    node = make_node(name="gate_cs")
     ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
 
     assert not (tmp_path / ".claude" / "commands" / "code-standards.md").exists()
@@ -309,7 +308,7 @@ def test_gate_code_standards_uses_universal_prompt_when_local_file_absent(tmp_pa
 # ---------------------------------------------------------------------------
 
 def _agy_gate_node():
-    return type("Node", (), {"name": "evidence", "attrs": {"backend": "agy"}, "shape": ""})()
+    return make_node(name="evidence", backend="agy")
 
 
 def test_gate_er_runs_agy_when_backend_agy(tmp_path, monkeypatch):
@@ -415,7 +414,7 @@ def _priority_node(priority, *, prefer_adversarial=False, name="evidence"):
     attrs = {"backend_priority": ",".join(priority)}
     if prefer_adversarial:
         attrs["prefer_adversarial"] = "true"
-    return type("Node", (), {"name": name, "attrs": attrs, "shape": ""})()
+    return make_node(name=name, **attrs)
 
 
 def test_adversarial_priority_picks_first_installed(monkeypatch):
@@ -1035,7 +1034,7 @@ def test_execute_gate_tags_infra_failure_when_all_backends_die(tmp_path, monkeyp
 
 def _slash_node(command: str | None):
     attrs = {} if command is None else {"command": command}
-    return type("Node", (), {"name": "lane", "attrs": attrs, "shape": ""})()
+    return make_node(name="lane", **attrs)
 
 
 def test_gate_slash_missing_command_errors(tmp_path):
