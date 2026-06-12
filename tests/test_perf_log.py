@@ -36,11 +36,15 @@ def test_git_context_from_workdir(monkeypatch, tmp_path):
             return "feat/my-branch"
         if cmd == ["remote", "get-url", "origin"]:
             return "https://github.com/jleechanorg/dark-factory.git"
-        if cmd == ["rev-parse", "HEAD"]:
+        return None
+
+    def fake_rev_parse(workdir: pathlib.Path, *args: str, timeout: int = 15):
+        if tuple(args) == ("HEAD",):
             return "a" * 40
         return None
 
     monkeypatch.setattr(perf_log, "_git_cmd", fake_git)
+    monkeypatch.setattr(perf_log, "_git_rev_parse", fake_rev_parse)
     ctx = perf_log.resolve_git_context(tmp_path)
     assert ctx.repo_slug == "dark-factory"
     assert ctx.branch_slug == "feat_my-branch"

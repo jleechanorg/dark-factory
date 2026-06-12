@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
 from .parser import Node, is_start_node, is_exit_node
+from ._git import _SHA_RE, _git_rev_parse
 from .paths import factory_home
 
 if TYPE_CHECKING:
@@ -985,20 +986,10 @@ _HEAD_SHA_ECHO_RE = re.compile(
 
 def _worktree_head_sha(workdir: pathlib.Path) -> Optional[str]:
     """Return the full 40-char HEAD SHA for `workdir`, or None on failure."""
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(workdir), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    sha = _git_rev_parse(workdir, "HEAD")
+    if sha is None:
         return None
-    if proc.returncode != 0:
-        return None
-    sha = proc.stdout.strip()
-    if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha.lower()):
+    if _SHA_RE.match(sha.lower()):
         return sha.lower()
     return None
 
@@ -2036,11 +2027,6 @@ def _holdout_eval(node: Node, ctx: Context) -> Result:
         eval_env.pop(gcp_var, None)
 
     eval_env["BENCHMARK_PORT"] = str(port)
-    # Strip real GCP credentials so Firebase emulators don't try to reach
-    # production — they should use emulator-local auth only.
-    for _cred_key in ("GOOGLE_APPLICATION_CREDENTIALS", "GCLOUD_PROJECT",
-                      "GOOGLE_CLOUD_PROJECT"):
-        eval_env.pop(_cred_key, None)
 
     startup_delay = int(node.attrs.get("startup_delay", "5"))
     server_proc = None
