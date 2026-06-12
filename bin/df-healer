@@ -14,12 +14,20 @@ if [[ ! -x "${VENV_PYTHON}" ]]; then
   exit 1
 fi
 
-# Preflight: probe the healer's primary backend (default: claude per
-# runner/healer.py:208) and warn-or-fail before invoking the LLM call.
-# Echo is the no-LLM default but a Healer run on echo still works — only
-# the prescription step is no-op. Skip the preflight on echo so a
-# diagnose-only run never blocks on a missing CLI.
-PREFLIGHT_BACKEND="${HEALER_BACKEND:-claude}"
+# Extract --backend value from argv (default: echo per runner/healer.py:209)
+# without disturbing the rest of the argument list. Cheap linear scan is
+# fine — bash only. Echo is the no-LLM default but a Healer run on echo
+# still works — only the prescription step is no-op.
+PREFLIGHT_BACKEND="${HEALER_BACKEND:-}"
+prev=""
+for arg in "$@"; do
+  if [[ "${prev}" == "--backend" ]]; then
+    PREFLIGHT_BACKEND="${arg}"
+    break
+  fi
+  prev="${arg}"
+done
+PREFLIGHT_BACKEND="${PREFLIGHT_BACKEND:-echo}"
 
 PREFLIGHT_JSON=""
 PREFLIGHT_RC=0
