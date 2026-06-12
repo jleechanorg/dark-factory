@@ -15,10 +15,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from typing import Optional, TextIO
 
+from . import perf_log
+from ._classify import _classify_outcome
 from .cxdb import CXDB
 from .handlers import Context, Result, resolve
-from .parser import Edge, Graph, Node, is_exit_node, is_start_node
-from . import perf_log
+from .parser import Edge, Graph, Node, _tokenize_condition, is_exit_node, is_start_node
 
 _VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards"}
 
@@ -79,27 +80,6 @@ def _log(handle: Optional[TextIO], message: str) -> None:
         handle.flush()
     except (OSError, ValueError):
         pass
-
-
-def _classify_outcome(raw: str) -> str:
-    """Normalize diverse outcomes to a small engine outcome taxonomy.
-
-    Notes:
-      - `pass` and `warn` are treated as success for routing.
-      - `partial` is preserved as partial so caller can opt into
-        `allow_partial` semantics.
-      - Any non-empty unknown token collapses to failure.
-    """
-    value = str(raw).strip().lower()
-    if value in {"success", "pass", "warn"}:
-        return "success"
-    if value in {"partial", "partial_success"}:
-        return "partial"
-    if value == "error":
-        return "error"
-    if value in {"failure", "fail", "exhausted", "stuck", "inconclusive"}:
-        return "failure"
-    return "failure"
 
 
 def _is_success_result(outcome: str) -> bool:
@@ -304,46 +284,13 @@ def _evaluate_expression(
     if not cond:
         return True
 
-    import re
-
-    token_specification = [
-        ('PAREN', r'[()]'),
-        ('AND', r'&&|and\b'),
-        ('OR', r'\|\||or\b'),
-        ('NOT_CONTAINS', r'not contains\b'),
-        ('CONTAINS', r'contains\b'),
-        ('NOT_IN', r'not in\b'),
-        ('IN', r'in\b'),
-        ('NEQ', r'!='),
-        ('EQ', r'==|='),
-        ('NOT', r'!|not\b(?=\s|\(|\)|$)'),
-        ('STRING', r'"[^"]*"|\'[^\']*\''),
-        ('WORD', r'[a-zA-Z_0-9\-\.\*]+'),
-        ('SPACE', r'\s+'),
-    ]
-    tok_regex = '|'.join(f'(?P<{name}>{pattern})' for name, pattern in token_specification)
-
-    token_re = re.compile(tok_regex)
-    tokens = []
-    pos = 0
-    for mo in token_re.finditer(cond):
-        if mo.start() != pos:
-            return False
-        pos = mo.end()
-        kind = mo.lastgroup
-        value = mo.group()
-        if kind == 'SPACE':
-            continue
-        elif kind == 'STRING':
-            value = value[1:-1]
-            tokens.append((kind, value))
-        else:
-            tokens.append((kind, value))
-
-    if not tokens:
-        return False
-    if pos != len(cond):
-        return False
+    tokens = _tokenize_condition(cond)
+    if tokens is None:
+        # Tokenization failed — fall through to the malformed-condition
+        # back-compat branch below (str.split on `!=` / `=`). This is the
+        # de-facto contract for malformed conditions and must remain until
+        # promoted to a first-class grammar extension.
+        tokens = []
 
     idx = 0
 

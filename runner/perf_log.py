@@ -13,24 +13,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, TextIO
 
+from ._classify import _classify_outcome
+from ._git import _git_rev_parse
+
 
 def _safe_slug(name: str) -> str:
     """Filesystem-safe slug for repo/branch directory names."""
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:64] or "unknown"
-
-
-def _classify_outcome(raw: str) -> str:
-    """Normalize diverse outcomes to engine taxonomy (duplicated to avoid circular imports)."""
-    value = str(raw).strip().lower()
-    if value in {"success", "pass", "warn"}:
-        return "success"
-    if value in {"partial", "partial_success"}:
-        return "partial"
-    if value == "error":
-        return "error"
-    if value in {"failure", "fail", "exhausted", "stuck", "inconclusive"}:
-        return "failure"
-    return "failure"
 
 
 def _is_success_outcome(raw: str) -> bool:
@@ -112,7 +101,7 @@ def resolve_git_context(
     if remote_url:
         repo_slug = _safe_slug(_parse_repo_name(remote_url))
 
-    sha_raw = _git_cmd(target, "rev-parse", "HEAD")
+    sha_raw = _git_rev_parse(target, "HEAD")
     if sha_raw and len(sha_raw) == 40 and all(c in "0123456789abcdef" for c in sha_raw.lower()):
         head_sha = sha_raw.lower()
 

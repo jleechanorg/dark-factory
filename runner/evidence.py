@@ -30,6 +30,8 @@ import subprocess
 import time
 from typing import Optional
 
+from ._git import _SHA_RE, _git_rev_parse
+
 
 _HOLDOUT_NODE_TYPES = {"holdout_eval"}
 # Conservative redaction: only the verdict + scenario-pass-count fields are
@@ -47,22 +49,14 @@ def _sha256(data: bytes) -> str:
 
 def _dark_factory_head_sha(workdir: pathlib.Path) -> Optional[str]:
     """Best-effort: read the parent dark-factory repo HEAD. Returns None if git
-    is unavailable or `workdir` is not a git checkout."""
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    is unavailable, `workdir` is not a git checkout, or the output is not a
+    valid 40-hex SHA."""
+    sha = _git_rev_parse(workdir, "HEAD", timeout=10)
+    if sha is None:
         return None
-    if proc.returncode != 0:
-        return None
-    sha = proc.stdout.strip()
-    return sha or None
+    if _SHA_RE.match(sha.lower()):
+        return sha.lower()
+    return None
 
 
 def _safe_filename(name: str) -> str:

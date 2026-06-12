@@ -211,33 +211,45 @@ def _is_builtin_stmt(name: str) -> bool:
     return name in {"", "\\n", "\n", "graph", "node", "edge"}
 
 
-def _validate_condition(condition: str, context: str) -> None:
-    condition = (condition or "").strip()
-    if not condition:
-        raise ValueError(f"{context}: malformed condition {condition!r}")
+# Shared tokenizer for edge/condition expressions.
+# `engine._evaluate_expression` consumes the same token stream, so the
+# 13-entry `token_specification` table and the combined regex live here as
+# the single source of truth. Callers (parser validation, engine evaluator)
+# are responsible for raising on a `None` return (malformed input).
+_TOKEN_SPECIFICATION = [
+    ('PAREN', r'[()]'),
+    ('AND', r'&&|\band\b'),
+    ('OR', r'\|\||\bor\b'),
+    ('NOT_CONTAINS', r'not\s+contains\b'),
+    ('CONTAINS', r'contains\b'),
+    ('NOT_IN', r'not\s+in\b'),
+    ('IN', r'\bin\b'),
+    ('NEQ', r'!='),
+    ('EQ', r'==|='),
+    ('NOT', r'!|not\b(?=\s|\(|\)|$)'),
+    ('STRING', r'"[^"]*"|\'[^\']*\''),
+    ('WORD', r'[a-zA-Z_0-9\-\.\*]+'),
+    ('SPACE', r'\s+'),
+]
 
-    token_specification = [
-        ('PAREN', r'[()]'),
-        ('AND', r'&&|\band\b'),
-        ('OR', r'\|\||\bor\b'),
-        ('NOT_CONTAINS', r'not\s+contains\b'),
-        ('CONTAINS', r'contains\b'),
-        ('NOT_IN', r'not\s+in\b'),
-        ('IN', r'\bin\b'),
-        ('NEQ', r'!='),
-        ('EQ', r'==|='),
-        ('NOT', r'!|not\b(?=\s|\(|\)|$)'),
-        ('STRING', r'"[^"]*"|\'[^\']*\''),
-        ('WORD', r'[a-zA-Z_0-9\-\.\*]+'),
-        ('SPACE', r'\s+'),
-    ]
-    pattern = re.compile('|'.join(f'(?P<{kind}>{expr})' for kind, expr in token_specification))
+_TOKEN_RE = re.compile('|'.join(f'(?P<{kind}>{expr})' for kind, expr in _TOKEN_SPECIFICATION))
+
+
+def _tokenize_condition(cond: str) -> list[tuple[str, str]] | None:
+    """Tokenize a condition expression into ``[(name, value), ...]``.
+
+    Returns ``None`` if the input does not tokenize cleanly (e.g. unexpected
+    characters, mismatched positions). The caller decides whether a ``None``
+    return is a hard error (parser validation) or triggers a fall-back path
+    (engine evaluator's ``str.split`` exception branch).
+    """
+    if not cond:
+        return None
     tokens: list[tuple[str, str]] = []
-
     pos = 0
-    for match in pattern.finditer(condition):
+    for match in _TOKEN_RE.finditer(cond):
         if match.start() != pos:
-            raise ValueError(f"{context}: malformed condition {condition!r}")
+            return None
         pos = match.end()
         kind = match.lastgroup
         value = match.group()
@@ -245,13 +257,22 @@ def _validate_condition(condition: str, context: str) -> None:
             continue
         if kind == 'STRING':
             value = value[1:-1]
-            tokens.append((kind, value))
-        else:
-            tokens.append((kind, value))
+        tokens.append((kind, value))
 
     if not tokens:
+        return None
+    if pos != len(cond):
+        return None
+    return tokens
+
+
+def _validate_condition(condition: str, context: str) -> None:
+    condition = (condition or "").strip()
+    if not condition:
         raise ValueError(f"{context}: malformed condition {condition!r}")
-    if pos != len(condition):
+
+    tokens = _tokenize_condition(condition)
+    if tokens is None:
         raise ValueError(f"{context}: malformed condition {condition!r}")
 
     index = 0
