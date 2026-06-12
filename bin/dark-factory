@@ -17,6 +17,51 @@ if [[ ! -x "${VENV_PYTHON}" ]]; then
   exit 1
 fi
 
+# Extract --backend value from argv (default: echo) without disturbing
+# the rest of the argument list. Cheap linear scan is fine — bash only.
+PREFLIGHT_BACKEND="${DARK_FACTORY_BACKEND:-}"
+prev=""
+for arg in "$@"; do
+  if [[ "${prev}" == "--backend" ]]; then
+    PREFLIGHT_BACKEND="${arg}"
+    break
+  fi
+  prev="${arg}"
+done
+PREFLIGHT_BACKEND="${PREFLIGHT_BACKEND:-echo}"
+
+# Preflight: probe the configured backend and warn-or-fail before
+# we hand off to the Python runner. Best-effort: if preflight itself
+# crashes (e.g. module import error in dev), fall through to the
+# original runner path so we don't block legitimate runs.
+PREFLIGHT_JSON=""
+PREFLIGHT_RC=0
+PREFLIGHT_JSON="$(
+  env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${VENV_PYTHON}" -m runner.preflight \
+    --backend "${PREFLIGHT_BACKEND}" --json 2>/dev/null
+)" || PREFLIGHT_RC=$?
+
+if [[ "${PREFLIGHT_RC}" -eq 2 ]]; then
+  # Hard-stop: zero backends reachable. Print the JSON to stderr
+  # and exit 2 so callers (cron, automation) can detect the failure.
+  echo "${PREFLIGHT_JSON}" >&2
+  exit 2
+elif [[ "${PREFLIGHT_RC}" -eq 0 && -n "${PREFLIGHT_JSON}" ]]; then
+  # Pass or warn. For warn, print a single yellow line + recommendation
+  # to stderr and continue. We use a minimal awk parse of the JSON
+  # fields we need (no jq dependency) — structured consumers can
+  # re-run the preflight module directly with --json.
+  STATUS=""
+  FALLBACK=""
+  STATUS="$(printf '%s' "${PREFLIGHT_JSON}" | awk -F'"' '/"status":/ {print $4; exit}')"
+  FALLBACK="$(printf '%s' "${PREFLIGHT_JSON}" | awk -F'"' '/"fallback_recommendation":/ {print $4; exit}')"
+  if [[ "${STATUS}" == "warn" ]]; then
+    printf '\033[33mwarning\033[0m: %s missing; falling back to %s\n' \
+      "${PREFLIGHT_BACKEND}" "${FALLBACK}" >&2
+  fi
+fi
+
 has_workdir=0
 for arg in "$@"; do
   if [[ "${arg}" == "--workdir" ]]; then
