@@ -26,14 +26,13 @@ import pytest
 
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from runner.engine import run
-from runner.handlers import Context, Result, TYPE_REGISTRY
-from runner.parser import parse
+from conftest import _pipeline  # noqa: E402
 
-
-def _pipeline(name: str) -> pathlib.Path:
-    return ROOT / "pipelines" / "factory" / name
+from runner.engine import run  # noqa: E402
+from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
+from runner.parser import parse  # noqa: E402
 
 
 def test_node_exception_is_recorded_not_raised(monkeypatch):

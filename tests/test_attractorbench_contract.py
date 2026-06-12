@@ -25,19 +25,16 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+
+from conftest import run_conformance  # noqa: E402
+
 CONFORMANCE = ROOT / "bin" / "conformance"
 
 
-def _run(*args: str, env: dict | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, str(CONFORMANCE), *args],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        env=env,
-        check=False,
-    )
+def _run(*args: str, env: dict | None = None) -> "subprocess.CompletedProcess[str]":
+    return run_conformance(*args, env=env)
 
 
 SIMPLE_DOT = """digraph simple {

@@ -14,22 +14,21 @@ import sys
 
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from runner.cxdb import CXDB
-from runner.engine import run
-from runner.handlers import (
+from conftest import _pipeline  # noqa: E402
+
+from runner.cxdb import CXDB  # noqa: E402
+from runner.engine import run  # noqa: E402
+from runner.handlers import (  # noqa: E402
     Context,
     Result,
     TYPE_REGISTRY,
     _claude_json_result,
     _codergen_metrics,
 )
-from runner.healer import _clusters
-from runner.parser import parse
-
-
-def _pipeline(name: str) -> pathlib.Path:
-    return ROOT / "pipelines" / "factory" / name
+from runner.healer import _clusters  # noqa: E402
+from runner.parser import parse  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
