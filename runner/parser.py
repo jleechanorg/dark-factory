@@ -85,14 +85,6 @@ class Graph:
         return [e for e in self.edges if e.src == name]
 
 
-def is_start_node(node: Node) -> bool:
-    return node.name == "start" or node.shape == "Mdiamond"
-
-
-def is_exit_node(node: Node) -> bool:
-    return node.name == "exit" or node.shape == "Msquare"
-
-
 def _strip(value: str) -> str:
     if value is None:
         return ""
