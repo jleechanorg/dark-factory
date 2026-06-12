@@ -14,5 +14,34 @@ if [[ ! -x "${VENV_PYTHON}" ]]; then
   exit 1
 fi
 
+# Preflight: probe the healer's primary backend (default: claude per
+# runner/healer.py:208) and warn-or-fail before invoking the LLM call.
+# Echo is the no-LLM default but a Healer run on echo still works — only
+# the prescription step is no-op. Skip the preflight on echo so a
+# diagnose-only run never blocks on a missing CLI.
+PREFLIGHT_BACKEND="${HEALER_BACKEND:-claude}"
+
+PREFLIGHT_JSON=""
+PREFLIGHT_RC=0
+PREFLIGHT_JSON="$(
+  env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${VENV_PYTHON}" -m runner.preflight \
+    --backend "${PREFLIGHT_BACKEND}" --json 2>/dev/null
+)" || PREFLIGHT_RC=$?
+
+if [[ "${PREFLIGHT_RC}" -eq 2 ]]; then
+  echo "${PREFLIGHT_JSON}" >&2
+  exit 2
+elif [[ "${PREFLIGHT_RC}" -eq 0 && -n "${PREFLIGHT_JSON}" ]]; then
+  STATUS=""
+  FALLBACK=""
+  STATUS="$(printf '%s' "${PREFLIGHT_JSON}" | awk -F'"' '/"status":/ {print $4; exit}')"
+  FALLBACK="$(printf '%s' "${PREFLIGHT_JSON}" | awk -F'"' '/"fallback_recommendation":/ {print $4; exit}')"
+  if [[ "${STATUS}" == "warn" ]]; then
+    printf '\033[33mwarning\033[0m: %s missing; falling back to %s\n' \
+      "${PREFLIGHT_BACKEND}" "${FALLBACK}" >&2
+  fi
+fi
+
 exec env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
   "${VENV_PYTHON}" -m runner.healer "$@"
