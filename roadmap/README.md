@@ -2,6 +2,24 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-12 — thermo+simplify cross-validated fix queue (3 PRs, 9 beads) — SHIPPED
+
+- 4-subagent fanout (`/thermo` × 2, `/simplify` × 2) over runner/ + bin/ + tests/ returned **52 findings**; **12 cross-validated** by 2+ independent reviewers.
+- **3 PRs MERGED** (file-overlap check passed — independent scopes, no shared-file contention):
+  - **[PR #44](https://github.com/jleechanorg/dark-factory/pull/44) MERGED at [`ae6993a`](https://github.com/jleechanorg/dark-factory/commit/ae6993a2d20b5bc2e71de32f8b1579243a7a8ac7)** — `fix/thermo-test-helpers` (conftest helpers + Node dataclass + hardcoded-path fix). Closes jleechan-6w7, jleechan-du1, jleechan-ij1. 11 files, +103/−83.
+  - **[PR #45](https://github.com/jleechanorg/dark-factory/pull/45) MERGED at [`e08a306`](https://github.com/jleechanorg/dark-factory/commit/e08a306e87aa075b5cd441ead5296fd21b3d079f)** — `fix/thermo-parser-evidence-dup` (parser.py:88-93 duplicate `is_start_node`/`is_exit_node` removal). Closes jleechan-kxf. 1 file, −8.
+  - **[PR #46](https://github.com/jleechanorg/dark-factory/pull/46) MERGED at [`1f030aa`](https://github.com/jleechanorg/dark-factory/commit/1f030aaffb8d5adde5801c7cecc50ed61d13dc2c)** — `fix/thermo-grammar-classify-git` (shared condition token spec + `_classify_outcome` to runner/_classify.py + `_git_rev_parse` to runner/_git.py + handlers.py:2030-2034 duplicate GCP-cred strip deletion). Closes jleechan-ige, jleechan-96f, jleechan-zz3, jleechan-4t5, jleechan-305. 8 files, +147/−140 (2 new modules).
+- All 3 admin-merged (squash) per the `jleechan-xpv` CodeRabbit rate-limit stall pattern: real CI green (test + skeptic + bugbot), CodeRabbit `Review limit reached` on all 3, no actionable findings, prior session precedent for direct admin-merge.
+- **8 beads CLOSED**: kxf, ige, 96f, 4t5, 6w7, du1, ij1, zz3, 305. **1 deferred to `gs2`**: 1k-line structural splits for `runner/engine.py` (1720), `runner/handlers.py` (2350), `tests/test_gates.py` (1173) — need file-ownership map, separate PRs each.
+- Suite on merged main: **329 passed, 1 skipped** (matches baseline).
+- Full nextsteps doc: [~/roadmap/nextsteps-2026-06-12-dark-factory-thermo-simplify-fixes.md](file:///Users/jleechan/roadmap/nextsteps-2026-06-12-dark-factory-thermo-simplify-fixes.md) (in $HOME/roadmap).
+
+### 2026-06-11 — v9 factory state recovered: perf-log default path moved off /tmp, 5 conformance tests unblocked
+
+- **`44b6454` fix(perf-log): move default root from `/tmp/dark-factory` to `~/Library/Logs/dark-factory`** — v9 factory state-loss root cause: macOS periodic `/tmp` sweeps dropped all perf logs and CXDB session continuity. Apple-standard per-app log location survives reboots, AO retag cycles, and `/tmp` reaping. CLAUDE.md and AGENTS.md updated with explicit warning ("do not pass `/tmp/...` as `--perf-log-dir` — that's the failure mode that lost v9 2026-06-11").
+- **`ea5c688` test(conftest): declare `DARK_FACTORY_HOLDOUTS` for the test fixture** — 5 conformance tests were silently failing because the sealed-holdout env var contract was documented in the conftest docstring but never set. New session-scoped autouse fixture sets the env var to `tests/fixtures/holdout-eval`. Deliberately does NOT set `DISABLE_SANDBOX` (would break `test_ao_sandbox.py` on macOS where `sandbox-exec` exists and must be exercised).
+- **`5bf1fdc` docs(audit): Hermes 2026-06-10 parallelization audit (67-PR refactor chain incident)** — 129-line postmortem of the worldarchitect.ai chain that shipped 7 divergent blobs of one module (14→28 defs) because 6 parallel lanes each patched their own copy. Lesson: stacked-PR single-writer rule. Tracked at the worldarchitect.ai side; preserved here as a reference.
+
 ### 2026-06-09 — /fs spec-generation lane SHIPPED: PRs #39/#37/#38 merged, suite 309/309
 
 - **[PR #39](https://github.com/jleechanorg/dark-factory/pull/39) MERGED at [`a5ec9e2`](https://github.com/jleechanorg/dark-factory/commit/a5ec9e2fc2a4ece846c050758df6827e4ece31e9)** — `pipelines/slim/spec_gen.dot` (explore fanout → plan → cold spec review → fix loop, no implement node) + `prompts/slim/spec_review.md` / `fix_spec.md`. Bugbot HIGH fixed in-flight: gate handlers (`gate_es`/`gate_er`/`gate_code_standards`) now honor a node-level `prompt="@path"` attr via `_run_custom_prompt_gate` (custom template + machine contract + SHA binding, dispatched through the adversarial backend priority queue); spec_review verdict contract rewritten `VERDICT: success|failure` → `verdict: pass|fail` (old tokens proven unparseable by a RED test against `_parse_verdict`).
