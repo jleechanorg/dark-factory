@@ -1,9 +1,9 @@
 ---
 name: factory-spec
-description: "Dark Factory spec workflow (/factory-spec, /fs): create a reviewed spec via the spec_gen pipeline, review an existing spec, or display the pipeline node graphs. Create mode runs the pipeline; review and show modes are in-session only."
+description: "Dark Factory spec workflow (/factory-spec, /fs): create a reviewed spec via the spec_gen pipeline, review an existing spec, or display the pipeline node graphs — spec-review pipelines, factory gates, node types, edge conditions, handler mappings. Create mode runs dark-factory --pipeline slim/spec_gen.dot; review and show modes are in-session only."
 ---
 
-# /factory_spec — Dark Factory Spec Workflow & Node Graph Reference
+# /factory-spec — Dark Factory Spec Workflow & Node Graph Reference
 
 ## Install vs source
 
@@ -11,8 +11,8 @@ Dark Factory runs via the **`dark-factory` binary**, not `python -m runner` from
 a raw checkout:
 
 ```bash
-./install.sh   # uv python + venv + ~/.local/bin/dark-factory
-export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$(pwd)}"
+~/projects/dark-factory/install.sh
+export DARK_FACTORY_HOME=~/projects/dark-factory
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
@@ -22,17 +22,55 @@ export PATH="$HOME/.local/bin:$PATH"
 Pipelines and prompts resolve from `$DARK_FACTORY_HOME`; implementation work
 happens in the caller's cwd (`--workdir` defaults to cwd).
 
+This block is the **canonical install/setup copy** — the command files
+(`factory-spec.md`, `fs.md`) point here; do not maintain divergent copies.
+
+## Modes — what `/fs` / `/factory-spec` execute
+
+### Create mode (default: `/fs <spec description>`)
+
+1. Run **Step 0** (below): classify greenfield vs brownfield. Mandatory.
+   The classification output feeds the goal/context string passed to the pipeline.
+2. For brownfield tasks, encode rules 1–6 (delete-first, executor node for
+   deletion, net-LOC ≤ 0 guard, dead-code gate, same-call-site replace,
+   post-deletion proof) directly in the goal string.
+3. Report the proposed `--goal` string (classification + description) and ask
+   the user to confirm or modify **before** running.
+4. Run the spec-generation pipeline from the target project's cwd:
+
+   ```bash
+   export DARK_FACTORY_HOME=~/projects/dark-factory
+   export PATH="$HOME/.local/bin:$PATH"
+   dark-factory --pipeline slim/spec_gen.dot --goal "<Step-0 context + description>"
+   ```
+
+   The pipeline (implemented on branch `feat/spec-gen-pipeline`) runs:
+   `explore → plan → cold spec review → fix loop → exit`, producing a reviewed
+   `spec.md` without running any implement node.
+
+   **Note:** `slim/spec_gen.dot` is being implemented in a parallel lane. If the
+   pipeline is not yet available, report that and fall back to review mode to
+   inspect a manually-written spec.
+
+### Review mode (`/fs --review [spec_path]`)
+
+1. `spec_path` defaults to `spec/feature.md` relative to the caller's cwd.
+2. Read the spec and check, line-by-line: testable acceptance criteria;
+   greenfield/brownfield classification stated; brownfield rules 1–6 present
+   when applicable; pipeline named; goal stated as an observable output
+   (a PR, a passing named test, a deleted path — not "improve X").
+3. Report findings with line references and a verdict: `ready` or
+   `needs-changes` with the specific gaps. Do **not** run a pipeline.
+
+### Show mode (`/fs --show`)
+
+Display the pipeline graphs below. Read-only; no classification, no spec
+writes, no run.
+
 ## Pipeline selection (mandatory before `/f` or `/factory`)
 
 Full decision table:
-[docs/pipeline-selection.md](../../../docs/pipeline-selection.md)
-
-**`/fs` create mode is pinned to `pipelines/slim/spec_gen.dot`.** This table
-classifies goals for `/f` / `/factory` (implementation runs) only. A `/fs`
-spec-creation request must never be re-classified into a feature pipeline
-(e.g. `minimal_feature.dot`) just because the description reads like a new
-feature — Step 0 classification feeds the **goal string**, not the pipeline
-choice, in create mode.
+`~/projects/dark-factory/docs/pipeline-selection.md`
 
 **Do not default every run to one `.dot`.** If the user did not pass `--pipeline`,
 classify the goal (Step 0 below) and pick from this quick guide:
@@ -43,7 +81,6 @@ classify the goal (Step 0 below) and pick from this quick guide:
 | Smoke / wiring | `pipelines/factory/hello.dot` |
 | New feature (full loop) | `pipelines/slim/minimal_feature.dot` |
 | PR iteration (research + holdout) | `pipelines/slim/minimal_pr.dot` |
-| Research report only | `pipelines/slim/minimal_research.dot` |
 | Validate diff + holdout | `pipelines/factory/gates.dot` |
 | PR gates only | `pipelines/factory/pr_gates.dot` |
 | Spec review slim | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` |
@@ -51,7 +88,22 @@ classify the goal (Step 0 below) and pick from this quick guide:
 | Brownfield replace/delete | custom goal + delete-first rules; often `minimal_feature.dot` or custom `.dot` |
 
 Short names for `--pipeline`: `spec_gen`, `gates`, `hello`, `pr_gates`, `minimal_pr`,
-`minimal_feature`, `minimal_research`, `review_slim`, `review_full`.
+`minimal_feature`, `review_slim`, `review_full`.
+
+**Repo-specific pipelines (target-repo subdir convention):** graphs that
+hardcode the target repo's own slash commands or repo-specific review
+lanes belong at `<target_repo>/dark-factory/pipelines/<name>.dot`, not
+in `~/projects/dark-factory/pipelines/`. The runner resolves bare
+filenames against `<workdir>/dark-factory/pipelines/` **before** falling
+through to `$DARK_FACTORY_HOME/pipelines/`, so an operator in the target
+repo can pass `--pipeline my_repo_lane.dot` and the runner finds it
+locally.
+
+**When `--pipeline` is omitted (auto-select path),** `/f` and `/factory`
+list the contents of `<workdir>/dark-factory/pipelines/` **before**
+falling back to the built-in decision table, so repo-specific graphs
+surface in the auto-select output. The convention is therefore
+discoverable, not just documentable.
 
 Execution command (from target repo cwd):
 
@@ -66,6 +118,48 @@ Show the factory pipeline graph structure at a glance — node types, edges,
 conditions, and handler mappings — without running a pipeline. Use this when
 you need to remember what nodes exist, what the wiring looks like, or which
 pipeline to pick for a given goal.
+
+## Step 0 (MANDATORY): classify the task — Brownfield vs Greenfield
+
+Before picking a pipeline or writing the spec/goal, decide which kind of change this is.
+**Getting this wrong is the #1 cause of a factory run that reaches `exit`/success while
+certifying the wrong thing.** (Real failure 2026-05-30: a *replace-the-backend-override*
+task was run with a greenfield additive pipeline → the override was never deleted, a parallel
+mechanism was bolted on top, net LOC was +2507/−54, and an unwired Pydantic model passed
+`test_e2e` as dead code.)
+
+### Greenfield — new behavior from scratch (net-additive)
+Use the standard pipelines (`hello.dot`, `minimal_feature.dot`, `review_*.dot`):
+`plan → implement → test → review → holdout → gates`. Net-positive LOC is expected.
+
+### Brownfield — refactor / replace / **delete** existing behavior
+The task removes or replaces a code path that already runs in production. A greenfield
+pipeline is **wrong** here. Encode these rules in the spec, the `--goal`, and the DAG:
+
+1. **DELETE-FIRST ordering (not delete-last).** The `implement` node must *remove or replace
+   the old path as part of the build*, and the behavior/`test_llm` node then proves the new
+   path works **with the old one already gone**. Never "add new alongside old → prove → delete
+   later": the deletion gets **orphaned** (no node executes it) and the proof is **confounded**
+   (the old path's fallback/passthrough can mask a weak new path, so green proves nothing).
+2. **Deletion needs an executor node — never a conditional.** Do NOT write "(N) only AFTER the
+   proof, delete X" in a goal: nothing in the DAG runs a post-proof deletion, and resume
+   pipelines (test-onward) have no `implement` node at all. Make the deletion part of
+   `implement`/`fix`, or add an explicit node.
+3. **Net-LOC ≤ 0 guard.** For replace/delete milestones, add a gate/acceptance check that
+   FAILS if net production LOC > 0 (the new code must displace at least as much as it adds).
+   See `deletion-milestone` skill.
+4. **Dead-code gate.** Add a check that FAILS if a newly-added module/symbol is *defined but
+   unreferenced in runtime* (non-test). Otherwise a passing unit test makes `test_e2e` green
+   while the code is dead (e.g. a model class only instantiated in its own test).
+5. **Replace at the same call site.** The new mechanism must be wired into the *same* call
+   site the old one used, and the old one removed in the same change — not added at a new
+   site while the old site still runs.
+6. **Prove against the post-deletion tree.** The real-LLM / behavior test must execute with the
+   old path already deleted, so a green verdict cannot be produced by the old fallback.
+
+**Quick test:** "If this milestone succeeds, should `git diff` show deletions of production
+code?" If yes → brownfield → apply rules 1–6. If the planned diff is all additions for a
+replace/delete goal, the pipeline is mis-shaped — STOP and re-architect delete-first.
 
 ## Spec-Review Pipelines (Primary)
 
@@ -176,7 +270,7 @@ start ──▶ plan ──▶ implement ──▶ holdout_eval ──(success)�
 ### 5. `minimal_feature.dot` — Full Feature Factory (Slim)
 
 ```
-start ──▶ explore ──▶ plan ──▶ implement ──▶ test ──(success)──▶ review ──(success)──▶ holdout ──(success)──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ exit
+start ──▶ plan ──▶ implement ──▶ test ──(success)──▶ review ──(success)──▶ holdout ──(success)──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ exit
                                     │                  │                  │                  │
                                     └──(fail)──▶ fix ◀─┘                  │                  │
                                                           └──(fail)──▶ fix ┘                  │
