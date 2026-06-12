@@ -102,16 +102,24 @@ if [[ "${CMDS}" -eq 1 ]]; then
     fi
   done
 
-  # 2 factory skills — directory symlinks (cp -R would break on next run)
+  # 2 factory skills — directory symlinks (cp -R would break on next run).
+  # Existing regular directories are backed up to <dst>.bak.<unix-ts> so the
+  # operator can recover user-scope edits; subsequent runs replace the symlink
+  # cleanly with `ln -sfn`.
   for skill in dark-factory factory-spec; do
     src="${REPO_ROOT}/.claude/skills/${skill}"
     dst="${CLAUDE_DIR}/skills/${skill}"
-    if [[ -d "${src}" ]]; then
-      ln -sfn "${src}" "${dst}"
-      echo "==> linked ${dst} -> ${src}"
-    else
+    if [[ ! -d "${src}" ]]; then
       echo "==> SKIP: ${src} not found" >&2
+      continue
     fi
+    if [[ -d "${dst}" && ! -L "${dst}" ]]; then
+      backup="${dst}.bak.$(date +%s)"
+      echo "==> ${dst} is a regular directory; backing up to ${backup}"
+      mv "${dst}" "${backup}"
+    fi
+    ln -sfn "${src}" "${dst}"
+    echo "==> linked ${dst} -> ${src}"
   done
 fi
 
