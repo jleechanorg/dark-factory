@@ -185,8 +185,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument(
             "--perf-log-dir",
             type=pathlib.Path,
-            default=pathlib.Path("/tmp/dark-factory"),
-            help="Root directory for repo/branch performance logs (default: /tmp/dark-factory).",
+            default=pathlib.Path.home() / "Library" / "Logs" / "dark-factory",
+            help="Root directory for repo/branch performance logs (default: ~/Library/Logs/dark-factory).",
         )
         p.add_argument(
             "--no-perf-log",

@@ -1,4 +1,4 @@
-"""Tests for repo/branch performance logging under /tmp/dark-factory."""
+"""Tests for repo/branch performance logging under ~/Library/Logs/dark-factory (default)."""
 
 from __future__ import annotations
 

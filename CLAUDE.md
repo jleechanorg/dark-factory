@@ -169,12 +169,12 @@ Use this benchmark as the template for general spec-validation lanes.
 - `runner/cxdb.py` records `(run_id, seq, node, outcome, ts, output_hash, output_head, metadata)` per step. WAL mode + 5s busy_timeout so concurrent pipelines into one CXDB don't collide on `database is locked`.
 - `runner/healer.py` reads CXDB, clusters terminal failures (`failure | fail | exhausted | stuck | partial | inconclusive`) by `(node, outcome, output_hash)`, and emits a Markdown report with a per-cluster prescription. The Healer's prefix logic (`gate_*`, `plan|implement|fix`, `holdout`) is internal data routing over its own node namespace — not user input — so it is not a ZFC violation.
 
-### Performance logging (`/tmp/dark-factory`)
+### Performance logging (`~/Library/Logs/dark-factory`)
 
 Enabled by default. Logs are organized by **target workdir git identity** (prefers `ao.worktree` when set):
 
 ```text
-/tmp/dark-factory/<repo-slug>/<branch-slug>/
+~/Library/Logs/dark-factory/<repo-slug>/<branch-slug>/
   <run_id>.jsonl          # structured node_enter / node_exit / transition / run_end
   <run_id>.log              # human-readable ENTER/EXIT lines with outcome + duration_ms
   latest.jsonl -> <run_id>.jsonl
@@ -182,15 +182,17 @@ Enabled by default. Logs are organized by **target workdir git identity** (prefe
   runs.index.jsonl          # one summary line per run (branch rollup)
 ```
 
+The default lives under `~/Library/Logs/` (Apple's standard per-app log location) so runs survive reboots, macOS `/tmp` periodic sweeps, and AO retag cycles. **Do not pass `/tmp/...` as `--perf-log-dir`** — that's the failure mode that lost v9 (2026-06-11).
+
 - **Disable:** `--no-perf-log`
-- **Custom root:** `--perf-log-dir /path/to/root` (default `/tmp/dark-factory`)
+- **Custom root:** `--perf-log-dir /path/to/root` (default `~/Library/Logs/dark-factory`)
 - CLI JSON summary includes `perf_log.jsonl`, `perf_log.log`, `repo`, `branch` when enabled.
 
 Monitor a branch in real time:
 
 ```bash
-tail -f /tmp/dark-factory/worldarchitect.ai/feat_my-feature/latest.log
-tail -f /tmp/dark-factory/worldarchitect.ai/feat_my-feature/runs.index.jsonl
+tail -f ~/Library/Logs/dark-factory/worldarchitect.ai/feat_my-feature/latest.log
+tail -f ~/Library/Logs/dark-factory/worldarchitect.ai/feat_my-feature/runs.index.jsonl
 ```
 
 Each node emits `ENTER` on visit and `EXIT` with classified outcome (`success`, `failure`, `error`, `partial`) plus engine-level `duration_ms`. Parallel branch nodes are included.
