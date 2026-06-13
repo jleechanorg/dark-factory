@@ -131,8 +131,18 @@ for __df_arg in "$@"; do
     __DF_LOCK_TARGET="${__df_arg}"
     break
   fi
+  # Handle --workdir=/path format
+  if [[ "${__df_arg}" == --workdir=* ]]; then
+    __DF_LOCK_TARGET="${__df_arg#--workdir=}"
+    break
+  fi
   __DF_ARG_LOCK_PREV="${__df_arg}"
 done
+# Normalize to canonical absolute path to ensure equivalent directories
+# map to the same lock key (resolves symlinks, relative paths, ~)
+if [[ -d "${__DF_LOCK_TARGET}" ]]; then
+  __DF_LOCK_TARGET="$(cd "${__DF_LOCK_TARGET}" && pwd -P)"
+fi
 
 # merge_train acquire: claim the per-target-repo lock so a second
 # concurrent dark-factory invocation against the same workdir
