@@ -10,8 +10,8 @@ digraph airbnb_clone_master {
     exit  [shape=Msquare,  label="Exit"]
 
     // ---------- Sprint 1: Data Layer ----------
-    s1_plan      [type="codergen", label="Plan S1",      prompt="@benchmarks/airbnb-clone/prompts/sprint-1-plan.md"]
-    s1_implement [type="codergen", label="Implement S1", prompt="@benchmarks/airbnb-clone/prompts/sprint-1-implement.md"]
+    s1_plan      [type="codergen", label="Plan S1",      prompt="@benchmarks/airbnb-clone/prompts/sprint-1-plan.md",      timeout=600]
+    s1_implement [type="codergen", label="Implement S1", prompt="@benchmarks/airbnb-clone/prompts/sprint-1-implement.md", timeout=600]
     s1_verify    [type="holdout_eval",
                   label="Verify S1",
                   validation="true",
@@ -19,11 +19,11 @@ digraph airbnb_clone_master {
                   implementation="${state.ao.worktree}",
                   startup_delay="120",
                   timeout="600"]
-    s1_fix       [type="codergen", label="Fix S1", prompt="@benchmarks/airbnb-clone/prompts/sprint-1-fix.md", max_visits="5"]
+    s1_fix       [type="codergen", label="Fix S1", prompt="@benchmarks/airbnb-clone/prompts/sprint-1-fix.md", max_visits="5", timeout=600]
 
     // ---------- Sprint 2: Backend Layer ----------
-    s2_plan      [type="codergen", label="Plan S2",      prompt="@benchmarks/airbnb-clone/prompts/sprint-2-plan.md"]
-    s2_implement [type="codergen", label="Implement S2", prompt="@benchmarks/airbnb-clone/prompts/sprint-2-implement.md"]
+    s2_plan      [type="codergen", label="Plan S2",      prompt="@benchmarks/airbnb-clone/prompts/sprint-2-plan.md",      timeout=600]
+    s2_implement [type="codergen", label="Implement S2", prompt="@benchmarks/airbnb-clone/prompts/sprint-2-implement.md", timeout=600]
     s2_verify    [type="holdout_eval",
                   label="Verify S2",
                   validation="true",
@@ -31,11 +31,11 @@ digraph airbnb_clone_master {
                   implementation="${state.ao.worktree}",
                   startup_delay="120",
                   timeout="600"]
-    s2_fix       [type="codergen", label="Fix S2", prompt="@benchmarks/airbnb-clone/prompts/sprint-2-fix.md", max_visits="5"]
+    s2_fix       [type="codergen", label="Fix S2", prompt="@benchmarks/airbnb-clone/prompts/sprint-2-fix.md", max_visits="5", timeout=600]
 
     // ---------- Sprint 3: Frontend Layer ----------
-    s3_plan      [type="codergen", label="Plan S3",      prompt="@benchmarks/airbnb-clone/prompts/sprint-3-plan.md"]
-    s3_implement [type="codergen", label="Implement S3", prompt="@benchmarks/airbnb-clone/prompts/sprint-3-implement.md"]
+    s3_plan      [type="codergen", label="Plan S3",      prompt="@benchmarks/airbnb-clone/prompts/sprint-3-plan.md",      timeout=600]
+    s3_implement [type="codergen", label="Implement S3", prompt="@benchmarks/airbnb-clone/prompts/sprint-3-implement.md", timeout=600]
     s3_verify    [type="holdout_eval",
                   label="Verify S3",
                   validation="true",
@@ -43,7 +43,7 @@ digraph airbnb_clone_master {
                   implementation="${state.ao.worktree}",
                   startup_delay="120",
                   timeout="900"]
-    s3_fix       [type="codergen", label="Fix S3", prompt="@benchmarks/airbnb-clone/prompts/sprint-3-fix.md", max_visits="5"]
+    s3_fix       [type="codergen", label="Fix S3", prompt="@benchmarks/airbnb-clone/prompts/sprint-3-fix.md", max_visits="5", timeout=600]
 
     // ---------- Wiring ----------
     start -> s1_plan -> s1_implement -> s1_verify
