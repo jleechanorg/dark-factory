@@ -1,0 +1,130 @@
+digraph BrownfieldDeleteFirstFactory {
+  graph [
+    include="@pipelines/_base.dot",
+    goal="Implement a feature by first deleting obsolete code, passing net LOC and dead code gates, then implementing and passing tests, review, and holdouts"
+    rankdir=LR
+    model_stylesheet="minimal_feature.model.css"
+  ]
+
+  start [shape=Mdiamond, label="Start"]
+  exit  [shape=Msquare, label="Exit - Ready to Merge"]
+
+  plan [
+    type="codergen",
+    label="Plan & Spec",
+    class="plan",
+    prompt="@prompts/slim/plan.md",
+    timeout=600
+  ]
+
+  delete_first [
+    type="codergen",
+    label="Delete First",
+    class="delete_first",
+    prompt="@prompts/slim/delete_first.md",
+    max_retries=2,
+    timeout=600
+  ]
+
+  gate_net_loc [
+    type="gate_net_loc",
+    label="Gate Net LOC (<=0)",
+    timeout=600
+  ]
+
+  gate_dead_code [
+    type="gate_dead_code",
+    label="Gate Dead Code",
+    timeout=600
+  ]
+
+  implement [
+    type="codergen",
+    label="Implement",
+    class="implement",
+    prompt="@prompts/slim/implement.md",
+    max_retries=2,
+    timeout=600
+  ]
+
+  test [
+    type="tool",
+    label="Run Tests",
+    command="${state.slim.test_command}",
+    validation=true,
+    goal_gate=true,
+    timeout=600,
+    retry_target="fix"
+  ]
+
+  review [
+    type="codergen",
+    label="Fresh Eyes Review",
+    class="review",
+    prompt="@prompts/slim/review.md",
+    goal_gate=true,
+    retry_target="fix",
+    timeout=600
+  ]
+
+  holdout [
+    type="holdout_eval",
+    label="Behavioral Holdouts",
+    validation=true,
+    goal_gate=true,
+    timeout=600,
+    retry_target="fix"
+  ]
+
+  gate_es [
+    type="gate_es",
+    label="/es Evidence Standards",
+    timeout=600
+  ]
+
+  gate_er [
+    type="gate_er",
+    label="/er Evidence Review",
+    timeout=600
+  ]
+
+  fix [
+    type="codergen",
+    label="Fix & Iterate",
+    class="fix",
+    prompt="@prompts/slim/fix.md",
+    max_retries=2,
+    max_visits="3",
+    timeout=600
+  ]
+
+  start -> explore_in
+  explore_out -> plan
+  plan -> delete_first
+  delete_first -> gate_net_loc
+  
+  gate_net_loc -> gate_dead_code [condition="outcome=success"]
+  gate_net_loc -> delete_first [condition="outcome!=success"]
+
+  gate_dead_code -> implement [condition="outcome=success"]
+  gate_dead_code -> delete_first [condition="outcome!=success"]
+
+  implement -> test
+
+  test -> review [condition="outcome=success"]
+  test -> fix [condition="outcome!=success"]
+
+  review -> holdout [condition="outcome=success"]
+  review -> fix [condition="outcome!=success"]
+
+  holdout -> gate_es [condition="outcome=success"]
+  holdout -> fix [condition="outcome!=success"]
+
+  gate_es -> gate_er [condition="outcome=success"]
+  gate_es -> fix [condition="outcome!=success"]
+
+  gate_er -> exit [condition="outcome=success"]
+  gate_er -> fix [condition="outcome!=success"]
+
+  fix -> test
+}
