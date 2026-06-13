@@ -9,6 +9,7 @@ import time
 import sys
 import traceback
 
+from . import _agy_safe
 from .engine import run
 from .handlers import Context
 from .parser import parse, validate_pipeline
@@ -131,6 +132,7 @@ def _handle_panic(
 
 
 def main(argv: list[str] | None = None) -> int:
+    _agy_safe.install()
     args = None
     ctx = None
     try:

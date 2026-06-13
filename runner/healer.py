@@ -13,6 +13,7 @@ import sys
 from dataclasses import dataclass
 from typing import Optional
 
+from . import _agy_safe
 from .cxdb import CXDB
 
 
@@ -197,6 +198,7 @@ def report(cxdb_path: pathlib.Path, backend: str = "echo") -> str:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    _agy_safe.install()
     p = argparse.ArgumentParser(prog="dark-factory-healer")
     p.add_argument(
         "--cxdb",
