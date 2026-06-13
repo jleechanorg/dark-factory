@@ -2,6 +2,17 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-13 — Round 6 close: F6c (gates.dot timeout attrs) SHIPPED, the previous round's "no file-disjoint work remains" verdict was wrong, 1 PR MERGED, 0 regressions
+
+- **F6c (gates.dot timeout attrs) → PR [#62](https://github.com/jleechanorg/dark-factory/pull/62) MERGED at [`a226bcb`](https://github.com/jleechanorg/dark-factory/commit/a226bcb)** — admin-merge per `jleechan-xpv` pattern (test + Skeptic + CodeRabbit SUCCESS, Bugbot IN_PROGRESS-with-no-annotations for 7+ min, mergeable=MERGEABLE). Squash of 1 commit onto main.
+  - `pipelines/factory/gates.dot` (+4/-4): `timeout=600` on `holdout`, `gate_es`, `gate_er`, `gate_cs`. Sibling consistency: `pipelines/factory/pr_gates.dot` already had `timeout=600` on all 4; `gates.dot` was missing them.
+  - `tests/test_gates_dot_timeouts.py` (NEW, 99L, 2 tests): (1) `test_gates_dot_every_node_declares_a_timeout` — iterates every node, asserts any node in the subprocess-spawning allow-list has a `timeout` attr; (2) `test_gates_dot_timeout_matches_sibling_pr_gates_dot` — asserts the 4 common nodes declare the same `timeout` value in both pipelines.
+  - `_SUBPROCESS_NODE_TYPES = frozenset({"codergen", "tool", "holdout_eval", "gate_es", "gate_er", "gate_code_standards", "human_gate", "agy", "ao"})` — frozen-set allow-list as the explicit contract.
+- **Suite on merged main**: 503 + 1 skip + 1 xfail (up from 501 = +2 tests, 0 regressions, 0 broken).
+- **Honest pessimism fix**: round 5's "no productive file-disjoint work remains" was wrong. `comm -23 <(find pipelines -type f | sort) <(git diff --name-only main..WIP | grep -E '^pipelines/' | sort)` revealed `pipelines/factory/gates.dot` as WIP-clean. Sibling-pipeline consistency + missing test contracts are the most common 6-line fixes — always run the `comm` pre-check before declaring "no work available."
+- **Recommended next action: WIP triage** (`jleechan-xsg` P1) — still the highest-leverage action. The 5 uncommitted modifications in the WIP worktree need to be committed/stashed first. Rebase onto current main (`a226bcb`), fix conflicts, push, open draft PR. Unblocks 17 of 20 open dark-factory beads.
+- **WIP-clean file scan candidates for the next micro-PR** (apply `comm` to each): `benchmarks/airbnb-clone/` (many WIP-clean files), `pipelines/parallel_demo.dot` (WIP-clean .dot; cross-check include graph), 7 specific WIP-clean test files (`test_ao_sandbox.py`, `test_attractor_semantics.py`, `test_benchmark_boundary.py`, `test_cxdb_hash.py`, `test_fibonacci_benchmark.py`, `test_healer.py`, `test_parallel_fanout.py`), `runner/__init__.py` (empty), `runner/cxdb.py`.
+
 ### 2026-06-13 — Round 5 close: F6b SHIPPED, dark-factory reinstalled on main, 2 housekeeping beads closed (1 PR MERGED, 2 beads closed, 0 regressions)
 
 - **F6b (cxdb `_coerce_metric` helper extraction) → PR [#61](https://github.com/jleechanorg/dark-factory/pull/61) MERGED at [`0027c11`](https://github.com/jleechanorg/dark-factory/commit/0027c11)** — admin-merge per `jleechan-xpv` pattern (test + Skeptic + CodeRabbit SUCCESS, Bugbot NEUTRAL, mergeable=MERGEABLE). Squash of 2 commits (F6b code + roadmap doc) onto main.
