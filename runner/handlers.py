@@ -227,7 +227,7 @@ def _ao_wait_idle(
     return "timeout"
 
 
-def _codergen(node: Node, ctx: Context) -> Result:
+def _codergen_impl(node: Node, ctx: Context) -> Result:
     """Run an LLM coding step.
 
     Reads the prompt template referenced by `prompt="@path"` (relative to the
@@ -699,6 +699,22 @@ def _codergen(node: Node, ctx: Context) -> Result:
         output=output,
         metadata=meta,
     )
+
+
+def _codergen(node: Node, ctx: Context) -> Result:
+    res = _codergen_impl(node, ctx)
+    if res.outcome == "success":
+        backend = node.attrs.get("backend", node.attrs.get("model", ctx.backend))
+        if isinstance(backend, bool):
+            backend = ctx.backend
+        backend = str(backend)
+        if backend == "echo":
+            if "early_exit" in ctx.goal or "early-exit" in ctx.goal:
+                res.outcome = "early_exit"
+        else:
+            if "early_exit" in res.output or "early-exit" in res.output:
+                res.outcome = "early_exit"
+    return res
 
 
 def _conditional(node: Node, ctx: Context) -> Result:
@@ -2323,6 +2339,14 @@ def _join_handler(node: Node, ctx: Context) -> Result:
     return Result(outcome="success", output=f"join: {node.name}", metadata={"role": "join"})
 
 
+def _point_handler(node: Node, ctx: Context) -> Result:
+    """A shape=point routing anchor. Propagates the previous step's outcome if present, else success."""
+    if ctx.history:
+        prev_outcome = ctx.history[-1].get("outcome", "success")
+        return Result(outcome=prev_outcome, output=f"point: {node.name}")
+    return Result(outcome="success", output=f"point: {node.name}")
+
+
 REGISTRY: dict[str, Handler] = {
     # by shape
     "Mdiamond": _start,
@@ -2330,6 +2354,7 @@ REGISTRY: dict[str, Handler] = {
     "hexagon": _conditional,
     "component": _parallel_fanout,      # fan-out shape alias (Kilroy: shape=component)
     "tripleoctagon": _join_handler,     # join shape alias (Kilroy: shape=tripleoctagon)
+    "point": _point_handler,
 }
 
 TYPE_REGISTRY: dict[str, Handler] = {
@@ -2348,6 +2373,7 @@ TYPE_REGISTRY: dict[str, Handler] = {
     "gate_green": _gate_green,
     "parallel": _parallel_fanout,       # fan-out type (type=parallel)
     "join": _join_handler,              # fan-in type (type=join)
+    "point": _point_handler,
 }
 
 

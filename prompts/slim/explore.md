@@ -49,5 +49,6 @@ content of the four partials (no new claims, no new design).
   internals; work only from the four partials and the visible goal.
 - If two partials disagree, surface the disagreement under the relevant
   section but do not resolve it.
+- If the goal is infeasible (due to a non-existent target repo, already-implemented feature, or forbidden action class), do not write the four sections. Instead, explain clearly why the goal is infeasible and end your response with: `explore stitched: early_exit`.
 
-End your response with: `explore stitched: .dark-factory/explore-findings.md`
+End your response with: `explore stitched: .dark-factory/explore-findings.md` or `explore stitched: early_exit` depending on feasibility.

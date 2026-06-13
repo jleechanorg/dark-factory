@@ -77,7 +77,8 @@ digraph MinimalFeatureFactory {
   ]
 
   start -> explore_in
-  explore_out -> plan
+  explore_out -> plan [condition="outcome!=early_exit"]
+  explore_out -> exit [condition="outcome=early_exit"]
   plan -> implement
   implement -> test
 

@@ -394,3 +394,20 @@ def test_recursive_boolean_edge_matching():
     # Nested parenthesized expressions
     assert _evaluate_expression("outcome = success && (error_code = 500 || test_failures contains critical)", last, ctx, True) is True
     assert _evaluate_expression("outcome = success && !(error_code = 500 || test_failures contains blocker)", last, ctx, True) is True
+
+
+def test_explore_early_exit_detection_and_routing():
+    """Verify that an infeasible goal containing early_exit is detected and routed to exit."""
+    g = parse(_pipeline("hello.dot"))
+    # The goal contains "early_exit" so it will be rendered in the prompt text
+    ctx = Context(goal="This is an infeasible goal containing early_exit", workdir=ROOT, backend="echo")
+    history = run(g, ctx, max_steps=50)
+
+    nodes = [r.node for r in history]
+    # Traversal should go start -> explore nodes -> exit, skipping plan -> implement -> holdout
+    assert "plan" not in nodes
+    assert "implement" not in nodes
+    assert "holdout" not in nodes
+    assert nodes[-1] == "exit"
+    assert history[-1].outcome == "early_exit"
+

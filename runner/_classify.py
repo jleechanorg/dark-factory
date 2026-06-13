@@ -25,6 +25,8 @@ def _classify_outcome(raw: str) -> str:
         return "partial"
     if value == "error":
         return "error"
+    if value == "early_exit":
+        return "early_exit"
     if value in {"failure", "fail", "exhausted", "stuck", "inconclusive"}:
         return "failure"
     return "failure"

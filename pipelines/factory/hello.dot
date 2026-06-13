@@ -18,7 +18,8 @@ digraph hello {
     fix       [type="codergen", label="Fix",       prompt="@prompts/hello/fix.md", max_visits="3"]
 
     start       -> explore_in
-    explore_out -> plan
+    explore_out -> plan [condition="outcome!=early_exit"]
+    explore_out -> exit [condition="outcome=early_exit"]
     plan        -> implement -> holdout
     holdout     -> exit [condition="outcome=success"]
     holdout     -> fix  [condition="outcome!=success"]
