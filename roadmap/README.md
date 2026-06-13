@@ -2,6 +2,22 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-13 — Round 9 close: F6e (amazon-clone codergen + gate timeouts) SHIPPED, the timeout-attrs contract now covers 4 pipeline families (factory, slim, airbnb-clone, amazon-clone), 1 PR MERGED, 0 regressions
+
+- **F6e (amazon-clone codergen + gate timeouts) → PR [#65](https://github.com/jleechanorg/dark-factory/pull/65) MERGED at [`e075d05`](https://github.com/jleechanorg/dark-factory/commit/e075d05)** — admin-merge per `jleechan-xpv` pattern (test + Skeptic + CodeRabbit SUCCESS, Bugbot IN_PROGRESS-with-no-annotations, mergeable=MERGEABLE). Squash of 1 commit onto main.
+  - `benchmarks/amazon-clone/pipelines/dark_factory.dot` (+12/-6): `timeout=600` on 9 codergen + 2 gate nodes.
+  - `benchmarks/amazon-clone/pipelines/kilroy.dot` (+3/-0): `timeout=600` on `spec`, `build`, `review`.
+  - `benchmarks/amazon-clone/pipelines/mammoth.dot` (+3/-0): `timeout=600` on `specify`, `build`, `repair`.
+  - `benchmarks/amazon-clone/pipelines/slim.dot` (+1/-0): `timeout=600` added to `implement` (pre-existing `fix` is `timeout=300` intentionally).
+  - `benchmarks/amazon-clone/pipelines/smasher.dot` (+5/-0): `timeout=600` on `plan`/`implement`/`fix`/`test` (tool), `timeout=900` on `holdout` (tool) — pre-existing.
+  - `benchmarks/amazon-clone/pipelines/tracker.dot` (+3/-0): `timeout=600` on `analyze`, `create`, `refine`.
+  - `tests/test_amazon_clone_pipelines_timeouts.py` (NEW, 215L, 3 tests): (1) `test_every_amazon_clone_subprocess_node_declares_a_timeout` — every node in the subprocess-spawning allow-list has a `timeout` attr (covers 10 amazon-clone pipelines × 9 node types); (2) `test_amazon_clone_codergen_nodes_use_canonical_600_second_timeout` — value is 600, scoped via `_CODERGEN_600_EXPECTED` allow-list that documents the 300s-vs-600s fix-loop distinction (slim + 4 slices_* `fix` nodes are 300s intentionally — fix loop should be quick); (3) `test_amazon_clone_pipeline_count_is_stable` — count-pinning test (10 pipelines: dark_factory + kilroy + mammoth + smasher + tracker + slim + 4 slices_*) so a future 11th pipeline fails the test and forces an explicit contract update.
+- **Scoping decision**: `_CODERGEN_600_EXPECTED` allow-list is the contract review tool — it enumerates exactly which nodes MUST be 600s vs exempt, with inline comments like `"""slim""" : {"implement"},  # ``fix`` is 300 (intentional)`. The test only fires on enumerated nodes; everything else is silently ignored. This pattern is more durable than a hand-coded exemption list because the test itself reads as the contract spec.
+- **Mixed form tolerance**: the amazon-clone benchmark uses BOTH `timeout=600` (int) and `timeout="600"` (string) forms; pydot returns both unchanged. The test normalises via `_normalise_timeout(value) → int(value)` so both pass. Same trick as PR #63's `test_slim_pipelines_timeouts.py`.
+- **Test-driven development caught real gaps mid-flight**: the test was failing during development because smasher's `test` (tool) and `holdout` (tool) nodes had no `timeout`. Both got `timeout=600` and `timeout=900` respectively. The contract test was the spec, not a checklist.
+- **Suite on merged main**: 511 + 1 skip + 1 xfail (up from 508 = +3 tests, 0 regressions, 0 broken). Background test run confirmed (task `b1ca389k9`).
+- **The 4th family in a single session is the natural ceiling for this pattern.** A 5th family is now <15 min of mechanical work (copy test, scope allow-list, scan for codergen nodes, add timeouts) but the marginal value drops. Better next moves: (a) **refactor the 4 timeout-attr test files into 1 parameterized helper** (`tests/test_pipeline_timeouts.py` with per-family fixture) — ~80% code reduction, single source of truth, new file is file-disjoint from all 4 existing tests; (b) **start checking values across the canonical allow-list** (timeout=300? timeout=1800? what's the next-narrower rule?); (c) **WIP triage** (`jleechan-xsg` P1) — still the highest-leverage unblocking action.
+
 ### 2026-06-13 — Round 8 close: F6d (airbnb-clone codergen timeouts) SHIPPED, the timeout-attrs contract now covers 3 pipeline families (factory, slim, airbnb-clone), 1 PR MERGED, 0 regressions
 
 - **F6d (airbnb-clone codergen timeouts) → PR [#64](https://github.com/jleechanorg/dark-factory/pull/64) MERGED at [`ea067d0`](https://github.com/jleechanorg/dark-factory/commit/ea067d0)** — admin-merge per `jleechan-xpv` pattern (test + Skeptic + CodeRabbit SUCCESS, Bugbot IN_PROGRESS-with-no-annotations, mergeable=MERGEABLE). Squash of 1 commit onto main.
