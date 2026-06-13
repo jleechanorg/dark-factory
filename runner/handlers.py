@@ -1740,6 +1740,102 @@ def _gate_code_standards(node: "Node", ctx: "Context") -> "Result":
     return _run_universal_prompt_gate(UNIVERSAL_CODE_STANDARDS_PROMPT, "gate_code_standards", node, ctx)
 
 
+def _resolve_base_sha(node: Node, ctx: Context) -> str:
+    base = ctx.state.get("base_sha")
+    if not base:
+        base = node.attrs.get("base_sha")
+    if not base:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(ctx.workdir), "merge-base", "origin/main", "HEAD"],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                base = proc.stdout.strip()
+        except Exception:
+            pass
+    if not base:
+        base = "origin/main"
+    return str(base)
+
+
+def _gate_net_loc(node: Node, ctx: Context) -> Result:
+    base_sha = _resolve_base_sha(node, ctx)
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(ctx.workdir), "diff", "--numstat", base_sha],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except Exception as e:
+        return Result(outcome="error", output=f"Failed to run git diff: {e}")
+
+    if proc.returncode != 0:
+        return Result(outcome="failure", output=f"git diff --numstat failed (rc={proc.returncode}):\n{proc.stdout}\n{proc.stderr}")
+
+    total_additions = 0
+    total_deletions = 0
+    lines = proc.stdout.strip().splitlines()
+    for line in lines:
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            add_str, del_str = parts[0], parts[1]
+            try:
+                total_additions += int(add_str)
+            except ValueError:
+                pass
+            try:
+                total_deletions += int(del_str)
+            except ValueError:
+                pass
+
+    net_loc = total_additions - total_deletions
+    output = f"Base SHA: {base_sha}\nTotal Additions: {total_additions}\nTotal Deletions: {total_deletions}\nNet LOC: {net_loc}"
+    if total_additions > total_deletions:
+        return Result(outcome="failure", output=f"Net LOC is positive: {output}")
+    else:
+        return Result(outcome="success", output=f"Net LOC is non-positive: {output}")
+
+
+UNIVERSAL_DEAD_CODE_PROMPT = """\\
+You are performing an automated Dead Code & Cleanliness Review.
+Analyze the active repository changes and diff in the current workspace.
+
+You MUST audit the implementation against the following core principles:
+
+1. DEAD CODE DETECTOR:
+   - Identify any commented-out code blocks, legacy comments that no longer apply, or debug prints.
+   - Look for any unused functions, classes, methods, or imports introduced or left behind in the modified files.
+   - Look for any unused variables or constants.
+
+2. CLEANUP INTEGRITY:
+   - Ensure old/legacy/dead code has been completely deleted rather than commented out or left dangling.
+   - Verify that all newly introduced primitives are actually used.
+
+Provide a detailed review report listing:
+- A brief summary of scope.
+- Audit results for Dead Code and Cleanup Integrity.
+- A bulleted list of any blockers and required fixes.
+
+CRITICAL FORMATTING INSTRUCTIONS:
+1. You MUST include a binding verification line:
+   head_sha: {expected_sha}
+
+2. You MUST conclude your review with:
+   verdict: <pass|fail>
+"""
+
+
+def _gate_dead_code(node: "Node", ctx: "Context") -> "Result":
+    if _node_prompt_ref(node):
+        return _run_custom_prompt_gate(node, ctx, "gate_dead_code")
+    local_cmd = ctx.workdir / ".claude" / "commands" / "dead-code.md"
+    if local_cmd.exists():
+        return _slash_gate("dead-code")(node, ctx)
+    return _run_universal_prompt_gate(UNIVERSAL_DEAD_CODE_PROMPT, "gate_dead_code", node, ctx)
+
+
 def _gate_slash(node: "Node", ctx: "Context") -> "Result":
     """Generic single-lane reviewer gate: ``type="gate_slash" command="zfc"``.
 
@@ -2676,6 +2772,8 @@ TYPE_REGISTRY: dict[str, Handler] = {
     "gate_es": _gate_es,
     "gate_er": _gate_er,
     "gate_code_standards": _gate_code_standards,
+    "gate_net_loc": _gate_net_loc,
+    "gate_dead_code": _gate_dead_code,
     "gate_slash": _gate_slash,
     "gate_red": _gate_red,
     "gate_green": _gate_green,
