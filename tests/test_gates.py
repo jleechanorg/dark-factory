@@ -1027,6 +1027,63 @@ def test_execute_gate_tags_infra_failure_when_all_backends_die(tmp_path, monkeyp
     )
 
 
+def test_handler_timeouts_metadata(tmp_path, monkeypatch):
+    import subprocess as _sp
+    from runner.handlers import _run_gate_once, _tool, _codergen, Context as HCtx
+    from runner.parser import Node
+
+    # 1. Test gate timeout metadata
+    def _fake_run_gate(cmd, **kwargs):
+        raise _sp.TimeoutExpired(cmd, 300, output=b"partial gate output", stderr=b"gate stderr")
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run_gate)
+
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+    result = _run_gate_once("codex", "PROMPT", "b"*40, 300, ctx, "evidence")
+
+    assert result.outcome == "failure"
+    assert result.metadata["timed_out"] == "true"
+    assert result.metadata["timeout_s"] == "300"
+    assert result.metadata["backend"] == "codex"
+    assert "codex" in result.metadata["command"]
+    assert "partial gate output" in result.output
+    assert "gate stderr" in result.output
+
+    # 2. Test tool timeout metadata
+    def _fake_run_tool(cmd, **kwargs):
+        raise _sp.TimeoutExpired(cmd, 120, output=b"partial tool output", stderr=b"tool stderr")
+
+    monkeypatch.setattr("subprocess.run", _fake_run_tool)
+    tool_node = make_node(name="my_tool", command="pytest", timeout=120)
+    result_tool = _tool(tool_node, ctx)
+
+    assert result_tool.outcome == "failure"
+    assert result_tool.metadata["timed_out"] == "true"
+    assert result_tool.metadata["timeout_s"] == "120"
+    assert result_tool.metadata["backend"] == "tool"
+    assert result_tool.metadata["command"] == "pytest"
+    assert "partial tool output" in result_tool.output
+    assert "tool stderr" in result_tool.output
+
+    # 3. Test codex timeout metadata
+    def _fake_run_codex(cmd, **kwargs):
+        raise _sp.TimeoutExpired(cmd, 150, output=b"partial codex output", stderr=b"codex stderr")
+
+    monkeypatch.setattr("subprocess.run", _fake_run_codex)
+    codex_node = make_node(name="my_codex", backend="codex", timeout=150)
+    result_codex = _codergen(codex_node, ctx)
+
+    assert result_codex.outcome == "failure"
+    assert result_codex.metadata["timed_out"] == "true"
+    assert result_codex.metadata["timeout_s"] == "150"
+    assert result_codex.metadata["backend"] == "codex"
+    assert "codex" in result_codex.metadata["command"]
+    assert "partial codex output" in result_codex.output
+    assert "codex stderr" in result_codex.output
+
+
+
 # ---------------------------------------------------------------------------
 # gate_slash — generic single-lane reviewer gate
 # ---------------------------------------------------------------------------

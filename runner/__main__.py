@@ -83,6 +83,24 @@ def _handle_panic(
     if args is not None and event_log_path is None and getattr(args, "events", None) is not None:
         event_log_path = args.events
 
+    log_path = None
+    if run_id:
+        log_path = str(pathlib.Path.home() / ".dark-factory" / "logs" / f"{run_id}.log")
+
+    checkpoint_path_str = None
+    if args is not None and getattr(args, "checkpoint", None) is not None:
+        checkpoint_path_str = str(args.checkpoint.resolve())
+
+    evidence_bundle_path_str = None
+    if args is not None and getattr(args, "evidence_bundle", None) is not None:
+        evidence_bundle_path_str = str(args.evidence_bundle.resolve())
+
+    cxdb_path_str = None
+    if args is not None and getattr(args, "cxdb", None) is not None:
+        cxdb_path_str = str(args.cxdb.resolve())
+    elif cxdb_path is not None:
+        cxdb_path_str = str(cxdb_path.resolve())
+
     payload: dict[str, str | None] = {
         "status": "panic",
         "error": f"{type(exc).__name__}: {exc}",
@@ -92,7 +110,10 @@ def _handle_panic(
         "pipeline": str(getattr(args, "pipeline", "")) if args is not None else None,
         "goal": getattr(args, "goal", None),
         "events": str(event_log_path) if event_log_path else None,
-        "cxdb_path": str(cxdb_path) if cxdb_path else None,
+        "cxdb_path": cxdb_path_str,
+        "log_path": log_path,
+        "checkpoint_path": checkpoint_path_str,
+        "evidence_bundle": evidence_bundle_path_str,
     }
 
     panic_root = _PANIC_DIR
@@ -280,6 +301,20 @@ def main(argv: list[str] | None = None) -> int:
                 event_log_path=args.events,
             )
 
+        cxdb_path_str = None
+        if getattr(args, "cxdb", None) is not None:
+            cxdb_path_str = str(args.cxdb.resolve())
+        elif getattr(ctx, "cxdb_path", None) is not None:
+            cxdb_path_str = str(ctx.cxdb_path.resolve())
+
+        checkpoint_path_str = None
+        if getattr(args, "checkpoint", None) is not None:
+            checkpoint_path_str = str(args.checkpoint.resolve())
+
+        evidence_bundle_path_str = None
+        if getattr(args, "evidence_bundle", None) is not None:
+            evidence_bundle_path_str = str(args.evidence_bundle.resolve())
+
         summary = {
             "pipeline": graph.name,
             "goal": args.goal,
@@ -287,6 +322,10 @@ def main(argv: list[str] | None = None) -> int:
             "events": str(ctx.event_log_path) if ctx.event_log_path else None,
             "steps": len(history),
             "final_outcome": history[-1].outcome if history else "empty",
+            "log_path": str(pathlib.Path.home() / ".dark-factory" / "logs" / f"{ctx.run_id}.log") if ctx.run_id else None,
+            "cxdb_path": cxdb_path_str,
+            "checkpoint_path": checkpoint_path_str,
+            "evidence_bundle": evidence_bundle_path_str,
             "trace": [
                 {
                     "node": r.node,

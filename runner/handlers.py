@@ -335,8 +335,8 @@ def _codergen(node: Node, ctx: Context) -> Result:
                     env=_sanitized_env(),
                 )
             except subprocess.TimeoutExpired as exc:
-                stdout = exc.stdout or ""
-                stderr = exc.stderr or ""
+                stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+                stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
                 return Result(
                     outcome="failure",
                     output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
@@ -346,6 +346,9 @@ def _codergen(node: Node, ctx: Context) -> Result:
                         "activity": "timeout",
                         "timed_out": "true",
                         "timeout": str(ao_spawn_timeout),
+                        "timeout_s": str(ao_spawn_timeout),
+                        "backend": "ao",
+                        "command": " ".join(spawn_args) if spawn_args else "ao",
                         "returncode": "",
                     },
                 )
@@ -428,8 +431,8 @@ def _codergen(node: Node, ctx: Context) -> Result:
                 env=_sanitized_env(),
             )
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
+            stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
             return Result(
                 outcome="failure",
                 output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
@@ -439,6 +442,9 @@ def _codergen(node: Node, ctx: Context) -> Result:
                     "activity": "timeout",
                     "timed_out": "true",
                     "timeout": str(ao_send_timeout),
+                    "timeout_s": str(ao_send_timeout),
+                    "backend": "ao",
+                    "command": " ".join(send_args) if send_args else "ao",
                     "returncode": "",
                 },
             )
@@ -527,6 +533,9 @@ def _codergen(node: Node, ctx: Context) -> Result:
                 metadata={
                     "timed_out": "true",
                     "timeout": str(timeout_s),
+                    "timeout_s": str(timeout_s),
+                    "backend": "claude",
+                    "command": " ".join(args) if args else "claude",
                     "returncode": "",
                 },
             )
@@ -566,8 +575,8 @@ def _codergen(node: Node, ctx: Context) -> Result:
                 env=_sanitized_env(),
             )
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
+            stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
             return Result(
                 outcome="failure",
                 output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
@@ -575,6 +584,9 @@ def _codergen(node: Node, ctx: Context) -> Result:
                 metadata={
                     "timed_out": "true",
                     "timeout": str(timeout_s),
+                    "timeout_s": str(timeout_s),
+                    "backend": "codex",
+                    "command": " ".join(args) if args else "codex",
                     "returncode": "",
                 },
             )
@@ -648,7 +660,14 @@ def _codergen(node: Node, ctx: Context) -> Result:
             output = stdout + ("\nSTDERR:\n" + stderr if stderr else "")
             wall_ms = int((time.monotonic() - _start_ts) * 1000)
             metrics = _codergen_metrics(stdout, stderr, wall_ms)
-            meta = {"returncode": str(proc.returncode if proc.returncode is not None else ""), "timed_out": "true"}
+            meta = {
+                "returncode": str(proc.returncode if proc.returncode is not None else ""),
+                "timed_out": "true",
+                "timeout": str(timeout_s),
+                "timeout_s": str(timeout_s),
+                "backend": "agy",
+                "command": " ".join(args) if args else "agy",
+            }
             meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
             return Result(
                 outcome="failure",
@@ -730,7 +749,7 @@ def _tool(node: Node, ctx: Context) -> Result:
     if not cmd:
         return Result(outcome="failure", output="no command attribute")
     cmd = _substitute_state(cmd, ctx)
-    timeout = _coerce_timeout(node.attrs.get("timeout", "300"), 300)
+    timeout = _coerce_timeout(node.attrs.get("timeout", "900"), 900)
     cwd_attr = node.attrs.get("cwd")
     if cwd_attr:
         cwd_attr = _substitute_state(cwd_attr, ctx)
@@ -759,15 +778,17 @@ def _tool(node: Node, ctx: Context) -> Result:
             env=_sanitized_env(),
         )
     except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
+        stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
         return Result(
             outcome="failure",
             output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip() or f"tool command timed out after {timeout} seconds",
             metadata={
                 "command": cmd,
                 "timeout": str(timeout),
+                "timeout_s": str(timeout),
                 "timed_out": "true",
+                "backend": "tool",
                 "returncode": "",
             },
         )
@@ -1185,9 +1206,17 @@ def _run_gate_once(
         return Result(
             outcome="failure",
             output=combined.strip() or f"gate {name} timed out after {run_timeout}s",
-            metadata={"slash_command": name, "verdict": "unknown",
-                      "head_sha_status": "missing", "timed_out": "true",
-                      "reviewer_backend": reviewer_backend},
+            metadata={
+                "slash_command": name,
+                "verdict": "unknown",
+                "head_sha_status": "missing",
+                "timed_out": "true",
+                "timeout": str(run_timeout),
+                "timeout_s": str(run_timeout),
+                "reviewer_backend": reviewer_backend,
+                "backend": reviewer_backend,
+                "command": " ".join(sub_args) if sub_args else reviewer_backend,
+            },
         )
     except FileNotFoundError as exc:
         return Result(

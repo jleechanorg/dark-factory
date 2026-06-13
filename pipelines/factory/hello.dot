@@ -14,7 +14,7 @@ digraph hello {
 
     plan      [type="codergen", label="Plan",      prompt="@prompts/hello/plan.md"]
     implement [type="codergen", label="Implement", prompt="@prompts/hello/implement.md"]
-    holdout   [type="holdout_eval", label="Holdout Eval", feature="hello"]
+    holdout   [type="holdout_eval", label="Holdout Eval", feature="hello", timeout=600]
     fix       [type="codergen", label="Fix",       prompt="@prompts/hello/fix.md", max_visits="3"]
 
     start       -> explore_in

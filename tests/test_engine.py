@@ -144,6 +144,90 @@ def test_default_event_log_path_uses_final_cxdb_run_id(monkeypatch, tmp_path):
     assert {event["run_id"] for event in events} == {ctx.run_id}
 
 
+def test_cxdb_init_failure_warning(capsys, monkeypatch):
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="fake pass")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    graph = parse(_pipeline("hello.dot"))
+    ctx = Context(goal="cxdb fail path", workdir=ROOT, backend="echo", cxdb_path=pathlib.Path("/nonexistent_dir_123456/cxdb.sqlite"))
+
+    history = run(graph, ctx, max_steps=50)
+
+    assert history[-1].outcome == "success"
+    assert ctx.run_id
+    captured = capsys.readouterr()
+    assert "WARNING: CXDB initialization failed at /nonexistent_dir_123456/cxdb.sqlite:" in captured.err
+
+
+def test_validation_node_timeout_refusal(monkeypatch):
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="fake pass")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+
+    # 1. Test missing timeout on a validation node
+    graph = parse(_pipeline("hello.dot"))
+    holdout_node = graph.nodes["holdout"]
+    if "timeout" in holdout_node.attrs:
+        del holdout_node.attrs["timeout"]
+
+    ctx = Context(goal="timeout missing test", workdir=ROOT, backend="echo")
+    history = run(graph, ctx, max_steps=50)
+
+    holdout_record = next(r for r in history if r.node == "holdout")
+    assert holdout_record.outcome == "error"
+    assert "ValueError: validation node 'holdout' missing explicit timeout" in holdout_record.output_preview
+
+    # 2. Test below minimum timeout (e.g. 30s)
+    graph2 = parse(_pipeline("hello.dot"))
+    holdout_node2 = graph2.nodes["holdout"]
+    holdout_node2.attrs["timeout"] = 30
+
+    ctx2 = Context(goal="timeout too low test", workdir=ROOT, backend="echo")
+    history2 = run(graph2, ctx2, max_steps=50)
+
+    holdout_record2 = next(r for r in history2 if r.node == "holdout")
+    assert holdout_record2.outcome == "error"
+    assert "ValueError: validation node 'holdout' timeout 30s is below minimum 60s" in holdout_record2.output_preview
+
+
+def test_persistence_failures_isolated(monkeypatch, tmp_path):
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="fake pass")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    graph = parse(_pipeline("hello.dot"))
+
+    # 1. Test checkpoint write failure
+    # pass a directory as checkpoint path so writing to it raises OSError
+    ctx = Context(goal="checkpoint fail", workdir=ROOT, backend="echo")
+    history = run(graph, ctx, checkpoint=tmp_path, max_steps=50)
+
+    assert history[-1].outcome == "success"
+    assert "persistence_error" in ctx.state
+    assert any(err in ctx.state["persistence_error"] for err in ["IsADirectoryError", "PermissionError", "OSError"])
+
+    # Check that history records got the persistence_error metadata
+    assert any("persistence_error" in (r.metadata or {}) for r in history)
+
+    # 2. Test CXDB record failure
+    # Monkeypatch CXDB.record_step to raise an exception
+    from runner.cxdb import CXDB
+    def fail_record_step(*args, **kwargs):
+        raise RuntimeError("Simulated DB Lock")
+    monkeypatch.setattr(CXDB, "record_step", fail_record_step)
+
+    cxdb_file = tmp_path / "cxdb.sqlite"
+    ctx2 = Context(goal="cxdb fail", workdir=ROOT, backend="echo", cxdb_path=cxdb_file)
+    history2 = run(graph, ctx2, max_steps=50)
+
+    assert history2[-1].outcome == "success"
+    assert "persistence_error" in ctx2.state
+    assert "Simulated DB Lock" in ctx2.state["persistence_error"]
+    assert any("persistence_error" in (r.metadata or {}) for r in history2)
+
+
 def test_cli_invocation_green():
     """End-to-end: run the CLI with the real holdout evaluator against the impl tree."""
     proc = subprocess.run(

@@ -650,6 +650,17 @@ def _run_single_node(
     ctx: Context,
     graph: Graph,
 ) -> tuple[list[Result], list[StepRecord]]:
+    if _is_validation_node(node):
+        timeout_val = node.attrs.get("timeout")
+        if timeout_val is None:
+            raise ValueError(f"validation node {node.name!r} missing explicit timeout")
+        try:
+            timeout_int = int(timeout_val)
+        except (TypeError, ValueError):
+            raise ValueError(f"validation node {node.name!r} has invalid timeout: {timeout_val!r}")
+        if timeout_int < 60:
+            raise ValueError(f"validation node {node.name!r} timeout {timeout_int}s is below minimum 60s")
+
     handler = resolve(node)
     results = _run_with_retries(handler, node, ctx, graph)
     normalized_results: list[Result] = []
@@ -880,6 +891,8 @@ def run(
             cxdb = CXDB(ctx.cxdb_path)
             ctx.run_id = cxdb.start_run(pipeline=graph.name, goal=ctx.goal)
         except Exception as exc:
+            sys.stderr.write(f"WARNING: CXDB initialization failed at {ctx.cxdb_path}: {exc}\n")
+            sys.stderr.flush()
             _emit_event(
                 ctx,
                 "cxdb_init_failed",
@@ -1548,6 +1561,15 @@ def _append_record(
         try:
             checkpoint.write_text(json.dumps([asdict(r) for r in history], indent=2))
         except Exception as exc:
+            err_msg = f"Checkpoint write failed: {type(exc).__name__}: {exc}"
+            log_handle = _open_run_log(ctx.run_id) if ctx.run_id else None
+            if log_handle:
+                _log(log_handle, err_msg)
+                log_handle.close()
+            ctx.state["persistence_error"] = f"{type(exc).__name__}: {exc}"
+            if record.metadata is None:
+                record.metadata = {}
+            record.metadata["persistence_error"] = f"{type(exc).__name__}: {exc}"
             _emit_event(
                 ctx,
                 "checkpoint_write_failed",
@@ -1593,6 +1615,15 @@ def _persist(
             metadata=metadata or record.metadata,
         )
     except Exception as exc:
+        err_msg = f"CXDB record failed: {type(exc).__name__}: {exc}"
+        log_handle = _open_run_log(ctx.run_id) if ctx.run_id else None
+        if log_handle:
+            _log(log_handle, err_msg)
+            log_handle.close()
+        ctx.state["persistence_error"] = f"{type(exc).__name__}: {exc}"
+        if record.metadata is None:
+            record.metadata = {}
+        record.metadata["persistence_error"] = f"{type(exc).__name__}: {exc}"
         _emit_event(
             ctx,
             "cxdb_record_failed",
