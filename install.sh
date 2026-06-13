@@ -69,6 +69,11 @@ fi
 echo "==> installing requirements.txt into venv (PyPI via uv pip)"
 uv pip install --python "${PYTHON_BIN}" -r "${REPO_ROOT}/requirements.txt"
 
+if [[ -f "${REPO_ROOT}/requirements-dev.txt" ]]; then
+  echo "==> installing requirements-dev.txt into venv (PyPI via uv pip)"
+  uv pip install --python "${PYTHON_BIN}" -r "${REPO_ROOT}/requirements-dev.txt"
+fi
+
 echo "==> verifying import"
 "${PYTHON_BIN}" -c "import pydot, yaml; print('deps ok:', pydot.__version__)"
 

@@ -698,7 +698,20 @@ def validate_pipeline(path: pathlib.Path) -> tuple[Optional[Graph], list[dict[st
             else:
                 prompt_path = pathlib.Path(prompt_ref)
                 if not prompt_path.is_absolute():
-                    prompt_path = (pipeline_path.parent / prompt_path).resolve()
+                    dot_relative = (pipeline_path.parent / prompt_path).resolve()
+                    if dot_relative.exists():
+                        prompt_path = dot_relative
+                    else:
+                        from .paths import factory_home
+                        home = factory_home()
+                        if home is not None:
+                            home_relative = (home / prompt_path).resolve()
+                            if home_relative.exists():
+                                prompt_path = home_relative
+                            else:
+                                prompt_path = dot_relative
+                        else:
+                            prompt_path = dot_relative
                 if not prompt_path.exists():
                     diagnostics.append(
                         {
