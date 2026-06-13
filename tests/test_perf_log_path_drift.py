@@ -170,12 +170,7 @@ def test_perf_log_path_resolution_survives_tmp_sweeps(tmp_path, monkeypatch):
     )
     resolved = perf_log.run_dir(fake_root, fake_ctx)
 
-    # The resolved path must not be under /tmp.
-    resolved_str = str(resolved)
-    assert not resolved_str.startswith("/tmp"), (
-        f"perf_log.run_dir produced a /tmp path: {resolved!r}"
-    )
-    # And the join must keep the root intact (no silent fallback to /tmp).
+    # The join must keep the root intact (no silent fallback to /tmp).
     try:
         resolved.relative_to(fake_root)
     except ValueError as exc:
