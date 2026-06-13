@@ -30,6 +30,87 @@ _LOG_DIR = pathlib.Path.home() / ".dark-factory" / "logs"
 _EVENT_DIR = pathlib.Path.home() / ".dark-factory" / "events"
 
 _event_lock = threading.Lock()
+_heartbeat_lock = threading.Lock()
+
+def _write_heartbeat(
+    ctx: Context,
+    graph: Optional[Graph] = None,
+    node: Optional[Node] = None,
+    is_complete: bool = False,
+) -> None:
+    run_id = ctx.run_id
+    if not run_id:
+        return
+    with _heartbeat_lock:
+        try:
+            run_dir = pathlib.Path.home() / ".dark-factory" / "runs" / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            hb_path = run_dir / "heartbeat.json"
+            
+            existing = {}
+            if hb_path.exists():
+                try:
+                    existing = json.loads(hb_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            
+            pipeline = existing.get("pipeline", "")
+            if graph is not None:
+                pipeline = str(graph.pipeline_path) if getattr(graph, "pipeline_path", None) else graph.name
+                
+            goal = ctx.goal
+            workdir = str(ctx.workdir)
+            
+            start_ts = existing.get("start_timestamp")
+            if not is_complete and node is not None:
+                start_ts = time.time()
+            if start_ts is None:
+                start_ts = time.time()
+                
+            elapsed_time = existing.get("elapsed_time")
+            if is_complete and start_ts is not None:
+                elapsed_time = time.time() - start_ts
+                
+            if node is not None:
+                current_node = None if is_complete else node.name
+                backend = _node_backend(node, ctx)
+                timeout_raw = node.attrs.get("timeout")
+                timeout = None
+                if timeout_raw is not None:
+                    try:
+                        if isinstance(timeout_raw, (int, float)):
+                            timeout = timeout_raw
+                        else:
+                            timeout = float(timeout_raw)
+                    except (TypeError, ValueError):
+                        pass
+            else:
+                current_node = existing.get("current_node")
+                backend = existing.get("backend", ctx.backend)
+                timeout = existing.get("timeout")
+                
+            hb_data = {
+                "pipeline": pipeline,
+                "goal": goal,
+                "workdir": workdir,
+                "current_node": current_node,
+                "start_timestamp": start_ts,
+                "backend": backend,
+                "timeout": timeout,
+                "last_completed_seq": getattr(ctx, "last_completed_seq", 0)
+            }
+            
+            if is_complete or elapsed_time is not None:
+                hb_data["elapsed_time"] = elapsed_time
+                hb_data["timestamp"] = time.time()
+                
+            hb_path.write_text(json.dumps(hb_data, indent=2), encoding="utf-8")
+        except Exception as exc:
+            try:
+                print(f"[runner:write_heartbeat:{type(exc).__name__}] {exc}", file=sys.stderr, flush=True)
+            except Exception:
+                pass
+
 
 
 def _emit_event(ctx: Context, event: str, payload: dict[str, str], seq: int | None = None) -> None:
@@ -252,6 +333,7 @@ def _clone_context(ctx: Context) -> Context:
         perf_log_root=getattr(ctx, "perf_log_root", None),
         git_ctx=getattr(ctx, "git_ctx", None),
         perf_run=getattr(ctx, "perf_run", None),
+        last_completed_seq=getattr(ctx, "last_completed_seq", 0),
     )
 
 
@@ -696,6 +778,7 @@ def _run_branch_until_join(
                 with seq_lock:
                     local_seq = seq_ref[0]
                     seq_ref[0] += 1
+                    ctx.last_completed_seq = local_seq
 
                 if i > 0:
                     _emit_event(
@@ -759,29 +842,33 @@ def _run_single_node(
     ctx: Context,
     graph: Graph,
 ) -> tuple[list[Result], list[StepRecord]]:
-    handler = resolve(node)
-    results = _run_with_retries(handler, node, ctx, graph)
-    normalized_results: list[Result] = []
-    records: list[StepRecord] = []
-    for attempt in results:
-        attempt = _normalized_result(attempt)
-        ctx.state.update(attempt.context_updates)
-        ctx.state["_last_node"] = node.name
-        ctx.state["_last_outcome"] = attempt.outcome
-        ctx.state["_last_output"] = attempt.output[:4000]
-        normalized_results.append(attempt)
-        records.append(
-            StepRecord(
-                node=node.name,
-                outcome=attempt.outcome,
-                ts=time.time(),
-                output_preview=attempt.output[:280],
-                metadata=attempt.metadata,
+    _write_heartbeat(ctx, graph, node)
+    try:
+        handler = resolve(node)
+        results = _run_with_retries(handler, node, ctx, graph)
+        normalized_results: list[Result] = []
+        records: list[StepRecord] = []
+        for attempt in results:
+            attempt = _normalized_result(attempt)
+            ctx.state.update(attempt.context_updates)
+            ctx.state["_last_node"] = node.name
+            ctx.state["_last_outcome"] = attempt.outcome
+            ctx.state["_last_output"] = attempt.output[:4000]
+            normalized_results.append(attempt)
+            records.append(
+                StepRecord(
+                    node=node.name,
+                    outcome=attempt.outcome,
+                    ts=time.time(),
+                    output_preview=attempt.output[:280],
+                    metadata=attempt.metadata,
+                )
             )
-        )
-        _update_failure_state(node, ctx, attempt)
-        ctx.history.append({"node": node.name, "outcome": attempt.outcome})
-    return normalized_results, records
+            _update_failure_state(node, ctx, attempt)
+            ctx.history.append({"node": node.name, "outcome": attempt.outcome})
+        return normalized_results, records
+    finally:
+        _write_heartbeat(ctx, graph, node, is_complete=True)
 
 
 def _allow_partial(node: Node) -> bool:
@@ -940,6 +1027,7 @@ def run(
     visits: dict[str, int] = {}
     current = _start_node(graph)
     seq = 0  # CXDB sequence — independent of history length so refactors can't desync.
+    ctx.last_completed_seq = seq
     _resumed_overhead = 0
 
     if resume is not None:
@@ -1079,6 +1167,7 @@ def run(
                     graph, current, ctx, exc, history, checkpoint, cxdb, seq, log, visits
                 )
                 seq += 1
+                ctx.last_completed_seq = seq
                 if next_node is None:
                     break
                 current = next_node
@@ -1444,6 +1533,7 @@ def run(
                                     )
 
                         seq = _seq_ref[0]
+                        ctx.last_completed_seq = seq
 
                         for _bs in _branch_starts:
                             _b_recs, _b_res = _name_to_br.get(_bs.name, ([], Result(outcome="failure")))
@@ -1573,6 +1663,7 @@ def run(
                     skip_perf_exit=True,
                 )
                 seq += 1
+                ctx.last_completed_seq = seq
                 if next_node is None:
                     break
                 current = next_node
@@ -1794,6 +1885,8 @@ def _append_record(
         seq,
     )
     _persist(cxdb, ctx, seq, record, output, metadata)
+    ctx.last_completed_seq = seq
+    _write_heartbeat(ctx)
     return seq + 1
 
 

@@ -53,6 +53,7 @@ class Context:
     perf_log_root: Optional[pathlib.Path] = None
     git_ctx: Optional["GitContext"] = None
     perf_run: Optional["PerfRun"] = None
+    last_completed_seq: int = 0
 
 
 _TIMEOUT_MIN_SECONDS = 5
