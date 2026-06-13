@@ -129,12 +129,10 @@ __DF_ARG_LOCK_PREV=""
 for __df_arg in "$@"; do
   if [[ "${__DF_ARG_LOCK_PREV}" == "--workdir" && -n "${__df_arg}" ]]; then
     __DF_LOCK_TARGET="${__df_arg}"
-    break
   fi
   # Handle --workdir=/path format
   if [[ "${__df_arg}" == --workdir=* ]]; then
     __DF_LOCK_TARGET="${__df_arg#--workdir=}"
-    break
   fi
   __DF_ARG_LOCK_PREV="${__df_arg}"
 done
@@ -155,13 +153,17 @@ if ! env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
     --target "${__DF_LOCK_TARGET}" --run-id "${__DF_LOCK_RUN_ID}" \
     >/dev/null 2>&1; then
   # Re-run the acquire non-silently so we can show the holder on stderr.
-  env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
-    "${VENV_PYTHON}" -m runner._merge_train acquire \
-    --target "${__DF_LOCK_TARGET}" --run-id "${__DF_LOCK_RUN_ID}" >&2 || true
-  echo "ERROR: another dark-factory run is editing ${__DF_LOCK_TARGET}" >&2
-  # Clear the run_id so the EXIT trap's release is a no-op.
-  __DF_LOCK_RUN_ID=""
-  exit 3
+  # If this succeeds (holder released between attempts), proceed normally.
+  if env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+      "${VENV_PYTHON}" -m runner._merge_train acquire \
+      --target "${__DF_LOCK_TARGET}" --run-id "${__DF_LOCK_RUN_ID}" >&2; then
+    : # Lock acquired on retry, continue to runner
+  else
+    echo "ERROR: another dark-factory run is editing ${__DF_LOCK_TARGET}" >&2
+    # Clear the run_id so the EXIT trap's release is a no-op.
+    __DF_LOCK_RUN_ID=""
+    exit 3
+  fi
 fi
 
 has_workdir=0
