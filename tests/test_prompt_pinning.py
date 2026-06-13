@@ -74,9 +74,8 @@ def _all_dot_files() -> list[pathlib.Path]:
 def _resolve_prompt_path(dot_file: pathlib.Path, prompt_ref: str) -> pathlib.Path:
     """Resolve a ``@<ref>`` prompt reference the way the engine does.
 
-    Mirrors ``runner.handlers._render_prompt`` (and the
-    ``runner.structural_preflight._check_prompt_paths`` wrapper that
-    shadows it for the preflight CLI):
+    Mirrors ``runner.handlers._render_prompt`` (the production
+    resolver that actually loads the prompt at runtime):
 
       1. Strip the leading ``@``.
       2. If the result is an absolute path, honor it as-is (the engine
@@ -93,6 +92,15 @@ def _resolve_prompt_path(dot_file: pathlib.Path, prompt_ref: str) -> pathlib.Pat
          prompts/...`` files which sit beside the .dot at a level
          above it (i.e. the @-prefixed path is repo-root relative,
          not .dot-dir relative).
+
+    Note: this order is deliberately the ENGINE's runtime order
+    (workdir → factory_home), not the preflight CLI's order
+    (dot-dir → factory_home). ``runner.structural_preflight`` is a
+    separate module that validates a single .dot at a time and
+    resolves relative to the .dot file's directory first; the
+    production engine in ``runner.handlers._render_prompt`` resolves
+    relative to the CWD first. This test pins the production path
+    that codergen / tool nodes actually exercise at run time.
 
     Returns the FIRST path that exists; falls back to the workdir
     resolution for diagnostic reporting. Existence is checked
@@ -140,19 +148,23 @@ def test_every_prompt_reference_in_every_dot_file_resolves_to_existing_file() ->
         for name, node in g.nodes.items():
             if name in {"start", "exit"}:
                 continue
-            # pydot may or may not surface the leading-@ in the attr
-            # value, depending on DOT quoting. Check both forms.
-            for raw_value in (node.attrs.get("prompt"), node.attrs.get("prompt", "")):
-                if not raw_value:
-                    continue
-                prompt_ref = str(raw_value)
-                if not prompt_ref.startswith("@"):
-                    continue
-                resolved = _resolve_prompt_path(path, prompt_ref)
-                if not resolved.is_file():
-                    missing.append((rel, f"{name} -> {prompt_ref} -> {resolved}"))
+            # Use the parser's prompt_ref property — it strips the
+            # leading '@' (or returns the un-prefixed value as-is if
+            # the .dot author omitted the @). This matches what the
+            # engine actually feeds to _render_prompt at runtime, so
+            # the test pins the contract the engine sees, not the
+            # string-equal-to-literal-"@..." form.
+            ref = node.prompt_ref
+            if not ref:
+                continue
+            # Re-add the '@' for the resolver helper's path-strip step
+            # (the helper mirrors the engine's runtime contract: it
+            # also strips the leading '@' before resolving).
+            resolved = _resolve_prompt_path(path, "@" + ref)
+            if not resolved.is_file():
+                missing.append((rel, f"{name} -> @{ref} -> {resolved}"))
     assert not missing, (
-        f"every prompt=@... reference in every .dot file must resolve to an "
+        f"every prompt reference in every .dot file must resolve to an "
         f"existing file. Missing: {missing}."
     )
 
