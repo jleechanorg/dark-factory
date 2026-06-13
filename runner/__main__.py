@@ -110,7 +110,7 @@ def _handle_panic(
         _append_event(
             pathlib.Path(payload["events"]),
             {
-                "event": "panic",
+                "event": "crash",
                 "run_id": run_id or "",
                 "exit_code": "128",
                 "panic_artifact": str(panic_file),
