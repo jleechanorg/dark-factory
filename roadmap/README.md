@@ -2,6 +2,20 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-13 — Round 7 close: minimal_feature_cs + levelup_pra_validate slim pipelines SHIPPED, 2 untracked files promoted to tracked, 1 PR MERGED, 0 regressions
+
+- **Two untracked working files promoted to tracked → PR [#63](https://github.com/jleechanorg/dark-factory/pull/63) MERGED at [`0e3843b`](https://github.com/jleechanorg/dark-factory/commit/0e3843b)** — admin-merge per `jleechan-xpv` pattern (test + Skeptic + CodeRabbit SUCCESS, Bugbot NEUTRAL, mergeable=MERGEABLE). Squash of 1 commit onto main.
+  - `pipelines/slim/minimal_feature_cs.dot` (NEW, 113L): feature loop with `gate_es` → `gate_er` → `gate_cs` after the sealed-holdout. Closes the gap the F6c sibling-pipeline test exposed (slim/ feature pipelines were missing the `/code_standards` gate that factory/ siblings carry). Includes `@pipelines/_base.dot` for the explore phase.
+  - `pipelines/slim/levelup_pra_validate.dot` (NEW, 24L): PR-A validation-only pipeline (holdout → gate_es → gate_er → gate_cs → exit, no short-circuit on holdout failure). Used to validate a prompt diff before the implementing agent lands any deletion-class scenarios.
+  - `tests/test_slim_pipelines_timeouts.py` (NEW, 161L, 2 tests): companion to `test_gates_dot_timeouts.py`. Pins the same contract (subprocess-spawning nodes declare a `timeout`) and the same value (600s) for the two new slim/ pipelines, with an explicit `_INHERITED_FROM_BASE_DOT` exception list (`explore_in`, `explore_out`, `explore_fanout`, `explore_concept`, `explore_auth`, `explore_reuse`, `explore_risks`, `explore_join`, `explore_stitch`) so the WIP branch's eventual `_base.dot` work has a clear seam.
+- **`minimal_feature_cs.dot` history**: real commit `787a9a2` on stale `chore/minimal-feature-cs-pipeline` branch, but that branch never landed a PR. The on-disk untracked file was a slightly newer revision (comments stripped). Both files diff'd; on-disk is current, branch copy is stale.
+- **`levelup_pra_validate.dot` history**: no git history — purely a working file.
+- **Test design notes**: (1) `_normalise_timeout(value)` coerces via `int(value)` because pydot returns DOT values as-written (`timeout=600` → int, `timeout="600"` → str). Both forms pass the test. (2) Skipping `_INHERITED_FROM_BASE_DOT` keeps the test scoped to this PR's surface — those nodes' timeouts are the WIP branch's responsibility. (3) `_SLIM_PIPELINES` pinning is intentionally absent here (the discovery + assertion is the right model for new pipelines) but the test uses a hardcoded `_PIPELINES_IN_THIS_PR` for now because the existing slim/ family has codergen nodes WITHOUT timeouts (WIP-touched) and including them would be a false positive.
+- **Suite on merged main**: 505 + 1 skip + 1 xfail (up from 503 = +2 tests, 0 regressions, 0 broken).
+- **File-disjoint verification**: `comm -12 <(git diff --cached --name-only | sort) <(git diff --name-only main..feat/agento-dark-factory-implement-attractor-runner-parity-bead | sort)` returns empty. All 3 new files (2 .dot, 1 .py) are disjoint from the WIP branch's 152 files.
+- **3/4 gates SUCCESS**: test + Skeptic + CodeRabbit all passed; Bugbot NEUTRAL with no annotations. The 7-green routine took the cleanest path this round (no 7-min timeout, no admin-merge chase).
+- **Recommended next action: WIP triage** (`jleechan-xsg` P1) — still the highest-leverage action. After 3 rounds of file-disjoint micro-PRs, the most impactful unblocking move is to push the WIP branch into a PR.
+
 ### 2026-06-13 — Round 6 close: F6c (gates.dot timeout attrs) SHIPPED, the previous round's "no file-disjoint work remains" verdict was wrong, 1 PR MERGED, 0 regressions
 
 - **F6c (gates.dot timeout attrs) → PR [#62](https://github.com/jleechanorg/dark-factory/pull/62) MERGED at [`a226bcb`](https://github.com/jleechanorg/dark-factory/commit/a226bcb)** — admin-merge per `jleechan-xpv` pattern (test + Skeptic + CodeRabbit SUCCESS, Bugbot IN_PROGRESS-with-no-annotations for 7+ min, mergeable=MERGEABLE). Squash of 1 commit onto main.
