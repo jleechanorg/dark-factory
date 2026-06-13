@@ -2,6 +2,22 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-13 — Round 5 close: F6b SHIPPED, dark-factory reinstalled on main, 2 housekeeping beads closed (1 PR MERGED, 2 beads closed, 0 regressions)
+
+- **F6b (cxdb `_coerce_metric` helper extraction) → PR [#61](https://github.com/jleechanorg/dark-factory/pull/61) MERGED at [`0027c11`](https://github.com/jleechanorg/dark-factory/commit/0027c11)** — admin-merge per `jleechan-xpv` pattern (test + Skeptic + CodeRabbit SUCCESS, Bugbot NEUTRAL, mergeable=MERGEABLE). Squash of 2 commits (F6b code + roadmap doc) onto main.
+  - `runner/cxdb.py` (+31/-26): new `_coerce_metric(value, cast)` private helper, refactored `cluster_aggregates` to use it (3 repeated coerce-skip blocks → single helper). Removed dead `for key, target in (("tokens_in", "_in"), ...)` tuple.
+  - `tests/test_cxdb_aggregates.py` (NEW, 201L, 14 tests): `_coerce_metric` contract (int / float / None / "" / garbage / non-scalar) + `cluster_aggregates` integration (sums valid + skips garbage, None-for-all-garbage, all 3 token keys, per-key independence).
+  - `roadmap/README.md` (+17): Round 4/5 rolling entries.
+- **Suite on merged main**: 501 + 1 skip + 1 xfail (up from 487 = +14 tests, 0 regressions, 0 broken).
+- **Dark-factory reinstalled on main (`./install.sh --clear`)**: uv-managed Python 3.13.9, venv recreated, 3 deps installed (pydot 4.0.1, pyparsing 3.3.2, pyyaml 6.0.3), 3 binaries linked to `~/.local/bin/{dark-factory,df-healer,df-validate}`, 4 command symlinks + 2 skill symlinks mirrored to `~/.claude/`. **`install.sh --clear` wipes test deps, not just runtime deps** — re-ran `uv pip install --python .venv/bin/python pytest` (worth a follow-up bead for `requirements-dev.txt`).
+- **3 binary smoke tests via installed `~/.local/bin/dark-factory`**: (1) `pipelines/factory/hello.dot` echo → rc=0 (engine runs to exit after `fix` max_visits=3 on holdout that returns `passed:0/total:0` against unchanged repo — expected); (2) `pipelines/slim/review_pr.dot` echo → rc=0, **final outcome=success** (clean run through `review` → `gate_er` → `exit`); (3) `--preflight` on `hello.dot` → rc=0 with structural pre-existing limitation surfaced (preflight resolves `@prompts/...` relative to the pipeline file's parent; engine's include-chain resolver is correct; preflight is the wrong one — file as follow-up bead).
+- **2 beads closed in housekeeping**:
+  - `jleechan-1l7` (P3, F6 git-helper consolidation) — closed as **superseded by WIP**. WIP branch `feat/agento-dark-factory-implement-attractor-runner-parity-bead` has already **deleted** `runner/_git.py` entirely (152 files / 10 commits ahead of main). The F6 refactor would be a no-op once WIP lands.
+  - `jleechan-4gx` (P3, dark-factory-cleanup-untracked) — was already closed by PR #56's merge (MERGED 2026-06-13T06:42:57Z).
+- **Open beads after round 5 close: 20** (was 22, -2 housekeeping). Of these, ~17 are WIP-blocked (WIP touches 56/60 `runner/*.py`, 17/25 `tests/test_*.py`, 11 `pipelines/*.dot`, 11 `prompts/slim/*.md`, plus `install.sh` / `bin/conformance` / `diagrams/` / `docs/` / `roadmap/` / `benchmarks/` / `AGENTS.md` / `CLAUDE.md`).
+- **Recommended next action: WIP triage** — rebase WIP onto current main, fix any conflicts, push and open a draft PR for Skeptic + CodeRabbit review. This unblocks 17 of 20 open beads. While WIP is in triage, ship a micro-PR for the untracked file `pipelines/slim/minimal_feature_cs.dot` (1-line `git rm --cached` + `.gitignore` entry).
+- **Key process notes**: (1) Do housekeeping bead closes at the start of any "what next?" decision — `1l7` and `4gx` were both outdated by 5-min `br close` calls. (2) The preflight's prompt-path resolver is structurally different from the engine's include-chain resolver — same input produces different output, and the preflight is the wrong one. (3) The WIP branch is the throughput bottleneck — every day it stays open with 150+ files, 17 of 20 dark-factory beads sit idle. Open a draft PR on WIP today.
+
 ### 2026-06-13 — healer-discriminator + perf-log-drift-tripwire + parallel-demo-prompt SHIPPED (3 PRs MERGED, 2 beads closed, ua8 subitem 1 closed)
 
 - **3 file-disjoint parallel subagents dispatched** (after pre-check: each lane touches files disjoint from the WIP `feat/agento-dark-factory-implement-attractor-runner-parity-bead` and disjoint from each other):
