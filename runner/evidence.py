@@ -319,6 +319,20 @@ def write_bundle(
 
     # 3. Summarise the run for manifest + README + step files.
     steps, totals = _summarise_run(cxdb_path, run_id)
+    
+    # Enforce exit node check: force final_outcome to "failure" if no exit node was hit
+    from .parser import is_exit_node
+    has_exit = False
+    if graph is not None and hasattr(graph, "nodes"):
+        for step in steps:
+            node_name = step.get("node")
+            if node_name in graph.nodes:
+                if is_exit_node(graph.nodes[node_name]):
+                    has_exit = True
+                    break
+    if not has_exit:
+        totals["final_outcome"] = "failure"
+
     holdout_nodes = _holdout_nodes_in_graph(graph)
     _write_step_files(bundle_dir, cxdb_path, run_id, steps, holdout_nodes)
     events_path = _copy_events(event_log_path, bundle_dir)

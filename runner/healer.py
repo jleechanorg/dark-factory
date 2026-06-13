@@ -207,23 +207,29 @@ Your output must consist entirely of the prescription (no preamble, no conversat
         return f"Error: Unknown backend {backend!r}."
 
 
-def _clusters(cxdb_path: pathlib.Path) -> list[Cluster]:
+def _clusters(cxdb_path: pathlib.Path, run_id: Optional[str] = None) -> list[Cluster]:
     db = CXDB(cxdb_path)
-    rows = db.failed_steps()
+    rows = db.failed_steps(run_id=run_id)
     out: list[Cluster] = []
     for row in rows:
         agg = db.cluster_aggregates(
-            row["node"], row["outcome"], row["output_hash"]
+            row["node"], row["outcome"], row["output_hash"], run_id=run_id
         )
         # Snapshot first matching step's metadata_json for the discriminator
         # (orch-g06). The Cluster dataclass accepts a dict-shaped metadata.
         first_meta: dict = {}
         try:
             cur = db._conn.cursor()
-            cur.execute(
-                "SELECT metadata_json FROM steps WHERE node=? AND outcome=? AND output_hash=? LIMIT 1",
-                (row["node"], row["outcome"], row["output_hash"]),
-            )
+            if run_id is not None:
+                cur.execute(
+                    "SELECT metadata_json FROM steps WHERE node=? AND outcome=? AND output_hash=? AND run_id=? LIMIT 1",
+                    (row["node"], row["outcome"], row["output_hash"], run_id),
+                )
+            else:
+                cur.execute(
+                    "SELECT metadata_json FROM steps WHERE node=? AND outcome=? AND output_hash=? LIMIT 1",
+                    (row["node"], row["outcome"], row["output_hash"]),
+                )
             meta_row = cur.fetchone()
             if meta_row and meta_row[0]:
                 import json as _json
@@ -259,8 +265,8 @@ def _fmt(value) -> str:
     return str(value)
 
 
-def report(cxdb_path: pathlib.Path, backend: str = "echo") -> str:
-    clusters = _clusters(cxdb_path)
+def report(cxdb_path: pathlib.Path, backend: str = "echo", run_id: Optional[str] = None) -> str:
+    clusters = _clusters(cxdb_path, run_id=run_id)
     if not clusters:
         return "# Healer Report\n\nNo terminal failures recorded. Nothing to diagnose.\n"
 
@@ -342,6 +348,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="LLM backend for healer diagnosis (default: echo)",
     )
     p.add_argument(
+        "--run-id",
+        default=None,
+        help="Pin Healer to a specific run_id (CXDB isolation)",
+    )
+    p.add_argument(
         "--out",
         type=pathlib.Path,
         default=None,
@@ -353,7 +364,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"CXDB not found: {args.cxdb}", file=sys.stderr)
         return 1
 
-    text = report(args.cxdb, backend=args.backend)
+    text = report(args.cxdb, backend=args.backend, run_id=args.run_id)
     if args.out:
         args.out.write_text(text)
         print(f"wrote {args.out}")

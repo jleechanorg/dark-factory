@@ -16,7 +16,7 @@ import re
 import sqlite3
 import time
 import uuid
-from typing import Iterable
+from typing import Iterable, Optional
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -158,7 +158,7 @@ class CXDB:
         self._conn.commit()
 
     def cluster_aggregates(
-        self, node: str, outcome: str, output_hash: str
+        self, node: str, outcome: str, output_hash: str, run_id: Optional[str] = None
     ) -> dict:
         """Sum tokens / cost / wall_ms across every row in a failure cluster.
 
@@ -168,13 +168,22 @@ class CXDB:
         contribute and they do not raise.
         """
         cur = self._conn.cursor()
-        cur.execute(
-            """
-            SELECT metadata_json FROM steps
-            WHERE node = ? AND outcome = ? AND output_hash = ?
-            """,
-            (node, outcome, output_hash),
-        )
+        if run_id is not None:
+            cur.execute(
+                """
+                SELECT metadata_json FROM steps
+                WHERE node = ? AND outcome = ? AND output_hash = ? AND run_id = ?
+                """,
+                (node, outcome, output_hash, run_id),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT metadata_json FROM steps
+                WHERE node = ? AND outcome = ? AND output_hash = ?
+                """,
+                (node, outcome, output_hash),
+            )
         total_tokens = 0
         total_cost_usd = 0.0
         total_wall_ms = 0
@@ -203,22 +212,38 @@ class CXDB:
             "total_wall_ms": total_wall_ms if saw_any else None,
         }
 
-    def failed_steps(self) -> Iterable[sqlite3.Row]:
+    def failed_steps(self, run_id: Optional[str] = None) -> Iterable[sqlite3.Row]:
         cur = self._conn.cursor()
         cur.row_factory = sqlite3.Row
-        cur.execute(
-            """
-            SELECT node, outcome, output_hash, COUNT(*) AS hits,
-                   GROUP_CONCAT(run_id, ',') AS run_ids,
-                   MAX(output_head) AS sample
-            FROM steps
-            WHERE outcome IN (
-                'failure', 'fail', 'error', 'exhausted', 'stuck', 'partial', 'inconclusive'
+        if run_id is not None:
+            cur.execute(
+                """
+                SELECT node, outcome, output_hash, COUNT(*) AS hits,
+                       GROUP_CONCAT(run_id, ',') AS run_ids,
+                       MAX(output_head) AS sample
+                FROM steps
+                WHERE run_id = ? AND outcome IN (
+                    'failure', 'fail', 'error', 'exhausted', 'stuck', 'partial', 'inconclusive'
+                )
+                GROUP BY node, outcome, output_hash
+                ORDER BY hits DESC, node ASC
+                """,
+                (run_id,),
             )
-            GROUP BY node, outcome, output_hash
-            ORDER BY hits DESC, node ASC
-            """,
-        )
+        else:
+            cur.execute(
+                """
+                SELECT node, outcome, output_hash, COUNT(*) AS hits,
+                       GROUP_CONCAT(run_id, ',') AS run_ids,
+                       MAX(output_head) AS sample
+                FROM steps
+                WHERE outcome IN (
+                    'failure', 'fail', 'error', 'exhausted', 'stuck', 'partial', 'inconclusive'
+                )
+                GROUP BY node, outcome, output_hash
+                ORDER BY hits DESC, node ASC
+                """,
+            )
         return list(cur.fetchall())
 
     def close(self) -> None:
