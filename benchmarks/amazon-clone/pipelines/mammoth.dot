@@ -10,14 +10,16 @@ digraph AmazonCloneMammoth {
   specify [
     type="codergen",
     label="Specify",
-    prompt="@benchmarks/amazon-clone/prompts/plan.md"
+    prompt="@benchmarks/amazon-clone/prompts/plan.md",
+    timeout=600
   ]
 
   build [
     type="codergen",
     label="Build",
     prompt="@benchmarks/amazon-clone/prompts/implement.md",
-    max_retries=2
+    max_retries=2,
+    timeout=600
   ]
 
   validate [
@@ -32,7 +34,8 @@ digraph AmazonCloneMammoth {
     type="codergen",
     label="Repair",
     prompt="@benchmarks/amazon-clone/prompts/fix.md",
-    max_retries=2
+    max_retries=2,
+    timeout=600
   ]
 
   start -> specify

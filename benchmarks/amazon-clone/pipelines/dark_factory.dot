@@ -5,20 +5,20 @@ digraph amazon_fullstack {
     start [shape=Mdiamond, label="Start"]
     exit  [shape=Msquare, label="Exit"]
 
-    spec_review [type="codergen", backend="codex", label="Spec Review", prompt="@benchmarks/amazon-clone/prompts/spec_review.md"]
-    architect   [type="codergen", backend="claude", label="Architecture", prompt="@benchmarks/amazon-clone/prompts/architect.md"]
+    spec_review [type="codergen", backend="codex", label="Spec Review", prompt="@benchmarks/amazon-clone/prompts/spec_review.md", timeout=600]
+    architect   [type="codergen", backend="claude", label="Architecture", prompt="@benchmarks/amazon-clone/prompts/architect.md", timeout=600]
 
-    data_model      [type="codergen", backend="codex", label="Data Model + Firestore", prompt="@benchmarks/amazon-clone/prompts/data_model.md"]
-    backend         [type="codergen", backend="codex", label="Backend API", prompt="@benchmarks/amazon-clone/prompts/backend.md"]
-    frontend        [type="codergen", backend="claude", label="Frontend App", prompt="@benchmarks/amazon-clone/prompts/frontend.md"]
-    firestore_rules [type="codergen", backend="codex", label="Firestore Rules", prompt="@benchmarks/amazon-clone/prompts/firestore_rules.md"]
-    seed_data       [type="codergen", backend="codex", label="Seed + Reset", prompt="@benchmarks/amazon-clone/prompts/seed_data.md"]
-    validation      [type="codergen", backend="codex", label="Validation Harness", prompt="@benchmarks/amazon-clone/prompts/validation_harness.md"]
+    data_model      [type="codergen", backend="codex", label="Data Model + Firestore", prompt="@benchmarks/amazon-clone/prompts/data_model.md", timeout=600]
+    backend         [type="codergen", backend="codex", label="Backend API", prompt="@benchmarks/amazon-clone/prompts/backend.md", timeout=600]
+    frontend        [type="codergen", backend="claude", label="Frontend App", prompt="@benchmarks/amazon-clone/prompts/frontend.md", timeout=600]
+    firestore_rules [type="codergen", backend="codex", label="Firestore Rules", prompt="@benchmarks/amazon-clone/prompts/firestore_rules.md", timeout=600]
+    seed_data       [type="codergen", backend="codex", label="Seed + Reset", prompt="@benchmarks/amazon-clone/prompts/seed_data.md", timeout=600]
+    validation      [type="codergen", backend="codex", label="Validation Harness", prompt="@benchmarks/amazon-clone/prompts/validation_harness.md", timeout=600]
 
     local_smoke [type="tool", label="Local Smoke", command="make test", timeout="900"]
     size_check  [type="tool", label="Source Size Check", command="make validate-size", timeout="300"]
-    gate_es     [type="gate_es", label="/es Evidence Gate"]
-    gate_er     [type="gate_er", label="/er Review Gate"]
+    gate_es     [type="gate_es", label="/es Evidence Gate", timeout=600]
+    gate_er     [type="gate_er", label="/er Review Gate", timeout=600]
 
     independent_review [
         type="tool",
@@ -28,7 +28,7 @@ digraph amazon_fullstack {
     ]
 
     holdout [type="holdout_eval", label="Sealed Holdout Eval", feature="amazon-clone", timeout="900", startup_delay="30"]
-    fix     [type="codergen", backend="codex", label="Fix", prompt="@benchmarks/amazon-clone/prompts/fix.md", max_visits="5"]
+    fix     [type="codergen", backend="codex", label="Fix", prompt="@benchmarks/amazon-clone/prompts/fix.md", max_visits="5", timeout=600]
 
     start -> spec_review -> architect
     architect -> data_model -> backend -> frontend -> firestore_rules -> seed_data -> validation
