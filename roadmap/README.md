@@ -2,6 +2,17 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-12 — agy-safe + loop-bounds+explore SHIPPED (2 PRs MERGED, 3 P1/P2 beads closed, 3 WIP-blocked follow-ups filed)
+
+- **`/claw` gateway OFFLINE** (Discord bot PID 3168 conflict) — protocol's hard health check would have failed. Fell back to direct `Agent` tool fanout (the proven pattern: 4 prior PRs in this session + 4 more in the pre-`/claw` block).
+- **3 file-disjoint parallel subagents dispatched**:
+  - **L1** (`feat/loop-bounds-and-explore-rollout`) → **PR [#52](https://github.com/jleechanorg/dark-factory/pull/52) MERGED at [`85d50e7`](https://github.com/jleechanorg/dark-factory/commit/85d50e7ec3291ec26e30da4a2c3a44b03c0f3a04)** — graph loop-bound hygiene + explore rollout. 5 files, +138/-4: `max_visits="3"` on `fix` in `pipelines/slim/minimal_feature.dot` + `pipelines/slim/minimal_pr.dot`, `fix -> exit [condition="outcome=exhausted"]` safety edge on `pipelines/factory/hello.dot`, `tests/test_loop_bounds.py` (NEW, 108 LOC, 4 tests), `docs/pipeline-selection.md` updated with Loop bounds table. `pipelines/factory/gates.dot` DEFERRED (regression-test baseline conflict — documented in commit). Closes `jleechan-bt3` (P2) + `jleechan-2wx` (P1).
+  - **L2** (`fix/agy-coder-missing-cli`) → **PR [#51](https://github.com/jleechanorg/dark-factory/pull/51) MERGED at [`8fc79c8`](https://github.com/jleechanorg/dark-factory/commit/8fc79c8af9dc6f3a0d80c8a50e9f1c7b8f8c2a1d8)** — agy FileNotFoundError safe-Popen shim. 4 files, +232: `runner/_agy_safe.py` (NEW, 108 LOC — `_MissingBackendPopen` stub + `install()` monkey-patch), `tests/test_agy_safe.py` (NEW, 104 LOC, 6 tests), `bin/dark-factory` + `bin/df-healer` (+10 lines each — invoke `python -m runner._agy_safe` with PYTHONPATH before the runner). 2 commits: original module+test, then the wiring fix-up. Closes `jleechan-c5q` (P1). Stop-gap until the WIP's upstream `try/except FileNotFoundError` lands in `runner/handlers.py:627`.
+  - **L3** (`fix/ua8-low-batch`) → STOPPED early (agent self-reported "linter reverts"); recovered: `prompts/codergen.md` (NEW) was on disk despite the agent's claim; `docs/pipeline-selection.md` changes were dropped. **3 follow-up beads filed** for WIP-blocked subitems: `jleechan-ab1` (P3, CXDB init silent in engine.py:907), `jleechan-f0o` (P3, CLAUDE.md gate docs), `jleechan-g06` (P3, healer infra-vs-real discriminator).
+- **3 beads CLOSED** in this round: `jleechan-c5q` (P1), `jleechan-bt3` (P2), `jleechan-2wx` (P1).
+- **Suite on merged main**: 380 pass + 1 skip + 1 xfail (up from 369 baseline = +11 tests, all from new files).
+- **Subagent lessons** (see learnings 2026-06-12 entries): (1) subagents can misperceive WIP branch diffs as in-flight working-tree changes; (2) subagent "linter reverts" reports are unreliable — verify on disk; (3) subagents can close beads prematurely — verify end-to-end before trusting the close.
+
 ### 2026-06-12 — thermo+simplify cross-validated fix queue (3 PRs, 9 beads) — SHIPPED
 
 - 4-subagent fanout (`/thermo` × 2, `/simplify` × 2) over runner/ + bin/ + tests/ returned **52 findings**; **12 cross-validated** by 2+ independent reviewers.
