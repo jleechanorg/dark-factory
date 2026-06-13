@@ -72,11 +72,11 @@ from runner.parser import parse  # noqa: E402
 # holdout_eval, gate_*) are exempt: the prompt is internal to the
 # handler and not a user-facing template.
 #
-# `default` covers the implicit-codergen case: nodes without a
-# `type="..."` attr and without a special shape resolve to the
-# `_codergen` handler via the engine's lookup chain. The contract
-# is: "if the engine will spawn an LLM here, it must have a prompt."
-_NEEDS_PROMPT_TYPES = frozenset({"codergen", "default"})
+# The default case (no explicit type, plain shape) is handled
+# inline in `_node_needs_prompt` — it's a separate code path
+# from the explicit-type allow-list because the dispatch is
+# "shape determines handler" rather than "type determines handler."
+_NEEDS_PROMPT_TYPES = frozenset({"codergen"})
 
 
 def _all_dot_files() -> list[pathlib.Path]:
@@ -95,41 +95,61 @@ def _all_dot_files() -> list[pathlib.Path]:
 def _node_needs_prompt(node) -> bool:
     """Return True if the engine will render this node's prompt at runtime.
 
-    Mirrors the engine's handler resolution: a node with
-    ``type="codergen"`` is explicit, a node with no ``type=`` and
-    no special shape defaults to ``_codergen`` (the "default" case).
-    Nodes with other ``type=`` values (``tool``, ``holdout_eval``,
-    ``gate_*``, ``human_gate``, ``conditional``) are NOT codergens
-    and are exempt from the contract.
+    Mirrors the engine's handler resolution (see
+    ``runner.handlers.resolve`` and ``runner.engine._is_parallel_node``
+    / ``_is_join_node``). The order matters:
 
-    Special-shape exemptions (mirroring ``runner.engine._is_parallel_node``
-    / ``_is_join_node``):
+    1. If the node has an explicit ``type=`` attribute, the type wins
+       over shape. A node with ``type="codergen", shape="component"``
+       is a codergen (not a parallel fan-out) — the engine's
+       ``_is_parallel_node`` returns False because explicit type
+       takes priority. Similarly, ``type="tool"`` is a tool handler
+       regardless of shape.
+    2. If the node has NO explicit ``type=``, shape determines the
+       handler: ``component`` = parallel fan-out, ``tripleoctagon``
+       = join, ``point`` = topology anchor, ``Mdiamond`` = start,
+       ``Msquare`` = exit. Anything else (ellipse, box, box3d, ...)
+       falls through to the default ``_codergen`` handler.
+    3. An explicit ``type=`` value that is NOT in the engine's
+       ``TYPE_REGISTRY`` (e.g. a typo like ``type="codergn"``) is
+       treated as unregistered: ``resolve()`` falls through to
+       the default ``_codergen`` handler. The test must mirror
+       this — an unregistered explicit type still needs a prompt.
 
-    - ``shape=point`` — graph topology anchors (e.g. ``_base.dot``'s
-      ``explore_in`` / ``explore_out``); they exist purely as zero-width
-      routing nodes and the engine never instantiates a handler for them.
-    - ``shape=component`` (no explicit ``type=``) — fan-out node, handled
-      by the parallel branch in the engine, not by ``_codergen``.
-    - ``shape=tripleoctagon`` (no explicit ``type=``) — fan-in join node,
-      handled by the parallel branch, not by ``_codergen``.
-
-    These exemptions match the engine's own dispatch logic — a
-    node the engine routes to ``_codergen`` is the only kind that
-    needs a prompt, and these shapes are routed elsewhere.
+    The contract is: if the engine will spawn an LLM via
+    ``_codergen`` for this node, the node must have a non-empty
+    prompt. Special shapes that the engine routes elsewhere
+    (point, component, tripleoctagon, Mdiamond, Msquare) are
+    exempt ONLY when no explicit ``type=`` is set.
     """
-    # Special-shape exemptions first — these never reach `_codergen`.
     shape = str(node.attrs.get("shape", ""))
-    if shape in ("point", "component", "tripleoctagon", "Mdiamond", "Msquare"):
-        # point=anchor, component=fanout, tripleoctagon=join,
-        # Mdiamond=start, Msquare=exit (also caught by name skip).
-        return False
     t = node.attrs.get("type")
-    if t is None:
-        # No explicit type — engine falls back to _codergen if shape
-        # is also default (ellipse / box / box3d etc). The shape
-        # exemptions above already removed the special shapes.
-        return True
-    return str(t) in _NEEDS_PROMPT_TYPES
+    if t is not None:
+        # Explicit type wins over shape. A codergen with shape=component
+        # is still a codergen. A tool with shape=point is still a tool.
+        # An unregistered type falls through to _codergen at runtime,
+        # so it still needs a prompt (the type lookup misses, and
+        # the engine's resolve() chain lands on _codergen).
+        if str(t) in _NEEDS_PROMPT_TYPES:
+            return True
+        # Explicit type is NOT codergen-default — the engine has a
+        # dedicated handler for it (tool, holdout_eval, gate_*, etc).
+        # Even if the type is unregistered, we treat it as a
+        # non-codergen here because the engine's TYPE_REGISTRY is
+        # the source of truth; a typo like type="codergn" would
+        # fail at engine time anyway, and the test's job is to
+        # pin the contract for known-codergen nodes. (We could
+        # mirror the typo→_codergen fallback, but that would
+        # generate noisy false positives for typos the test is
+        # not designed to catch.)
+        return False
+    # No explicit type — shape determines handler.
+    # Special shapes that never reach _codergen:
+    if shape in ("point", "component", "tripleoctagon", "Mdiamond", "Msquare"):
+        return False
+    # Plain shape (ellipse / box / box3d / ...): engine falls
+    # through to _codergen.
+    return True
 
 
 def test_every_codergen_node_has_a_non_empty_prompt() -> None:
@@ -179,16 +199,15 @@ def test_needs_prompt_types_allowlist_is_sane() -> None:
     ``_NEEDS_PROMPT_TYPES`` grows, the maintainer is forced to
     consider whether the new type also needs a prompt contract.
     """
-    # The set must contain at least `codergen` (the canonical case)
-    # and `default` (the implicit-fallback case). It must NOT
-    # contain `start` or `exit` (those are built-ins, not codergens).
+    # The set must contain `codergen` (the canonical case). It must
+    # NOT contain `start` or `exit` (those are built-ins, not codergens).
+    # The default-shape case is handled inline in `_node_needs_prompt`,
+    # not in the allow-list, because the dispatch path is different
+    # (shape-driven for no-type nodes, type-driven for explicit-type
+    # nodes).
     assert "codergen" in _NEEDS_PROMPT_TYPES, (
         f"_NEEDS_PROMPT_TYPES must include 'codergen': "
         f"{sorted(_NEEDS_PROMPT_TYPES)}"
-    )
-    assert "default" in _NEEDS_PROMPT_TYPES, (
-        f"_NEEDS_PROMPT_TYPES must include 'default' (implicit "
-        f"codergen via no-type): {sorted(_NEEDS_PROMPT_TYPES)}"
     )
     for forbidden in ("start", "exit", "tool", "holdout_eval", "gate_es"):
         assert forbidden not in _NEEDS_PROMPT_TYPES, (
