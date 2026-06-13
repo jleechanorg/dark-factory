@@ -37,7 +37,20 @@ __df_panic_collect() {
   fi
   exit "${rc}"
 }
-trap '__df_panic_collect $? $LINENO' EXIT
+# merge_train release runs in the EXIT trap AFTER any panic-hook work
+# so the lock is always released (success or error). It is a no-op
+# when no lock was acquired (idempotent on the Python side). The
+# release command is built lazily by __df_release_lock so the trap
+# string itself stays static.
+__df_release_lock() {
+  if [[ -n "${__DF_LOCK_RUN_ID:-}" && -n "${__DF_LOCK_TARGET:-}" && -n "${VENV_PYTHON:-}" && -x "${VENV_PYTHON}" ]]; then
+    env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+      "${VENV_PYTHON}" -m runner._merge_train release \
+      --target "${__DF_LOCK_TARGET}" --run-id "${__DF_LOCK_RUN_ID}" \
+      >/dev/null 2>&1 || true
+  fi
+}
+trap '__df_exit_code=$?; __df_release_lock; __df_panic_collect ${__df_exit_code} $LINENO' EXIT
 
 _SCRIPT_REAL="$([ -L "${BASH_SOURCE[0]}" ] && readlink -f "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${_SCRIPT_REAL}")" && pwd)"
@@ -105,6 +118,41 @@ fi
 # try/except in handlers.py.
 env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
   "${VENV_PYTHON}" -m runner._agy_safe >/dev/null 2>&1 || true
+
+# Resolve the effective workdir the same way the runner will see it:
+# explicit --workdir <PATH> wins, otherwise the script's cwd. This
+# value becomes the merge_train lock key so a second invocation
+# against the SAME workdir (regardless of which cwd it was launched
+# from) hard-stops with rc=3.
+__DF_LOCK_TARGET="${TARGET_WORKDIR}"
+__DF_ARG_LOCK_PREV=""
+for __df_arg in "$@"; do
+  if [[ "${__DF_ARG_LOCK_PREV}" == "--workdir" && -n "${__df_arg}" ]]; then
+    __DF_LOCK_TARGET="${__df_arg}"
+    break
+  fi
+  __DF_ARG_LOCK_PREV="${__df_arg}"
+done
+
+# merge_train acquire: claim the per-target-repo lock so a second
+# concurrent dark-factory invocation against the same workdir
+# hard-stops here with rc=3. The EXIT trap (set above) releases
+# on every exit path. Run id is timestamp+pid so two simultaneous
+# wrappers do not collide.
+__DF_LOCK_RUN_ID="df-$(date +%s%N)-$$"
+if ! env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${VENV_PYTHON}" -m runner._merge_train acquire \
+    --target "${__DF_LOCK_TARGET}" --run-id "${__DF_LOCK_RUN_ID}" \
+    >/dev/null 2>&1; then
+  # Re-run the acquire non-silently so we can show the holder on stderr.
+  env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${VENV_PYTHON}" -m runner._merge_train acquire \
+    --target "${__DF_LOCK_TARGET}" --run-id "${__DF_LOCK_RUN_ID}" >&2 || true
+  echo "ERROR: another dark-factory run is editing ${__DF_LOCK_TARGET}" >&2
+  # Clear the run_id so the EXIT trap's release is a no-op.
+  __DF_LOCK_RUN_ID=""
+  exit 3
+fi
 
 has_workdir=0
 for arg in "$@"; do
