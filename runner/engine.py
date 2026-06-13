@@ -1002,6 +1002,26 @@ def run(
     if event_path_is_default and ctx.run_id is not None:
         ctx.event_log_path = pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id / "events.jsonl"
 
+    if ctx.run_id is not None:
+        run_dir = pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = run_dir / "manifest.json"
+        pipeline_val = str(graph.pipeline_path) if getattr(graph, "pipeline_path", None) else graph.name
+        manifest_data = {
+            "pipeline": pipeline_val,
+            "goal": ctx.goal,
+            "backend": ctx.backend,
+            "workdir": str(ctx.workdir) if ctx.workdir else "",
+            "state": ctx.state,
+        }
+        try:
+            manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    if checkpoint is None and ctx.run_id is not None:
+        checkpoint = pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id / "checkpoint.json"
+
     perf_root = getattr(ctx, "perf_log_root", None)
     if perf_root is not None and ctx.run_id is not None:
         ctx.git_ctx = perf_log.resolve_git_context(ctx.workdir, ctx.state)
