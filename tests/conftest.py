@@ -46,8 +46,14 @@ def _pipeline(name: str) -> pathlib.Path:
     return ROOT / "pipelines" / "factory" / name
 
 
-def run_conformance(*args: str, timeout: int = 60, env: dict | None = None) -> "subprocess.CompletedProcess[str]":
-    """Run `bin/conformance` with the given args, return CompletedProcess."""
+def run_conformance(*args: str, timeout: int = 240, env: dict | None = None) -> "subprocess.CompletedProcess[str]":
+    """Run `bin/conformance` with the given args, return CompletedProcess.
+
+    The default 240s outer wrapper covers the `conformance score` chain
+    (compileall + pytest + validate + run). It was raised from 60s as the
+    suite grew past the 120s pytest inner cap inside `cmd_score`; an outer
+    cap below the inner caps makes the wrapper flap on warm runs.
+    """
     return subprocess.run(
         [sys.executable, str(ROOT / "bin" / "conformance"), *args],
         cwd=ROOT,
