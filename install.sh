@@ -78,8 +78,10 @@ if [[ "${LINK}" -eq 1 ]]; then
   mkdir -p "${LOCAL_BIN}"
   ln -sf "${BIN_DIR}/dark-factory" "${LOCAL_BIN}/dark-factory"
   ln -sf "${BIN_DIR}/df-healer" "${LOCAL_BIN}/df-healer"
+  ln -sf "${BIN_DIR}/df-validate" "${LOCAL_BIN}/df-validate"
   echo "==> linked ${LOCAL_BIN}/dark-factory"
   echo "==> linked ${LOCAL_BIN}/df-healer"
+  echo "==> linked ${LOCAL_BIN}/df-validate"
 fi
 
 # Mirror repo-scope commands + skills to user-scope (~/.claude/) so /f /fs
