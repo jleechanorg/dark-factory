@@ -256,7 +256,11 @@ def acquire(
 
     try:
         os.write(fd, json.dumps(payload, sort_keys=True).encode("utf-8"))
-    finally:
+    except:
+        os.close(fd)
+        path.unlink(missing_ok=True)
+        raise
+    else:
         os.close(fd)
 
     return Lock(
@@ -307,7 +311,11 @@ def _reclaim_stale(
 
     try:
         os.write(fd, json.dumps(payload, sort_keys=True).encode("utf-8"))
-    finally:
+    except:
+        os.close(fd)
+        path.unlink(missing_ok=True)
+        raise
+    else:
         os.close(fd)
 
     return Lock(
