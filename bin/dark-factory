@@ -5,6 +5,40 @@
 
 set -euo pipefail
 
+# Capture original CLI arguments before trap overwrites $@
+_ORIGINAL_ARGV=("$@")
+
+# ---------------------------------------------------------------------------
+# Top-level panic hook — writes a crash artifact on any non-zero exit
+# (bash-level or Python-level). Exit code 124 is preserved as the
+# distinct panic sentinel so CI / the Healer can group panics
+# separately from regular failures.
+#
+# Use a guard variable (__DF_PANIC_FIRED) so the trap runs at most
+# once even when both ERR and EXIT fire for the same failure, and
+# do NOT use ``exec`` for the Python subprocess so the bash shell
+# stays alive to actually run the EXIT trap on Python's exit code.
+# ---------------------------------------------------------------------------
+__df_panic_fired=0
+__df_panic_collect() {
+  local rc="$1" line="$2"
+  if [[ "${rc}" -ne 0 && "${__df_panic_fired}" -eq 0 && -n "${VENV_PYTHON:-}" && -x "${VENV_PYTHON}" ]]; then
+    __df_panic_fired=1
+    # Best-effort: never let the panic hook itself cause a second
+    # failure. Pass the wrapper name + original argv as a single
+    # JSON-encoded string so argparse can't greedily misread it.
+    local argv_json
+    argv_json="$(printf '%s\0' "$0" "${_ORIGINAL_ARGV[@]}" | python3 -c 'import json,sys;data=sys.stdin.buffer.read().split(b"\x00");data=[x.decode("utf-8","replace") for x in data if x];print(json.dumps(data))' 2>/dev/null || printf '[]')"
+    env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+      "${VENV_PYTHON}" -m runner.panic_hook \
+      --exit-code "${rc}" \
+      --line "${line}" \
+      --bash-argv "${argv_json}" >/dev/null 2>&1 || true
+  fi
+  exit "${rc}"
+}
+trap '__df_panic_collect $? $LINENO' EXIT
+
 _SCRIPT_REAL="$([ -L "${BASH_SOURCE[0]}" ] && readlink -f "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${_SCRIPT_REAL}")" && pwd)"
 export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
@@ -75,5 +109,7 @@ if [[ "${has_workdir}" -eq 0 ]]; then
   args=(--workdir "${TARGET_WORKDIR}" "$@")
 fi
 
-exec env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+# NOTE: do NOT use ``exec`` here — that would replace the bash shell
+# and the EXIT trap would never fire when Python exits non-zero.
+env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
   "${VENV_PYTHON}" -m runner "${args[@]}"
