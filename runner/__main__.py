@@ -131,11 +131,16 @@ def _handle_panic(
 
 
 def main(argv: list[str] | None = None) -> int:
+    args_list = list(argv) if argv is not None else list(sys.argv[1:])
+    if args_list and args_list[0] == "resume":
+        args_list[0] = "--resume"
+    argv = args_list
+
     args = None
     ctx = None
     try:
         p = argparse.ArgumentParser(prog="dark-factory")
-        p.add_argument("--pipeline", required=True, type=pathlib.Path)
+        p.add_argument("--pipeline", type=pathlib.Path)
         p.add_argument("--goal")
         p.add_argument("--workdir", type=pathlib.Path, default=pathlib.Path.cwd())
         p.add_argument("--preflight", action="store_true", help="Validate pipeline and emit diagnostics, then exit.")
@@ -201,6 +206,32 @@ def main(argv: list[str] | None = None) -> int:
             help="Pre-seed ctx.state; repeatable. E.g. --state slim.test_command=true",
         )
         args = p.parse_args(argv)
+        if args.resume:
+            val = str(args.resume)
+            import re
+            is_12_hex = bool(re.match(r'^[0-9a-fA-F]{12}$', val))
+            manifest_file = pathlib.Path.home() / ".dark-factory" / "runs" / val / "manifest.json"
+            if is_12_hex or manifest_file.exists():
+                if manifest_file.exists():
+                    try:
+                        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+                        args.pipeline = pathlib.Path(manifest["pipeline"])
+                        args.goal = manifest.get("goal")
+                        args.backend = manifest.get("backend", "echo")
+                        if manifest.get("workdir"):
+                            args.workdir = pathlib.Path(manifest["workdir"])
+                        state_dict = manifest.get("state", {})
+                        args.state = [f"{k}={v}" for k, v in state_dict.items()]
+                    except Exception as exc:
+                        sys.stderr.write(f"Error loading manifest from {manifest_file}: {exc}\n")
+                        return 1
+                checkpoint_path = pathlib.Path.home() / ".dark-factory" / "runs" / val / "checkpoint.json"
+                args.resume = checkpoint_path
+                args.checkpoint = checkpoint_path
+
+        if not args.pipeline:
+            p.error("the following arguments are required: --pipeline")
+
         # --workdir defaults to cwd in the argparse setup above; the resolver
         # uses it to also look up <workdir>/dark-factory/pipelines/<name> for
         # bare-filename --pipeline values (target-repo subdir convention).
