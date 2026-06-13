@@ -2,6 +2,19 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-13 — Round 8 close: F6d (airbnb-clone codergen timeouts) SHIPPED, the timeout-attrs contract now covers 3 pipeline families (factory, slim, airbnb-clone), 1 PR MERGED, 0 regressions
+
+- **F6d (airbnb-clone codergen timeouts) → PR [#64](https://github.com/jleechanorg/dark-factory/pull/64) MERGED at [`ea067d0`](https://github.com/jleechanorg/dark-factory/commit/ea067d0)** — admin-merge per `jleechan-xpv` pattern (test + Skeptic + CodeRabbit SUCCESS, Bugbot IN_PROGRESS-with-no-annotations, mergeable=MERGEABLE). Squash of 1 commit onto main.
+  - `benchmarks/airbnb-clone/pipelines/airbnb-clone.dot` (+12/-6): `timeout=600` on every `s{1,2,3}_{plan,implement,fix}` node (9 attrs).
+  - `benchmarks/airbnb-clone/pipelines/sprint-1-data.dot` (+3/-0, fix block): `timeout=600` on `plan`, `implement`, `fix`.
+  - `benchmarks/airbnb-clone/pipelines/sprint-2-backend.dot` (+3/-0, fix block): same.
+  - `benchmarks/airbnb-clone/pipelines/sprint-3-frontend.dot` (+3/-0, fix block): same.
+  - `tests/test_airbnb_clone_pipelines_timeouts.py` (NEW, 180L, 3 tests): (1) `test_every_airbnb_clone_codergen_node_declares_a_timeout` — every `codergen` node has a timeout; (2) `test_airbnb_clone_codergen_nodes_use_canonical_600_second_timeout` — value is 600 (parity with siblings); (3) `test_airbnb_clone_codergen_count_is_stable` — count-pinning test (master=9, per-sprint=3) so a future sprint addition fails the test and forces an explicit contract update.
+- **Scoping decision**: the test only covers `codergen` nodes, NOT the existing `holdout_eval` verify nodes (which already declare their own timeouts: 600 for S1/S2, 900 for S3 — the larger frontend surface needs more headroom for the sealed evaluator). The contract is "codergen → 600", not "all subprocesses → 600".
+- **Suite on merged main**: 508 + 1 skip + 1 xfail (up from 505 = +3 tests, 0 regressions, 0 broken).
+- **Three rounds of file-disjoint micro-PRs completed** (rounds 6, 7, 8). The F5/F6/F6b/F6c/F6d pattern — extract small testable contract + assert on existing artifacts + add to the canonical allow-list — is now a reliable 5-30 min lane. WIP triage (`jleechan-xsg` P1) is still the highest-leverage action; these micro-PRs buy cheap stack-additions while the WIP branch sits.
+- **3-file scope is now the new ceiling for new "timeout contract" PRs.** After this PR, the only remaining codergen-without-timeout files are `pipelines/factory/hello.dot` (WIP-touched, WIP branch's responsibility) and the slim/ family that PR #63 already covered. The next round's natural F6e is either: (a) extend the contract to a new pipeline family, (b) start checking **values** across the canonical allow-list (timeout=300? timeout=1800? what's the next-narrower rule?), or (c) do the WIP triage that unblocks 17 of 20 open beads.
+
 ### 2026-06-13 — Round 7 close: minimal_feature_cs + levelup_pra_validate slim pipelines SHIPPED, 2 untracked files promoted to tracked, 1 PR MERGED, 0 regressions
 
 - **Two untracked working files promoted to tracked → PR [#63](https://github.com/jleechanorg/dark-factory/pull/63) MERGED at [`0e3843b`](https://github.com/jleechanorg/dark-factory/commit/0e3843b)** — admin-merge per `jleechan-xpv` pattern (test + Skeptic + CodeRabbit SUCCESS, Bugbot NEUTRAL, mergeable=MERGEABLE). Squash of 1 commit onto main.
