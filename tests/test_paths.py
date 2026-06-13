@@ -125,3 +125,19 @@ def test_resolve_pipeline_no_match_returns_resolved_candidate(tmp_path, monkeypa
     # No files anywhere — both workdir, subdir, and factory home are empty.
     resolved = resolve_pipeline_path("does_not_exist.dot", workdir=tmp_path)
     assert resolved == (tmp_path / "does_not_exist.dot").resolve()
+
+
+def test_resolve_pipeline_relative_without_pipelines_prefix(tmp_path, monkeypatch):
+    """When the user passes 'slim/spec_gen.dot' and it is not in workdir, it resolves to $DARK_FACTORY_HOME/pipelines/slim/spec_gen.dot."""
+    home = tmp_path / "factory_home"
+    home_pipeline = _write(home / "pipelines" / "slim" / "spec_gen.dot")
+
+    monkeypatch.setenv("DARK_FACTORY_HOME", str(home))
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    resolved = resolve_pipeline_path("slim/spec_gen.dot", workdir=tmp_path)
+    assert resolved == home_pipeline.resolve()
+

@@ -389,11 +389,16 @@ def _resolve_includes(
     forever. The first call from ``_parse`` passes an empty tuple; every
     recursive call appends the resolved ``include_path`` before recursing.
     """
+    from runner.paths import factory_home
     raw_attr = str(graph_attrs.get("include") or "")
     if not raw_attr:
         return
     parent_dir = path.resolve().parent
     cwd = pathlib.Path.cwd()
+    home = factory_home()
+    bases = [("parent-relative", parent_dir), ("cwd-relative", cwd)]
+    if home is not None:
+        bases.append(("home-relative", home))
     for raw in raw_attr.split(";"):
         ref = raw.strip()
         if not ref:
@@ -403,17 +408,17 @@ def _resolve_includes(
         if not ref:
             continue
         include_path: pathlib.Path | None = None
-        tried: list[pathlib.Path] = []
-        for base in (parent_dir, cwd):
+        tried: list[tuple[str, pathlib.Path]] = []
+        for label, base in bases:
             candidate = (base / ref).resolve()
-            tried.append(candidate)
+            tried.append((label, candidate))
             if candidate.exists():
                 include_path = candidate
                 break
         if include_path is None:
+            tried_desc = " and ".join(f"{label} {p}" for label, p in tried)
             raise ValueError(
-                f"{path}: include not found: {ref!r} "
-                f"(tried parent-relative {tried[0]} and cwd-relative {tried[1]})"
+                f"{path}: include not found: {ref!r} (tried {tried_desc})"
             )
         if include_path in visited:
             chain = " -> ".join(str(p) for p in (*visited, include_path))

@@ -134,3 +134,35 @@ def test_bug_fix_lane_includes_base_and_has_red_green(tmp_path):
     assert "fix" in g.nodes
     # AttrValue is str | int | bool; the parser stores unquoted "3" as int 3
     assert str(g.nodes["fix"].attrs.get("max_visits")) == "3"
+
+
+def test_include_resolves_from_factory_home_fallback(tmp_path, monkeypatch):
+    """Include paths fall back to resolving against DARK_FACTORY_HOME."""
+    home = tmp_path / "factory_home"
+    lib = home / "pipelines" / "_base_lib.dot"
+    lib.parent.mkdir(parents=True)
+    lib.write_text('digraph _bl { lib_node [type="codergen"] }\n')
+
+    monkeypatch.setenv("DARK_FACTORY_HOME", str(home))
+
+    lane = tmp_path / "lane.dot"
+    lane.write_text(
+        textwrap.dedent(
+            """\
+            digraph L {
+              graph [include="@pipelines/_base_lib.dot"]
+              start [shape=Mdiamond]
+              exit  [shape=Msquare]
+              start -> lib_node -> exit
+            }
+            """
+        )
+    )
+    # Run from elsewhere
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    g = parse(lane)
+    assert "lib_node" in g.nodes
+
