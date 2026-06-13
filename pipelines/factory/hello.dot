@@ -23,4 +23,5 @@ digraph hello {
     holdout     -> exit [condition="outcome=success"]
     holdout     -> fix  [condition="outcome!=success"]
     fix         -> holdout
+    fix         -> exit [condition="outcome=exhausted"]
 }

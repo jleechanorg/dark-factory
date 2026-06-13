@@ -8,12 +8,12 @@ task. If the user passes `--pipeline`, use it. Otherwise classify the goal first
 
 | Task | Pipeline | Notes |
 |------|----------|-------|
-| Wiring smoke / install verify | `pipelines/factory/hello.dot` | `--backend echo` |
+| Wiring smoke / install verify | `pipelines/factory/hello.dot` | `--backend echo`; explore → plan → implement → holdout → fix (max 3) → exit |
 | New feature, full production loop | `pipelines/slim/minimal_feature.dot` | explore → plan → test → review → holdout → gates |
 | New feature, minimal loop | `pipelines/factory/hello.dot` | plan → implement → holdout → fix |
 | In-flight PR iteration | `pipelines/slim/minimal_pr.dot` | explore → research → plan → … → review → holdout → gates; set `--state slim.test_command=...`; requires `$DARK_FACTORY_HOLDOUTS` |
 | Bug fix with red/green discipline | `pipelines/bug_fix.dot` | reproduce (fresh test) → red gate → fix → green gate → holdout → adversarial evidence; max 3 fix visits |
-| Validate diff + sealed holdout | `pipelines/factory/gates.dot` | code already implemented |
+| Validate diff + sealed holdout | `pipelines/factory/gates.dot` | code already implemented (no fix loop; explore rollout intentionally skipped — see PR for rationale) |
 | Validate in-flight PR | `pipelines/factory/pr_gates.dot` | holdout + evidence gates (no fix loop) |
 | Spec review (line-aware, slim) | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | acceptance + codex reviewer |
 | Spec review (+ stack smoke) | `benchmarks/attractor-spec-review/pipelines/review_full.dot` | adds fullstack smoke |
@@ -39,6 +39,29 @@ Deliberate exceptions:
   only.
 - `pipelines/slim/review_pr.dot` — holdouts test feature scenarios, not PR
   diffs (see its header comment).
+
+## Loop bounds (`max_visits`)
+
+Every `fix` loop in the feature lanes is bounded by a `max_visits="N"`
+attribute on the `fix` node. The engine emits a synthetic `exhausted` step
+when a node is visited more than `max_visits` times, then terminates the
+run. This is **graph-level** enforcement (per-node per-pipeline), distinct
+from `max_retries` which is **handler-level** (per-codergen attempt
+re-execution on a single visit).
+
+Current bounds:
+
+| Pipeline | fix node | max_visits |
+|----------|----------|------------|
+| `pipelines/factory/hello.dot` | `fix` | `3` |
+| `pipelines/factory/gates.dot` | n/a (no fix loop) | n/a |
+| `pipelines/slim/minimal_feature.dot` | `fix` | `3` |
+| `pipelines/slim/minimal_pr.dot` | `fix` | `3` |
+| `pipelines/bug_fix.dot` | `fix` | `3` |
+
+`hello.dot` also carries an explicit `fix -> exit [condition="outcome=exhausted"]`
+edge as a safety net for any future engine revision that routes on
+`exhausted` rather than terminating.
 
 ## Role-based model routing (slim pipelines)
 

@@ -81,7 +81,8 @@ digraph MinimalPRFactory {
     label="Fix & Iterate",
     class="fix",
     prompt="@prompts/slim/fix.md",
-    max_retries=2
+    max_retries=2,
+    max_visits="3"
   ]
 
   start -> explore_in
