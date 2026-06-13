@@ -81,6 +81,16 @@ elif [[ "${PREFLIGHT_RC}" -eq 0 && -n "${PREFLIGHT_JSON}" ]]; then
   fi
 fi
 
+# agy-safe: install the FileNotFoundError monkey-patch for the agy
+# subprocess BEFORE the runner Python code runs. handlers.py:627 has
+# an unguarded Popen that panics when agy is missing; this shim
+# returns a stub Popen (exit 127 + "backend_missing=true") so the
+# codergen node returns a clean Result instead of a traceback.
+# No-op when agy is on PATH. Stop-gap for the WIP branch's upstream
+# try/except in handlers.py.
+env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+  "${VENV_PYTHON}" -m runner._agy_safe >/dev/null 2>&1 || true
+
 # NOTE: do NOT use ``exec`` here — that would replace the bash shell
 # and the EXIT trap would never fire when Python exits non-zero.
 env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
