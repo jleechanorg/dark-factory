@@ -5,6 +5,26 @@
 
 set -euo pipefail
 
+# ---------------------------------------------------------------------------
+# Top-level panic hook — writes a crash artifact on any non-zero exit
+# (bash-level or Python-level). Exit code 124 is preserved as the
+# distinct panic sentinel so CI / the Healer can group panics
+# separately from regular failures.
+# ---------------------------------------------------------------------------
+__df_panic_collect() {
+  local rc="$1" line="$2"
+  if [[ "${rc}" -ne 0 && -n "${VENV_PYTHON:-}" && -x "${VENV_PYTHON}" ]]; then
+    # Best-effort: never let the panic hook itself cause a second
+    # failure. Capture original argv (skip the bash wrapper name).
+    "${VENV_PYTHON}" -m runner.panic_hook \
+      --exit-code "${rc}" \
+      --line "${line}" \
+      --bash-argv "$0" "$@" >/dev/null 2>&1 || true
+  fi
+  exit "${rc}"
+}
+trap '__df_panic_collect $? $LINENO' ERR EXIT
+
 _SCRIPT_REAL="$([ -L "${BASH_SOURCE[0]}" ] && readlink -f "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${_SCRIPT_REAL}")" && pwd)"
 export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
