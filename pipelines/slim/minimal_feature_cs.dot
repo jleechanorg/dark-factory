@@ -1,0 +1,118 @@
+digraph MinimalFeatureFactoryCS {
+  // Same as minimal_feature.dot but adds the gate_cs (/code_standards) node so every
+  // /f run carries the 3 required gate nodes: sealed-holdout + /er evidence + /code_standards.
+  // Chain: plan -> implement -> test -> review -> holdout -> gate_es -> gate_er -> gate_cs -> exit
+  graph [
+    include="@pipelines/_base.dot",
+    goal="Implement a production-ready feature that passes tests, review, behavioral holdouts, evidence review, and code standards"
+    rankdir=LR
+    model_stylesheet="minimal_feature.model.css"
+  ]
+
+  start [shape=Mdiamond, label="Start"]
+  exit  [shape=Msquare, label="Exit - Ready to Merge"]
+
+  // _base.dot provides: explore_in, explore_fanout, explore_{concept,auth,
+  // reuse,risks}, explore_join, explore_out.
+
+  plan [
+    type="codergen",
+    label="Plan & Spec",
+    class="plan",
+    prompt="@prompts/slim/plan.md"
+  ]
+
+  implement [
+    type="codergen",
+    label="Implement",
+    class="implement",
+    prompt="@prompts/slim/implement.md",
+    max_retries=2
+  ]
+
+  test [
+    type="tool",
+    label="Run Tests",
+    command="${state.slim.test_command}",
+    validation=true,
+    goal_gate=true,
+    timeout=600,
+    retry_target="fix"
+  ]
+
+  review [
+    type="codergen",
+    label="Fresh Eyes Review",
+    class="review",
+    prompt="@prompts/slim/review.md",
+    goal_gate=true,
+    retry_target="fix"
+  ]
+
+  // ===== 3 REQUIRED GATE NODES =====
+  holdout [
+    type="holdout_eval",
+    label="Behavioral Holdouts (sealed)",
+    validation=true,
+    goal_gate=true,
+    timeout=600,
+    retry_target="fix"
+  ]
+
+  gate_es [
+    type="gate_es",
+    label="/es Evidence Standards",
+    timeout=600
+  ]
+
+  gate_er [
+    type="gate_er",
+    label="/er Evidence Review",
+    timeout=600,
+    goal_gate=true,
+    retry_target="fix"
+  ]
+
+  gate_cs [
+    type="gate_code_standards",
+    label="/code_standards (ZFC + leveling + RCF)",
+    timeout=600,
+    goal_gate=true,
+    retry_target="fix"
+  ]
+  // =================================
+
+  fix [
+    type="codergen",
+    label="Fix & Iterate",
+    class="fix",
+    prompt="@prompts/slim/fix.md",
+    max_retries=2,
+    max_visits="3"
+  ]
+
+  start -> explore_in
+  explore_out -> plan
+  plan -> implement
+  implement -> test
+
+  test -> review [condition="outcome=success"]
+  test -> fix [condition="outcome!=success"]
+
+  review -> holdout [condition="outcome=success"]
+  review -> fix [condition="outcome!=success"]
+
+  holdout -> gate_es [condition="outcome=success"]
+  holdout -> fix [condition="outcome!=success"]
+
+  gate_es -> gate_er [condition="outcome=success"]
+  gate_es -> fix [condition="outcome!=success"]
+
+  gate_er -> gate_cs [condition="outcome=success"]
+  gate_er -> fix [condition="outcome!=success"]
+
+  gate_cs -> exit [condition="outcome=success"]
+  gate_cs -> fix [condition="outcome!=success"]
+
+  fix -> test
+}
