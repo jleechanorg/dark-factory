@@ -149,6 +149,9 @@ Handler types:
 - `conditional` — hexagon decision node; outcome comes from `ctx.state[decision_key]`.
 - `holdout_eval` — run the sealed evaluator at `$DARK_FACTORY_HOLDOUTS/evaluator/run.py`. Parses the last JSON line of stdout for `{verdict: pass|...}`.
 - `gate_es` / `gate_er` / `gate_code_standards` — shell out to `claude --print /<slash>`. Verdicts are normalized by `_parse_verdict`: the anchored marker regex (`verdict:`/`overall:`/`normalized:` + token) takes priority; the standalone-line fallback only fires when no marker is present; `pass|warn → success`, `fail|partial|inconclusive → failure`. Unknown verdict combined with `rc!=0` becomes `error` (distinct from real failures so the Healer can group infra crashes separately).
+- `gate_red` — red-gate verification (used in bug-fix lanes). Runs a pytest test (referenced by `test_path="${state.bug_fix.test_path}"`) and asserts it FAILS (pytest returns non-zero). A non-zero return code maps to outcome `success` (bug reproduced), while a zero return maps to outcome `failure` (bug not reproduced).
+- `gate_green` — green-gate verification (used in bug-fix lanes). Runs a pytest test (referenced by `test_path="${state.bug_fix.test_path}"`) and asserts it PASSES (pytest returns zero). A zero return code maps to outcome `success`.
+- `point` — shape=point topology routing anchor. Propagates the previous node's outcome, facilitating conditional exits or joins across included subgraphs without mutating graph state.
 
 ### Spec validation benchmark
 
