@@ -99,7 +99,6 @@ digraph MinimalPRFactory {
 
   holdout -> gate_es [condition="outcome=success"]
   holdout -> fix [condition="outcome!=success"]
-
   gate_es -> gate_er [condition="outcome=success"]
   gate_es -> fix [condition="outcome!=success"]
 

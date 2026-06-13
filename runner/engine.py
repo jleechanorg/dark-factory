@@ -227,7 +227,6 @@ def _branch_context(ctx: Context, branch_name: str, node_type: str = "") -> Cont
     so their file operations are independent.  If the parent workdir is not a
     valid directory (e.g. None or a non-existent path) fall back to a
     system-managed tmp dir.
-
     Branches that start at a read-only node type (reviewer gates,
     holdout_eval) skip isolation and keep the parent workdir — they need the
     real repo, and being read-only they cannot race each other.

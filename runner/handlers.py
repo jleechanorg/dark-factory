@@ -1889,6 +1889,7 @@ def _run_pytest_test(node: "Node", ctx: "Context", *, label: str) -> "Result":
             outcome="error",
             output=f"{label}: pytest invocation failed: {exc}",
         )
+
     return Result(
         outcome="success" if proc.returncode == 0 else "failure",
         output=(
