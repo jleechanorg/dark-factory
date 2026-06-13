@@ -186,13 +186,13 @@ def test_main_returns_panic_exit_code() -> None:
 def test_main_writes_artifact_for_bash_crash(tmp_path: pathlib.Path, monkeypatch) -> None:
     target = tmp_path / "bash-panics"
     target.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(panic_hook, "PANIC_DIR", target)
+    bash_argv = json.dumps(["dark-factory", "--backend", "claude", "--pipeline", "missing.dot"])
     rc = panic_hook.main(
         [
             "--exit-code", "1",
             "--line", "42",
-            "--bash-argv",
-            "dark-factory", "--backend", "claude", "--pipeline", "missing.dot",
+            "--bash-argv", bash_argv,
+            "--panic-dir", str(target),
         ]
     )
     assert rc == panic_hook.PANIC_EXIT_CODE
@@ -206,19 +206,22 @@ def test_main_writes_artifact_for_bash_crash(tmp_path: pathlib.Path, monkeypatch
 
 def test_cli_subprocess_writes_artifact(tmp_path: pathlib.Path) -> None:
     """End-to-end: invoking `python -m runner.panic_hook` from a subprocess
-    must produce a valid artifact. This is the bash wrapper contract."""
+    must produce a valid artifact in the requested panic-dir, NOT in
+    the user's real ~/.dark-factory/panics/. This is the bash wrapper
+    contract — the artifact must land in the requested directory."""
     target = tmp_path / "subproc-panics"
     target.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     repo_root = pathlib.Path(__file__).resolve().parent.parent
     env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+    bash_argv = json.dumps(["dark-factory", "--backend", "echo"])
     proc = subprocess.run(
         [
             sys.executable, "-m", "runner.panic_hook",
             "--exit-code", "1",
             "--line", "10",
-            "--bash-argv",
-            "dark-factory", "--backend", "echo",
+            "--bash-argv", bash_argv,
+            "--panic-dir", str(target),
         ],
         capture_output=True,
         text=True,
@@ -227,16 +230,19 @@ def test_cli_subprocess_writes_artifact(tmp_path: pathlib.Path) -> None:
         cwd=str(tmp_path),
     )
     assert proc.returncode == panic_hook.PANIC_EXIT_CODE, proc.stderr
-    # The module writes to its home-dir default in the success path.
-    # Confirm rc + clean stderr.
-    assert proc.stderr == "" or "warning" in proc.stderr.lower()
+    # Artifact must be in the requested tmp_path, not ~/.dark-factory.
+    files = list(target.iterdir())
+    assert len(files) == 1, f"expected exactly one artifact in {target}, got {files}"
+    parsed = json.loads(files[0].read_text())
+    assert parsed["exit_code"] == 1
+    assert "dark-factory" in parsed["argv"]
 
 
 # ---------------------------------------------------------------------------
 # Fail-safe contract
 # ---------------------------------------------------------------------------
 
-def test_hook_does_not_crash_on_unwritable_dir(tmp_path: pathlib.Path, monkeypatch) -> None:
+def test_hook_does_not_crash_on_unwritable_dir(tmp_path: pathlib.Path) -> None:
     """If PANIC_DIR is a path inside a read-only file, the hook must
     NOT raise — it returns the intended path so the caller can log it."""
     read_only = tmp_path / "blocker"

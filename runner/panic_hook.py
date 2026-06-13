@@ -95,9 +95,14 @@ _HASH_PREFIX_LEN: int = 8
 
 
 def _is_secret(var_name: str) -> bool:
-    """True when ``var_name`` looks like it holds a secret."""
+    """True when ``var_name`` looks like it holds a secret.
+
+    Both the explicit allow-list and the substring pattern are matched
+    case-insensitively, so a caller passing ``dark_factory_holdouts``
+    is treated the same as ``DARK_FACTORY_HOLDOUTS``.
+    """
     upper = var_name.upper()
-    if var_name in _BLACKLISTED_VARS:
+    if upper in {b.upper() for b in _BLACKLISTED_VARS}:
         return True
     return any(token in upper for token in _SECRET_SUBSTRINGS)
 
@@ -269,6 +274,10 @@ def _build_argparser() -> argparse.ArgumentParser:
     optional except ``--exit-code``, and the parser accepts unknown
     argv transparently so a wrapper can pass through the original
     command line without re-encoding it.
+
+    The original bash argv is passed as a single JSON-encoded string
+    via ``--bash-argv`` (so there is no possibility of argparse
+    greedily consuming the first positional as a flag value).
     """
     p = argparse.ArgumentParser(
         prog="python -m runner.panic_hook",
@@ -279,13 +288,21 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--line", type=int, default=0, help="Bash $LINENO where the panic was raised (0 if unknown).")
     p.add_argument(
         "--bash-argv",
-        action="store_true",
-        help="Treat all remaining args as the original bash argv[0..] of the wrapper.",
+        default=None,
+        help=(
+            "JSON-encoded list of the original bash argv. "
+            "Pass the wrapper's $0 and $@ as a single JSON string."
+        ),
     )
     p.add_argument(
         "--traceback",
         default="",
         help="Optional pre-formatted traceback string (default: empty).",
+    )
+    p.add_argument(
+        "--panic-dir",
+        default=None,
+        help="Override the panic output directory (used by tests).",
     )
     return p
 
@@ -298,13 +315,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_argparser()
     args, remaining = parser.parse_known_args(argv)
 
-    # When --bash-argv is set, the remaining args are the original
-    # wrapper argv. The last element is the panic flag itself; the
-    # rest form the actual command being executed.
-    if args.bash_argv and remaining:
-        original_argv = list(remaining)
+    # When --bash-argv is set, its value is a JSON-encoded list of the
+    # original wrapper argv. This avoids argparse ambiguity where the
+    # first positional could be greedily consumed as a flag value.
+    if args.bash_argv:
+        try:
+            original_argv = list(json.loads(args.bash_argv))
+        except (ValueError, TypeError):
+            # Malformed JSON — fall back to treating it as a single token.
+            original_argv = [args.bash_argv]
+    elif remaining:
+        original_argv = [sys.argv[0], *remaining]
     else:
-        original_argv = [sys.argv[0], *remaining] if remaining else [sys.argv[0]]
+        original_argv = [sys.argv[0]]
 
     # We only have a path hint from --line; argv[0] is the python
     # interpreter when invoked via ``-m runner.panic_hook``. The
@@ -331,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
         run_id=run_id,
         env_filtered=env_filtered,
         exit_code=args.exit_code,
+        panic_dir=args.panic_dir,
     )
     return PANIC_EXIT_CODE
 
