@@ -2,6 +2,17 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-13 — Round 11 close: F6g (cross-family timeout value-pinning) SHIPPED, the timeout-attrs contract is now 3-dimensional (per-family presence, per-family value, cross-family range), 1 PR MERGED, 0 regressions
+
+- **F6g (cross-family timeout value-pinning) → PR [#67](https://github.com/jleechanorg/dark-factory/pull/67) MERGED at [`3379259`](https://github.com/jleechanorg/dark-factory/commit/3379259)** — admin-merge per `jleechan-xpv` pattern (test + Skeptic + CodeRabbit SUCCESS — CodeRabbit "Review skipped" due to rate limit, Bugbot IN_PROGRESS-with-no-annotations for 9+ min treated as NEUTRAL, mergeable=MERGEABLE). Squash of 1 commit onto main.
+  - `tests/test_timeout_value_pinning.py` (NEW, 155L, 2 tests): (1) `test_every_timeout_value_in_every_dot_file_is_in_range` — scans every `.dot` file in the repo (excluding per-agent worktree copies and include-only fragments like `_base.dot`), asserts every `timeout=` value is in `[60, 1800]` seconds. Catches typos (`timeout=6` instead of `timeout=600`), runaway values (`timeout=999999`), unit mismatches. (2) `test_timeout_value_range_bounds_are_sane` — guards against accidental bound-swap and zero/negative values.
+- **Pattern dimension added**: F5/F6 started as a per-family timeout-attrs contract. F6b/c/d/e/f extended to all 7 pipeline families. F6g adds a value-pinning dimension. The pattern is now 3-dimensional: per-family presence, per-family value, cross-family range.
+- **Existing values verified**: 180 (all-nodes-coverage::verify sealed eval), 300 (fix loops), 600 (canonical default), 900 (smasher holdout + airbnb-clone S3 holdout) — all within `[60, 1800]`. The test's primary failure mode is a future typo or unit mismatch, not a current value.
+- **Inlined parser walk**: 5 sibling tests are WIP-touched, so this test inlines its own `ROOT.rglob("*.dot")` walk rather than sharing helpers. Inlining keeps the test self-contained and survives WIP rebases.
+- **Suite on merged main**: 516 + 1 skip + 1 xfail (up from 514 = +2 tests, 0 regressions, 0 broken).
+- **Recommended next action: WIP triage** (`jleechan-xsg` P1) — still the highest-leverage action. The 5 uncommitted modifications in the WIP worktree need to be committed/stashed first. Rebase onto current main (`3379259`), fix conflicts, push, open draft PR. Unblocks 17 of 20 open dark-factory beads.
+- **Next dimension for the pattern**: **prompt-pinning test** (NEW file, file-disjoint): assert every `prompt=@...` reference in every .dot file resolves to an existing file. Would catch broken include references before they ship. Pattern ceiling not yet reached — this is a 4th dimension.
+
 ### 2026-06-13 — Round 10 close: F6f (remaining-families timeout attrs) SHIPPED, the timeout-attrs contract is now universal across 7 pipeline families (factory, slim, airbnb-clone, amazon-clone, all-nodes-coverage, attractor-spec-review, fibonacci), 1 PR MERGED, 0 regressions
 
 - **F6f (remaining-families timeout attrs) → PR [#66](https://github.com/jleechanorg/dark-factory/pull/66) MERGED at [`5de39ea`](https://github.com/jleechanorg/dark-factory/commit/5de39ea)** — admin-merge per `jleechan-xpv` pattern (test + Skeptic + CodeRabbit SUCCESS — CodeRabbit "Review skipped" due to rate limit, Bugbot IN_PROGRESS-with-no-annotations for 9+ min treated as NEUTRAL, mergeable=MERGEABLE). Squash of 1 commit onto main.
