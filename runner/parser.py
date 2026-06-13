@@ -80,6 +80,7 @@ class Graph:
     nodes: dict[str, Node]
     edges: list[Edge]
     attrs: dict[str, AttrValue] = field(default_factory=dict)
+    pipeline_path: Optional[pathlib.Path] = None
 
     def outgoing(self, name: str) -> list[Edge]:
         return [e for e in self.edges if e.src == name]
@@ -585,7 +586,7 @@ def _parse(
             raise ValueError(f"{path}: unreachable nodes from start: {', '.join(unreachable)}")
     _validate_retry_targets(path, graph_attrs, nodes, edges)
 
-    return Graph(name=name, goal=goal, nodes=nodes, edges=edges, attrs=graph_attrs)
+    return Graph(name=name, goal=goal, nodes=nodes, edges=edges, attrs=graph_attrs, pipeline_path=path.resolve())
 
 
 def _start_node_name(nodes: dict[str, Node]) -> str:
