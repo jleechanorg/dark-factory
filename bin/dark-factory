@@ -19,7 +19,8 @@ __df_panic_collect() {
   if [[ "${rc}" -ne 0 && -n "${VENV_PYTHON:-}" && -x "${VENV_PYTHON}" ]]; then
     # Best-effort: never let the panic hook itself cause a second
     # failure. Capture original argv (skip the bash wrapper name).
-    "${VENV_PYTHON}" -m runner.panic_hook \
+    env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+      "${VENV_PYTHON}" -m runner.panic_hook \
       --exit-code "${rc}" \
       --line "${line}" \
       --bash-argv "$0" "${_ORIGINAL_ARGV[@]}" >/dev/null 2>&1 || true
