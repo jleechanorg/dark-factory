@@ -5,10 +5,10 @@ digraph kilroy_amazon {
     start [shape=Mdiamond, label="Start"]
     exit  [shape=Msquare, label="Exit"]
 
-    spec   [type="codergen", label="Spec", prompt="@benchmarks/amazon-clone/prompts/kilroy/spec.md"]
-    build  [type="codergen", label="Build", prompt="@benchmarks/amazon-clone/prompts/kilroy/build.md"]
+    spec   [type="codergen", label="Spec", prompt="@benchmarks/amazon-clone/prompts/kilroy/spec.md", timeout=600]
+    build  [type="codergen", label="Build", prompt="@benchmarks/amazon-clone/prompts/kilroy/build.md", timeout=600]
     test   [type="holdout_eval", label="Test", timeout="300"]
-    review [type="codergen", label="Review", prompt="@benchmarks/amazon-clone/prompts/kilroy/review.md"]
+    review [type="codergen", label="Review", prompt="@benchmarks/amazon-clone/prompts/kilroy/review.md", timeout=600]
 
     start -> spec -> build -> test
     test -> exit [condition="outcome=success"]

@@ -5,7 +5,7 @@ digraph amazon_slim {
     start [shape=Mdiamond, label="Start"]
     exit  [shape=Msquare, label="Exit"]
 
-    implement [type="codergen", label="Implement", prompt="@benchmarks/amazon-clone/prompts/implement.md"]
+    implement [type="codergen", label="Implement", prompt="@benchmarks/amazon-clone/prompts/implement.md", timeout=600]
     public_acceptance [type="tool", label="Public Acceptance", command="bash benchmarks/amazon-clone/scripts/public_acceptance.sh .", timeout="300", validation="true"]
     verify    [type="holdout_eval", label="Verify", timeout="300"]
     fix       [type="codergen", label="Fix", prompt="@benchmarks/amazon-clone/prompts/fix.md", timeout="300", max_visits="5"]

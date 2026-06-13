@@ -10,14 +10,16 @@ digraph AmazonCloneSmasher {
   plan [
     type="codergen",
     label="Plan",
-    prompt="@benchmarks/amazon-clone/prompts/plan.md"
+    prompt="@benchmarks/amazon-clone/prompts/plan.md",
+    timeout=600
   ]
 
   implement [
     type="codergen",
     label="Implement",
     prompt="@benchmarks/amazon-clone/prompts/implement.md",
-    max_retries=2
+    max_retries=2,
+    timeout=600
   ]
 
   test [
@@ -25,7 +27,8 @@ digraph AmazonCloneSmasher {
     label="Public Acceptance",
     command="${state.amazon.public_command}",
     goal_gate=true,
-    retry_target="fix"
+    retry_target="fix",
+    timeout=600
   ]
 
   holdout [
@@ -33,14 +36,16 @@ digraph AmazonCloneSmasher {
     label="Redacted Holdout Score",
     command="${state.amazon.holdout_command}",
     goal_gate=true,
-    retry_target="fix"
+    retry_target="fix",
+    timeout=900
   ]
 
   fix [
     type="codergen",
     label="Fix",
     prompt="@benchmarks/amazon-clone/prompts/fix.md",
-    max_retries=2
+    max_retries=2,
+    timeout=600
   ]
 
   start -> plan

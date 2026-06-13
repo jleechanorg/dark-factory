@@ -5,10 +5,10 @@ digraph tracker_amazon {
     start [shape=Mdiamond, label="Start"]
     exit  [shape=Msquare, label="Exit"]
 
-    analyze [type="codergen", label="Analyze", prompt="@benchmarks/amazon-clone/prompts/tracker/analyze.md"]
-    create  [type="codergen", label="Create", prompt="@benchmarks/amazon-clone/prompts/implement.md"]
+    analyze [type="codergen", label="Analyze", prompt="@benchmarks/amazon-clone/prompts/tracker/analyze.md", timeout=600]
+    create  [type="codergen", label="Create", prompt="@benchmarks/amazon-clone/prompts/implement.md", timeout=600]
     check   [type="holdout_eval", label="Check", timeout="300"]
-    refine  [type="codergen", label="Refine", prompt="@benchmarks/amazon-clone/prompts/tracker/refine.md"]
+    refine  [type="codergen", label="Refine", prompt="@benchmarks/amazon-clone/prompts/tracker/refine.md", timeout=600]
 
     start -> analyze -> create -> check
     check -> exit [condition="outcome=success"]
