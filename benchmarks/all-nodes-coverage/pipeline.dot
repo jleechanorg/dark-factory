@@ -8,8 +8,8 @@ digraph roman_benchmark {
     start [shape=Mdiamond, label="Start"]
     exit  [shape=Msquare,  label="Exit"]
 
-    plan      [type="codergen", label="Plan",      prompt="@benchmarks/all-nodes-coverage/prompts/plan.md"]
-    implement [type="codergen", label="Implement", prompt="@benchmarks/all-nodes-coverage/prompts/implement.md"]
+    plan      [type="codergen", label="Plan",      prompt="@benchmarks/all-nodes-coverage/prompts/plan.md",      timeout=600]
+    implement [type="codergen", label="Implement", prompt="@benchmarks/all-nodes-coverage/prompts/implement.md", timeout=600]
 
     // verify is a sealed evaluator node opting into validation behaviour. On
     // success it clears `_unresolved_failure` so the exit node can report
@@ -22,7 +22,7 @@ digraph roman_benchmark {
             implementation="${state.ao.worktree}",
             timeout="180"]
 
-    fix [type="codergen", label="Fix", prompt="@benchmarks/all-nodes-coverage/prompts/fix.md", max_visits="3"]
+    fix [type="codergen", label="Fix", prompt="@benchmarks/all-nodes-coverage/prompts/fix.md", max_visits="3", timeout=600]
 
     start -> plan -> implement -> verify
     verify -> exit [condition="outcome=success"]

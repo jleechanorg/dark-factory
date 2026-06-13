@@ -7,22 +7,24 @@ digraph attractor_spec_review_slim {
     start [shape=Mdiamond, label="Start"]
     exit  [shape=Msquare,  label="Exit"]
 
-    plan [type="codergen", label="Plan", prompt="@benchmarks/attractor-spec-review/prompts/plan.md"]
-    implement [type="codergen", label="Implement", prompt="@benchmarks/attractor-spec-review/prompts/implement.md"]
+    plan [type="codergen", label="Plan", prompt="@benchmarks/attractor-spec-review/prompts/plan.md", timeout=600]
+    implement [type="codergen", label="Implement", prompt="@benchmarks/attractor-spec-review/prompts/implement.md", timeout=600]
 
     acceptance [type="tool",
                 label="Public Acceptance",
                 command="python scripts/validate_spec.py --spec spec/feature.md --report spec_review/validation_report.json",
                 goal_gate=true,
-                retry_target="fix"]
+                retry_target="fix",
+                timeout=600]
 
     review [type="tool",
             label="Independent Reviewer",
             command="benchmarks/attractor-spec-review/scripts/review_with_codex.sh . spec/feature.md spec_review/independent_reviewer.json",
             goal_gate=true,
-            retry_target="fix"]
+            retry_target="fix",
+            timeout=600]
 
-    fix [type="codergen", label="Fix", prompt="@benchmarks/attractor-spec-review/prompts/fix.md", max_visits="3"]
+    fix [type="codergen", label="Fix", prompt="@benchmarks/attractor-spec-review/prompts/fix.md", max_visits="3", timeout=600]
 
     start -> plan
     plan -> implement

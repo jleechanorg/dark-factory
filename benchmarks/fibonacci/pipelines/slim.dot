@@ -10,14 +10,16 @@ digraph FibonacciSlim {
   plan [
     type="codergen",
     label="Plan",
-    prompt="@benchmarks/fibonacci/prompts/plan.md"
+    prompt="@benchmarks/fibonacci/prompts/plan.md",
+    timeout=600
   ]
 
   implement [
     type="codergen",
     label="Implement",
     prompt="@benchmarks/fibonacci/prompts/implement.md",
-    max_retries=2
+    max_retries=2,
+    timeout=600
   ]
 
   public_acceptance [
@@ -25,7 +27,8 @@ digraph FibonacciSlim {
     label="Public Acceptance",
     command="${state.fibonacci.public_command}",
     goal_gate=true,
-    retry_target="fix"
+    retry_target="fix",
+    timeout=600
   ]
 
   sealed_score [
@@ -33,14 +36,16 @@ digraph FibonacciSlim {
     label="Redacted Sealed Score",
     command="${state.fibonacci.score_command}",
     goal_gate=true,
-    retry_target="fix"
+    retry_target="fix",
+    timeout=600
   ]
 
   fix [
     type="codergen",
     label="Fix",
     prompt="@benchmarks/fibonacci/prompts/fix.md",
-    max_retries=2
+    max_retries=2,
+    timeout=600
   ]
 
   start -> plan
