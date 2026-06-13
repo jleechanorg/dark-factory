@@ -2,6 +2,20 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-13 — Round 13 close: F6i (codergen-has-non-empty-prompt) SHIPPED, the contract pattern is now 5-dimensional (per-family presence, per-family value, cross-family range, prompt-pinning, codergen-has-prompt), 1 PR MERGED, 0 regressions
+
+- **F6i (codergen-has-non-empty-prompt) → PR [#69](https://github.com/jleechanorg/dark-factory/pull/69) MERGED at [`d173d03`](https://github.com/jleechanorg/dark-factory/commit/d173d03)** — admin-merge per `jleechan-xpv` pattern (test + Skeptic + CodeRabbit "Review skipped" SUCCESS, Bugbot NEUTRAL with no actionable comments after push, mergeable=MERGEABLE). Squash of 2 commits onto main.
+  - `tests/test_codergen_prompt_non_empty.py` (NEW, 216L after review fixes, 2 tests): (1) `test_every_codergen_node_has_a_non_empty_prompt` — scans every `.dot` file in the repo, asserts every codergen-class node (explicit `type="codergen"` OR no-type default-shape implicit codergen) has a non-empty `prompt`. Special-shape exemptions (point=anchor, component=fanout, tripleoctagon=join, Mdiamond=start, Msquare=exit) match the engine's own dispatch. (2) `test_needs_prompt_types_allowlist_is_sane` — pins the `_NEEDS_PROMPT_TYPES` allow-list (must include `codergen`; must NOT include `start`/`exit`/`tool`/`holdout_eval`/`gate_es`).
+- **CodeRabbit + chatgpt-codex-connector review addressed in commit 2**:
+  - P2 (Respect explicit types before shape exemptions) — `_node_needs_prompt` now checks explicit `type=` first; the shape exemption only fires when no type is set. A node with `type="codergen", shape="component"` is now correctly a codergen (not a parallel fan-out), matching the engine's `_is_parallel_node` priority rule.
+  - P2 (Treat unregistered types as codergen fallbacks) — the no-type case is now handled by a clean `if t is None: shape decides` branch instead of overloading the `_NEEDS_PROMPT_TYPES` allow-list. Removed `default` from the allow-list (it was a code smell — the no-type default case is shape-driven, not type-driven).
+- **Pattern dimension added**: F6i extends the F5/F6/F6b-F6h contract pattern to a 5th dimension: **codergen-has-non-empty-prompt**. The pattern is now 5-dimensional: per-family timeout-attr presence, per-family timeout value, cross-family timeout value range, prompt resolution, codergen-has-non-empty-prompt.
+- **Complementary to F6h**: F6h catches broken `@`-references (the prompt file is missing on disk). F6i catches missing `prompt=` attributes (the codergen has no prompt at all). Together they pin both "the prompt file exists" and "every codergen has a prompt."
+- **Existing codergens verified**: 0 codergen nodes today are missing a prompt; the test's primary failure mode is a future copy-paste error or merge conflict that drops the `prompt=` attr.
+- **Inlined parser walk**: like F6g/F6h, inlines its own `ROOT.rglob("*.dot")` walk rather than sharing helpers with WIP-touched siblings. Survives WIP rebases.
+- **Suite on merged main**: 520 + 1 skip + 1 xfail (up from 518 = +2 tests, 0 regressions, 0 broken).
+- **Recommended next action**: the contract-test pattern is now at plateau across 5 dimensions. The natural 6th dimension is **prompt-substitution pinning** (every prompt file contains `${goal}` or has a structured template), but the test pattern would need to be parameterized per-prompt (some prompts use `${state.X}` not `${goal}`), so the marginal value is lower. Pivot to WIP triage (`jleechan-xsg` P1) which still unblocks 17 of 20 open beads.
+
 ### 2026-06-13 — Round 12 close: F6h (cross-family prompt-pinning) SHIPPED, the contract pattern is now 4-dimensional (per-family presence, per-family value, cross-family range, prompt-pinning), 1 PR MERGED, 0 regressions
 
 - **F6h (cross-family prompt-pinning) → PR [#68](https://github.com/jleechanorg/dark-factory/pull/68) MERGED at [`51f47c6`](https://github.com/jleechanorg/dark-factory/commit/51f47c6)** — admin-merge per `jleechan-xpv` pattern (test + Skeptic + CodeRabbit "Review skipped" SUCCESS, Bugbot NEUTRAL with no actionable comments after push, mergeable=MERGEABLE). Squash of 2 commits onto main.
