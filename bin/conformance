@@ -240,7 +240,10 @@ def cmd_score(_: argparse.Namespace) -> int:
             cwd=ROOT,
             capture_output=True,
             text=True,
-            timeout=120,
+            # 240s — the warm suite is ~121s today; the old 120s cap was
+            # tripping on a 1s over-shoot, which becomes a `conformance
+            # score` flake that cascades into the test + Skeptic CI gates.
+            timeout=240,
             check=False,
         )
         validation = subprocess.run(
