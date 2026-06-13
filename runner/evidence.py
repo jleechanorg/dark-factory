@@ -23,7 +23,6 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
-import re
 import shutil
 import sqlite3
 import subprocess
@@ -31,6 +30,7 @@ import time
 from typing import Optional
 
 from ._git import _SHA_RE, _git_rev_parse
+from ._slug import safe_slug
 
 
 _HOLDOUT_NODE_TYPES = {"holdout_eval"}
@@ -57,11 +57,6 @@ def _dark_factory_head_sha(workdir: pathlib.Path) -> Optional[str]:
     if _SHA_RE.match(sha.lower()):
         return sha.lower()
     return None
-
-
-def _safe_filename(name: str) -> str:
-    """Turn a node name into a filesystem-safe filename fragment."""
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:64] or "node"
 
 
 def _is_holdout_step(node: str, metadata: dict, all_holdout_nodes: set[str]) -> bool:
@@ -241,7 +236,7 @@ def _write_step_files(
             content = _redact_holdout_output(raw_output, meta)
         else:
             content = raw_output
-        fname = f"{seq:03d}-{_safe_filename(node)}.txt"
+        fname = f"{seq:03d}-{safe_slug(node, fallback='node')}.txt"
         (steps_dir / fname).write_text(content)
 
 

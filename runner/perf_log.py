@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import pathlib
-import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -15,11 +14,7 @@ from typing import Optional, TextIO
 
 from ._classify import _classify_outcome
 from ._git import _git_rev_parse
-
-
-def _safe_slug(name: str) -> str:
-    """Filesystem-safe slug for repo/branch directory names."""
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:64] or "unknown"
+from ._slug import safe_slug
 
 
 def _is_success_outcome(raw: str) -> bool:
@@ -89,17 +84,17 @@ def resolve_git_context(
     if ao_worktree:
         target = pathlib.Path(ao_worktree).expanduser().resolve()
 
-    repo_slug = _safe_slug(target.name)
+    repo_slug = safe_slug(target.name)
     branch_slug = "unknown"
     head_sha: Optional[str] = None
 
     branch_raw = _git_cmd(target, "rev-parse", "--abbrev-ref", "HEAD")
     if branch_raw:
-        branch_slug = _safe_slug(branch_raw)
+        branch_slug = safe_slug(branch_raw)
 
     remote_url = _git_cmd(target, "remote", "get-url", "origin")
     if remote_url:
-        repo_slug = _safe_slug(_parse_repo_name(remote_url))
+        repo_slug = safe_slug(_parse_repo_name(remote_url))
 
     sha_raw = _git_rev_parse(target, "HEAD")
     if sha_raw and len(sha_raw) == 40 and all(c in "0123456789abcdef" for c in sha_raw.lower()):
