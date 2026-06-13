@@ -103,6 +103,9 @@ def classify_failure_kind(cluster: Cluster) -> tuple[str, str]:
 
     # 3. Normal real-failure outcomes with substantive output.
     if cluster.outcome in {"failure", "fail", "partial", "inconclusive"}:
+        # Check for timeout before treating as real failure
+        if metadata.get("timed_out") == "true":
+            return ("infra", f"outcome={cluster.outcome} with timeout (timed_out=true)")
         if sample.strip():
             return ("real", f"outcome={cluster.outcome} with normal output")
         # empty output on a real-shaped outcome is unusual — fall through.

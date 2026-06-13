@@ -147,6 +147,20 @@ def test_stuck_with_substantive_output_is_real():
     assert kind == "real"
 
 
+def test_failure_with_timed_out_true_is_infra():
+    """Timeout failures are marked with outcome='failure' and timed_out='true'
+    in metadata. These should be classified as infra (harness timeout), not
+    real (agent failure), even when they have non-empty output."""
+    c = _cluster(
+        "failure",
+        "ao spawn timed out after 300 seconds",
+        {"timed_out": "true", "timeout": "300"},
+    )
+    kind, reason = classify_failure_kind(c)
+    assert kind == "infra"
+    assert "timeout" in reason.lower() or "timed_out" in reason.lower()
+
+
 # ------------------------------------------------------------------
 # Integration: the Healer report must include the kind + justification
 # ------------------------------------------------------------------
