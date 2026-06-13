@@ -22,7 +22,7 @@ from .cxdb import CXDB
 from .handlers import Context, Result, resolve
 from .parser import Edge, Graph, Node, _tokenize_condition, is_exit_node, is_start_node
 
-_VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards"}
+_VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards", "gate_audit"}
 
 # Per-run runner logs land here so a crash always leaves a diagnosable
 # traceback on disk even when no CXDB is attached. Monkeypatchable in tests.
