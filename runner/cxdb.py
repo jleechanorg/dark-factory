@@ -78,6 +78,25 @@ def _hash(text: str) -> str:
     ).hexdigest()[:16]
 
 
+def _coerce_metric(value: object, cast: type) -> Optional[object]:
+    """Return ``cast(value)`` or ``None`` on coercion failure.
+
+    Matches the "skip unparseable, never raise" contract that
+    :meth:`CXDB.cluster_aggregates` needs to survive rows whose
+    ``metadata_json`` is partially malformed: some CXDB writers
+    emit string numbers, others emit ``None``, others omit the
+    key entirely. None and empty string are normalised to ``None``
+    up front so a single downstream ``if n is not None`` check
+    covers all three "absent" cases.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return cast(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class CXDB:
     """Thin SQLite wrapper. Cheap to open per-run; not pooled."""
 
@@ -165,33 +184,19 @@ class CXDB:
                 meta = json.loads(raw or "{}")
             except (TypeError, ValueError):
                 continue
-            for key, target in (
-                ("tokens_in", "_in"),
-                ("tokens_out", "_out"),
-                ("tokens_total", "_tot"),
-            ):
-                v = meta.get(key)
-                if v in (None, ""):
-                    continue
-                try:
-                    total_tokens += int(v)
+            for k in ("tokens_in", "tokens_out", "tokens_total"):
+                n = _coerce_metric(meta.get(k), int)
+                if n is not None:
+                    total_tokens += n
                     saw_any = True
-                except (TypeError, ValueError):
-                    pass
-            cost = meta.get("cost_usd")
-            if cost not in (None, ""):
-                try:
-                    total_cost_usd += float(cost)
-                    saw_any = True
-                except (TypeError, ValueError):
-                    pass
-            wall = meta.get("wall_ms")
-            if wall not in (None, ""):
-                try:
-                    total_wall_ms += int(wall)
-                    saw_any = True
-                except (TypeError, ValueError):
-                    pass
+            cost = _coerce_metric(meta.get("cost_usd"), float)
+            if cost is not None:
+                total_cost_usd += cost
+                saw_any = True
+            wall = _coerce_metric(meta.get("wall_ms"), int)
+            if wall is not None:
+                total_wall_ms += wall
+                saw_any = True
         return {
             "total_tokens": total_tokens if saw_any else None,
             "total_cost_usd": total_cost_usd if saw_any else None,
