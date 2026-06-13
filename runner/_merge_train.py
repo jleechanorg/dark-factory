@@ -119,6 +119,29 @@ def _lock_path(target_repo: str, lock_dir: pathlib.Path) -> pathlib.Path:
     return lock_dir / f"{_sanitize(target_repo)}.lock"
 
 
+def _reserve_tmp_path(final_path: pathlib.Path) -> pathlib.Path:
+    """Return a unique sibling temp path for the atomic write-then-link.
+
+    The temp file lives in the same directory as the final lock so
+    ``os.link`` is a same-filesystem operation (POSIX only guarantees
+    link(2) atomicity on the same filesystem). Uniqueness comes from
+    pid + a thread-safe monotonic counter; collisions are resolved by
+    the O_EXCL retry in :func:`acquire`.
+    """
+    import threading as _threading
+
+    state = getattr(_reserve_tmp_path, "_state", None)
+    if state is None:
+        state = (_threading.Lock(), 0)
+        _reserve_tmp_path._state = state
+    lock, n = state
+    with lock:
+        n = state[1] + 1
+        _reserve_tmp_path._state = (lock, n)
+    suffix = f".{os.getpid()}.{n}.tmp"
+    return final_path.with_name(final_path.name + suffix)
+
+
 def _now_utc() -> _dt.datetime:
     """Return the current UTC time as a timezone-aware datetime."""
     return _dt.datetime.now(_dt.timezone.utc)
@@ -245,23 +268,65 @@ def acquire(
     path = _lock_path(target_repo, base)
     timestamp = (now or _now_utc()).astimezone(_dt.timezone.utc)
     payload = {"run_id": run_id, "acquired_at": timestamp.isoformat()}
+    payload_bytes = json.dumps(payload, sort_keys=True).encode("utf-8")
 
-    # Fast path: atomic create-if-not-exists. On POSIX this is a
-    # single syscall and is the only correct way to race two
-    # ``acquire`` calls without a separate lock around them.
-    try:
-        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError:
-        return _reclaim_stale(path, target_repo, run_id, payload, now=now)
-
-    try:
-        os.write(fd, json.dumps(payload, sort_keys=True).encode("utf-8"))
-    except:
-        os.close(fd)
-        path.unlink(missing_ok=True)
-        raise
+    # Atomicity strategy: write the JSON to a sibling temp file, fsync
+    # it, then use ``os.link(tmp, final)`` as the "publish or fail"
+    # step. ``os.link`` is POSIX-guaranteed to fail with
+    # ``FileExistsError`` if the final path exists, and to create a
+    # hard link otherwise — both atomically. This is the key invariant:
+    # a reader who sees ``final`` existing will see a fully-written
+    # payload, never an empty file. The previous ``O_EXCL`` probe
+    # approach created an empty file that was visible to readers for
+    # the duration of the temp-write + fsync + close window, which
+    # broke the loser-thread reads under contention (the Skeptic CI
+    # gate caught this: ``exc.held_by == None`` in the concurrent test).
+    tmp_path = _reserve_tmp_path(path)
+    for _attempt in range(3):
+        try:
+            tmp_fd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            break
+        except FileExistsError:
+            tmp_path = _reserve_tmp_path(path)
     else:
-        os.close(fd)
+        raise OSError(f"could not reserve temp lock path near {path}")
+    try:
+        os.write(tmp_fd, payload_bytes)
+        os.fsync(tmp_fd)
+    except BaseException:
+        os.close(tmp_fd)
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+    os.close(tmp_fd)
+
+    try:
+        os.link(tmp_path, path)
+    except FileExistsError:
+        # Another live holder has the lock. Reclaim-stale decides
+        # between "fresh holder, raise LockBusy" and "stale, take
+        # over". The temp file is now an orphan since we never
+        # published.
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return _reclaim_stale(path, target_repo, run_id, payload, now=now)
+    except OSError:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+    # Link succeeded: ``path`` and ``tmp_path`` are now two paths to
+    # the same inode. Drop the temp link so only ``path`` remains.
+    try:
+        tmp_path.unlink()
+    except OSError:
+        pass
 
     return Lock(
         target_repo=target_repo,
