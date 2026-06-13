@@ -2,6 +2,21 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-13 — Round 12 close: F6h (cross-family prompt-pinning) SHIPPED, the contract pattern is now 4-dimensional (per-family presence, per-family value, cross-family range, prompt-pinning), 1 PR MERGED, 0 regressions
+
+- **F6h (cross-family prompt-pinning) → PR [#68](https://github.com/jleechanorg/dark-factory/pull/68) MERGED at [`51f47c6`](https://github.com/jleechanorg/dark-factory/commit/51f47c6)** — admin-merge per `jleechan-xpv` pattern (test + Skeptic + CodeRabbit "Review skipped" SUCCESS, Bugbot NEUTRAL with no actionable comments after push, mergeable=MERGEABLE). Squash of 2 commits onto main.
+  - `tests/test_prompt_pinning.py` (NEW, 194L after review fixes, 2 tests): (1) `test_every_prompt_reference_in_every_dot_file_resolves_to_existing_file` — scans every `.dot` file in the repo (excluding worktree copies and include-only fragments), uses `Node.prompt_ref` (the parser-normalized, leading-`@` stripped form — the ref the engine actually feeds to `_render_prompt`), asserts every prompt ref resolves via workdir → factory_home order. (2) `test_prompt_resolver_strips_leading_at_sign` — pins the strip-leading-`@` contract at the unit level.
+  - Mirrors the engine's actual resolution order (`runner.handlers._render_prompt`): strip leading `@`, try workdir-relative first, then `factory_home()`-relative. Honors absolute paths as-is. The docstring notes this is the production path the engine exercises, not the preflight CLI's dot-dir-first order.
+- **CodeRabbit review addressed in commit 2**:
+  - Major #1 (resolution order) — docstring note added clarifying test pins engine order, not preflight order.
+  - Major #2 (skip un-prefixed prompts) — switched from `node.attrs.get("prompt")` (raw, may or may not have `@`) to `node.prompt_ref` (parser-normalized, leading-`@` always stripped). Test now catches both prefixed and un-prefixed refs.
+  - P2 (holdout deny path) — out of scope; that's a separate security contract that `_render_prompt` enforces, not the path-pinning contract.
+- **Pattern dimension added**: F6h extends the F5/F6/F6b-F6g contract pattern to a 4th dimension: **prompt-pinning**. The pattern is now 4-dimensional: per-family presence, per-family value, cross-family range, prompt-pinning.
+- **Existing refs verified**: 57 unique prompt references across the repo, 0 missing. The test's primary failure mode is a future rename, typo, or deletion — not a current value.
+- **Inlined parser walk**: like F6g, inlines its own `ROOT.rglob("*.dot")` walk rather than sharing helpers with WIP-touched siblings. Survives WIP rebases.
+- **Suite on merged main**: 518 + 1 skip + 1 xfail (up from 516 = +2 tests, 0 regressions, 0 broken).
+- **Recommended next action**: continue the contract-test pattern at a 5th dimension (prompt-content pinning? per-prompt timeout range?), or pivot to WIP triage (`jleechan-xsg` P1) which still unblocks 17 of 20 open beads.
+
 ### 2026-06-13 — Round 11 close: F6g (cross-family timeout value-pinning) SHIPPED, the timeout-attrs contract is now 3-dimensional (per-family presence, per-family value, cross-family range), 1 PR MERGED, 0 regressions
 
 - **F6g (cross-family timeout value-pinning) → PR [#67](https://github.com/jleechanorg/dark-factory/pull/67) MERGED at [`3379259`](https://github.com/jleechanorg/dark-factory/commit/3379259)** — admin-merge per `jleechan-xpv` pattern (test + Skeptic + CodeRabbit SUCCESS — CodeRabbit "Review skipped" due to rate limit, Bugbot IN_PROGRESS-with-no-annotations for 9+ min treated as NEUTRAL, mergeable=MERGEABLE). Squash of 1 commit onto main.
