@@ -72,7 +72,7 @@ uv pip install --python "${PYTHON_BIN}" -r "${REPO_ROOT}/requirements.txt"
 echo "==> verifying import"
 "${PYTHON_BIN}" -c "import pydot, yaml; print('deps ok:', pydot.__version__)"
 
-chmod +x "${BIN_DIR}/dark-factory" "${BIN_DIR}/df-healer"
+chmod +x "${BIN_DIR}/dark-factory" "${BIN_DIR}/df-healer" "${BIN_DIR}/df-validate"
 
 if [[ "${LINK}" -eq 1 ]]; then
   mkdir -p "${LOCAL_BIN}"
