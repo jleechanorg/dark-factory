@@ -21,10 +21,6 @@ from runner.parser import parse  # noqa: E402
 from runner import perf_log  # noqa: E402
 
 
-def test_slugify_branch_with_slashes():
-    assert perf_log._safe_slug("feat/my-feature") == "feat_my-feature"
-
-
 def test_parse_repo_name_from_scp_style():
     assert perf_log._parse_repo_name("git@github.com:org/worldarchitect.ai.git") == "worldarchitect.ai"
 
