@@ -8,10 +8,10 @@ digraph gates {
     start [shape=Mdiamond, label="Start"]
     exit  [shape=Msquare,  label="Exit"]
 
-    holdout         [type="holdout_eval",        label="Holdout Eval", feature="hello"]
-    gate_es         [type="gate_es",             label="/es Evidence Standards"]
-    gate_er         [type="gate_er",             label="/er Evidence Review"]
-    gate_cs         [type="gate_code_standards", label="/code_standards (ZFC + leveling + RCF)"]
+    holdout         [type="holdout_eval",        label="Holdout Eval", feature="hello", timeout=600]
+    gate_es         [type="gate_es",             label="/es Evidence Standards",        timeout=600]
+    gate_er         [type="gate_er",             label="/er Evidence Review",            timeout=600]
+    gate_cs         [type="gate_code_standards", label="/code_standards (ZFC + leveling + RCF)", timeout=600]
 
     start -> holdout
     holdout -> gate_es [condition="outcome=success"]
