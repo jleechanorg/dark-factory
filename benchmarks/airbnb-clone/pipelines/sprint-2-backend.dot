@@ -8,8 +8,8 @@ digraph airbnb_sprint_2 {
     start [shape=Mdiamond, label="Start"]
     exit  [shape=Msquare,  label="Exit"]
 
-    plan      [type="codergen", label="Plan S2",      prompt="@benchmarks/airbnb-clone/prompts/sprint-2-plan.md"]
-    implement [type="codergen", label="Implement S2", prompt="@benchmarks/airbnb-clone/prompts/sprint-2-implement.md"]
+    plan      [type="codergen", label="Plan S2",      prompt="@benchmarks/airbnb-clone/prompts/sprint-2-plan.md",      timeout=600]
+    implement [type="codergen", label="Implement S2", prompt="@benchmarks/airbnb-clone/prompts/sprint-2-implement.md", timeout=600]
 
     verify [type="holdout_eval",
             label="sealed evaluator (S2)",
@@ -22,7 +22,8 @@ digraph airbnb_sprint_2 {
     fix [type="codergen",
          label="Fix S2",
          prompt="@benchmarks/airbnb-clone/prompts/sprint-2-fix.md",
-         max_visits="5"]
+         max_visits="5",
+         timeout=600]
 
     start -> plan -> implement -> verify
     verify -> exit [condition="outcome=success"]
