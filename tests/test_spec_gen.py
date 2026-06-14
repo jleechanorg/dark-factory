@@ -1,4 +1,11 @@
-"""Tests for pipelines/slim/spec_gen.dot and its prompts (jleechan-6a6 / #34)."""
+"""Tests for pipelines/slim/spec_gen.dot and its prompts (jleechan-6a6 / #34).
+
+Spec_gen is a TWO-PHASE pipeline:
+  Phase 1 (Main spec.md):     plan_main  -> review_main  -> [success] plan_attractor
+                                                       \\-> [fail] fix_main -> review_main
+  Phase 2 (attractor_spec.md): plan_attractor -> review_attractor -> [success] exit
+                                                               \\-> [fail] fix_attractor -> review_attractor
+"""
 
 from __future__ import annotations
 
@@ -29,8 +36,13 @@ def test_spec_gen_dot_parses_successfully():
 
 
 def test_spec_gen_has_required_nodes():
+    """All 8 two-phase spec-gen nodes must be present."""
     g = parse(SPEC_GEN)
-    for node_name in ("start", "exit", "plan", "spec_review", "fix_spec"):
+    for node_name in (
+        "start", "exit",
+        "plan_main", "review_main", "fix_main",
+        "plan_attractor", "review_attractor", "fix_attractor",
+    ):
         assert node_name in g.nodes, f"missing node: {node_name}"
 
 
@@ -59,125 +71,221 @@ def test_spec_gen_topology_start_to_explore_in():
     )
 
 
-def test_spec_gen_topology_explore_out_to_plan():
+def test_spec_gen_topology_explore_out_to_plan_main():
     g = parse(SPEC_GEN)
-    assert any(e.src == "explore_out" and e.dst == "plan" for e in g.edges), (
-        "explore_out must wire to plan"
+    assert any(e.src == "explore_out" and e.dst == "plan_main" for e in g.edges), (
+        "explore_out must wire to plan_main"
     )
 
 
-def test_spec_gen_topology_plan_to_spec_review():
+def test_spec_gen_topology_plan_main_to_review_main():
     g = parse(SPEC_GEN)
-    assert any(e.src == "plan" and e.dst == "spec_review" for e in g.edges), (
-        "plan must wire to spec_review"
+    assert any(e.src == "plan_main" and e.dst == "review_main" for e in g.edges), (
+        "plan_main must wire to review_main"
     )
 
 
-def test_spec_gen_topology_spec_review_success_to_exit():
+# Phase 1: review_main branches — success -> plan_attractor; fail -> fix_main
+def test_spec_gen_topology_review_main_success_to_plan_attractor():
     g = parse(SPEC_GEN)
     success_edges = [
         e for e in g.edges
-        if e.src == "spec_review" and e.dst == "exit"
+        if e.src == "review_main" and e.dst == "plan_attractor"
     ]
     assert len(success_edges) == 1, (
-        "spec_review must have exactly one success edge to exit"
+        "review_main must have exactly one success edge to plan_attractor"
     )
 
 
-def test_spec_gen_topology_spec_review_failure_to_fix_spec():
+def test_spec_gen_topology_review_main_failure_to_fix_main():
     g = parse(SPEC_GEN)
     fail_edges = [
         e for e in g.edges
-        if e.src == "spec_review" and e.dst == "fix_spec"
+        if e.src == "review_main" and e.dst == "fix_main"
     ]
     assert len(fail_edges) == 1, (
-        "spec_review must have exactly one failure edge to fix_spec"
+        "review_main must have exactly one failure edge to fix_main"
     )
 
 
-def test_spec_gen_topology_fix_spec_back_to_spec_review():
+def test_spec_gen_topology_fix_main_back_to_review_main():
     g = parse(SPEC_GEN)
-    assert any(e.src == "fix_spec" and e.dst == "spec_review" for e in g.edges), (
-        "fix_spec must loop back to spec_review"
+    assert any(e.src == "fix_main" and e.dst == "review_main" for e in g.edges), (
+        "fix_main must loop back to review_main"
     )
+
+
+# Phase 2: plan_attractor -> review_attractor -> exit | fix_attractor
+def test_spec_gen_topology_plan_attractor_to_review_attractor():
+    g = parse(SPEC_GEN)
+    assert any(
+        e.src == "plan_attractor" and e.dst == "review_attractor" for e in g.edges
+    ), "plan_attractor must wire to review_attractor"
+
+
+def test_spec_gen_topology_review_attractor_success_to_exit():
+    g = parse(SPEC_GEN)
+    success_edges = [
+        e for e in g.edges
+        if e.src == "review_attractor" and e.dst == "exit"
+    ]
+    assert len(success_edges) == 1, (
+        "review_attractor must have exactly one success edge to exit"
+    )
+
+
+def test_spec_gen_topology_review_attractor_failure_to_fix_attractor():
+    g = parse(SPEC_GEN)
+    fail_edges = [
+        e for e in g.edges
+        if e.src == "review_attractor" and e.dst == "fix_attractor"
+    ]
+    assert len(fail_edges) == 1, (
+        "review_attractor must have exactly one failure edge to fix_attractor"
+    )
+
+
+def test_spec_gen_topology_fix_attractor_back_to_review_attractor():
+    g = parse(SPEC_GEN)
+    assert any(
+        e.src == "fix_attractor" and e.dst == "review_attractor" for e in g.edges
+    ), "fix_attractor must loop back to review_attractor"
 
 
 # ---------------------------------------------------------------------------
-# Node attribute / contract tests
+# Node attribute / contract tests — Phase 1 (main)
 # ---------------------------------------------------------------------------
 
 
-def test_spec_gen_plan_is_plan_class():
+def test_spec_gen_plan_main_is_plan_class():
     g = parse(SPEC_GEN)
-    assert g.nodes["plan"].attrs.get("class") == "plan"
+    assert g.nodes["plan_main"].attrs.get("class") == "plan"
 
 
-def test_spec_gen_plan_prompt_is_plan_md():
+def test_spec_gen_plan_main_prompt_is_plan_md():
     g = parse(SPEC_GEN)
-    assert g.nodes["plan"].attrs.get("prompt") == "@prompts/slim/plan.md"
+    assert g.nodes["plan_main"].attrs.get("prompt") == "@prompts/slim/plan.md"
 
 
-def test_spec_gen_spec_review_is_gate_er():
-    """spec_review must be type=gate_er for cold adversarial review."""
+def test_spec_gen_review_main_is_gate_er():
+    """review_main must be type=gate_er for cold adversarial review."""
     g = parse(SPEC_GEN)
-    assert g.nodes["spec_review"].attrs.get("type") == "gate_er", (
-        "spec_review must be type=gate_er to use adversarial priority queue"
+    assert g.nodes["review_main"].attrs.get("type") == "gate_er", (
+        "review_main must be type=gate_er to use adversarial priority queue"
     )
 
 
-def test_spec_gen_spec_review_has_backend_priority():
+def test_spec_gen_review_main_has_backend_priority():
     g = parse(SPEC_GEN)
-    bp = g.nodes["spec_review"].attrs.get("backend_priority", "")
-    assert bp, "spec_review must declare backend_priority for adversarial routing"
+    bp = g.nodes["review_main"].attrs.get("backend_priority", "")
+    assert bp, "review_main must declare backend_priority for adversarial routing"
     priority = [p.strip() for p in bp.split(",")]
     assert "codex" in priority, "codex must be in backend_priority"
     assert "agy" in priority, "agy must be in backend_priority"
 
 
-def test_spec_gen_spec_review_prefer_adversarial():
+def test_spec_gen_review_main_prefer_adversarial():
     g = parse(SPEC_GEN)
-    prefer = g.nodes["spec_review"].attrs.get("prefer_adversarial")
+    prefer = g.nodes["review_main"].attrs.get("prefer_adversarial")
     assert str(prefer).lower() in ("true", "1", "yes"), (
-        "spec_review must set prefer_adversarial=true"
+        "review_main must set prefer_adversarial=true"
     )
 
 
-def test_spec_gen_spec_review_goal_gate_true():
+def test_spec_gen_review_main_goal_gate_true():
     g = parse(SPEC_GEN)
-    goal_gate = g.nodes["spec_review"].attrs.get("goal_gate")
+    goal_gate = g.nodes["review_main"].attrs.get("goal_gate")
     assert str(goal_gate).lower() in ("true", "1", "yes"), (
-        "spec_review must set goal_gate=true"
+        "review_main must set goal_gate=true"
     )
 
 
-def test_spec_gen_spec_review_retry_target_fix_spec():
+def test_spec_gen_review_main_retry_target_fix_main():
     g = parse(SPEC_GEN)
-    assert g.nodes["spec_review"].attrs.get("retry_target") == "fix_spec", (
-        "spec_review retry_target must be fix_spec"
+    assert g.nodes["review_main"].attrs.get("retry_target") == "fix_main", (
+        "review_main retry_target must be fix_main"
     )
 
 
-def test_spec_gen_spec_review_prompt_is_spec_review_md():
+def test_spec_gen_review_main_prompt_is_spec_review_md():
     g = parse(SPEC_GEN)
-    assert g.nodes["spec_review"].attrs.get("prompt") == "@prompts/slim/spec_review.md", (
-        "spec_review must use @prompts/slim/spec_review.md"
+    assert g.nodes["review_main"].attrs.get("prompt") == "@prompts/slim/spec_review.md", (
+        "review_main must use @prompts/slim/spec_review.md"
     )
 
 
-def test_spec_gen_fix_spec_max_retries():
+def test_spec_gen_fix_main_max_retries():
     g = parse(SPEC_GEN)
-    mr = g.nodes["fix_spec"].attrs.get("max_retries")
-    assert str(mr) == "2", "fix_spec max_retries must be 2"
+    mr = g.nodes["fix_main"].attrs.get("max_retries")
+    assert str(mr) == "2", "fix_main max_retries must be 2"
 
 
-def test_spec_gen_fix_spec_prompt_is_fix_spec_md():
+def test_spec_gen_fix_main_prompt_is_fix_spec_md():
+    """fix_main reuses the fix_spec.md prompt (single fix-spec authoring)."""
     g = parse(SPEC_GEN)
-    assert g.nodes["fix_spec"].attrs.get("prompt") == "@prompts/slim/fix_spec.md"
+    assert g.nodes["fix_main"].attrs.get("prompt") == "@prompts/slim/fix_spec.md"
 
 
-def test_spec_gen_fix_spec_class_is_fix():
+def test_spec_gen_fix_main_class_is_fix():
     g = parse(SPEC_GEN)
-    assert g.nodes["fix_spec"].attrs.get("class") == "fix"
+    assert g.nodes["fix_main"].attrs.get("class") == "fix"
+
+
+# ---------------------------------------------------------------------------
+# Node attribute / contract tests — Phase 2 (attractor)
+# ---------------------------------------------------------------------------
+
+
+def test_spec_gen_plan_attractor_is_plan_class():
+    g = parse(SPEC_GEN)
+    assert g.nodes["plan_attractor"].attrs.get("class") == "plan"
+
+
+def test_spec_gen_plan_attractor_prompt_is_plan_attractor_md():
+    g = parse(SPEC_GEN)
+    assert g.nodes["plan_attractor"].attrs.get("prompt") == (
+        "@prompts/slim/plan_attractor.md"
+    )
+
+
+def test_spec_gen_review_attractor_is_gate_er():
+    """review_attractor must be type=gate_er for cold adversarial review."""
+    g = parse(SPEC_GEN)
+    assert g.nodes["review_attractor"].attrs.get("type") == "gate_er", (
+        "review_attractor must be type=gate_er to use adversarial priority queue"
+    )
+
+
+def test_spec_gen_review_attractor_prompt_is_spec_review_attractor_md():
+    g = parse(SPEC_GEN)
+    assert g.nodes["review_attractor"].attrs.get("prompt") == (
+        "@prompts/slim/spec_review_attractor.md"
+    ), "review_attractor must use the dedicated attractor review prompt"
+
+
+def test_spec_gen_review_attractor_retry_target_fix_attractor():
+    g = parse(SPEC_GEN)
+    assert g.nodes["review_attractor"].attrs.get("retry_target") == "fix_attractor", (
+        "review_attractor retry_target must be fix_attractor"
+    )
+
+
+def test_spec_gen_fix_attractor_max_retries():
+    g = parse(SPEC_GEN)
+    mr = g.nodes["fix_attractor"].attrs.get("max_retries")
+    assert str(mr) == "2", "fix_attractor max_retries must be 2"
+
+
+def test_spec_gen_fix_attractor_prompt_is_fix_attractor_md():
+    g = parse(SPEC_GEN)
+    assert g.nodes["fix_attractor"].attrs.get("prompt") == (
+        "@prompts/slim/fix_attractor.md"
+    )
+
+
+def test_spec_gen_fix_attractor_class_is_fix():
+    g = parse(SPEC_GEN)
+    assert g.nodes["fix_attractor"].attrs.get("class") == "fix"
 
 
 # ---------------------------------------------------------------------------
@@ -185,16 +293,20 @@ def test_spec_gen_fix_spec_class_is_fix():
 # ---------------------------------------------------------------------------
 
 
-def test_spec_gen_happy_path_explore_plan_review_exit(monkeypatch, tmp_path):
-    """Happy path: spec_review succeeds on first attempt → exit."""
+def test_spec_gen_happy_path_explore_plan_main_review_main_plan_attractor_review_attractor_exit(
+    monkeypatch, tmp_path,
+):
+    """Happy path: review_main and review_attractor both succeed on first attempt → exit."""
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
 
     g = parse(SPEC_GEN)
-    # Pin plan to echo; gate_er in echo mode reads outcome from ctx.state.
-    g.nodes["plan"].attrs["backend"] = "echo"
+    # Pin both plan nodes to echo; gate_er in echo mode reads outcome from ctx.state.
+    g.nodes["plan_main"].attrs["backend"] = "echo"
+    g.nodes["plan_attractor"].attrs["backend"] = "echo"
 
     ctx = Context(goal="define a reviewed spec for a tiny utility", workdir=ROOT, backend="echo")
-    ctx.state["spec_review.outcome"] = "success"
+    ctx.state["review_main.outcome"] = "success"
+    ctx.state["review_attractor.outcome"] = "success"
 
     history = run(g, ctx, checkpoint=tmp_path / "checkpoint.json")
 
@@ -207,41 +319,45 @@ def test_spec_gen_happy_path_explore_plan_review_exit(monkeypatch, tmp_path):
     assert "explore_stitch" in node_names
     assert "explore_out" in node_names
 
-    # Core spec-gen nodes must appear.
-    assert "plan" in node_names
-    assert "spec_review" in node_names
+    # Core spec-gen nodes must appear (both phases).
+    assert "plan_main" in node_names
+    assert "review_main" in node_names
+    assert "plan_attractor" in node_names
+    assert "review_attractor" in node_names
     assert "exit" in node_names
 
     # implement must NOT appear.
     assert "implement" not in node_names
     assert "fix" not in node_names  # fix from other lanes also absent
 
-    # fix_spec must NOT appear on a happy path (no spec failures).
-    assert "fix_spec" not in node_names
+    # fix_main and fix_attractor must NOT appear on a happy path.
+    assert "fix_main" not in node_names
+    assert "fix_attractor" not in node_names
 
 
-def test_spec_gen_fix_loop_on_review_failure(monkeypatch, tmp_path):
-    """Failure path: spec_review fails → fix_spec → spec_review succeeds."""
+def test_spec_gen_fix_main_loop_on_review_main_failure(monkeypatch, tmp_path):
+    """Failure path: review_main fails → fix_main → review_main succeeds → phase 2 succeeds."""
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
 
     g = parse(SPEC_GEN)
-    g.nodes["plan"].attrs["backend"] = "echo"
+    g.nodes["plan_main"].attrs["backend"] = "echo"
+    g.nodes["plan_attractor"].attrs["backend"] = "echo"
 
     ctx = Context(goal="bad spec needs one fix", workdir=ROOT, backend="echo")
+    ctx.state["review_attractor.outcome"] = "success"
 
-    # First review visit fails; second succeeds (fix_spec runs once in between).
+    # First review_main visit fails; second succeeds.
     call_count = {"n": 0}
     original_handler = handlers_mod._gate_er  # noqa: SLF001
 
     def patched_gate_er(node, _ctx):
-        if node.name == "spec_review":
+        if node.name == "review_main":
             call_count["n"] += 1
             if call_count["n"] == 1:
                 from runner.handlers import Result
                 return Result(outcome="failure", output="spec missing non-goals")
-            else:
-                from runner.handlers import Result
-                return Result(outcome="success", output="spec approved after fix")
+            from runner.handlers import Result
+            return Result(outcome="success", output="spec approved after fix")
         return original_handler(node, _ctx)
 
     monkeypatch.setitem(TYPE_REGISTRY, "gate_er", patched_gate_er)
@@ -250,20 +366,61 @@ def test_spec_gen_fix_loop_on_review_failure(monkeypatch, tmp_path):
 
     assert history[-1].outcome == "success"
     node_names = [step.node for step in history]
-    assert "fix_spec" in node_names
-    # spec_review visited twice: once failing, once succeeding.
-    assert node_names.count("spec_review") == 2
+    assert "fix_main" in node_names
+    # review_main visited twice: once failing, once succeeding.
+    assert node_names.count("review_main") == 2
+    # fix_attractor did NOT fire (phase 2 was clean).
+    assert "fix_attractor" not in node_names
 
 
-def test_spec_gen_full_node_sequence_happy_path(monkeypatch, tmp_path):
-    """Full deterministic node order for the happy path."""
+def test_spec_gen_fix_attractor_loop_on_review_attractor_failure(monkeypatch, tmp_path):
+    """Failure path: review_attractor fails → fix_attractor → review_attractor succeeds."""
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
 
     g = parse(SPEC_GEN)
-    g.nodes["plan"].attrs["backend"] = "echo"
+    g.nodes["plan_main"].attrs["backend"] = "echo"
+    g.nodes["plan_attractor"].attrs["backend"] = "echo"
+
+    ctx = Context(goal="attractor spec needs one fix", workdir=ROOT, backend="echo")
+    ctx.state["review_main.outcome"] = "success"
+
+    # First review_attractor visit fails; second succeeds.
+    call_count = {"n": 0}
+    original_handler = handlers_mod._gate_er  # noqa: SLF001
+
+    def patched_gate_er(node, _ctx):
+        if node.name == "review_attractor":
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                from runner.handlers import Result
+                return Result(outcome="failure", output="attractor spec not consistent")
+            from runner.handlers import Result
+            return Result(outcome="success", output="attractor spec approved after fix")
+        return original_handler(node, _ctx)
+
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_er", patched_gate_er)
+
+    history = run(g, ctx, checkpoint=tmp_path / "checkpoint.json")
+
+    assert history[-1].outcome == "success"
+    node_names = [step.node for step in history]
+    assert "fix_attractor" in node_names
+    assert node_names.count("review_attractor") == 2
+    # fix_main did NOT fire (phase 1 was clean).
+    assert "fix_main" not in node_names
+
+
+def test_spec_gen_full_node_sequence_happy_path(monkeypatch, tmp_path):
+    """Full deterministic node order for the happy path (both phases)."""
+    monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
+
+    g = parse(SPEC_GEN)
+    g.nodes["plan_main"].attrs["backend"] = "echo"
+    g.nodes["plan_attractor"].attrs["backend"] = "echo"
 
     ctx = Context(goal="spec-gen happy path ordering", workdir=ROOT, backend="echo")
-    ctx.state["spec_review.outcome"] = "success"
+    ctx.state["review_main.outcome"] = "success"
+    ctx.state["review_attractor.outcome"] = "success"
 
     history = run(g, ctx, checkpoint=tmp_path / "checkpoint.json")
 
@@ -278,8 +435,10 @@ def test_spec_gen_full_node_sequence_happy_path(monkeypatch, tmp_path):
         "explore_join",
         "explore_stitch",
         "explore_out",
-        "plan",
-        "spec_review",
+        "plan_main",
+        "review_main",
+        "plan_attractor",
+        "review_attractor",
         "exit",
     ]
 
@@ -297,6 +456,21 @@ def test_spec_review_prompt_exists():
 def test_fix_spec_prompt_exists():
     p = ROOT / "prompts" / "slim" / "fix_spec.md"
     assert p.exists(), f"fix_spec.md missing at {p}"
+
+
+def test_spec_review_attractor_prompt_exists():
+    p = ROOT / "prompts" / "slim" / "spec_review_attractor.md"
+    assert p.exists(), f"spec_review_attractor.md missing at {p}"
+
+
+def test_plan_attractor_prompt_exists():
+    p = ROOT / "prompts" / "slim" / "plan_attractor.md"
+    assert p.exists(), f"plan_attractor.md missing at {p}"
+
+
+def test_fix_attractor_prompt_exists():
+    p = ROOT / "prompts" / "slim" / "fix_attractor.md"
+    assert p.exists(), f"fix_attractor.md missing at {p}"
 
 
 def test_spec_review_prompt_contains_verdict_contract():
