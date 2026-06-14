@@ -14,6 +14,8 @@ from typing import Optional
 
 import pydot
 
+from .paths import factory_home
+
 AttrValue = str | int | bool
 
 _GRAPH_INT_ATTRS = {"default_max_retries"}
@@ -405,16 +407,28 @@ def _resolve_includes(
             continue
         include_path: pathlib.Path | None = None
         tried: list[pathlib.Path] = []
-        for base in (parent_dir, cwd):
+        # Resolution order: parent_dir → cwd → $DARK_FACTORY_HOME.
+        # The third fallback lets the `dark-factory` binary be invoked from
+        # any workdir without `cd`-ing into the install root, matching
+        # `paths.resolve_factory_path`'s cwd→$DARK_FACTORY_HOME contract.
+        # Bug: pre-fix, the parser only tried parent_dir + cwd, so
+        # `--pipeline slim/spec_gen.dot` (a bare filename) from a worktree
+        # cwd raised "include not found" for `@pipelines/_base.dot`.
+        bases: list[pathlib.Path] = [parent_dir, cwd]
+        home = factory_home()
+        if home is not None:
+            bases.append(home)
+        for base in bases:
             candidate = (base / ref).resolve()
             tried.append(candidate)
             if candidate.exists():
                 include_path = candidate
                 break
         if include_path is None:
+            tried_str = ", ".join(str(p) for p in tried)
             raise ValueError(
                 f"{path}: include not found: {ref!r} "
-                f"(tried parent-relative {tried[0]} and cwd-relative {tried[1]})"
+                f"(tried {tried_str})"
             )
         if include_path in visited:
             chain = " -> ".join(str(p) for p in (*visited, include_path))
