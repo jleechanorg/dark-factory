@@ -1,6 +1,6 @@
 ---
 name: factory-spec
-description: "Dark Factory spec workflow (/factory-spec, /fs): create a reviewed spec via the spec_gen pipeline, review an existing spec, or display the pipeline node graphs — spec-review pipelines, factory gates, node types, edge conditions, handler mappings. Create mode runs dark-factory --pipeline slim/spec_gen.dot; review and show modes are in-session only."
+description: "Dark Factory two-phase spec workflow (/factory-spec, /fs): create a main spec (spec.md) AND an attractor spec (attractor_spec.md) via the spec_gen pipeline, review an existing spec of either kind, or display the pipeline node graphs — spec-review pipelines, factory gates, node types, edge conditions, handler mappings. Create mode runs dark-factory --pipeline slim/spec_gen.dot; both the main and attractor specs must be codex-cold-reviewed and pass before exit. Review and show modes are in-session only."
 ---
 
 # /factory-spec — Dark Factory Spec Workflow & Node Graph Reference
@@ -29,6 +29,15 @@ This block is the **canonical install/setup copy** — the command files
 
 ### Create mode (default: `/fs <spec description>`)
 
+**Two-phase spec generation.** By default, `/fs` produces BOTH a **main
+spec** (`spec.md`) AND an **attractor spec** (`attractor_spec.md`). The
+main spec describes the implementation path (acceptance criteria, test
+command, non-goals, lane-independence matrix). The attractor spec
+describes the convergence goal (stable end state the system must reach,
+plus the anti-attractor states it must NOT converge to). A cold
+adversarial codex reviewer signs off on **both** before exit. Pass
+`--skip-attractor` to produce only the main spec.
+
 1. Run **Step 0** (below): classify greenfield vs brownfield. Mandatory.
    The classification output feeds the goal/context string passed to the pipeline.
 2. For brownfield tasks, encode rules 1–6 (delete-first, executor node for
@@ -44,13 +53,25 @@ This block is the **canonical install/setup copy** — the command files
    dark-factory --pipeline slim/spec_gen.dot --goal "<Step-0 context + description>"
    ```
 
-   The pipeline (implemented on branch `feat/spec-gen-pipeline`) runs:
-   `explore → plan → cold spec review → fix loop → exit`, producing a reviewed
-   `spec.md` without running any implement node.
+   The pipeline runs:
 
-   **Note:** `slim/spec_gen.dot` is being implemented in a parallel lane. If the
-   pipeline is not yet available, report that and fall back to review mode to
-   inspect a manually-written spec.
+   ```
+   start → explore_in → explore_fanout → {explore_concept, explore_auth,
+          explore_reuse, explore_risks} → explore_join → explore_stitch →
+          explore_out
+        → plan_main        [plan.md → spec.md]
+        → review_main      [codex cold review of spec.md]              ─┐
+        → plan_attractor   [plan_attractor.md → attractor_spec.md]     │ if main review fails → fix_main → review_main
+        → review_attractor [codex cold review of attractor_spec.md]    ─┐
+        → exit                                                            │ if attractor review fails → fix_attractor → review_attractor
+   ```
+
+   The attractor spec is generated **after** the main spec passes review
+   (sequential, not parallel), so the attractor spec can reference the
+   codex-signed-off `spec.md` for the consistency check. Both phases
+   must sign off before exit. The pipeline produces a reviewed `spec.md`
+   AND a reviewed `attractor_spec.md` without running any implement
+   node. Pass `--skip-attractor` to short-circuit the attractor phase.
 
 ### Review mode (`/fs --review [spec_path]`)
 
@@ -77,14 +98,15 @@ classify the goal (Step 0 below) and pick from this quick guide:
 
 | Task | Pipeline |
 |------|----------|
-| **Create a reviewed spec** | `pipelines/slim/spec_gen.dot` ← `/fs` create mode |
+| **Create a reviewed spec (main + attractor)** | `pipelines/slim/spec_gen.dot` ← `/fs` create mode (default) |
+| **Create only the main spec** | `pipelines/slim/spec_gen.dot` ← `/fs --skip-attractor` |
 | Smoke / wiring | `pipelines/factory/hello.dot` |
 | New feature (full loop) | `pipelines/slim/minimal_feature.dot` |
 | PR iteration (research + holdout) | `pipelines/slim/minimal_pr.dot` |
 | Validate diff + holdout | `pipelines/factory/gates.dot` |
 | PR gates only | `pipelines/factory/pr_gates.dot` |
-| Spec review slim | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` |
-| Spec review full | `benchmarks/attractor-spec-review/pipelines/review_full.dot` |
+| Spec review slim (legacy attractor) | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` |
+| Spec review full (legacy attractor) | `benchmarks/attractor-spec-review/pipelines/review_full.dot` |
 | Brownfield replace/delete | custom goal + delete-first rules; often `minimal_feature.dot` or custom `.dot` |
 
 Short names for `--pipeline`: `spec_gen`, `gates`, `hello`, `pr_gates`, `minimal_pr`,
