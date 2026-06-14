@@ -277,7 +277,7 @@ start ──▶ gate_es ──(success)──▶ gate_er ──(success)──�
 | `gate_er` | `gate_er` | `claude --print /er` | Evidence review check |
 | `gate_cs` | `gate_code_standards` | `claude --print /code_standards` | ZFC + leveling + root-cause-first |
 
-**Use when:** validating an in-flight PR diff (like gates.dot but bypasses holdout features).
+**Use when:** validating an in-flight PR diff (like gates.dot; the actual `.dot` runs holdout as the first node per the Holdout-always policy, so pass `--feature <name>`).
 
 ### 4. `hello.dot` — Plan/Implement/Fix Loop
 
