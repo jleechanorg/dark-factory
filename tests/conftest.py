@@ -78,3 +78,10 @@ def make_node(name: str = "test", **attrs) -> _Node:
 def _declare_test_environment() -> None:
     """Set the env var every test in this directory expects."""
     os.environ.setdefault("DARK_FACTORY_HOLDOUTS", str(FIXTURE_HOLDOUTS))
+    # DARK_FACTORY_HOME: lets the parser's `_resolve_includes` find
+    # `@pipelines/_base.dot` from any cwd (e.g. a worktree). The bin/dark-factory
+    # wrapper exports this by default; pytest doesn't, so tests that
+    # `parse(pipelines/slim/*.dot)` from a worktree cwd raise "include not
+    # found" for `@pipelines/_base.dot`. Set it to the install root (parent of
+    # this conftest).
+    os.environ.setdefault("DARK_FACTORY_HOME", str(ROOT))

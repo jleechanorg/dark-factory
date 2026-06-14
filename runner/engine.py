@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import sys
@@ -21,12 +22,95 @@ from .cxdb import CXDB
 from .handlers import Context, Result, resolve
 from .parser import Edge, Graph, Node, _tokenize_condition, is_exit_node, is_start_node
 
-_VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards"}
+_VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards", "gate_audit"}
 
 # Per-run runner logs land here so a crash always leaves a diagnosable
 # traceback on disk even when no CXDB is attached. Monkeypatchable in tests.
 _LOG_DIR = pathlib.Path.home() / ".dark-factory" / "logs"
 _EVENT_DIR = pathlib.Path.home() / ".dark-factory" / "events"
+
+_event_lock = threading.Lock()
+_heartbeat_lock = threading.Lock()
+
+def _write_heartbeat(
+    ctx: Context,
+    graph: Optional[Graph] = None,
+    node: Optional[Node] = None,
+    is_complete: bool = False,
+) -> None:
+    run_id = ctx.run_id
+    if not run_id:
+        return
+    with _heartbeat_lock:
+        try:
+            run_dir = pathlib.Path.home() / ".dark-factory" / "runs" / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            hb_path = run_dir / "heartbeat.json"
+            
+            existing = {}
+            if hb_path.exists():
+                try:
+                    existing = json.loads(hb_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            
+            pipeline = existing.get("pipeline", "")
+            if graph is not None:
+                pipeline = str(graph.pipeline_path) if getattr(graph, "pipeline_path", None) else graph.name
+                
+            goal = ctx.goal
+            workdir = str(ctx.workdir)
+            
+            start_ts = existing.get("start_timestamp")
+            if not is_complete and node is not None:
+                start_ts = time.time()
+            if start_ts is None:
+                start_ts = time.time()
+                
+            elapsed_time = existing.get("elapsed_time")
+            if is_complete and start_ts is not None:
+                elapsed_time = time.time() - start_ts
+                
+            if node is not None:
+                current_node = None if is_complete else node.name
+                backend = _node_backend(node, ctx)
+                timeout_raw = node.attrs.get("timeout")
+                timeout = None
+                if timeout_raw is not None:
+                    try:
+                        if isinstance(timeout_raw, (int, float)):
+                            timeout = timeout_raw
+                        else:
+                            timeout = float(timeout_raw)
+                    except (TypeError, ValueError):
+                        pass
+            else:
+                current_node = existing.get("current_node")
+                backend = existing.get("backend", ctx.backend)
+                timeout = existing.get("timeout")
+                
+            hb_data = {
+                "pipeline": pipeline,
+                "goal": goal,
+                "workdir": workdir,
+                "current_node": current_node,
+                "start_timestamp": start_ts,
+                "backend": backend,
+                "timeout": timeout,
+                "last_completed_seq": getattr(ctx, "last_completed_seq", 0)
+            }
+            
+            if is_complete or elapsed_time is not None:
+                hb_data["elapsed_time"] = elapsed_time
+                hb_data["timestamp"] = time.time()
+                
+            hb_path.write_text(json.dumps(hb_data, indent=2), encoding="utf-8")
+        except Exception as exc:
+            try:
+                print(f"[runner:write_heartbeat:{type(exc).__name__}] {exc}", file=sys.stderr, flush=True)
+            except Exception:
+                pass
+
 
 
 def _emit_event(ctx: Context, event: str, payload: dict[str, str], seq: int | None = None) -> None:
@@ -41,7 +125,6 @@ def _emit_event(ctx: Context, event: str, payload: dict[str, str], seq: int | No
     payload_text = str(event)
     try:
         path = pathlib.Path(event_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
         record = {
             "ts": time.time(),
             "run_id": ctx.run_id,
@@ -51,12 +134,65 @@ def _emit_event(ctx: Context, event: str, payload: dict[str, str], seq: int | No
             record["seq"] = seq
         record.update(payload)
         payload_text = json.dumps(record, sort_keys=True)
-        path.open("a", encoding="utf-8").write(payload_text + "\n")
+        with _event_lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.open("a", encoding="utf-8").write(payload_text + "\n")
     except Exception as exc:
         try:
             print(f"[runner:emit_event:{type(exc).__name__}] {payload_text}", file=sys.stderr, flush=True)
         except Exception:
             pass
+
+
+def _write_transcript_sidecar(
+    ctx: Context,
+    seq: int,
+    node_name: str,
+    attempt_index: int,
+    output: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Write the full output (transcript) of a node to a sidecar file.
+
+    If the node is a holdout, the output is redacted.
+    Returns (absolute_path_str, sha256_hash).
+    """
+    if not output:
+        return None, None
+
+    run_id = getattr(ctx, "run_id", None)
+    if not run_id:
+        return None, None
+
+    # Redact holdout outputs
+    is_holdout = (
+        node_name == "holdout"
+        or node_name.startswith("holdout_")
+        or "holdout" in node_name.lower()
+    )
+    if is_holdout:
+        content = "<redacted holdout output>"
+    else:
+        content = output
+
+    sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    try:
+        run_dir = pathlib.Path.home() / ".dark-factory" / "runs" / run_id
+        transcripts_dir = run_dir / "transcripts"
+        transcripts_dir.mkdir(parents=True, exist_ok=True)
+
+        file_name = f"{seq}_{node_name}_{attempt_index}.txt"
+        file_path = transcripts_dir / file_name
+        file_path.write_text(content, encoding="utf-8")
+
+        return str(file_path), sha256
+    except Exception as exc:
+        # Observability errors should not fail the run
+        try:
+            print(f"[runner:write_transcript_sidecar:{type(exc).__name__}] {exc}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+        return None, None
 
 
 def _open_run_log(run_id: str) -> Optional[TextIO]:
@@ -197,6 +333,7 @@ def _clone_context(ctx: Context) -> Context:
         perf_log_root=getattr(ctx, "perf_log_root", None),
         git_ctx=getattr(ctx, "git_ctx", None),
         perf_run=getattr(ctx, "perf_run", None),
+        last_completed_seq=getattr(ctx, "last_completed_seq", 0),
     )
 
 
@@ -227,7 +364,6 @@ def _branch_context(ctx: Context, branch_name: str, node_type: str = "") -> Cont
     so their file operations are independent.  If the parent workdir is not a
     valid directory (e.g. None or a non-existent path) fall back to a
     system-managed tmp dir.
-
     Branches that start at a read-only node type (reviewer gates,
     holdout_eval) skip isolation and keep the parent workdir — they need the
     real repo, and being read-only they cannot race each other.
@@ -614,6 +750,19 @@ def _run_branch_until_join(
                     output=f"branch max_visits={max_visits} exceeded at {current.name}",
                 )
                 break
+            with seq_lock:
+                start_seq = seq_ref[0]
+            _emit_event(
+                ctx,
+                "node_start",
+                {
+                    "node": current.name,
+                    "attempt": "1",
+                    "parallel": "true",
+                },
+                start_seq,
+            )
+
             results, records = _run_single_node(current, ctx, graph)
             steps += 1
             step_result = results[-1] if results else Result(outcome="success")
@@ -622,12 +771,55 @@ def _run_branch_until_join(
                 pass
             else:
                 last_result = step_result
+
             for i, attempt in enumerate(results):
                 record = records[i]
                 record.metadata = {**record.metadata, "_branch_overhead": "true"}
                 with seq_lock:
                     local_seq = seq_ref[0]
                     seq_ref[0] += 1
+                    ctx.last_completed_seq = local_seq
+
+                if i > 0:
+                    _emit_event(
+                        ctx,
+                        "retry",
+                        {
+                            "node": current.name,
+                            "attempt": str(i + 1),
+                            "max_retries": record.metadata.get("max_retries", "0"),
+                            "previous_outcome": results[i - 1].outcome,
+                            "parallel": "true",
+                        },
+                        local_seq,
+                    )
+                    _emit_event(
+                        ctx,
+                        "node_start",
+                        {
+                            "node": current.name,
+                            "attempt": str(i + 1),
+                            "parallel": "true",
+                        },
+                        local_seq,
+                    )
+
+                transcript_path, transcript_sha256 = _write_transcript_sidecar(
+                    ctx, local_seq, current.name, i + 1, attempt.output
+                )
+
+                payload = {
+                    "node": current.name,
+                    "outcome": _classify_outcome(record.outcome),
+                    "attempt": str(i + 1),
+                    "max_retries": record.metadata.get("max_retries", "0"),
+                    "parallel": "true",
+                }
+                if transcript_path:
+                    payload["transcript_path"] = transcript_path
+                    payload["transcript_sha256"] = transcript_sha256
+
+                _emit_event(ctx, "node_result", payload, local_seq)
                 _persist(thread_cxdb, ctx, local_seq, record, attempt.output, record.metadata)
                 branch_records.append(record)
             # Route using current step's actual result, not the preserved first failure.
@@ -650,29 +842,33 @@ def _run_single_node(
     ctx: Context,
     graph: Graph,
 ) -> tuple[list[Result], list[StepRecord]]:
-    handler = resolve(node)
-    results = _run_with_retries(handler, node, ctx, graph)
-    normalized_results: list[Result] = []
-    records: list[StepRecord] = []
-    for attempt in results:
-        attempt = _normalized_result(attempt)
-        ctx.state.update(attempt.context_updates)
-        ctx.state["_last_node"] = node.name
-        ctx.state["_last_outcome"] = attempt.outcome
-        ctx.state["_last_output"] = attempt.output[:4000]
-        normalized_results.append(attempt)
-        records.append(
-            StepRecord(
-                node=node.name,
-                outcome=attempt.outcome,
-                ts=time.time(),
-                output_preview=attempt.output[:280],
-                metadata=attempt.metadata,
+    _write_heartbeat(ctx, graph, node)
+    try:
+        handler = resolve(node)
+        results = _run_with_retries(handler, node, ctx, graph)
+        normalized_results: list[Result] = []
+        records: list[StepRecord] = []
+        for attempt in results:
+            attempt = _normalized_result(attempt)
+            ctx.state.update(attempt.context_updates)
+            ctx.state["_last_node"] = node.name
+            ctx.state["_last_outcome"] = attempt.outcome
+            ctx.state["_last_output"] = attempt.output[:4000]
+            normalized_results.append(attempt)
+            records.append(
+                StepRecord(
+                    node=node.name,
+                    outcome=attempt.outcome,
+                    ts=time.time(),
+                    output_preview=attempt.output[:280],
+                    metadata=attempt.metadata,
+                )
             )
-        )
-        _update_failure_state(node, ctx, attempt)
-        ctx.history.append({"node": node.name, "outcome": attempt.outcome})
-    return normalized_results, records
+            _update_failure_state(node, ctx, attempt)
+            ctx.history.append({"node": node.name, "outcome": attempt.outcome})
+        return normalized_results, records
+    finally:
+        _write_heartbeat(ctx, graph, node, is_complete=True)
 
 
 def _allow_partial(node: Node) -> bool:
@@ -831,6 +1027,7 @@ def run(
     visits: dict[str, int] = {}
     current = _start_node(graph)
     seq = 0  # CXDB sequence — independent of history length so refactors can't desync.
+    ctx.last_completed_seq = seq
     _resumed_overhead = 0
 
     if resume is not None:
@@ -891,7 +1088,27 @@ def run(
             )
             cxdb = None
     if event_path_is_default and ctx.run_id is not None:
-        ctx.event_log_path = _EVENT_DIR / f"{ctx.run_id}.jsonl"
+        ctx.event_log_path = pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id / "events.jsonl"
+
+    if ctx.run_id is not None:
+        run_dir = pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = run_dir / "manifest.json"
+        pipeline_val = str(graph.pipeline_path) if getattr(graph, "pipeline_path", None) else graph.name
+        manifest_data = {
+            "pipeline": pipeline_val,
+            "goal": ctx.goal,
+            "backend": ctx.backend,
+            "workdir": str(ctx.workdir) if ctx.workdir else "",
+            "state": ctx.state,
+        }
+        try:
+            manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    if checkpoint is None and ctx.run_id is not None:
+        checkpoint = pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id / "checkpoint.json"
 
     perf_root = getattr(ctx, "perf_log_root", None)
     if perf_root is not None and ctx.run_id is not None:
@@ -958,6 +1175,7 @@ def run(
                     "node_start",
                     {
                         "node": current.name,
+                        "attempt": "1",
                     },
                     seq,
                 )
@@ -969,6 +1187,7 @@ def run(
                     graph, current, ctx, exc, history, checkpoint, cxdb, seq, log, visits
                 )
                 seq += 1
+                ctx.last_completed_seq = seq
                 if next_node is None:
                     break
                 current = next_node
@@ -983,19 +1202,24 @@ def run(
             if current.attrs.get("parallel", False) and not _is_parallel_node(current):
                 branch_edges = _parallel_branches(graph, current, result, ctx)
                 branch_results: list[Result] = []
+                b_seq = seq + len(results)
                 for edge in branch_edges:
                     target = graph.nodes.get(edge.dst)
                     if target is None:
                         continue
-                    branch_seq = seq
                     branch_visit = 1
+                    target_start_seq = b_seq
                     _emit_event(
                         ctx,
                         "node_start",
-                        {"node": target.name, "parallel": "true"},
-                        branch_seq,
+                        {
+                            "node": target.name,
+                            "attempt": "1",
+                            "parallel": "true",
+                        },
+                        b_seq,
                     )
-                    _perf_node_enter(ctx, target, branch_seq, branch_visit)
+                    _perf_node_enter(ctx, target, b_seq, branch_visit)
                     try:
                         b_results, b_records = _run_single_node(target, _clone_context(ctx), graph)
                     except Exception as exc:  # noqa: BLE001
@@ -1013,7 +1237,7 @@ def run(
                         _perf_node_exit(
                             ctx,
                             target.name,
-                            branch_seq,
+                            target_start_seq,
                             "error",
                             branch_visit,
                             {"exception": type(exc).__name__, "parallel": "true"},
@@ -1027,21 +1251,86 @@ def run(
                                 "error_type": type(exc).__name__,
                                 "message": str(exc),
                             },
-                            seq,
+                            b_seq,
                         )
+                        transcript_path, transcript_sha256 = _write_transcript_sidecar(
+                            ctx, b_seq, target.name, 1, b_tb
+                        )
+                        payload = {
+                            "node": target.name,
+                            "outcome": "error",
+                            "attempt": "1",
+                            "max_retries": "0",
+                            "parallel": "true",
+                        }
+                        if transcript_path:
+                            payload["transcript_path"] = transcript_path
+                            payload["transcript_sha256"] = transcript_sha256
+                        _emit_event(ctx, "node_result", payload, b_seq)
+                        
+                        _emit_event(
+                            ctx,
+                            "node_complete",
+                            {
+                                "node": target.name,
+                                "outcome": "error",
+                                "parallel": "true",
+                            },
+                            b_seq,
+                        )
+                        b_seq += 1
                         continue
 
                     if b_records:
                         for branch_index, b_result in enumerate(b_results):
                             b_record = b_records[branch_index]
                             branch_records.append((b_record, b_result.output, b_record.metadata))
-                        # Emit a single exit for the last result — calling inside the loop
-                        # would produce N exits for one enter when a node retries.
+                            
+                            if branch_index > 0:
+                                _emit_event(
+                                    ctx,
+                                    "retry",
+                                    {
+                                        "node": target.name,
+                                        "attempt": str(branch_index + 1),
+                                        "max_retries": b_record.metadata.get("max_retries", "0"),
+                                        "previous_outcome": b_results[branch_index - 1].outcome,
+                                        "parallel": "true",
+                                    },
+                                    b_seq,
+                                )
+                                _emit_event(
+                                    ctx,
+                                    "node_start",
+                                    {
+                                        "node": target.name,
+                                        "attempt": str(branch_index + 1),
+                                        "parallel": "true",
+                                    },
+                                    b_seq,
+                                )
+
+                            transcript_path, transcript_sha256 = _write_transcript_sidecar(
+                                ctx, b_seq, target.name, branch_index + 1, b_result.output
+                            )
+                            payload = {
+                                "node": target.name,
+                                "outcome": _classify_outcome(b_record.outcome),
+                                "attempt": str(branch_index + 1),
+                                "max_retries": b_record.metadata.get("max_retries", "0"),
+                                "parallel": "true",
+                            }
+                            if transcript_path:
+                                payload["transcript_path"] = transcript_path
+                                payload["transcript_sha256"] = transcript_sha256
+                            _emit_event(ctx, "node_result", payload, b_seq)
+                            b_seq += 1
+
                         final_b_record = b_records[-1]
                         _perf_node_exit(
                             ctx,
                             target.name,
-                            branch_seq,
+                            target_start_seq,
                             b_results[-1].outcome,
                             branch_visit,
                             final_b_record.metadata,
@@ -1055,7 +1344,7 @@ def run(
                                 "outcome": _classify_outcome(b_results[-1].outcome),
                                 "parallel": "true",
                             },
-                            branch_seq,
+                            b_seq - 1,
                         )
 
                 if branch_records:
@@ -1081,6 +1370,42 @@ def run(
 
             for index, attempt in enumerate(results):
                 record = records[index]
+                if index > 0:
+                    _emit_event(
+                        ctx,
+                        "retry",
+                        {
+                            "node": current.name,
+                            "attempt": str(index + 1),
+                            "max_retries": record.metadata.get("max_retries", "0"),
+                            "previous_outcome": results[index - 1].outcome,
+                        },
+                        seq,
+                    )
+                    _emit_event(
+                        ctx,
+                        "node_start",
+                        {
+                            "node": current.name,
+                            "attempt": str(index + 1),
+                        },
+                        seq,
+                    )
+
+                transcript_path, transcript_sha256 = _write_transcript_sidecar(
+                    ctx, seq, current.name, index + 1, attempt.output
+                )
+                payload = {
+                    "node": current.name,
+                    "outcome": _classify_outcome(record.outcome),
+                    "attempt": str(index + 1),
+                    "max_retries": record.metadata.get("max_retries", "0"),
+                }
+                if transcript_path:
+                    payload["transcript_path"] = transcript_path
+                    payload["transcript_sha256"] = transcript_sha256
+                _emit_event(ctx, "node_result", payload, seq)
+
                 seq = _append_record(
                     history,
                     checkpoint,
@@ -1228,6 +1553,7 @@ def run(
                                     )
 
                         seq = _seq_ref[0]
+                        ctx.last_completed_seq = seq
 
                         for _bs in _branch_starts:
                             _b_recs, _b_res = _name_to_br.get(_bs.name, ([], Result(outcome="failure")))
@@ -1357,6 +1683,7 @@ def run(
                     skip_perf_exit=True,
                 )
                 seq += 1
+                ctx.last_completed_seq = seq
                 if next_node is None:
                     break
                 current = next_node
@@ -1547,14 +1874,23 @@ def _append_record(
     if checkpoint is not None:
         try:
             checkpoint.write_text(json.dumps([asdict(r) for r in history], indent=2))
+            _emit_event(
+                ctx,
+                "checkpoint",
+                {
+                    "node": record.node,
+                    "path": str(checkpoint),
+                },
+                seq,
+            )
         except Exception as exc:
             _emit_event(
                 ctx,
-                "checkpoint_write_failed",
+                "persistence_error",
                 {
                     "node": record.node,
-                    "seq": str(seq),
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
                 },
                 seq,
             )
@@ -1569,6 +1905,8 @@ def _append_record(
         seq,
     )
     _persist(cxdb, ctx, seq, record, output, metadata)
+    ctx.last_completed_seq = seq
+    _write_heartbeat(ctx)
     return seq + 1
 
 
@@ -1595,11 +1933,11 @@ def _persist(
     except Exception as exc:
         _emit_event(
             ctx,
-            "cxdb_record_failed",
+            "persistence_error",
             {
                 "node": record.node,
-                "seq": str(seq),
-                "error": f"{type(exc).__name__}:{exc}",
+                "error_type": type(exc).__name__,
+                "message": str(exc),
             },
             seq,
         )

@@ -1,7 +1,7 @@
-digraph MinimalPRFactory {
+digraph BrownfieldDeleteFirstFactory {
   graph [
     include="@pipelines/_base.dot",
-    goal="Iterate on an in-flight PR: passes tests, review, and evidence gates"
+    goal="Implement a feature by first deleting obsolete code, passing net LOC and dead code gates, then implementing and passing tests, review, and holdouts"
     rankdir=LR
     model_stylesheet="minimal_feature.model.css"
   ]
@@ -9,23 +9,33 @@ digraph MinimalPRFactory {
   start [shape=Mdiamond, label="Start"]
   exit  [shape=Msquare, label="Exit - Ready to Merge"]
 
-  // _base.dot provides: explore_in, explore_fanout, explore_{concept,auth,
-  // reuse,risks}, explore_join, explore_out.
-
-  // Research rides the coder backend (no class → run-level --backend),
-  // read-only: digests explore findings into .dark-factory/research-findings.md
-  // before the heavier plan model runs.
-  research [
-    type="codergen",
-    label="Research (read-only)",
-    prompt="@prompts/slim/research.md"
-  ]
-
   plan [
     type="codergen",
     label="Plan & Spec",
     class="plan",
-    prompt="@prompts/slim/plan.md"
+    prompt="@prompts/slim/plan.md",
+    timeout=600
+  ]
+
+  delete_first [
+    type="codergen",
+    label="Delete First",
+    class="delete_first",
+    prompt="@prompts/slim/delete_first.md",
+    max_retries=2,
+    timeout=600
+  ]
+
+  gate_net_loc [
+    type="gate_net_loc",
+    label="Gate Net LOC (<=0)",
+    timeout=600
+  ]
+
+  gate_dead_code [
+    type="gate_dead_code",
+    label="Gate Dead Code",
+    timeout=600
   ]
 
   implement [
@@ -33,7 +43,8 @@ digraph MinimalPRFactory {
     label="Implement",
     class="implement",
     prompt="@prompts/slim/implement.md",
-    max_retries=2
+    max_retries=2,
+    timeout=600
   ]
 
   test [
@@ -52,7 +63,8 @@ digraph MinimalPRFactory {
     class="review",
     prompt="@prompts/slim/review.md",
     goal_gate=true,
-    retry_target="fix"
+    retry_target="fix",
+    timeout=600
   ]
 
   holdout [
@@ -82,13 +94,21 @@ digraph MinimalPRFactory {
     class="fix",
     prompt="@prompts/slim/fix.md",
     max_retries=2,
-    max_visits="3"
+    max_visits="3",
+    timeout=600
   ]
 
   start -> explore_in
-  explore_out -> research
-  research -> plan
-  plan -> implement
+  explore_out -> plan
+  plan -> delete_first
+  delete_first -> gate_net_loc
+  
+  gate_net_loc -> gate_dead_code [condition="outcome=success"]
+  gate_net_loc -> delete_first [condition="outcome!=success"]
+
+  gate_dead_code -> implement [condition="outcome=success"]
+  gate_dead_code -> delete_first [condition="outcome!=success"]
+
   implement -> test
 
   test -> review [condition="outcome=success"]
@@ -99,6 +119,7 @@ digraph MinimalPRFactory {
 
   holdout -> gate_es [condition="outcome=success"]
   holdout -> fix [condition="outcome!=success"]
+
   gate_es -> gate_er [condition="outcome=success"]
   gate_es -> fix [condition="outcome!=success"]
 

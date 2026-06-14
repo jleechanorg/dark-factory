@@ -133,8 +133,8 @@ def test_default_event_log_path_uses_final_cxdb_run_id(monkeypatch, tmp_path):
 
     assert history[-1].outcome == "success"
     assert ctx.run_id
-    assert ctx.event_log_path is not None
-    assert ctx.event_log_path.name == f"{ctx.run_id}.jsonl"
+    assert ctx.event_log_path.name == "events.jsonl"
+    assert ctx.event_log_path.parent.name == ctx.run_id
     events = [
         json.loads(line)
         for line in ctx.event_log_path.read_text().splitlines()
@@ -310,3 +310,123 @@ def test_recursive_boolean_edge_matching():
     # Nested parenthesized expressions
     assert _evaluate_expression("outcome = success && (error_code = 500 || test_failures contains critical)", last, ctx, True) is True
     assert _evaluate_expression("outcome = success && !(error_code = 500 || test_failures contains blocker)", last, ctx, True) is True
+
+
+def test_structured_events_and_transcripts(monkeypatch, tmp_path):
+    import hashlib
+    # We will write a custom dot file with a node that has max_retries set,
+    # and a mock implementation that fails first and then succeeds, or fails always.
+    dot_file = tmp_path / "test_retries.dot"
+    dot_file.write_text(
+        'digraph test_retries {\n'
+        '  graph [goal="testing events"]\n'
+        '  start [shape=Mdiamond]\n'
+        '  node_a [type="codergen", max_retries="2"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> node_a -> exit\n'
+        '}\n'
+    )
+    
+    attempts = []
+    def fake_codergen(node, ctx):
+        attempts.append(len(attempts) + 1)
+        if len(attempts) < 3:
+            return Result(outcome="fail", output=f"fail attempt {len(attempts)}")
+        return Result(outcome="success", output="pass attempt 3")
+        
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
+    
+    g = parse(dot_file)
+    ctx = Context(goal="test retries", workdir=ROOT, backend="echo")
+    checkpoint_file = tmp_path / "checkpoint.json"
+    
+    history = run(g, ctx, checkpoint=checkpoint_file, max_steps=50)
+    
+    # Verify execution outcome
+    assert len(attempts) == 3
+    assert history[-1].outcome == "success"
+    
+    # Read the event log
+    assert ctx.event_log_path is not None
+    assert ctx.event_log_path.exists()
+    
+    events = [
+        json.loads(line)
+        for line in ctx.event_log_path.read_text().splitlines()
+        if line.strip()
+    ]
+    
+    node_starts = [e for e in events if e["event"] == "node_start" and e.get("node") == "node_a"]
+    assert len(node_starts) == 3
+    assert node_starts[0]["attempt"] == "1"
+    assert node_starts[1]["attempt"] == "2"
+    assert node_starts[2]["attempt"] == "3"
+    
+    retries = [e for e in events if e["event"] == "retry" and e.get("node") == "node_a"]
+    assert len(retries) == 2
+    assert retries[0]["attempt"] == "2"
+    assert retries[1]["attempt"] == "3"
+    
+    node_results = [e for e in events if e["event"] == "node_result" and e.get("node") == "node_a"]
+    assert len(node_results) == 3
+    assert node_results[0]["attempt"] == "1"
+    assert node_results[0]["outcome"] == "failure"
+    assert node_results[1]["attempt"] == "2"
+    assert node_results[1]["outcome"] == "failure"
+    assert node_results[2]["attempt"] == "3"
+    assert node_results[2]["outcome"] == "success"
+    
+    # Check that transcript sidecars were written and contain correct hashes and content
+    for r in node_results:
+        assert "transcript_path" in r
+        assert "transcript_sha256" in r
+        path = pathlib.Path(r["transcript_path"])
+        assert path.exists()
+        content = path.read_text()
+        assert r["transcript_sha256"] == hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if r["attempt"] == "1":
+            assert content == "fail attempt 1"
+        elif r["attempt"] == "2":
+            assert content == "fail attempt 2"
+        elif r["attempt"] == "3":
+            assert content == "pass attempt 3"
+            
+    # Check checkpoint events
+    checkpoint_events = [e for e in events if e["event"] == "checkpoint"]
+    assert len(checkpoint_events) > 0
+    assert all("path" in e for e in checkpoint_events)
+
+    # Let's also verify holdout transcript redaction
+    # We will write a custom dot file with a holdout node
+    dot_file_holdout = tmp_path / "test_holdout_redaction.dot"
+    dot_file_holdout.write_text(
+        'digraph test_holdout {\n'
+        '  graph [goal="testing holdout"]\n'
+        '  start [shape=Mdiamond]\n'
+        '  holdout [type="holdout_eval"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> holdout -> exit\n'
+        '}\n'
+    )
+    
+    def fake_holdout_node(node, ctx):
+        return Result(outcome="success", output="super secret holdout details")
+        
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout_node)
+    
+    g_holdout = parse(dot_file_holdout)
+    ctx_holdout = Context(goal="test holdout", workdir=ROOT, backend="echo")
+    history_holdout = run(g_holdout, ctx_holdout, max_steps=50)
+    
+    assert history_holdout[-1].outcome == "success"
+    events_holdout = [
+        json.loads(line)
+        for line in ctx_holdout.event_log_path.read_text().splitlines()
+        if line.strip()
+    ]
+    
+    holdout_result = next(e for e in events_holdout if e["event"] == "node_result" and e.get("node") == "holdout")
+    assert "transcript_path" in holdout_result
+    holdout_path = pathlib.Path(holdout_result["transcript_path"])
+    assert holdout_path.exists()
+    assert holdout_path.read_text() == "<redacted holdout output>"

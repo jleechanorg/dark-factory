@@ -1,56 +1,96 @@
 digraph SpecGenFactory {
   graph [
     include="@pipelines/_base.dot",
-    goal="Produce a reviewed, ready-to-execute spec.md without implementing anything"
+    goal="Produce a reviewed main spec AND a reviewed attractor spec without implementing anything"
     rankdir=LR
     model_stylesheet="minimal_feature.model.css"
   ]
 
   start [shape=Mdiamond, label="Start"]
-  exit  [shape=Msquare, label="Exit - Spec Ready"]
+  exit  [shape=Msquare, label="Exit - Both Specs Ready"]
 
+  // ---- Phase 1: Main spec (spec.md) ----
   // _base.dot provides: explore_in, explore_fanout, explore_{concept,auth,
   // reuse,risks}, explore_join, explore_stitch, explore_out.
-  // Lanes wire the base with: start -> explore_in and explore_out -> <next>.
 
-  plan [
+  plan_main [
     type="codergen",
-    label="Plan & Spec",
+    label="Plan Main Spec",
     class="plan",
     prompt="@prompts/slim/plan.md"
   ]
 
-  // Cold adversarial spec reviewer: a different vendor than the coder that
-  // wrote the spec. Uses the adversarial-review priority queue
+  // Cold adversarial reviewer: a different vendor than the coder that wrote
+  // the spec. Uses the adversarial-review priority queue
   // (codex > minimax > agy > claude-sonnet) via backend_priority= so the
   // reviewer is never the run-level coder backend. goal_gate=true means a
-  // "failure" verdict routes to fix_spec; "success" routes to exit.
-  spec_review [
+  // "failure" verdict routes to fix_main; "success" routes to plan_attractor.
+  review_main [
     type="gate_er",
-    label="Cold Spec Review",
+    label="Cold Review: Main Spec",
     class="review",
     backend_priority="codex,minimax,agy,claude-sonnet",
     prefer_adversarial="true",
     prompt="@prompts/slim/spec_review.md",
     goal_gate=true,
-    retry_target="fix_spec",
+    retry_target="fix_main",
     timeout=600
   ]
 
-  fix_spec [
+  fix_main [
     type="codergen",
-    label="Revise Spec",
+    label="Revise Main Spec",
     class="fix",
     prompt="@prompts/slim/fix_spec.md",
     max_retries=2
   ]
 
+  // ---- Phase 2: Attractor spec (attractor_spec.md) ----
+  // The attractor spec is the goal-state complement to the main spec:
+  // main = "how we get there" (implementation path), attractor = "what done
+  // looks like as a stable end state" + "what we must NOT end up as."
+  // The attractor spec MUST be consistent with spec.md (consistency check
+  // is one of the review blocking steps), so it is generated AFTER the main
+  // spec has been codex-signed-off.
+
+  plan_attractor [
+    type="codergen",
+    label="Plan Attractor Spec",
+    class="plan",
+    prompt="@prompts/slim/plan_attractor.md"
+  ]
+
+  review_attractor [
+    type="gate_er",
+    label="Cold Review: Attractor Spec",
+    class="review",
+    backend_priority="codex,minimax,agy,claude-sonnet",
+    prefer_adversarial="true",
+    prompt="@prompts/slim/spec_review_attractor.md",
+    goal_gate=true,
+    retry_target="fix_attractor",
+    timeout=600
+  ]
+
+  fix_attractor [
+    type="codergen",
+    label="Revise Attractor Spec",
+    class="fix",
+    prompt="@prompts/slim/fix_attractor.md",
+    max_retries=2
+  ]
+
+  // ---- Edges ----
   start -> explore_in
-  explore_out -> plan
-  plan -> spec_review
+  explore_out -> plan_main
+  plan_main -> review_main
 
-  spec_review -> exit     [condition="outcome=success"]
-  spec_review -> fix_spec [condition="outcome!=success"]
+  review_main -> plan_attractor [condition="outcome=success"]
+  review_main -> fix_main       [condition="outcome!=success"]
+  fix_main -> review_main
 
-  fix_spec -> spec_review
+  plan_attractor -> review_attractor
+  review_attractor -> exit          [condition="outcome=success"]
+  review_attractor -> fix_attractor [condition="outcome!=success"]
+  fix_attractor -> review_attractor
 }

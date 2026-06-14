@@ -53,6 +53,7 @@ class Context:
     perf_log_root: Optional[pathlib.Path] = None
     git_ctx: Optional["GitContext"] = None
     perf_run: Optional["PerfRun"] = None
+    last_completed_seq: int = 0
 
 
 _TIMEOUT_MIN_SECONDS = 5
@@ -1740,6 +1741,102 @@ def _gate_code_standards(node: "Node", ctx: "Context") -> "Result":
     return _run_universal_prompt_gate(UNIVERSAL_CODE_STANDARDS_PROMPT, "gate_code_standards", node, ctx)
 
 
+def _resolve_base_sha(node: Node, ctx: Context) -> str:
+    base = ctx.state.get("base_sha")
+    if not base:
+        base = node.attrs.get("base_sha")
+    if not base:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(ctx.workdir), "merge-base", "origin/main", "HEAD"],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                base = proc.stdout.strip()
+        except Exception:
+            pass
+    if not base:
+        base = "origin/main"
+    return str(base)
+
+
+def _gate_net_loc(node: Node, ctx: Context) -> Result:
+    base_sha = _resolve_base_sha(node, ctx)
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(ctx.workdir), "diff", "--numstat", base_sha],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except Exception as e:
+        return Result(outcome="error", output=f"Failed to run git diff: {e}")
+
+    if proc.returncode != 0:
+        return Result(outcome="failure", output=f"git diff --numstat failed (rc={proc.returncode}):\n{proc.stdout}\n{proc.stderr}")
+
+    total_additions = 0
+    total_deletions = 0
+    lines = proc.stdout.strip().splitlines()
+    for line in lines:
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            add_str, del_str = parts[0], parts[1]
+            try:
+                total_additions += int(add_str)
+            except ValueError:
+                pass
+            try:
+                total_deletions += int(del_str)
+            except ValueError:
+                pass
+
+    net_loc = total_additions - total_deletions
+    output = f"Base SHA: {base_sha}\nTotal Additions: {total_additions}\nTotal Deletions: {total_deletions}\nNet LOC: {net_loc}"
+    if total_additions > total_deletions:
+        return Result(outcome="failure", output=f"Net LOC is positive: {output}")
+    else:
+        return Result(outcome="success", output=f"Net LOC is non-positive: {output}")
+
+
+UNIVERSAL_DEAD_CODE_PROMPT = """\\
+You are performing an automated Dead Code & Cleanliness Review.
+Analyze the active repository changes and diff in the current workspace.
+
+You MUST audit the implementation against the following core principles:
+
+1. DEAD CODE DETECTOR:
+   - Identify any commented-out code blocks, legacy comments that no longer apply, or debug prints.
+   - Look for any unused functions, classes, methods, or imports introduced or left behind in the modified files.
+   - Look for any unused variables or constants.
+
+2. CLEANUP INTEGRITY:
+   - Ensure old/legacy/dead code has been completely deleted rather than commented out or left dangling.
+   - Verify that all newly introduced primitives are actually used.
+
+Provide a detailed review report listing:
+- A brief summary of scope.
+- Audit results for Dead Code and Cleanup Integrity.
+- A bulleted list of any blockers and required fixes.
+
+CRITICAL FORMATTING INSTRUCTIONS:
+1. You MUST include a binding verification line:
+   head_sha: {expected_sha}
+
+2. You MUST conclude your review with:
+   verdict: <pass|fail>
+"""
+
+
+def _gate_dead_code(node: "Node", ctx: "Context") -> "Result":
+    if _node_prompt_ref(node):
+        return _run_custom_prompt_gate(node, ctx, "gate_dead_code")
+    local_cmd = ctx.workdir / ".claude" / "commands" / "dead-code.md"
+    if local_cmd.exists():
+        return _slash_gate("dead-code")(node, ctx)
+    return _run_universal_prompt_gate(UNIVERSAL_DEAD_CODE_PROMPT, "gate_dead_code", node, ctx)
+
+
 def _gate_slash(node: "Node", ctx: "Context") -> "Result":
     """Generic single-lane reviewer gate: ``type="gate_slash" command="zfc"``.
 
@@ -1889,6 +1986,7 @@ def _run_pytest_test(node: "Node", ctx: "Context", *, label: str) -> "Result":
             outcome="error",
             output=f"{label}: pytest invocation failed: {exc}",
         )
+
     return Result(
         outcome="success" if proc.returncode == 0 else "failure",
         output=(
@@ -2294,6 +2392,367 @@ def _join_handler(node: Node, ctx: Context) -> Result:
     return Result(outcome="success", output=f"join: {node.name}", metadata={"role": "join"})
 
 
+def _git_config_origin_url(workdir: pathlib.Path) -> Optional[str]:
+    try:
+        res = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _git_merge_base(workdir: pathlib.Path) -> Optional[str]:
+    try:
+        for base in ("origin/main", "main", "master", "origin/master"):
+            res = subprocess.run(
+                ["git", "merge-base", base, "HEAD"],
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if res.returncode == 0:
+                return res.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _git_diff_stat(workdir: pathlib.Path, base_sha: str) -> Optional[str]:
+    try:
+        cmd = ["git", "diff", "--stat"]
+        if base_sha:
+            cmd.append(base_sha)
+        res = subprocess.run(
+            cmd,
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _gh_pr_body(workdir: pathlib.Path, target_pr: str) -> Optional[str]:
+    if not target_pr or target_pr == "N/A":
+        return None
+    try:
+        res = subprocess.run(
+            ["gh", "pr", "view", target_pr, "--json", "body", "-q", ".body"],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _compute_evidence_sha(workdir: pathlib.Path, paths: list[str]) -> Optional[str]:
+    import hashlib
+    h = hashlib.sha256()
+    has_files = False
+    for p in paths:
+        fp = workdir / p
+        if fp.is_file():
+            try:
+                h.update(fp.read_bytes())
+                has_files = True
+            except Exception:
+                pass
+    return h.hexdigest() if has_files else None
+
+
+def _verify_evidence_freshness(workdir: pathlib.Path, paths: list[str], expected_sha: str) -> bool:
+    if not expected_sha:
+        return False
+    expected_sha_lower = expected_sha.lower()
+    for p in paths:
+        fp = workdir / p
+        if not fp.exists():
+            return False
+        try:
+            content = fp.read_text(encoding="utf-8", errors="ignore")
+            if expected_sha_lower in content.lower():
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _check_unresolved_review_state(workdir: pathlib.Path, target_pr: str) -> bool:
+    import json
+    import subprocess
+    if not target_pr or target_pr == "N/A":
+        return True
+    try:
+        res = subprocess.run(
+            ["gh", "pr", "view", target_pr, "--json", "reviewDecision,reviews"],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if res.returncode == 0:
+            data = json.loads(res.stdout)
+            decision = data.get("reviewDecision")
+            if decision in ("CHANGES_REQUESTED", "REVIEW_REQUIRED"):
+                return False
+            reviews = data.get("reviews", [])
+            reviewer_states = {}
+            for r in reviews:
+                author = r.get("author", {}).get("login")
+                state = r.get("state")
+                if author and state:
+                    reviewer_states[author] = state
+            if "CHANGES_REQUESTED" in reviewer_states.values():
+                return False
+    except Exception as exc:
+        print(f"DEBUG EXCEPTION 2: {exc}", file=sys.stderr)
+    return True
+
+
+def _is_replacement_or_deletion_work(diff_summary: str, pr_description: str, is_replacement_attr: bool) -> bool:
+    if is_replacement_attr:
+        return True
+    insertions = 0
+    deletions = 0
+    import re
+    ins_match = re.search(r"(\d+)\s+insertion", diff_summary)
+    del_match = re.search(r"(\d+)\s+deletion", diff_summary)
+    if ins_match:
+        insertions = int(ins_match.group(1))
+    if del_match:
+        deletions = int(del_match.group(1))
+    if deletions > 0 and (insertions - deletions <= 0):
+        return True
+    keywords = ["delete", "remove", "refactor", "cleanup", "dead code", "replacement", "replace"]
+    desc_lower = pr_description.lower()
+    if any(k in desc_lower for k in keywords):
+        return True
+    return False
+
+
+def _gate_audit(node: Node, ctx: Context) -> Result:
+    """automated, repository-agnostic Evidence Audit review gate handler."""
+    target_repo = ctx.state.get("target_repo") or node.attrs.get("target_repo")
+    if not target_repo:
+        target_repo = _git_config_origin_url(ctx.workdir) or "N/A"
+        
+    target_pr = ctx.state.get("target_pr") or node.attrs.get("target_pr") or "N/A"
+    
+    target_head_sha = ctx.state.get("target_head_sha") or node.attrs.get("target_head_sha")
+    if not target_head_sha:
+        target_head_sha = _worktree_head_sha(ctx.workdir)
+        
+    base_sha = ctx.state.get("base_sha") or node.attrs.get("base_sha")
+    if not base_sha:
+        base_sha = _git_merge_base(ctx.workdir) or ""
+        
+    diff_summary = ctx.state.get("diff_summary") or node.attrs.get("diff_summary")
+    if not diff_summary:
+        diff_summary = _git_diff_stat(ctx.workdir, base_sha) or "No changes found."
+        
+    pr_description = ctx.state.get("pr_description") or node.attrs.get("pr_description")
+    if not pr_description:
+        pr_description = _gh_pr_body(ctx.workdir, target_pr) or "N/A"
+        
+    evidence_paths_raw = ctx.state.get("evidence_paths") or node.attrs.get("evidence_paths")
+    evidence_paths = []
+    if evidence_paths_raw:
+        if isinstance(evidence_paths_raw, str):
+            if evidence_paths_raw.startswith("[") and evidence_paths_raw.endswith("]"):
+                try:
+                    evidence_paths = json.loads(evidence_paths_raw)
+                except Exception:
+                    evidence_paths = [p.strip() for p in evidence_paths_raw.split(",") if p.strip()]
+            else:
+                evidence_paths = [p.strip() for p in evidence_paths_raw.split(",") if p.strip()]
+        elif isinstance(evidence_paths_raw, list):
+            evidence_paths = evidence_paths_raw
+    else:
+        for standard_name in ("gemini_http_request_responses.jsonl", "gemini_http_responses.jsonl", "evidence.jsonl"):
+            if (ctx.workdir / standard_name).is_file():
+                evidence_paths.append(standard_name)
+
+    missing_artifacts = []
+    for p in evidence_paths:
+        fp = ctx.workdir / p
+        if not fp.is_file():
+            missing_artifacts.append(p)
+            
+    verdict_artifact = {
+        "target_repo": target_repo,
+        "target_pr": target_pr,
+        "target_head_sha": target_head_sha or "N/A",
+        "base_sha": base_sha,
+        "diff_summary": diff_summary,
+        "pr_description": pr_description,
+        "evidence_paths": evidence_paths,
+        "evidence_sha": "N/A",
+        "verdict": "unknown",
+        "outcome": "error",
+        "is_replacement": False,
+        "audit_details": "",
+        "timestamp": time.time(),
+    }
+    
+    verdict_artifact_path = ctx.workdir / "gate_audit_verdict.json"
+    
+    def write_verdict_artifact(outcome: str, verdict: str, details: str, is_repl: bool, ev_sha: str):
+        verdict_artifact["outcome"] = outcome
+        verdict_artifact["verdict"] = verdict
+        verdict_artifact["audit_details"] = details
+        verdict_artifact["is_replacement"] = is_repl
+        verdict_artifact["evidence_sha"] = ev_sha
+        try:
+            verdict_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            verdict_artifact_path.write_text(json.dumps(verdict_artifact, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    if not evidence_paths or missing_artifacts:
+        err_msg = f"Evidence Audit: missing evidence artifacts: {missing_artifacts or 'no evidence paths specified'}"
+        write_verdict_artifact("error", "unknown", err_msg, False, "N/A")
+        return Result(
+            outcome="error",
+            output=err_msg,
+            metadata={"verdict": "unknown", "error_type": "missing_artifact"},
+        )
+        
+    evidence_sha = ctx.state.get("evidence_sha") or node.attrs.get("evidence_sha")
+    if not evidence_sha:
+        evidence_sha = _compute_evidence_sha(ctx.workdir, evidence_paths) or "N/A"
+
+    if not target_head_sha or not _verify_evidence_freshness(ctx.workdir, evidence_paths, target_head_sha):
+        err_msg = f"Evidence Audit: stale evidence, target HEAD SHA {target_head_sha} not found in evidence logs."
+        write_verdict_artifact("failure", "fail", err_msg, False, evidence_sha)
+        return Result(
+            outcome="failure",
+            output=err_msg,
+            metadata={"verdict": "fail", "error_type": "stale_evidence", "evidence_sha": evidence_sha},
+        )
+
+    if not _check_unresolved_review_state(ctx.workdir, target_pr):
+        err_msg = f"Evidence Audit: unresolved required review state (PR #{target_pr} changes requested or pending approval)."
+        write_verdict_artifact("failure", "fail", err_msg, False, evidence_sha)
+        return Result(
+            outcome="failure",
+            output=err_msg,
+            metadata={"verdict": "fail", "error_type": "unresolved_reviews", "evidence_sha": evidence_sha},
+        )
+
+    is_replacement_attr = False
+    raw_repl = node.attrs.get("is_replacement")
+    if raw_repl is not None:
+        if isinstance(raw_repl, bool):
+            is_replacement_attr = raw_repl
+        else:
+            is_replacement_attr = str(raw_repl).strip().lower() in {"true", "1", "yes"}
+            
+    is_repl = _is_replacement_or_deletion_work(diff_summary, pr_description, is_replacement_attr)
+
+    evidence_snapshots = []
+    for p in evidence_paths:
+        fp = ctx.workdir / p
+        try:
+            lines = fp.read_text(encoding="utf-8", errors="ignore").splitlines()[:50]
+            snapshot = "\n".join(lines)
+            evidence_snapshots.append(f"Evidence file: {p}\n---\n{snapshot}\n---")
+        except Exception:
+            pass
+    evidence_snapshot_text = "\n\n".join(evidence_snapshots)
+
+    audit_prompt = f"""\
+You are performing an automated, repository-agnostic Evidence Audit review.
+You MUST audit the active repository changes, diff, and evidence files.
+
+RECORDS:
+Target Repo: {target_repo}
+Target PR: {target_pr}
+Target HEAD SHA: {target_head_sha}
+Base SHA: {base_sha}
+Diff Summary: {diff_summary}
+PR Description Snapshot: {pr_description}
+Evidence Paths: {", ".join(evidence_paths)}
+Evidence SHA: {evidence_sha}
+
+EVIDENCE SNAPSHOTS:
+{evidence_snapshot_text}
+
+Verify the following:
+1. Stale evidence: Confirm that the evidence SHA matches target_head_sha and reflects the current changes.
+2. PR alignment: Verify that the implementation in the diff matches the PR description's intent.
+3. Deletion/integrity review: Since this task is {"" if is_repl else "NOT "}replacement/deletion/refactor/dead-code work:
+   - Confirm that the deletion proof/evidence is present and verified.
+   - Confirm that the dead code/deleted logic is completely removed and there are no stray/unused remnants.
+   - Confirm that the new implementation is not a simple additive overlay without cleaning up the replaced code.
+
+CRITICAL FORMATTING INSTRUCTIONS:
+1. You MUST include a binding verification line:
+   head_sha: {target_head_sha}
+2. You MUST conclude your review with:
+   verdict: <pass|fail|warn|inconclusive>
+"""
+
+    if ctx.backend in ("echo", "mock_llm"):
+        hint = ctx.state.get(f"{node.name}.outcome", "success")
+        verdict = "pass" if hint == "success" else ("warn" if hint == "warn" else "fail")
+        outcome = hint
+        if is_repl:
+            if verdict not in ("pass", "approved", "approve"):
+                outcome = "failure"
+        output_text = f"echo gate_audit: pre-seeded {hint}\nhead_sha: {target_head_sha}\nverdict: {verdict}"
+        write_verdict_artifact(outcome, verdict, output_text, is_repl, evidence_sha)
+        return Result(
+            outcome=outcome,
+            output=output_text,
+            metadata={"verdict": verdict, "evidence_sha": evidence_sha, "is_replacement": str(is_repl)},
+        )
+
+    timeout = _coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
+    backend, gate_meta = _resolve_gate_backend(node, ctx)
+    result = _execute_gate(audit_prompt, target_head_sha, timeout, ctx, "gate_audit", backend)
+    
+    if gate_meta:
+        for k, v in gate_meta.items():
+            result.metadata.setdefault(k, v)
+            
+    verdict, normalized = _parse_verdict(result.output)
+    
+    if result.outcome == "error":
+        write_verdict_artifact("error", verdict, result.output, is_repl, evidence_sha)
+        return result
+        
+    outcome = normalized
+    if is_repl:
+        if verdict not in ("pass", "approved", "approve"):
+            outcome = "failure"
+            
+    write_verdict_artifact(outcome, verdict, result.output, is_repl, evidence_sha)
+    result.outcome = outcome
+    result.metadata.update({
+        "verdict": verdict,
+        "evidence_sha": evidence_sha,
+        "is_replacement": str(is_repl),
+    })
+    return result
+
+
 REGISTRY: dict[str, Handler] = {
     # by shape
     "Mdiamond": _start,
@@ -2314,9 +2773,13 @@ TYPE_REGISTRY: dict[str, Handler] = {
     "gate_es": _gate_es,
     "gate_er": _gate_er,
     "gate_code_standards": _gate_code_standards,
+    "gate_net_loc": _gate_net_loc,
+    "gate_dead_code": _gate_dead_code,
     "gate_slash": _gate_slash,
     "gate_red": _gate_red,
     "gate_green": _gate_green,
+    "gate_audit": _gate_audit,
+    "gate_evidence_audit": _gate_audit,
     "parallel": _parallel_fanout,       # fan-out type (type=parallel)
     "join": _join_handler,              # fan-in type (type=join)
 }

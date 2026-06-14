@@ -295,8 +295,6 @@ def test_gate_code_standards_uses_universal_prompt_when_local_file_absent(tmp_pa
         f"When code-standards.md is absent, _gate_code_standards must use "
         f"universal prompt. Got: {prompt_used[:60]!r}"
     )
-
-
 # ---------------------------------------------------------------------------
 # agy reviewer backend + claude fallback (review_pr.dot evidence gate).
 #
@@ -1028,6 +1026,113 @@ def test_execute_gate_tags_infra_failure_when_all_backends_die(tmp_path, monkeyp
 
 
 # ---------------------------------------------------------------------------
+# agy reviewer backend + claude fallback (review_pr.dot evidence gate).
+#
+# A reviewer gate node with backend="agy" (explicit or via a .review model
+# stylesheet) must (a) actually invoke agy, (b) fall back to claude only on agy
+# *infrastructure* failure, and (c) NEVER reviewer-shop a real agy fail/partial
+# verdict onto claude. These three properties are what make "agy reviews, falls
+# back to claude if it doesn't work" honest rather than a label.
+# ---------------------------------------------------------------------------
+
+def _agy_gate_node():
+    return make_node(name="evidence", backend="agy")
+
+
+def test_gate_er_runs_agy_when_backend_agy(tmp_path, monkeypatch):
+    """backend=agy → the reviewer subprocess is `agy --print ...`, not claude."""
+    import subprocess as _sp
+    from runner.handlers import _gate_er, Context as HCtx
+
+    node = _agy_gate_node()
+    # ctx.backend is the run-level CLI backend; the per-node backend=agy must win.
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+
+    seen: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        return _sp.CompletedProcess(
+            cmd, 0, stdout=f"head_sha: {kwargs.get('env', {}).get('EXPECTED_SHA') or 'a'*40}\nverdict: pass\n", stderr=""
+        )
+
+    monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: "a" * 40)
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    result = _gate_er(node, ctx)
+    assert result.outcome == "success"
+    assert len(seen) == 1
+    assert os.path.basename(seen[0][0]) == "agy", "must run the agy binary"
+
+
+def test_gate_er_falls_back_to_claude_on_agy_infra_failure(tmp_path, monkeypatch):
+    """agy binary missing / sandbox block → verdict: unknown + head_sha: missing,
+    which is an infra failure. It must fall back to claude; the final result
+    records the fallback in metadata."""
+    import subprocess as _sp
+    from runner.handlers import _gate_er, Context as HCtx
+
+    node = _agy_gate_node()
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+
+    fake_sha = "b" * 40
+    seen: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        if os.path.basename(cmd[0]) == "agy":
+            # agy failed to resolve/run → raise FileNotFoundError
+            raise FileNotFoundError("agy not found")
+        # claude fallback succeeds
+        return _sp.CompletedProcess(
+            cmd, 0, stdout=f"head_sha: {fake_sha}\nverdict: pass\n", stderr=""
+        )
+
+    monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    result = _gate_er(node, ctx)
+    assert result.outcome == "success"
+    assert len(seen) == 2, "must attempt agy, then fall back to claude"
+    assert os.path.basename(seen[0][0]) == "agy"
+    assert os.path.basename(seen[1][0]) == "claude"
+    assert result.metadata["fallback_used"] == "true"
+    assert result.metadata["fallback_from"] == "agy"
+
+
+def test_gate_er_does_not_fall_back_on_real_agy_verdict(tmp_path, monkeypatch):
+    """agy runs successfully and emits 'verdict: fail' → this is a real grading,
+    not an infra crash. We must NOT fall back to claude (no reviewer-shopping);
+    the fail is returned as-is."""
+    import subprocess as _sp
+    from runner.handlers import _gate_er, Context as HCtx
+
+    node = _agy_gate_node()
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+
+    fake_sha = "a" * 40
+    seen: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        return _sp.CompletedProcess(
+            cmd, 0, stdout=f"head_sha: {fake_sha}\nverdict: fail\n", stderr=""
+        )
+
+    monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    result = _gate_er(node, ctx)
+    assert result.outcome == "failure"
+    assert result.metadata["fallback_used"] == "false"
+    assert len(seen) == 1, "real FAIL verdict must not trigger a second backend"
+    assert os.path.basename(seen[0][0]) == "agy"
+
+
+# ---------------------------------------------------------------------------
 # gate_slash — generic single-lane reviewer gate
 # ---------------------------------------------------------------------------
 
@@ -1170,3 +1275,96 @@ def test_gate_slash_registered_in_type_registry():
 # mechanics of parallel gate_slash fan-outs are exercised by the
 # \ tests above and the general parallel/join engine
 # tests in tests/test_engine.py.
+
+
+def test_gate_audit_contract(monkeypatch, tmp_path):
+    import json
+    from runner.handlers import TYPE_REGISTRY, _gate_audit, Context, Result, Node
+    
+    # 1. Missing artifact test
+    node = Node(name="audit_node", attrs={"type": "gate_audit", "evidence_paths": "missing_ev.jsonl", "shape": "hexagon"})
+    ctx = Context(goal="audit test", workdir=tmp_path, backend="echo")
+    res = _gate_audit(node, ctx)
+    assert res.outcome == "error"
+    assert "missing evidence artifacts" in res.output
+    assert (tmp_path / "gate_audit_verdict.json").exists()
+    
+    # Let's seed a fake target_head_sha
+    fake_sha = "a" * 40
+    ctx.state["target_head_sha"] = fake_sha
+    
+    # Create the evidence file
+    ev_file = tmp_path / "evidence.jsonl"
+    ev_file.write_text("dummy content without head sha")
+    
+    node = Node(name="audit_node", attrs={"type": "gate_audit", "evidence_paths": "evidence.jsonl", "shape": "hexagon"})
+    
+    # 2. Stale evidence test (since fake_sha is not in evidence file)
+    res = _gate_audit(node, ctx)
+    assert res.outcome == "failure"
+    assert "stale evidence" in res.output
+    
+    # Update evidence file to contain HEAD SHA to make it fresh
+    ev_file.write_text(f"dummy content with {fake_sha}")
+    
+    # Mock gh pr view to return changes requested
+    def fake_subprocess_run(args, **kwargs):
+        # If gh pr view is called:
+        if "gh" in args and "pr" in args and "view" in args:
+            class FakeProc:
+                returncode = 0
+                stdout = json.dumps({"reviewDecision": "CHANGES_REQUESTED", "reviews": []})
+                stderr = ""
+            return FakeProc()
+        # Fallback to a success process
+        class FakeProcSuccess:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return FakeProcSuccess()
+        
+    monkeypatch.setattr("subprocess.run", fake_subprocess_run)
+    ctx.state["target_pr"] = "123"
+    
+    # 3. Unresolved reviews test
+    res = _gate_audit(node, ctx)
+    assert res.outcome == "failure"
+    assert "unresolved required review state" in res.output
+    
+    # Update mock to return APPROVED review state
+    def fake_subprocess_run_approved(args, **kwargs):
+        if "gh" in args and "pr" in args and "view" in args:
+            class FakeProc:
+                returncode = 0
+                stdout = json.dumps({"reviewDecision": "APPROVED", "reviews": []})
+                stderr = ""
+            return FakeProc()
+        class FakeProcSuccess:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return FakeProcSuccess()
+    monkeypatch.setattr("subprocess.run", fake_subprocess_run_approved)
+    
+    # 4. Replacement work with warn verdict test
+    ctx.state["diff_summary"] = "5 files changed, 10 insertions(+), 50 deletions(-)" # net negative delta -> replacement
+    ctx.state["audit_node.outcome"] = "warn"
+    res = _gate_audit(node, ctx)
+    assert res.outcome == "failure" # Warn verdict is overridden to failure for replacement work!
+    
+    # 5. Non-replacement work with warn verdict test
+    ctx.state["diff_summary"] = "5 files changed, 50 insertions(+), 10 deletions(-)" # positive delta -> not replacement
+    res = _gate_audit(node, ctx)
+    assert res.outcome == "warn" # Warn verdict is allowed for non-replacement!
+    
+    # 6. Valid pass test
+    ctx.state["audit_node.outcome"] = "success"
+    res = _gate_audit(node, ctx)
+    assert res.outcome == "success"
+    
+    # Check the final verdict artifact file
+    verdict_json = json.loads((tmp_path / "gate_audit_verdict.json").read_text())
+    assert verdict_json["target_head_sha"] == fake_sha
+    assert verdict_json["outcome"] == "success"
+    assert verdict_json["verdict"] == "pass"
+
