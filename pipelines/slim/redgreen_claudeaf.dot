@@ -1,0 +1,29 @@
+digraph redgreen_claudeaf {
+    graph [
+        goal="Prove RED->GREEN for the /api/plan superadmin ownership bypass using claudeaf-only nodes (no codex). Run the regression test (RED on the vulnerable base, GREEN with the fix), then certify the GREEN diff with /es + /er. No sealed holdout exists for this feature so the holdout node is omitted; no coder/implement/fix nodes because the code is already on the branch and must be VALIDATED, not regenerated. gate_er has no hardcoded backend_priority, so DARK_FACTORY_ADVERSARIAL_PRIORITY=claude-sonnet binds the adversarial reviewer to claudeaf (claude), never codex."
+        label="RedGreen (claudeaf-only)"
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    test [
+        type="tool",
+        label="Run regression test",
+        command="${state.slim.test_command}",
+        validation=true,
+        goal_gate=true,
+        timeout=600
+    ]
+    gate_es [type="gate_es", label="/es Evidence Standards", timeout=600]
+    gate_er [type="gate_er", label="/er Evidence Review",     timeout=600]
+
+    start   -> test
+    test    -> gate_es [condition="outcome=success"]
+    test    -> exit    [condition="outcome!=success"]
+    gate_es -> gate_er [condition="outcome=success"]
+    gate_es -> exit    [condition="outcome!=success"]
+    gate_er -> exit    [condition="outcome=success"]
+    gate_er -> exit    [condition="outcome!=success"]
+}
