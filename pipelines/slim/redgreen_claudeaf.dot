@@ -16,8 +16,12 @@ digraph redgreen_claudeaf {
         goal_gate=true,
         timeout=600
     ]
-    gate_es [type="gate_es", label="/es Evidence Standards", timeout=600]
-    gate_er [type="gate_er", label="/er Evidence Review",     timeout=600]
+    // backend_priority pins the reviewer to claude by graph contract, so the
+    // claudeaf-only guarantee does not depend on the operator passing --backend claude
+    // (without it, _resolve_gate_backend falls through to the run-level ctx.backend,
+    // which could be codex). Keeps this pipeline claude-only regardless of invocation.
+    gate_es [type="gate_es", label="/es Evidence Standards", backend_priority="claude-sonnet", timeout=600]
+    gate_er [type="gate_er", label="/er Evidence Review",     backend_priority="claude-sonnet", timeout=600]
 
     start   -> test
     test    -> gate_es [condition="outcome=success"]

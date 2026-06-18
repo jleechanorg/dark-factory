@@ -1590,12 +1590,12 @@ You MUST audit the implementation's evidence against the following core standard
      production behavior actually diverges between the recorded SHA and HEAD.
 
 2. METRICS & TELEMETRY:
-   - Execution duration (or equivalent timing) SHOULD be recorded. Token usage and cost
-     are OPTIONAL / best-effort: when the executing backend or harness does not surface
-     them, that is reported as "N/A (not emitted by backend)" and MUST NOT fail this
-     standard. PASS when timing is present, or when the absence of token/cost is honestly
-     disclosed for a context whose harness does not emit them. Do not fail solely on
-     missing token or cost figures.
+   - Execution duration (or equivalent timing) MUST be recorded — FAIL this standard if no
+     timing is present at all. Token usage and cost are OPTIONAL / best-effort: when the
+     executing backend or harness does not surface them, that is reported as "N/A (not
+     emitted by backend)" and MUST NOT fail this standard. PASS only when timing is present
+     (whether or not token/cost are available); do not fail solely on missing token or cost
+     figures.
 
 3. RESULT INVARIANTS:
    - Ensure all executed scenarios are explicitly marked as passed with no silent failures.
