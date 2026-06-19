@@ -251,7 +251,12 @@ def test_subprocess_emits_valid_json(tmp_path):
     payload = json.loads(proc.stdout)
     assert payload["status"] == "pass"
     assert payload["pipeline_path"] == str(p)
-    assert len(payload["checks"]) == 3
+    # As of Lane B1 (bead jleechan-ku3) there are four checks:
+    # prompt_paths, timeout_thresholds, edge_resolution, command_binaries.
+    # The new command-binaries check is a pure addition; the count
+    # pin below guards against accidental check removal in future
+    # refactors.
+    assert len(payload["checks"]) == 4
     assert all(c["ok"] for c in payload["checks"])
 
     # Now do the same for a failing pipeline and confirm exit code 2.
