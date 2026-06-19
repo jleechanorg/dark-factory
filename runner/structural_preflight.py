@@ -58,6 +58,20 @@ from runner.paths import factory_home  # type: ignore
 # for any prompt-driven work. Mirrors ``parser._VALIDATION_TIMEOUT_MIN_SECONDS``.
 TIMEOUT_THRESHOLD_S = 60
 
+# Rationale (jleechan-arr): this module exports the *minimum* timeout
+# threshold that any validation/codergen node must satisfy. The roadmap
+# at ``docs/plans/factory_improvement_analysis.md`` section "Dynamic LLM
+# Timeouts & Provider Backoff" proposes 60 / 180 / 300 seconds for tool /
+# codergen / review; the 60s minimum matches that proposal exactly. The
+# *upper bound* per-class defaults are NOT duplicated here — they live in
+# the per-handler modules (``runner/handler_codergen.py`` codergen 1800s,
+# ``runner/handler_audit.py``/``handler_universal_prompts.py``/
+# ``handler_special_gates.py`` gate reviewers 1200s). Production evidence
+# contradicts the roadmap's 180s/300s codergen/review proposal: real
+# codergen runs hit the 1800s ceiling on claude/codex backends (see
+# ``TIMEOUT_DEFAULTS_RATIONALE`` in
+# ``docs/plans/factory_improvement_analysis.implementation.md`` Pillar 4).
+
 
 # Shell builtins that ``shutil.which`` cannot resolve but ``tool`` nodes may
 # legitimately invoke as the head of ``command="..."``. Exposed at module

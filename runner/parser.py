@@ -29,6 +29,21 @@ _STYLE_RULE_RE = re.compile(
 _VALIDATION_TIMEOUT_MIN_SECONDS = 60
 _VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards"}
 
+# Rationale (jleechan-arr): the roadmap at
+# ``docs/plans/factory_improvement_analysis.md`` section "Dynamic LLM Timeouts &
+# Provider Backoff" proposes per-class defaults of 60 / 180 / 300 seconds for
+# tool / codergen / review respectively. The 60s *minimum* in this module is
+# the lower-bound guard rail that the proposal and the implementation agree on:
+# it protects against pathological zero/near-zero timeouts that would
+# truncate any prompt-driven work. The *upper-bound* per-class defaults
+# (codergen 180s, review 300s) are NOT adopted here because production
+# wall-clock evidence contradicts them — see ``TIMEOUT_DEFAULTS_RATIONALE``
+# in ``docs/plans/factory_improvement_analysis.implementation.md`` Pillar 4
+# for the empirical distribution (codergen p99=1800s on real runs; gate
+# reviewer p99=206s). This file owns only the *minimum threshold* — the
+# per-call-site class-specific defaults live in ``runner/handler_core.py``
+# and ``runner/handler_codergen.py``.
+
 
 @dataclass
 class Node:

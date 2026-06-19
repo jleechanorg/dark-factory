@@ -1,5 +1,18 @@
 """Universal + custom-prompt + slash gate family.
 
+Rationale (jleechan-arr): all three call sites in this module use the
+**1200s** default when a node omits the ``timeout`` attribute. The
+roadmap at ``docs/plans/factory_improvement_analysis.md`` proposes
+**300s** for "review / deep auditing". Observed production gate wall
+clocks (gate_es / gate_er / gate_code_standards across the CXDB event
+log) show p99 = 206s (max observed = 206s, never timed out). The 1200s
+default intentionally leaves headroom for very large diffs that would
+exceed the 300s roadmap value; it does not slow down the median case
+(the OS-level subprocess timeout only fires after the wall clock
+exceeds the bound). See ``TIMEOUT_DEFAULTS_RATIONALE`` in
+``docs/plans/factory_improvement_analysis.implementation.md`` Pillar 4
+for the empirical distribution and the citation.
+
 Owns:
   * `_slash_gate` — factory for ``/<command>`` reviewer gates with SHA binding.
   * `UNIVERSAL_CODE_STANDARDS_PROMPT` — embedded prompt template.

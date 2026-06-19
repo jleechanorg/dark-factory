@@ -51,6 +51,23 @@ class Context:
 _TIMEOUT_MIN_SECONDS = 5
 _TIMEOUT_MAX_SECONDS = 3600
 
+# Rationale (jleechan-arr): the policy envelope here is the *clamp range*,
+# not a default. Callers pass `default=...` to ``_coerce_timeout`` and that
+# default is what shows up when a .dot node omits the ``timeout`` attribute.
+# The roadmap at ``docs/plans/factory_improvement_analysis.md`` proposes
+# per-class defaults of 60 / 180 / 300 seconds (tool / codergen / review).
+# Those values are *not* enforced as global defaults because production
+# evidence contradicts them: real codergen runs hit the 1800s ceiling on
+# claude/codex backends (p99 = 1800s, max = 1800s); gate reviewer runs
+# (gate_es / gate_er / gate_code_standards / gate_audit) have a p99 = 206s
+# but the 1200s default still has headroom for very large diffs. The
+# per-class defaults are co-located with the call sites that use them
+# (``runner/handler_codergen.py`` codergen 1800s/600s, ``handler_audit.py``
+# / ``handler_universal_prompts.py`` / ``handler_special_gates.py`` gates
+# 1200s) — see ``TIMEOUT_DEFAULTS_RATIONALE`` in
+# ``docs/plans/factory_improvement_analysis.implementation.md`` Pillar 4
+# for the empirical distribution and the rationale.
+
 
 def _coerce_timeout(value: object, default: int, *, minimum: int = _TIMEOUT_MIN_SECONDS, maximum: int = _TIMEOUT_MAX_SECONDS) -> int:
     """Parse and clamp timeout values to the policy envelope.

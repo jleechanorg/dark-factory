@@ -19,6 +19,28 @@ All monkeypatched helper symbols (``_sanitized_env``, ``_sandboxed_args``,
 ``_get_claude_executable``, ``_ao_wait_idle``, ``_render_prompt``) are looked
 up via the ``runner.handlers`` shim (late binding) so that
 ``monkeypatch.setattr("runner.handlers._X", ...)`` still takes effect.
+
+Per-backend timeout defaults
+----------------------------
+
+The roadmap at ``docs/plans/factory_improvement_analysis.md`` section
+"Dynamic LLM Timeouts & Provider Backoff" proposes a codergen default of
+**180 seconds**. This module uses **1800s** for claude/codex and **600s**
+for agy — both deliberately exceed the roadmap value.
+
+Rationale (jleechan-arr): production codergen wall-clock evidence from
+``~/Library/Logs/dark-factory`` across real claude/codex/agy runs shows:
+
+  * claude codergen p50 ≈ 276s, p90 ≈ 585s, p99 = 1800s (timeout hits)
+  * codex codergen p99 = 1800s (timeout hits)
+
+The 180s roadmap value would timeout roughly **50 % of observed claude
+runs** at p50 alone. The 1800s default matches the observed p99 ceiling
+without dropping too many runs; the 600s agy default matches the observed
+agy distribution (agy is faster than claude in our samples). See
+``TIMEOUT_DEFAULTS_RATIONALE`` in
+``docs/plans/factory_improvement_analysis.implementation.md`` Pillar 4 for
+the full empirical distribution and the citation.
 """
 
 from __future__ import annotations

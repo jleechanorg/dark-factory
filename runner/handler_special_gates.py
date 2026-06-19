@@ -1,5 +1,16 @@
 """Net-LOC + slash + pytest gates.
 
+Rationale (jleechan-arr): the ``_gate_slash`` call site uses the
+**1200s** default when a node omits the ``timeout`` attribute. The
+roadmap at ``docs/plans/factory_improvement_analysis.md`` proposes
+**300s** for "review / deep auditing". Observed production gate wall
+clocks (gate_es / gate_er / gate_code_standards across the CXDB event
+log) show p99 = 206s (max observed = 206s, never timed out). The 1200s
+default intentionally leaves headroom for very large diffs that would
+exceed the 300s roadmap value. See ``TIMEOUT_DEFAULTS_RATIONALE`` in
+``docs/plans/factory_improvement_analysis.implementation.md`` Pillar 4
+for the empirical distribution and the citation.
+
 Owns:
   * `_resolve_base_sha` — state → attr → ``git merge-base origin/main HEAD`` →
     ``"origin/main"``.
@@ -182,6 +193,8 @@ def _gate_slash(node: "Node", ctx: "Context") -> "Result":
         f"head_sha: {expected_sha}\n"
         f"verdict: <pass|warn|fail|partial>\n"
     )
+    # Rationale (jleechan-arr): 1200s default — see module docstring for
+    # the empirical basis (observed p99 = 206s, max = 206s).
     timeout = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
     backend, gate_meta = _handlers_shim._resolve_gate_backend(node, ctx)
     result = _handlers_shim._execute_gate(prompt, expected_sha, timeout, ctx, command, backend)
