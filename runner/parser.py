@@ -7,6 +7,7 @@ extracted (node attributes, edge attributes, optional subgraph clusters).
 
 from __future__ import annotations
 
+import os
 import pathlib
 import re
 from dataclasses import dataclass, field
@@ -26,6 +27,7 @@ _STYLE_RULE_RE = re.compile(
     r"(?P<selector>[^\n{]+)\{\s*(?P<body>[^}]*)\}",
     re.MULTILINE | re.DOTALL,
 )
+_STYLE_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _VALIDATION_TIMEOUT_MIN_SECONDS = 60
 _VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards"}
 
@@ -113,6 +115,45 @@ def _coerce_bool(value: str, context: str) -> bool:
     raise ValueError(f"{context}: expected boolean, got {value!r}")
 
 
+def _substitute_env_in_value(value: str) -> str:
+    """Resolve ``${VAR}`` and ``${VAR:-default}`` references in a stylesheet value.
+
+    Reads from ``os.environ``. Bash-compatible semantics:
+
+    - ``${VAR}`` → env value, or ``""`` when unset
+    - ``${VAR:-default}`` → env value, or ``default`` when unset OR empty
+      (bash's ``:-`` treats empty the same as unset; this matches the
+      documented ``${VAR:-default}`` convention used by the model
+      stylesheet).
+
+    Escape sequences are not supported — CSS files are author-controlled,
+    so backslashes and braces inside literal values are out of scope.
+    """
+    if "${" not in value:
+        return value
+
+    def _resolve(match: re.Match[str]) -> str:
+        name = match.group(1)
+        default = match.group(2)
+        env_value = os.environ.get(name)
+        if env_value is None or env_value == "":
+            return default if default is not None else ""
+        return env_value
+
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}", _resolve, value)
+
+
+def _preprocess_style_text(raw: str) -> str:
+    """Strip ``/* ... */`` comments and resolve ``${VAR}`` env refs.
+
+    Run before the rule-matching regex so an embedded ``}`` inside a
+    ``${VAR:-default}`` reference (or inside a comment) cannot terminate
+    the body match early.
+    """
+    stripped = _STYLE_COMMENT_RE.sub("", raw)
+    return _substitute_env_in_value(stripped)
+
+
 def _parse_model_style_rules(raw: str) -> list[tuple[str, dict[str, str]]]:
     """Parse a tiny CSS-like stylesheet into ordered selector → attrs rules.
 
@@ -122,9 +163,18 @@ def _parse_model_style_rules(raw: str) -> list[tuple[str, dict[str, str]]]:
     * {backend: codex}
     node-name {timeout: 120}
     ```
+
+    Values may reference environment variables via ``${VAR}`` or
+    ``${VAR:-default}`` (bash-style). ``runner/parser.py:_substitute_env_in_value``
+    resolves them against ``os.environ`` at parse time so a node's resolved
+    attributes are deterministic and unaffected by mid-run env mutations.
+
+    ``/* ... */`` block comments and ``${...}`` env refs are preprocessed
+    away before rule matching so neither can terminate the body match early.
     """
+    preprocessed = _preprocess_style_text(raw)
     rules: list[tuple[str, dict[str, str]]] = []
-    for match in _STYLE_RULE_RE.finditer(raw):
+    for match in _STYLE_RULE_RE.finditer(preprocessed):
         selector = match.group("selector").strip()
         body = match.group("body")
         if not selector or body is None:

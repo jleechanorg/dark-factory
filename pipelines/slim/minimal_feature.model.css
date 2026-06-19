@@ -8,13 +8,15 @@
  *
  * Plan tier: heavier Claude model for architecture/spec work (design phase).
  * Explicit node attrs win over stylesheet rules; tests pin plan to echo.
+ * The `model_name` honors `DARK_FACTORY_PLAN_MODEL` via `${VAR:-default}`
+ * env-var substitution (see runner/parser.py:_substitute_env_in_value).
  *
  * Review tier: independent adversarial backend (Antigravity), separate from
  * the coder --backend.
  */
 .plan {
   backend: claude;
-  model_name: claude-opus-4-6;
+  model_name: ${DARK_FACTORY_PLAN_MODEL:-claude-opus-4-6};
 }
 
 .review {
