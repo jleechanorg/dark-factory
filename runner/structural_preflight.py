@@ -45,6 +45,8 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import shlex
+import shutil
 import sys
 from typing import Any, Optional
 
@@ -55,6 +57,52 @@ from runner.paths import factory_home  # type: ignore
 # Threshold (seconds) below which a node's `timeout` is considered too low
 # for any prompt-driven work. Mirrors ``parser._VALIDATION_TIMEOUT_MIN_SECONDS``.
 TIMEOUT_THRESHOLD_S = 60
+
+
+# Shell builtins that ``shutil.which`` cannot resolve but ``tool`` nodes may
+# legitimately invoke as the head of ``command="..."``. Exposed at module
+# level so conformance tests can pin the exact skip list. Mirrors the set
+# of POSIX builtins dark-factory pipelines actually use; new entries must
+# be added with a corresponding test so the failure UX stays contractually
+# stable.
+_SHELL_BUILTINS: frozenset[str] = frozenset(
+    {"cd", "test", "echo", "true", "false", "pwd", "[", "[["}
+)
+
+
+def _first_binary_token(command: str) -> Optional[str]:
+    """Return the first non-placeholder token of ``command``.
+
+    The runner's ``_tool`` handler runs ``shlex.split(cmd)`` and invokes
+    the resulting argv through ``subprocess``. To match runtime behavior,
+    the preflight takes the first whitespace-delimited token — provided
+    it is not a ``${state.<key>}`` placeholder that the runner resolves
+    at execution time (e.g. ``command="${state.slim.test_command}"``).
+    Quoted tokens are stripped of their surrounding quotes by ``shlex``.
+    Returns ``None`` for empty input or for an unresolved placeholder
+    head (which we deliberately skip — the binary is not knowable until
+    the runner binds state).
+    """
+    stripped = command.strip()
+    if not stripped:
+        return None
+    if stripped.startswith("${"):
+        return None
+    try:
+        tokens = shlex.split(stripped)
+    except ValueError:
+        # Unbalanced quotes — let the runtime surface the parse error;
+        # preflight should not shadow it with a binary-not-found
+        # diagnostic.
+        return None
+    if not tokens:
+        return None
+    head = tokens[0]
+    if head in _SHELL_BUILTINS:
+        return None
+    if head.startswith("${"):
+        return None
+    return head
 
 
 def _check_prompt_paths(graph: _parser.Graph, pipeline_path: pathlib.Path) -> dict[str, Any]:
@@ -145,6 +193,54 @@ def _check_edge_resolution(graph: _parser.Graph) -> dict[str, Any]:
     return {"name": "edge_resolution", "ok": not unresolved, "unresolved": unresolved}
 
 
+def _check_command_binaries(graph: _parser.Graph) -> dict[str, Any]:
+    """Check that every ``tool`` node's ``command`` head resolves on PATH.
+
+    The runner's ``_tool`` handler executes the first token of the
+    ``command`` attribute via ``subprocess``. A typo in that token
+    (e.g. ``pytes`` instead of ``pytest``) currently only surfaces at
+    runtime as a cryptic ``[Errno 2] No such file or directory``; this
+    preflight check catches the same class of mistake at validation
+    time with a precise, actionable diagnostic.
+
+    The check uses ``shutil.which`` (not ``pathlib.exists``) so PATH
+    resolution matches runtime behavior — ``/usr/bin/echo`` may exist
+    but the tool handler runs through PATH, and operators may not have
+    that exact directory mounted.
+
+    Skipped cases (no false positives):
+
+    - Empty ``command`` attribute (defer to runtime — empty is
+      already a runtime failure surfaced by the tool handler).
+    - ``${state.<key>}`` placeholder heads (the runner substitutes
+      state at execution time; the actual binary is not knowable
+      during preflight).
+    - Shell builtins listed in ``_SHELL_BUILTINS`` (these have no
+      on-disk binary; the kernel invokes them via ``/bin/sh``-style
+      dispatch or, in the runner's subprocess.run path, the OS still
+      resolves them through the shell PATH differently).
+    - Unbalanced-quote commands (defer to runtime).
+
+    Returns a check dict with ``ok`` (bool) and ``missing`` (list of
+    strings in the form ``"<node>: binary not found on PATH: <name>"``).
+    The message format is pinned by a conformance test in
+    ``tests/test_structural_preflight_command_binaries.py``.
+    """
+    missing: list[str] = []
+    for node in graph.nodes.values():
+        if node.attrs.get("type") != "tool":
+            continue
+        cmd = node.attrs.get("command")
+        if not cmd or not isinstance(cmd, str):
+            continue
+        binary = _first_binary_token(cmd)
+        if binary is None:
+            continue
+        if shutil.which(binary) is None:
+            missing.append(f"{node.name}: binary not found on PATH: {binary}")
+    return {"name": "command_binaries", "ok": not missing, "missing": missing}
+
+
 def validate_structure(pipeline_path: pathlib.Path) -> dict[str, Any]:
     """Validate a pipeline .dot file and return a structured status dict.
 
@@ -184,6 +280,7 @@ def validate_structure(pipeline_path: pathlib.Path) -> dict[str, Any]:
         _check_prompt_paths(graph, pipeline_path),
         _check_timeout_thresholds(graph),
         _check_edge_resolution(graph),
+        _check_command_binaries(graph),
     ]
 
     for check in checks:
@@ -198,6 +295,9 @@ def validate_structure(pipeline_path: pathlib.Path) -> dict[str, Any]:
         elif check["name"] == "edge_resolution":
             for entry in check["unresolved"]:
                 errors.append(f"unresolved edge: {entry}")
+        elif check["name"] == "command_binaries":
+            for entry in check["missing"]:
+                errors.append(entry)
 
     return {
         "status": "pass" if not errors else "fail",
