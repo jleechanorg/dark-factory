@@ -11,6 +11,7 @@ import traceback
 
 from .engine import run
 from .handlers import Context
+from .panic_hook import PANIC_EXIT_CODE
 from .parser import parse, validate_pipeline
 from .paths import resolve_factory_path, resolve_pipeline_path
 
@@ -55,7 +56,7 @@ def _record_cxdb_panic(
             output=traceback_text,
             metadata={
                 "event": "panic",
-                "returncode": "128",
+                "returncode": str(PANIC_EXIT_CODE),
             },
         )
         cxdb.end_run(run_id=run_id, final="error")
@@ -112,7 +113,7 @@ def _handle_panic(
             {
                 "event": "crash",
                 "run_id": run_id or "",
-                "exit_code": "128",
+                "exit_code": str(PANIC_EXIT_CODE),
                 "panic_artifact": str(panic_file),
                 "error": f"{type(exc).__name__}: {exc}",
             },
@@ -356,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         payload = _handle_panic(sys.exc_info()[1], args=args, ctx=ctx)
         print(json.dumps(payload, sort_keys=True, indent=2))
-        return 128
+        return PANIC_EXIT_CODE
 
 
 if __name__ == "__main__":
