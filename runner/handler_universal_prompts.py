@@ -1,0 +1,360 @@
+"""Universal + custom-prompt + slash gate family.
+
+Owns:
+  * `_slash_gate` — factory for ``/<command>`` reviewer gates with SHA binding.
+  * `UNIVERSAL_CODE_STANDARDS_PROMPT` — embedded prompt template.
+  * `UNIVERSAL_EVIDENCE_REVIEW_PROMPT` — embedded prompt template.
+  * `_run_universal_prompt_gate` — run a gate using an embedded universal
+    prompt (no local cmd file).
+  * `_node_prompt_ref` — read ``prompt="@path"`` attr.
+  * `_run_custom_prompt_gate` — render an authored ``prompt=`` template +
+    append the machine contract.
+  * `_gate_es` — es.md → slash OR universal fallback OR custom prompt.
+  * `_gate_er` — er.md / evidence_review.md → slash OR universal fallback
+    OR custom prompt.
+  * `_gate_code_standards` — code-standards.md → slash OR universal fallback
+    OR custom prompt.
+  * `UNIVERSAL_DEAD_CODE_PROMPT` — embedded prompt template (declared here so
+    the dead-code gate stays in the same family as the others).
+  * `_gate_dead_code` — dead-code.md → slash OR universal fallback OR custom
+    prompt.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Callable, Optional
+
+import runner.handlers as _handlers_shim
+
+from .handler_core import Result
+
+if TYPE_CHECKING:
+    from .parser import Node
+    from .handler_core import Context, Handler
+
+
+def _slash_gate(slash_command: str, default_args: str = "") -> "Handler":
+    """Build a handler that shells out to the reviewer backend with `/<command> <args>`."""
+
+    def handler(node: "Node", ctx: "Context") -> "Result":
+        args = node.attrs.get("args", default_args)
+        target = node.attrs.get("target", str(ctx.workdir))
+
+        # Echo backend: outcome from state hint, used by tests + CI. The
+        # echo path does not call out to a subprocess so SHA binding is not
+        # applicable — tests that exercise SHA binding must use the claude
+        # backend with a fake binary on PATH.
+        if ctx.backend in ("echo", "mock_llm"):
+            hint = ctx.state.get(f"{node.name}.outcome", "success")
+            return Result(
+                outcome=hint,
+                output=f"echo gate /{slash_command}: pre-seeded {hint}",
+                metadata={"slash_command": slash_command, "verdict": "echo:" + hint},
+            )
+
+        # SHA binding: compute the worktree HEAD and require the gate to
+        # echo it back. If we cannot compute a SHA (not a git worktree, git
+        # missing), the gate cannot be safely run — return `error`.
+        expected_sha = _handlers_shim._worktree_head_sha(ctx.workdir)
+        if expected_sha is None:
+            return Result(
+                outcome="error",
+                output=f"gate /{slash_command} cannot resolve HEAD SHA for {ctx.workdir}",
+                metadata={
+                    "slash_command": slash_command,
+                    "verdict": "unknown",
+                    "head_sha_status": "missing",
+                },
+            )
+
+        sha_directive = (
+            f"\n\n"
+            f"<!-- RUNNER BINDING REQUIREMENT (non-negotiable) -->\n"
+            f"expected_head_sha: {expected_sha}\n\n"
+            f"CRITICAL: Your response MUST include the following line verbatim "
+            f"(machine-parsed binding — do NOT omit it, paraphrase it, "
+            f"or put it inside a code block):\n"
+            f"head_sha: {expected_sha}\n\n"
+            f"Place this line near the top of your response, right after any "
+            f"header/context block. The pipeline runner rejects responses missing this line.\n"
+        )
+        prompt = f"/{slash_command} {args} {target}".strip() + sha_directive
+        timeout = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
+
+        # Reviewer backend routing + agy→claude infra fallback live in
+        # _execute_gate. The gate is read-only and SHA-bound regardless of
+        # which backend grades the diff.
+        backend, gate_meta = _handlers_shim._resolve_gate_backend(node, ctx)
+        result = _handlers_shim._execute_gate(prompt, expected_sha, timeout, ctx, slash_command, backend)
+        if gate_meta:
+            for k, v in gate_meta.items():
+                result.metadata.setdefault(k, v)
+        return result
+
+    handler.__name__ = f"_gate_{slash_command}"  # noqa: WPS125
+    return handler
+
+
+UNIVERSAL_CODE_STANDARDS_PROMPT = """\
+You are performing an automated, repository-agnostic Code Standards & Quality Review.
+Analyze the active repository changes and diff in the current workspace.
+
+You MUST audit the implementation against the following core principles:
+
+1. ZERO FRAMEWORK COGNITION (ZFC):
+   - Avoid dependency/framework bloat. Prioritize lightweight, native logical primitives.
+   - Do not pull in heavy abstractions or third-party wrappers unnecessarily.
+   - Ensure the solution uses standard library/native features where applicable.
+
+2. ROOT-CAUSE-FIRST ENGINEERING:
+   - Verify that the changes directly address the true root cause of the feature request or bug.
+   - Look for and reject "workaround" logic, such as generic try/catch suppression, defensive
+     fallback values, sanitizers, or clamp layers that merely mask upstream errors.
+   - Prohibit fixing symptoms when upstream prompts, schemas, or instructions should be corrected.
+
+3. CLEAN CODE & CODE QUALITY:
+   - Readability, proper modularity, clean interface boundaries, and appropriate type annotations.
+   - No trailing debugging logs/comments or placeholders.
+
+Provide a detailed review report listing:
+- A brief summary of scope.
+- Audit results for ZFC, Root-Cause-First, and Clean Code.
+- A bulleted list of any blockers and required fixes.
+
+CRITICAL FORMATTING INSTRUCTIONS:
+1. You MUST include a binding verification line:
+   head_sha: {expected_sha}
+
+2. You MUST conclude your review with:
+   verdict: <pass|warn|fail>
+"""
+
+
+UNIVERSAL_EVIDENCE_REVIEW_PROMPT = """\
+You are performing an automated, repository-agnostic Evidence Standards & Review check.
+Analyze the active repository changes, diff, and any generated evidence files in the workspace.
+
+You MUST audit the implementation's evidence against the following core standards:
+
+1. GIT PROVENANCE & STALENESS:
+   - Check that metadata records git provenance: HEAD SHA, branch, and merge base.
+   - Staleness is about whether the evidence still reflects the code under review,
+     NOT exact SHA equality with the current HEAD ({expected_sha}). PASS this standard
+     when HEAD is at, or a descendant of, the recorded evidence/fix commit AND the
+     production (non-test, non-evidence) files relevant to the claim are unchanged
+     between the recorded SHA and HEAD (verify with git, e.g.
+     `git merge-base --is-ancestor <recorded_sha> HEAD` plus a diff of the claim's
+     production paths). Committed in-repo evidence is EXPECTED to be an ancestor of
+     HEAD — a commit cannot embed its own tip SHA — so an evidence/fix commit that sits
+     one or more commits behind HEAD does NOT fail this standard as long as the certified
+     production code is unchanged. Ignore test-only and evidence-only commits when judging
+     staleness. Only fail when provenance is missing entirely, or when the certified
+     production behavior actually diverges between the recorded SHA and HEAD.
+
+2. METRICS & TELEMETRY:
+   - Execution duration (or equivalent timing) MUST be recorded — FAIL this standard if no
+     timing is present at all. Token usage and cost are OPTIONAL / best-effort: when the
+     executing backend or harness does not surface them, that is reported as "N/A (not
+     emitted by backend)" and MUST NOT fail this standard. PASS only when timing is present
+     (whether or not token/cost are available); do not fail solely on missing token or cost
+     figures.
+
+3. RESULT INVARIANTS:
+   - Ensure all executed scenarios are explicitly marked as passed with no silent failures.
+   - An intended RED/failing result that is clearly labeled as the proof state (e.g. a
+     bug-reproduction that must fail on vulnerable code) is a documented invariant, not a
+     silent failure.
+
+4. CHECKSUM INTEGRITY:
+   - Confirm that generated files are accompanied by valid checksums or integrity metadata.
+
+CRITICAL FORMATTING INSTRUCTIONS:
+1. You MUST include a binding verification line:
+   head_sha: {expected_sha}
+
+2. You MUST conclude your review with:
+   verdict: <pass|fail>
+"""
+
+
+def _run_universal_prompt_gate(
+    prompt_template: str, name: str, node: "Node", ctx: "Context"
+) -> "Result":
+    """Run a gate review using an embedded universal prompt (no local slash command file)."""
+    if ctx.backend in ("echo", "mock_llm"):
+        hint = ctx.state.get(f"{node.name}.outcome", "success")
+        return Result(
+            outcome=hint,
+            output=f"echo gate {name}: pre-seeded {hint}",
+            metadata={"slash_command": name, "verdict": "echo:" + hint},
+        )
+
+    expected_sha = _handlers_shim._worktree_head_sha(ctx.workdir)
+    if expected_sha is None:
+        return Result(
+            outcome="error",
+            output=f"gate {name} cannot resolve HEAD SHA for {ctx.workdir}",
+            metadata={"slash_command": name, "verdict": "unknown", "head_sha_status": "missing"},
+        )
+
+    sha_directive = (
+        f"\n\n<!-- RUNNER BINDING REQUIREMENT (non-negotiable) -->\n"
+        f"expected_head_sha: {expected_sha}\n\n"
+        f"CRITICAL: Your response MUST include the following line verbatim:\n"
+        f"head_sha: {expected_sha}\n"
+    )
+    prompt = prompt_template.format(expected_sha=expected_sha) + sha_directive
+    timeout = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
+
+    # Reviewer backend routing + agy→claude infra fallback live in
+    # _execute_gate (shared with _slash_gate).
+    backend, gate_meta = _handlers_shim._resolve_gate_backend(node, ctx)
+    result = _handlers_shim._execute_gate(prompt, expected_sha, timeout, ctx, name, backend)
+    if gate_meta:
+        for k, v in gate_meta.items():
+            result.metadata.setdefault(k, v)
+    return result
+
+
+def _node_prompt_ref(node: "Node") -> Optional[str]:
+    """Prompt template ref from node attrs (mirrors ``Node.prompt_ref``).
+
+    Reads ``attrs`` directly so gate routing also works for duck-typed test
+    nodes that don't carry the parser property.
+    """
+    ref = node.attrs.get("prompt")
+    if not ref:
+        return None
+    ref = str(ref)
+    return ref[1:] if ref.startswith("@") else ref
+
+
+def _run_custom_prompt_gate(node: "Node", ctx: "Context", name: str) -> "Result":
+    """Run a gate review using the node's own prompt template (``prompt="@path"``).
+
+    A graph that authors review instructions on a gate node owns the review
+    *content*; the runner still owns the machine contract — SHA binding and
+    the ``verdict: <pass|fail>`` marker are appended here so
+    ``_parse_verdict`` / ``_verify_head_sha_echo`` grade a custom gate
+    exactly like the slash and universal gates.
+    """
+    if ctx.backend in ("echo", "mock_llm"):
+        hint = ctx.state.get(f"{node.name}.outcome", "success")
+        return Result(
+            outcome=hint,
+            output=f"echo gate {name}: pre-seeded {hint}",
+            metadata={"slash_command": name, "verdict": "echo:" + hint},
+        )
+
+    expected_sha = _handlers_shim._worktree_head_sha(ctx.workdir)
+    if expected_sha is None:
+        return Result(
+            outcome="error",
+            output=f"gate {name} cannot resolve HEAD SHA for {ctx.workdir}",
+            metadata={"slash_command": name, "verdict": "unknown", "head_sha_status": "missing"},
+        )
+
+    rendered = _handlers_shim._render_prompt(node, ctx)
+    # _render_prompt degrades to a goal-only stub when the template is
+    # missing or outside the allowed roots. A coder node can limp along on
+    # the stub; a review gate must not silently grade with no instructions.
+    ref = _node_prompt_ref(node)
+    if f"(missing prompt: {ref})" in rendered or f"(invalid prompt: {ref})" in rendered:
+        return Result(
+            outcome="error",
+            output=f"gate {name}: prompt template unavailable: {ref}",
+            metadata={"slash_command": name, "verdict": "unknown", "prompt_status": "missing"},
+        )
+
+    contract = (
+        f"\n\nCRITICAL FORMATTING INSTRUCTIONS:\n"
+        f"1. You MUST include a binding verification line:\n"
+        f"   head_sha: {expected_sha}\n\n"
+        f"2. You MUST conclude your review with:\n"
+        f"   verdict: <pass|fail>\n"
+    )
+    sha_directive = (
+        f"\n\n<!-- RUNNER BINDING REQUIREMENT (non-negotiable) -->\n"
+        f"expected_head_sha: {expected_sha}\n\n"
+        f"CRITICAL: Your response MUST include the following line verbatim:\n"
+        f"head_sha: {expected_sha}\n"
+    )
+    prompt = rendered + contract + sha_directive
+    timeout = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
+
+    # Reviewer backend routing + agy→claude infra fallback live in
+    # _execute_gate (shared with _slash_gate / _run_universal_prompt_gate).
+    backend, gate_meta = _handlers_shim._resolve_gate_backend(node, ctx)
+    result = _handlers_shim._execute_gate(prompt, expected_sha, timeout, ctx, name, backend)
+    if gate_meta:
+        for k, v in gate_meta.items():
+            result.metadata.setdefault(k, v)
+    return result
+
+
+def _gate_es(node: "Node", ctx: "Context") -> "Result":
+    if _node_prompt_ref(node):
+        return _run_custom_prompt_gate(node, ctx, "gate_es")
+    local_es = ctx.workdir / ".claude" / "commands" / "es.md"
+    if local_es.exists():
+        return _slash_gate("es")(node, ctx)
+    return _run_universal_prompt_gate(UNIVERSAL_EVIDENCE_REVIEW_PROMPT, "gate_es", node, ctx)
+
+
+def _gate_er(node: "Node", ctx: "Context") -> "Result":
+    if _node_prompt_ref(node):
+        return _run_custom_prompt_gate(node, ctx, "gate_er")
+    local_er = ctx.workdir / ".claude" / "commands" / "er.md"
+    local_cmd = ctx.workdir / ".claude" / "commands" / "evidence_review.md"
+    if local_er.exists():
+        return _slash_gate("er")(node, ctx)
+    if local_cmd.exists():
+        return _slash_gate("evidence_review")(node, ctx)
+    return _run_universal_prompt_gate(UNIVERSAL_EVIDENCE_REVIEW_PROMPT, "gate_er", node, ctx)
+
+
+def _gate_code_standards(node: "Node", ctx: "Context") -> "Result":
+    if _node_prompt_ref(node):
+        return _run_custom_prompt_gate(node, ctx, "gate_code_standards")
+    local_cmd = ctx.workdir / ".claude" / "commands" / "code-standards.md"
+    if local_cmd.exists():
+        return _slash_gate("code-standards")(node, ctx)
+    return _run_universal_prompt_gate(UNIVERSAL_CODE_STANDARDS_PROMPT, "gate_code_standards", node, ctx)
+
+
+UNIVERSAL_DEAD_CODE_PROMPT = """\
+You are performing an automated Dead Code & Cleanliness Review.
+Analyze the active repository changes and diff in the current workspace.
+
+You MUST audit the implementation against the following core principles:
+
+1. DEAD CODE DETECTOR:
+   - Identify any commented-out code blocks, legacy comments that no longer apply, or debug prints.
+   - Look for any unused functions, classes, methods, or imports introduced or left behind in the modified files.
+   - Look for any unused variables or constants.
+
+2. CLEANUP INTEGRITY:
+   - Ensure old/legacy/dead code has been completely deleted rather than commented out or left dangling.
+   - Verify that all newly introduced primitives are actually used.
+
+Provide a detailed review report listing:
+- A brief summary of scope.
+- Audit results for Dead Code and Cleanup Integrity.
+- A bulleted list of any blockers and required fixes.
+
+CRITICAL FORMATTING INSTRUCTIONS:
+1. You MUST include a binding verification line:
+   head_sha: {expected_sha}
+
+2. You MUST conclude your review with:
+   verdict: <pass|fail>
+"""
+
+
+def _gate_dead_code(node: "Node", ctx: "Context") -> "Result":
+    if _node_prompt_ref(node):
+        return _run_custom_prompt_gate(node, ctx, "gate_dead_code")
+    local_cmd = ctx.workdir / ".claude" / "commands" / "dead-code.md"
+    if local_cmd.exists():
+        return _slash_gate("dead-code")(node, ctx)
+    return _run_universal_prompt_gate(UNIVERSAL_DEAD_CODE_PROMPT, "gate_dead_code", node, ctx)
