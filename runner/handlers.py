@@ -1575,14 +1575,33 @@ Analyze the active repository changes, diff, and any generated evidence files in
 You MUST audit the implementation's evidence against the following core standards:
 
 1. GIT PROVENANCE & STALENESS:
-   - Check if metadata captures the exact git HEAD SHA, branch, and merge base.
-   - Confirm that the SHA of the recorded evidence matches the current HEAD: {expected_sha}
+   - Check that metadata records git provenance: HEAD SHA, branch, and merge base.
+   - Staleness is about whether the evidence still reflects the code under review,
+     NOT exact SHA equality with the current HEAD ({expected_sha}). PASS this standard
+     when HEAD is at, or a descendant of, the recorded evidence/fix commit AND the
+     production (non-test, non-evidence) files relevant to the claim are unchanged
+     between the recorded SHA and HEAD (verify with git, e.g.
+     `git merge-base --is-ancestor <recorded_sha> HEAD` plus a diff of the claim's
+     production paths). Committed in-repo evidence is EXPECTED to be an ancestor of
+     HEAD — a commit cannot embed its own tip SHA — so an evidence/fix commit that sits
+     one or more commits behind HEAD does NOT fail this standard as long as the certified
+     production code is unchanged. Ignore test-only and evidence-only commits when judging
+     staleness. Only fail when provenance is missing entirely, or when the certified
+     production behavior actually diverges between the recorded SHA and HEAD.
 
 2. METRICS & TELEMETRY:
-   - Confirm that token usage, execution duration, and costs are accurately logged.
+   - Execution duration (or equivalent timing) MUST be recorded — FAIL this standard if no
+     timing is present at all. Token usage and cost are OPTIONAL / best-effort: when the
+     executing backend or harness does not surface them, that is reported as "N/A (not
+     emitted by backend)" and MUST NOT fail this standard. PASS only when timing is present
+     (whether or not token/cost are available); do not fail solely on missing token or cost
+     figures.
 
 3. RESULT INVARIANTS:
    - Ensure all executed scenarios are explicitly marked as passed with no silent failures.
+   - An intended RED/failing result that is clearly labeled as the proof state (e.g. a
+     bug-reproduction that must fail on vulnerable code) is a documented invariant, not a
+     silent failure.
 
 4. CHECKSUM INTEGRITY:
    - Confirm that generated files are accompanied by valid checksums or integrity metadata.
