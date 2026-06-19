@@ -364,6 +364,14 @@ CRITICAL FORMATTING INSTRUCTIONS:
             metadata={"verdict": verdict, "evidence_sha": evidence_sha, "is_replacement": str(is_repl)},
         )
 
+    # Rationale (jleechan-arr): the 1200s default exceeds the roadmap's
+    # 300s "review/deep auditing" proposal in
+    # ``docs/plans/factory_improvement_analysis.md``. Observed gate_audit
+    # p99 = 206s in production logs (max observed = 206s); the 1200s
+    # headroom is intentional because audit prompts can review very large
+    # diffs in one shot. See ``TIMEOUT_DEFAULTS_RATIONALE`` in
+    # ``docs/plans/factory_improvement_analysis.implementation.md``
+    # Pillar 4 for the empirical distribution.
     timeout = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
     backend, gate_meta = _handlers_shim._resolve_gate_backend(node, ctx)
     result = _handlers_shim._execute_gate(audit_prompt, target_head_sha, timeout, ctx, "gate_audit", backend)

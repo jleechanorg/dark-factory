@@ -216,14 +216,44 @@ policy table in `runner/parser.py` for future expansion.
 default is too low for some validation=true nodes. This is a separate
 bead-driven workstream, not a roadmap gap.
 
+**TIMEOUT_DEFAULTS_RATIONALE** (resolved by `jleechan-arr`, 2026-06-19):
+
+Empirical wall-clock evidence from `~/Library/Logs/dark-factory/**/*.jsonl`
+across 270+ production runs (33 real gate exits, 65 real codergen-class
+exits > 5s) shows the roadmap's per-class proposals are mis-calibrated for
+production traffic:
+
+| Class | Roadmap default | Current default | Observed p50 | Observed p90 | Observed p99 / max | Verdict |
+|---|---|---|---|---|---|---|
+| tool / local | 60s | 300s | n/a | n/a | n/a | roadmap minimum enforced as the *lower bound* guard rail (parser + preflight 60s); 300s actual `tool` default covers pytest + tooling budgets |
+| codergen / LLM | 180s | 1800s (claude/codex) / 600s (agy) | 276s | 585s | **1800s (timeout hits)** | roadmap value would timeout ≈ 50 % of observed claude runs at p50 alone |
+| gate_*/review | 300s | 1200s | 71s | 95s | 206s | roadmap value would suffice for the observed max (206s) but leaves no headroom for large diffs |
+
+The decision recorded by this PR is **option (b)**: the deviation from
+the roadmap's 60/180/300 table is **annotated**, not eliminated. The
+*minimum* threshold (60s, parser + preflight) is the actual guard rail
+and matches the roadmap. The *upper-bound* defaults in handler_codergen
+(1800s/600s) and the gate reviewer family (1200s) are co-located with
+their call sites and carry an inline `# Rationale:` comment + module
+docstring citation pointing to this section. A new test
+`tests/test_timeout_defaults_authority.py` asserts the deviation is
+annotated (every constant has the rationale block) so the annotation
+cannot be silently dropped in a future refactor.
+
+The `_TIMEOUT_DEFAULTS_BY_TYPE` policy table from the prior recommendation
+was NOT introduced — empirical evidence showed per-class defaults are
+heterogeneous enough (claude vs codex vs agy vs gates) that a single table
+would either lose fidelity or become a thin wrapper over the per-call-site
+literal. The per-call-site literal-with-rationale pattern is preferred.
+
 | Field | Value |
 |---|---|
-| Target files | `runner/handlers.py` (per-call-site defaults), `docs/plans/factory_improvement_analysis.md` (rationale addendum), `runner/parser.py` (optional `_TIMEOUT_DEFAULTS_BY_TYPE`) |
-| Entry point | `_coerce_timeout` in `runner/handlers.py:63` |
-| Success criterion | (a) a docs PR explains why current defaults differ from the roadmap's proposed numbers; (b) `_TIMEOUT_DEFAULTS_BY_TYPE` (if added) is exercised by `tests/test_parser.py` covering tool/codergen/review classes. |
-| Classification | doc-only + optional runner-change |
-| Status | needs-spec-first (decide whether to chase roadmap numbers or document deviation) |
-| Beads | depends on `jleechan-7ql` decision; no new bead needed at this layer |
+| Target files | `runner/handler_core.py`, `runner/handler_codergen.py`, `runner/handler_audit.py`, `runner/handler_universal_prompts.py`, `runner/handler_special_gates.py`, `runner/parser.py`, `runner/structural_preflight.py`, `docs/plans/factory_improvement_analysis.implementation.md`, `tests/test_timeout_defaults_authority.py` |
+| Entry point | `_coerce_timeout` in `runner/handler_core.py:55` |
+| Success criterion | (a) every timeout-default constant has a `# Rationale:` comment in the same module; (b) `tests/test_timeout_defaults_authority.py` pins that annotation; (c) existing `tests/test_timeout_value_pinning.py` + `tests/test_structural_preflight.py::test_threshold_constant_is_60` + 5 family timeout-attr tests stay green. |
+| Classification | doc-only + inline annotations + one new pinning test |
+| Status | **annotated-deviation** (option b chosen; empirical distribution recorded above) |
+| Beads | `jleechan-arr` (this PR); `jleechan-7ql` (closed, parent context) |
 
 ---
 
