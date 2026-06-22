@@ -2,9 +2,17 @@
 
 Owns:
   * `_render_prompt` — resolve ``@path``, enforce workdir-relative, holdout-deny,
-    substitute ``${goal}`` / ``${state.<key>}``. Mirrors
+    substitute ``${goal}`` / ``${state.<key>}` / ``${diff}``. Mirrors
     ``runner.handlers._render_prompt`` so ``tests/test_prompt_pinning.py`` can
     pin the same resolution order.
+
+Substitutions (in order):
+  * ``${goal}``     → the run-level goal text
+  * ``${state.<key>}`` → any ``ctx.state`` key, e.g. ``${state._last_output}``
+  * ``${diff}``     → the most recent codergen's ``git diff`` (G4), captured
+    automatically by ``_codergen`` on the success path. Defaults to
+    ``"(no diff captured)"`` when no codergen has run yet (or when the
+    capture silently failed because the workdir is not a git repo).
 """
 
 from __future__ import annotations
@@ -17,6 +25,23 @@ import runner.handlers as _handlers_shim
 if TYPE_CHECKING:
     from .parser import Node
     from .handler_core import Context
+
+
+def _substitute_placeholders(text: str, ctx: "Context") -> str:
+    """Apply ``${goal}`` / ``${state.<key>}`` / ``${diff}`` substitutions.
+
+    ``${diff}`` resolves to ``ctx.state["_last_diff"]`` if a successful
+    codergen stashed one, else the placeholder ``"(no diff captured)"`` so
+    reviewer prompts never render an empty cell where the diff should be.
+    """
+    text = text.replace("${goal}", ctx.goal)
+    for k, v in ctx.state.items():
+        text = text.replace("${state." + k + "}", v)
+    diff = ctx.state.get("_last_diff", "")
+    if not diff:
+        diff = "(no diff captured)"
+    text = text.replace("${diff}", diff)
+    return text
 
 
 def _render_prompt(node: "Node", ctx: "Context") -> str:
@@ -43,10 +68,7 @@ def _render_prompt(node: "Node", ctx: "Context") -> str:
         if not text_path.exists():
             return f"# {node.name}\n\nGoal: {ctx.goal}\n(missing prompt: {ref})"
         text = text_path.read_text()
-        text = text.replace("${goal}", ctx.goal)
-        for k, v in ctx.state.items():
-            text = text.replace("${state." + k + "}", v)
-        return text
+        return _substitute_placeholders(text, ctx)
     from .paths import factory_home
     root = ctx.workdir.resolve()
     p = (root / ref_path).resolve()
@@ -70,7 +92,4 @@ def _render_prompt(node: "Node", ctx: "Context") -> str:
     if not p.exists():
         return f"# {node.name}\n\nGoal: {ctx.goal}\n(missing prompt: {ref})"
     text = p.read_text()
-    text = text.replace("${goal}", ctx.goal)
-    for k, v in ctx.state.items():
-        text = text.replace("${state." + k + "}", v)
-    return text
+    return _substitute_placeholders(text, ctx)

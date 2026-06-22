@@ -1,0 +1,504 @@
+"""Static structural audit for dark-factory ``.dot`` pipelines.
+
+Detects two of the most expensive reviewer gaps in the G-tuple catalogued
+in ``docs/factory-evolve-research/reviewer-gap-taxonomy.md``:
+
+* **G1** — code-producing graph has no reviewer wired. A graph is
+  G1-positive when there exists a path from ``start`` to ``exit`` that
+  contains at least one code-producing node (resolved handler is
+  ``_codergen``) and contains **zero** reviewer nodes (handler type is
+  one of ``gate_es | gate_er | gate_code_standards | holdout_eval``).
+
+* **G2** — reviewer routes ``outcome!=success`` to ``exit`` instead of a
+  bounded fix loop. A graph is G2-positive when any edge ``reviewer ->
+  exit`` carries a condition whose normalized form is
+  ``outcome != success`` (or the equivalent ``outcome != "success"``).
+
+This module is **pure metadata analysis**. No LLM calls, no NL
+classification. Handler classification mirrors ``runner.handlers.resolve``
+EXACTLY so a node we say is "code-producing" is what the engine would
+actually invoke as ``_codergen`` at runtime. The structural analogy to
+``runner/healer.py``'s prefix routing is intentional: CLAUDE.md ZFC
+section exempts internal data routing over the engine's own node
+namespace from the "no heuristic classification" rule.
+
+The audit is invoked three ways:
+
+1. ``audit_graph(path)`` — returns ``list[Violation]`` for a single .dot.
+2. ``audit_graphs(dir)`` — walks ``dir.rglob("*.dot")`` and aggregates.
+3. ``python -m runner.graph_audit [pipeline_dir]`` — CLI; exit 0 if
+   no violations, exit 1 + human-readable report otherwise.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import sys
+from dataclasses import dataclass
+from typing import Iterable, Literal, Optional
+
+from . import handlers
+from .parser import (
+    Edge,
+    Graph,
+    Node,
+    _tokenize_condition,
+    is_exit_node,
+    is_start_node,
+    parse,
+)
+
+
+# ---------------------------------------------------------------------------
+# Constants mirrored from runner.handlers.{TYPE_REGISTRY,REGISTRY} and
+# runner.parser.{is_start_node,is_exit_node}. We intentionally read the
+# registries at runtime (instead of duplicating their contents) so the
+# audit cannot drift from the engine's actual handler resolution order.
+# ---------------------------------------------------------------------------
+
+# Topology-only DOT shapes that never reach ``_codergen`` at runtime.
+# Mirrors CLAUDE.md § "Handlers" and the comment in
+# ``runner/handler_codergen.py``'s contract tests: a ``point`` node is a
+# zero-width routing anchor; ``component`` and ``tripleoctagon`` are the
+# Kilroy fan-out / fan-in shape aliases registered in REGISTRY.
+TOPOLOGY_ONLY_SHAPES: frozenset[str] = frozenset({"point", "component", "tripleoctagon"})
+
+# Reviewer node types — the G1 / G2 violation target. Matched against the
+# node's resolved handler *name* so a node declared as
+# ``type="gate_er"`` is a reviewer even if the implementation moves it
+# between modules. Mirrors the keys in ``runner.handlers.TYPE_REGISTRY``
+# that gate / holdout the workflow at the boundary between coder output
+# and merge readiness.
+_REVIEWER_TYPE_NAMES: frozenset[str] = frozenset(
+    {"gate_es", "gate_er", "gate_code_standards", "holdout_eval"}
+)
+
+
+# ---------------------------------------------------------------------------
+# Advisory allowlist — pipelines that are exempt from the audit by
+# design. Each entry is a repo-relative path under the CWD and the
+# comment justifies *why* the graph is intentionally non-compliant.
+# ---------------------------------------------------------------------------
+ADVISORY_ALLOWLIST: set[str] = {
+    # Smoke graph — has no codergen node at all, exits via a hello
+    # workflow stub. Including it in the audit would force every
+    # smoke pipeline to declare a reviewer, which the Attractor
+    # benchmark explicitly forbids ("smoke must remain cheap").
+    "pipelines/factory/hello.dot",
+    # Parallel fan-out demo — topologically exhibits only fan-out /
+    # fan-in nodes; the audit's G1 path finder would always flag it
+    # because there are no codergen OR reviewer nodes by construction.
+    "pipelines/parallel_demo.dot",
+}
+
+
+# ---------------------------------------------------------------------------
+# Public types
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Violation:
+    """A single structural audit finding.
+
+    ``kind``        — "G1" (no reviewer wired) or "G2" (reviewer routes
+                       failure to exit instead of a fix loop).
+    ``pipeline``    — repo-relative POSIX path of the offending .dot.
+    ``location``    — node-and-edge locator (e.g. "reviewer_node ->
+                       exit") so a human can grep without re-parsing.
+    ``message``     — human-readable explanation; one short line.
+    """
+
+    kind: Literal["G1", "G2"]
+    pipeline: str
+    location: str
+    message: str
+
+
+# ---------------------------------------------------------------------------
+# Handler resolution — *must* match runner.handlers.resolve() exactly.
+# We re-implement here (instead of calling ``resolve``) because
+# ``resolve`` returns a callable, and we want a stable string label we
+# can compare to ``_REVIEWER_TYPE_NAMES``. The order is identical to
+# CLAUDE.md § "Handlers" and to runner.handlers.resolve():
+#
+#   1. explicit ``type=`` lookup in TYPE_REGISTRY
+#   2. name == "start" / "exit"  →  built-ins
+#   3. shape lookup in REGISTRY
+#   4. default  →  ``_codergen``
+# ---------------------------------------------------------------------------
+
+
+def _resolved_type_label(node: Node) -> str:
+    """Return the *type label* the engine would resolve this node to.
+
+    The label is one of:
+
+    * the string from ``node.attrs["type"]`` (if it resolves in
+      ``TYPE_REGISTRY``),
+    * ``"start"`` / ``"exit"`` for the built-in name/shape anchors,
+    * ``"conditional"`` / ``"parallel"`` / ``"join"`` for shape-only
+      registrations,
+    * ``"codergen"`` for the default fallback (any other node without
+      an explicit ``type`` that the engine would run as a coder).
+
+    For reviewer detection we only need to know whether the label is
+    one of ``_REVIEWER_TYPE_NAMES``; for code-producing detection we
+    only need to know whether the label is ``"codergen"``. Both
+    classifications come from the SAME resolution path so they
+    cannot drift apart.
+    """
+    t = node.attrs.get("type")
+    if t and t in handlers.TYPE_REGISTRY:
+        return str(t)
+    if is_start_node(node):
+        return "start"
+    if is_exit_node(node):
+        return "exit"
+    shape = node.shape
+    if shape in handlers.REGISTRY:
+        return str(shape)
+    return "codergen"
+
+
+def _is_code_producing(node: Node) -> bool:
+    """A node is code-producing iff the engine would invoke ``_codergen``.
+
+    Topology-only shapes never reach ``_codergen`` — they are routing
+    aliases registered in ``REGISTRY``. Nodes with an explicit
+    ``type=`` that resolves in ``TYPE_REGISTRY`` (gate_*, tool,
+    conditional, holdout_eval, parallel, join) are *not* code
+    producers because the engine dispatches them elsewhere.
+    """
+    if node.name in {"start", "exit"}:
+        return False
+    if node.shape in TOPOLOGY_ONLY_SHAPES:
+        return False
+    return _resolved_type_label(node) == "codergen"
+
+
+def _is_reviewer(node: Node) -> bool:
+    """A node is a reviewer iff its resolved type is in the reviewer set.
+
+    Includes both ``type="gate_*"`` / ``type="holdout_eval"`` AND any
+    future aliasing added to ``TYPE_REGISTRY`` under those names. Does
+    NOT include ``type="codergen"`` even if the node is ``class="review"`` —
+    the engine never resolves a ``class=review`` codergen to a reviewer
+    handler; the class is a styling hint, not a dispatch contract.
+    """
+    return _resolved_type_label(node) in _REVIEWER_TYPE_NAMES
+
+
+# ---------------------------------------------------------------------------
+# Condition normalisation — replicate parser._validate_condition's
+# token-shape check so we can ask "is this edge conditioned on
+# ``outcome != success``?" without re-implementing the whole grammar.
+# ---------------------------------------------------------------------------
+
+
+def _is_outcome_failure_condition(condition: Optional[str]) -> bool:
+    """Return True iff ``condition`` tokenises to ``outcome != success``.
+
+    Mirrors ``runner.parser._validate_condition``'s grammar: an
+    ``EQ``/``NEQ`` comparison between the literal ``outcome`` and the
+    literal ``success`` (with optional whitespace). Surrounding ``AND``
+    / ``OR`` clauses would make this a complex condition; we treat
+    those as NOT a simple failure routing, matching what the engine
+    actually evaluates as "the failure branch".
+    """
+    if not condition:
+        return False
+    tokens = _tokenize_condition(condition)
+    if tokens is None:
+        return False
+    # Drop leading/trailing NOT in the simple form.
+    cleaned: list[tuple[str, str]] = []
+    for kind, value in tokens:
+        if kind == "SPACE":
+            continue
+        cleaned.append((kind, value))
+    if len(cleaned) == 3:
+        word_kind, word_val, op_kind, op_val, rhs_kind, rhs_val = (
+            cleaned[0][0], cleaned[0][1],
+            cleaned[1][0], cleaned[1][1],
+            cleaned[2][0], cleaned[2][1],
+        )
+        if (
+            word_kind == "WORD" and word_val == "outcome"
+            and op_kind == "NEQ" and op_val == "!="
+            and rhs_val == "success"
+            and rhs_kind in ("WORD", "STRING")
+        ):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# G1: path-without-reviewer detection.
+#
+# We BFS from ``start`` over outgoing edges, keeping the visited
+# reviewer-set per path. We only care whether *any* path from start to
+# exit visits a code-producer AND zero reviewers. Implemented as a
+# recursive DFS with a ``visited + reviewer_seen`` state so we don't
+# re-explore branches that already passed through a reviewer.
+# ---------------------------------------------------------------------------
+
+
+def _find_unreviewed_code_paths(graph: Graph) -> list[tuple[str, ...]]:
+    """Return one witness path per ``start -> exit`` branch that
+    contains a code-producer and zero reviewer nodes.
+
+    The path is a tuple of node names ``(start, ..., exit)``. Multiple
+    witnesses can be returned if multiple branches qualify. Cycles are
+    bounded by not re-entering a node already on the current path.
+    """
+    start = _find_start_node(graph)
+    if start is None:
+        return []
+    out: list[tuple[str, ...]] = []
+    _dfs_witness(graph, start, (), False, out)
+    return out
+
+
+def _find_start_node(graph: Graph) -> Optional[str]:
+    for name, node in graph.nodes.items():
+        if is_start_node(node):
+            return name
+    return None
+
+
+def _dfs_witness(
+    graph: Graph,
+    current: str,
+    path: tuple[str, ...],
+    saw_reviewer: bool,
+    out: list[tuple[str, ...]],
+) -> None:
+    new_path = path + (current,)
+    node = graph.nodes[current]
+    saw_code = any(
+        _is_code_producing(graph.nodes[n]) for n in new_path
+    )
+    current_saw_reviewer = saw_reviewer or _is_reviewer(node)
+    outgoing = graph.outgoing(current)
+    if not outgoing:
+        # Dead-end (non-exit) leaf — not a witness unless it is exit.
+        if is_exit_node(node) and saw_code and not current_saw_reviewer:
+            out.append(new_path)
+        return
+    for edge in outgoing:
+        dst = edge.dst
+        # Cycle / re-visit guard: do not descend into a node already on
+        # the current path. (max_visits-style bounds are runtime
+        # concerns; here we only need to avoid infinite recursion.)
+        if dst in new_path:
+            if is_exit_node(graph.nodes[dst]) and saw_code and not current_saw_reviewer:
+                out.append(new_path + (dst,))
+            continue
+        # If dst is exit and condition blocks success, follow it ONLY
+        # as a witness when the conditional branch itself is the
+        # failure path. For G1 we treat any routing into exit as a
+        # candidate witness — the question is "does the branch contain
+        # a code-producer and zero reviewers?", not "would the engine
+        # actually take it on a successful run?"
+        _dfs_witness(graph, dst, new_path, current_saw_reviewer, out)
+
+
+# ---------------------------------------------------------------------------
+# G2: reviewer -> exit with outcome!=success.
+# ---------------------------------------------------------------------------
+
+
+def _find_g2_violations(graph: Graph, relpath: str) -> list[Violation]:
+    violations: list[Violation] = []
+    for edge in graph.edges:
+        src_node = graph.nodes.get(edge.src)
+        if src_node is None or not _is_reviewer(src_node):
+            continue
+        dst_node = graph.nodes.get(edge.dst)
+        if dst_node is None or not is_exit_node(dst_node):
+            continue
+        if _is_outcome_failure_condition(edge.condition):
+            violations.append(
+                Violation(
+                    kind="G2",
+                    pipeline=relpath,
+                    location=f"{edge.src} -> {edge.dst}",
+                    message=(
+                        f"reviewer node {edge.src!r} routes "
+                        f"outcome!=success directly to exit; failure "
+                        f"verdicts should loop back to a bounded fix "
+                        f"node, not exit"
+                    ),
+                )
+            )
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Public audit entrypoints
+# ---------------------------------------------------------------------------
+
+
+def audit_graph(path: pathlib.Path) -> list[Violation]:
+    """Audit a single ``.dot`` pipeline.
+
+    Library files (those that ``include="@..."`` other graphs and
+    declare no ``start``/``exit`` of their own — e.g.
+    ``pipelines/_base.dot``) are skipped silently: they are not
+    runnable, so the G1/G2 contract does not apply to them. Per the
+    spec the scanner walks them; it just does not report violations.
+
+    Parse errors on non-library files are surfaced as a synthetic
+    violation so a downstream driver can still report the file as
+    broken.
+    """
+    relpath = _relpath(path)
+    if relpath in ADVISORY_ALLOWLIST:
+        return []
+    try:
+        graph = parse(path)
+    except ValueError as exc:
+        # A "must contain both 'start' and 'exit' nodes" error on a
+        # file that has an `include` graph-attribute is a *library*,
+        # not a broken pipeline. The library contract is enforced by
+        # ``_resolve_includes``; scanning the bare library file
+        # produces the same ValueError regardless of contents. Skip
+        # such files silently — but ONLY when the raw file actually
+        # carries the library-defining ``include="@..."`` graph
+        # attribute. Otherwise the parse failure is real and the
+        # author needs to see the violation.
+        if "start" in str(exc) and "exit" in str(exc):
+            try:
+                raw = path.read_text(encoding="utf-8")
+            except OSError:
+                raw = ""
+            if 'include="@' in raw:
+                return []
+        return [
+            Violation(
+                kind="G1",
+                pipeline=relpath,
+                location="<parse>",
+                message=f"pipeline failed to parse: {type(exc).__name__}: {exc}",
+            )
+        ]
+    except Exception as exc:
+        return [
+            Violation(
+                kind="G1",
+                pipeline=relpath,
+                location="<parse>",
+                message=f"pipeline failed to parse: {type(exc).__name__}: {exc}",
+            )
+        ]
+
+    violations: list[Violation] = []
+
+    # G1 — at least one path from start to exit that visits a
+    # code-producer and zero reviewers.
+    code_producers = [n for n in graph.nodes.values() if _is_code_producing(n)]
+    if code_producers:
+        unreviewed = _find_unreviewed_code_paths(graph)
+        if unreviewed:
+            # One violation per witness path keeps the message
+            # actionable; collapse them if they share a code-producer
+            # to avoid spam when the same graph has many branches.
+            for witness in unreviewed:
+                producer_names = [
+                    n for n in witness if _is_code_producing(graph.nodes[n])
+                ]
+                producer = producer_names[0] if producer_names else "?"
+                violations.append(
+                    Violation(
+                        kind="G1",
+                        pipeline=relpath,
+                        location=" -> ".join(witness),
+                        message=(
+                            f"code-producing node {producer!r} has a path "
+                            f"to exit with no reviewer node (G1: graph "
+                            f"reaches exit un-reviewed)"
+                        ),
+                    )
+                )
+
+    # G2 — reviewer -> exit on outcome!=success.
+    violations.extend(_find_g2_violations(graph, relpath))
+
+    return violations
+
+
+def audit_graphs(pipeline_dir: pathlib.Path) -> list[Violation]:
+    """Walk ``pipeline_dir.rglob('*.dot')`` and audit every .dot found.
+
+    Subdirs (``pipelines/slim/``, ``pipelines/factory/``) and
+    include-fragments (``pipelines/_base.dot``) are all reached by
+    ``rglob``. The order is sorted so reports are deterministic across
+    filesystems.
+    """
+    if not pipeline_dir.exists():
+        raise FileNotFoundError(f"pipeline dir does not exist: {pipeline_dir}")
+    violations: list[Violation] = []
+    for dot in sorted(pipeline_dir.rglob("*.dot")):
+        violations.extend(audit_graph(dot))
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _relpath(path: pathlib.Path) -> str:
+    """Return the path as a repo-root-relative POSIX string for
+    consistent reporting. Falls back to absolute when the path is
+    not under the current working directory.
+    """
+    try:
+        return path.resolve().relative_to(pathlib.Path.cwd()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _format_report(violations: Iterable[Violation]) -> str:
+    lines = []
+    for v in violations:
+        lines.append(f"{v.kind} | {v.pipeline} | {v.location} | {v.message}")
+    return "\n".join(lines)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m runner.graph_audit",
+        description=(
+            "Static structural audit for dark-factory pipelines. "
+            "Exits 0 if no G1/G2 violations are found under the "
+            "given directory, 1 otherwise."
+        ),
+    )
+    parser.add_argument(
+        "pipeline_dir",
+        nargs="?",
+        default="pipelines",
+        help="Root directory to walk for *.dot files (default: ./pipelines).",
+    )
+    args = parser.parse_args(argv)
+
+    root = pathlib.Path(args.pipeline_dir)
+    try:
+        violations = audit_graphs(root)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if not violations:
+        print("OK: no G1/G2 violations found.")
+        return 0
+
+    print(_format_report(violations))
+    return 1
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

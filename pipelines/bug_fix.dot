@@ -103,9 +103,10 @@ digraph BugFix {
     reproduce  -> gate_red
 
     // Red gate: success means bug reproduced; failure means we couldn't
-    // reproduce — exit early instead of pretending to fix.
+    // reproduce — loop back to explore_in (per factory-evolve G1)
+    // so the coder re-investigates before attempting a fix.
     gate_red   -> fix          [condition="outcome=success"]
-    gate_red   -> exit         [condition="outcome!=success"]
+    gate_red   -> explore_in   [condition="outcome!=success"]
 
     // Fix loop: sealed holdouts then adversarial review on success, back to
     // fix on failure (max 3 visits).

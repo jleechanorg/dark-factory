@@ -41,7 +41,21 @@ digraph ReviewPR {
 
     start    -> review
     review   -> evidence  [condition="outcome=success"]
-    review   -> exit      [condition="outcome!=success"]
+    review   -> fix       [condition="outcome!=success"]
 
     evidence -> exit
+
+    // Bounded fix loop: when the cold fresh-eyes review rejects the diff,
+    // route through the fix prompt (bounded) so the lane can iterate on
+    // the artifact rather than exit silently unreviewed (G1: the
+    // evidence gate_er is the real merge-confidence reviewer).
+    fix [
+        type="codergen",
+        label="Fix & Iterate",
+        class="fix",
+        prompt="@prompts/slim/fix.md",
+        max_visits="3",
+        timeout=600
+    ]
+    fix -> review
 }

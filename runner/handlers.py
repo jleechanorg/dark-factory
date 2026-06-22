@@ -54,6 +54,8 @@ from .handler_ao import (
 # The single _codergen function (kept whole for the TYPE_REGISTRY contract).
 from .handler_codergen import (
     _codergen,
+    _capture_diff,
+    _DIFF_MAX_CHARS,
 )
 
 # Decision + state substitution.

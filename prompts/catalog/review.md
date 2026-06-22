@@ -6,6 +6,16 @@ ${goal}
 
 Use the current repository state and `spec.md`.
 
+## Implementing agent's diff (injected by G4)
+
+The dark-factory runner captured the implementing agent's `git diff` (unstaged + staged, truncated to 50k chars) right after the codergen step. Read this diff before any other review step — it is the primary artifact under review.
+
+```
+${diff}
+```
+
+If the diff is empty or reads "(no diff captured)", the implementing agent's run did not produce a measurable change (or the workdir is not a git repo). Flag that as a blocker before continuing — a review with no diff is meaningless.
+
 ## Required review steps
 
 1. **Diff-scoped correctness**: Verify the changed code is correct, complete, and

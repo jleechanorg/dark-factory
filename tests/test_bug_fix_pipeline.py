@@ -61,10 +61,19 @@ def test_bug_fix_runs_red_to_green_to_exit(tmp_path, monkeypatch):
 
 
 def test_bug_fix_exits_when_red_gate_cant_reproduce(tmp_path, monkeypatch):
-    """If the red gate fails (test passes — bug not reproduced), pipeline exits at gate_red."""
+    """If the red gate fails (test passes — bug not reproduced), the pipeline
+    routes back to the explore stage (per factory-evolve G1) so the coder
+    re-investigates rather than pretending to fix an un-reproduced bug.
+    fix must NOT run on a failed reproduction."""
     passing = tmp_path / "tests" / "test_passes.py"
     passing.parent.mkdir(parents=True, exist_ok=True)
     passing.write_text("def test_x():\n    assert 1 == 1\n")
+
+    # gate_red fails; reproduction is "successful" but the test already
+    # passes, so the red gate cannot confirm the bug reproduces.
+    monkeypatch.setitem(
+        TYPE_REGISTRY, "gate_red",
+        lambda node, ctx: Result(outcome="failure", output="RED: test did NOT fail"))
 
     def fake_codergen(node, ctx):
         if node.name == "reproduce":
@@ -79,12 +88,15 @@ def test_bug_fix_exits_when_red_gate_cant_reproduce(tmp_path, monkeypatch):
     history = run(g, ctx, max_steps=80)
 
     nodes = [r.node for r in history]
-    # We should hit gate_red and exit there (fix must NOT run when bug not reproduced)
+    # We should hit gate_red; failure routes back to explore_in, NOT to fix.
     assert "gate_red" in nodes
     assert "fix" not in nodes, (
         f"fix ran even though red gate failed; full path: {nodes}"
     )
-    assert history[-1].node == "exit"
+    # The loop eventually exhausts and terminates on the explore_in re-entry
+    # (engine exhausts the explore_fanout retry budget); history[-1].outcome
+    # is non-success.
+    assert history[-1].outcome != "success"
 
 
 def test_bug_fix_fix_loops_back_when_green_fails(tmp_path, monkeypatch):

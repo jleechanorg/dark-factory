@@ -1,0 +1,32 @@
+// Clean graph: codergen -> reviewer; reviewer routes success to exit,
+// failure to a bounded fix loop back into the reviewer. No G1, no G2.
+digraph clean {
+    graph [goal="clean reviewer graph"]
+    rankdir=LR
+
+    start  [shape=Mdiamond, label="Start"]
+    exit   [shape=Msquare,  label="Exit"]
+
+    coder [
+        type="codergen",
+        label="Coder",
+        prompt="@prompts/slim/implement.md"
+    ]
+    reviewer [
+        type="gate_er",
+        label="Reviewer",
+        timeout=600
+    ]
+    fix [
+        type="codergen",
+        label="Fix",
+        prompt="@prompts/slim/fix.md",
+        max_visits="3"
+    ]
+
+    start       -> coder
+    coder       -> reviewer
+    reviewer    -> exit [condition="outcome=success"]
+    reviewer    -> fix [condition="outcome!=success"]
+    fix         -> reviewer
+}
