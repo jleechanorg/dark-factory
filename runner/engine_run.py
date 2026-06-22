@@ -8,6 +8,7 @@ pair consumed by the main loop).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import threading
@@ -78,6 +79,12 @@ def run(
     """
     history: list = []
     visits: dict[str, int] = {}
+    # Per-node ring of recent output hashes for the no_progress detector
+    # (D3 in feedback 2026-06-22). When a node produces the same output
+    # hash on consecutive visits, the engine short-circuits to "exhausted"
+    # rather than burning LLM budget on a stuck fix loop. Opt-in via the
+    # node's `no_progress_max="N"` attribute (default 0 = disabled).
+    _no_progress_history: dict[str, list[str]] = {}
     current = _persist._start_node(graph)
     seq = 0  # CXDB sequence — independent of history length so refactors can't desync.
     ctx.last_completed_seq = seq
@@ -250,6 +257,44 @@ def run(
                 result = results[-1]
             else:
                 result = _obs._normalized_result(Result(outcome="success"))
+
+            # D3 (feedback 2026-06-22): semantic loop bound. When a node
+            # has `no_progress_max="N"` set, track the last N output hashes
+            # for that node. If all N match, the node is stuck — short-
+            # circuit to "exhausted" with reason="no_progress" instead of
+            # waiting for `max_visits` to fire. This catches the pattern
+            # where a fix-node returns `success` blindly (e.g. blind prompt
+            # with no test output) but the upstream failure never resolves.
+            no_progress_max = _edges._attr_int(current, "no_progress_max", 0)
+            if no_progress_max and result.output is not None:
+                head = (result.output or "")[:1024]
+                node_hash = hashlib.sha256(head.encode("utf-8")).hexdigest()
+                history_for_node = _no_progress_history.setdefault(current.name, [])
+                history_for_node.append(node_hash)
+                # Trim to the no_progress_max window
+                if len(history_for_node) > no_progress_max:
+                    history_for_node.pop(0)
+                if (
+                    len(history_for_node) == no_progress_max
+                    and len(set(history_for_node)) == 1
+                ):
+                    record = _persist.StepRecord(
+                        node=current.name,
+                        outcome="exhausted",
+                        ts=time.time(),
+                        output_preview=(
+                            f"no_progress_max={no_progress_max} reached — "
+                            f"output hash unchanged across last "
+                            f"{no_progress_max} visits"
+                        ),
+                        metadata={
+                            "no_progress": "true",
+                            "no_progress_max": str(no_progress_max),
+                            "stuck_hash": node_hash,
+                        },
+                    )
+                    seq = _persist._append_record(history, checkpoint, cxdb, ctx, seq, record, "")
+                    break
 
             branch_records: list[tuple] = []
             if current.attrs.get("parallel", False) and not _parallel._is_parallel_node(current):
