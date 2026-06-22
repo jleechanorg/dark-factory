@@ -69,14 +69,36 @@ def _seed_other_gates(ctx: Context) -> None:
     # gate_es is the first gate; we don't pre-seed it (we want to exercise
     # the real claude-backend path). gate_er / gate_cs are seeded so the
     # pipeline can complete without spawning more fake binaries.
+    # gate_skeptic and adversarial_reviewer are pre-seeded because they now
+    # sit between holdout and gate_es in the Level-5 topology.
+    ctx.state["gate_skeptic.outcome"] = "success"
+    ctx.state["adversarial_reviewer.outcome"] = "success"
     ctx.state["gate_er.outcome"] = "success"
     ctx.state["gate_cs.outcome"] = "success"
+
+
+def _mock_adversarial_reviewer(monkeypatch) -> None:
+    """Replace `tool` and `gate_skeptic` handlers with echo-seeded fakes so
+    the Level-5 pre-gate nodes (between holdout and gate_es) honor
+    ctx.state seeding instead of trying to run real CLIs."""
+    def fake_tool(node, ctx):
+        pre = ctx.state.get(f"{node.name}.outcome")
+        return Result(outcome=pre or "success", output=f"fake_tool({node.name})")
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_tool)
+    # gate_skeptic has no registered handler; default _codergen only honors
+    # ctx.state seeding in echo backend. Register an echo-seeded fake so
+    # backend=claude tests don't try to call a real LLM.
+    def fake_skeptic(node, ctx):
+        pre = ctx.state.get(f"{node.name}.outcome")
+        return Result(outcome=pre or "success", output=f"fake_skeptic({node.name})")
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_skeptic", fake_skeptic)
 
 
 def test_gate_missing_head_sha_echo_is_error(tmp_path, monkeypatch):
     """Verdict PASS but no head_sha line → outcome=error (NOT success)."""
     fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    _mock_adversarial_reviewer(monkeypatch)
 
     # Fake claude: prints a PASS verdict but does NOT echo head_sha.
     # Exit 0 so the rc!=0 fail-closed branch does NOT swallow the bug —
@@ -102,6 +124,7 @@ def test_gate_wrong_head_sha_echo_is_error(tmp_path, monkeypatch):
     """Verdict PASS with head_sha mismatching expected → outcome=error."""
     fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    _mock_adversarial_reviewer(monkeypatch)
 
     # 40-hex SHA that is guaranteed not to match the real worktree HEAD.
     wrong_sha = "0" * 40
@@ -135,6 +158,7 @@ def test_gate_correct_head_sha_echo_is_success(tmp_path, monkeypatch):
     """
     fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    _mock_adversarial_reviewer(monkeypatch)
 
     # The fake binary parses its own argv for `expected_head_sha:` and
     # echoes that value back as `head_sha:`. This is exactly what a real
@@ -170,6 +194,7 @@ def test_gate_sha_binding_preserves_rc_nonzero_fail_closed(tmp_path, monkeypatch
     behaviour from PR for `_parse_verdict`)."""
     fake_holdout = lambda node, ctx: Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    _mock_adversarial_reviewer(monkeypatch)
 
     script = (
         "#!/bin/sh\n"

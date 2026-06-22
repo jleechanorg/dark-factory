@@ -25,16 +25,33 @@ def test_gate_echo_seeded_outcome(monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    # adversarial_reviewer is type=tool; mock it so it honors ctx.state
+    # seeding (the real _tool handler runs subprocesses, not echo).
+    def fake_tool(node, ctx):
+        pre = ctx.state.get(f"{node.name}.outcome")
+        return Result(outcome=pre or "success", output=f"fake_tool({node.name})")
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_tool)
 
     g = parse(_pipeline("gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx.state["gate_skeptic.outcome"] = "success"
+    ctx.state["adversarial_reviewer.outcome"] = "success"
     ctx.state["gate_es.outcome"] = "success"
     ctx.state["gate_er.outcome"] = "success"
     ctx.state["gate_cs.outcome"] = "success"
 
     history = run(g, ctx, max_steps=20)
     nodes = [r.node for r in history]
-    assert nodes == ["start", "holdout", "gate_es", "gate_er", "gate_cs", "exit"]
+    assert nodes == [
+        "start",
+        "holdout",
+        "gate_skeptic",
+        "adversarial_reviewer",
+        "gate_es",
+        "gate_er",
+        "gate_cs",
+        "exit",
+    ]
     assert history[-1].outcome == "success"
 
 
@@ -42,12 +59,22 @@ def test_cxdb_records_steps(tmp_path, monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    def fake_tool(node, ctx):
+        pre = ctx.state.get(f"{node.name}.outcome")
+        return Result(outcome=pre or "success", output=f"fake_tool({node.name})")
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_tool)
 
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(_pipeline("gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=db_path)
     ctx.state.update(
-        {"gate_es.outcome": "success", "gate_er.outcome": "success", "gate_cs.outcome": "success"}
+        {
+            "gate_skeptic.outcome": "success",
+            "adversarial_reviewer.outcome": "success",
+            "gate_es.outcome": "success",
+            "gate_er.outcome": "success",
+            "gate_cs.outcome": "success",
+        }
     )
     run(g, ctx, max_steps=20)
     assert db_path.exists()
@@ -58,6 +85,8 @@ def test_cxdb_records_steps(tmp_path, monkeypatch):
     assert [r[0] for r in rows] == [
         "start",
         "holdout",
+        "gate_skeptic",
+        "adversarial_reviewer",
         "gate_es",
         "gate_er",
         "gate_cs",
@@ -86,9 +115,15 @@ def test_healer_reports_gate_infra_errors(tmp_path, monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    def fake_tool(node, ctx):
+        pre = ctx.state.get(f"{node.name}.outcome")
+        return Result(outcome=pre or "success", output=f"fake_tool({node.name})")
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_tool)
 
     g = parse(_pipeline("gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=tmp_path / "cxdb.sqlite")
+    ctx.state["gate_skeptic.outcome"] = "success"
+    ctx.state["adversarial_reviewer.outcome"] = "success"
     ctx.state["gate_es.outcome"] = "success"
     ctx.state["gate_er.outcome"] = "error"
 
@@ -104,12 +139,22 @@ def test_healer_no_failures(tmp_path, monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    def fake_tool(node, ctx):
+        pre = ctx.state.get(f"{node.name}.outcome")
+        return Result(outcome=pre or "success", output=f"fake_tool({node.name})")
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_tool)
 
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(_pipeline("gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=db_path)
     ctx.state.update(
-        {"gate_es.outcome": "success", "gate_er.outcome": "success", "gate_cs.outcome": "success"}
+        {
+            "gate_skeptic.outcome": "success",
+            "adversarial_reviewer.outcome": "success",
+            "gate_es.outcome": "success",
+            "gate_er.outcome": "success",
+            "gate_cs.outcome": "success",
+        }
     )
     run(g, ctx, max_steps=20)
 

@@ -94,6 +94,170 @@ def _diagnostic(rule: str, severity: str, message: str, node_id: str | None = No
     return {"rule": rule, "severity": severity, "message": message, "node_id": node_id}
 
 
+# Level-5 invariants — see
+# project_2026-06-22_g3_closure_dynamic_node_design.md for the locked design.
+#
+# Trigger: pipelines/factory/*.dot (excluding hello.dot smoke lane) OR any
+# .dot with graph [level5="true"] attribute. Slim / hello / library fragments
+# are exempt so iteration lanes don't fight the rule.
+
+_LEVEL5_HARD_TIER_REVIEWERS = ("codex exec", "agy --print", "claude -p")
+
+
+def _is_level5_path(path: pathlib.Path) -> bool:
+    """True iff the path falls under pipelines/factory/ but is not the smoke lane.
+
+    Library fragments (`_*.dot`) are pre-filtered by the walker; we still
+    defend against explicit invocations to keep the invariant strict.
+    """
+    if path.name.startswith("_"):
+        return False
+    try:
+        rel = path.relative_to(ROOT)
+    except ValueError:
+        return False
+    parts = rel.parts
+    if len(parts) < 2 or parts[0] != "pipelines" or parts[1] != "factory":
+        return False
+    # `hello.dot` is the smoke / wiring lane — never a Level-5 pipeline.
+    return path.name != "hello.dot"
+
+
+def _has_cross_vendor_reviewer(graph, graph_backend: str | None) -> bool:
+    """A reviewer node whose `command` starts with a known reviewer CLI AND
+    is not the same vendor family as the graph's `backend` attribute (if
+    set). Empty/unset backend always passes the cross-vendor requirement
+    (the runner decides at run-time).
+    """
+    graph_vendor = (graph_backend or "").strip().lower() or None
+    for node in graph.nodes.values():
+        command = str(node.attrs.get("command", "") or "").strip().lower()
+        if not command:
+            continue
+        for prefix in _LEVEL5_HARD_TIER_REVIEWERS:
+            if command.startswith(prefix):
+                # If the graph pins a backend, the reviewer must be a
+                # different vendor. Codex CLI vs. claude backend, agy vs.
+                # claude, etc. Unknown/unset graph vendor = always OK.
+                if graph_vendor is None:
+                    return True
+                prefix_vendor = prefix.split()[0]  # e.g. "codex" or "agy"
+                if prefix_vendor != graph_vendor and prefix_vendor != "claude":
+                    return True
+                # `claude -p` with a non-claude backend counts as cross-vendor.
+                if prefix_vendor == "claude" and graph_vendor != "claude":
+                    return True
+                return False
+    return False
+
+
+def _check_level5(graph, path: pathlib.Path) -> list[dict]:
+    """Run the Level-5 rule set; return diagnostics (empty when exempt)."""
+    diagnostics: list[dict] = []
+
+    graph_attrs = getattr(graph, "attrs", {}) or {}
+    graph_level5 = str(graph_attrs.get("level5", "")).strip().lower() == "true"
+    if not (graph_level5 or _is_level5_path(path)):
+        return diagnostics
+
+    graph_backend = str(graph_attrs.get("backend", "") or "").strip() or None
+
+    # --- HARD TIER (errors) ---
+
+    has_gate_er = False
+    has_gate_skeptic = False
+    for node in graph.nodes.values():
+        ntype = str(node.attrs.get("type", "") or "").strip().lower()
+        if ntype in {"gate_er", "gate_evidence_audit"}:
+            has_gate_er = True
+        if ntype == "gate_skeptic" or node.name == "gate_skeptic":
+            has_gate_skeptic = True
+
+    if not has_gate_er:
+        diagnostics.append(
+            _diagnostic(
+                "missing_hard_tier_gate",
+                "error",
+                "Level-5 graph must contain a node with type=\"gate_er\" "
+                "(evidence review). See G3 closure design.",
+            )
+        )
+    if not has_gate_skeptic:
+        diagnostics.append(
+            _diagnostic(
+                "missing_hard_tier_gate",
+                "error",
+                "Level-5 graph must contain a node with type=\"gate_skeptic\" "
+                "(inverted-incentive skeptic review). See G3 closure design.",
+            )
+        )
+    if not _has_cross_vendor_reviewer(graph, graph_backend):
+        diagnostics.append(
+            _diagnostic(
+                "missing_hard_tier_gate",
+                "error",
+                "Level-5 graph must contain a cross-vendor adversarial "
+                "reviewer node (command starting with one of: "
+                + ", ".join(_LEVEL5_HARD_TIER_REVIEWERS)
+                + ") that is not the same vendor as the graph backend.",
+            )
+        )
+
+    # --- SOFT TIER (warnings; skip_<x>="true" allows opt-out) ---
+
+    skip_holdout = str(graph_attrs.get("skip_holdout", "")).strip().lower() == "true"
+    skip_spec = str(graph_attrs.get("skip_spec_validation", "")).strip().lower() == "true"
+
+    has_holdout = any(
+        str(node.attrs.get("type", "") or "").strip().lower() == "holdout_eval"
+        for node in graph.nodes.values()
+    )
+    if not has_holdout and not skip_holdout:
+        diagnostics.append(
+            _diagnostic(
+                "missing_soft_tier_node",
+                "warning",
+                "Level-5 graph is missing a holdout_eval node; opt out with "
+                "graph [skip_holdout=\"true\"] when no production code is "
+                "touched.",
+            )
+        )
+
+    has_healer = any(
+        node.name == "healer"
+        or (
+            str(node.attrs.get("type", "") or "").strip().lower() == "tool"
+            and "df-healer" in str(node.attrs.get("command", "") or "")
+        )
+        for node in graph.nodes.values()
+    )
+    if not has_healer:
+        # Healer is post-failure only — soft tier without an opt-out flag.
+        diagnostics.append(
+            _diagnostic(
+                "missing_soft_tier_node",
+                "warning",
+                "Level-5 graph is missing a `healer` node (typically a "
+                "`type=\"tool\"` running `df-healer`). The Healer is "
+                "post-failure only, so this is advisory.",
+            )
+        )
+
+    has_spec = any(node.name == "spec_validation" for node in graph.nodes.values())
+    if not has_spec and not skip_spec:
+        diagnostics.append(
+            _diagnostic(
+                "missing_soft_tier_node",
+                "warning",
+                "Level-5 graph is missing a `spec_validation` node; opt out "
+                "with graph [skip_spec_validation=\"true\"] when iterating "
+                "on an existing spec.",
+            )
+        )
+
+    return diagnostics
+
+
 def _validate_one(path: pathlib.Path) -> tuple[list[dict], dict | None]:
     diagnostics: list[dict] = []
     try:
@@ -114,6 +278,7 @@ def _validate_one(path: pathlib.Path) -> tuple[list[dict], dict | None]:
                     node.name,
                 )
             )
+    diagnostics.extend(_check_level5(graph, path))
     return diagnostics, {
         "path": _display_path(path),
         "status": "pass" if not any(d["severity"] == "error" for d in diagnostics) else "fail",
