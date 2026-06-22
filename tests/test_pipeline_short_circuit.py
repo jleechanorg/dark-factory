@@ -25,18 +25,33 @@ def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    def fake_tool(node, ctx):
+        pre = ctx.state.get(f"{node.name}.outcome")
+        return Result(outcome=pre or "success", output=f"fake_tool({node.name})")
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_tool)
 
     g = parse(_pipeline("pr_gates.dot"))
     assert g.nodes["holdout"].attrs.get("type") == "holdout_eval"
 
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx.state["gate_skeptic.outcome"] = "success"
+    ctx.state["adversarial_reviewer.outcome"] = "success"
     ctx.state["gate_es.outcome"] = "success"
     ctx.state["gate_er.outcome"] = "success"
     ctx.state["gate_cs.outcome"] = "success"
 
     history = run(g, ctx, max_steps=20)
     nodes = [r.node for r in history]
-    assert nodes == ["start", "holdout", "gate_es", "gate_er", "gate_cs", "exit"]
+    assert nodes == [
+        "start",
+        "holdout",
+        "gate_skeptic",
+        "adversarial_reviewer",
+        "gate_es",
+        "gate_er",
+        "gate_cs",
+        "exit",
+    ]
     assert history[-1].outcome == "success"
 
 
@@ -63,9 +78,15 @@ def test_gate_failure_short_circuits(monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    def fake_tool(node, ctx):
+        pre = ctx.state.get(f"{node.name}.outcome")
+        return Result(outcome=pre or "success", output=f"fake_tool({node.name})")
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_tool)
 
     g = parse(_pipeline("gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx.state["gate_skeptic.outcome"] = "success"
+    ctx.state["adversarial_reviewer.outcome"] = "success"
     ctx.state["gate_es.outcome"] = "success"
     ctx.state["gate_er.outcome"] = "failure"  # fail at /er
     ctx.state["gate_cs.outcome"] = "success"
@@ -83,6 +104,17 @@ def test_gate_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    def fake_tool(node, ctx):
+        pre = ctx.state.get(f"{node.name}.outcome")
+        return Result(outcome=pre or "success", output=f"fake_tool({node.name})")
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_tool)
+    # gate_skeptic has no registered handler; default _codergen would call
+    # claude --print /gate_skeptic (no such command). Mock it so the test
+    # can focus on the gate_es rc!=0 spoof scenario.
+    def fake_skeptic(node, ctx):
+        pre = ctx.state.get(f"{node.name}.outcome")
+        return Result(outcome=pre or "success", output=f"fake_skeptic({node.name})")
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_skeptic", fake_skeptic)
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -93,6 +125,8 @@ def test_gate_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path):
 
     g = parse(_pipeline("gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="claude")
+    ctx.state["gate_skeptic.outcome"] = "success"
+    ctx.state["adversarial_reviewer.outcome"] = "success"
 
     history = run(g, ctx, max_steps=20)
 

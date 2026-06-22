@@ -1,0 +1,137 @@
+// Reference Level-5 (G3 closure) pipeline.
+//
+// This is the canonical implementation of the G3 closure design (see
+// project_2026-06-22_g3_closure_dynamic_node_design.md, bead jleechan-0qy).
+// It is what every `pipelines/factory/*.dot` should converge toward:
+//
+//   * 4 default coding nodes (explore / plan / implement / fix). Each is
+//     a single-phase .dot invocation; the Claude Workflow orchestrator
+//     is responsible for dispatching these as separate .dot runs.
+//   * Hard-tier reviewers (gate_er / gate_skeptic / adversarial_reviewer)
+//     are always present; `bin/conformance validate` rejects factory
+//     pipelines that drop them.
+//   * Soft-tier nodes (holdout_eval / healer / spec_validation) are
+//     present by default; skip flags allow opt-out on iteration lanes.
+//   * `graph [level5="true"]` forces the level5 rule even on non-factory
+//     paths that include this graph.
+
+digraph Level5Feature {
+    graph [
+        goal="Reference Level-5 pipeline: explore/plan/implement/fix default nodes + hard-tier reviewers + soft-tier evaluators."
+        level5="true"
+        label="Level-5 Feature (reference)"
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    // -- Default coding nodes (driver-aware via ctx.backend) -----------------
+    // No `type="dynamic"`, no `default=` fallback, no separate static nodes.
+    // Each node is a single codergen invocation; the Claude Workflow
+    // orchestrator dispatches successive .dot runs (one per node) using
+    // the pipeline `level5="true"` attribute as the orchestration key.
+
+    explore [
+        type="codergen",
+        label="Explore",
+        class="explore",
+        prompt="@prompts/slim/explore.md",
+        max_visits="2",
+        timeout=600
+    ]
+    plan [
+        type="codergen",
+        label="Plan",
+        class="plan",
+        prompt="@prompts/slim/plan.md",
+        max_visits="2",
+        timeout=600
+    ]
+    implement [
+        type="codergen",
+        label="Implement",
+        class="implement",
+        prompt="@prompts/slim/implement.md",
+        max_visits="3",
+        timeout=600
+    ]
+    fix [
+        type="codergen",
+        label="Fix & Iterate",
+        class="fix",
+        prompt="@prompts/slim/fix.md",
+        max_visits="3",
+        timeout=600
+    ]
+
+    // -- Hard-tier reviewers (Level-5 conformance surface) -------------------
+
+    gate_skeptic [
+        type="gate_skeptic",
+        label="Skeptic (inverted-incentive review)",
+        timeout=600
+    ]
+    adversarial_reviewer [
+        type="tool",
+        label="Adversarial reviewer (cross-vendor)",
+        command="codex exec --yolo --skip-git-repo-check",
+        timeout=600
+    ]
+    gate_er [
+        type="gate_er",
+        label="/er Evidence Review",
+        timeout=600
+    ]
+
+    // -- Soft-tier nodes (default-present) -----------------------------------
+
+    holdout_eval [
+        type="holdout_eval",
+        label="Behavioral Holdouts",
+        timeout=600
+    ]
+    healer [
+        type="tool",
+        label="Healer (post-failure)",
+        command="df-healer --cxdb ${ctx.cxdb_path}",
+        timeout=600
+    ]
+    spec_validation [
+        type="codergen",
+        label="Spec Validation",
+        prompt="@prompts/slim/spec_validation.md",
+        timeout=600
+    ]
+
+    // -- Topology ------------------------------------------------------------
+    //
+    // The Claude Workflow orchestrator runs each .dot invocation from the
+    // success/failure of the previous one. Within a single .dot run, the
+    // engine still walks the conditional edges below.
+
+    start       -> explore
+    explore     -> plan         [condition="outcome=success"]
+    explore     -> fix          [condition="outcome!=success"]
+    plan        -> implement    [condition="outcome=success"]
+    plan        -> fix          [condition="outcome!=success"]
+    implement   -> gate_skeptic [condition="outcome=success"]
+    implement   -> fix          [condition="outcome!=success"]
+
+    gate_skeptic        -> adversarial_reviewer [condition="outcome=success"]
+    gate_skeptic        -> fix                  [condition="outcome!=success"]
+    adversarial_reviewer -> gate_er             [condition="outcome=success"]
+    adversarial_reviewer -> fix                 [condition="outcome!=success"]
+
+    gate_er     -> holdout_eval [condition="outcome=success"]
+    gate_er     -> fix          [condition="outcome!=success"]
+
+    holdout_eval -> spec_validation [condition="outcome=success"]
+    holdout_eval -> fix             [condition="outcome!=success"]
+    spec_validation -> healer       [condition="outcome!=success"]
+
+    fix -> explore
+
+    healer    -> exit [condition="outcome=success"]
+    spec_validation -> exit [condition="outcome=success"]
+}
