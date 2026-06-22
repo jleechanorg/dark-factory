@@ -26,5 +26,11 @@ results/holdout_results.json
 # Misc test artifacts
 *_test.log
 
+# Nested clone artifact left by factory pipeline runs (not canonical)
+origin/
+
+# Skeptic-gate run report (per-PR ephemeral; not canonical history)
+specs/skeptic-report.json
+
 # But: rendered diagram PNGs in diagrams/png/ are canonical docs, not test artifacts
 !diagrams/png/*.png
