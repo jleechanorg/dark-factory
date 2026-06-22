@@ -10,6 +10,26 @@ List edge cases, race/finish-commit concerns, persistence failures, and
 invariants the design must preserve. Flag localized-patch temptations to
 reject — places where the obvious quick fix creates a worse long-term shape.
 
+## Lazy senior dev lens (apply before naming risks)
+
+Source: `~/.claude/skills/ponytail/SKILL.md`
+(mirror of <https://github.com/DietrichGebert/ponytail/blob/main/.github/copilot-instructions.md>).
+
+Two ponytail rules drive this sub-agent's framing:
+
+- **Bug fix = root cause, not symptom.** A risk report that names a symptom
+  ("X can fail when Y") is not yet done. Trace Y back to the shared function
+  it depends on, and name that function. The plan agent needs the upstream
+  cause to decide whether to centralize or fix in place.
+- **Shortest working diff wins — but only once you understand the problem.**
+  A "patch-trap warning" must name the wart the small diff would entrench,
+  not just the size of the diff. "Three lines, but locks us into a global
+  mutex" is a real trap; "three lines" alone is not.
+
+Lazy code without its check is unfinished. For every invariant listed, name
+the assertion or test that currently checks it (or note that no check
+exists — that's a risk too).
+
 ## Output
 
 Write `.dark-factory/explore-risks.md` in the target repo. Sections:

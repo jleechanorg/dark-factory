@@ -9,6 +9,27 @@ Identify the fields, flags, modules, routes, state keys, and event types this go
 touches. Grep/search the repo for every reference; list writers and readers with
 `path:line` citations.
 
+## Lazy senior dev lens (apply before naming concepts)
+
+Source: `~/.claude/skills/ponytail/SKILL.md`
+(mirror of <https://github.com/DietrichGebert/ponytail/blob/main/.github/copilot-instructions.md>).
+
+Run the seven-rung ladder against the goal before enumerating concepts:
+
+1. Does this need to be built at all? (YAGNI)
+2. Does it already exist in this codebase? Reuse the helper, util, or pattern
+   that's already here — don't re-write it.
+3. Does the standard library already do this?
+4. Does a native platform feature cover it?
+5. Does an already-installed dependency solve it?
+6. Can this be one line?
+7. Only then: write the minimum code that works.
+
+For *this* (concepts) sub-agent, the ladder's output is a **concept inventory
+gated by rung 2**: list a concept only if it has a real owner and reader in
+the visible repo. A concept with no readers and no writers is a YAGNI trap
+— note it under "Open questions" so the plan agent can drop it.
+
 ## Output
 
 Write `.dark-factory/explore-concepts.md` in the target repo. Sections:
