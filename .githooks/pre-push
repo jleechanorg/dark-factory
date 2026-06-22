@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Shim — mirrors /Users/jleechan/.config/git/hooks/pre-push pattern.
+# Real logic lives in pre-push-graph-audit.sh (and any future pre-push siblings).
+
+set -euo pipefail
+exec "$(git rev-parse --show-toplevel)/.githooks/pre-push-graph-audit.sh" "$@"

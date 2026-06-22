@@ -72,6 +72,21 @@ uv pip install --python "${PYTHON_BIN}" -r "${REPO_ROOT}/requirements.txt"
 echo "==> verifying import"
 "${PYTHON_BIN}" -c "import pydot, yaml; print('deps ok:', pydot.__version__)"
 
+# Configure repo-local git hooks (.githooks/) so the pre-push graph-audit
+# guard fires before any push. Mirrors the .github/workflows/ci.yml:35
+# step locally. Setting core.hooksPath is local-only (.git/config), so
+# other operators' checkouts and CI runners are unaffected. Idempotent:
+# skips if already pointing at .githooks.
+if [[ -d "${REPO_ROOT}/.githooks" ]]; then
+  current_hooks_path="$(git -C "${REPO_ROOT}" config --get core.hooksPath 2>/dev/null || true)"
+  if [[ "${current_hooks_path}" != ".githooks" ]]; then
+    git -C "${REPO_ROOT}" config core.hooksPath .githooks
+    echo "==> configured core.hooksPath=.githooks (was: '${current_hooks_path:-<unset>}')"
+  else
+    echo "==> core.hooksPath already .githooks"
+  fi
+fi
+
 chmod +x "${BIN_DIR}/dark-factory" "${BIN_DIR}/df-healer" "${BIN_DIR}/df-validate"
 
 if [[ "${LINK}" -eq 1 ]]; then
