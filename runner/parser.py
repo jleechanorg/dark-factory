@@ -21,7 +21,7 @@ AttrValue = str | int | bool
 
 _GRAPH_INT_ATTRS = {"default_max_retries"}
 _NODE_INT_ATTRS = {"max_retries", "max_visits", "timeout", "join_quorum", "k"}
-_NODE_BOOL_ATTRS = {"allow_partial", "goal_gate", "validation", "parallel"}
+_NODE_BOOL_ATTRS = {"allow_partial", "goal_gate", "validation", "parallel", "gate_strict"}
 _EDGE_INT_ATTRS = {"weight"}
 _STYLE_RULE_RE = re.compile(
     r"(?P<selector>[^\n{]+)\{\s*(?P<body>[^}]*)\}",

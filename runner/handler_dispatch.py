@@ -100,7 +100,8 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
 
 
 def _run_gate_once(
-    backend: str, prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str
+    backend: str, prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str,
+    *, gate_strict: bool = False,
 ) -> "Result":
     """Run one reviewer-gate attempt on ``backend`` and classify the result.
 
@@ -169,7 +170,7 @@ def _run_gate_once(
                       "head_sha_status": "missing", "reviewer_backend": reviewer_backend},
         )
     combined = proc.stdout + "\n" + proc.stderr
-    verdict, normalized = _handlers_shim._parse_verdict(combined)
+    verdict, normalized = _handlers_shim._parse_verdict(combined, gate_strict=gate_strict)
     # SHA binding check comes BEFORE collapsing to pass/fail so a spoofed-pass
     # with the wrong SHA collapses to `error`, not `success`.
     sha_ok, observed_sha = _handlers_shim._verify_head_sha_echo(combined, expected_sha)
@@ -396,7 +397,8 @@ def _coerce_bool_attr(value: object) -> bool:
 
 
 def _execute_gate(
-    prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str, backend: str
+    prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str, backend: str,
+    *, gate_strict: bool = False,
 ) -> "Result":
     """Run a reviewer gate on ``backend``; infra failures fall back to claude.
 
@@ -417,12 +419,12 @@ def _execute_gate(
     ``codex`` actually invokes the codex subprocess, with
     ``reviewer_backend: codex`` recorded in the result metadata.
     """
-    result = _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name)
+    result = _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name, gate_strict=gate_strict)
     # minimax shares the claude CLI binary but grades via a different
     # gateway/model, so claude is still a genuine infra fallback for it.
     claude_routed = backend in ("claude", "claude-sonnet")
     if _is_gate_infra_failure(result) and not claude_routed:
-        fallback = _run_gate_once("claude", prompt, expected_sha, timeout, ctx, name)
+        fallback = _run_gate_once("claude", prompt, expected_sha, timeout, ctx, name, gate_strict=gate_strict)
         fallback.metadata["fallback_used"] = "true"
         fallback.metadata["fallback_from"] = backend
         if _is_gate_infra_failure(fallback):

@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import runner.handlers as _handlers_shim
 
-from .handler_core import Result
+from .handler_core import Result, _gate_strict_flag
 
 if TYPE_CHECKING:
     from .parser import Node
@@ -98,7 +98,10 @@ def _slash_gate(slash_command: str, default_args: str = "") -> "Handler":
         # _execute_gate. The gate is read-only and SHA-bound regardless of
         # which backend grades the diff.
         backend, gate_meta = _handlers_shim._resolve_gate_backend(node, ctx)
-        result = _handlers_shim._execute_gate(prompt, expected_sha, timeout, ctx, slash_command, backend)
+        result = _handlers_shim._execute_gate(
+            prompt, expected_sha, timeout, ctx, slash_command, backend,
+            gate_strict=_gate_strict_flag(node),
+        )
         if gate_meta:
             for k, v in gate_meta.items():
                 result.metadata.setdefault(k, v)
@@ -222,7 +225,10 @@ def _run_universal_prompt_gate(
     # Reviewer backend routing + agy→claude infra fallback live in
     # _execute_gate (shared with _slash_gate).
     backend, gate_meta = _handlers_shim._resolve_gate_backend(node, ctx)
-    result = _handlers_shim._execute_gate(prompt, expected_sha, timeout, ctx, name, backend)
+    result = _handlers_shim._execute_gate(
+        prompt, expected_sha, timeout, ctx, name, backend,
+        gate_strict=_gate_strict_flag(node),
+    )
     if gate_meta:
         for k, v in gate_meta.items():
             result.metadata.setdefault(k, v)
@@ -298,7 +304,10 @@ def _run_custom_prompt_gate(node: "Node", ctx: "Context", name: str) -> "Result"
     # Reviewer backend routing + agy→claude infra fallback live in
     # _execute_gate (shared with _slash_gate / _run_universal_prompt_gate).
     backend, gate_meta = _handlers_shim._resolve_gate_backend(node, ctx)
-    result = _handlers_shim._execute_gate(prompt, expected_sha, timeout, ctx, name, backend)
+    result = _handlers_shim._execute_gate(
+        prompt, expected_sha, timeout, ctx, name, backend,
+        gate_strict=_gate_strict_flag(node),
+    )
     if gate_meta:
         for k, v in gate_meta.items():
             result.metadata.setdefault(k, v)
