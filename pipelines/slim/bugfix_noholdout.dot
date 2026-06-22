@@ -57,6 +57,7 @@ digraph MinimalPRNoHoldout {
   gate_er [
     type="gate_er",
     label="/er Evidence Review",
+    gate_strict="true",
     timeout=600
   ]
 
