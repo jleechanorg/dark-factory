@@ -16,6 +16,14 @@ ${diff}
 
 If the diff is empty or reads "(no diff captured)", the implementing agent's run did not produce a measurable change (or the workdir is not a git repo). Flag that as a blocker before continuing — a review with no diff is meaningless.
 
+## Engine-computed lint findings (injected by F5)
+
+The dark-factory runner ran a fixed-pattern lint pass over the workdir before rendering this prompt. Findings are pre-computed (not interpreted from the diff) so you can grade them deterministically. The block is a Markdown table or `(none)`.
+
+${lint_findings}
+
+For each `fail` finding: confirm the rationale applies to the diff (the runner scans the entire workdir, not just changed files — call out if a hit is in unchanged code). For each `warn` finding: spot-check only.
+
 ## Required review steps
 
 1. **Diff-scoped correctness**: Verify the changed code is correct, complete, and
