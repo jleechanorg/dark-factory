@@ -59,13 +59,29 @@ _PROMPT_ATTR_RE = re.compile(r'prompt\s*=\s*"?@([^"\s]+)"?')
 
 
 def _all_dot_files() -> list[pathlib.Path]:
-    """Return every .dot file in the repo, excluding worktree copies and include-only fragments."""
+    """Return every .dot file in the repo, excluding worktree copies,
+    include-only fragments, and test fixtures.
+
+    Excludes:
+      * `.claude/worktrees/**` — nested-clone copies left behind by
+        worktree-driven PR iteration.
+      * `_*` stems — include-only fragments referenced from a parent
+        ``include="@_base.dot"`` attribute; never resolved standalone.
+      * `tests/fixtures/**` — deliberately-invalid conformance fixtures
+        (e.g. ``level5_missing_gate.dot``, ``level5_valid.dot``) used to
+        exercise the conformance validator's diagnostic path. Their
+        ``@prompts/hello/spec_validation.md`` references are intentionally
+        unresolved; pinning them here would conflate "deliberately broken
+        fixture" with "broken real pipeline".
+    """
     out: list[pathlib.Path] = []
     for path in ROOT.rglob("*.dot"):
         parts = path.parts
         if ".claude" in parts and "worktrees" in parts:
             continue
         if path.stem.startswith("_"):
+            continue
+        if "tests" in parts and "fixtures" in parts:
             continue
         out.append(path)
     return sorted(out)
