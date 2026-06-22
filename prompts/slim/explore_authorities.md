@@ -14,6 +14,26 @@ authoritative. Call out:
 - Streaming vs non-streaming branches
 - Persistence boundaries (where authoritative state diverges from cached state)
 
+## Lazy senior dev lens (apply before naming authorities)
+
+Source: `~/.claude/skills/ponytail/SKILL.md`
+(mirror of <https://github.com/DietrichGebert/ponytail/blob/main/.github/copilot-instructions.md>).
+
+The ladder's "fix the shared function once" rule maps directly onto authority
+analysis:
+
+- **One guard at the shared function is a smaller diff than one guard per caller.**
+  When you find a "conflicting authorities" case, do NOT name multiple writers
+  as acceptable. Name the single upstream authority that should win, and call
+  out the projections that become read-only mirrors.
+- **A bug report names a symptom. Grep every caller of the function you touch.**
+  When you flag a god-mode path, list every caller it bypasses; the plan agent
+  needs the full set to decide whether to centralize or leave the bypass.
+
+Mark intentional simplifications with a `ponytail:` comment when you call
+out a ceiling (legacy projection kept for compatibility, streamed branch kept
+for backpressure, etc.).
+
 ## Output
 
 Write `.dark-factory/explore-authorities.md` in the target repo. Sections:

@@ -17,6 +17,25 @@ findings artifact the plan node will consume.
 Goal:
 ${goal}
 
+## Lazy senior dev lens (apply during stitching)
+
+Source: `~/.claude/skills/ponytail/SKILL.md`
+(mirror of <https://github.com/DietrichGebert/ponytail/blob/main/.github/copilot-instructions.md>).
+
+Before stitching, run the seven-rung ladder against the goal one more time.
+The four partials have each covered their angle (concepts, authorities,
+reuse, risks); your job is to surface the ladder's verdict at the consolidated
+level:
+
+- If the four partials together imply a feature that is not actually
+  requested (YAGNI), flag it in the summary line — do NOT invent a design
+  to satisfy it.
+- If the reuse partial names an in-tree helper that the concepts partial
+  duplicated, mark the duplication explicitly so the plan node can drop it.
+- If the authorities partial flagged a god-mode path and the risks partial
+  named a sibling caller, the consolidated finding is "fix the shared
+  function once" — make that the summary, not two separate findings.
+
 ## Input (must read all four)
 
 - `.dark-factory/explore-concepts.md`
