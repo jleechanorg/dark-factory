@@ -10,7 +10,7 @@
 
 **The dark-factory in-pipeline reviewer nodes are NOT wired into this repo's own PR CI.** Only two workflows run on a PR:
 
-```
+```shell
 .github/workflows/ci.yml          -> "test"     (pytest)
 .github/workflows/skeptic-gate.yml -> "skeptic"  (cron-skeptic claim verifier)
 ```

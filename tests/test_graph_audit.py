@@ -126,6 +126,8 @@ def test_classification_table(attrs, is_code, is_review):
     [
         ("outcome!=success", True),
         ("outcome != success", True),
+        ('outcome!="success"', True),     # quoted RHS — STRING token
+        ("outcome!='success'", True),     # single-quoted RHS
         ("outcome=success", False),
         ("outcome == success", False),
         (None, False),

@@ -227,7 +227,8 @@ def _is_outcome_failure_condition(condition: Optional[str]) -> bool:
         if (
             word_kind == "WORD" and word_val == "outcome"
             and op_kind == "NEQ" and op_val == "!="
-            and rhs_kind == "WORD" and rhs_val == "success"
+            and rhs_val == "success"
+            and rhs_kind in ("WORD", "STRING")
         ):
             return True
     return False
@@ -364,21 +365,17 @@ def audit_graph(path: pathlib.Path) -> list[Violation]:
         # not a broken pipeline. The library contract is enforced by
         # ``_resolve_includes``; scanning the bare library file
         # produces the same ValueError regardless of contents. Skip
-        # such files silently.
+        # such files silently — but ONLY when the raw file actually
+        # carries the library-defining ``include="@..."`` graph
+        # attribute. Otherwise the parse failure is real and the
+        # author needs to see the violation.
         if "start" in str(exc) and "exit" in str(exc):
-            # Detect library files: re-read the raw file and look for
-            # ``include="@..."`` on a graph attr. A library is *by
-            # design* missing start/exit; the parser rejects it only
-            # because ``require_start_exit`` defaults to True. We do
-            # NOT pay the parse cost twice — try ``parse(...,
-            # require_start_exit=False)`` once to confirm.
             try:
-                parse(path, require_start_exit=False)
+                raw = path.read_text(encoding="utf-8")
+            except OSError:
+                raw = ""
+            if 'include="@' in raw:
                 return []
-            except Exception:
-                # Not a library, just a broken pipeline — fall through
-                # to the violation report below.
-                pass
         return [
             Violation(
                 kind="G1",

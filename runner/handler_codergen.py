@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import re
 import signal
 import subprocess
@@ -86,10 +87,21 @@ def _capture_diff(workdir: "Path | str | None") -> str:
     agent writes inside its AO-managed worktree — ``ctx.workdir`` is
     the runner cwd, not the coder's tree, so the caller must pass the
     AO worktree string when present.
+
+    Defense in depth: ``ctx.state["ao.worktree"]`` is set by the AO
+    backend itself, but a forged state value could point ``git -C`` at
+    any filesystem location. Reject anything that isn't an absolute,
+    non-traversing path to an existing directory. Best-effort: a bad
+    path returns ``""`` so the renderer's ``(no diff captured)``
+    placeholder is what the reviewer reads, never a partial diff
+    from the wrong repo.
     """
     if not workdir:
         return ""
-    wd = str(workdir)
+    wd_path = pathlib.Path(str(workdir))
+    if not wd_path.is_absolute() or ".." in wd_path.parts or not wd_path.is_dir():
+        return ""
+    wd = str(wd_path)
     try:
         unstaged = subprocess.run(
             ["git", "-C", wd, "diff"],
@@ -127,8 +139,21 @@ def _stash_diff(node: "Node", ctx: "Context") -> None:
     """
     workdir: "Path | str | None" = None
     ao_wt = ctx.state.get("ao.worktree")
+    # Defense in depth: a forged or stale ``ao.worktree`` value could
+    # point ``git -C`` at an unintended repo. Validate before use;
+    # fall back to ``ctx.workdir`` if the AO worktree is missing,
+    # relative, traversing, or doesn't exist.
+    ao_wt_valid = False
     if ao_wt:
-        workdir = ao_wt
+        ao_path = pathlib.Path(str(ao_wt))
+        if (
+            ao_path.is_absolute()
+            and ".." not in ao_path.parts
+            and ao_path.is_dir()
+        ):
+            ao_wt_valid = True
+    if ao_wt_valid:
+        workdir = str(ao_wt)
     else:
         try:
             workdir = ctx.workdir

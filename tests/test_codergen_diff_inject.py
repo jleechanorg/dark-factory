@@ -88,6 +88,10 @@ def test_capture_diff_for_tracked_modification(tmp_path: pathlib.Path) -> None:
 
     node = _make_node("impl")
     ctx = Context(goal="diff capture test", workdir=tmp_path, backend="echo")
+    # Drive the echo backend deterministically via the same outcome
+    # seed the engine would inject on a successful run; protects the
+    # test from any future change that gates echo on the state slot.
+    ctx.state["impl.outcome"] = "success"
     result = _codergen(node, ctx)
 
     assert result.outcome == "success", f"echo backend should succeed; got {result.outcome}: {result.output}"
