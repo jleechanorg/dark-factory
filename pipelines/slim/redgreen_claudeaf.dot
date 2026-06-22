@@ -23,11 +23,24 @@ digraph redgreen_claudeaf {
     gate_es [type="gate_es", label="/es Evidence Standards", backend_priority="claude-sonnet", timeout=600]
     gate_er [type="gate_er", label="/er Evidence Review",     backend_priority="claude-sonnet", timeout=600]
 
+    // Bounded fix loop: any reviewer verdict other than success routes here
+    // so a failing gate iterates on the artifact rather than terminating
+    // (per factory-evolve G2 fix-loop contract).
+    fix [
+        type="codergen",
+        label="Fix & Iterate",
+        class="fix",
+        prompt="@prompts/slim/fix.md",
+        max_visits="3",
+        timeout=600
+    ]
+
     start   -> test
     test    -> gate_es [condition="outcome=success"]
     test    -> exit    [condition="outcome!=success"]
     gate_es -> gate_er [condition="outcome=success"]
-    gate_es -> exit    [condition="outcome!=success"]
+    gate_es -> fix     [condition="outcome!=success"]
     gate_er -> exit    [condition="outcome=success"]
-    gate_er -> exit    [condition="outcome!=success"]
+    gate_er -> fix     [condition="outcome!=success"]
+    fix -> test
 }

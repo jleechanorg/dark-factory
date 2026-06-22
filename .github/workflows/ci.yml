@@ -31,3 +31,6 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
+
+      - name: Graph structural audit (G1/G2 dogfooding)
+        run: python -m runner.graph_audit pipelines

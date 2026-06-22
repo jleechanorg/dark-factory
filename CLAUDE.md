@@ -214,3 +214,8 @@ Each node emits `ENTER` on visit and `EXIT` with classified outcome (`success`, 
    `tool` nodes when separating coder and reviewer/evaluator CLIs.
 6. Use `model_stylesheet="path.model.css"` when a graph needs CSS-like
    backend/model routing without cluttering every node.
+7. Every code-producing graph must route a reviewer `outcome!=success` to a bounded
+   `fix` loop, not to `exit`; CI enforces this via `runner.graph_audit`. G4: reviewer
+   prompts that need the implementing agent's diff should reference `${diff}` in their
+   template; `_codergen` captures it automatically and stashes in
+   `ctx.state['<node>.diff']` and `ctx.state['_last_diff']`.

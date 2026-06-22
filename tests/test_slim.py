@@ -128,6 +128,10 @@ def test_minimal_research_factory_runs_with_deterministic_gates(monkeypatch, tmp
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
     graph = parse(ROOT / "pipelines" / "slim" / "minimal_research.dot")
     ctx = Context(goal="research some code", workdir=ROOT, backend="echo")
+    # gate_er is echo-short-circuited by --backend echo; pre-seed a success
+    # verdict so the lane exits deterministically without invoking a real
+    # reviewer (per factory-evolve G1, research must pass a reviewer).
+    ctx.state["gate_er.outcome"] = "success"
 
     history = run(graph, ctx, checkpoint=tmp_path / "checkpoint.json")
 
@@ -144,6 +148,7 @@ def test_minimal_research_factory_runs_with_deterministic_gates(monkeypatch, tmp
         "explore_stitch",
         "explore_out",
         "research",
+        "gate_er",
         "exit",
     ]
 

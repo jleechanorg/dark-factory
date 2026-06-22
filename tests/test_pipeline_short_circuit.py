@@ -41,7 +41,8 @@ def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
 
 
 def test_pr_gates_holdout_failure_short_circuits(monkeypatch):
-    """A holdout failure in pr_gates exits immediately — no evidence gates run."""
+    """A holdout failure in pr_gates routes to the fix loop (per factory-evolve
+    G2) instead of exiting. Evidence gates do not run on a holdout failure."""
     def fake_holdout(node, ctx):
         return Result(outcome="failure", output="holdout FAIL")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
@@ -52,8 +53,10 @@ def test_pr_gates_holdout_failure_short_circuits(monkeypatch):
     history = run(g, ctx, max_steps=20)
     nodes = [r.node for r in history]
     assert "gate_es" not in nodes
-    assert history[-1].node == "exit"
-    assert history[-1].outcome == "failure"
+    # The fix node loops back to holdout (bounded by max_visits). The pipeline
+    # terminates once the fix loop exhausts (history[-1].outcome != success).
+    assert "fix" in nodes
+    assert history[-1].outcome in ("failure", "exhausted")
 
 
 def test_gate_failure_short_circuits(monkeypatch):
@@ -69,8 +72,11 @@ def test_gate_failure_short_circuits(monkeypatch):
 
     history = run(g, ctx, max_steps=20)
     nodes = [r.node for r in history]
-    assert nodes == ["start", "holdout", "gate_es", "gate_er", "exit"]
-    assert history[-1].outcome == "failure"
+    # gate_er failure now routes to fix (which loops back to holdout), not exit.
+    # The run terminates when fix's max_visits is exhausted.
+    assert "gate_er" in nodes
+    assert "fix" in nodes
+    assert history[-1].outcome in ("failure", "exhausted")
 
 
 def test_gate_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path):

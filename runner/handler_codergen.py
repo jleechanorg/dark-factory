@@ -51,6 +51,7 @@ import re
 import signal
 import subprocess
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import runner.handlers as _handlers_shim
@@ -60,6 +61,82 @@ from .handler_core import Result
 if TYPE_CHECKING:
     from .parser import Node
     from .handler_core import Context
+
+# G4 diff-injection cap. Hard limit on the diff we paste into reviewer
+# prompts to avoid blowing past LLM context windows on large PRs. The
+# note appended on truncation surfaces the original byte count so the
+# reviewer knows the diff was lossy (it can re-fetch via git if it
+# needs the rest).
+_DIFF_MAX_CHARS = 50_000
+
+
+def _capture_diff(workdir: "Path | str | None") -> str:
+    """Best-effort ``git diff`` capture for reviewer prompts (G4).
+
+    Returns ``git diff`` + ``git diff --staged`` concatenated with a blank
+    line. Returns an empty string on any failure (no workdir, git missing,
+    not a repo, subprocess errors). The caller decides what to do with the
+    empty result — by convention it is stashed verbatim into
+    ``ctx.state["_last_diff"]`` so subsequent codergen calls see no diff
+    yet and the renderer's default ``(no diff captured)`` placeholder is
+    what the reviewer reads.
+
+    The workdir may be either a Path (ctx.workdir) or a string
+    (ctx.state["ao.worktree"]). For the AO backend, the implementing
+    agent writes inside its AO-managed worktree — ``ctx.workdir`` is
+    the runner cwd, not the coder's tree, so the caller must pass the
+    AO worktree string when present.
+    """
+    if not workdir:
+        return ""
+    wd = str(workdir)
+    try:
+        unstaged = subprocess.run(
+            ["git", "-C", wd, "diff"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        staged = subprocess.run(
+            ["git", "-C", wd, "diff", "--staged"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    parts = []
+    if unstaged.returncode == 0 and unstaged.stdout:
+        parts.append(unstaged.stdout)
+    if staged.returncode == 0 and staged.stdout:
+        parts.append(staged.stdout)
+    if not parts:
+        return ""
+    raw = "\n".join(parts)
+    if len(raw) <= _DIFF_MAX_CHARS:
+        return raw
+    truncated = raw[:_DIFF_MAX_CHARS]
+    note = f"\n... (truncated, full diff is {len(raw)} bytes)"
+    return truncated + note
+
+
+def _stash_diff(node: "Node", ctx: "Context") -> None:
+    """Stash the captured diff into ``ctx.state`` for reviewer prompts.
+
+    Writes both ``ctx.state["<node.name>.diff"]`` (per-node, scoped) and
+    ``ctx.state["_last_diff"]`` (rolling, the most recent successful
+    codergen diff — what ``${diff}`` substitutes against). Best-effort:
+    if git fails or the workdir is not a repo, ``_last_diff`` becomes
+    ``""`` (which the renderer turns into ``"(no diff captured)"``).
+    """
+    workdir: "Path | str | None" = None
+    ao_wt = ctx.state.get("ao.worktree")
+    if ao_wt:
+        workdir = ao_wt
+    else:
+        try:
+            workdir = ctx.workdir
+        except AttributeError:
+            workdir = None
+    diff = _capture_diff(workdir)
+    ctx.state[f"{node.name}.diff"] = diff
+    ctx.state["_last_diff"] = diff
 
 
 def _codergen(node: "Node", ctx: "Context") -> "Result":
@@ -85,6 +162,8 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         # (same convention as human_gate pre-seeding).
         pre = ctx.state.get(f"{node.name}.outcome")
         outcome = pre if pre is not None else "success"
+        if outcome == "success":
+            _stash_diff(node, ctx)
         return Result(outcome=outcome, output=prompt_text, metadata=meta)
 
     if backend == "mock_llm":
@@ -135,6 +214,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             "total_tokens": str(total_tokens),
             "wall_ms": str(wall_ms),
         }
+        _stash_diff(node, ctx)
         return Result(outcome="success", output=content_text, metadata=meta)
 
     if backend == "ao":
@@ -225,6 +305,8 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 "returncode": str(proc.returncode),
             }
             meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
+            if outcome == "success":
+                _stash_diff(node, ctx)
             return Result(
                 outcome=outcome,
                 output=f"ao spawn session={sess_name} worktree={worktree} activity={activity}",
@@ -309,6 +391,8 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             "returncode": str(proc.returncode),
         }
         meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
+        if outcome == "success":
+            _stash_diff(node, ctx)
         return Result(
             outcome=outcome,
             output=f"ao send session={session} activity={activity}",
@@ -373,6 +457,8 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         output = output_text + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
         meta = {"returncode": str(proc.returncode)}
         meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
+        if outcome == "success":
+            _stash_diff(node, ctx)
         return Result(outcome=outcome, output=output, metadata=meta)
     elif backend == "codex":
         args = _handlers_shim._sandboxed_args(["codex", "exec", "--yolo", "--skip-git-repo-check", prompt_text])
@@ -488,6 +574,8 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         metrics = _handlers_shim._codergen_metrics(stdout, stderr, wall_ms)
         meta = {"returncode": str(proc.returncode)}
         meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
+        if outcome == "success":
+            _stash_diff(node, ctx)
         return Result(outcome=outcome, output=output, metadata=meta)
     else:
         return Result(outcome="failure", output=f"unknown backend {backend!r}")
@@ -500,6 +588,8 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
     metrics = _handlers_shim._codergen_metrics(proc.stdout, proc.stderr, wall_ms)
     meta = {"returncode": str(proc.returncode)}
     meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
+    if outcome == "success":
+        _stash_diff(node, ctx)
     return Result(
         outcome=outcome,
         output=output,

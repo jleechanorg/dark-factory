@@ -22,5 +22,30 @@ digraph MinimalResearchFactory {
 
   start -> explore_in
   explore_out -> research
-  research -> exit
+  // Research is a code-producing node; on non-success, loop back to the
+  // explore stage (bounded by the explore fan-in's max_visits semantics in
+  // _base.dot) rather than exit unreviewed (G1: research findings must
+  // pass through the explore refine cycle before the run terminates).
+  // Evidence review at the lane boundary: research findings must pass a
+  // gate_er before the run terminates (factory-evolve G1). On a non-success
+  // verdict the fix prompt iterates the research artifact (bounded by
+  // fix.max_visits).
+  gate_er [
+    type="gate_er",
+    label="/er Evidence Review",
+    timeout=600
+  ]
+  fix [
+    type="codergen",
+    label="Fix & Iterate",
+    class="fix",
+    prompt="@prompts/slim/fix.md",
+    max_visits="3",
+    timeout=600
+  ]
+
+  research -> gate_er
+  gate_er -> exit   [condition="outcome=success"]
+  gate_er -> fix    [condition="outcome!=success"]
+  fix -> research
 }
