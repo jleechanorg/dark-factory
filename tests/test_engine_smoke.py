@@ -42,6 +42,9 @@ def test_gate_echo_seeded_outcome(monkeypatch):
 
     history = run(g, ctx, max_steps=20)
     nodes = [r.node for r in history]
+    # `__run_end__` is a synthetic CXDB step (P-B) that surfaces the
+    # uncommitted-state snapshot; it is NOT appended to the in-memory
+    # `history` list, so the assertion here stays on the original 8.
     assert nodes == [
         "start",
         "holdout",
@@ -82,6 +85,9 @@ def test_cxdb_records_steps(tmp_path, monkeypatch):
     db = CXDB(db_path)
     rows = list(db._conn.execute("SELECT node FROM steps ORDER BY seq").fetchall())
     db.close()
+    # P-B adds a synthetic `__run_end__` step carrying the uncommitted-state
+    # metadata so the Healer (P-C) can sub-cluster exhausted runs with vs
+    # without work sitting in the worktree. Real .dot nodes always come first.
     assert [r[0] for r in rows] == [
         "start",
         "holdout",
@@ -91,6 +97,7 @@ def test_cxdb_records_steps(tmp_path, monkeypatch):
         "gate_er",
         "gate_cs",
         "exit",
+        "__run_end__",
     ]
 
 

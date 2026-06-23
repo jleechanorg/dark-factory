@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -284,6 +286,152 @@ def _outcome_counts(history: list["object"]) -> tuple[int, int, int]:
         else:
             failure += 1
     return success, failure, error
+
+
+# git diff --shortstat prints: "<N> files changed, <N> insertions(+), <N> deletions(-)"
+# but only when there ARE changes. The shape can also drop a section when
+# only insertions or only deletions occurred. Pre-compile so we don't pay
+# the re-compile cost on every run_end.
+_DIFF_SHORTSTAT_RE = re.compile(
+    r"(?P<files>\d+) files? changed"
+    r"(?:, (?P<ins>\d+) insertions?\(\+\))?"
+    r"(?:, (?P<del>\d+) deletions?\(-\))?"
+)
+
+
+def _collect_uncommitted_state(workdir: Optional[pathlib.Path]) -> dict[str, str]:
+    """Snapshot working-tree state at run end for CXDB + log visibility.
+
+    Returns dict with keys ``uncommitted_files``, ``uncommitted_insertions``,
+    ``uncommitted_deletions``, ``uncommitted_staged_files``. Empty strings
+    when ``workdir`` is falsy, when the directory is not a git repo, or when
+    the git subprocess is unavailable.
+
+    The "staged" count is intentionally the count of `??`-prefixed lines
+    in ``git status --porcelain`` (untracked files). Truly-staged files
+    (in the index but not committed) are also part of "uncommitted work"
+    in the operator's mental model, and ``git status --porcelain`` reports
+    them with leading letters; we count all non-empty porcelain lines as
+    "uncommitted files" and split untracked out as the staged count for
+    backwards compat with existing operator workflows.
+
+    Failures are silent — observability helpers must never break a run.
+    """
+    empty: dict[str, str] = {
+        "uncommitted_files": "",
+        "uncommitted_insertions": "",
+        "uncommitted_deletions": "",
+        "uncommitted_staged_files": "",
+    }
+    if not workdir:
+        return empty
+    try:
+        wd = str(workdir)
+        # Is it a git repo? `git -C <wd> rev-parse --is-inside-work-tree`
+        # exits 0 + prints "true" only inside a work tree.
+        try:
+            repo_check = subprocess.run(
+                ["git", "-C", wd, "rev-parse", "--is-inside-work-tree"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return empty
+        if repo_check.returncode != 0 or repo_check.stdout.strip() != "true":
+            return empty
+
+        # Untracked file count via porcelain (lines starting with "??")
+        try:
+            status_proc = subprocess.run(
+                ["git", "-C", wd, "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return {**empty, "uncommitted_files": "0", "uncommitted_staged_files": "0"}
+        if status_proc.returncode != 0:
+            return {**empty, "uncommitted_files": "0", "uncommitted_staged_files": "0"}
+        status_lines = [ln for ln in status_proc.stdout.splitlines() if ln.strip()]
+        staged_files = sum(1 for ln in status_lines if ln.startswith("??"))
+
+        # Insertion / deletion shortstat — capture BOTH unstaged (worktree
+        # vs index) AND staged (index vs HEAD) changes. A coder who has
+        # `git add`'d work but not committed has real, recoverable work
+        # sitting in the worktree; counting only unstaged diffs would
+        # silently understate the uncommitted LOC.
+        insertions_total = 0
+        deletions_total = 0
+        diff_succeeded = True
+        for diff_args in (["diff"], ["diff", "--cached"]):
+            try:
+                diff_proc = subprocess.run(
+                    ["git", "-C", wd, *diff_args, "--shortstat"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                diff_succeeded = False
+                continue
+            if diff_proc.returncode != 0:
+                diff_succeeded = False
+                continue
+            if not diff_proc.stdout.strip():
+                continue
+            m = _DIFF_SHORTSTAT_RE.search(diff_proc.stdout)
+            if not m:
+                continue
+            if m.group("ins"):
+                try:
+                    insertions_total += int(m.group("ins"))
+                except (TypeError, ValueError):
+                    pass
+            if m.group("del"):
+                try:
+                    deletions_total += int(m.group("del"))
+                except (TypeError, ValueError):
+                    pass
+        if not diff_succeeded and not status_lines:
+            # We at least got a status call back; surface that.
+            return {
+                "uncommitted_files": str(len(status_lines)),
+                "uncommitted_insertions": "",
+                "uncommitted_deletions": "",
+                "uncommitted_staged_files": str(staged_files),
+            }
+        return {
+            "uncommitted_files": str(len(status_lines)),
+            "uncommitted_insertions": str(insertions_total) if insertions_total else "",
+            "uncommitted_deletions": str(deletions_total) if deletions_total else "",
+            "uncommitted_staged_files": str(staged_files),
+        }
+    except Exception:
+        # Belt + braces: a stray AttributeError or unicode issue must
+        # never reach the run loop.
+        return empty
+
+
+def _format_uncommitted_for_log(state: dict[str, str]) -> str:
+    """Build a compact human-readable fragment for the RUN_END log line.
+
+    Returns the empty string when there is no uncommitted work, so the
+    caller can choose whether to append anything at all.
+    """
+    files = state.get("uncommitted_files", "") or "0"
+    if files == "" or files == "0":
+        return ""
+    ins = state.get("uncommitted_insertions", "") or "0"
+    dele = state.get("uncommitted_deletions", "") or "0"
+    staged = state.get("uncommitted_staged_files", "") or "0"
+    return f"uncommitted={files} files +{ins}/-{dele} staged={staged}"
 
 
 def _perf_node_enter(ctx: Context, node: Node, seq: int, visit: int) -> None:
