@@ -2,7 +2,7 @@
 // directly to exit (no fix loop). The graph records the verdict but
 // does not block on it.
 digraph g2_violator {
-    graph [goal="G2 violator: reviewer failure -> exit"]
+    graph [goal="G2 violator: reviewer failure -> exit", test_fixture="true"]
     rankdir=LR
 
     start [shape=Mdiamond, label="Start"]

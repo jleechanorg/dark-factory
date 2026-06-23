@@ -6,6 +6,7 @@ digraph level5_valid {
         goal="Level-5 reference fixture for conformance validate tests."
         backend="claude"
         level5="true"
+        test_fixture="true"
     ]
     rankdir=LR
 

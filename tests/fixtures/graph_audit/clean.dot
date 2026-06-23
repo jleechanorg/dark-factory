@@ -1,7 +1,7 @@
 // Clean graph: codergen -> reviewer; reviewer routes success to exit,
 // failure to a bounded fix loop back into the reviewer. No G1, no G2.
 digraph clean {
-    graph [goal="clean reviewer graph"]
+    graph [goal="clean reviewer graph", test_fixture="true"]
     rankdir=LR
 
     start  [shape=Mdiamond, label="Start"]
