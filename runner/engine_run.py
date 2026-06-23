@@ -8,8 +8,10 @@ pair consumed by the main loop).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
+import subprocess
 import threading
 import time
 import traceback
@@ -28,6 +30,81 @@ from ._classify import _classify_outcome
 from .cxdb import CXDB
 from .handlers import Context, Result, resolve
 from .parser import Graph, Node, is_exit_node
+
+
+def _auto_wip_commit_on_exhaustion(ctx: "Context", reason: str) -> None:
+    """If workdir is a git repo with uncommitted changes, commit as WIP.
+
+    Only fires at exhaustion (not on success paths). Prevents the
+    2026-06-22 PR-B'' work-loss false alarm pattern (run 7aa7695b1cf6)
+    where dark-factory exhausted without committing and the parent agent
+    declared work LOST — recoverable in fact, but only by luck because
+    the worktree was never reset.
+
+    Guards:
+      - workdir missing → noop
+      - workdir not a git repo → noop
+      - worktree clean (`git status --porcelain` empty) → noop
+      - subprocess failures → silently swallowed (best-effort)
+    """
+    try:
+        workdir = pathlib.Path(getattr(ctx, "workdir", "") or "")
+        if not workdir or not workdir.exists():
+            return
+        if not (workdir / ".git").exists():
+            return
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(workdir),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            return
+        if status.returncode != 0 or not (status.stdout or "").strip():
+            return
+
+        run_id = getattr(ctx, "run_id", None) or "unknown"
+        head_sha = "unknown"
+        try:
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(workdir),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if head.returncode == 0 and (head.stdout or "").strip():
+                head_sha = head.stdout.strip()[:12]
+        except Exception:
+            pass
+
+        msg = (
+            f"WIP: dark-factory exhausted at {run_id} {head_sha}\n\n"
+            f"Auto-recovery commit. {reason}"
+        )
+        try:
+            subprocess.run(
+                ["git", "add", "-A"],
+                cwd=str(workdir),
+                check=False,
+                timeout=30,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", msg],
+                cwd=str(workdir),
+                check=False,
+                timeout=30,
+            )
+        except Exception:
+            pass
+    except Exception:
+        # Best-effort: never let the WIP commit path raise into the run loop.
+        return
 
 
 def _run_single_node(
@@ -78,6 +155,12 @@ def run(
     """
     history: list = []
     visits: dict[str, int] = {}
+    # Per-node ring of recent output hashes for the no_progress detector
+    # (D3 in feedback 2026-06-22). When a node produces the same output
+    # hash on consecutive visits, the engine short-circuits to "exhausted"
+    # rather than burning LLM budget on a stuck fix loop. Opt-in via the
+    # node's `no_progress_max="N"` attribute (default 0 = disabled).
+    _no_progress_history: dict[str, list[str]] = {}
     current = _persist._start_node(graph)
     seq = 0  # CXDB sequence — independent of history length so refactors can't desync.
     ctx.last_completed_seq = seq
@@ -207,6 +290,7 @@ def run(
                     output_preview=f"max_steps={max_steps} reached before exit",
                 )
                 seq = _persist._append_record(history, checkpoint, cxdb, ctx, seq, record, "")
+                _auto_wip_commit_on_exhaustion(ctx, f"max_steps={max_steps} reached")
                 break
 
 
@@ -220,6 +304,9 @@ def run(
                     output_preview=f"max_visits={max_visits} exceeded",
                 )
                 seq = _persist._append_record(history, checkpoint, cxdb, ctx, seq, record, "")
+                _auto_wip_commit_on_exhaustion(
+                    ctx, f"max_visits={max_visits} exceeded on node {current.name!r}"
+                )
                 break
 
             try:
@@ -250,6 +337,47 @@ def run(
                 result = results[-1]
             else:
                 result = _obs._normalized_result(Result(outcome="success"))
+
+            # D3 (feedback 2026-06-22): semantic loop bound. When a node
+            # has `no_progress_max="N"` set, track the last N output hashes
+            # for that node. If all N match, the node is stuck — short-
+            # circuit to "exhausted" with reason="no_progress" instead of
+            # waiting for `max_visits` to fire. This catches the pattern
+            # where a fix-node returns `success` blindly (e.g. blind prompt
+            # with no test output) but the upstream failure never resolves.
+            no_progress_max = _edges._attr_int(current, "no_progress_max", 0)
+            if no_progress_max and result.output is not None:
+                head = (result.output or "")[:1024]
+                node_hash = hashlib.sha256(head.encode("utf-8")).hexdigest()
+                history_for_node = _no_progress_history.setdefault(current.name, [])
+                history_for_node.append(node_hash)
+                # Trim to the no_progress_max window
+                if len(history_for_node) > no_progress_max:
+                    history_for_node.pop(0)
+                if (
+                    len(history_for_node) == no_progress_max
+                    and len(set(history_for_node)) == 1
+                ):
+                    record = _persist.StepRecord(
+                        node=current.name,
+                        outcome="exhausted",
+                        ts=time.time(),
+                        output_preview=(
+                            f"no_progress_max={no_progress_max} reached — "
+                            f"output hash unchanged across last "
+                            f"{no_progress_max} visits"
+                        ),
+                        metadata={
+                            "no_progress": "true",
+                            "no_progress_max": str(no_progress_max),
+                            "stuck_hash": node_hash,
+                        },
+                    )
+                    seq = _persist._append_record(history, checkpoint, cxdb, ctx, seq, record, "")
+                    _auto_wip_commit_on_exhaustion(
+                        ctx, f"no_progress_max={no_progress_max} reached on node {current.name!r}"
+                    )
+                    break
 
             branch_records: list[tuple] = []
             if current.attrs.get("parallel", False) and not _parallel._is_parallel_node(current):
@@ -556,6 +684,9 @@ def run(
                             },
                             seq,
                         )
+                        _auto_wip_commit_on_exhaustion(
+                            ctx, f"join max_visits={_jn_max} exceeded on join {_jn.name!r}"
+                        )
                         break
                     # Filter by edge conditions; deduplicate by node name so multiple
                     # edges to the same target don't launch duplicate branch workers.
@@ -778,6 +909,11 @@ def run(
             final_outcome = "failure"
             if history:
                 history[-1].outcome = final_outcome
+        # P-B: snapshot working-tree state so the operator can tell at a glance
+        # whether the run exhausted with no work, or with N files of uncommitted
+        # work sitting in the worktree. Surfaced into BOTH the run_end event
+        # payload (CXDB record) AND the human-readable log line.
+        uncommitted = _obs._collect_uncommitted_state(getattr(ctx, "workdir", None))
         _obs._emit_event(
             ctx,
             "run_end",
@@ -786,10 +922,15 @@ def run(
                 "final_outcome": final_outcome,
                 "ended_at_exit": str(ended_at_exit),
                 "steps": str(len(history)),
+                **uncommitted,
             },
             seq,
         )
-        _obs._log(log, f"run end final={final_outcome!r} steps={len(history)}")
+        uncommitted_log = _obs._format_uncommitted_for_log(uncommitted)
+        log_line = f"run end final={final_outcome!r} steps={len(history)}"
+        if uncommitted_log:
+            log_line = f"{log_line} {uncommitted_log}"
+        _obs._log(log, log_line)
         success_count, failure_count, error_count = _obs._outcome_counts(history)
         perf_log.close_run(
             getattr(ctx, "perf_run", None),
@@ -801,6 +942,38 @@ def run(
         )
         if cxdb is not None and ctx.run_id is not None:
             try:
+                # P-B: append a synthetic terminal step carrying the
+                # uncommitted state so the Healer can sub-cluster
+                # `exhausted_with_uncommitted_work` vs `exhausted_clean`.
+                # `node="__run_end__"` is reserved and never produced by a
+                # real .dot node, so the cluster key is collision-free.
+                try:
+                    cxdb.record_step(
+                        ctx.run_id,
+                        seq + 1,
+                        node="__run_end__",
+                        outcome=final_outcome,
+                        ts=time.time(),
+                        output=json.dumps(
+                            {
+                                "final_outcome": final_outcome,
+                                "ended_at_exit": bool(ended_at_exit),
+                                "steps": len(history),
+                                **uncommitted,
+                            },
+                            sort_keys=True,
+                        ),
+                        metadata={
+                            "final_outcome": final_outcome,
+                            "ended_at_exit": str(ended_at_exit).lower(),
+                            "steps": str(len(history)),
+                            **uncommitted,
+                        },
+                    )
+                except Exception:
+                    # CXDB write is best-effort; never fail the run on
+                    # a synthetic step that the operator can recover from.
+                    pass
                 cxdb.end_run(
                     ctx.run_id,
                     final=final_outcome,
