@@ -23,6 +23,9 @@ if str(ROOT) not in sys.path:
 from runner.engine import run as run_graph  # noqa: E402
 from runner.handlers import Context, TYPE_REGISTRY  # noqa: E402
 from runner.parser import is_exit_node, is_start_node, parse  # noqa: E402
+from runner.prompt_substitution_audit import (  # noqa: E402
+    audit_prompts as audit_prompts_tree,
+)
 
 
 def _pipelines() -> list[pathlib.Path]:
@@ -301,6 +304,32 @@ def cmd_validate(args: argparse.Namespace) -> int:
             ok = False
             if result is None:
                 results.append({"path": _display_path(path), "status": "fail"})
+
+    # Prompt-substitution audit (P4 from proposals-2026-06-23.md). Catches
+    # unwired ${state.X} keys, missing prompt files, and templated
+    # one-liners. Runs against the real prompts/, pipelines/, runner/
+    # trees so it works whether validating a single .dot or the full
+    # pipeline set. The audit's own Violations are mapped to
+    # _diagnostic so they appear in the same JSON envelope.
+    prompts_dir = ROOT / "prompts"
+    if prompts_dir.exists():
+        prompt_violations = audit_prompts_tree(
+            prompts_dir=prompts_dir,
+            pipelines_dir=ROOT / "pipelines",
+            runner_dir=ROOT / "runner",
+            repo_root=ROOT,
+        )
+        for v in prompt_violations:
+            diagnostics.append(
+                _diagnostic(
+                    f"prompt_{v.kind.lower()}",
+                    "error",
+                    v.message,
+                    v.prompt,
+                )
+            )
+            ok = False
+
     print(json.dumps({"diagnostics": diagnostics}, indent=2))
     return 0 if ok else 1
 
