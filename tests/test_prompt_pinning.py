@@ -58,6 +58,39 @@ from runner.parser import parse  # noqa: E402
 _PROMPT_ATTR_RE = re.compile(r'prompt\s*=\s*"?@([^"\s]+)"?')
 
 
+# Match the first `graph [ ... ]` block in a .dot file. Captures (1) the
+# block contents (a newline-separated list of `key="value"` lines).
+_GRAPH_ATTRS_RE = re.compile(r"graph\s*\[\s*([^\]]*?)\s*\]", re.DOTALL)
+# Match a `key="value"` line inside a graph [...] block. Captures (1) key.
+_GRAPH_ATTR_LINE_RE = re.compile(r'^\s*([a-z_][a-z0-9_]*)\s*=\s*"([^"]*)"', re.MULTILINE)
+
+
+def _is_test_fixture(dot_file: pathlib.Path) -> bool:
+    """Return True if a .dot file declares `graph [test_fixture="true"]`.
+
+    The opt-out is a property of the file, not a property of the test's
+    path-walk logic. This mirrors the existing soft-tier convention
+    (``skip_holdout="true"`` / ``skip_spec_validation="true"`` at
+    ``bin/conformance:208-253``) so a fixture anywhere in the repo can
+    opt out without a hardcoded path check.
+
+    Reads the .dot file once and regex-extracts the first ``graph [...]``
+    block. The block is the same DOT `Graph attributes` block the engine
+    surfaces via ``runner.parser.Graph.graph_attrs`` at runtime.
+    """
+    try:
+        text = dot_file.read_text()
+    except (OSError, UnicodeDecodeError):
+        return False
+    block = _GRAPH_ATTRS_RE.search(text)
+    if not block:
+        return False
+    for key, value in _GRAPH_ATTR_LINE_RE.findall(block.group(1)):
+        if key == "test_fixture" and value.lower() == "true":
+            return True
+    return False
+
+
 def _all_dot_files() -> list[pathlib.Path]:
     """Return every .dot file in the repo, excluding worktree copies,
     include-only fragments, and test fixtures.
@@ -67,12 +100,14 @@ def _all_dot_files() -> list[pathlib.Path]:
         worktree-driven PR iteration.
       * `_*` stems — include-only fragments referenced from a parent
         ``include="@_base.dot"`` attribute; never resolved standalone.
-      * `tests/fixtures/**` — deliberately-invalid conformance fixtures
-        (e.g. ``level5_missing_gate.dot``, ``level5_valid.dot``) used to
+      * `.dot` files declaring ``graph [test_fixture="true"]`` —
+        deliberately-invalid conformance fixtures (e.g.
+        ``level5_missing_gate.dot``, ``level5_valid.dot``) used to
         exercise the conformance validator's diagnostic path. Their
-        ``@prompts/hello/spec_validation.md`` references are intentionally
-        unresolved; pinning them here would conflate "deliberately broken
-        fixture" with "broken real pipeline".
+        ``@prompts/hello/...`` references may be intentionally
+        unresolved; pinning them here would conflate "deliberately
+        broken fixture" with "broken real pipeline". The opt-out is
+        a property of the file, not of the test's path-walk logic.
     """
     out: list[pathlib.Path] = []
     for path in ROOT.rglob("*.dot"):
@@ -81,7 +116,7 @@ def _all_dot_files() -> list[pathlib.Path]:
             continue
         if path.stem.startswith("_"):
             continue
-        if "tests" in parts and "fixtures" in parts:
+        if _is_test_fixture(path):
             continue
         out.append(path)
     return sorted(out)
