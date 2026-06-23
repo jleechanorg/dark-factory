@@ -10,6 +10,28 @@ Surface existing modules, reducers, helpers, or patterns that the upcoming
 implementation should extend instead of reimplementing. Identify the highest-
 value centralization proposals.
 
+## Lazy senior dev lens (this sub-agent owns rung 2)
+
+Source: `~/.claude/skills/ponytail/SKILL.md`
+(mirror of <https://github.com/DietrichGebert/ponytail/blob/main/.github/copilot-instructions.md>).
+
+The seven-rung ladder starts with rung 2: **does it already exist in this
+codebase?** That is exactly this sub-agent's job. Apply the ladder explicitly:
+
+1. **Rung 2 first** — for every feature the goal implies, grep for the
+   in-tree helper, util, or pattern that already covers it. List candidates
+   with `path:line` + 1-line rationale.
+2. **Rung 3 (stdlib)** — call out stdlib modules that would replace a
+   hand-roll (`argparse`, `dataclasses`, `pathlib`, `itertools`, etc.).
+3. **Rung 4 (platform)** — note native framework features that would replace
+   custom code (e.g. built-in config, logging, retry, scheduling).
+4. **Rung 5 (installed dep)** — only if rungs 2–4 don't cover it, name an
+   already-installed dependency. Do not propose a new dependency from this
+   node; the plan agent owns that decision.
+5. **Rung 6 (one line)** — for each candidate, the lazy-senior-dev answer
+   is "can this be one line?" If yes, the candidate likely replaces a
+   whole module — flag it as a centralization win.
+
 ## Output
 
 Write `.dark-factory/explore-reuse.md` in the target repo. Sections:
