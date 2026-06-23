@@ -29,21 +29,34 @@ from runner.parser import parse  # noqa: E402
 
 def _init_git_repo(path: pathlib.Path) -> None:
     """Set up a minimal git repo at `path` so _auto_wip_commit_on_exhaustion
-    treats it as committable. Uses `-c user.email` to avoid host-machine
-    global config leakage."""
+    treats it as committable.
+
+    Persists `user.name`/`user.email`/`commit.gpgsign=false` in the repo's
+    local config so subsequent `git commit` calls (including those inside
+    the helper under test) succeed regardless of whether the host has a
+    `~/.gitconfig`. CI runners have no global git identity; locally the
+    user has one. Setting it per-repo keeps the test environment hermetic.
+
+    Also sets `safe.directory=*` so the repo is committable regardless of
+    the host's `safe.directory` whitelist (matters when pytest's tmp_path
+    lives under a path git would otherwise refuse)."""
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(path), check=True)
+    for key, value in [
+        ("user.name", "test"),
+        ("user.email", "test@example.com"),
+        ("commit.gpgsign", "false"),
+    ]:
+        subprocess.run(
+            ["git", "config", key, value],
+            cwd=str(path), check=True,
+        )
     subprocess.run(
-        ["git", "-c", "user.name=test", "-c", "user.email=test@x", "config",
-         "commit.gpgsign", "false"],
+        ["git", "config", "--add", "safe.directory", str(path)],
         cwd=str(path), check=True,
     )
     (path / "README.md").write_text("seed\n")
     subprocess.run(["git", "add", "README.md"], cwd=str(path), check=True)
-    subprocess.run(
-        ["git", "-c", "user.name=test", "-c", "user.email=test@x",
-         "commit", "-q", "-m", "init"],
-        cwd=str(path), check=True,
-    )
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(path), check=True)
 
 
 def test_auto_wip_commit_fires_on_exhaustion_with_uncommitted(tmp_path):
