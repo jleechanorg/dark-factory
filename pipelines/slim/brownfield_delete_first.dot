@@ -85,6 +85,7 @@ digraph BrownfieldDeleteFirstFactory {
   gate_er [
     type="gate_er",
     label="/er Evidence Review",
+    gate_strict="true",
     timeout=600
   ]
 
@@ -95,6 +96,7 @@ digraph BrownfieldDeleteFirstFactory {
     prompt="@prompts/slim/fix.md",
     max_retries=2,
     max_visits="3",
+    no_progress_max="2",
     timeout=600
   ]
 

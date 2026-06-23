@@ -2,9 +2,9 @@
 
 Owns:
   * `_render_prompt` — resolve ``@path``, enforce workdir-relative, holdout-deny,
-    substitute ``${goal}`` / ``${state.<key>}` / ``${diff}``. Mirrors
-    ``runner.handlers._render_prompt`` so ``tests/test_prompt_pinning.py`` can
-    pin the same resolution order.
+    substitute ``${goal}`` / ``${state.<key>}`` / ``${diff}` / ``${lint_findings}``.
+    Mirrors ``runner.handlers._render_prompt`` so ``tests/test_prompt_pinning.py``
+    can pin the same resolution order.
 
 Substitutions (in order):
   * ``${goal}``     → the run-level goal text
@@ -13,6 +13,12 @@ Substitutions (in order):
     automatically by ``_codergen`` on the success path. Defaults to
     ``"(no diff captured)"`` when no codergen has run yet (or when the
     capture silently failed because the workdir is not a git repo).
+  * ``${lint_findings}`` → Markdown table of engine-computed lint findings
+    (F5, jleechan-zba). Computed once per render via
+    ``runner/pre_review_lint.py::lint_findings(ctx.workdir)``. Cached in
+    ``ctx.state["_lint_findings"]`` so a prompt that references the
+    placeholder twice doesn't re-scan. Defaults to ``"(none)"`` when the
+    scan returns no findings.
 """
 
 from __future__ import annotations
@@ -21,18 +27,35 @@ import pathlib
 from typing import TYPE_CHECKING
 
 import runner.handlers as _handlers_shim
+from .pre_review_lint import findings_to_markdown, findings_to_json, lint_findings
 
 if TYPE_CHECKING:
     from .parser import Node
     from .handler_core import Context
 
 
+def _resolve_lint_findings(ctx: "Context") -> list[dict]:
+    """Return the cached lint findings, computing on first call."""
+    import json
+    cached = ctx.state.get("_lint_findings")
+    if cached is not None:
+        return json.loads(cached)
+    findings = lint_findings(ctx.workdir)
+    ctx.state["_lint_findings"] = findings_to_json(findings)
+    return findings
+
+
 def _substitute_placeholders(text: str, ctx: "Context") -> str:
-    """Apply ``${goal}`` / ``${state.<key>}`` / ``${diff}`` substitutions.
+    """Apply ``${goal}`` / ``${state.<key>}`` / ``${diff}`` / ``${lint_findings}`` substitutions.
 
     ``${diff}`` resolves to ``ctx.state["_last_diff"]`` if a successful
     codergen stashed one, else the placeholder ``"(no diff captured)"`` so
     reviewer prompts never render an empty cell where the diff should be.
+
+    ``${lint_findings}`` resolves to a Markdown table of engine-computed
+    findings (F5, jleechan-zba). Findings are computed once per render and
+    cached in ``ctx.state["_lint_findings"]`` so multiple substitutions
+    don't re-scan the workdir.
     """
     text = text.replace("${goal}", ctx.goal)
     for k, v in ctx.state.items():
@@ -41,6 +64,10 @@ def _substitute_placeholders(text: str, ctx: "Context") -> str:
     if not diff:
         diff = "(no diff captured)"
     text = text.replace("${diff}", diff)
+
+    if "${lint_findings}" in text:
+        findings = _resolve_lint_findings(ctx)
+        text = text.replace("${lint_findings}", findings_to_markdown(findings))
     return text
 
 

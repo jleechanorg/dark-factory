@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING
 
 import runner.handlers as _handlers_shim
 
-from .handler_core import Result
+from .handler_core import Result, _gate_strict_flag
 
 if TYPE_CHECKING:
     from .parser import Node
@@ -197,7 +197,10 @@ def _gate_slash(node: "Node", ctx: "Context") -> "Result":
     # the empirical basis (observed p99 = 206s, max = 206s).
     timeout = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
     backend, gate_meta = _handlers_shim._resolve_gate_backend(node, ctx)
-    result = _handlers_shim._execute_gate(prompt, expected_sha, timeout, ctx, command, backend)
+    result = _handlers_shim._execute_gate(
+        prompt, expected_sha, timeout, ctx, command, backend,
+        gate_strict=_gate_strict_flag(node),
+    )
     if gate_meta:
         for k, v in gate_meta.items():
             result.metadata.setdefault(k, v)

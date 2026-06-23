@@ -117,7 +117,7 @@ _STANDALONE_RE = re.compile(
 )
 
 
-def _parse_verdict(text: str) -> tuple[str, str]:
+def _parse_verdict(text: str, *, gate_strict: bool = False) -> tuple[str, str]:
     """Extract a normalized verdict from gate output.
 
     Strategy:
@@ -129,13 +129,20 @@ def _parse_verdict(text: str) -> tuple[str, str]:
       3. With no marker at all, scan the last 40 lines for a *standalone*
          verdict token (not embedded in prose).
 
+    Args:
+      text: Gate output text to parse.
+      gate_strict: When True, a `warn` verdict is normalized to `failure`
+        instead of `success`. Opt-in per gate node via the `gate_strict="true"`
+        DOT attribute (see jleechan-9ia / F6). Default False preserves the
+        legacy warn→success mapping so existing graphs do not regress.
+
     Returns (raw_verdict, normalized_outcome). Unknown returns ("unknown", "failure").
     """
     body = text or ""
     matches = list(_MARKER_RE.finditer(body))
     if matches:
         raw = matches[-1].group(1).lower()
-        return raw, _VERDICT_NORMALIZE.get(raw, "failure")
+        return raw, _normalize_outcome(raw, gate_strict=gate_strict)
 
     if _MARKER_PRESENT_RE.search(body):
         # A verdict marker existed but with an invalid token — refuse to guess.
@@ -145,5 +152,17 @@ def _parse_verdict(text: str) -> tuple[str, str]:
     fallback = list(_STANDALONE_RE.finditer(tail))
     if fallback:
         raw = fallback[-1].group(1).lower()
-        return raw, _VERDICT_NORMALIZE.get(raw, "failure")
+        return raw, _normalize_outcome(raw, gate_strict=gate_strict)
     return "unknown", "failure"
+
+
+def _normalize_outcome(raw_verdict: str, *, gate_strict: bool) -> str:
+    """Map a raw verdict token to a success/failure outcome.
+
+    When ``gate_strict`` is True, a `warn` verdict is treated as `failure`
+    (the gate flagged a real concern the operator must address). Default
+    preserves the legacy warn→success mapping.
+    """
+    if gate_strict and raw_verdict == "warn":
+        return "failure"
+    return _VERDICT_NORMALIZE.get(raw_verdict, "failure")

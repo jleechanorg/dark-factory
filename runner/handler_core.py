@@ -89,6 +89,30 @@ def _coerce_timeout(value: object, default: int, *, minimum: int = _TIMEOUT_MIN_
 Handler = Callable[[Node, Context], Result]
 
 
+def _gate_strict_flag(node: "Node") -> bool:
+    """Read the ``gate_strict`` node attribute as a bool.
+
+    Accepts ``True`` / ``"true"`` / ``"1"`` (case-insensitive). Any other
+    value is treated as False so unknown typos do not silently enable
+    strict-mode and break existing graphs.
+
+    See jleechan-9ia (F6 in 2026-06-22 /factory-evolve proposals). When
+    True, the gate's `warn` verdict is normalized to `failure` instead of
+    the legacy warn→success mapping.
+
+    Lives in handler_core (not handler_dispatch) to avoid the circular
+    import between handler_dispatch and runner.handlers.
+    """
+    raw = node.attrs.get("gate_strict")
+    if raw is True:
+        return True
+    if isinstance(raw, str) and raw.strip().lower() in ("true", "1", "yes"):
+        return True
+    if isinstance(raw, int) and raw == 1:
+        return True
+    return False
+
+
 def _start(node: Node, ctx: Context) -> Result:
     return Result(outcome="success", output=f"start: {ctx.goal!r}")
 

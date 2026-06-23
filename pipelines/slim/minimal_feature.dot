@@ -73,7 +73,8 @@ digraph MinimalFeatureFactory {
     class="fix",
     prompt="@prompts/slim/fix.md",
     max_retries=2,
-    max_visits="3"
+    max_visits="3",
+    no_progress_max="2"
   ]
 
   start -> explore_in

@@ -33,12 +33,13 @@ def test_gate_er_with_prompt_attr_sends_custom_prompt_to_reviewer(monkeypatch, t
 
     captured = {}
 
-    def fake_execute_gate(prompt, expected_sha, timeout, ctx, name, backend):
+    def fake_execute_gate(prompt, expected_sha, timeout, ctx, name, backend, **kwargs):
         captured["prompt"] = prompt
         captured["sha"] = expected_sha
         captured["timeout"] = timeout
         captured["name"] = name
         captured["backend"] = backend
+        captured["gate_strict"] = kwargs.get("gate_strict", False)
         return handlers_mod.Result(
             outcome="success", output="verdict: pass", metadata={"verdict": "pass"}
         )
@@ -134,7 +135,7 @@ def test_gate_es_and_cs_with_prompt_attr_route_custom_prompt(monkeypatch, tmp_pa
     monkeypatch.setattr(
         handlers_mod,
         "_execute_gate",
-        lambda prompt, sha, timeout, ctx, name, backend: (
+        lambda prompt, sha, timeout, ctx, name, backend, **kwargs: (
             seen.append((name, prompt)),
             handlers_mod.Result(outcome="success", output="verdict: pass", metadata={}),
         )[1],

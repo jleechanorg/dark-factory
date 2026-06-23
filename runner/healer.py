@@ -34,6 +34,11 @@ class Cluster:
     # / timeout signatures without re-querying CXDB. Optional: empty dict when
     # the cluster was hand-built for unit tests.
     metadata: dict | None = None
+    # P-C: refined outcome label that folds in "exhausted with uncommitted
+    # work" as a distinct cluster from raw "exhausted". Set in `_clusters()`
+    # from the first metadata snapshot. Defaults to ``outcome`` for backwards
+    # compatibility (unit tests + hand-built clusters).
+    refined_outcome: str = ""
 
     # Heuristic over the Healer's own node-name namespace (not user/model
     # input), so prefix matching here is internal data routing, not ZFC.
@@ -56,6 +61,17 @@ class Cluster:
         """
         return classify_failure_kind(self)
 
+    @property
+    def display_outcome(self) -> str:
+        """Outcome label used in the report and prescription templates.
+
+        Returns ``refined_outcome`` when set (P-C sub-clustering), else the
+        raw ``outcome``. The raw outcome is preserved on the dataclass so
+        classification heuristics that key on the canonical outcome still
+        work; only the operator-facing surface uses the refined label.
+        """
+        return self.refined_outcome or self.outcome
+
 
 # Substrings in captured stdout/stderr that mean the agent never got to do
 # work — the harness itself failed before any reasoning. These are checked
@@ -67,6 +83,27 @@ _INFRA_OUTPUT_MARKERS = (
     "backend_missing=true",    # explicit sentinel in metadata-as-text
     "No such file or directory",
 )
+
+
+def _exhausted_with_uncommitted(outcome: str, metadata: Optional[dict]) -> str:
+    """Sub-cluster key for exhaustion.
+
+    Returns a refined outcome label so the Healer can emit a different
+    prescription when the run exhausted with uncommitted work sitting in
+    the worktree vs. exhausted with a clean tree. Two separate clusters
+    let the operator read the prescription and act (recover vs rebuild)
+    without having to inspect the worktree themselves.
+
+    For any outcome other than ``exhausted`` we return the original
+    outcome unchanged so this is a no-op for non-exhaustion clusters.
+    """
+    if outcome != "exhausted":
+        return outcome
+    meta = metadata or {}
+    files = (meta.get("uncommitted_files") or "").strip()
+    if files and files != "0":
+        return "exhausted_with_uncommitted_work"
+    return outcome
 
 
 def classify_failure_kind(cluster: Cluster) -> tuple[str, str]:
@@ -128,6 +165,41 @@ def diagnose_cluster(cluster: Cluster, backend: str = "echo", cxdb_path: Optiona
     goal = "unknown"
     pipeline = "unknown"
     metadata_json = "{}"
+
+    # 0. P-C prescription for `exhausted_with_uncommitted_work` — fired
+    # BEFORE the echo/claude backend branch so the operator gets a
+    # deterministic, evidence-backed recovery hint regardless of which
+    # LLM the Healer was configured with. The cost-asymmetry lesson
+    # from the 2026-06-22 PR-B'' incident (8–20 hr rebuild vs 30–60 min
+    # recovery) made this a static, deterministic prescription.
+    if cluster.display_outcome == "exhausted_with_uncommitted_work":
+        meta = cluster.metadata or {}
+        files = meta.get("uncommitted_files") or "?"
+        ins = meta.get("uncommitted_insertions") or "?"
+        dele = meta.get("uncommitted_deletions") or "?"
+        staged = meta.get("uncommitted_staged_files") or "?"
+        workdir_hint = ""
+        if cluster.run_ids:
+            # The Healer doesn't know the workdir directly, but it can read
+            # the goal + pipeline so the operator can correlate. The
+            # explicit recovery commands are still local to the operator's
+            # terminal — there is no machine-readable workdir in CXDB.
+            workdir_hint = (
+                " (correlate with the run's `--workdir` argument)"
+            )
+        return (
+            "## Cluster: exhausted_with_uncommitted_work\n"
+            "The run exhausted but the worktree has uncommitted changes.\n"
+            "**Before declaring 'lost':**\n"
+            "  - Run `git status --porcelain` to see uncommitted files\n"
+            "  - Run `git diff --shortstat` to see line counts\n"
+            "  - Run `git fsck --lost-found` to find dangling commits\n"
+            "  - The work may be uncommitted, not lost — see the\n"
+            "    2026-06-22 PR-B'' incident.\n"
+            f"\nObserved: {files} uncommitted files ({staged} untracked), "
+            f"+{ins}/-{dele} lines{workdir_hint}.\n"
+            f"\nPipeline: `{pipeline}` — Goal: `{goal}`."
+        )
 
     if cxdb_path is not None:
         db = CXDB(cxdb_path)
@@ -251,6 +323,7 @@ def _clusters(cxdb_path: pathlib.Path, run_id: Optional[str] = None) -> list[Clu
                 total_cost_usd=agg["total_cost_usd"],
                 total_wall_ms=agg["total_wall_ms"],
                 metadata=first_meta,
+                refined_outcome=_exhausted_with_uncommitted(row["outcome"], first_meta),
             )
         )
     db.close()
@@ -292,7 +365,7 @@ def report(cxdb_path: pathlib.Path, backend: str = "echo", run_id: Optional[str]
             "| {hits} | `{node}` | `{outcome}` | **{kind}** | {reason} | `{hash}` | {tok} | {cost} | {wall} | {rx} |".format(
                 hits=c.hits,
                 node=c.node,
-                outcome=c.outcome,
+                outcome=c.display_outcome,
                 kind=kind,
                 reason=_md_escape(reason),
                 hash=c.output_hash,
@@ -318,7 +391,7 @@ def report(cxdb_path: pathlib.Path, backend: str = "echo", run_id: Optional[str]
     lines.append("")
     for c, kind, _reason in classified:
         lines.append(
-            f"### `{c.node}` × `{c.outcome}` (hash `{c.output_hash}`) — **{kind}**"
+            f"### `{c.node}` × `{c.display_outcome}` (hash `{c.output_hash}`) — **{kind}**"
         )
         lines.append("```")
         lines.append((c.sample or "")[:280] or "<empty>")

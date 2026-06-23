@@ -37,3 +37,24 @@ def test_old_spec_review_verdict_tokens_are_unparseable():
     # The replacement contract is parseable.
     assert _parse_verdict("verdict: pass")[1] == "success"
     assert _parse_verdict("verdict: fail")[1] == "failure"
+
+
+def test_gate_strict_overrides_warn_to_failure():
+    """F6 (jleechan-9ia): when gate_strict=True, a `warn` verdict must
+    normalize to `failure` instead of the legacy warn→success mapping.
+
+    Opt-in per gate node via the `gate_strict="true"` DOT attribute
+    (parsed as bool via _NODE_BOOL_ATTRS in runner/parser.py). Existing
+    graphs without the attribute keep the legacy mapping.
+    """
+    # Default: warn→success (legacy)
+    assert _parse_verdict("VERDICT: WARN — minor")[1] == "success"
+    # Strict: warn→failure
+    assert _parse_verdict("VERDICT: WARN — minor", gate_strict=True)[1] == "failure"
+    # Standalone fallback path is also strict-aware
+    assert _parse_verdict("all good\nwarn\n", gate_strict=True)[1] == "failure"
+    # pass/fail unaffected by strict
+    assert _parse_verdict("VERDICT: PASS", gate_strict=True)[1] == "success"
+    assert _parse_verdict("VERDICT: FAIL", gate_strict=True)[1] == "failure"
+    # Gate_strict=False (explicit) is same as default
+    assert _parse_verdict("VERDICT: WARN", gate_strict=False)[1] == "success"
