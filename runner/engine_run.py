@@ -909,6 +909,11 @@ def run(
             final_outcome = "failure"
             if history:
                 history[-1].outcome = final_outcome
+        # P-B: snapshot working-tree state so the operator can tell at a glance
+        # whether the run exhausted with no work, or with N files of uncommitted
+        # work sitting in the worktree. Surfaced into BOTH the run_end event
+        # payload (CXDB record) AND the human-readable log line.
+        uncommitted = _obs._collect_uncommitted_state(getattr(ctx, "workdir", None))
         _obs._emit_event(
             ctx,
             "run_end",
@@ -917,10 +922,15 @@ def run(
                 "final_outcome": final_outcome,
                 "ended_at_exit": str(ended_at_exit),
                 "steps": str(len(history)),
+                **uncommitted,
             },
             seq,
         )
-        _obs._log(log, f"run end final={final_outcome!r} steps={len(history)}")
+        uncommitted_log = _obs._format_uncommitted_for_log(uncommitted)
+        log_line = f"run end final={final_outcome!r} steps={len(history)}"
+        if uncommitted_log:
+            log_line = f"{log_line} {uncommitted_log}"
+        _obs._log(log, log_line)
         success_count, failure_count, error_count = _obs._outcome_counts(history)
         perf_log.close_run(
             getattr(ctx, "perf_run", None),
@@ -932,6 +942,38 @@ def run(
         )
         if cxdb is not None and ctx.run_id is not None:
             try:
+                # P-B: append a synthetic terminal step carrying the
+                # uncommitted state so the Healer can sub-cluster
+                # `exhausted_with_uncommitted_work` vs `exhausted_clean`.
+                # `node="__run_end__"` is reserved and never produced by a
+                # real .dot node, so the cluster key is collision-free.
+                try:
+                    cxdb.record_step(
+                        ctx.run_id,
+                        seq + 1,
+                        node="__run_end__",
+                        outcome=final_outcome,
+                        ts=time.time(),
+                        output=json.dumps(
+                            {
+                                "final_outcome": final_outcome,
+                                "ended_at_exit": bool(ended_at_exit),
+                                "steps": len(history),
+                                **uncommitted,
+                            },
+                            sort_keys=True,
+                        ),
+                        metadata={
+                            "final_outcome": final_outcome,
+                            "ended_at_exit": str(ended_at_exit).lower(),
+                            "steps": str(len(history)),
+                            **uncommitted,
+                        },
+                    )
+                except Exception:
+                    # CXDB write is best-effort; never fail the run on
+                    # a synthetic step that the operator can recover from.
+                    pass
                 cxdb.end_run(
                     ctx.run_id,
                     final=final_outcome,

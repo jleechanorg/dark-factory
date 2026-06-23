@@ -62,7 +62,9 @@ from .engine_observability import (  # noqa: E402,F401
     _LOG_DIR,  # tests/test_crash_resilience.py monkeypatches this path
     _VALIDATION_TYPES,
     _classify_records,
+    _collect_uncommitted_state,
     _emit_event,
+    _format_uncommitted_for_log,
     _is_partial_result,
     _is_success_result,
     _is_validation_failed,
