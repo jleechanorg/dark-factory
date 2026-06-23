@@ -67,20 +67,31 @@ echo "$ARGUMENTS"
 
 ### Default path: invoke the dark-factory workflow
 
-After Step 0 resolves PR-vs-feature, invoke the workflow:
+After Step 0 resolves PR-vs-feature, the LLM follows the **Level-5
+multi-phase workflow** at
+`$DARK_FACTORY_HOME/.claude/workflows/dark-factory.md`. Read that file
+and execute each phase (`spec_validation → explore → plan → implement →
+gate → bounded fix loop`) as a separate `dark-factory` binary call
+against a phase-specific `.dot` graph, sharing one `CXDB` so the
+Healer can cluster failures across phase boundaries.
 
+The workflow is the source of truth — it owns phase ordering, shared
+CXDB, fix-loop bounding, and the final summary. Each phase invocation
+follows this shell (substituting the phase's own pipeline and goal):
+
+```bash
+cd "$TARGET_REPO"
+dark-factory \
+  --pipeline pipelines/<PHASE>.dot \
+  --goal "<PHASE GOAL — see workflow file>" \
+  --backend "$BACKEND" \
+  --feature "$FEATURE" \
+  --cxdb "$CXDB"
 ```
-Skill("dark-factory", args="--mode <pr|feature> --backend <echo|claude|...> --feature <name> --goal <…>")
-```
 
-The workflow owns phase ordering, shared CXDB, fix-loop bounding, and the
-final summary. It dispatches each phase as a separate `dark-factory`
-invocation against a phase-specific `.dot` graph (no engine changes
-required — the `.dot` engine stays a single-phase runner).
-
-If the user passed `--phase <name>`, forward it to the workflow as
-`--phase-until <name>` so the workflow halts after that phase (useful for
-iterating one phase in isolation without running the full 6-phase loop).
+If the user passed `--phase <name>`, only execute the workflow phases
+up to and including `<name>` and then stop (useful for iterating one
+phase in isolation without running the full 6-phase loop).
 
 **Why this is the default:** the workflow is the **G3 closure artifact** —
 runtime-determined fan-out (the original gap the user's prior `type="dynamic"`

@@ -42,20 +42,29 @@ main+attractor generation with codex cold review).
    in-session as before (read-only, no pipeline invoked).
 3. If `--legacy` is present OR `--pipeline spec_gen` was passed, fall
    through to **Legacy dispatch** below.
-4. Otherwise, this is a **workflow invocation**:
+4. Otherwise, the user wants spec VALIDATION on an existing spec (not
+   spec generation). The workflow's Phase 1 validates a spec already
+   present at `specs/<feature>.md` via
+   `benchmarks/attractor-spec-review/pipelines/review_slim.dot`. The
+   LLM follows the workflow at
+   `$DARK_FACTORY_HOME/.claude/workflows/dark-factory.md` and runs
+   only Phase 1 (`spec_validation`), then stops:
 
-   ```
-   Skill("dark-factory",
-         args="--mode feature --phase-until spec_validation \
-               --backend <echo|claude> --feature <name> \
-               --goal 'Generate spec.md + attractor_spec.md for <description>. \
-                       Stop after Phase 1 (spec_validation) passes.'")
+   ```bash
+   cd "$TARGET_REPO"
+   dark-factory \
+     --pipeline benchmarks/attractor-spec-review/pipelines/review_slim.dot \
+     --goal "Validate spec: specs/${FEATURE}.md" \
+     --backend "$BACKEND" \
+     --feature "$FEATURE" \
+     --cxdb "$CXDB"
    ```
 
-   The workflow runs Phase 1 (spec_validation) against
-   `benchmarks/attractor-spec-review/pipelines/review_slim.dot`. On pass,
-   it continues to Phase 2 (explore) and Phase 3 (plan). To stop after
-   Phase 1, pass `--phase-until spec_validation`.
+   If no `specs/${FEATURE}.md` exists, the workflow stops with a
+   missing-file error — for greenfield spec CREATION, fall through to
+   **Legacy dispatch** below (`/fs --legacy`) which runs
+   `pipelines/slim/spec_gen.dot` and writes `spec.md` +
+   `attractor_spec.md`.
 
 ### Step 0: detect context (workflow path only)
 
@@ -73,15 +82,11 @@ both possibilities to the spec author.
 
 ### Workflow path: what gets produced
 
-The workflow's spec_validation phase produces:
-
-1. `spec.md` (main spec) — passed through `review_slim.dot`'s cold review.
-2. `attractor_spec.md` (attractor spec) — generated **after** main spec
-   passes review (sequential, not parallel). The attractor spec can
-   reference the codex-signed-off `spec.md` for the consistency check.
-
-Both files land in `specs/<feature>/` of the target repo. The CXDB
-records the per-line validation verdicts.
+The workflow's spec_validation phase produces a **validation report** in
+CXDB for the existing `specs/<feature>.md` (line-by-line pass/fail
+verdicts from `review_slim.dot`'s cold review). It does **NOT** write
+new `spec.md` / `attractor_spec.md` files — spec generation is the
+**Legacy dispatch** path below.
 
 **Pass criterion:** `final_outcome == "success"` for Phase 1 with all
 spec line-items passing (or marked `warn` with documented mitigation).
