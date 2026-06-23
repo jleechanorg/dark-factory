@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import subprocess
 import threading
 import time
 import traceback
@@ -29,6 +30,81 @@ from ._classify import _classify_outcome
 from .cxdb import CXDB
 from .handlers import Context, Result, resolve
 from .parser import Graph, Node, is_exit_node
+
+
+def _auto_wip_commit_on_exhaustion(ctx: "Context", reason: str) -> None:
+    """If workdir is a git repo with uncommitted changes, commit as WIP.
+
+    Only fires at exhaustion (not on success paths). Prevents the
+    2026-06-22 PR-B'' work-loss false alarm pattern (run 7aa7695b1cf6)
+    where dark-factory exhausted without committing and the parent agent
+    declared work LOST — recoverable in fact, but only by luck because
+    the worktree was never reset.
+
+    Guards:
+      - workdir missing → noop
+      - workdir not a git repo → noop
+      - worktree clean (`git status --porcelain` empty) → noop
+      - subprocess failures → silently swallowed (best-effort)
+    """
+    try:
+        workdir = pathlib.Path(getattr(ctx, "workdir", "") or "")
+        if not workdir or not workdir.exists():
+            return
+        if not (workdir / ".git").exists():
+            return
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(workdir),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            return
+        if status.returncode != 0 or not (status.stdout or "").strip():
+            return
+
+        run_id = getattr(ctx, "run_id", None) or "unknown"
+        head_sha = "unknown"
+        try:
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(workdir),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if head.returncode == 0 and (head.stdout or "").strip():
+                head_sha = head.stdout.strip()[:12]
+        except Exception:
+            pass
+
+        msg = (
+            f"WIP: dark-factory exhausted at {run_id} {head_sha}\n\n"
+            f"Auto-recovery commit. {reason}"
+        )
+        try:
+            subprocess.run(
+                ["git", "add", "-A"],
+                cwd=str(workdir),
+                check=False,
+                timeout=30,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", msg],
+                cwd=str(workdir),
+                check=False,
+                timeout=30,
+            )
+        except Exception:
+            pass
+    except Exception:
+        # Best-effort: never let the WIP commit path raise into the run loop.
+        return
 
 
 def _run_single_node(
@@ -214,6 +290,7 @@ def run(
                     output_preview=f"max_steps={max_steps} reached before exit",
                 )
                 seq = _persist._append_record(history, checkpoint, cxdb, ctx, seq, record, "")
+                _auto_wip_commit_on_exhaustion(ctx, f"max_steps={max_steps} reached")
                 break
 
 
@@ -227,6 +304,9 @@ def run(
                     output_preview=f"max_visits={max_visits} exceeded",
                 )
                 seq = _persist._append_record(history, checkpoint, cxdb, ctx, seq, record, "")
+                _auto_wip_commit_on_exhaustion(
+                    ctx, f"max_visits={max_visits} exceeded on node {current.name!r}"
+                )
                 break
 
             try:
@@ -294,6 +374,9 @@ def run(
                         },
                     )
                     seq = _persist._append_record(history, checkpoint, cxdb, ctx, seq, record, "")
+                    _auto_wip_commit_on_exhaustion(
+                        ctx, f"no_progress_max={no_progress_max} reached on node {current.name!r}"
+                    )
                     break
 
             branch_records: list[tuple] = []
@@ -600,6 +683,9 @@ def run(
                                 "is_exit": str(is_exit_node(current)),
                             },
                             seq,
+                        )
+                        _auto_wip_commit_on_exhaustion(
+                            ctx, f"join max_visits={_jn_max} exceeded on join {_jn.name!r}"
                         )
                         break
                     # Filter by edge conditions; deduplicate by node name so multiple
