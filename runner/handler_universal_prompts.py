@@ -113,7 +113,7 @@ def _slash_gate(slash_command: str, default_args: str = "") -> "Handler":
 
 UNIVERSAL_CODE_STANDARDS_PROMPT = """\
 You are performing an automated, repository-agnostic Code Standards & Quality Review.
-Analyze the active repository changes and diff in the current workspace.
+You have full read-write tool access to the current workspace. Proactively use your tools to inspect, build, run tests, and actively verify the code.
 
 You MUST audit the implementation against the following core principles:
 
@@ -148,7 +148,7 @@ CRITICAL FORMATTING INSTRUCTIONS:
 
 UNIVERSAL_EVIDENCE_REVIEW_PROMPT = """\
 You are performing an automated, repository-agnostic Evidence Standards & Review check.
-Analyze the active repository changes, diff, and any generated evidence files in the workspace.
+You have full read-write tool access to the current workspace. Proactively use your tools to inspect, read, run, and verify evidence and test execution.
 
 You MUST audit the implementation's evidence against the following core standards:
 
@@ -346,7 +346,7 @@ def _gate_code_standards(node: "Node", ctx: "Context") -> "Result":
 
 UNIVERSAL_DEAD_CODE_PROMPT = """\
 You are performing an automated Dead Code & Cleanliness Review.
-Analyze the active repository changes and diff in the current workspace.
+You have full read-write tool access to the current workspace. Proactively use your tools to inspect, compile, check references, and verify the workspace.
 
 You MUST audit the implementation against the following core principles:
 
