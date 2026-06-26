@@ -4,6 +4,7 @@ Goal:
 ${goal}
 
 Rules:
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed.
 - Behavior must be preserved exactly: the same tests that pass before must pass
   after, with no assertion changes.
 - Reduce duplication, clarify names, and tighten structure; do not add features.

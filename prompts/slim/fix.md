@@ -20,6 +20,7 @@ Last test output (stdout + stderr, head-truncated to 4000 chars):
 ${state.last_test_output}
 
 Rules:
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed.
 - Address only the failing evidence.
 - Preserve working code.
 - Do not restart the implementation from scratch.

@@ -4,6 +4,7 @@ Goal:
 ${goal}
 
 Rules:
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed.
 - Cover the public behavioral expectations stated in the visible spec.
 - Prefer fast, hermetic unit tests; add an integration test only when the spec's
   behavior cannot be proven at the unit level.

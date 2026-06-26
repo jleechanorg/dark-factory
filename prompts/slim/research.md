@@ -8,7 +8,7 @@ ${goal}
 - Codebase files referenced or relevant to the goal.
 
 ## Rules
-- Read-only: Do not modify production code in this node.
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed.
 - Identify the exact files, functions, and call sites the change must touch, with `path:line` references.
 - Surface existing modules or helpers to reuse rather than reimplement.
 - Call out constraints, edge cases, and prior art relevant to the goal.
