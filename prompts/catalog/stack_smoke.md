@@ -5,6 +5,7 @@ Goal:
 ${goal}
 
 Rules:
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed.
 - Exercise the real runtime path (start the service / invoke the entrypoint),
   not just unit mocks.
 - Confirm the primary user-visible behavior from `spec.md` responds successfully

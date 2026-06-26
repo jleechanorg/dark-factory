@@ -22,6 +22,13 @@ The green gate will run `${state.bug_fix.test_path}` after you finish
 and assert it PASSES. If it still fails, the pipeline routes you back
 here for another iteration (up to 3 visits total).
 
+## Rules
+
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed.
+- Address only the failing evidence.
+- Preserve working code.
+- Do not restart the implementation from scratch.
+
 ## Output
 
 End your response with a one-line summary of the change:

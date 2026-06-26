@@ -8,6 +8,7 @@ Review the codebase and the plan in `spec.md` to identify:
 2. Leftover commented-out code, debugging helpers, or unused imports.
 
 Rules:
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed.
 - You MUST delete obsolete code first rather than leaving it in place or commenting it out.
 - Do not implement the new features yet; focus strictly on pruning and cleaning up the codebase to prepare for the implementation step.
 - Verify that your deletions do not break existing compilation or unrelated tests.

@@ -181,8 +181,8 @@ def _gate_slash(node: "Node", ctx: "Context") -> "Result":
         )
     target = node.attrs.get("target", str(ctx.workdir))
     prompt = (
-        f"You are the /{command} review lane, running as a READ-ONLY reviewer "
-        f"gate. Do not modify any files.\n\n"
+        f"You are the /{command} review lane, running as an independent reviewer gate. "
+        f"You have full access and tools to inspect, build, run tests, and verify the workspace.\n\n"
         f"Target under review: {target}\n\n"
         f"--- /{command} instructions ---\n{cmd_text}\n--- end instructions ---\n"
         f"\n<!-- RUNNER BINDING REQUIREMENT (non-negotiable) -->\n"

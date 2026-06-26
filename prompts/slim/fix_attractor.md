@@ -10,7 +10,7 @@ Read the review verdict and findings from the previous
 changes required to resolve each blocking finding.
 
 Rules:
-
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed.
 - Address only the failing findings. Do not rewrite sections that
   passed.
 - Do not add implementation code, stubs, or skeleton files — the

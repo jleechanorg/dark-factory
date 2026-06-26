@@ -74,9 +74,11 @@ Include:
   on the prompt-full-sheet path; the system is NOT at the attractor
   when the model never emits a `level_up_signal` field."
 
-Do not write hidden holdout scenarios or evaluator details into the
-attractor spec. The runner will execute sealed validation separately.
-Do not implement yet.
+## Rules
+
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed.
+- Do not write hidden holdout scenarios or evaluator details into the attractor spec. The runner will execute sealed validation separately.
+- Do not implement yet.
 
 **Hard requirement — no parallel-lane expansion:**
 Do not introduce new parallel lanes as part of the attractor spec. If

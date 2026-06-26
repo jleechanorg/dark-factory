@@ -4,8 +4,7 @@ Goal:
 ${goal}
 
 Rules:
-- Read-only: do not modify production code in this node. Output is a written
-  findings summary the downstream implement node will consume.
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed.
 - Identify the exact files, functions, and call sites the change must touch, with
   `path:line` references.
 - Surface existing modules or helpers to reuse rather than reimplement.

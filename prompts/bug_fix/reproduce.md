@@ -47,4 +47,4 @@ pipeline.
 
 - Write ONE test file. Multiple tests inside are fine; one file is the unit.
 - The test must be a real pytest test, not a script that exits non-zero.
-- Do not modify any production code in this node — only write the test.
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed. Do not modify any production code in this node — only write the test.

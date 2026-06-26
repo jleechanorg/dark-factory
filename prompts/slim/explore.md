@@ -63,7 +63,7 @@ content of the four partials (no new claims, no new design).
 ## Rules (load-bearing)
 
 - The four partials are the only source of truth. Do not invent new content.
-- Do not modify production code or write `spec.md` in this node.
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed. Do not modify production code or write `spec.md` in this node.
 - Do not seek out, read, or summarize sealed holdout scenarios or evaluator
   internals; work only from the four partials and the visible goal.
 - If two partials disagree, surface the disagreement under the relevant

@@ -43,7 +43,7 @@ End your response with: `explore written: .dark-factory/explore-concepts.md`
 
 ## Rules
 
-- Read-only: do not modify production code or write `spec.md` in this node.
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed.
 - Do not seek out, read, or summarize sealed holdout scenarios or evaluator
   internals; work only from the visible goal and repository.
 - Focus on **what exists today** — naming, surfaces, and call sites. Leave

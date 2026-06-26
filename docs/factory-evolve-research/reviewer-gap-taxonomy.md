@@ -159,6 +159,35 @@ all. A codex cold review reads the actual test code and spots a mock-only proof.
 - **Fix idea:** require gate_er to re-run at least one cited scenario, or flag
   "evidence accepted without independent execution" when no holdout node exists.
 
+## G10 — visual-evidence-not-inspected (frames captured but pixels never read)
+
+A pipeline captures visual artifacts (screenshots, video, frame extractions) but
+no gate reads the pixel content. Evidence review trusts file-level metadata
+(count, byte size, codec, event counts) as a proxy for visual correctness. The
+transport layer is verified but the presentation layer is not.
+
+**Incident (2026-06-25, worldai_claw PR #250):** iOS evidence capture produced 52
+PNG frames and a 51.8s video showing SSE streaming on native iOS. The captions
+track and JSONL both confirmed 30 SSE chunks arrived. Every gate — E2E tests,
+CodeRabbit, `/er` audit, holdout (never executed) — passed. A manual frame
+inspection found three visible UX bugs present in **every single frame**:
+
+1. "No connection to server" error banner persisted throughout active SSE streaming
+2. "Open in WorldAI Claw?" native dialog was never dismissed
+3. Raw JSON tokens (`}`, `[SESSION_HEADER]`, escaped `\\n`) rendered as narrative
+
+The pipeline verified the wire (30 chunks arrived) but not the screen (what the
+user sees). The evidence-review prompt (`evidence_review.md`) checked SHA match,
+pass rates, and artifact existence — it never told the LLM reviewer to `view_file`
+on the PNGs. The `/es` skill (user-scope) at line 209 already says "extract frames
+and look" — but this instruction was not wired into the factory's reviewer prompt.
+
+- `prompts/slim/evidence_review.md` (fixed: step 4 now mandates visual cross-check)
+- `prompts/slim/review.md` (fixed: step 3 evidence check now includes visual cross-check)
+- **Detection:** look for evidence bundles containing `.png`/`.mp4` files where the
+  only assertions are on metadata (file count, `ffprobe` output, `wc -l` on JSONL)
+  rather than on content (OCR text, pixel state, element visibility).
+
 ---
 
 ## Cross-cutting note for /factory-evolve
