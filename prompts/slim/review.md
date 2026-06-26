@@ -38,6 +38,7 @@ For each `fail` finding: confirm the rationale applies to the diff (the runner s
    - Evidence SHA matches PR HEAD SHA
    - No "single_organic_level_up: FAIL" or similar failures in evidence.md
    Evidence gate passing due to URL presence alone is insufficient — read the content.
+   - **Visual cross-check** (mandatory when `.png`/`.mp4` artifacts exist in the bundle): Open and view 3–5 representative frames. Cross-check: do the frames show what the PR claims works? Look for error banners during "connected" periods, undismissed system dialogs, raw JSON rendered as user-facing text, or empty content where narrative should appear. Counting files or checking metadata (byte size, codec, frame count) without viewing pixel content is the G10 anti-pattern.
 
 4. **Test call-chain tracing**: For any new or modified test, trace the full call chain:
    - Does the campaign/character class match what the assertions expect?
