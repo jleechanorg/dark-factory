@@ -3,3 +3,7 @@
 Following the plan from the previous step and the spec at `specs/hello.md`,
 create `impl/greet.py` with the required `hello()` function. Do not add
 extra behavior; the holdout evaluator only checks the documented contract.
+
+## Rules
+
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed.

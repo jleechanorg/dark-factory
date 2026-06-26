@@ -89,6 +89,7 @@ target repo with this structure:
 
 ## Rules (load-bearing)
 
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed.
 - Validate only against the spec as written. Do not invent requirements
   the spec omits; report them as missing instead.
 - Do not read, reference, or paraphrase sealed holdout scenarios or

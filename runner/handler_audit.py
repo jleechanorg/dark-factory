@@ -321,6 +321,8 @@ def _gate_audit(node: "Node", ctx: "Context") -> "Result":
 You are performing an automated, repository-agnostic Evidence Audit review.
 You MUST audit the active repository changes, diff, and evidence files.
 
+You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed.
+
 RECORDS:
 Target Repo: {target_repo}
 Target PR: {target_pr}
