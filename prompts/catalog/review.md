@@ -30,9 +30,12 @@ For each `fail` finding: confirm the rationale applies to the diff (the runner s
 1. **Diff-scoped correctness**: Verify the changed code is correct, complete, and
    consistent with `spec.md`.
 
-2. **Off-diff contradiction check**: For each file changed, identify related
-   files that were NOT changed but may now contradict the change (prompt files,
-   constants, classification consumers).
+2. **Off-diff contradiction check**:
+   The runner captured the list of changed files:
+
+   ${changed_files}
+
+   For each file changed, identify related files that were NOT changed but may now contradict the change (prompt files, constants, classification consumers). For each changed symbol, you MUST explicitly name the unchanged consumers/callers you checked.
 
 3. **Evidence quality check** (not URL presence): If an evidence bundle is
    referenced, read it. Verify raw pass rates, required artifact files, and that

@@ -35,7 +35,13 @@ For each `fail` finding: confirm the rationale applies to the diff (the runner s
    - Do not restrict your review to the diff snippet. Use tools to view the full content of changed files and their neighbors.
    - Trace references to find any NameErrors, unimported modules, syntax errors, or compiler warnings. Run compiler checks (e.g., `python3 -m py_compile <file>`) to ensure no broken syntax is committed.
 
-3. **Off-diff contradiction check**: For each file changed, identify related files that were NOT changed but may now contradict the change. Specifically:
+3. **Off-diff contradiction check**:
+   The runner captured the list of changed files:
+
+   ${changed_files}
+
+   For each file changed, identify related files that were NOT changed but may now contradict the change. Specifically:
+   - For each changed symbol, you MUST explicitly name the unchanged consumers/callers you checked.
    - If a production constant/class/enum changed: search for all prompt files (`prompts/`, `*instruction*.md`, `*system*.md`) that reference the same entity and check for contradictions.
    - If a test was added/modified: check the test's call chain — trace every helper it calls and verify no hardcoded values create a mismatch (e.g. hardcoded campaign class vs `self.args.class_name`).
    - If config/classification logic changed: verify all consumers of that classification are consistent.

@@ -65,6 +65,11 @@ def _substitute_placeholders(text: str, ctx: "Context") -> str:
         diff = "(no diff captured)"
     text = text.replace("${diff}", diff)
 
+    changed_files = ctx.state.get("_last_changed_files", "")
+    if not changed_files:
+        changed_files = "(none)"
+    text = text.replace("${changed_files}", changed_files)
+
     if "${lint_findings}" in text:
         findings = _resolve_lint_findings(ctx)
         text = text.replace("${lint_findings}", findings_to_markdown(findings))
