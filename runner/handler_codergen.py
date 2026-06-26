@@ -128,14 +128,49 @@ def _capture_diff(workdir: "Path | str | None") -> str:
     return truncated + note
 
 
-def _stash_diff(node: "Node", ctx: "Context") -> None:
-    """Stash the captured diff into ``ctx.state`` for reviewer prompts.
+def _capture_changed_files(workdir: "Path | str | None") -> str:
+    """Best-effort list of changed files for G5.
 
-    Writes both ``ctx.state["<node.name>.diff"]`` (per-node, scoped) and
-    ``ctx.state["_last_diff"]`` (rolling, the most recent successful
-    codergen diff — what ``${diff}`` substitutes against). Best-effort:
-    if git fails or the workdir is not a repo, ``_last_diff`` becomes
-    ``""`` (which the renderer turns into ``"(no diff captured)"``).
+    Returns a bulleted list of changed files relative to workdir.
+    """
+    if not workdir:
+        return ""
+    wd_path = pathlib.Path(str(workdir))
+    if not wd_path.is_absolute() or ".." in wd_path.parts or not wd_path.is_dir():
+        return ""
+    wd = str(wd_path)
+    try:
+        unstaged = subprocess.run(
+            ["git", "-C", wd, "diff", "--name-only"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        staged = subprocess.run(
+            ["git", "-C", wd, "diff", "--staged", "--name-only"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    files = set()
+    if unstaged.returncode == 0 and unstaged.stdout:
+        for line in unstaged.stdout.splitlines():
+            line = line.strip()
+            if line:
+                files.add(line)
+    if staged.returncode == 0 and staged.stdout:
+        for line in staged.stdout.splitlines():
+            line = line.strip()
+            if line:
+                files.add(line)
+    if not files:
+        return "(none)"
+    return "\n".join(f"- {f}" for f in sorted(files))
+
+
+def _stash_diff(node: "Node", ctx: "Context") -> None:
+    """Stash the captured diff and changed files into ``ctx.state`` for reviewer prompts.
+
+    Writes both ``ctx.state["<node.name>.diff"]`` and ``ctx.state["_last_diff"]``,
+    as well as ``ctx.state["<node.name>.changed_files"]`` and ``ctx.state["_last_changed_files"]``.
     """
     workdir: "Path | str | None" = None
     ao_wt = ctx.state.get("ao.worktree")
@@ -162,6 +197,10 @@ def _stash_diff(node: "Node", ctx: "Context") -> None:
     diff = _capture_diff(workdir)
     ctx.state[f"{node.name}.diff"] = diff
     ctx.state["_last_diff"] = diff
+
+    changed_files = _capture_changed_files(workdir)
+    ctx.state[f"{node.name}.changed_files"] = changed_files
+    ctx.state["_last_changed_files"] = changed_files
 
 
 def _codergen(node: "Node", ctx: "Context") -> "Result":

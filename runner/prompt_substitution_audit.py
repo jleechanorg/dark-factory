@@ -101,6 +101,7 @@ DIRECTIVE_VERBS: frozenset[str] = frozenset({
 GENERIC_WRITER_SUFFIXES: tuple[str, ...] = (
     ".outcome",
     ".diff",
+    ".changed_files",
     ".resolved_backend",
     ".resolved_backend_meta",
     ".output",
