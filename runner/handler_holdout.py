@@ -19,6 +19,7 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -29,6 +30,159 @@ from .handler_core import Result
 if TYPE_CHECKING:
     from .parser import Node
     from .handler_core import Context
+
+
+# Homebrew openjdk path on Apple Silicon / Intel macOS. The Firebase emulator
+# requires Java on PATH; on Linux JVMs are normally installed system-wide so
+# no PATH override is needed. The darwin-only injection lives in
+# `_inject_firebase_java` so non-Firebase backends and non-macOS hosts never
+# touch this path.
+_HOMEBREW_JAVA_BIN = "/opt/homebrew/opt/java/bin"
+_HOMEBREW_JAVA_HOME = "/opt/homebrew/opt/java"
+
+
+def _read_yaml_scalar(path: "pathlib.Path", *keys: str) -> str | None:
+    """Return the first scalar string value found at ``keys`` in a tiny YAML subset.
+
+    We deliberately avoid a PyYAML dependency. The manifest schema we accept is:
+
+        emulator:
+          kind: firebase
+          start_command: "firebase emulators:start --only firestore"
+
+    Indentation is two spaces; only ``key: scalar`` rows are recognized, which
+    is enough for the ``emulator: {kind, start_command}`` block we own. Returns
+    ``None`` if the file is missing, unparseable, or no key matches.
+    """
+    try:
+        text = path.read_text()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+    lines = text.splitlines()
+    # Walk the line tree tracking indentation; each ``key:`` row at deeper
+    # indentation under a known parent is a candidate.
+    parents: list[tuple[int, str]] = []
+    want_parents = list(keys[:-1])
+    for raw in lines:
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        stripped = raw.lstrip()
+        indent = len(raw) - len(stripped)
+        # Pop parents whose indent is >= this line's indent — they're siblings
+        # or ancestors, not the parent of this line.
+        while parents and parents[-1][0] >= indent:
+            parents.pop()
+        if ":" not in stripped:
+            continue
+        key, _, value = stripped.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        # Strip a single layer of matched single or double quotes — the
+        # schema we accept uses scalar values like ``start_command: 'foo'``
+        # or ``port: "8080"``. Anything else (multi-line, escaped, block
+        # scalars) is out of scope.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        # Top-level scalar: callers passing a single key (no parents).
+        if not parents and not want_parents:
+            if key == keys[0]:
+                return value or None
+            continue
+        # If we have no current parents and the line is a top-level key, push.
+        if not parents:
+            if key in want_parents:
+                parents.append((indent, key))
+                if not value or value.startswith("#"):
+                    continue
+                if len(want_parents) == 1:
+                    return value
+            continue
+        # Otherwise check whether the active parent chain still matches.
+        current_parent_keys = [p[1] for p in parents]
+        if current_parent_keys == want_parents and key == keys[-1]:
+            return value or None
+        if key in want_parents[len(current_parent_keys):]:
+            parents.append((indent, key))
+    return None
+
+
+def _detect_emulator_backend(impl: "pathlib.Path") -> str:
+    """Discover the emulator backend the implementation under test expects.
+
+    Discovery order (first match wins):
+      1. ``dark-factory.yaml`` with ``emulator.kind: <backend>`` — explicit
+         per-worktree override.
+      2. ``firebase.json`` present at the impl root → ``firebase`` (keeps the
+         historical amazon-clone convention working without a manifest).
+      3. ``Makefile`` with a ``run:`` target → ``make``.
+      4. ``package.json`` with a ``start`` script → ``node_start``.
+      5. Otherwise → ``none`` (the evaluator runs without a local server;
+         e.g. fibonacci, hello, or any pure-Python CLI benchmark).
+
+    Returns one of: ``"firebase"``, ``"make"``, ``"node_start"``, ``"none"``.
+    The value is consumed by `_holdout_eval` to decide whether to inject the
+    Homebrew Java path, whether to strip GCP credentials, and which command to
+    spawn for the local server subprocess.
+    """
+    manifest = impl / "dark-factory.yaml"
+    kind = _read_yaml_scalar(manifest, "emulator", "kind")
+    if kind:
+        return str(kind).strip().lower()
+
+    if (impl / "firebase.json").exists():
+        return "firebase"
+
+    makefile = impl / "Makefile"
+    if makefile.exists():
+        try:
+            if re.search(r"^run\s*:", makefile.read_text(), re.MULTILINE):
+                return "make"
+        except (PermissionError, OSError):
+            pass
+
+    pkg_json = impl / "package.json"
+    if pkg_json.exists():
+        try:
+            data = json.loads(pkg_json.read_text())
+            if "start" in (data.get("scripts") or {}):
+                return "node_start"
+        except (json.JSONDecodeError, PermissionError, OSError):
+            pass
+
+    return "none"
+
+
+def _inject_firebase_java(eval_env: dict) -> bool:
+    """Prepend Homebrew openjdk to ``eval_env['PATH']``/``JAVA_HOME``.
+
+    Returns True iff Java was injected. The darwin gate keeps non-macOS hosts
+    untouched — Linux CI runners already have Java on PATH via apt, and the
+    Homebrew path does not exist there. Non-firebase call sites must not
+    invoke this helper.
+    """
+    if sys.platform != "darwin":
+        return False
+    if not os.path.isdir(_HOMEBREW_JAVA_BIN):
+        return False
+    eval_env["PATH"] = _HOMEBREW_JAVA_BIN + ":" + eval_env.get("PATH", "")
+    eval_env["JAVA_HOME"] = _HOMEBREW_JAVA_HOME
+    return True
+
+
+def _strip_firebase_gcp_creds(eval_env: dict) -> int:
+    """Pop real GCP credentials so the Firebase emulator uses the local project.
+
+    Only invoked when the detected emulator backend is ``firebase``; non-firebase
+    backends may legitimately need the operator's GCP credentials for
+    downstream tooling. Returns the number of vars removed.
+    """
+    removed = 0
+    for gcp_var in ("GOOGLE_APPLICATION_CREDENTIALS", "GCLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT"):
+        if eval_env.pop(gcp_var, None) is not None:
+            removed += 1
+    return removed
 
 
 def _tcp_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -42,13 +196,19 @@ def _tcp_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
 def _holdout_eval(node: "Node", ctx: "Context") -> "Result":
     """Run the sealed holdout evaluator in a separate process.
 
-    Infrastructure invariants (see memory/feedback_2026-05-24_holdout_eval_emulator_infra.md):
-    1. Java on PATH for Firebase emulators (Homebrew openjdk path).
-    2. Poll TCP ports, don't sleep — wait for all emulators to be ready.
-    3. Kill process GROUP on cleanup, not just the wrapper process.
-    4. Strip real GCP credentials from env so Cloud Functions emulator uses local project.
-    5. Pre-clean emulator ports before launching to kill stale JVM holders.
-    6. Run seed script (impl/scripts/seed.ts or npm run seed) after emulators are ready.
+    Emulator backend discovery is manifest-driven (see
+    ``_detect_emulator_backend``). The Firebase-specific invariants from
+    memory/feedback_2026-05-24_holdout_eval_emulator_infra.md only apply when
+    the discovered backend is ``firebase``:
+
+      1. Java on PATH for Firebase emulators (Homebrew openjdk path on macOS).
+      2. Poll TCP ports, don't sleep — wait for all emulators to be ready.
+      3. Kill process GROUP on cleanup, not just the wrapper process.
+      4. Strip real GCP credentials from env so Cloud Functions emulator
+         uses local project (firebase-only — non-firebase backends keep creds).
+      5. Pre-clean emulator ports before launching to kill stale JVM holders.
+      6. Run seed script (impl/scripts/seed.ts or npm run seed) after emulators
+         are ready (firebase-only).
     """
     import random
 
@@ -92,15 +252,25 @@ def _holdout_eval(node: "Node", ctx: "Context") -> "Result":
     # and strips holdout vars from its own children).
     eval_env = _handlers_shim._sanitized_env()
 
-    # Fix 1 — Java PATH: prepend Homebrew openjdk so Firebase emulators can find java.
-    homebrew_java = "/opt/homebrew/opt/java/bin"
-    if os.path.isdir(homebrew_java):
-        eval_env["PATH"] = homebrew_java + ":" + eval_env.get("PATH", "")
-        eval_env["JAVA_HOME"] = "/opt/homebrew/opt/java"
+    # Discover the emulator backend from the implementation tree, NOT a
+    # hardcoded Firebase assumption. ``dark-factory.yaml`` -> ``firebase.json``
+    # -> Makefile ``run:`` -> ``package.json`` ``start`` -> none.
+    emulator_backend = _detect_emulator_backend(impl)
 
-    # Fix 4 — Strip real GCP credentials: Cloud Functions emulator must use local project.
-    for gcp_var in ("GOOGLE_APPLICATION_CREDENTIALS", "GCLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT"):
-        eval_env.pop(gcp_var, None)
+    # Fix 1 — Java PATH: prepend Homebrew openjdk so Firebase emulators can
+    # find java. Only fires when (a) the discovered backend is ``firebase``
+    # AND (b) we are on macOS — non-firebase backends never need Java, and
+    # Linux CI hosts get Java from apt. This is the explicit gate the audit
+    # called out (lane E / jleechan-je5).
+    if emulator_backend == "firebase":
+        _inject_firebase_java(eval_env)
+
+    # Fix 4 — Strip real GCP credentials: Cloud Functions emulator must use
+    # local project. Firebase-only — non-firebase backends may legitimately
+    # need the operator's real GCP credentials (e.g. make/node_start hitting
+    # a real staging endpoint during scoring).
+    if emulator_backend == "firebase":
+        _strip_firebase_gcp_creds(eval_env)
 
     eval_env["BENCHMARK_PORT"] = str(port)
 
@@ -109,7 +279,7 @@ def _holdout_eval(node: "Node", ctx: "Context") -> "Result":
     makefile = impl / "Makefile"
     firebase_json = impl / "firebase.json"
     has_make_run = False
-    if makefile.exists():
+    if emulator_backend == "make" and makefile.exists():
         try:
             has_make_run = bool(re.search(r"^run\s*:", makefile.read_text(), re.MULTILINE))
         except Exception:
@@ -122,7 +292,7 @@ def _holdout_eval(node: "Node", ctx: "Context") -> "Result":
             ["make", "run"], cwd=str(impl), env=env_p,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         time.sleep(startup_delay)
-    elif firebase_json.exists():
+    elif emulator_backend == "firebase" and firebase_json.exists():
         # Kill any lingering processes from previous runs that hold the
         # Firebase emulator ports, so the new emulator can bind cleanly.
         for _em_port in (8080, 9099, 5001, 4000, 4400):
@@ -141,11 +311,14 @@ def _holdout_eval(node: "Node", ctx: "Context") -> "Result":
         # Ensure Java is on PATH — Firebase emulators require it.
         # Homebrew installs Java at /opt/homebrew/opt/java/bin but doesn't
         # add it to PATH by default. Prepend it so emulators can find `java`.
+        # Already gated by `_inject_firebase_java` above; idempotent guard
+        # for the legacy case where the backend was discovered via
+        # ``firebase.json`` directly without a manifest.
         _homebrew_java = "/opt/homebrew/opt/java/bin"
         _java_path = eval_env.get("PATH", "")
-        if _homebrew_java not in _java_path:
+        if sys.platform == "darwin" and os.path.isdir(_homebrew_java) and _homebrew_java not in _java_path:
             eval_env["PATH"] = _homebrew_java + ":" + _java_path
-        eval_env.setdefault("JAVA_HOME", "/opt/homebrew/opt/java")
+            eval_env.setdefault("JAVA_HOME", _HOMEBREW_JAVA_HOME)
         # Build Cloud Functions if source exists but compiled output is missing
         fn_pkg = impl / "functions" / "package.json"
         fn_lib = impl / "functions" / "lib" / "index.js"
