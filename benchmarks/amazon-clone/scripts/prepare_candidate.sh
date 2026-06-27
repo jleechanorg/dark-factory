@@ -40,6 +40,11 @@ echo "Copying benchmark files..."
 mkdir -p "$WORKDIR/benchmarks/amazon-clone"
 cp "${BENCHMARK_DIR}/spec.md" "$WORKDIR/benchmarks/amazon-clone/spec.md"
 cp "${BENCHMARK_DIR}/visible_acceptance.md" "$WORKDIR/benchmarks/amazon-clone/visible_acceptance.md"
+# README.md and SCORING.md are referenced from spec.md's "Revealed vs.
+# operator-only" pointer and from visible_acceptance.md's disclosure-model
+# preamble; copy them so the public pointers resolve in packaged workdirs.
+cp "${BENCHMARK_DIR}/README.md" "$WORKDIR/benchmarks/amazon-clone/README.md"
+cp "${BENCHMARK_DIR}/SCORING.md" "$WORKDIR/benchmarks/amazon-clone/SCORING.md"
 cp -r "${BENCHMARK_DIR}/prompts" "$WORKDIR/benchmarks/amazon-clone/"
 cp -r "${BENCHMARK_DIR}/scripts" "$WORKDIR/benchmarks/amazon-clone/"
 

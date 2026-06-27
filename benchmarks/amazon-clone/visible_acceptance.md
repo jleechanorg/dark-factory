@@ -1,9 +1,20 @@
 # Amazon Clone MVP - Visible Acceptance Criteria
 
-**Version:** 1.0  
-**Last Updated:** 2026-05-22  
+**Version:** 1.1  
+**Last Updated:** 2026-06-27  
 **Total Points:** 100 (+ 10 bonus)  
-**Pass Threshold:** 70/100 points
+**Pass Threshold:** 70/100 points  
+
+**Disclosure model (recommendation A, 2026-06-27 audit):** this file lists the
+visible targets the implementing agent should aim at — Lighthouse Performance
+score ≥ 70, axe-core accessibility violations < 5 of `serious`/`critical`
+impact, concrete viewport/responsive criteria, etc. Some of these targets
+appear in the 100-point core score; the audit and accessibility audits
+(Lighthouse ≥ 70, axe-core < 5) are scored in the Evidence bonus section
+(§7.2 / §7.3, +5 of the 10 bonus points), not as gating line items in the
+70/100 pass threshold. The held-back evaluator adds additional probes beyond
+these visible targets; the implementing agent cannot enumerate them by reading
+this file. This model is shared with `benchmarks/airbnb-clone/visible_acceptance.md`.
 
 ---
 
