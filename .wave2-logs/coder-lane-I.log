@@ -1,0 +1,22 @@
+[2026-06-27 13:57:50] [STATE] lane-I-clean at d93b0ca tracking origin/lane-I-clean. PR #115 CI running on clean head.
+[2026-06-27 14:02:14] [CI] test=PASS on d93b0ca. Skeptic still pending.
+[2026-06-27 14:08:30] [CI_FULL_GREEN] test=PASS skeptic=PASS CodeRabbit=PASS mergeable=MERGEABLE on d93b0ca
+[2026-06-27 14:09:00] [CONTENT] Diff verified clean. 5 files, +52/-16 lines. Addresses jleechan-vwv (amazon spec leak) + jleechan-hn4 (asymmetric disclosure model).
+[2026-06-27 14:16:00] [PIPELINE] dark-factory pr_gates --backend echo ran: holdout x3=failure (no sealed feature), fix exhausted max_visits=3. Evidence gates never reached (holdout-first policy + missing holdout feature).
+[2026-06-27 14:16:30] [CLEANUP] Reset worktree to origin/lane-I-clean d93b0ca; removed evidence dir created by dark-factory.
+[2026-06-27 14:16:45] [VERDICT] PR #115 ready-to-merge: YES. CI all-green + content addresses both sub-beads + CodeRabbit pass + mergeable. No real gate failure.
+[2026-06-27 14:30:00] [WAKEUP] Scheduled wakeup fired - re-checking CodeRabbit (chatgpt-codex-connector[bot]) inline comments.
+[2026-06-27 14:30:15] [FINDING] 2 P2 inline comments on PR #115:
+  - comment 0 (spec.md:2026): README/SCORING pointers are unreachable from packaged benchmark (prepare_candidate.sh doesn't copy README.md or SCORING.md)
+  - comment 1 (visible_acceptance.md:11): Lighthouse/axe-core claimed as "pass/fail targets" but actually Evidence bonus items outside 70/100 threshold
+[2026-06-27 14:30:30] [VERIFIED] Both findings confirmed via direct file inspection. Need to fix on lane-I-clean.
+[2026-06-27 14:30:45] [FIX_PLAN] Attempt 1:
+  - spec.md: restore the held-back guidance content directly in spec.md (it cannot depend on README/SCORING being packaged), OR add README/SCORING to prepare_candidate.sh copy list
+  - visible_acceptance.md: either (a) move 7.2/7.3 from bonus section into core scoring, or (b) qualify the preamble so it does not claim Lighthouse/axe-core as pass/fail targets
+[2026-06-27 14:34:00] [FIX_APPLIED] Both chatgpt-codex-connector findings addressed:
+  - benchmarks/amazon-clone/scripts/prepare_candidate.sh: added README.md + SCORING.md to cp list (5 lines)
+  - benchmarks/amazon-clone/visible_acceptance.md: rewrote preamble to qualify Lighthouse/axe-core as bonus-scored not gating (12 lines)
+[2026-06-27 14:34:30] [COMMIT] 77ec8c8 — "audit-2026-06-27 lane-I: address chatgpt-codex-connector inline findings"
+[2026-06-27 14:34:45] [PUSH] lane-I-clean: d93b0ca -> 77ec8c8 (push succeeded, G1/G2 audit clean)
+[2026-06-27 14:35:00] [PR_UPDATE] PR #115 headRefOid now 77ec8c89446dc9834a9142815fda90ccd6d35fe5, mergeable=MERGEABLE
+[2026-06-27 14:35:15] [CI_PENDING] gh checks hit rate limit; will re-poll on next agent turn
