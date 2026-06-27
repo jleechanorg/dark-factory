@@ -76,3 +76,30 @@ def test_auto_wip_commit_skipped_in_test_mode(tmp_path, monkeypatch):
     _auto_wip_commit_on_exhaustion(ctx, "test exhaustion")
     
     assert not called, "subprocess.run should not have been called under pytest"
+
+
+def test_last_output_handoff_is_truncated_under_agy(tmp_path):
+    from runner.handler_render import _render_prompt
+    
+    tail_marker = "TAIL-FINDING-coder-must-see-this"
+    long_review = "review finding\n" + ("x" * 4500) + tail_marker
+    
+    p = tmp_path / "fix.md"
+    p.write_text("fix handoff:\n${state._last_output}\n", encoding="utf-8")
+    
+    # 1. Under agy backend -> truncated
+    node_agy = Node(name="fix", attrs={"type": "codergen", "backend": "agy", "prompt": f"@{p}"})
+    ctx_agy = Context(goal="truncation test", workdir=tmp_path)
+    ctx_agy.state["_last_output"] = long_review
+    
+    rendered_agy = _render_prompt(node_agy, ctx_agy)
+    assert tail_marker not in rendered_agy
+    assert len(ctx_agy.state["_last_output"]) > 4000  # Verify orig_last_output was restored in state
+    
+    # 2. Under echo backend -> not truncated
+    node_echo = Node(name="fix", attrs={"type": "codergen", "backend": "echo", "prompt": f"@{p}"})
+    ctx_echo = Context(goal="truncation test", workdir=tmp_path)
+    ctx_echo.state["_last_output"] = long_review
+    
+    rendered_echo = _render_prompt(node_echo, ctx_echo)
+    assert tail_marker in rendered_echo

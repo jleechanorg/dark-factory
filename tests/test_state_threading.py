@@ -103,10 +103,10 @@ def test_goal_only_prompt_does_not_see_upstream_output(tmp_path):
     assert NODE1_MARKER not in migration.output_preview
 
 
-def test_last_output_handoff_is_truncated(tmp_path):
+def test_last_output_handoff_is_not_truncated(tmp_path):
     """A reviewer can return a long free-form finding; the next coder must
-    receive the truncated text (up to 4000 chars) through ``${state._last_output}``
-    to prevent context limit exhaust/OOM.
+    receive the full text through ``${state._last_output}``, not only the
+    preview stored in CXDB/event summaries.
     """
     tail_marker = "TAIL-FINDING-coder-must-see-this"
     long_review = "review finding\n" + ("x" * 4500) + tail_marker
@@ -117,15 +117,15 @@ def test_last_output_handoff_is_truncated(tmp_path):
 
     review = Node(name="review", attrs={"type": "codergen", "backend": "echo", "prompt": f"@{p1}"})
     fix = Node(name="fix", attrs={"type": "codergen", "backend": "echo", "prompt": f"@{p2}"})
-    graph = Graph(name="thread", goal="truncation check", nodes={"review": review, "fix": fix}, edges=[])
-    ctx = Context(goal="truncation check", workdir=tmp_path, backend="echo")
+    graph = Graph(name="thread", goal="no truncation", nodes={"review": review, "fix": fix}, edges=[])
+    ctx = Context(goal="no truncation", workdir=tmp_path, backend="echo")
 
     _run_single_node(review, ctx, graph, seq_base=1)
-    assert tail_marker not in ctx.state["_last_output"]
-    assert len(ctx.state["_last_output"]) == 4000
+    assert tail_marker in ctx.state["_last_output"]
+    assert len(ctx.state["_last_output"]) > 4000
 
     results, _records = _run_single_node(fix, ctx, graph, seq_base=2)
-    assert tail_marker not in results[-1].output
+    assert tail_marker in results[-1].output
 
 
 def test_long_output_handoff_and_sidecars_are_full(monkeypatch, tmp_path):

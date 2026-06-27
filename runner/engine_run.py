@@ -155,7 +155,7 @@ def _run_single_node(
             ctx.state.update(attempt.context_updates)
             ctx.state["_last_node"] = node.name
             ctx.state["_last_outcome"] = attempt.outcome
-            ctx.state["_last_output"] = attempt.output[:4000]
+            ctx.state["_last_output"] = attempt.output
             
             # Surface Coder Handoff section + verdict token (P5)
             verdict = attempt.metadata.get("verdict")
