@@ -16,6 +16,7 @@ ${spec_lines}
 
 Output JSON schema:
 {
+  "head_sha": "<sha>",
   "verdict": "pass|fail",
   "spec": {
     "path": "<spec_path>",
