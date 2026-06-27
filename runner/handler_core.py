@@ -125,4 +125,19 @@ def _exit(node: Node, ctx: Context) -> Result:
         previous = ctx.history[-1].get("outcome", "success")
         if previous != "success":
             return Result(outcome=previous, output=f"exit after {previous}")
+    
+    # G8: re-pin HEAD SHA at exit node
+    last_validated = ctx.state.get("_last_validated_head_sha")
+    if last_validated:
+        from .handler_verdict import _worktree_head_sha
+        current_sha = _worktree_head_sha(ctx.workdir)
+        if current_sha and current_sha.lower() != last_validated.lower():
+            return Result(
+                outcome="error",
+                output=(
+                    f"exit blocked: HEAD SHA changed since last validated review gate. "
+                    f"Expected: {last_validated}, got: {current_sha}"
+                ),
+                metadata={"exit_sha_status": "mismatched"},
+            )
     return Result(outcome="success", output="exit")

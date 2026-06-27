@@ -77,51 +77,64 @@ def _substitute_placeholders(text: str, ctx: "Context") -> str:
 
 
 def _render_prompt(node: "Node", ctx: "Context") -> str:
-    ref = node.prompt_ref
-    if not ref:
-        return f"# {node.name}\n\nGoal: {ctx.goal}"
-    ref_path = pathlib.Path(ref)
-    if ref_path.is_absolute():
-        resolved_ref = ref_path
-        try:
-            resolved_ref = ref_path.resolve()
-        except FileNotFoundError:
-            return f"# {node.name}\n\nGoal: {ctx.goal}\n(missing prompt: {ref})"
+    backend = node.attrs.get("backend", node.attrs.get("model", ctx.backend))
+    if isinstance(backend, bool):
+        backend = ctx.backend
+    backend = str(backend)
 
-        for deny in _handlers_shim._holdout_denied_paths():
+    orig_last_output = ctx.state.get("_last_output")
+    if backend == "agy" and orig_last_output is not None:
+        ctx.state["_last_output"] = orig_last_output[:4000]
+
+    try:
+        ref = node.prompt_ref
+        if not ref:
+            return f"# {node.name}\n\nGoal: {ctx.goal}"
+        ref_path = pathlib.Path(ref)
+        if ref_path.is_absolute():
+            resolved_ref = ref_path
             try:
-                resolved_ref.relative_to(deny)
-            except ValueError:
-                pass
+                resolved_ref = ref_path.resolve()
+            except FileNotFoundError:
+                return f"# {node.name}\n\nGoal: {ctx.goal}\n(missing prompt: {ref})"
+
+            for deny in _handlers_shim._holdout_denied_paths():
+                try:
+                    resolved_ref.relative_to(deny)
+                except ValueError:
+                    pass
+                else:
+                    return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
+
+            text_path = resolved_ref
+            if not text_path.exists():
+                return f"# {node.name}\n\nGoal: {ctx.goal}\n(missing prompt: {ref})"
+            text = text_path.read_text()
+            return _substitute_placeholders(text, ctx)
+        from .paths import factory_home
+        root = ctx.workdir.resolve()
+        p = (root / ref_path).resolve()
+        if not p.exists():
+            home = factory_home()
+            if home is not None:
+                alt = (home / ref_path).resolve()
+                if alt.exists():
+                    p = alt
+        try:
+            p.relative_to(root)
+        except ValueError:
+            home = factory_home()
+            if home is not None:
+                try:
+                    p.relative_to(home.resolve())
+                except ValueError:
+                    return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
             else:
                 return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
-
-        text_path = resolved_ref
-        if not text_path.exists():
+        if not p.exists():
             return f"# {node.name}\n\nGoal: {ctx.goal}\n(missing prompt: {ref})"
-        text = text_path.read_text()
+        text = p.read_text()
         return _substitute_placeholders(text, ctx)
-    from .paths import factory_home
-    root = ctx.workdir.resolve()
-    p = (root / ref_path).resolve()
-    if not p.exists():
-        home = factory_home()
-        if home is not None:
-            alt = (home / ref_path).resolve()
-            if alt.exists():
-                p = alt
-    try:
-        p.relative_to(root)
-    except ValueError:
-        home = factory_home()
-        if home is not None:
-            try:
-                p.relative_to(home.resolve())
-            except ValueError:
-                return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
-        else:
-            return f"# {node.name}\n\nGoal: {ctx.goal}\n(invalid prompt: {ref})"
-    if not p.exists():
-        return f"# {node.name}\n\nGoal: {ctx.goal}\n(missing prompt: {ref})"
-    text = p.read_text()
-    return _substitute_placeholders(text, ctx)
+    finally:
+        if orig_last_output is not None:
+            ctx.state["_last_output"] = orig_last_output

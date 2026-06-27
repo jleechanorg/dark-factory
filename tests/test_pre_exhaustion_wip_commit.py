@@ -15,6 +15,13 @@ import pathlib
 import subprocess
 import sys
 
+import os
+import pytest
+
+@pytest.fixture(autouse=True)
+def _allow_wip_test(monkeypatch):
+    monkeypatch.setenv("DARK_FACTORY_ALLOW_WIP_TEST", "1")
+
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -43,7 +50,7 @@ def _init_git_repo(path: pathlib.Path) -> None:
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(path), check=True)
     for key, value in [
         ("user.name", "test"),
-        ("user.email", "test@example.com"),
+        ("user.email", "jleechan2015@users.noreply.github.com"),
         ("commit.gpgsign", "false"),
     ]:
         subprocess.run(

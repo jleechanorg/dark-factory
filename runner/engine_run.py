@@ -47,6 +47,14 @@ def _auto_wip_commit_on_exhaustion(ctx: "Context", reason: str) -> None:
       - worktree clean (`git status --porcelain` empty) → noop
       - subprocess failures → silently swallowed (best-effort)
     """
+    # Skip auto-WIP commit if running under pytest / test mode to avoid polluting the repo
+    import sys
+    import os
+    if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ or os.environ.get("DARK_FACTORY_TESTING") == "1":
+        current_test = os.environ.get("PYTEST_CURRENT_TEST", "")
+        # Allow specific tests in test_pre_exhaustion_wip_commit to run WIP commits
+        if "test_pre_exhaustion_wip_commit" not in current_test and os.environ.get("DARK_FACTORY_ALLOW_WIP_TEST") != "1":
+            return
     try:
         workdir = pathlib.Path(getattr(ctx, "workdir", "") or "")
         if not workdir or not workdir.exists():
@@ -107,6 +115,22 @@ def _auto_wip_commit_on_exhaustion(ctx: "Context", reason: str) -> None:
         return
 
 
+def _extract_coder_handoff(text: str) -> str:
+    """Extract ## Coder Handoff section from reviewer output."""
+    if not text:
+        return ""
+    import re
+    # Match ## Coder Handoff (case-insensitive) and extract until next markdown header (e.g. ## or #) or end of string.
+    pattern = re.compile(
+        r"##\s*Coder\s+Handoff\b(.*?)(?=^(?:#+|\s*##)\s|\Z)",
+        re.IGNORECASE | re.DOTALL | re.MULTILINE
+    )
+    match = pattern.search(text)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
 def _run_single_node(
     node: Node,
     ctx: Context,
@@ -135,6 +159,20 @@ def _run_single_node(
             ctx.state["_last_node"] = node.name
             ctx.state["_last_outcome"] = attempt.outcome
             ctx.state["_last_output"] = attempt.output
+            
+            # Surface Coder Handoff section + verdict token (P5)
+            verdict = attempt.metadata.get("verdict")
+            if verdict:
+                ctx.state["_last_verdict"] = verdict
+            else:
+                ctx.state.pop("_last_verdict", None)
+
+            handoff = _extract_coder_handoff(attempt.output)
+            if handoff:
+                ctx.state["_last_coder_handoff"] = handoff
+            else:
+                ctx.state.pop("_last_coder_handoff", None)
+
             normalized_results.append(attempt)
             records.append(
                 _persist.StepRecord(

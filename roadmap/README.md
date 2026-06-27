@@ -7,6 +7,14 @@
 
 ## Recent activity (rolling)
 
+### 2026-06-27 — P0 default Level-5 graph contract
+
+- Operator escalation: the default DOT graph contract is P0, not P3. A reference graph is not enough; `/f` and `/factory` must run the real `dark-factory` binary and always include or generate Level-5 default nodes unless the operator explicitly overrides the pipeline.
+- Current gap: `pipelines/factory/level5_feature.dot` documents the intended graph, but `runner/__main__.py` still requires `--pipeline` and `.claude/skills/dark-factory/SKILL.md` still says not to default to a single pipeline.
+- Beads updated/created: `jleechan-0qy` promoted to P0, plus P0 children `jleechan-0qy.1` through `jleechan-0qy.4` for binary default, conformance/CI enforcement, command/skill split-brain cleanup, and proof tests/evidence handoff.
+- GitHub issues: https://github.com/jleechanorg/dark-factory/issues/122, https://github.com/jleechanorg/dark-factory/issues/123, https://github.com/jleechanorg/dark-factory/issues/124, https://github.com/jleechanorg/dark-factory/issues/125.
+- Nextsteps doc: `~/roadmap/nextsteps-2026-06-27-dark-factory-p0-default-level5-graph.md`.
+
 ### 2026-06-27 — Factory-runs-the-factory contract (addendum to compliance review)
 
 - Operator-requested: `/fs` and `/f` must invoke the actual `dark-factory` binary (not an in-Claude Claude Workflow dispatch) in adversarial spec-producer mode; after every invocation, the literal command line + run ID + CXDB SHA must be echoed in the reply.

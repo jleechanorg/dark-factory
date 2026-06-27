@@ -47,7 +47,7 @@ from runner.parser import Node as _Node  # noqa: E402
 EXPECTED_CODER_OUTCOME = {
     "claude": "failure",    # caught by `except Exception` (line 535)
     "codex": "error",       # caught by `except Exception` (line 583)
-    "agy": "PANIC",         # Popen at line 629 is unprotected (bead jleechan-c5q)
+    "agy": "error",         # Popen is protected (bead jleechan-c5q)
     "ao": "failure",        # caught by `except Exception` (line 352/445)
 }
 
@@ -79,9 +79,10 @@ def _node(backend: str, name: str = "test_step") -> _Node:
 
 
 def _disable_sandbox(monkeypatch) -> None:
-    """Make ``_sandboxed_args`` a transparent passthrough so the tests
+    """Make ``_sandboxed_args`` and ``_sandboxed_args_for_workdir`` transparent passthroughs so the tests
     focus on the *backend* argv, not the sandbox wrapper."""
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: list(a))
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda a, w: list(a))
 
 
 def _fake_completed(args, *, returncode: int = 0, stdout: str = "", stderr: str = ""):
@@ -112,6 +113,7 @@ def _patched_run_raises(monkeypatch, *, target: str, exc: BaseException):
         return _fake_completed(args, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("runner.handlers.subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_codergen.subprocess.run", _fake_run)
     monkeypatch.setattr("subprocess.run", _fake_run)
 
 
@@ -128,6 +130,7 @@ def _patched_popen_raises(monkeypatch, *, target: str, exc: BaseException):
         return real_popen(args, **kwargs)
 
     monkeypatch.setattr("runner.handlers.subprocess.Popen", _fake_popen)
+    monkeypatch.setattr("runner.handler_codergen.subprocess.Popen", _fake_popen)
     monkeypatch.setattr("subprocess.Popen", _fake_popen)
 
 
@@ -191,36 +194,20 @@ def test_codex_coder_missing_returns_clean_error(monkeypatch, tmp_path):
     assert result.metadata.get("backend_missing") != "true"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="bead jleechan-c5q: agy coder path lacks FileNotFoundError handler. "
-    "Popen at runner/handlers.py:629 is unprotected; only TimeoutExpired is caught.",
-)
 def test_agy_coder_missing_panics_unprotected(monkeypatch, tmp_path):
-    """agy missing → ``FileNotFoundError`` propagates from
-    ``subprocess.Popen`` at line 629 of ``_codergen``.
-
-    Audit-table row: agy | PANIC | NO | N/A (panic).
-
-    This test is xfail-strict — the moment bead jleechan-c5q lands the
-    fix, the test should be updated to assert the clean ``Result``
-    outcome (most likely ``error`` with ``backend_missing="true"`` to
-    match the gate path) and ``strict=False`` (or xfail removed).
+    """agy missing → ``FileNotFoundError`` is caught and returned as clean error Result.
     """
     _disable_sandbox(monkeypatch)
-    # ``agy`` uses ``subprocess.Popen`` (line 629) and the only
-    # try/except is around ``proc.communicate`` for TimeoutExpired.
     _patched_popen_raises(
         monkeypatch,
         target="agy",
         exc=FileNotFoundError(2, "No such file or directory: agy"),
     )
 
-    # The handler currently raises FileNotFoundError out of _codergen.
-    # We do NOT catch it here — we let it propagate so pytest records
-    # the panic as a failure and ``xfail(strict=True)`` keeps the build
-    # green with a clear reason.
-    _codergen(_node("agy"), Context(goal="t", workdir=tmp_path, backend="agy"))
+    result = _codergen(_node("agy"), Context(goal="t", workdir=tmp_path, backend="agy"))
+    assert result.outcome == "error"
+    assert result.metadata.get("backend_missing") == "true"
+
 
 
 def test_ao_coder_missing_sandbox_present_returns_failure(monkeypatch, tmp_path):
