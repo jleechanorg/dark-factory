@@ -144,10 +144,10 @@ export DARK_FACTORY_HOME="${REPO_ROOT}"
 export PATH="${LOCAL_BIN}:${PATH}"
 
 if [[ "${SMOKE}" -eq 1 ]]; then
-  echo "==> smoke run via dark-factory binary (echo backend, no LLM)"
+  echo "==> smoke run via dark-factory binary (parallel demo, echo backend, no LLM)"
   cd "${REPO_ROOT}"
   "${BIN_DIR}/dark-factory" \
-    --pipeline pipelines/factory/hello.dot \
+    --pipeline pipelines/parallel_demo.dot \
     --goal "install.sh smoke" \
     --no-perf-log \
     --max-steps 20 \
