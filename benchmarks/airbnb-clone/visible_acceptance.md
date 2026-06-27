@@ -1,6 +1,8 @@
 # Visible Acceptance — airbnb-clone
 
-These checks are **visible to the implementing agent**. They cover the happy path and the rules / contracts that are explicitly part of `spec.md`. The sealed adversarial probes (race conditions, leak attempts, Lighthouse budgets, accessibility audits) live in the holdout repo and are **not** described here.
+These checks are **visible to the implementing agent**. They cover the happy path and the rules / contracts that are explicitly part of `spec.md`. The held-back adversarial probes (race conditions, leak attempts, exact scenario values) live in the holdout repo and are **not** described here.
+
+This file follows the same disclosure model as `benchmarks/amazon-clone/visible_acceptance.md` (recommendation A from the 2026-06-27 benchmark spec-isolation audit): the visible thresholds the implementing agent should target — Lighthouse Performance ≥ 70, axe-core violations < 5, viewport breakpoints 360/414/768, etc. — are listed in the per-sprint sections below as concrete pass/fail targets. The held-back layer adds adversarial probes (race conditions, leak attempts, exact adversarial payloads) that go beyond these visible thresholds; the implementing agent cannot enumerate them by reading this file.
 
 The implementing agent should treat this file as a self-check list: if a section here fails, the corresponding sprint output is not done. Passing every section here is necessary, **not sufficient**, for a passing run.
 
@@ -141,6 +143,21 @@ A unit test for **each** server action asserts both shapes are reachable.
 - Each route has a `loading.tsx` that shows during initial render.
 - Each route has an `error.tsx` that catches thrown errors and shows a Retry button.
 - A 404 page exists at `app/not-found.tsx`.
+
+### S3.9 Performance + accessibility budgets (visible thresholds)
+
+These are the **visible thresholds** the implementing agent should target on
+the home page (`/`) and the search results page (`/search`):
+
+- Lighthouse Performance score ≥ 70.
+- axe-core accessibility audit reports < 5 violations of `serious` or
+  `critical` impact.
+- No horizontal scroll at viewport widths 360, 414, and 768 (see S3.7).
+- Total transferred bytes for the home route ≤ 500 KB gzipped (excluding
+  user-supplied listing photos).
+
+The held-back layer may probe additional adversarial payloads, race conditions,
+or stricter thresholds beyond the visible targets above.
 
 ---
 

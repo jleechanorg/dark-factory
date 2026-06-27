@@ -17,5 +17,10 @@ Candidate quality threshold: 80/100 with no critical sealed validation failure.
 
 Fair method comparison additionally requires the outer harness to enforce equal
 visible spec, starter state, model access, runtime budget, token budget, retry
-budget, and sealed evaluator version. This rubric scores one candidate artifact;
+budget, and held-back evaluator version. This rubric scores one candidate artifact;
 it does not by itself prove a method bakeoff was fair.
+
+For the visible-vs-held-back disclosure contract that pairs with this rubric, see
+the parent `README.md` ("Revealed vs. operator-only" section). For the visible
+acceptance checklist used by the implementing agent during self-review, see
+`visible_acceptance.md`.
