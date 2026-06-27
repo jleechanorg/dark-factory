@@ -115,12 +115,16 @@ def _successful_for_node(node: Node, result) -> bool:
     return partial_allowed and outcome == "partial"
 
 
-def _run_with_retries(handler, node: Node, ctx: Context, graph) -> list:
+def _run_with_retries(handler, node: Node, ctx: Context, graph, input_logger=None) -> list:
     results: list = []
     max_retries = _node_max_retries(node, graph)
     attempts = 0
     while True:
+        attempt_index = attempts + 1
+        input_meta = input_logger(attempt_index) if input_logger is not None else {}
         last = handler(node, ctx)
+        if input_meta:
+            last.metadata = {**input_meta, **last.metadata}
         results.append(last)
         if _successful_for_node(node, last) or attempts >= max_retries:
             break

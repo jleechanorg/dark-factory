@@ -205,7 +205,9 @@ def _run_branch_until_join(
                 start_seq,
             )
 
-            results, records = _engine_run._run_single_node(current, ctx, graph)
+            results, records = _engine_run._run_single_node(
+                current, ctx, graph, start_seq
+            )
             steps += 1
             step_result = results[-1] if results else Result(outcome="success")
             # Preserve first failure: don't let a mid-branch join's success mask it.
@@ -257,6 +259,9 @@ def _run_branch_until_join(
                     "max_retries": record.metadata.get("max_retries", "0"),
                     "parallel": "true",
                 }
+                for key in ("input_path", "input_sha256", "llm_prompt_path", "llm_prompt_sha256"):
+                    if key in record.metadata:
+                        payload[key] = record.metadata[key]
                 if transcript_path:
                     payload["transcript_path"] = transcript_path
                     payload["transcript_sha256"] = transcript_sha256

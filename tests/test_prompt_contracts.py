@@ -153,6 +153,11 @@ def test_slim_review_prompt_has_diff_and_lint_findings() -> None:
         f"Without ${{diff}} the reviewer cannot see the work; without "
         f"${{lint_findings}} the reviewer cannot pre-check style."
     )
+    for required in ("## Coder Handoff", "Blocking findings", "Required fix", "Verification to rerun"):
+        assert required in text, (
+            f"prompts/slim/review.md is missing {required!r}. "
+            f"Reviewer output must remain useful as free-form input to the next fix node."
+        )
 
 
 def test_bug_fix_prompt_has_test_path() -> None:

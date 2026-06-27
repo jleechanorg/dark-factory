@@ -316,6 +316,21 @@ def main(argv: list[str] | None = None) -> int:
             "pipeline": graph.name,
             "goal": args.goal,
             "run_id": ctx.run_id,
+            "run_dir": (
+                str(pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id)
+                if ctx.run_id
+                else None
+            ),
+            "inputs_dir": (
+                str(pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id / "inputs")
+                if ctx.run_id
+                else None
+            ),
+            "transcripts_dir": (
+                str(pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id / "transcripts")
+                if ctx.run_id
+                else None
+            ),
             "events": str(ctx.event_log_path) if ctx.event_log_path else None,
             "steps": len(history),
             "final_outcome": history[-1].outcome if history else "empty",

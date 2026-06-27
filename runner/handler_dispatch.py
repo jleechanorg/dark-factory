@@ -119,6 +119,38 @@ def _run_gate_once(
     # model, which is the cross-vendor intent). Everything else is whatever
     # the priority queue / run-level config chose.
     reviewer_backend = backend
+    prompt_meta: dict[str, str] = {}
+    try:
+        from . import engine_observability as _obs
+
+        seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
+        attempt = int(getattr(ctx, "_df_current_attempt", 1))
+        node_name = str(getattr(ctx, "_df_current_node", name))
+        prompt_path, prompt_sha = _obs._write_input_sidecar(
+            ctx,
+            seq,
+            node_name,
+            attempt,
+            prompt,
+            kind="llm_prompt",
+        )
+        if prompt_path:
+            prompt_meta = {
+                "llm_prompt_path": prompt_path,
+                "llm_prompt_sha256": prompt_sha or "",
+            }
+            _obs._emit_event(
+                ctx,
+                "node_prompt",
+                {
+                    "node": node_name,
+                    "attempt": str(attempt),
+                    **prompt_meta,
+                },
+                seq,
+            )
+    except Exception:
+        prompt_meta = {}
     sub_args = _gate_subprocess_args(backend, prompt, ctx, timeout)
     sub_env = _gate_subprocess_env(backend)
     if sub_args is None:
@@ -126,7 +158,8 @@ def _run_gate_once(
             outcome="failure",
             output="sandbox-exec unavailable",
             metadata={"slash_command": name, "verdict": "unknown",
-                      "reviewer_backend": reviewer_backend, "sandbox": "unavailable"},
+                      "reviewer_backend": reviewer_backend, "sandbox": "unavailable",
+                      **prompt_meta},
         )
     # agy enforces its own --print-timeout; give the outer wait a small buffer
     # so we read agy's timeout message rather than killing it first.
@@ -152,7 +185,7 @@ def _run_gate_once(
             output=combined.strip() or f"gate {name} timed out after {run_timeout}s",
             metadata={"slash_command": name, "verdict": "unknown",
                       "head_sha_status": "missing", "timed_out": "true",
-                      "reviewer_backend": reviewer_backend},
+                      "reviewer_backend": reviewer_backend, **prompt_meta},
         )
     except FileNotFoundError as exc:
         return Result(
@@ -160,14 +193,15 @@ def _run_gate_once(
             output=f"gate {name} backend {reviewer_backend!r} not found: {exc}",
             metadata={"slash_command": name, "verdict": "unknown",
                       "head_sha_status": "missing", "reviewer_backend": reviewer_backend,
-                      "backend_missing": "true"},
+                      "backend_missing": "true", **prompt_meta},
         )
     except Exception as exc:
         return Result(
             outcome="error",
             output=f"gate {name} subprocess failed: {exc}",
             metadata={"slash_command": name, "verdict": "unknown",
-                      "head_sha_status": "missing", "reviewer_backend": reviewer_backend},
+                      "head_sha_status": "missing", "reviewer_backend": reviewer_backend,
+                      **prompt_meta},
         )
     combined = proc.stdout + "\n" + proc.stderr
     verdict, normalized = _handlers_shim._parse_verdict(combined, gate_strict=gate_strict)
@@ -195,6 +229,7 @@ def _run_gate_once(
             "expected_head_sha": expected_sha, "observed_head_sha": observed_sha,
             "head_sha_status": head_sha_status,
             "reviewer_backend": reviewer_backend,
+            **prompt_meta,
         },
     )
 

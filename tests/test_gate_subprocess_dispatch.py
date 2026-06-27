@@ -124,6 +124,40 @@ def test_execute_gate_runs_codex_subprocess_when_priority_resolves_codex(
     )
 
 
+def test_execute_gate_writes_exact_prompt_sidecar(tmp_path, monkeypatch):
+    """Reviewer gates must log the exact prompt sent to the backend."""
+    import subprocess as _sp
+    from runner.handlers import _execute_gate, Context as HCtx
+
+    fake_sha = "a" * 40
+
+    def _fake_run(cmd, **kwargs):
+        return _sp.CompletedProcess(
+            cmd,
+            0,
+            stdout=f"head_sha: {fake_sha}\nverdict: pass\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude", run_id="promptlog1")
+    ctx.event_log_path = tmp_path / "events.jsonl"
+    setattr(ctx, "_df_current_seq", 7)
+    setattr(ctx, "_df_current_attempt", 2)
+    setattr(ctx, "_df_current_node", "evidence")
+
+    result = _execute_gate("PROMPT WITH REVIEW INSTRUCTIONS", fake_sha, 300, ctx, "gate_er", "codex")
+
+    assert result.outcome == "success"
+    prompt_path = pathlib.Path(result.metadata["llm_prompt_path"])
+    assert prompt_path.exists()
+    assert prompt_path.read_text() == "PROMPT WITH REVIEW INSTRUCTIONS"
+    assert result.metadata["llm_prompt_sha256"]
+    events = [line for line in ctx.event_log_path.read_text().splitlines() if line.strip()]
+    assert any('"event": "node_prompt"' in line and '"node": "evidence"' in line for line in events)
+
+
 def test_execute_gate_runs_minimax_with_correct_env(monkeypatch, tmp_path):
     """_execute_gate with backend='minimax' invokes the claude CLI but with
     ANTHROPIC_BASE_URL set to the minimax gateway. The recorded reviewer

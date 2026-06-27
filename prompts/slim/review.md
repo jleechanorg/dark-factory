@@ -63,4 +63,13 @@ Return a concise verdict:
 - `success` only if ALL five steps pass, tests run and pass, and no blocking issues remain.
 - `failure` if any step finds a correctness, security, evidence, or call-chain gap, or if tests fail.
 
+Before the final verdict, include a section titled `## Coder Handoff` with:
+- Summary: one or two sentences describing what you actually verified.
+- Blocking findings: each blocker with file paths, line numbers, artifact references, and why it fails.
+- Evidence checked: exact commands, logs, screenshots, videos, URLs, or files you inspected.
+- Required fix: concrete implementation steps the coder should take next.
+- Verification to rerun: exact commands or artifacts that should prove the fix.
+
+If there are no blockers, still include the section and state `Blocking findings: none`.
+
 List concrete findings with file paths, line numbers, and exact remediation steps.

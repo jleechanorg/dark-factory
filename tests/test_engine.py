@@ -378,6 +378,15 @@ def test_structured_events_and_transcripts(monkeypatch, tmp_path):
     
     # Check that transcript sidecars were written and contain correct hashes and content
     for r in node_results:
+        assert "input_path" in r
+        assert "input_sha256" in r
+        input_path = pathlib.Path(r["input_path"])
+        assert input_path.exists()
+        input_content = input_path.read_text()
+        assert "Dark Factory node input" in input_content
+        assert '"node": "node_a"' in input_content
+        assert r["input_sha256"] == hashlib.sha256(input_content.encode("utf-8")).hexdigest()
+
         assert "transcript_path" in r
         assert "transcript_sha256" in r
         path = pathlib.Path(r["transcript_path"])
@@ -426,6 +435,8 @@ def test_structured_events_and_transcripts(monkeypatch, tmp_path):
     ]
     
     holdout_result = next(e for e in events_holdout if e["event"] == "node_result" and e.get("node") == "holdout")
+    assert "input_path" in holdout_result
+    assert pathlib.Path(holdout_result["input_path"]).exists()
     assert "transcript_path" in holdout_result
     holdout_path = pathlib.Path(holdout_result["transcript_path"])
     assert holdout_path.exists()

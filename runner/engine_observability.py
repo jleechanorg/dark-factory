@@ -215,6 +215,111 @@ def _write_transcript_sidecar(
         return None, None
 
 
+def _write_input_sidecar(
+    ctx: Context,
+    seq: int,
+    node_name: str,
+    attempt_index: int,
+    content: str,
+    kind: str = "input",
+) -> tuple[Optional[str], Optional[str]]:
+    """Write the full input for a node attempt to a sidecar file."""
+    if not content:
+        return None, None
+
+    run_id = getattr(ctx, "run_id", None)
+    if not run_id:
+        return None, None
+
+    sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    try:
+        run_dir = pathlib.Path.home() / ".dark-factory" / "runs" / run_id
+        inputs_dir = run_dir / "inputs"
+        inputs_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_kind = re.sub(r"[^A-Za-z0-9_.-]+", "_", kind).strip("_") or "input"
+        file_name = f"{seq}_{node_name}_{attempt_index}_{safe_kind}.txt"
+        file_path = inputs_dir / file_name
+        file_path.write_text(content, encoding="utf-8")
+
+        return str(file_path), sha256
+    except Exception as exc:
+        try:
+            print(f"[runner:write_input_sidecar:{type(exc).__name__}] {exc}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+        return None, None
+
+
+def _node_input_snapshot(node: Node, ctx: Context) -> str:
+    """Return a human-readable snapshot of the input visible to a node."""
+    payload = {
+        "node": node.name,
+        "node_type": _node_type(node),
+        "backend": _node_backend(node, ctx),
+        "goal": ctx.goal,
+        "workdir": str(ctx.workdir),
+        "attrs": {str(k): str(v) for k, v in node.attrs.items()},
+        "state": {str(k): str(v) for k, v in ctx.state.items()},
+    }
+    parts = [
+        "# Dark Factory node input",
+        "",
+        json.dumps(payload, indent=2, sort_keys=True),
+    ]
+
+    if node.prompt_ref:
+        try:
+            import runner.handlers as _handlers_shim
+
+            parts.extend(
+                [
+                    "",
+                    "## Rendered prompt",
+                    "",
+                    _handlers_shim._render_prompt(node, ctx),
+                ]
+            )
+        except Exception as exc:
+            parts.extend(
+                [
+                    "",
+                    "## Rendered prompt",
+                    "",
+                    f"<prompt render failed: {type(exc).__name__}: {exc}>",
+                ]
+            )
+    return "\n".join(parts)
+
+
+def _write_node_input_sidecar(
+    ctx: Context,
+    seq: int,
+    node: Node,
+    attempt_index: int,
+) -> dict[str, str]:
+    """Persist the node's pre-execution input snapshot and emit an event."""
+    content = _node_input_snapshot(node, ctx)
+    path, sha256 = _write_input_sidecar(ctx, seq, node.name, attempt_index, content)
+    if not path:
+        return {}
+    meta = {
+        "input_path": path,
+        "input_sha256": sha256 or "",
+    }
+    _emit_event(
+        ctx,
+        "node_input",
+        {
+            "node": node.name,
+            "attempt": str(attempt_index),
+            **meta,
+        },
+        seq,
+    )
+    return meta
+
+
 def _open_run_log(run_id: str) -> Optional[TextIO]:
     """Open ~/.dark-factory/logs/<run_id>.log for append-mode tee logging.
 

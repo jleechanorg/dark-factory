@@ -98,3 +98,53 @@ def test_gate_code_standards_uses_universal_prompt_when_local_file_absent(tmp_pa
         f"When code-standards.md is absent, _gate_code_standards must use "
         f"universal prompt. Got: {prompt_used[:60]!r}"
     )
+
+
+def test_universal_gate_prompts_require_coder_handoff() -> None:
+    from runner.handler_universal_prompts import (
+        CODER_HANDOFF_FORMAT,
+        UNIVERSAL_CODE_STANDARDS_PROMPT,
+        UNIVERSAL_EVIDENCE_REVIEW_PROMPT,
+    )
+
+    for prompt in (UNIVERSAL_CODE_STANDARDS_PROMPT, UNIVERSAL_EVIDENCE_REVIEW_PROMPT):
+        assert "## Coder Handoff" in prompt
+        assert "Blocking findings" in prompt
+        assert "Required fix" in prompt
+        assert "Verification to rerun" in prompt
+
+    assert "## Coder Handoff" in CODER_HANDOFF_FORMAT
+    assert "Blocking findings" in CODER_HANDOFF_FORMAT
+
+
+def test_custom_prompt_gate_appends_coder_handoff_contract(tmp_path, monkeypatch):
+    import subprocess as _sp
+    from runner.handlers import _run_custom_prompt_gate, Context as HCtx
+
+    prompt_dir = tmp_path / "prompts"
+    prompt_dir.mkdir()
+    (prompt_dir / "custom.md").write_text("Custom review body for ${goal}\n", encoding="utf-8")
+
+    node = make_node(name="gate_custom", type="gate_er", prompt="@prompts/custom.md")
+    ctx = HCtx(goal="handoff goal", workdir=tmp_path, backend="claude")
+
+    fake_sha = "c" * 40
+    called_prompts: list[str] = []
+
+    def _fake_run(cmd, **kwargs):
+        called_prompts.append(cmd[-1])
+        return _sp.CompletedProcess(cmd, 0,
+            stdout=f"head_sha: {fake_sha}\nverdict: pass\n", stderr="")
+
+    monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    result = _run_custom_prompt_gate(node, ctx, "gate_er")
+
+    assert result.outcome == "success"
+    assert called_prompts
+    prompt_used = called_prompts[0]
+    assert "Custom review body for handoff goal" in prompt_used
+    assert "## Coder Handoff" in prompt_used
+    assert "Required fix" in prompt_used

@@ -46,6 +46,18 @@ if TYPE_CHECKING:
     from .handler_core import Context, Handler
 
 
+CODER_HANDOFF_FORMAT = """\
+Before the final verdict, include a section titled `## Coder Handoff` with:
+- Summary: one or two sentences describing what you actually verified.
+- Blocking findings: each blocker with file/path, line or artifact reference, and why it fails.
+- Evidence checked: exact commands, logs, screenshots, videos, URLs, or files you inspected.
+- Required fix: concrete implementation steps the coder should take next.
+- Verification to rerun: exact commands or artifacts that should prove the fix.
+
+If there are no blockers, still include the section and state `Blocking findings: none`.
+"""
+
+
 def _slash_gate(slash_command: str, default_args: str = "") -> "Handler":
     """Build a handler that shells out to the reviewer backend with `/<command> <args>`."""
 
@@ -137,6 +149,15 @@ Provide a detailed review report listing:
 - Audit results for ZFC, Root-Cause-First, and Clean Code.
 - A bulleted list of any blockers and required fixes.
 
+Before the final verdict, include a section titled `## Coder Handoff` with:
+- Summary: one or two sentences describing what you actually verified.
+- Blocking findings: each blocker with file/path, line or artifact reference, and why it fails.
+- Evidence checked: exact commands, logs, screenshots, videos, URLs, or files you inspected.
+- Required fix: concrete implementation steps the coder should take next.
+- Verification to rerun: exact commands or artifacts that should prove the fix.
+
+If there are no blockers, still include the section and state `Blocking findings: none`.
+
 CRITICAL FORMATTING INSTRUCTIONS:
 1. You MUST include a binding verification line:
    head_sha: {expected_sha}
@@ -183,6 +204,15 @@ You MUST audit the implementation's evidence against the following core standard
 
 4. CHECKSUM INTEGRITY:
    - Confirm that generated files are accompanied by valid checksums or integrity metadata.
+
+Before the final verdict, include a section titled `## Coder Handoff` with:
+- Summary: one or two sentences describing what you actually verified.
+- Blocking findings: each blocker with file/path, line or artifact reference, and why it fails.
+- Evidence checked: exact commands, logs, screenshots, videos, URLs, or files you inspected.
+- Required fix: concrete implementation steps the coder should take next.
+- Verification to rerun: exact commands or artifacts that should prove the fix.
+
+If there are no blockers, still include the section and state `Blocking findings: none`.
 
 CRITICAL FORMATTING INSTRUCTIONS:
 1. You MUST include a binding verification line:
@@ -286,6 +316,7 @@ def _run_custom_prompt_gate(node: "Node", ctx: "Context", name: str) -> "Result"
         )
 
     contract = (
+        f"\n\n{CODER_HANDOFF_FORMAT}"
         f"\n\nCRITICAL FORMATTING INSTRUCTIONS:\n"
         f"1. You MUST include a binding verification line:\n"
         f"   head_sha: {expected_sha}\n\n"

@@ -111,11 +111,22 @@ def _run_single_node(
     node: Node,
     ctx: Context,
     graph: Graph,
+    seq_base: int = 0,
 ) -> tuple[list[Result], list]:
     _obs._write_heartbeat(ctx, graph, node)
     try:
         handler = resolve(node)
-        results = _persist._run_with_retries(handler, node, ctx, graph)
+
+        def _log_input(attempt_index: int) -> dict[str, str]:
+            seq = seq_base + attempt_index - 1
+            setattr(ctx, "_df_current_seq", seq)
+            setattr(ctx, "_df_current_attempt", attempt_index)
+            setattr(ctx, "_df_current_node", node.name)
+            return _obs._write_node_input_sidecar(ctx, seq, node, attempt_index)
+
+        results = _persist._run_with_retries(
+            handler, node, ctx, graph, input_logger=_log_input
+        )
         normalized_results: list[Result] = []
         records: list = []
         for attempt in results:
@@ -321,7 +332,7 @@ def run(
                 )
                 enter_seq = seq  # capture before _append_record increments seq
                 _obs._perf_node_enter(ctx, current, enter_seq, visits[current.name])
-                results, records = _run_single_node(current, ctx, graph)
+                results, records = _run_single_node(current, ctx, graph, seq)
             except Exception as exc:  # noqa: BLE001 — any node crash must be recorded, not fatal
                 next_node = _exc._handle_node_exception(
                     graph, current, ctx, exc, history, checkpoint, cxdb, seq, log, visits
@@ -402,7 +413,9 @@ def run(
                     )
                     _obs._perf_node_enter(ctx, target, b_seq, branch_visit)
                     try:
-                        b_results, b_records = _run_single_node(target, _branches._clone_context(ctx), graph)
+                        b_results, b_records = _run_single_node(
+                            target, _branches._clone_context(ctx), graph, b_seq
+                        )
                     except Exception as exc:  # noqa: BLE001
                         b_tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
                         summary_line = b_tb.strip().splitlines()[-1] if b_tb.strip() else ""
@@ -444,6 +457,9 @@ def run(
                             "max_retries": "0",
                             "parallel": "true",
                         }
+                        for key in ("input_path", "input_sha256", "llm_prompt_path", "llm_prompt_sha256"):
+                            if key in b_record.metadata:
+                                payload[key] = b_record.metadata[key]
                         if transcript_path:
                             payload["transcript_path"] = transcript_path
                             payload["transcript_sha256"] = transcript_sha256
@@ -501,6 +517,9 @@ def run(
                                 "max_retries": b_record.metadata.get("max_retries", "0"),
                                 "parallel": "true",
                             }
+                            for key in ("input_path", "input_sha256", "llm_prompt_path", "llm_prompt_sha256"):
+                                if key in b_record.metadata:
+                                    payload[key] = b_record.metadata[key]
                             if transcript_path:
                                 payload["transcript_path"] = transcript_path
                                 payload["transcript_sha256"] = transcript_sha256
@@ -582,6 +601,9 @@ def run(
                     "attempt": str(index + 1),
                     "max_retries": record.metadata.get("max_retries", "0"),
                 }
+                for key in ("input_path", "input_sha256", "llm_prompt_path", "llm_prompt_sha256"):
+                    if key in record.metadata:
+                        payload[key] = record.metadata[key]
                 if transcript_path:
                     payload["transcript_path"] = transcript_path
                     payload["transcript_sha256"] = transcript_sha256
