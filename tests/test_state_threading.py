@@ -9,7 +9,7 @@ test by name as the justification for giving Mode A its best honest config.
 
 Mechanism under test (engine.py ``_run_single_node``):
     after every node the engine writes ``ctx.state["_last_output"]`` = the
-    node's output (truncated to 4000 chars); ``_render_prompt`` then substitutes
+    node's full output; ``_render_prompt`` then substitutes
     ``${state._last_output}`` in the next node's prompt template.
 
 The echo backend returns the *rendered prompt* as its output, so if node 2's
@@ -25,8 +25,9 @@ ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from runner.engine import run  # noqa: E402
+from runner.engine_run import _run_single_node  # noqa: E402
 from runner.handlers import Context  # noqa: E402
-from runner.parser import parse  # noqa: E402
+from runner.parser import Graph, Node, parse  # noqa: E402
 
 NODE1_MARKER = "SCHEMA-COLUMNS=id,name,created_at"
 
@@ -99,3 +100,28 @@ def test_goal_only_prompt_does_not_see_upstream_output(tmp_path):
     history = run(graph, ctx)
     migration = [s for s in history if s.node == "migration"][-1]
     assert NODE1_MARKER not in migration.output_preview
+
+
+def test_last_output_handoff_is_not_truncated(tmp_path):
+    """A reviewer can return a long free-form finding; the next coder must
+    receive the full text through ``${state._last_output}``, not only the
+    preview stored in CXDB/event summaries.
+    """
+    tail_marker = "TAIL-FINDING-coder-must-see-this"
+    long_review = "review finding\n" + ("x" * 4500) + tail_marker
+    p1 = tmp_path / "review.md"
+    p2 = tmp_path / "fix.md"
+    p1.write_text(long_review, encoding="utf-8")
+    p2.write_text("fix handoff:\n${state._last_output}\n", encoding="utf-8")
+
+    review = Node(name="review", attrs={"type": "codergen", "backend": "echo", "prompt": f"@{p1}"})
+    fix = Node(name="fix", attrs={"type": "codergen", "backend": "echo", "prompt": f"@{p2}"})
+    graph = Graph(name="thread", goal="no truncation", nodes={"review": review, "fix": fix}, edges=[])
+    ctx = Context(goal="no truncation", workdir=tmp_path, backend="echo")
+
+    _run_single_node(review, ctx, graph, seq_base=1)
+    assert tail_marker in ctx.state["_last_output"]
+    assert len(ctx.state["_last_output"]) > 4000
+
+    results, _records = _run_single_node(fix, ctx, graph, seq_base=2)
+    assert tail_marker in results[-1].output

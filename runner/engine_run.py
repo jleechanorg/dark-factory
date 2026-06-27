@@ -134,7 +134,7 @@ def _run_single_node(
             ctx.state.update(attempt.context_updates)
             ctx.state["_last_node"] = node.name
             ctx.state["_last_outcome"] = attempt.outcome
-            ctx.state["_last_output"] = attempt.output[:4000]
+            ctx.state["_last_output"] = attempt.output
             normalized_results.append(attempt)
             records.append(
                 _persist.StepRecord(

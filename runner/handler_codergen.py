@@ -50,8 +50,10 @@ import os
 import pathlib
 import re
 import signal
+import shutil
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -69,6 +71,286 @@ if TYPE_CHECKING:
 # reviewer knows the diff was lossy (it can re-fetch via git if it
 # needs the rest).
 _DIFF_MAX_CHARS = 50_000
+
+
+@dataclass
+class _ShadowCodexReview:
+    prompt: str = ""
+    proc: subprocess.Popen | None = None
+    prompt_path: str = ""
+    prompt_sha256: str = ""
+    launch_error: str = ""
+    started_at: float = 0.0
+
+
+def _shadow_review_enabled(node: "Node", ctx: "Context", backend: str) -> bool:
+    """True when a review node should get a parallel plain-Codex check."""
+    raw = node.attrs.get("shadow_codex_review", "true")
+    if isinstance(raw, str) and raw.strip().lower() in {"false", "0", "no", "off"}:
+        return False
+    if raw is False:
+        return False
+    if backend in {"echo", "mock_llm"}:
+        return False
+    return str(node.attrs.get("class", "")).strip().lower() == "review"
+
+
+def _shadow_review_prompt(node: "Node", ctx: "Context", primary_prompt: str) -> str:
+    """Build the simple independent reviewer prompt for the Codex shadow lane."""
+    review_target = str(node.attrs.get("shadow_review_target", "diff")).strip() or "diff"
+    diff = ctx.state.get("_last_diff", "(no diff captured)")
+    changed_files = ctx.state.get("_last_changed_files", "(no changed files captured)")
+    previous = ctx.state.get("_last_output", "")
+    return f"""\
+review this {review_target}
+
+You are the parallel Codex reviewer for a Dark Factory reviewer node.
+Do an independent, blocker-first review of the current workspace. Focus on
+what a coder can fix next, not on restating gate status.
+
+Goal:
+{ctx.goal}
+
+Reviewer node:
+{node.name}
+
+Changed files:
+{changed_files}
+
+Diff captured before this reviewer:
+```
+{diff}
+```
+
+Previous node output:
+```
+{previous}
+```
+
+Primary reviewer prompt for comparison:
+```
+{primary_prompt}
+```
+
+Return this exact free-form shape:
+
+## Review Verdict
+pass | fail
+
+## Blocking Findings
+1. Severity: concise issue title.
+   Evidence: exact file/function/run/artifact/line or say none.
+   Why it matters: behavioral or merge-readiness impact.
+   Fix: smallest concrete coder action.
+
+## Evidence Checked
+- Exact commands, files, logs, screenshots, videos, URLs, or artifacts inspected.
+
+## Required Next Actions
+1. Smallest patch or evidence regeneration step.
+2. Exact verification command or artifact to rerun.
+
+End with this machine-readable routing line:
+verdict: <pass|fail>
+"""
+
+
+def _start_shadow_codex_review(
+    node: "Node",
+    ctx: "Context",
+    backend: str,
+    primary_prompt: str,
+) -> _ShadowCodexReview | None:
+    """Launch the plain Codex shadow review before the primary reviewer blocks."""
+    if not _shadow_review_enabled(node, ctx, backend):
+        return None
+
+    prompt = _shadow_review_prompt(node, ctx, primary_prompt)
+    shadow = _ShadowCodexReview(prompt=prompt, started_at=time.monotonic())
+    try:
+        from . import engine_observability as _obs
+
+        seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
+        attempt = int(getattr(ctx, "_df_current_attempt", 1))
+        prompt_path, prompt_sha = _obs._write_input_sidecar(
+            ctx,
+            seq,
+            node.name,
+            attempt,
+            prompt,
+            kind="shadow_codex_prompt",
+        )
+        shadow.prompt_path = prompt_path or ""
+        shadow.prompt_sha256 = prompt_sha or ""
+        if prompt_path:
+            _obs._emit_event(
+                ctx,
+                "shadow_review_prompt",
+                {
+                    "node": node.name,
+                    "attempt": str(attempt),
+                    "shadow_backend": "codex",
+                    "shadow_prompt_path": shadow.prompt_path,
+                    "shadow_prompt_sha256": shadow.prompt_sha256,
+                },
+                seq,
+            )
+    except Exception:
+        pass
+
+    if shutil.which("codex") is None:
+        shadow.launch_error = "codex executable not found"
+        return shadow
+
+    args = _handlers_shim._sandboxed_args([
+        "codex",
+        "exec",
+        "--yolo",
+        "--skip-git-repo-check",
+        prompt,
+    ])
+    if args is None:
+        shadow.launch_error = "sandbox-exec unavailable"
+        return shadow
+    try:
+        shadow.proc = subprocess.Popen(
+            args,
+            cwd=ctx.workdir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            env=_handlers_shim._sanitized_env(),
+        )
+    except Exception as exc:
+        shadow.launch_error = f"{type(exc).__name__}: {exc}"
+    return shadow
+
+
+def _finish_shadow_codex_review(
+    result: "Result",
+    shadow: _ShadowCodexReview | None,
+    node: "Node",
+    ctx: "Context",
+) -> "Result":
+    """Merge the parallel Codex review into a reviewer node's result."""
+    if shadow is None:
+        return result
+
+    timeout_s = _handlers_shim._coerce_timeout(
+        node.attrs.get("shadow_codex_timeout", node.attrs.get("timeout", "1200")),
+        1200,
+    )
+    stdout = ""
+    stderr = ""
+    timed_out = False
+    returncode = ""
+    if shadow.launch_error:
+        output = f"shadow codex review did not run: {shadow.launch_error}"
+        shadow_outcome = "error"
+        verdict = "unknown"
+    else:
+        proc = shadow.proc
+        if proc is None:
+            output = "shadow codex review did not run: missing process handle"
+            shadow_outcome = "error"
+            verdict = "unknown"
+        else:
+            remaining = max(1, timeout_s - int(time.monotonic() - shadow.started_at))
+            try:
+                stdout, stderr = proc.communicate(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    stdout, stderr = proc.communicate(timeout=5)
+                except Exception:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+                    stdout, stderr = proc.communicate()
+            returncode = str(proc.returncode if proc.returncode is not None else "")
+            output = (stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
+            if timed_out and not output:
+                output = f"shadow codex review timed out after {timeout_s} seconds"
+            verdict, normalized = _handlers_shim._parse_verdict(output)
+            if proc.returncode != 0 or timed_out:
+                shadow_outcome = "error"
+            else:
+                shadow_outcome = normalized
+
+    output_path = ""
+    output_sha = ""
+    try:
+        from . import engine_observability as _obs
+
+        seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
+        attempt = int(getattr(ctx, "_df_current_attempt", 1))
+        output_path, output_sha = _obs._write_input_sidecar(
+            ctx,
+            seq,
+            node.name,
+            attempt,
+            output,
+            kind="shadow_codex_output",
+        )
+        _obs._emit_event(
+            ctx,
+            "shadow_review_result",
+            {
+                "node": node.name,
+                "attempt": str(attempt),
+                "shadow_backend": "codex",
+                "shadow_outcome": shadow_outcome,
+                "shadow_verdict": verdict,
+                "shadow_returncode": returncode,
+                "shadow_output_path": output_path or "",
+                "shadow_output_sha256": output_sha or "",
+            },
+            seq,
+        )
+    except Exception:
+        pass
+
+    meta = dict(result.metadata)
+    meta.update(
+        {
+            "shadow_codex_review": "true",
+            "shadow_codex_outcome": shadow_outcome,
+            "shadow_codex_verdict": verdict,
+            "shadow_codex_returncode": returncode,
+            "shadow_codex_timed_out": "true" if timed_out else "false",
+            "shadow_codex_prompt_path": shadow.prompt_path,
+            "shadow_codex_prompt_sha256": shadow.prompt_sha256,
+            "shadow_codex_output_path": output_path or "",
+            "shadow_codex_output_sha256": output_sha or "",
+        }
+    )
+    comparison = (
+        "\n\n---\n\n"
+        "## Parallel Codex Review\n"
+        f"{output}\n\n"
+        "## Review Comparison\n"
+        f"- Primary reviewer outcome: {result.outcome}\n"
+        f"- Shadow Codex outcome: {shadow_outcome}\n"
+        f"- Shadow Codex verdict: {verdict}\n"
+    )
+    final_outcome = result.outcome
+    if result.outcome == "success" and shadow_outcome != "success":
+        final_outcome = "failure"
+    updates = dict(result.context_updates)
+    updates[f"{node.name}.shadow_codex_output"] = output
+    updates[f"{node.name}.shadow_codex_outcome"] = shadow_outcome
+    updates[f"{node.name}.shadow_codex_output_path"] = output_path or ""
+    return Result(
+        outcome=final_outcome,
+        output=result.output + comparison,
+        metadata=meta,
+        preferred_label=result.preferred_label,
+        suggested_next_ids=result.suggested_next_ids,
+        context_updates=updates,
+    )
 
 
 def _capture_diff(workdir: "Path | str | None") -> str:
@@ -216,6 +498,11 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         backend = ctx.backend
     backend = str(backend)
     _start_ts = time.monotonic()
+    shadow_review = _start_shadow_codex_review(node, ctx, backend, prompt_text)
+
+    def _finalize(result: "Result") -> "Result":
+        return _finish_shadow_codex_review(result, shadow_review, node, ctx)
+
     if backend == "echo":
         wall_ms = int((time.monotonic() - _start_ts) * 1000)
         metrics = _handlers_shim._codergen_metrics("", "", wall_ms)
@@ -228,7 +515,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         outcome = pre if pre is not None else "success"
         if outcome == "success":
             _stash_diff(node, ctx)
-        return Result(outcome=outcome, output=prompt_text, metadata=meta)
+        return _finalize(Result(outcome=outcome, output=prompt_text, metadata=meta))
 
     if backend == "mock_llm":
         mock_url = str(ctx.state.get("mock_url", "")).rstrip("/")
@@ -248,7 +535,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             with urllib.request.urlopen(req, timeout=15) as resp:
                 resp_data = json.loads(resp.read().decode("utf-8"))
         except Exception as e:
-            return Result(outcome="failure", output=f"mock LLM error: {e}")
+            return _finalize(Result(outcome="failure", output=f"mock LLM error: {e}"))
 
         output_parts = resp_data.get("output", [])
         content_text = ""
@@ -279,19 +566,19 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             "wall_ms": str(wall_ms),
         }
         _stash_diff(node, ctx)
-        return Result(outcome="success", output=content_text, metadata=meta)
+        return _finalize(Result(outcome="success", output=content_text, metadata=meta))
 
     if backend == "ao":
         project = ctx.state.get("ao.project")
         if not project:
-            return Result(outcome="failure", output="ao backend requires --ao-project")
+            return _finalize(Result(outcome="failure", output="ao backend requires --ao-project"))
         agent = ctx.state.get("ao.agent", "claude-code")
         session = ctx.state.get("ao.session")
         if not session:
             spawn_args = ["ao", "spawn", prompt_text, "-p", project, "--agent", agent]
             spawn_args = _handlers_shim._sandboxed_args(spawn_args)
             if spawn_args is None:
-                return Result(outcome="failure", output="sandbox-exec unavailable")
+                return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
             ao_spawn_timeout = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "300"), 300)
             try:
                 proc = subprocess.run(
@@ -306,7 +593,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             except subprocess.TimeoutExpired as exc:
                 stdout = exc.stdout or ""
                 stderr = exc.stderr or ""
-                return Result(
+                return _finalize(Result(
                     outcome="failure",
                     output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
                     or f"ao spawn timed out after {ao_spawn_timeout} seconds",
@@ -317,9 +604,9 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                         "timeout": str(ao_spawn_timeout),
                         "returncode": "",
                     },
-                )
+                ))
             except Exception as exc:
-                return Result(
+                return _finalize(Result(
                     outcome="failure",
                     output=f"ao spawn failed: {exc}",
                     metadata={
@@ -329,9 +616,9 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                         "timeout": str(ao_spawn_timeout),
                         "returncode": "",
                     },
-                )
+                ))
             if proc.returncode != 0:
-                return Result(
+                return _finalize(Result(
                     outcome="failure",
                     output=f"ao spawn failed (rc={proc.returncode})\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
                     metadata={
@@ -341,7 +628,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                         "timeout": str(ao_spawn_timeout),
                         "activity": "spawn_failed",
                     },
-                )
+                ))
             sess_name = None
             worktree = None
             for line in proc.stdout.splitlines():
@@ -351,7 +638,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 if m:
                     worktree = m.group(1)
             if not sess_name:
-                return Result(outcome="failure", output=f"ao spawn produced no SESSION= line\n{proc.stdout}")
+                return _finalize(Result(outcome="failure", output=f"ao spawn produced no SESSION= line\n{proc.stdout}"))
             ctx.state["ao.session"] = sess_name
             if worktree:
                 ctx.state["ao.worktree"] = worktree
@@ -371,11 +658,11 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
             if outcome == "success":
                 _stash_diff(node, ctx)
-            return Result(
+            return _finalize(Result(
                 outcome=outcome,
                 output=f"ao spawn session={sess_name} worktree={worktree} activity={activity}",
                 metadata=meta,
-            )
+            ))
 
         ao_send_timeout = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "960"), 960)
         send_args = _handlers_shim._sandboxed_args([
@@ -387,7 +674,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             str(ao_send_timeout),
         ])
         if send_args is None:
-            return Result(outcome="failure", output="sandbox-exec unavailable")
+            return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
         try:
             proc = subprocess.run(
                 send_args,
@@ -401,7 +688,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         except subprocess.TimeoutExpired as exc:
             stdout = exc.stdout or ""
             stderr = exc.stderr or ""
-            return Result(
+            return _finalize(Result(
                 outcome="failure",
                 output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
                 or f"ao send timed out after {ao_send_timeout} seconds",
@@ -412,9 +699,9 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                     "timeout": str(ao_send_timeout),
                     "returncode": "",
                 },
-            )
+            ))
         except Exception as exc:
-            return Result(
+            return _finalize(Result(
                 outcome="failure",
                 output=f"ao send failed: {exc}",
                 metadata={
@@ -424,14 +711,14 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                     "timeout": str(ao_send_timeout),
                     "returncode": "",
                 },
-            )
+            ))
         if proc.returncode != 0:
             if "does not exist" in proc.stdout or "does not exist" in proc.stderr:
                 if "ao.session" in ctx.state:
                     del ctx.state["ao.session"]
                 if "ao.worktree" in ctx.state:
                     del ctx.state["ao.worktree"]
-            return Result(
+            return _finalize(Result(
                 outcome="failure",
                 output=f"ao send failed (rc={proc.returncode})\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
                 metadata={
@@ -441,7 +728,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                     "timeout": str(ao_send_timeout),
                     "returncode": str(proc.returncode),
                 },
-            )
+            ))
         ao_wait_timeout = _handlers_shim._coerce_timeout(node.attrs.get("wait_timeout", "900"), 900)
         activity = _handlers_shim._ao_wait_idle(session, ctx.workdir, timeout=ao_wait_timeout, project=project)
         outcome = "success" if activity in ("exited", "ready") else "failure"
@@ -457,11 +744,11 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
         if outcome == "success":
             _stash_diff(node, ctx)
-        return Result(
+        return _finalize(Result(
             outcome=outcome,
             output=f"ao send session={session} activity={activity}",
             metadata=meta,
-        )
+        ))
 
     if backend == "claude":
         # `--output-format json` makes coder token usage + dollar cost observable
@@ -479,7 +766,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         claude_cmd.append(prompt_text)
         args = _handlers_shim._sandboxed_args(claude_cmd)
         if args is None:
-            return Result(outcome="failure", output="sandbox-exec unavailable")
+            return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
         try:
             timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
             proc = subprocess.run(
@@ -494,7 +781,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                 env=_handlers_shim._sanitized_env(),
             )
         except subprocess.TimeoutExpired:
-            return Result(
+            return _finalize(Result(
                 outcome="failure",
                 output=f"claude backend timed out after {timeout_s} seconds",
                 metadata={
@@ -502,9 +789,9 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                     "timeout": str(timeout_s),
                     "returncode": "",
                 },
-            )
+            ))
         except Exception as e:
-            return Result(
+            return _finalize(Result(
                 outcome="failure",
                 output=f"claude backend error: {e}",
                 metadata={
@@ -512,7 +799,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                     "timeout": str(timeout_s),
                     "returncode": "",
                 },
-            )
+            ))
         # Success path: parse the JSON envelope for output text + token/cost
         # metrics, then return directly (codex/agy keep the regex-based tail).
         wall_ms = int((time.monotonic() - _start_ts) * 1000)
@@ -523,11 +810,11 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
         if outcome == "success":
             _stash_diff(node, ctx)
-        return Result(outcome=outcome, output=output, metadata=meta)
+        return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     elif backend == "codex":
         args = _handlers_shim._sandboxed_args(["codex", "exec", "--yolo", "--skip-git-repo-check", prompt_text])
         if args is None:
-            return Result(outcome="failure", output="sandbox-exec unavailable")
+            return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
         timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
         try:
             proc = subprocess.run(
@@ -543,7 +830,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         except subprocess.TimeoutExpired as exc:
             stdout = exc.stdout or ""
             stderr = exc.stderr or ""
-            return Result(
+            return _finalize(Result(
                 outcome="failure",
                 output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
                 or f"codex backend timed out after {timeout_s} seconds",
@@ -552,9 +839,9 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                     "timeout": str(timeout_s),
                     "returncode": "",
                 },
-            )
+            ))
         except Exception as exc:
-            return Result(
+            return _finalize(Result(
                 outcome="error",
                 output=f"codex backend error: {exc}",
                 metadata={
@@ -562,7 +849,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
                     "timeout": str(timeout_s),
                     "returncode": "",
                 },
-            )
+            ))
     elif backend == "agy":
         timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "600"), 600)
         task_dir = ctx.workdir / ".dark-factory"
@@ -598,7 +885,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             launch_prompt,
         ])
         if args is None:
-            return Result(outcome="failure", output="sandbox-exec unavailable")
+            return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
         proc = subprocess.Popen(
             args,
             cwd=ctx.workdir,
@@ -625,11 +912,11 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             metrics = _handlers_shim._codergen_metrics(stdout, stderr, wall_ms)
             meta = {"returncode": str(proc.returncode if proc.returncode is not None else ""), "timed_out": "true"}
             meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
-            return Result(
+            return _finalize(Result(
                 outcome="failure",
                 output=f"agy backend timed out after {timeout_s + 30}s\n{output}",
                 metadata=meta,
-            )
+            ))
         output = stdout + ("\nSTDERR:\n" + stderr if stderr else "")
         outcome = "success" if proc.returncode == 0 else "failure"
         if output.strip().startswith("Error: timed out waiting for response"):
@@ -640,9 +927,9 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
         if outcome == "success":
             _stash_diff(node, ctx)
-        return Result(outcome=outcome, output=output, metadata=meta)
+        return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     else:
-        return Result(outcome="failure", output=f"unknown backend {backend!r}")
+        return _finalize(Result(outcome="failure", output=f"unknown backend {backend!r}"))
 
     output = proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
     outcome = "success" if proc.returncode == 0 else "failure"
@@ -654,8 +941,8 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
     meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
     if outcome == "success":
         _stash_diff(node, ctx)
-    return Result(
+    return _finalize(Result(
         outcome=outcome,
         output=output,
         metadata=meta,
-    )
+    ))
