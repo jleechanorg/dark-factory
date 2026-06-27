@@ -24,10 +24,11 @@ the generated/selected DOT graph is saved or echoed in the run evidence.
 **Usage**:
 
 ```
-/f <goal description>                          # DEFAULT: binary-first factory run
+/f <goal description>                          # DEFAULT: binary-first factory run + reviewer calibration
 /f --pipeline gates <goal>                     # explicit binary pipeline
 /f --backend echo <goal>                       # wiring smoke (no LLM)
 /f --feature <name> <goal>                     # override holdout feature key
+/f --reviewer-calibration=false <goal>         # explicit opt-out; must explain why
 /f --dynamic-graph <goal>                      # binary-owned dynamic DOT/workflow builder
 /f --phase spec_validation <goal>              # binary-owned dynamic/phase run, if supported
 ```
@@ -100,6 +101,42 @@ If the user passed `--phase <name>`, pass it through only if the binary
 supports that phase/dynamic mode. Otherwise pick the closest explicit DOT
 pipeline and state the limitation.
 
+### Reviewer calibration (default on)
+
+`--reviewer-calibration=true` is the default for every real `/f` run. Treat
+the flag as present unless the user explicitly passes
+`--reviewer-calibration=false`.
+
+Calibration means the final `/f` evidence must compare at least:
+
+- the factory/in-graph reviewer outcome when the selected DOT has one;
+- a raw terminal mirror review via `codex exec --yolo -m gpt-5.3-codex-spark`;
+- a delegated reviewer/subagent outcome when available in the current session.
+
+All reviewers must receive the same frozen envelope: target repo, target PR or
+work item, head SHA, base SHA, diff, PR/task text, evidence paths, test logs,
+factory run ID, and the exact shared review prompt. Store outputs under:
+
+```text
+evidence/<run-id>/reviewer-calibration/
+  envelope.json
+  prompt.txt
+  raw-codex.output.md
+  raw-codex.findings.json
+  subagent.output.md
+  subagent.findings.json
+  factory-reviewer.output.md
+  factory-reviewer.findings.json
+  comparison.json
+  adjudication.md
+```
+
+Do not claim delegated subagents underperformed raw Codex unless the same
+envelope and prompt were reviewed at the same SHA and raw Codex found a
+later-confirmed blocker the delegated reviewer missed. If calibration is
+disabled, the final response must say `Reviewer calibration: disabled` and
+give the explicit reason.
+
 ### Report the verdict
 
 Quote the runner's final JSON line (`final_outcome`, `pipeline`, `steps`) and
@@ -128,6 +165,7 @@ dark-factory \
 # Wall-clock: <duration>
 # Logs: <path>
 # Evidence envelope: <path>
+# Reviewer calibration: <enabled|disabled> <artifact-path-or-reason>
 ```
 
 ## Honesty rules (LLM, do not skip)
@@ -142,6 +180,9 @@ dark-factory \
   stop** — do not silently fall through to a holdout-bearing pipeline.
 - If `--backend echo` was used, label the run as a wiring smoke, not a
   real validation. The 3-gate verdicts from echo are not real LLM verdicts.
+- Reviewer calibration is default-on. If `--reviewer-calibration=false` is
+  passed, quote the explicit opt-out reason and do not imply raw-Codex-vs-
+  subagent quality was measured.
 - The `gate_er` priority queue is `codex > minimax > agy > claude-sonnet`
   by default. If the LLM passes `--backend claude` for a real run, the
   `gate_er` reviewer is still resolved via the priority queue.

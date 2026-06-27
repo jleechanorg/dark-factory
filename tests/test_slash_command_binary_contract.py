@@ -100,3 +100,29 @@ def test_fs_alias_has_single_owner() -> None:
         if "fs" in _aliases(path.read_text())
     ]
     assert owners == ["fs.md"]
+
+
+def test_f_defaults_reviewer_calibration_on() -> None:
+    f_text = _command("f.md")
+    factory_text = _command("factory.md")
+    required_f_phrases = (
+        "--reviewer-calibration=true` is the default",
+        "--reviewer-calibration=false",
+        "# Reviewer calibration:",
+        "evidence/<run-id>/reviewer-calibration/",
+        "codex exec --yolo -m gpt-5.3-codex-spark",
+        "Do not claim delegated subagents underperformed raw Codex unless",
+    )
+    missing = [phrase for phrase in required_f_phrases if phrase not in f_text]
+    assert not missing, "f.md missing reviewer calibration contract: " + ", ".join(missing)
+
+    required_factory_phrases = (
+        "Reviewer calibration is also inherited from `/f`: default on",
+        "--reviewer-calibration=false",
+        "evidence/<run-id>/reviewer-calibration/",
+    )
+    missing_factory = [phrase for phrase in required_factory_phrases if phrase not in factory_text]
+    assert not missing_factory, (
+        "factory.md missing reviewer calibration alias contract: "
+        + ", ".join(missing_factory)
+    )

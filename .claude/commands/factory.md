@@ -19,10 +19,11 @@ Unlike `/h` (in-Claude subagent dispatch), `/factory` runs the external
 **Usage**:
 
 ```
-/factory <goal>                          # auto-detect: PR-mode or feature-mode
+/factory <goal>                          # auto-detect: PR-mode or feature-mode; reviewer calibration on
 /factory --pipeline gates <goal>         # explicit pipeline (skips auto-detect)
 /factory --backend echo <goal>           # dry-run wiring smoke
 /factory --feature hello <goal>          # override holdout feature key
+/factory --reviewer-calibration=false <goal>  # explicit opt-out; same as /f
 ```
 
 When `--pipeline` is omitted, the skill must run the same **Step 0
@@ -36,4 +37,6 @@ Equivalent to: `/f $ARGUMENTS`
 
 The final response must satisfy `/f`'s proof block: literal command run,
 Run ID, CXDB SHA, final outcome, exit code, wall-clock, logs, and evidence
-envelope.
+envelope. Reviewer calibration is also inherited from `/f`: default on,
+stored under `evidence/<run-id>/reviewer-calibration/`, and disabled only by
+an explicit `--reviewer-calibration=false` with a stated reason.
