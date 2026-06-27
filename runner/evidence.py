@@ -394,7 +394,8 @@ def write_bundle(
     command_text = command or ""
     (bundle_dir / "command.txt").write_text(command_text + ("\n" if command_text else ""))
 
-    # Enforce exit node check: force final_outcome to "failure" if no exit node was hit
+    # A successful run must have reached an exit node. Preserve explicit
+    # terminal outcomes like exhausted/error so the bundle matches the runner.
     from .parser import is_exit_node
     has_exit = False
     if graph is not None and hasattr(graph, "nodes"):
@@ -404,7 +405,7 @@ def write_bundle(
                 if is_exit_node(graph.nodes[node_name]):
                     has_exit = True
                     break
-    if not has_exit:
+    if not has_exit and totals.get("final_outcome") == "success":
         totals["final_outcome"] = "failure"
 
     holdout_nodes = _holdout_nodes_in_graph(graph)
@@ -428,6 +429,7 @@ def write_bundle(
         "ended_ts": totals.get("ended_ts"),
         "wall_clock_ms": wall_clock,
         "final_outcome": totals.get("final_outcome"),
+        "exit_reached": has_exit,
         "steps": len(steps),
         "cxdb_path": str(cxdb_path),
         "cxdb_sha256": cxdb_sha,
@@ -450,6 +452,7 @@ def write_bundle(
         "ended_ts": totals.get("ended_ts"),
         "wall_clock_ms": wall_clock,
         "final_outcome": totals.get("final_outcome"),
+        "exit_reached": has_exit,
         "steps": len(steps),
         "events_path": str(events_path) if events_path is not None else None,
         "summary_path": "summary.json",
