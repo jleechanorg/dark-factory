@@ -42,7 +42,9 @@ from .handler_sandbox import (
     _get_claude_executable,
     _holdouts_repo_path,
     _holdout_denied_paths,
+    _sealed_benchmark_doc_paths,
     _sandboxed_args,
+    _sandboxed_args_for_workdir,
 )
 
 # AO backend helpers.
