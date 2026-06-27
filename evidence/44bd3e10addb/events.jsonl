@@ -57,3 +57,4 @@
 {"event": "transition", "from": "holdout", "outcome": "failure", "run_id": "44bd3e10addb", "seq": 8, "to": "fix", "ts": 1782594012.322828}
 {"event": "checkpoint", "node": "fix", "path": "/Users/jleechan/.dark-factory/runs/44bd3e10addb/checkpoint.json", "run_id": "44bd3e10addb", "seq": 8, "ts": 1782594012.323266}
 {"event": "step", "node": "fix", "outcome": "failure", "preview": "max_visits=3 exceeded", "run_id": "44bd3e10addb", "seq": 8, "ts": 1782594012.323361}
+{"ended_at_exit": "False", "event": "run_end", "final_outcome": "exhausted", "pipeline": "pr_gates", "run_id": "44bd3e10addb", "seq": 9, "steps": "9", "ts": 1782594018.5085409, "uncommitted_deletions": "", "uncommitted_files": "0", "uncommitted_insertions": "", "uncommitted_staged_files": "0"}
