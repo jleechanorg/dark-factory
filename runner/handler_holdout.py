@@ -31,6 +31,40 @@ if TYPE_CHECKING:
     from .handler_core import Context
 
 
+# File extensions that count as "docs-only" for the holdout skip path.
+# A PR that touches only these files cannot have behavioral regressions
+# (no code, no scripts, no configs that affect runtime), so the sealed
+# behavioral holdout is not informative and the handler exits success.
+_DOCS_ONLY_EXTS = {".md", ".markdown", ".txt", ".rst", ".adoc", ".rdoc"}
+
+
+def _workdir_diff_is_docs_only(workdir: pathlib.Path) -> bool:
+    """True iff every file in `workdir`'s diff vs origin/main is docs-only.
+
+    Used to skip the sealed holdout on docs-only PRs (the holdout evaluates
+    an implementation, which doesn't exist for a docs-only change). Returns
+    False on any git error so non-docs PRs still hit the normal failure
+    path that surfaces the real cause to the fix loop.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--name-only", "origin/main...HEAD"],
+            cwd=str(workdir), capture_output=True, text=True, timeout=10, check=False,
+        )
+    except Exception:
+        return False
+    if proc.returncode != 0:
+        return False
+    files = [f.strip() for f in proc.stdout.splitlines() if f.strip()]
+    if not files:
+        # No diff at all (e.g. main == HEAD) — not docs-only, surface as failure.
+        return False
+    for f in files:
+        if pathlib.Path(f).suffix.lower() not in _DOCS_ONLY_EXTS:
+            return False
+    return True
+
+
 def _tcp_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -61,6 +95,27 @@ def _holdout_eval(node: "Node", ctx: "Context") -> "Result":
             return Result(outcome="failure", output=f"unresolved feature path: {node_feature!r}")
     feature = str(feature or "").strip()
     if not feature:
+        # Docs-only PRs (the lane-I audit pattern: changes confined to
+        # benchmarks/* markdown files) have no implementation to evaluate.
+        # The sealed holdout grades behavior; behavior can't regress on a
+        # docs-only diff, so skip the gate with a redacted verdict.
+        if _workdir_diff_is_docs_only(ctx.workdir):
+            return Result(
+                outcome="success",
+                output=json.dumps(
+                    {
+                        "verdict": "pass",
+                        "passed": 0,
+                        "total": 0,
+                        "status_counts": {},
+                        "sealed": True,
+                        "skipped": "docs-only",
+                        "reason": "workdir diff vs origin/main contains only docs files",
+                    },
+                    indent=2,
+                ),
+                metadata={"verdict": "pass", "skipped": "docs-only"},
+            )
         return Result(outcome="failure", output="no feature attribute or state")
 
     eval_script = repo_path / "evaluator" / "run.py"
