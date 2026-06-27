@@ -13,7 +13,7 @@ ${goal}
 2. **Evidence quality checks**:
    - Scenario pass rate: must be 100% (3/3 or equivalent)
    - Evidence SHA must match HEAD SHA of the PR branch
-   - Required artifacts: `run.json`, `streaming_evidence.json`, `llm_request_responses.jsonl` (or equivalent captures)
+   - Required artifacts: `run.json` plus a primary evidence artifact (e.g. `<primary-evidence.json>`) and a run-trace capture (e.g. `<run-trace.jsonl>`), or equivalent feature-specific captures
    - Provenance fields must be populated (not blank)
    - Repro instructions must be present
 
