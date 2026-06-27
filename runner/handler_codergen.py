@@ -907,15 +907,22 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         ], ctx.workdir)
         if args is None:
             return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
-        proc = subprocess.Popen(
-            args,
-            cwd=ctx.workdir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-            env=_handlers_shim._sanitized_env(),
-        )
+        try:
+            proc = subprocess.Popen(
+                args,
+                cwd=ctx.workdir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+                env=_handlers_shim._sanitized_env(),
+            )
+        except FileNotFoundError as exc:
+            return _finalize(Result(
+                outcome="error",
+                output=f"agy backend not found: {exc}",
+                metadata={"returncode": "127", "backend_missing": "true"},
+            ))
         try:
             stdout, stderr = proc.communicate(timeout=timeout_s + 30)
         except subprocess.TimeoutExpired:
