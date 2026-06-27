@@ -133,6 +133,60 @@ def _handle_panic(
     return payload
 
 
+def _finalize_evidence_bundle_path(
+    args: argparse.Namespace,
+    ctx: Context,
+    *,
+    explicit_evidence_bundle: bool,
+    evidence_staging_dir: pathlib.Path | None,
+) -> None:
+    if (
+        args.evidence_bundle is not None
+        and not explicit_evidence_bundle
+        and evidence_staging_dir is not None
+        and ctx.run_id is not None
+    ):
+        old_cxdb = args.cxdb
+        old_events = args.events
+        final_evidence_bundle = args.workdir / "evidence" / ctx.run_id
+        if pathlib.Path(args.evidence_bundle) != final_evidence_bundle:
+            if final_evidence_bundle.exists():
+                shutil.rmtree(final_evidence_bundle)
+            args.evidence_bundle.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(args.evidence_bundle), str(final_evidence_bundle))
+            args.evidence_bundle = final_evidence_bundle
+        if old_cxdb is not None and pathlib.Path(old_cxdb).parent == evidence_staging_dir:
+            args.cxdb = final_evidence_bundle / pathlib.Path(old_cxdb).name
+            ctx.cxdb_path = args.cxdb
+        if old_events is not None and pathlib.Path(old_events).parent == evidence_staging_dir:
+            args.events = final_evidence_bundle / "events.jsonl"
+            ctx.event_log_path = args.events
+
+
+def _write_evidence_bundle(
+    *,
+    args: argparse.Namespace,
+    ctx: Context,
+    pipeline_path: pathlib.Path,
+    graph,
+    command: str,
+) -> None:
+    if args.evidence_bundle is None or ctx.run_id is None:
+        return
+    from .evidence import write_bundle
+
+    write_bundle(
+        bundle_dir=args.evidence_bundle,
+        cxdb_path=args.cxdb,
+        run_id=ctx.run_id,
+        pipeline_path=pipeline_path,
+        graph=graph,
+        workdir=args.workdir,
+        command=command,
+        event_log_path=args.events,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args_list = list(argv) if argv is not None else list(sys.argv[1:])
     if args_list and args_list[0] == "resume":
@@ -142,6 +196,10 @@ def main(argv: list[str] | None = None) -> int:
 
     args = None
     ctx = None
+    pipeline_path = None
+    graph = None
+    explicit_evidence_bundle = False
+    evidence_staging_dir = None
     try:
         p = argparse.ArgumentParser(prog="dark-factory")
         p.add_argument("--pipeline", type=pathlib.Path)
@@ -310,42 +368,19 @@ def main(argv: list[str] | None = None) -> int:
             max_steps=args.max_steps,
         )
 
-        final_evidence_bundle = args.evidence_bundle
-        if (
-            args.evidence_bundle is not None
-            and not explicit_evidence_bundle
-            and evidence_staging_dir is not None
-            and ctx.run_id is not None
-        ):
-            old_cxdb = args.cxdb
-            old_events = args.events
-            final_evidence_bundle = args.workdir / "evidence" / ctx.run_id
-            if final_evidence_bundle.exists():
-                shutil.rmtree(final_evidence_bundle)
-            args.evidence_bundle.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(args.evidence_bundle), str(final_evidence_bundle))
-            args.evidence_bundle = final_evidence_bundle
-            if old_cxdb is not None and pathlib.Path(old_cxdb).parent == evidence_staging_dir:
-                args.cxdb = final_evidence_bundle / pathlib.Path(old_cxdb).name
-                ctx.cxdb_path = args.cxdb
-            if old_events is not None and pathlib.Path(old_events).parent == evidence_staging_dir:
-                args.events = final_evidence_bundle / "events.jsonl"
-                ctx.event_log_path = args.events
-
-        if args.evidence_bundle is not None and ctx.run_id is not None:
-            # Lazy import so the CLI module stays cheap to load.
-            from .evidence import write_bundle
-
-            write_bundle(
-                bundle_dir=args.evidence_bundle,
-                cxdb_path=args.cxdb,
-                run_id=ctx.run_id,
-                pipeline_path=pipeline_path,
-                graph=graph,
-                workdir=args.workdir,
-                command=command,
-                event_log_path=args.events,
-            )
+        _finalize_evidence_bundle_path(
+            args,
+            ctx,
+            explicit_evidence_bundle=explicit_evidence_bundle,
+            evidence_staging_dir=evidence_staging_dir,
+        )
+        _write_evidence_bundle(
+            args=args,
+            ctx=ctx,
+            pipeline_path=pipeline_path,
+            graph=graph,
+            command=command,
+        )
 
         summary = {
             "pipeline": graph.name,
@@ -408,6 +443,39 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if history and history[-1].outcome == "success" else 1
     except Exception:
         payload = _handle_panic(sys.exc_info()[1], args=args, ctx=ctx)
+        if (
+            args is not None
+            and ctx is not None
+            and ctx.run_id is not None
+            and pipeline_path is not None
+            and graph is not None
+        ):
+            try:
+                old_artifact = payload.get("panic_artifact")
+                _finalize_evidence_bundle_path(
+                    args,
+                    ctx,
+                    explicit_evidence_bundle=explicit_evidence_bundle,
+                    evidence_staging_dir=evidence_staging_dir,
+                )
+                if old_artifact and evidence_staging_dir is not None:
+                    try:
+                        rel = pathlib.Path(old_artifact).relative_to(evidence_staging_dir)
+                        payload["panic_artifact"] = str(pathlib.Path(args.evidence_bundle) / rel)
+                    except ValueError:
+                        pass
+                _write_evidence_bundle(
+                    args=args,
+                    ctx=ctx,
+                    pipeline_path=pipeline_path,
+                    graph=graph,
+                    command=command,
+                )
+                payload["evidence_bundle"] = str(args.evidence_bundle)
+                payload["evidence_bundle_written"] = "true"
+            except Exception as bundle_exc:
+                payload["evidence_bundle_written"] = "false"
+                payload["evidence_bundle_error"] = f"{type(bundle_exc).__name__}: {bundle_exc}"
         print(json.dumps(payload, sort_keys=True, indent=2))
         return PANIC_EXIT_CODE
 

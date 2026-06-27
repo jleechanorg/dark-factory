@@ -28,6 +28,7 @@ from runner.engine import run  # noqa: E402
 from runner.evidence import write_bundle, _HOLDOUT_PATH_TOKEN  # noqa: E402
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.parser import parse  # noqa: E402
+from runner.panic_hook import PANIC_EXIT_CODE  # noqa: E402
 
 
 def _drive_run(tmp_path: pathlib.Path, monkeypatch) -> tuple[pathlib.Path, str, object]:
@@ -328,3 +329,54 @@ def test_cli_creates_default_evidence_bundle_under_run_id(tmp_path):
     ]
     assert any("transcript_path" in item["io_refs"] for item in node_io)
     assert not list((tmp_path / "evidence").glob("_pending-*"))
+
+
+def test_cli_panic_writes_default_evidence_bundle(tmp_path, monkeypatch, capsys):
+    """A top-level CLI panic after run_id allocation still leaves evidence."""
+    import runner.__main__ as cli
+    from runner.cxdb import CXDB
+
+    def exploding_run(graph, ctx, **_kwargs):
+        db = CXDB(ctx.cxdb_path)
+        try:
+            ctx.run_id = db.start_run(pipeline=graph.name, goal=ctx.goal)
+            db.record_step(
+                run_id=ctx.run_id,
+                seq=0,
+                node="before_panic",
+                outcome="success",
+                ts=0.0,
+                output="allocated run id before panic",
+                metadata={},
+            )
+        finally:
+            db.close()
+        raise RuntimeError("cli panic after run id")
+
+    monkeypatch.setattr(cli, "run", exploding_run)
+    rc = cli.main(
+        [
+            "--pipeline",
+            str(ROOT / "tests" / "fixtures" / "graph_audit" / "clean.dot"),
+            "--goal",
+            "panic evidence smoke",
+            "--backend",
+            "echo",
+            "--workdir",
+            str(tmp_path),
+        ]
+    )
+
+    assert rc == PANIC_EXIT_CODE
+    payload = json.loads(capsys.readouterr().out)
+    run_id = payload["run_id"]
+    bundle = tmp_path / "evidence" / run_id
+    assert payload["evidence_bundle"] == str(bundle)
+    assert payload["evidence_bundle_written"] == "true"
+    assert pathlib.Path(payload["panic_artifact"]).exists()
+    assert str(bundle) in payload["panic_artifact"]
+    summary = json.loads((bundle / "summary.json").read_text(encoding="utf-8"))
+    assert summary["final_outcome"] == "error"
+    assert summary["events_path"] == str(bundle / "events.jsonl")
+    assert (bundle / "command.txt").exists()
+    assert (bundle / f"cxdb-{run_id}.sqlite").exists()
