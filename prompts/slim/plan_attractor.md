@@ -35,10 +35,12 @@ command. Mismatch is a blocking failure at the attractor review.
 Include:
 
 - **Convergence target**: the stable end state the system must reach.
-  One sentence, single concrete noun. Example: "A level-up session can
-  be applied atomically with all four reducer outputs persisted in one
-  transaction, and the apply-level-up signal is owned by the model
-  (not synthesized by the server)."
+  One sentence, single concrete noun. Example: "A version upgrade is
+  applied atomically across the two related files in one transaction,
+  and the upgrade-signal is owned by the model (not synthesized by the
+  server)." Or, equivalently, "A checkout is applied atomically across
+  the order, inventory, and payment modules in one transaction, and the
+  commit signal is owned by the model (not synthesized by the server)."
 
 - **Observable convergence criteria**: deterministic checks that prove
   the system has reached the attractor. At least one, preferably a
@@ -72,7 +74,8 @@ Include:
   NOT at the attractor when partial writes exist; the system is NOT
   at the attractor when the server still synthesizes a planning block
   on the prompt-full-sheet path; the system is NOT at the attractor
-  when the model never emits a `level_up_signal` field."
+  when the model never emits an upgrade-signal (or commit-signal)
+  field."
 
 ## Rules
 

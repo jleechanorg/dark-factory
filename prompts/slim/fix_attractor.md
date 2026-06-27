@@ -29,9 +29,12 @@ Rules:
   deterministic check that proves the system has not reached it.
   Vague anti-states such as "the system should not be broken" are
   not acceptable — be specific (e.g., "the system is NOT converged
-  when `world_logic.py` still contains the source=server 2nd writer"
-  with the verification command `grep -n 'source=server' mvp_site/
-  world_logic.py`).
+  when the canonical module still contains the secondary writer
+  injected by the server" with a verification command such as
+  `grep -n '<secondary-writer-pattern>' <canonical-module-path>`).
+  Pick whatever module-path and pattern match your codebase; the rule
+  is that the anti-state must name the exact artifact and the exact
+  pattern that would prove it has not been removed.
 - If the review found a consistency-with-main-spec gap, update the
   attractor spec to reference the same lanes, file-ownership
   matrix, test commands, and acceptance criteria as `spec.md`. Use
