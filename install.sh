@@ -66,8 +66,14 @@ else
   echo "==> reusing venv at ${VENV_DIR}"
 fi
 
-echo "==> installing requirements.txt into venv (PyPI via uv pip)"
-uv pip install --python "${PYTHON_BIN}" -r "${REPO_ROOT}/requirements.txt"
+REQUIREMENTS_FILE="${REPO_ROOT}/requirements.lock"
+if [[ ! -f "${REQUIREMENTS_FILE}" ]]; then
+  echo "ERROR: requirements.lock not found." >&2
+  echo "Regenerate with: uv pip compile requirements.txt --python-version ${PYTHON_VERSION} -o requirements.lock" >&2
+  exit 1
+fi
+echo "==> installing $(basename "${REQUIREMENTS_FILE}") into venv (PyPI via uv pip)"
+uv pip install --python "${PYTHON_BIN}" -r "${REQUIREMENTS_FILE}"
 
 echo "==> verifying import"
 "${PYTHON_BIN}" -c "import pydot, yaml; print('deps ok:', pydot.__version__)"
