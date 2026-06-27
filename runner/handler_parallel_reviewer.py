@@ -3,8 +3,8 @@
 Runs a primary reviewer lane and a shadow Codex reviewer lane in parallel,
 then merges both outputs for one downstream handoff.
 
-Implementation note: this deliberately reuses existing gate-review helpers so
-runtime behavior is aligned with existing review lanes (`_run_gate_once`,
+Implementation note: this reuses existing gate-review helpers so runtime
+behavior is aligned with existing lanes (`_resolve_gate_backend`,
 `_start_shadow_gate_review`, `_finish_shadow_gate_review`).
 """
 
