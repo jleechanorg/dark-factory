@@ -26,8 +26,8 @@ ${goal}
    - **Cross-check PR claims against frame content**:
      - Does the PR claim a feature "works"? → Do the frames show the feature working from the user's perspective (readable text, correct UI state, no error banners)?
      - Does the PR claim "connection established"? → Is there a "No connection" or error banner visible in any frame during the connected period?
-     - Does the PR claim "streaming works"? → Do the frames show rendered narrative prose, or raw JSON / escaped characters?
-     - Does the PR claim "native app works"? → Are there undismissed system dialogs, permission prompts, or blocking overlays?
+     - Does the PR claim "real-time feature works"? → Do the frames show rendered user-visible content, or raw JSON / escaped characters?
+     - Does the PR claim "desktop/mobile/web app works"? → Are there undismissed system dialogs, permission prompts, or blocking overlays?
    - **Negative signals** (any of these in a frame during the "working" period is a gap):
      - Error banners or "No connection" indicators while data is flowing
      - System dialogs (e.g., "Open in App?") that were never dismissed

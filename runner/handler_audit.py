@@ -32,6 +32,41 @@ if TYPE_CHECKING:
     from .handler_core import Context
 
 
+# Vendor-neutral default evidence filenames probed when neither ``state["evidence_paths"]``
+# nor the node ``evidence_paths`` attribute is set. Project-local aliases (e.g.
+# ``gemini_http_request_responses.jsonl``) live in ``<workdir>/.dark-factory/evidence.yaml``
+# under the ``aliases:`` key — see ``_load_evidence_aliases`` below.
+DEFAULT_EVIDENCE_FILENAMES: tuple[str, ...] = (
+    "llm_request_responses.jsonl",
+    "llm_responses.jsonl",
+    "evidence.jsonl",
+)
+
+
+def _load_evidence_aliases(workdir: pathlib.Path) -> list[str]:
+    """Load vendor-specific filename aliases from ``<workdir>/.dark-factory/evidence.yaml``.
+
+    The YAML file may contain a top-level ``aliases:`` key whose value is a list of
+    strings (or a single comma-separated string). Files named here are probed in
+    addition to ``DEFAULT_EVIDENCE_FILENAMES``. A missing or malformed file yields
+    no aliases (silent fallback — the vendor-neutral defaults still apply).
+    """
+    manifest = workdir / ".dark-factory" / "evidence.yaml"
+    if not manifest.is_file():
+        return []
+    try:
+        import yaml  # local import: PyYAML is a runner dep but optional for callers
+        data = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return []
+    aliases = data.get("aliases") if isinstance(data, dict) else None
+    if isinstance(aliases, list):
+        return [str(a).strip() for a in aliases if str(a).strip()]
+    if isinstance(aliases, str):
+        return [a.strip() for a in aliases.split(",") if a.strip()]
+    return []
+
+
 def _git_config_origin_url(workdir: pathlib.Path) -> Optional[str]:
     try:
         res = subprocess.run(
