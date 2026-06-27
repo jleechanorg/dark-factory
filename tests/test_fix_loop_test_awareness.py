@@ -368,11 +368,11 @@ digraph NoProgressTest2 {
 # -- D4 ------------------------------------------------------------------
 
 
-def test_fix_md_prompt_substitutes_last_test_state(monkeypatch, tmp_path):
-    """End-to-end: prompts/slim/fix.md must consume ${state.last_test_*}.
+def test_fix_md_prompt_substitutes_failure_handoff_state(monkeypatch, tmp_path):
+    """End-to-end: prompts/slim/fix.md must consume failure handoff state.
     When the runner renders the fix prompt with last_test_* keys in
-    ctx.state, the placeholders must be replaced (not left as literal
-    '${state.last_test_output}' in the rendered text).
+    ctx.state and the previous node's free-form output in _last_output,
+    the placeholders must be replaced.
     """
     from runner.handler_render import _render_prompt
     from runner.handlers import Context
@@ -388,14 +388,19 @@ def test_fix_md_prompt_substitutes_last_test_state(monkeypatch, tmp_path):
     ctx.state["last_test_command"] = "python3 -m pytest tests/test_x.py"
     ctx.state["last_test_rc"] = "4"
     ctx.state["last_test_output"] = "fixture 'bar' not found"
+    ctx.state["_last_output"] = (
+        "Evidence reviewer finding: missing SHA-bound browser video proof."
+    )
 
     rendered = _render_prompt(node, ctx)
 
     # No literal placeholder should survive the substitution.
+    assert "${state._last_output}" not in rendered
     assert "${state.last_test_command}" not in rendered
     assert "${state.last_test_rc}" not in rendered
     assert "${state.last_test_output}" not in rendered
     # And the values must appear in the rendered prompt.
+    assert "missing SHA-bound browser video proof" in rendered
     assert "python3 -m pytest tests/test_x.py" in rendered
     assert "fixture 'bar' not found" in rendered
     # Returncode 4 is recorded; verify it appears in the fix prompt.

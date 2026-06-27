@@ -108,18 +108,22 @@ def test_catalog_review_prompt_has_diff_and_lint_findings() -> None:
     )
 
 
-def test_slim_fix_prompt_has_all_last_test_tokens() -> None:
+def test_slim_fix_prompt_has_failure_handoff_tokens() -> None:
     """``prompts/slim/fix.md`` is the canonical PR #95 regression
     case. The prompt must contain ``${state.last_test_command}``,
     ``${state.last_test_rc}``, and ``${state.last_test_output}`` —
     all three are written by ``runner/handler_control.py:130-135``
-    on ``goal_gate`` tool failures. This is the fix-loop prompt;
-    losing any of these tokens makes the fix attempt blind.
+    on ``goal_gate`` tool failures. It must also contain
+    ``${state._last_output}``, which is written after every node by
+    ``runner/engine_run.py`` so reviewer/gate prose reaches the fix
+    agent. This is the fix-loop prompt; losing any of these tokens
+    makes the fix attempt blind.
     """
     text = _read_prompt("prompts/slim/fix.md")
     missing = _has_all_tokens(
         text,
         [
+            "${state._last_output}",
             "${state.last_test_command}",
             "${state.last_test_rc}",
             "${state.last_test_output}",
@@ -193,6 +197,7 @@ def test_bug_fix_prompt_has_test_path() -> None:
         (
             "prompts/slim/fix.md",
             [
+                "${state._last_output}",
                 "${state.last_test_command}",
                 "${state.last_test_rc}",
                 "${state.last_test_output}",
