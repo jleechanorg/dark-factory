@@ -113,3 +113,4 @@
 {"event": "transition", "from": "holdout", "outcome": "failure", "run_id": "9e46bf6f2339", "seq": 19, "to": "fix", "ts": 1782557093.6097229}
 {"event": "checkpoint", "node": "fix", "path": "/Users/jleechan/.dark-factory/runs/9e46bf6f2339/checkpoint.json", "run_id": "9e46bf6f2339", "seq": 19, "ts": 1782557093.610013}
 {"event": "step", "node": "fix", "outcome": "failure", "preview": "max_visits=3 exceeded", "run_id": "9e46bf6f2339", "seq": 19, "ts": 1782557093.610076}
+{"ended_at_exit": "False", "event": "run_end", "final_outcome": "exhausted", "pipeline": "hello", "run_id": "9e46bf6f2339", "seq": 20, "steps": "20", "ts": 1782557095.13248, "uncommitted_deletions": "", "uncommitted_files": "0", "uncommitted_insertions": "", "uncommitted_staged_files": "0"}
