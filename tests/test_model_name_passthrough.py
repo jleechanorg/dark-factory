@@ -22,7 +22,11 @@ from runner.handlers import Context, Node, _codergen  # noqa: E402
 def _patch_claude(monkeypatch, commands):
     """Wire the claude backend to a deterministic capture seam."""
 
-    def fake_sandbox(args):
+    def fake_sandbox(args, workdir=None):
+        # `_sandboxed_args(args)` (legacy AO/shadow path) and
+        # `_sandboxed_args_for_workdir(args, ctx.workdir)` (Lane H coder path)
+        # both delegate to the same fake seam in this test — the workdir is
+        # only used by the real implementation to enumerate sealed doc paths.
         return ["sandboxed", *args]
 
     def fake_run(args, **kwargs):
@@ -37,6 +41,12 @@ def _patch_claude(monkeypatch, commands):
 
     monkeypatch.setattr(handlers_mod, "_get_claude_executable", lambda: "claude")
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", fake_sandbox)
+    # Lane H (jleechan-113) routes claude/codex/agy coder subprocesses through
+    # `_sandboxed_args_for_workdir` so the deny list also covers the
+    # implementing agent's own `benchmarks/*/{README,DESIGN,SCORING,SCENARIOS}.md`.
+    # Patch the new helper too so the test can assert on the dispatch layout
+    # without depending on the real sandbox-exec profile.
+    monkeypatch.setattr(handlers_mod, "_sandboxed_args_for_workdir", fake_sandbox)
     monkeypatch.setattr(handlers_mod.subprocess, "run", fake_run)
 
 

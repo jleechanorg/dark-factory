@@ -469,10 +469,12 @@ def cmd_score(_: argparse.Namespace) -> int:
             cwd=ROOT,
             capture_output=True,
             text=True,
-            # 240s — the warm suite is ~121s today; the old 120s cap was
-            # tripping on a 1s over-shoot, which becomes a `conformance
-            # score` flake that cascades into the test + Skeptic CI gates.
-            timeout=240,
+            # 360s — the warm suite was ~121s at the 240s write, but Lane H
+            # (jleechan-113) added tests/test_sealed_paths.py (+277 LOC of
+            # sandbox-profile + path-resolution tests) which pushed the cold
+            # CI run to ~273s, tripping the 240s cap and cascading into
+            # `conformance score` → test + Skeptic CI gates.
+            timeout=360,
             check=False,
         )
         validation = subprocess.run(
