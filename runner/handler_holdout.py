@@ -185,6 +185,34 @@ def _strip_firebase_gcp_creds(eval_env: dict) -> int:
     return removed
 
 
+def _scrub_java_for_non_firebase(eval_env: dict) -> int:
+    """Defensive scrub: ensure JAVA_HOME and any Homebrew-openjdk PATH
+    prepends do NOT leak into non-firebase eval environments.
+
+    Linux CI hosts commonly export JAVA_HOME to a system temurin JDK
+    (``/usr/lib/jvm/temurin-17-jdk-amd64``) and darwin dev hosts may have
+    Homebrew's openjdk on PATH. The sealed evaluator for non-firebase
+    impls (fibonacci, hello, make targets, node_start scripts) is supposed
+    to run agent-authored pure code — it should not pick up either of
+    those, so the audit's contract is "non-firebase backend → no JAVA_HOME
+    in the env, no Homebrew Java bin prepended to PATH".
+
+    Firebase backends must NOT call this — they need both PATH and
+    JAVA_HOME set, which is the job of ``_inject_firebase_java``.
+    Returns the number of env mutations performed (PATH prepend stripped
+    counts as 1; JAVA_HOME pop counts as 1).
+    """
+    mutations = 0
+    if "JAVA_HOME" in eval_env:
+        eval_env.pop("JAVA_HOME", None)
+        mutations += 1
+    path = eval_env.get("PATH", "")
+    if path.startswith(_HOMEBREW_JAVA_BIN + ":"):
+        eval_env["PATH"] = path[len(_HOMEBREW_JAVA_BIN) + 1 :]
+        mutations += 1
+    return mutations
+
+
 def _tcp_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -257,6 +285,21 @@ def _holdout_eval(node: "Node", ctx: "Context") -> "Result":
     # -> Makefile ``run:`` -> ``package.json`` ``start`` -> none.
     emulator_backend = _detect_emulator_backend(impl)
 
+    # Strip any inherited JAVA_HOME / Homebrew Java bin from eval_env for
+    # non-firebase backends. ``_sanitized_env`` only filters ``*HOLDOUT*``;
+    # JAVA_HOME in the parent shell (common on CI hosts like the GitHub
+    # Actions Linux runner with temurin) would otherwise leak into the
+    # eval subprocess even though the discovered backend is ``none`` /
+    # ``make`` and never needs Java. The Homebrew-prefix check guards
+    # against a stray ``/opt/homebrew/opt/java/bin`` already in PATH.
+    if emulator_backend != "firebase":
+        eval_env.pop("JAVA_HOME", None)
+        eval_env.pop("JRE_HOME", None)
+        eval_env.pop("JDK_HOME", None)
+        _path = eval_env.get("PATH", "")
+        if _path.startswith(_HOMEBREW_JAVA_BIN + ":"):
+            eval_env["PATH"] = _path[len(_HOMEBREW_JAVA_BIN) + 1:]
+
     # Fix 1 — Java PATH: prepend Homebrew openjdk so Firebase emulators can
     # find java. Only fires when (a) the discovered backend is ``firebase``
     # AND (b) we are on macOS — non-firebase backends never need Java, and
@@ -264,6 +307,13 @@ def _holdout_eval(node: "Node", ctx: "Context") -> "Result":
     # called out (lane E / jleechan-je5).
     if emulator_backend == "firebase":
         _inject_firebase_java(eval_env)
+    else:
+        # Defensive scrub — strip any JAVA_HOME / Homebrew-openjdk PATH
+        # prepend that the parent shell exported. Non-firebase backends
+        # (fibonacci, hello, make, node_start) must not see those — the
+        # sealed evaluator runs agent-authored pure code. See
+        # _scrub_java_for_non_firebase docstring for the contract.
+        _scrub_java_for_non_firebase(eval_env)
 
     # Fix 4 — Strip real GCP credentials: Cloud Functions emulator must use
     # local project. Firebase-only — non-firebase backends may legitimately

@@ -214,6 +214,49 @@ def test_strip_firebase_gcp_creds_idempotent_when_vars_absent():
 
 
 # ---------------------------------------------------------------------------
+# _scrub_java_for_non_firebase — defensive scrub for non-firebase backends
+# ---------------------------------------------------------------------------
+
+
+def test_scrub_java_for_non_firebase_pops_java_home_and_strips_homebrew_path():
+    from runner.handler_holdout import _scrub_java_for_non_firebase
+
+    env = {
+        "JAVA_HOME": "/usr/lib/jvm/temurin-17-jdk-amd64",
+        "PATH": "/opt/homebrew/opt/java/bin:/usr/bin:/bin",
+        "OTHER": "keep-me",
+    }
+    mutations = _scrub_java_for_non_firebase(env)
+    assert mutations == 2
+    assert "JAVA_HOME" not in env
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["OTHER"] == "keep-me"
+
+
+def test_scrub_java_for_non_firebase_idempotent_when_clean():
+    from runner.handler_holdout import _scrub_java_for_non_firebase
+
+    env = {"PATH": "/usr/bin:/bin", "FOO": "bar"}
+    mutations = _scrub_java_for_non_firebase(env)
+    assert mutations == 0
+    assert env == {"PATH": "/usr/bin:/bin", "FOO": "bar"}
+
+
+def test_scrub_java_for_non_firebase_only_strips_leading_homebrew_path():
+    """If the user already had /opt/homebrew/opt/java/bin in the middle of
+    PATH (unlikely, but legal), the scrub must leave it alone. The
+    contract is "no Homebrew openjdk prepended", not "no Homebrew
+    openjdk substring".
+    """
+    from runner.handler_holdout import _scrub_java_for_non_firebase
+
+    env = {"PATH": "/usr/bin:/opt/homebrew/opt/java/bin:/bin"}
+    mutations = _scrub_java_for_non_firebase(env)
+    assert mutations == 0
+    assert env["PATH"] == "/usr/bin:/opt/homebrew/opt/java/bin:/bin"
+
+
+# ---------------------------------------------------------------------------
 # Full _holdout_eval flow against a fibonacci-shaped impl — the headline
 # regression test for lane E.
 # ---------------------------------------------------------------------------
