@@ -34,5 +34,5 @@ Rules:
   `file or directory not found`), the fix is in the test command or
   state injection, not in the implementation. Update the test_command
   in the goal/spec to point at files that actually exist (or to use
-  pytest test discovery), then re-run.
+  the project's test runner), then re-run.
 - After fixing, the runner will go back to deterministic tests.
