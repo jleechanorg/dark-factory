@@ -1,0 +1,1 @@
+dark-factory --pipeline /Users/jleechan/projects/dark-factory/pipelines/factory/hello.dot --goal smoke --backend echo --feature does-not-exist
