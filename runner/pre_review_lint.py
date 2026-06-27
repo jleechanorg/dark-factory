@@ -30,6 +30,17 @@ Patterns covered (the 3 that caught real PRs in the 2026-06-22 window):
   * `gh_zizmor_template` — `template-injection` zizmor finding.
   * `ios_video_config`   — `video=` in iOS simctl config (tutorial recorder).
 
+Benchmark-shape bias guard (jleechan-fpi, audit-2026-06-27 Lane F):
+  Patterns that target a *specific benchmark family* (iOS simctl, Android
+  emulator, Firebase emulator) MUST NOT fire globally. Without the path
+  gate the `ios_video_config` pattern fired on every JSON file containing
+  `video=` anywhere in the workdir — leaking the iOS benchmark shape into
+  fibonacci / hello / roman / generic reviewer prompts. The fix: a
+  pattern entry may declare a `path_filter` regex; the scanner only emits
+  a finding when the lowercased file path (absolute, or relative to the
+  workdir) contains at least one match. iOS is gated to `(ios|simctl)`;
+  global patterns (datetime, zizmor) set `path_filter=None`.
+
 Adding a new pattern = add a `_LINT_PATTERNS` entry + a unit test. No
 prompt or runner change required.
 """
@@ -42,8 +53,12 @@ import re
 from typing import Optional
 
 
-# (pattern_id, regex, severity, rationale, file_glob)
-_LINT_PATTERNS: list[tuple[str, str, str, str, Optional[str]]] = [
+# (pattern_id, regex, severity, rationale, file_glob, path_filter)
+# `path_filter`: None → fires anywhere. Otherwise the lowercased file path
+# (absolute, then relative-to-workdir fallback) must contain at least one
+# match of this regex as a substring search — used to scope benchmark-family
+# patterns (iOS, Android, etc.) so they don't leak into generic reviews.
+_LINT_PATTERNS: list[tuple[str, str, str, str, Optional[str], Optional[str]]] = [
     (
         "py_datetime_utcnow",
         r"\bdatetime\s*\.\s*utcnow\s*\(",
@@ -51,6 +66,7 @@ _LINT_PATTERNS: list[tuple[str, str, str, str, Optional[str]]] = [
         "datetime.utcnow() is deprecated in Python 3.12+; use "
         "datetime.now(timezone.utc) instead.",
         "*.py",
+        None,
     ),
     (
         "gh_zizmor_template",
@@ -59,6 +75,7 @@ _LINT_PATTERNS: list[tuple[str, str, str, str, Optional[str]]] = [
         "GitHub Actions template-injection finding from zizmor; "
         "${{ ... }} interpolates untrusted input directly into shell.",
         "*.yml",
+        None,
     ),
     (
         "ios_video_config",
@@ -67,12 +84,46 @@ _LINT_PATTERNS: list[tuple[str, str, str, str, Optional[str]]] = [
         "iOS simctl video= config detected; ensure the recorder is "
         "configured for the right codec/mask before merging.",
         "*.json",
+        # Path-gate: only fire when the file path looks iOS / simctl.
+        # Without this gate a fibonacci worktree with a stray `video=1280`
+        # in fibonacci.json would trip the warning in every reviewer's
+        # prompt (jleechan-fpi, audit-2026-06-27).
+        r"ios|simctl",
     ),
 ]
 
 
-def _scan_file(path: pathlib.Path, pattern: re.Pattern[str], glob: Optional[str]) -> list[dict]:
+def _path_matches_filter(path: pathlib.Path, workdir: pathlib.Path, path_filter: str) -> bool:
+    """Return True iff `path` (absolute or workdir-relative) matches the filter.
+
+    `path_filter` is a regex (e.g. ``r"ios|simctl"``) applied as a case-
+    insensitive search against either the absolute path or the workdir-
+    relative path. We check both because workdir names like
+    `fibonacci-bench-2026-06-26` themselves never contain `ios`/`simctl`
+    but the file path inside the workdir does, and conversely a workdir
+    named `ios-simulator-bench` should gate matches even if the file is
+    at the workdir root.
+    """
+    compiled = re.compile(path_filter, re.IGNORECASE)
+    haystacks = [str(path)]
+    try:
+        rel = path.relative_to(workdir)
+        haystacks.append(str(rel))
+    except ValueError:
+        pass
+    return any(compiled.search(h) for h in haystacks)
+
+
+def _scan_file(
+    path: pathlib.Path,
+    pattern: re.Pattern[str],
+    glob: Optional[str],
+    workdir: pathlib.Path,
+    path_filter: Optional[str],
+) -> list[dict]:
     """Run a single regex over a single file, returning zero or more findings."""
+    if path_filter is not None and not _path_matches_filter(path, workdir, path_filter):
+        return []
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except (OSError, UnicodeDecodeError):
@@ -100,6 +151,12 @@ def lint_findings(workdir: pathlib.Path) -> list[dict]:
     to run in < 1s for a typical slim-graph workdir; if a glob matches more
     than 1000 files we cap the scan and return early with a `truncated=true`
     note (caller can decide whether to surface that to the reviewer).
+
+    Patterns with a non-None `path_filter` only emit findings for files
+    whose path contains the filter (case-insensitive substring search
+    against absolute or workdir-relative path). This scopes benchmark-
+    family patterns (iOS simctl, Android emulator) so they don't leak
+    into generic reviewer prompts.
     """
     workdir = pathlib.Path(workdir)
     if not workdir.is_dir():
@@ -110,7 +167,7 @@ def lint_findings(workdir: pathlib.Path) -> list[dict]:
     truncated = False
     max_files_per_pattern = 1000
 
-    for pattern_id, regex, severity, rationale, glob in _LINT_PATTERNS:
+    for pattern_id, regex, severity, rationale, glob, path_filter in _LINT_PATTERNS:
         compiled = re.compile(regex)
         files_scanned = 0
         for path in workdir.rglob(glob or "*"):
@@ -120,7 +177,7 @@ def lint_findings(workdir: pathlib.Path) -> list[dict]:
             if files_scanned > max_files_per_pattern:
                 truncated = True
                 break
-            for finding in _scan_file(path, compiled, glob):
+            for finding in _scan_file(path, compiled, glob, workdir, path_filter):
                 key = (pattern_id, finding["file"], finding["line"])
                 if key in seen:
                     continue
