@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
 import subprocess
 import threading
@@ -30,6 +31,23 @@ from ._classify import _classify_outcome
 from .cxdb import CXDB
 from .handlers import Context, Result, resolve
 from .parser import Graph, Node, is_exit_node
+
+
+# Cross-run exhaustion circuit breaker (v4 hardening).
+#
+# When the last N prior runs of the same pipeline ALL ended with
+# `final='exhausted'`, skip this run entirely instead of burning LLM
+# budget on a guaranteed-to-fail attempt. Prevents the 16+ WIP-exhausted
+# commit stack seen on test-merged (memory 2026-06-27).
+#
+# Proof state (per root-cause-first):
+#   - Server-owned invariant: CXDB stores cross-run state that the agent
+#     cannot see. Engine owns run lifecycle.
+#   - Prompt-insufficient (proven): the fix prompt has no signal about
+#     prior-run exhaustion.
+#
+# Set DARK_FACTORY_CROSS_RUN_CIRCUIT_THRESHOLD=0 to disable.
+CB_THRESHOLD = int(os.environ.get("DARK_FACTORY_CROSS_RUN_CIRCUIT_THRESHOLD", "3"))
 
 
 def _auto_wip_commit_on_exhaustion(ctx: "Context", reason: str) -> None:
@@ -282,6 +300,40 @@ def run(
         # count of branch records already in the checkpoint so the budget is correct.
         _parallel_overhead = _resumed_overhead
         while True:
+            # Cross-run exhaustion circuit breaker (v4 hardening):
+            # When the last CB_THRESHOLD prior runs of this pipeline ALL
+            # ended with `final='exhausted'`, emit a synthetic exhausted
+            # record at run start and break. This fires before any node
+            # handler runs, so no LLM budget is consumed on a stuck pattern.
+            # The synthetic node name `__cross_run_circuit__` is reserved
+            # (collision-free with real .dot node names) so the Healer can
+            # cluster it distinctly from real exhaustion.
+            if cxdb is not None and CB_THRESHOLD > 0:
+                _prior_finals = cxdb.recent_run_finals(graph.name, CB_THRESHOLD)
+                if (
+                    len(_prior_finals) >= CB_THRESHOLD
+                    and all(f == "exhausted" for f in _prior_finals)
+                ):
+                    _cb_record = _persist.StepRecord(
+                        node="__cross_run_circuit__",
+                        outcome="exhausted",
+                        ts=time.time(),
+                        output_preview=(
+                            f"cross_run_circuit_breaker: last {CB_THRESHOLD} "
+                            f"runs of pipeline {graph.name!r} all ended "
+                            f"exhausted; skipping run"
+                        ),
+                        metadata={
+                            "cross_run_circuit_breaker": "true",
+                            "threshold": str(CB_THRESHOLD),
+                            "prior_finals": json.dumps(_prior_finals),
+                        },
+                    )
+                    seq = _persist._append_record(
+                        history, checkpoint, cxdb, ctx, seq, _cb_record, "",
+                    )
+                    break
+
             if len(history) - _parallel_overhead >= max_steps:
                 record = _persist.StepRecord(
                     node=current.name,

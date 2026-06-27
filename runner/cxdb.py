@@ -212,6 +212,29 @@ class CXDB:
             "total_wall_ms": total_wall_ms if saw_any else None,
         }
 
+    def recent_run_finals(self, pipeline: str, n: int) -> list:
+        """Return the last ``n`` completed ``runs.final`` values for this
+        pipeline, newest first.
+
+        Excludes in-flight runs (``final IS NULL``) so the caller sees
+        only finalized outcomes — without this filter the engine's own
+        in-progress ``start_run`` row would corrupt the streak check.
+
+        Used by the cross-run exhaustion circuit breaker to detect a
+        stuck-failure streak without scanning the full step log.
+
+        Returns ``[]`` when no completed runs match.
+        """
+        if n <= 0:
+            return []
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT final FROM runs WHERE pipeline = ? AND final IS NOT NULL "
+            "ORDER BY started_ts DESC LIMIT ?",
+            (pipeline, n),
+        )
+        return [row[0] for row in cur.fetchall()]
+
     def failed_steps(self, run_id: Optional[str] = None) -> Iterable[sqlite3.Row]:
         cur = self._conn.cursor()
         cur.row_factory = sqlite3.Row

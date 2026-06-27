@@ -705,3 +705,235 @@ def test_holdout_eval_writes_only_redacted_results_to_impl(monkeypatch, tmp_path
     }
     assert "secret-story" not in json.dumps(saved)
     assert "hidden checkout edge" not in json.dumps(saved)
+
+
+# ---------------------------------------------------------------------------
+# Cross-run exhaustion circuit breaker (v4 hardening)
+# ---------------------------------------------------------------------------
+#
+# Prevents the 2026-06-27 failure mode where 16+ WIP-exhausted commits stack
+# on the same branch — each fresh run re-executes explore → plan → implement
+# → test → fix and exhausts again, because the underlying gate cannot be
+# passed by anything the in-loop reviewer can fix.
+#
+# Proof state (per root-cause-first):
+#   - Server-owned invariant: CXDB stores cross-run state that the agent
+#     cannot see. Engine owns run lifecycle.
+#   - Prompt-insufficient (proven): the fix prompt has no signal about
+#     prior-run exhaustion; agent is asked to fix without awareness of
+#     the failure streak.
+#
+# The breaker fires at run start when the last N runs of the same pipeline
+# all ended with `final='exhausted'`. It emits a synthetic exhausted record
+# and skips all node execution so the operator sees the unrecoverable state
+# in CXDB rather than burning LLM budget on a guaranteed-to-fail attempt.
+
+_CB_THRESHOLD = 3  # matches the documented streak from memory 2026-06-27
+
+
+def test_cross_run_circuit_breaker_short_circuits_when_prior_runs_all_exhausted(
+    monkeypatch, tmp_path
+):
+    """When the last 3 prior runs of the same pipeline all ended with
+    ``final='exhausted'``, the engine must emit a synthetic exhausted record
+    at run start without invoking any node handler.
+    """
+    cxdb_path = tmp_path / "cxdb.sqlite"
+
+    # 1. Seed CXDB with 3 prior runs that all ended exhausted for pipeline "hello".
+    seed = CXDB(cxdb_path)
+    try:
+        for _ in range(_CB_THRESHOLD):
+            rid = seed.start_run(pipeline="hello", goal="seed")
+            seed.record_step(
+                run_id=rid, seq=0, node="start", outcome="success",
+                ts=0.0, output="start", metadata={},
+            )
+            seed.record_step(
+                run_id=rid, seq=1, node="fix", outcome="exhausted",
+                ts=0.1, output="max_visits=3 exceeded",
+                metadata={"max_visits": "3"},
+            )
+            seed.end_run(rid, "exhausted")
+    finally:
+        seed.close()
+
+    # 2. Mock holdout_eval to track invocations. If the engine reaches the
+    # holdout node, this counter increments. The circuit breaker must
+    # short-circuit BEFORE any handler is called.
+    handler_calls = {"count": 0}
+
+    def fake_holdout(node, ctx):
+        handler_calls["count"] += 1
+        return Result(outcome="success", output="mock pass")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+
+    # 3. Run the engine with the seeded CXDB attached.
+    g = parse(_pipeline("hello.dot"))
+    ctx = Context(
+        goal="circuit breaker test",
+        workdir=ROOT,
+        backend="echo",
+        cxdb_path=cxdb_path,
+    )
+    history = run(g, ctx, max_steps=50)
+
+    # 4. Assert: engine short-circuited without running any node handler.
+    assert handler_calls["count"] == 0, (
+        f"expected 0 handler invocations, got {handler_calls['count']}"
+    )
+    assert len(history) == 1, (
+        f"expected exactly 1 record, got {len(history)}: {[r.node for r in history]}"
+    )
+    assert history[0].outcome == "exhausted"
+    assert history[0].node == "__cross_run_circuit__"
+    assert history[0].metadata.get("cross_run_circuit_breaker") == "true"
+
+
+def test_cross_run_circuit_breaker_disabled_when_threshold_not_reached(
+    monkeypatch, tmp_path
+):
+    """With fewer than 3 prior exhausted runs, the engine must NOT
+    short-circuit — normal pipeline execution proceeds."""
+    cxdb_path = tmp_path / "cxdb.sqlite"
+
+    # Seed only 2 prior exhausted runs (threshold is 3)
+    seed = CXDB(cxdb_path)
+    try:
+        for _ in range(_CB_THRESHOLD - 1):
+            rid = seed.start_run(pipeline="hello", goal="seed")
+            seed.record_step(
+                run_id=rid, seq=0, node="start", outcome="success",
+                ts=0.0, output="start", metadata={},
+            )
+            seed.end_run(rid, "exhausted")
+    finally:
+        seed.close()
+
+    monkeypatch.setitem(
+        TYPE_REGISTRY, "holdout_eval",
+        lambda node, ctx: Result(outcome="success", output="mock pass"),
+    )
+
+    g = parse(_pipeline("hello.dot"))
+    ctx = Context(
+        goal="below threshold test",
+        workdir=ROOT,
+        backend="echo",
+        cxdb_path=cxdb_path,
+    )
+    history = run(g, ctx, max_steps=50)
+
+    # Should run normally — holdout succeeds, exit reached
+    assert history[-1].outcome == "success"
+    assert history[-1].node == "exit"
+
+
+def test_cross_run_circuit_breaker_breaks_streak_on_success(monkeypatch, tmp_path):
+    """If ANY of the last N runs was not exhausted, the breaker must NOT fire."""
+    cxdb_path = tmp_path / "cxdb.sqlite"
+
+    seed = CXDB(cxdb_path)
+    try:
+        # 2 exhausted → 1 success → 2 exhausted. Most recent 3 = success+2xexhausted
+        # → streak is broken, breaker must not fire.
+        for _ in range(2):
+            rid = seed.start_run(pipeline="hello", goal="seed")
+            seed.record_step(
+                run_id=rid, seq=0, node="start", outcome="success",
+                ts=0.0, output="start", metadata={},
+            )
+            seed.end_run(rid, "exhausted")
+        rid_success = seed.start_run(pipeline="hello", goal="seed-success")
+        seed.record_step(
+            run_id=rid_success, seq=0, node="start", outcome="success",
+            ts=0.0, output="start", metadata={},
+        )
+        seed.end_run(rid_success, "success")
+        for _ in range(2):
+            rid = seed.start_run(pipeline="hello", goal="seed")
+            seed.record_step(
+                run_id=rid, seq=0, node="start", outcome="success",
+                ts=0.0, output="start", metadata={},
+            )
+            seed.end_run(rid, "exhausted")
+    finally:
+        seed.close()
+
+    monkeypatch.setitem(
+        TYPE_REGISTRY, "holdout_eval",
+        lambda node, ctx: Result(outcome="success", output="mock pass"),
+    )
+
+    g = parse(_pipeline("hello.dot"))
+    ctx = Context(
+        goal="streak broken test",
+        workdir=ROOT,
+        backend="echo",
+        cxdb_path=cxdb_path,
+    )
+    history = run(g, ctx, max_steps=50)
+
+    # Should run normally — streak is broken by the success in between
+    assert history[-1].outcome == "success"
+    assert history[-1].node == "exit"
+
+
+def test_cross_run_circuit_breaker_skipped_without_cxdb(monkeypatch, tmp_path):
+    """Without CXDB attached, the circuit breaker must not fire — runs proceed
+    normally. The breaker is opt-in via CXDB presence."""
+    monkeypatch.setitem(
+        TYPE_REGISTRY, "holdout_eval",
+        lambda node, ctx: Result(outcome="success", output="mock pass"),
+    )
+
+    g = parse(_pipeline("hello.dot"))
+    # No cxdb_path
+    ctx = Context(goal="no cxdb test", workdir=ROOT, backend="echo")
+    history = run(g, ctx, max_steps=50)
+
+    assert history[-1].outcome == "success"
+    assert history[-1].node == "exit"
+
+
+def test_cross_run_circuit_breaker_only_affects_matching_pipeline(
+    monkeypatch, tmp_path
+):
+    """Streak on pipeline A must NOT short-circuit pipeline B."""
+    cxdb_path = tmp_path / "cxdb.sqlite"
+
+    seed = CXDB(cxdb_path)
+    try:
+        # 3 exhausted runs on pipeline "other-pipeline" — different from "hello"
+        for _ in range(_CB_THRESHOLD):
+            rid = seed.start_run(pipeline="other-pipeline", goal="seed")
+            seed.record_step(
+                run_id=rid, seq=0, node="start", outcome="success",
+                ts=0.0, output="start", metadata={},
+            )
+            seed.end_run(rid, "exhausted")
+    finally:
+        seed.close()
+
+    handler_calls = {"count": 0}
+
+    def fake_holdout(node, ctx):
+        handler_calls["count"] += 1
+        return Result(outcome="success", output="mock pass")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+
+    g = parse(_pipeline("hello.dot"))
+    ctx = Context(
+        goal="pipeline mismatch test",
+        workdir=ROOT,
+        backend="echo",
+        cxdb_path=cxdb_path,
+    )
+    history = run(g, ctx, max_steps=50)
+
+    # Different pipeline — breaker must not fire; pipeline runs to completion
+    assert handler_calls["count"] >= 1
+    assert history[-1].outcome == "success"
+    assert history[-1].node == "exit"
