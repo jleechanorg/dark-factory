@@ -154,6 +154,11 @@ from .handler_parallel import (
     _join_handler,
 )
 
+# Parallel reviewer pair: primary + shadow Codex in one node.
+from .handler_parallel_reviewer import (
+    _parallel_reviewer,
+)
+
 # Evidence audit gate + git/gh helpers.
 from .handler_audit import (
     _git_config_origin_url,
@@ -201,6 +206,7 @@ TYPE_REGISTRY: "dict[str, Handler]" = {
     "gate_evidence_audit": _gate_audit,
     "parallel": _parallel_fanout,       # fan-out type (type=parallel)
     "join": _join_handler,              # fan-in type (type=join)
+    "parallel_reviewer": _parallel_reviewer,
 }
 
 

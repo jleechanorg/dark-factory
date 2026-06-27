@@ -63,6 +63,7 @@ def _drive_run(tmp_path: pathlib.Path, monkeypatch) -> tuple[pathlib.Path, str, 
 def test_bundle_layout_and_manifest_fields(tmp_path, monkeypatch):
     db_path, run_id, graph = _drive_run(tmp_path, monkeypatch)
     bundle = tmp_path / "bundle"
+    command = "dark-factory --pipeline pipelines/hello.dot --goal bundle smoke --backend echo"
     manifest = write_bundle(
         bundle_dir=bundle,
         cxdb_path=db_path,
@@ -70,6 +71,7 @@ def test_bundle_layout_and_manifest_fields(tmp_path, monkeypatch):
         pipeline_path=_pipeline("hello.dot"),
         graph=graph,
         workdir=ROOT,
+        command=command,
     )
 
     # Files
@@ -78,6 +80,9 @@ def test_bundle_layout_and_manifest_fields(tmp_path, monkeypatch):
     assert (bundle / "pipeline.dot").exists()
     assert (bundle / "pipeline.dot.sha256").exists()
     assert (bundle / f"cxdb-{run_id}.sqlite").exists()
+    assert (bundle / "summary.json").exists()
+    assert (bundle / "command.txt").exists()
+    assert (bundle / "node_io.jsonl").exists()
     assert (bundle / "steps").is_dir()
     step_files = sorted((bundle / "steps").glob("*.txt"))
     assert step_files, "expected at least one per-step file"
@@ -93,14 +98,24 @@ def test_bundle_layout_and_manifest_fields(tmp_path, monkeypatch):
         "run_id",
         "pipeline_name",
         "goal",
+        "command",
+        "command_path",
         "started_ts",
         "ended_ts",
+        "wall_clock_ms",
         "final_outcome",
+        "summary_path",
         "steps",
         "dark_factory_head_sha",
+        "cxdb_sha256",
+        "cxdb_path",
+        "cxdb_extract_path",
+        "cxdb_extract_sha256",
         "total_tokens",
         "total_cost_usd",
         "total_wall_ms",
+        "pipeline_copy",
+        "node_io_path",
     ):
         assert required in on_disk, f"missing manifest key {required!r}"
     assert on_disk["run_id"] == run_id
@@ -108,6 +123,27 @@ def test_bundle_layout_and_manifest_fields(tmp_path, monkeypatch):
     assert on_disk["goal"] == "bundle smoke"
     assert on_disk["final_outcome"] == "success"
     assert on_disk["steps"] >= 4  # start, plan, implement, holdout, exit
+    assert on_disk["command"] == command
+    assert on_disk["pipeline_copy"] == "pipeline.dot"
+    assert on_disk["node_io_path"] == "node_io.jsonl"
+    assert on_disk["summary_path"] == "summary.json"
+    assert on_disk["command_path"] == "command.txt"
+    assert on_disk["wall_clock_ms"] is not None
+    assert on_disk["cxdb_extract_path"] == str(bundle / f"cxdb-{run_id}.sqlite")
+
+    summary = json.loads((bundle / "summary.json").read_text())
+    assert summary["command"] == command
+    assert summary["wall_clock_ms"] == on_disk["wall_clock_ms"]
+    assert summary["cxdb_path"] == str(db_path)
+    assert summary["pipeline_path"] == str(_pipeline("hello.dot"))
+    assert summary["steps"] == on_disk["steps"]
+    assert summary["node_io_path"] == "node_io.jsonl"
+
+    node_io_lines = (bundle / "node_io.jsonl").read_text().strip().splitlines()
+    assert node_io_lines, "expected per-node I/O refs"
+    sample = json.loads(node_io_lines[0])
+    assert {"seq", "node", "outcome", "ts", "io_refs", "log_refs"} <= set(sample)
+    assert "events" in sample["log_refs"]
 
 
 def test_bundle_extract_contains_only_this_run(tmp_path, monkeypatch):
@@ -219,7 +255,12 @@ def test_cli_evidence_bundle_flag_creates_bundle(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (bundle / "manifest.json").exists()
     manifest = json.loads((bundle / "manifest.json").read_text())
+    summary = json.loads((bundle / "summary.json").read_text())
     assert manifest["pipeline_name"] == "hello"
+    assert manifest["command"].startswith("dark-factory")
+    assert (bundle / "command.txt").exists()
+    assert (bundle / "node_io.jsonl").exists()
+    assert (bundle / "summary.json").exists()
     # wall_ms per step should be present in metadata (echo backend records it).
     extract = next(bundle.glob("cxdb-*.sqlite"))
     conn = sqlite3.connect(str(extract))
@@ -235,3 +276,6 @@ def test_cli_evidence_bundle_flag_creates_bundle(tmp_path):
     for r in codergen_rows:
         meta = json.loads(r["metadata_json"])
         assert "wall_ms" in meta
+    assert summary["final_outcome"] in {"success", "failure"}
+    assert summary["cxdb_path"] == str(cxdb)
+    assert summary["steps"] == len(rows)

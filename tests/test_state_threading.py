@@ -18,6 +18,7 @@ rendered prompt contains node 1's marker, threading happened.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 
@@ -26,7 +27,7 @@ sys.path.insert(0, str(ROOT))
 
 from runner.engine import run  # noqa: E402
 from runner.engine_run import _run_single_node  # noqa: E402
-from runner.handlers import Context  # noqa: E402
+from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.parser import Graph, Node, parse  # noqa: E402
 
 NODE1_MARKER = "SCHEMA-COLUMNS=id,name,created_at"
@@ -125,3 +126,131 @@ def test_last_output_handoff_is_not_truncated(tmp_path):
 
     results, _records = _run_single_node(fix, ctx, graph, seq_base=2)
     assert tail_marker in results[-1].output
+
+
+def test_long_output_handoff_and_sidecars_are_full(monkeypatch, tmp_path):
+    """End-to-end handoff must keep long outputs intact in prompt and transcript
+    sidecars; only previews can be capped.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+
+    tail_marker = "TAIL-FINDING-coder-must-see-this"
+    long_review = "review finding\n" + ("x" * 4500) + tail_marker
+    p1 = tmp_path / "review.md"
+    p2 = tmp_path / "fix.md"
+    p3 = tmp_path / "implement.md"
+    p1.write_text(long_review, encoding="utf-8")
+    p2.write_text("fix handoff:\n${state._last_output}\n", encoding="utf-8")
+    p3.write_text("implementer must receive:\n${state._last_output}\n", encoding="utf-8")
+    dot = tmp_path / "thread_long.dot"
+    dot.write_text(
+        "digraph thread_long {\n"
+        '  graph [goal="long handoff"]\n'
+        "  start [shape=Mdiamond]\n"
+        f'  review [type="codergen", backend="echo", prompt="@{p1}"]\n'
+        f'  fix [type="codergen", backend="echo", prompt="@{p2}"]\n'
+        f'  implement [type="codergen", backend="echo", prompt="@{p3}"]\n'
+        "  exit [shape=Msquare]\n"
+        "  start -> review -> fix -> implement -> exit\n"
+        "}\n"
+    )
+
+    graph = parse(dot)
+    ctx = Context(goal="long handoff", workdir=tmp_path, backend="echo")
+    history = run(graph, ctx)
+    assert history[-1].node == "exit"
+
+    assert ctx.event_log_path is not None
+    events = [
+        json.loads(line)
+        for line in ctx.event_log_path.read_text().splitlines()
+        if line.strip()
+    ]
+
+    fix_input_event = next(
+        e for e in events
+        if e["event"] == "node_input" and e.get("node") == "fix" and e.get("attempt") == "1"
+    )
+    fix_trans_event = next(
+        e for e in events
+        if e["event"] == "node_result" and e.get("node") == "fix" and e.get("attempt") == "1"
+    )
+    implement_input_event = next(
+        e for e in events
+        if e["event"] == "node_input" and e.get("node") == "implement" and e.get("attempt") == "1"
+    )
+    implement_trans_event = next(
+        e for e in events
+        if e["event"] == "node_result" and e.get("node") == "implement" and e.get("attempt") == "1"
+    )
+
+    for path in [fix_input_event["input_path"], implement_input_event["input_path"]]:
+        content = pathlib.Path(path).read_text(encoding="utf-8")
+        assert tail_marker in content
+        assert len(content) > 4000
+
+    for path in [fix_trans_event["transcript_path"], implement_trans_event["transcript_path"]]:
+        content = pathlib.Path(path).read_text(encoding="utf-8")
+        assert tail_marker in content
+        assert len(content) > 4000
+
+    implement = next(step for step in history if step.node == "implement")
+    assert tail_marker not in implement.output_preview
+    assert len(implement.output_preview) <= 280
+
+
+def test_node_result_emits_generic_handoff_refs(monkeypatch, tmp_path):
+    """Any metadata key ending in `_path`/`_sha256` is carried as a node_result handoff ref."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+
+    p_prompt = tmp_path / "shadow_prompt.txt"
+    p_output = tmp_path / "shadow_output.txt"
+    p_prompt.write_text("shadow prompt")
+    p_output.write_text("shadow output")
+
+    def fake_codergen(node, ctx):
+        return Result(
+            outcome="success",
+            output="handoff test",
+            metadata={
+                "shadow_codex_prompt_path": str(p_prompt),
+                "shadow_codex_prompt_sha256": "prompt-sha",
+                "shadow_codex_output_path": str(p_output),
+                "shadow_codex_output_sha256": "output-sha",
+                "command_path": str(tmp_path / "command.log"),
+                "command_sha256": "command-sha",
+            },
+        )
+
+    monkeypatch.setitem(TYPE_REGISTRY, "codergen", fake_codergen)
+    dot = tmp_path / "refs.dot"
+    dot.write_text(
+        'digraph refs {\n'
+        '  graph [goal="refhand"]\n'
+        "  start [shape=Mdiamond]\n"
+        "  cod [type=\"codergen\"]\n"
+        "  exit [shape=Msquare]\n"
+        "  start -> cod -> exit\n"
+        "}\n"
+    )
+
+    ctx = Context(goal="refhand", workdir=tmp_path, backend="echo")
+    run(parse(dot), ctx)
+
+    events = [
+        json.loads(line)
+        for line in ctx.event_log_path.read_text().splitlines()
+        if line.strip()
+    ]
+    node_result = next(
+        e for e in events
+        if e["event"] == "node_result" and e.get("node") == "cod" and e.get("attempt") == "1"
+    )
+    assert node_result["shadow_codex_prompt_path"] == str(p_prompt)
+    assert node_result["shadow_codex_output_path"] == str(p_output)
+    assert node_result["command_path"] == str(tmp_path / "command.log")
+    assert node_result["shadow_codex_prompt_sha256"] == "prompt-sha"
+    assert node_result["shadow_codex_output_sha256"] == "output-sha"
+    assert node_result["command_sha256"] == "command-sha"

@@ -8,7 +8,7 @@ aliases: [df]
 # /factory — Dark Factory DOT Pipeline Runner (alias for /f)
 
 Dispatches to the **`dark-factory` binary** (`./install.sh` →
-`~/.local/bin/dark-factory`). Single writer for the workflow is
+`~/.local/bin/dark-factory`). Single writer for the binary-first contract is
 `.claude/commands/f.md`; this file is a thin alias so the
 auto-detect behavior (PR-mode vs feature-mode) is identical for both
 entry points.
@@ -33,3 +33,7 @@ the goal is unrelated, ask the user. Do not default to `gates.dot`,
 `minimal_feature.dot`, or any single file for every run.
 
 Equivalent to: `/f $ARGUMENTS`
+
+The final response must satisfy `/f`'s proof block: literal command run,
+Run ID, CXDB SHA, final outcome, exit code, wall-clock, logs, and evidence
+envelope.

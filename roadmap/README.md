@@ -1,6 +1,29 @@
 # dark-factory roadmap
 
+## Recent activity (by day)
+
+- [2026-06-27](activity/2026-06-27.md) — Compliance review: factory non-converging on `fix` (16+ WIP exhausted chain); 10 ranked gaps; 10 proposed beads awaiting operator decision
+- [2026-06-27-factory-runs-the-factory](activity/2026-06-27-factory-runs-the-factory.md) — Adversarial spec-producer mode + mandatory command-line echo contract for /fs and /f
+
 ## Recent activity (rolling)
+
+### 2026-06-27 — Factory-runs-the-factory contract (addendum to compliance review)
+
+- Operator-requested: `/fs` and `/f` must invoke the actual `dark-factory` binary (not an in-Claude Claude Workflow dispatch) in adversarial spec-producer mode; after every invocation, the literal command line + run ID + CXDB SHA must be echoed in the reply.
+- Clarified contract: binary-first does not forbid dynamic graph generation; it means any Claude/workflow graph builder must run behind the `dark-factory` binary and save/echo the generated or selected DOT graph. All nodes pass full free-form output forward; only preview/index fields may be capped.
+- Beads created/updated: `jleechan-92g` (P1, /fs default to binary), `jleechan-ion` (P1, mandatory command-line echo), `jleechan-0a6` (P2, audit /f and /fs current default path), `jleechan-tql` (P2, pipeline-level evidence envelope), `jleechan-fla` (P1, full all-node handoff), `jleechan-wlz` (P1, shadow Codex default-on), `jleechan-j9w` (P1, detailed node/LLM I/O logs), `jleechan-xx5` (P1, reviewer dedupe + parallelization).
+- First batch: `jleechan-0a6`, `jleechan-ion`, `jleechan-tql`, `jleechan-fla`, `jleechan-xx5`. After each bead, run `codex exec --yolo` as a cold reviewer, fix gaps before moving on, and inspect dark-factory logs.
+- Activity: `roadmap/activity/2026-06-27-factory-runs-the-factory.md`.
+- Cross-cuts: `pipelines/slim/spec_gen.dot` already has `prefer_adversarial="true"` on both `review_main` and `review_attractor` — the pipeline structure exists; what changes is the *invocation path* (`/fs` must shell to the binary, not synthesize specs in-Claude).
+- Spec contract after the change: every `/f` and `/fs` reply must end with a code block of the literal command run + `Run ID` + `CXDB SHA` + `Final outcome` + `Wall-clock`. Missing any of those four lines means the run did not happen.
+
+### 2026-06-27 — Compliance review: factory non-converging on `fix`, G1+G2 clean but G3–G9 unfixed
+
+- Compliance review at `docs/factory-evolve-research/review-2026-06-27.md`. Verdict: structurally compliant (G1+G2 clean), but currently broken in flight (16+ `WIP: dark-factory exhausted at ...` auto-recovery commits stack on `test-merged`, every one `no_progress_max=2 reached on node 'fix'`).
+- 10 ranked gaps with file:line citations: P1 G7 vendor collapse, P2 G6 default-wrong, P3 G8 SHA-bind stale, P4 _last_output unbounded (WIP 1d74023 regression), P5 fix-loop contract gap, P6 fix-loop bound on visits not outcomes (root-cause D3 unaddressed), P7 G9 evidence trust on holdout-less graphs, P8 prompt-substitution-audit gap on prompt-quality, P9 level5="true" not in CI, P10 diagnostic absence.
+- Spec-compliance scorecard vs strongdm/attractor + 2389 + danshapiro: 14/15 requirements met, only "fix-loop converges on self-review" fails.
+- Recommended: 5 file-disjoint fixes (≤ 1 day, do as one PR). Awaiting operator decision: drop or rebase the WIP chain on `test-merged`. Requires explicit `APPROVE DIR SWITCH` for worktree work.
+- Nextsteps doc: `~/roadmap/nextsteps-2026-06-27-dark-factory-compliance-review.md`
 
 ### 2026-06-13 — Round 13 close: F6i (codergen-has-non-empty-prompt) SHIPPED, the contract pattern is now 5-dimensional (per-family presence, per-family value, cross-family range, prompt-pinning, codergen-has-prompt), 1 PR MERGED, 0 regressions
 

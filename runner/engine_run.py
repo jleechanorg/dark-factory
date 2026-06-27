@@ -457,9 +457,7 @@ def run(
                             "max_retries": "0",
                             "parallel": "true",
                         }
-                        for key in ("input_path", "input_sha256", "llm_prompt_path", "llm_prompt_sha256"):
-                            if key in b_record.metadata:
-                                payload[key] = b_record.metadata[key]
+                        payload.update(_obs._handoff_refs(b_record.metadata))
                         if transcript_path:
                             payload["transcript_path"] = transcript_path
                             payload["transcript_sha256"] = transcript_sha256
@@ -517,9 +515,7 @@ def run(
                                 "max_retries": b_record.metadata.get("max_retries", "0"),
                                 "parallel": "true",
                             }
-                            for key in ("input_path", "input_sha256", "llm_prompt_path", "llm_prompt_sha256"):
-                                if key in b_record.metadata:
-                                    payload[key] = b_record.metadata[key]
+                            payload.update(_obs._handoff_refs(b_record.metadata))
                             if transcript_path:
                                 payload["transcript_path"] = transcript_path
                                 payload["transcript_sha256"] = transcript_sha256
@@ -601,9 +597,7 @@ def run(
                     "attempt": str(index + 1),
                     "max_retries": record.metadata.get("max_retries", "0"),
                 }
-                for key in ("input_path", "input_sha256", "llm_prompt_path", "llm_prompt_sha256"):
-                    if key in record.metadata:
-                        payload[key] = record.metadata[key]
+                payload.update(_obs._handoff_refs(record.metadata))
                 if transcript_path:
                     payload["transcript_path"] = transcript_path
                     payload["transcript_sha256"] = transcript_sha256

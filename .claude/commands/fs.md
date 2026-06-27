@@ -1,11 +1,11 @@
 ---
-description: "/fs — generate main + attractor specs with codex cold review. DEFAULT: dispatches Phase 1 (spec_validation) of the .claude/workflows/dark-factory.md workflow. Pass --legacy to use the legacy spec_gen pipeline directly."
+description: "/fs — generate main + attractor specs with codex cold review. DEFAULT: invoke the real dark-factory binary against spec_gen or a binary-owned dynamic spec graph, then echo proof metadata."
 type: quality
 execution_mode: immediate
 aliases: [fs]
 ---
 
-# /fs — Spec Generation (workflow Phase 1 by default)
+# /fs — Spec Generation (binary-first)
 
 `/fs` produces **two** reviewed specs:
 - `spec.md` — the main spec (acceptance criteria, test command, non-goals,
@@ -13,23 +13,24 @@ aliases: [fs]
 - `attractor_spec.md` — the attractor spec (convergence target, observable
   convergence criteria, anti-attractor states)
 
-**Default invocation path** is **Phase 1 (spec_validation) of the
-`.claude/workflows/dark-factory.md` workflow** — the workflow runs the
-public spec through the spec-validation benchmark first, so the spec is
-graded before any code is written. The workflow then hands off to explore
-/ plan / implement if Phase 1 passes; if Phase 1 fails, the workflow
-stops and surfaces the spec-validation trace.
+**Default invocation path** is the real `dark-factory` binary, normally
+against `pipelines/slim/spec_gen.dot`. The binary may use Claude/workflow
+logic internally to build or select a dynamic spec graph, but the run is
+unproven unless `/fs` shows the literal binary command, run metadata, logs,
+and evidence envelope.
 
-Pass `--legacy` to skip the workflow and run the original
-`pipelines/slim/spec_gen.dot` pipeline directly (two-phase
-main+attractor generation with codex cold review).
+The default graph must preserve these nodes or their generated equivalents:
+main spec plan, independent cold review, bounded main-spec fix loop,
+attractor-spec plan, independent cold review, bounded attractor fix loop, and
+exit.
 
 **Usage**:
 
 ```
-/fs <spec description>                  # DEFAULT: workflow Phase 1
-/fs --legacy <spec description>         # legacy spec_gen pipeline
-/fs --skip-attractor <description>      # main spec only (workflow or legacy)
+/fs <spec description>                  # DEFAULT: binary spec_gen run
+/fs --pipeline spec_gen <description>   # explicit static binary pipeline
+/fs --dynamic-graph <description>       # binary-owned dynamic spec graph
+/fs --skip-attractor <description>      # main spec only, still binary-first
 /fs --review <spec_path>                # review an existing main spec
 /fs --review-attractor <path>           # review an existing attractor spec
 /fs --show                              # graph reference only (read-only)
@@ -40,61 +41,57 @@ main+attractor generation with codex cold review).
 1. Parse `$ARGUMENTS`.
 2. If `--review`, `--review-attractor`, or `--show` is present, handle
    in-session as before (read-only, no pipeline invoked).
-3. If `--legacy` is present OR `--pipeline spec_gen` was passed, fall
-   through to **Legacy dispatch** below.
-4. Otherwise, the user wants spec VALIDATION on an existing spec (not
-   spec generation). The workflow's Phase 1 validates a spec already
-   present at `specs/<feature>.md` via
-   `benchmarks/attractor-spec-review/pipelines/review_slim.dot`. The
-   LLM follows the workflow at
-   `$DARK_FACTORY_HOME/.claude/workflows/dark-factory.md` and runs
-   only Phase 1 (`spec_validation`), then stops:
+3. Otherwise, construct and run the binary command below. If the LLM decides
+   an existing spec should be reviewed instead of generated, use the
+   Attractor spec-review pipeline explicitly; do not run an in-Claude workflow
+   and call it a factory run.
 
-   ```bash
-   cd "$TARGET_REPO"
-   dark-factory \
-     --pipeline benchmarks/attractor-spec-review/pipelines/review_slim.dot \
-     --goal "Validate spec: specs/${FEATURE}.md" \
-     --backend "$BACKEND" \
-     --feature "$FEATURE" \
-     --cxdb "$CXDB"
-   ```
+```bash
+export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$HOME/projects/dark-factory}"
+export DARK_FACTORY_HOLDOUTS="${DARK_FACTORY_HOLDOUTS:-$HOME/projects/dark-factory-holdouts}"
+export PATH="$HOME/.local/bin:$PATH"
+cd <target repo>
+dark-factory \
+  --pipeline pipelines/slim/spec_gen.dot \
+  --goal "<echo of $ARGUMENTS>" \
+  --backend <echo for smoke | claude/codex/agy/minimax for real> \
+  --feature <feature> \
+  --cxdb ~/.dark-factory/cxdb.sqlite
+```
 
-   If no `specs/${FEATURE}.md` exists, the workflow stops with a
-   missing-file error — for greenfield spec CREATION, fall through to
-   **Legacy dispatch** below (`/fs --legacy`) which runs
-   `pipelines/slim/spec_gen.dot` and writes `spec.md` +
-   `attractor_spec.md`.
+### Step 0: detect context
 
-### Step 0: detect context (workflow path only)
-
-For the workflow path, classify greenfield vs brownfield so the workflow
-can frame the spec_validation goal appropriately:
+Classify greenfield vs brownfield so the binary run can frame the spec goal
+appropriately:
 
 - **Greenfield** (new feature, no existing code in the target repo): the
-  spec is the source of truth; workflow uses `spec.md` as-is.
+  spec is the source of truth; the binary graph writes/reviews `spec.md`.
 - **Brownfield** (existing code, replacement/delete work): the spec must
   enumerate what stays, what goes, and the net-LOC constraint per
   `factory-spec` delete-first rules.
 
-This is informational; the workflow's spec_validation phase will surface
-both possibilities to the spec author.
+This is informational; the binary graph or generated DOT should surface both
+possibilities to the spec author.
 
-### Workflow path: what gets produced
+### Default graph: what gets produced
 
-The workflow's spec_validation phase produces a **validation report** in
-CXDB for the existing `specs/<feature>.md` (line-by-line pass/fail
-verdicts from `review_slim.dot`'s cold review). It does **NOT** write
-new `spec.md` / `attractor_spec.md` files — spec generation is the
-**Legacy dispatch** path below.
+The default `pipelines/slim/spec_gen.dot` path produces or updates:
 
-**Pass criterion:** `final_outcome == "success"` for Phase 1 with all
-spec line-items passing (or marked `warn` with documented mitigation).
+- `spec.md`
+- `attractor_spec.md`
+- cold-review outputs for both specs
+- fix-loop handoff when either review fails
 
-### Legacy dispatch (`--legacy` or `--pipeline spec_gen`)
+If the binary uses a dynamic generated spec graph instead, the generated DOT
+must be saved or echoed and must preserve the required default nodes.
+
+**Pass criterion:** `final_outcome == "success"` for the binary run, with both
+main and attractor reviews passing.
+
+### Graph reference
 
 Read `.claude/skills/factory-spec/SKILL.md` for full mode details. The
-legacy path is the original `pipelines/slim/spec_gen.dot` pipeline:
+default static path is `pipelines/slim/spec_gen.dot`:
 
 ```
 start → explore_in → explore_fanout → {explore_concept, explore_auth,
@@ -109,31 +106,52 @@ start → explore_in → explore_fanout → {explore_concept, explore_auth,
 
 ## Honesty rules
 
-- Quote the **actual** `Skill()` or `dark-factory` command run.
-- If the workflow's Phase 1 fails, **surface the trace** and stop. Do not
-  silently fall through to legacy or assume "we can fix the spec later."
+- Quote the **actual** `dark-factory` command run.
+- If the binary run fails, **surface the trace** and stop. Do not assume
+  "we can fix the spec later" without feeding the full review output into the
+  next fix loop.
 - If `--backend echo` was used, label the run as a wiring smoke, not a
   real validation. Echo-mode review verdicts are not real LLM verdicts.
-- Do not duplicate the workflow steps inline in this file. The
-  workflow at `$DARK_FACTORY_HOME/.claude/workflows/dark-factory.md`
-  is the single source of truth for spec_validation behavior.
+- Do not claim an in-Claude workflow or `Skill()` result is a factory run
+  unless the binary proof block below is present.
 
-## Why the workflow is the default
+End every `/fs` response with this proof block. Missing any required line means
+the run is unproven:
 
-Same reasoning as `/f`: the user's 2026-06-22 architectural pivot
-preferred default primitives over custom code. The workflow's
-spec_validation phase is the spec-validation benchmark wired into a
-multi-phase orchestrator — no engine changes required.
+```bash
+# Literal command run:
+cd /Users/jleechan/projects/<target-repo>
+DARK_FACTORY_HOME=~/projects/dark-factory \
+DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts \
+PATH="$HOME/.local/bin:$PATH" \
+dark-factory \
+  --pipeline pipelines/slim/spec_gen.dot \
+  --goal "<echo of $ARGUMENTS>" \
+  --backend <backend> \
+  --feature <feature> \
+  --cxdb ~/.dark-factory/cxdb.sqlite
+# Run ID: <id>
+# CXDB SHA: <sha>
+# Final outcome: <success|failure|exhausted|error>
+# Exit code: <integer>
+# Wall-clock: <duration>
+# Logs: <path>
+# Evidence envelope: <path>
+```
 
-Use **legacy** dispatch when:
-- The user explicitly opts in (`--legacy` / `--pipeline spec_gen`)
-- The user wants to iterate spec generation in isolation from
-  explore/plan/implement
-- The user is debugging the spec_gen pipeline itself
+## Why binary-first is the default
+
+Same reasoning as `/f`: the user's 2026-06-27 clarification requires default
+binary invocation. Claude/workflow logic may build a dynamic DOT graph behind
+the binary, but the durable proof remains the DOT graph, CXDB, logs, and
+evidence envelope.
+
+Use static `pipelines/slim/spec_gen.dot` unless a binary-owned dynamic graph is
+needed and saved/echoed.
 
 ## See also
 
 - `/factory-spec` — detailed skill workflow for legacy spec generation
-- `/f` — full Dark Factory loop; uses the same workflow by default
-- `$DARK_FACTORY_HOME/.claude/workflows/dark-factory.md` — workflow
-  source of truth for spec_validation behavior
+- `/f` — full Dark Factory loop; also binary-first by default
+- `$DARK_FACTORY_HOME/.claude/workflows/dark-factory.md` — optional source
+  material for binary-owned dynamic graph generation; not proof by itself

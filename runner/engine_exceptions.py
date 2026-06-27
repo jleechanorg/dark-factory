@@ -62,7 +62,7 @@ def _handle_node_exception(
     )
     ctx.state["_last_node"] = current.name
     ctx.state["_last_outcome"] = "error"
-    ctx.state["_last_output"] = tb_text[:4000]
+    ctx.state["_last_output"] = tb_text
     ctx.history.append({"node": current.name, "outcome": "error"})
 
     record = _persist.StepRecord(

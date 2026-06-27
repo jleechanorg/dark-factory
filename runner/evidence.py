@@ -6,6 +6,9 @@ Layout:
     <bundle>/
         manifest.json          # run summary + qhez metric totals
         README.md              # human-readable summary table
+        summary.json           # explicit run summary artifact
+        command.txt            # command echo used by the invocation
+        node_io.jsonl          # per-node I/O and log references
         pipeline.dot           # verbatim copy of the source DOT
         pipeline.dot.sha256    # sidecar checksum
         events.jsonl           # structured JSONL event stream (optional)
@@ -25,7 +28,6 @@ import json
 import pathlib
 import shutil
 import sqlite3
-import subprocess
 import time
 from typing import Optional
 
@@ -57,6 +59,57 @@ def _dark_factory_head_sha(workdir: pathlib.Path) -> Optional[str]:
     if _SHA_RE.match(sha.lower()):
         return sha.lower()
     return None
+
+
+def _sha256_file(path: pathlib.Path) -> Optional[str]:
+    try:
+        return _sha256(pathlib.Path(path).read_bytes())
+    except Exception:
+        return None
+
+
+def _wall_clock_ms(started_ts: object, ended_ts: object) -> Optional[int]:
+    if started_ts is None or ended_ts is None:
+        return None
+    try:
+        return int((float(ended_ts) - float(started_ts)) * 1000)
+    except (TypeError, ValueError):
+        return None
+
+
+def _iter_step_rows(cxdb_path: pathlib.Path, run_id: str) -> list[dict]:
+    conn = sqlite3.connect(str(cxdb_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT seq, node, outcome, ts, output_head, metadata_json
+            FROM steps WHERE run_id = ? ORDER BY seq ASC
+            """,
+            (run_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    out: list[dict] = []
+    for r in rows:
+        try:
+            meta = json.loads(r["metadata_json"] or "{}")
+        except (TypeError, ValueError):
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        out.append(
+            {
+                "seq": r["seq"],
+                "node": r["node"],
+                "outcome": r["outcome"],
+                "ts": r["ts"],
+                "output_head": r["output_head"] or "",
+                "metadata": meta,
+            }
+        )
+    return out
 
 
 def _is_holdout_step(node: str, metadata: dict, all_holdout_nodes: set[str]) -> bool:
@@ -202,6 +255,43 @@ def _holdout_nodes_in_graph(graph) -> set[str]:
     return out
 
 
+def _collect_node_sidecars(
+    steps: list[dict],
+    event_log_path: Optional[pathlib.Path],
+    run_id: str,
+) -> list[dict]:
+    event_path = str(event_log_path) if event_log_path else None
+    run_log_path = pathlib.Path.home() / ".dark-factory" / "logs" / f"{run_id}.log"
+    ref_keys = (
+        "input_path",
+        "input_sha256",
+        "llm_prompt_path",
+        "llm_prompt_sha256",
+        "transcript_path",
+        "transcript_sha256",
+        "shadow_codex_prompt_path",
+        "shadow_codex_prompt_sha256",
+        "shadow_codex_output_path",
+        "shadow_codex_output_sha256",
+        "shadow_output_path",
+        "shadow_output_sha256",
+    )
+    return [
+        {
+            "seq": step["seq"],
+            "node": step["node"],
+            "outcome": step["outcome"],
+            "ts": step["ts"],
+            "io_refs": {k: str(v) for k, v in step["metadata"].items() if k in ref_keys and v},
+            "log_refs": {
+                "events": event_path,
+                "run_log": str(run_log_path) if run_log_path.exists() else None,
+            },
+        }
+        for step in steps
+    ]
+
+
 def _write_step_files(
     bundle_dir: pathlib.Path,
     cxdb_path: pathlib.Path,
@@ -213,16 +303,7 @@ def _write_step_files(
     steps_dir.mkdir(parents=True, exist_ok=True)
 
     # Pull full output_head per step for the per-file artifact.
-    conn = sqlite3.connect(str(cxdb_path))
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(
-            "SELECT seq, node, output_head, metadata_json FROM steps WHERE run_id = ?",
-            (run_id,),
-        ).fetchall()
-    finally:
-        conn.close()
-    by_seq = {r["seq"]: r for r in rows}
+    by_seq = {row["seq"]: row for row in _iter_step_rows(cxdb_path, run_id)}
 
     for step in steps:
         seq = step["seq"]
@@ -298,6 +379,7 @@ def write_bundle(
     pipeline_path: pathlib.Path,
     graph,
     workdir: pathlib.Path,
+    command: str | None = None,
     event_log_path: Optional[pathlib.Path] = None,
 ) -> dict:
     """Materialise the evidence bundle for `run_id` under `bundle_dir`.
@@ -319,7 +401,9 @@ def write_bundle(
 
     # 3. Summarise the run for manifest + README + step files.
     steps, totals = _summarise_run(cxdb_path, run_id)
-    
+    command_text = command or ""
+    (bundle_dir / "command.txt").write_text(command_text + ("\n" if command_text else ""))
+
     # Enforce exit node check: force final_outcome to "failure" if no exit node was hit
     from .parser import is_exit_node
     has_exit = False
@@ -336,17 +420,54 @@ def write_bundle(
     holdout_nodes = _holdout_nodes_in_graph(graph)
     _write_step_files(bundle_dir, cxdb_path, run_id, steps, holdout_nodes)
     events_path = _copy_events(event_log_path, bundle_dir)
+    node_io = _collect_node_sidecars(steps, events_path, run_id)
+    (bundle_dir / "node_io.jsonl").write_text(
+        "\n".join(json.dumps(item, sort_keys=True) for item in node_io) + ("\n" if node_io else "")
+    )
+
+    cxdb_sha = _sha256_file(cxdb_path)
+    extract_sha = _sha256_file(extract_path)
+    wall_clock = _wall_clock_ms(totals.get("started_ts"), totals.get("ended_ts"))
+    summary = {
+        "run_id": run_id,
+        "pipeline_path": str(pipeline_path),
+        "pipeline_name": getattr(graph, "name", ""),
+        "goal": totals.get("goal", ""),
+        "command": command_text,
+        "started_ts": totals.get("started_ts"),
+        "ended_ts": totals.get("ended_ts"),
+        "wall_clock_ms": wall_clock,
+        "final_outcome": totals.get("final_outcome"),
+        "steps": len(steps),
+        "cxdb_path": str(cxdb_path),
+        "cxdb_sha256": cxdb_sha,
+        "extract_path": str(extract_path),
+        "extract_sha256": extract_sha,
+        "node_io_path": "node_io.jsonl",
+        "events_path": str(events_path) if events_path is not None else None,
+    }
+    (bundle_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 
     manifest = {
         "run_id": run_id,
         "pipeline_name": getattr(graph, "name", ""),
         "pipeline_path": str(pipeline_path),
+        "pipeline_copy": "pipeline.dot",
         "goal": totals.get("goal", ""),
+        "command": command_text,
+        "command_path": "command.txt",
         "started_ts": totals.get("started_ts"),
         "ended_ts": totals.get("ended_ts"),
+        "wall_clock_ms": wall_clock,
         "final_outcome": totals.get("final_outcome"),
         "steps": len(steps),
         "events_path": str(events_path) if events_path is not None else None,
+        "summary_path": "summary.json",
+        "node_io_path": "node_io.jsonl",
+        "cxdb_path": str(cxdb_path),
+        "cxdb_sha256": cxdb_sha,
+        "cxdb_extract_path": str(extract_path),
+        "cxdb_extract_sha256": extract_sha,
         "dark_factory_head_sha": _dark_factory_head_sha(workdir),
         "total_tokens": totals.get("total_tokens"),
         "total_cost_usd": totals.get("total_cost_usd"),

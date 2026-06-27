@@ -33,6 +33,30 @@ _event_lock = threading.Lock()
 _heartbeat_lock = threading.Lock()
 
 
+def _handoff_refs(metadata: dict[str, str]) -> dict[str, str]:
+    """Return path-like metadata keys that should be emitted on node_result.
+
+    The contract keeps `output`/`output_preview` as the handoff source of truth,
+    while still logging full path references for input/prompt/llm/shadow sidecars.
+
+    Using suffixes keeps this robust as new path keys are introduced without
+    requiring a central whitelist drift.
+    """
+    if not metadata:
+        return {}
+    refs: dict[str, str] = {}
+    for key, value in metadata.items():
+        if not isinstance(key, str):
+            continue
+        if not isinstance(value, str):
+            value = str(value)
+        if not value:
+            continue
+        if key.endswith("_path") or key.endswith("_sha256"):
+            refs[key] = value
+    return refs
+
+
 def _node_backend(node: Node, ctx: Context) -> str:
     backend = node.attrs.get("backend")
     if backend:

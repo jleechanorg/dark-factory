@@ -1,5 +1,5 @@
 ---
-description: "/f — full Dark Factory loop; auto-routes to PR-mode when a PR is open on the current branch, otherwise feature-mode. DEFAULT: invoke the .claude/workflows/dark-factory.md workflow (multi-phase orchestration). Pass --legacy to bypass and run a single-phase .dot pipeline directly."
+description: "/f — full Dark Factory loop; auto-routes to PR-mode when a PR is open on the current branch, otherwise feature-mode. DEFAULT: invoke the real dark-factory binary and echo proof metadata. Dynamic workflow/DOT generation is allowed only behind the binary."
 type: quality
 execution_mode: immediate
 aliases: [f]
@@ -7,46 +7,44 @@ aliases: [f]
 
 # /f — Full Dark Factory Loop (auto-routes PR vs feature)
 
-Shortcut for `/factory` oriented toward **full production loops**. **Default
-invocation path** is the multi-phase Claude Workflow at
-`$DARK_FACTORY_HOME/.claude/workflows/dark-factory.md` (the G3 closure
-artifact). The workflow orchestrates `spec_validation → explore → plan →
-implement → gate → bounded fix loop` as separate `dark-factory` invocations
-sharing one CXDB, so the LLM decides fan-out at workflow-execution time, not
-parse time.
+Shortcut for `/factory` oriented toward **full production loops**. The
+**default invocation path is the real `dark-factory` binary**. The binary may
+run a selected static DOT graph, or it may run a binary-owned graph builder /
+workflow that creates or selects a dynamic DOT graph. What is not allowed is an
+in-Claude prose-only workflow that claims a factory run without a logged binary
+invocation.
 
-Pass `--legacy` (or `--pipeline <name>.dot`) to bypass the workflow and run
-a single-phase `.dot` pipeline directly against the `dark-factory` binary.
-Use `--legacy` when you want to iterate one phase in isolation (e.g., a
-quick `gates.dot` re-run after a fix).
+Every default run must preserve required default nodes or their graph-level
+equivalents: plan/spec producer, independent review, bounded fix loop,
+evidence gates, and exit summary. Dynamic graph generation is valid only when
+the generated/selected DOT graph is saved or echoed in the run evidence.
 
 **Prerequisite:** `./install.sh` once; `dark-factory` on PATH via `~/.local/bin`.
 
 **Usage**:
 
 ```
-/f <goal description>                          # DEFAULT: workflow (6-phase orchestration)
-/f --legacy <goal>                             # single .dot pipeline (skip workflow)
-/f --legacy --pipeline gates <goal>            # explicit legacy pipeline
+/f <goal description>                          # DEFAULT: binary-first factory run
+/f --pipeline gates <goal>                     # explicit binary pipeline
 /f --backend echo <goal>                       # wiring smoke (no LLM)
 /f --feature <name> <goal>                     # override holdout feature key
-/f --phase spec_validation <goal>              # workflow, but stop after Phase 1
+/f --dynamic-graph <goal>                      # binary-owned dynamic DOT/workflow builder
+/f --phase spec_validation <goal>              # binary-owned dynamic/phase run, if supported
 ```
 
 ## Action
 
-1. Parse `$ARGUMENTS`. If `--legacy` or `--pipeline` is present, the user is
-   being explicit — **skip the workflow** and fall through to the **Legacy
-   dispatch** section below.
-2. If neither flag is present, this is a **workflow invocation** — invoke
-   the dark-factory Claude Workflow (Step 0: detect context first, then
-   `Skill("dark-factory", args="…")`).
+1. Parse `$ARGUMENTS`.
+2. Run Step 0 to decide PR-mode vs feature-mode.
+3. Construct and run a `dark-factory` binary command. If the LLM decides a
+   dynamic graph is required, the command must still be a binary invocation
+   and the generated/selected DOT graph must appear in the evidence envelope.
 
 ### Step 0: detect context (auto-routing — applies to BOTH paths)
 
 The auto-detect (PR-mode vs feature-mode) is **identical** whether the user
-gets the workflow or a legacy single-phase pipeline. Run once, before
-either dispatch:
+uses a selected static graph or a binary-owned dynamic graph. Run once before
+dispatch:
 
 ```bash
 # Is there an open PR for the current branch?
@@ -65,56 +63,21 @@ echo "$ARGUMENTS"
 - **Open PR exists** AND goal is unrelated → **ask the user** which mode
   they meant. Do not silently route.
 
-### Default path: invoke the dark-factory workflow
+### Default path: invoke the dark-factory binary
 
-After Step 0 resolves PR-vs-feature, the LLM follows the **Level-5
-multi-phase workflow** at
-`$DARK_FACTORY_HOME/.claude/workflows/dark-factory.md`. Read that file
-and execute each phase (`spec_validation → explore → plan → implement →
-gate → bounded fix loop`) as a separate `dark-factory` binary call
-against a phase-specific `.dot` graph, sharing one `CXDB` so the
-Healer can cluster failures across phase boundaries.
-
-The workflow is the source of truth — it owns phase ordering, shared
-CXDB, fix-loop bounding, and the final summary. Each phase invocation
-follows this shell (substituting the phase's own pipeline and goal):
-
-```bash
-cd "$TARGET_REPO"
-dark-factory \
-  --pipeline pipelines/<PHASE>.dot \
-  --goal "<PHASE GOAL — see workflow file>" \
-  --backend "$BACKEND" \
-  --feature "$FEATURE" \
-  --cxdb "$CXDB"
-```
-
-If the user passed `--phase <name>`, only execute the workflow phases
-up to and including `<name>` and then stop (useful for iterating one
-phase in isolation without running the full 6-phase loop).
-
-**Why this is the default:** the workflow is the **G3 closure artifact** —
-runtime-determined fan-out (the original gap the user's prior `type="dynamic"`
-custom code was meant to close) is handled by the workflow itself, not by
-hand-rolled engine code. Default nodes (`codergen`, `tool`, `holdout_eval`,
-`gate_*`) + a workflow orchestrator is the architectural pattern the user
-pinned on 2026-06-22 (see
-`~/.claude/projects/-Users-jleechan-projects-dark-factory/memory/feedback_2026-06-22_user_pivot_default_nodes_over_custom.md`).
-
-### Legacy dispatch (only when `--legacy` or `--pipeline` is present)
-
-Read the PR context (PR-mode only) and pick from the pipeline menu in the
-same way `/f` did before the workflow existed:
+After Step 0 resolves PR-vs-feature, select the appropriate pipeline or
+binary-owned dynamic graph mode. The default static choices are:
 
 | Pipeline | When the LLM might pick it |
 |----------|----------------------------|
 | `pipelines/factory/hello.dot` | Wiring smoke only — verify mechanics first with `--backend echo` |
 | `pipelines/factory/gates.dot` | Code is on the branch and the LLM wants holdout + the 3 evidence gates |
-| `pipelines/factory/pr_gates.dot` | Code is on the branch and the LLM wants the 3 evidence gates; `--feature <name>` for the holdout to resolve |
+| `pipelines/factory/pr_gates.dot` | Code is on the branch and the LLM wants the 3 evidence gates without sealed holdout |
 | `pipelines/slim/minimal_pr.dot` | The LLM thinks the PR needs more implement/test work, not just gates |
 | `pipelines/bug_fix.dot` | The PR is a TDD bug fix with red/green discipline |
 | `pipelines/slim/spec_gen.dot` | The LLM has decided /fs is needed first — STOP and recommend running it before any /f pipeline |
-| `pipelines/factory/level5_feature.dot` | Full Level-5 (dark-factory) reference pipeline with hard-tier gates wired in |
+| `pipelines/factory/level5_feature.dot` | Full Level-5 reference pipeline with hard-tier gates wired in |
+| **dynamic DOT via binary** | A static graph cannot express the needed phase/fanout, but the binary will save/echo the generated graph |
 | **no /f pipeline** | Docs-only / test-only / config-only PRs have no behavioral surface for the holdout to grade. The LLM should say so and stop |
 
 Then construct:
@@ -125,27 +88,53 @@ export DARK_FACTORY_HOLDOUTS="${DARK_FACTORY_HOLDOUTS:-$HOME/projects/dark-facto
 export PATH="$HOME/.local/bin:$PATH"
 cd <target repo>   # the repo the work lands in
 dark-factory \
-  --pipeline <CHOSEN> \
+  --pipeline <CHOSEN_OR_GENERATED_DOT> \
   --goal "<1-line LLM rationale + scope>" \
   --backend <echo for smoke | claude/codex/agy/minimax for real> \
   [--feature <holdout-feature-if-applicable>] \
-  [--state <KEY>=<VALUE> if minimal_pr] \
+  [--state <KEY>=<VALUE> if needed] \
   --cxdb ~/.dark-factory/cxdb.sqlite
 ```
 
+If the user passed `--phase <name>`, pass it through only if the binary
+supports that phase/dynamic mode. Otherwise pick the closest explicit DOT
+pipeline and state the limitation.
+
 ### Report the verdict
 
-**Workflow path:** the workflow emits its own final summary block (see
-`.claude/workflows/dark-factory.md` § "Final summary"). Quote it verbatim.
-If `Final outcome` is anything but `PASS`, run `df-healer --cxdb <CXDB>`.
+Quote the runner's final JSON line (`final_outcome`, `pipeline`, `steps`) and
+the per-node trace. If `final_outcome != "success"`, run
+`df-healer --cxdb <path>` and surface the report.
 
-**Legacy path:** quote the runner's final JSON line (`final_outcome`,
-`pipeline`, `steps`) and the per-node trace. If `final_outcome !=
-"success"`, run `df-healer --cxdb <path>` and surface the report.
+End every `/f` response with this proof block. Missing any required line means
+the factory run is unproven and must be reported as such:
+
+```bash
+# Literal command run:
+cd /Users/jleechan/projects/<target-repo>
+DARK_FACTORY_HOME=~/projects/dark-factory \
+DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts \
+PATH="$HOME/.local/bin:$PATH" \
+dark-factory \
+  --pipeline <chosen-or-generated-dot> \
+  --goal "<echo of $ARGUMENTS>" \
+  --backend <backend> \
+  --feature <feature-if-any> \
+  --cxdb ~/.dark-factory/cxdb.sqlite
+# Run ID: <id>
+# CXDB SHA: <sha>
+# Final outcome: <success|failure|exhausted|error>
+# Exit code: <integer>
+# Wall-clock: <duration>
+# Logs: <path>
+# Evidence envelope: <path>
+```
 
 ## Honesty rules (LLM, do not skip)
 
-- Quote the **actual** command or `Skill()` call you ran. No paraphrasing.
+- Quote the **actual** `dark-factory` command you ran. No paraphrasing.
+- Do not claim a factory run based on an in-Claude workflow, `Skill()` call,
+  or prose summary unless it includes the binary proof block above.
 - If the LLM decided /fs is needed first, **say so and stop** — do not
   silently fall through to `gates.dot` and pretend the PR is green.
 - If the LLM decided no /f pipeline fits (e.g. docs-only PR), **say so and
@@ -160,33 +149,31 @@ If `Final outcome` is anything but `PASS`, run `df-healer --cxdb <CXDB>`.
   `--feature`.
 - When the goal is unrelated to the open PR, **ask the user** which mode
   they meant. Do not silently route to PR-mode for unrelated work.
-- When the workflow exhausts its fix loop (3 attempts), surface the
+- When the binary-owned workflow/dynamic graph exhausts its fix loop (3 attempts), surface the
   diagnosis verbatim and **stop** — do not auto-merge.
 
-## Why the workflow is the default
+## Why binary-first is the default
 
-The user's 2026-06-22 architectural pivot (memory:
-`feedback_2026-06-22_user_pivot_default_nodes_over_custom`):
+The user's 2026-06-27 clarification:
 
-> "default nodes plus majority of this graph/pipeline managed by claude
-> workflow instead of custom code"
+> "default to the real binary but that binary can use a claude workflow to
+> build dynamic dot graph but always have default nodes"
 
-Translation: prefer the framework's built-in primitive (Claude Workflow)
-over hand-rolled extension (custom `type="dynamic"` Python handler). The
-single workflow file at `.claude/workflows/dark-factory.md` is the G3
-closure — it handles runtime-determined fan-out via re-dispatch across
-phases, without engine-level changes.
+Translation: the durable artifact is still the DOT graph and the runner log.
+Claude/workflow logic can help create or select the graph, but the operator
+must see a real `dark-factory` invocation and run metadata. The default nodes
+remain `codergen`, `tool`, `holdout_eval`, `gate_*`, reviewer/shadow-review
+nodes, fix loops, and `exit`.
 
-Use **legacy** dispatch only when:
-- The user explicitly opts in (`--legacy` / `--pipeline`)
-- The user is iterating one phase in isolation
-- The user wants a wiring smoke (`hello.dot` with `--backend echo`)
+Use static DOT dispatch when it fits. Use dynamic graph generation only when
+the binary saves/echoes the generated graph and the evidence envelope points
+to it.
 
 ## See also
 
-- `/f-pr` — explicit PR-mode entry point (legacy-only by default).
+- `/f-pr` — explicit PR-mode entry point.
 - `/factory` — alias for `/f` with identical behavior.
-- `/fs` — spec-generation entry point; dispatches Phase 1 of the workflow
-  when called without `--legacy`.
+- `/fs` — spec-generation entry point; default binary run of
+  `pipelines/slim/spec_gen.dot` or a binary-owned dynamic spec graph.
 - `~/.claude/projects/-Users-jleechan-projects-dark-factory/memory/feedback_2026-06-22_user_pivot_default_nodes_over_custom.md`
   — the architectural pivot that motivated this change.

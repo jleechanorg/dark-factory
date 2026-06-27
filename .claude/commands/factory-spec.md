@@ -2,7 +2,7 @@
 description: "/factory-spec — create or review a Dark Factory spec (main + attractor) with codex cold review of both"
 type: quality
 execution_mode: immediate
-aliases: [fs]
+aliases: []
 ---
 
 # /factory-spec — Two-Phase Spec Generation (Main + Attractor)
@@ -40,7 +40,7 @@ Pipeline decision table:
 
 ## Action
 
-Parse `$ARGUMENTS` and execute the `factory-spec` skill workflow:
+Parse `$ARGUMENTS` and execute the `factory-spec` reference workflow:
 
 1. **Detect mode**: `--review` → review main spec; `--review-attractor` →
    review attractor spec; `--show` → graph reference only; `--skip-attractor` →
@@ -53,7 +53,7 @@ Parse `$ARGUMENTS` and execute the `factory-spec` skill workflow:
    (`--review` / `--review-attractor`) and show (`--show`) modes are
    in-session and read-only — no pipeline is invoked, so no confirmation
    step applies.
-4. **Run workflow** as defined in `.claude/skills/factory-spec/SKILL.md`.
+4. **Run the binary-first workflow** as defined in `.claude/skills/factory-spec/SKILL.md`.
    Create mode is **pinned to `pipelines/slim/spec_gen.dot`** and runs it
    only after the step-3 confirmation. The pipeline produces BOTH
    `spec.md` (main) AND `attractor_spec.md` (attractor) by default;

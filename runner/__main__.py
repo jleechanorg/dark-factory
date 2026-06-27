@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import shlex
 import time
 import sys
 import traceback
@@ -136,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
     if args_list and args_list[0] == "resume":
         args_list[0] = "--resume"
     argv = args_list
+    command = shlex.join(["dark-factory", *argv])
 
     args = None
     ctx = None
@@ -310,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
                 pipeline_path=pipeline_path,
                 graph=graph,
                 workdir=args.workdir,
+                command=command,
                 event_log_path=args.events,
             )
 
@@ -317,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
             "pipeline": graph.name,
             "goal": args.goal,
             "run_id": ctx.run_id,
+            "command": command,
             "run_dir": (
                 str(pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id)
                 if ctx.run_id
