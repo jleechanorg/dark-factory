@@ -134,7 +134,8 @@ dark-factory \
 
 - Quote the **actual** `dark-factory` command you ran. No paraphrasing.
 - Do not claim a factory run based on an in-Claude workflow, `Skill()` call,
-  or prose summary unless it includes the binary proof block above.
+  or prose summary. The only valid proof is an actual `dark-factory` binary
+  invocation plus the required proof block from that run.
 - If the LLM decided /fs is needed first, **say so and stop** — do not
   silently fall through to `gates.dot` and pretend the PR is green.
 - If the LLM decided no /f pipeline fits (e.g. docs-only PR), **say so and

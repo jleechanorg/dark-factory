@@ -61,6 +61,38 @@ def test_skill_call_is_not_valid_factory_run_proof() -> None:
     assert not violations, "Skill() must not be accepted as factory-run proof:\n  " + "\n  ".join(violations)
 
 
+def test_workflow_or_skill_cannot_be_redeemed_by_pasted_proof_block() -> None:
+    violations: list[str] = []
+    invalid_patterns = (
+        r"(?:in-Claude workflow|`Skill\(\)`(?: call| result)?).*unless .*proof block",
+        r"unless (?:it includes |the )binary proof block",
+    )
+    for name in ("f.md", "fs.md"):
+        compact = " ".join(_command(name).split())
+        for pattern in invalid_patterns:
+            if re.search(pattern, compact):
+                violations.append(f"{name}: matches invalid permissive proof pattern {pattern!r}")
+    assert not violations, "Workflow/Skill proof cannot be redeemed by pasted metadata:\n  " + "\n  ".join(violations)
+
+
+def test_fs_has_no_read_only_in_session_modes() -> None:
+    forbidden = ("/fs --show", "read-only, no pipeline invoked")
+    invalid_patterns = (
+        r"/fs --review[^\n]*(?:no pipeline|read-only|in-session)",
+        r"/fs --review-attractor[^\n]*(?:no pipeline|read-only|in-session)",
+    )
+    violations: list[str] = []
+    for path in sorted(COMMANDS_DIR.glob("*.md")):
+        text = path.read_text()
+        for phrase in forbidden:
+            if phrase in text:
+                violations.append(f"{path.name}: contains {phrase!r}")
+        for pattern in invalid_patterns:
+            if re.search(pattern, text):
+                violations.append(f"{path.name}: matches {pattern!r}")
+    assert not violations, "/fs must be binary-backed; read-only helpers belong in /factory-spec: " + ", ".join(violations)
+
+
 def test_fs_alias_has_single_owner() -> None:
     owners = [
         path.name
@@ -68,4 +100,3 @@ def test_fs_alias_has_single_owner() -> None:
         if "fs" in _aliases(path.read_text())
     ]
     assert owners == ["fs.md"]
-

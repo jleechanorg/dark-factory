@@ -262,27 +262,17 @@ def _collect_node_sidecars(
 ) -> list[dict]:
     event_path = str(event_log_path) if event_log_path else None
     run_log_path = pathlib.Path.home() / ".dark-factory" / "logs" / f"{run_id}.log"
-    ref_keys = (
-        "input_path",
-        "input_sha256",
-        "llm_prompt_path",
-        "llm_prompt_sha256",
-        "transcript_path",
-        "transcript_sha256",
-        "shadow_codex_prompt_path",
-        "shadow_codex_prompt_sha256",
-        "shadow_codex_output_path",
-        "shadow_codex_output_sha256",
-        "shadow_output_path",
-        "shadow_output_sha256",
-    )
     return [
         {
             "seq": step["seq"],
             "node": step["node"],
             "outcome": step["outcome"],
             "ts": step["ts"],
-            "io_refs": {k: str(v) for k, v in step["metadata"].items() if k in ref_keys and v},
+            "io_refs": {
+                k: str(v)
+                for k, v in step["metadata"].items()
+                if isinstance(k, str) and (k.endswith("_path") or k.endswith("_sha256")) and v
+            },
             "log_refs": {
                 "events": event_path,
                 "run_log": str(run_log_path) if run_log_path.exists() else None,

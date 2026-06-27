@@ -31,20 +31,19 @@ exit.
 /fs --pipeline spec_gen <description>   # explicit static binary pipeline
 /fs --dynamic-graph <description>       # binary-owned dynamic spec graph
 /fs --skip-attractor <description>      # main spec only, still binary-first
-/fs --review <spec_path>                # review an existing main spec
-/fs --review-attractor <path>           # review an existing attractor spec
-/fs --show                              # graph reference only (read-only)
+/fs --review <spec_path>                # binary-backed review of an existing main spec
+/fs --review-attractor <path>           # binary-backed review of an existing attractor spec
 ```
 
 ## Action
 
 1. Parse `$ARGUMENTS`.
-2. If `--review`, `--review-attractor`, or `--show` is present, handle
-   in-session as before (read-only, no pipeline invoked).
-3. Otherwise, construct and run the binary command below. If the LLM decides
-   an existing spec should be reviewed instead of generated, use the
-   Attractor spec-review pipeline explicitly; do not run an in-Claude workflow
-   and call it a factory run.
+2. If `--review` or `--review-attractor` is present, construct a binary-backed
+   review command. Use `benchmarks/attractor-spec-review/pipelines/review_slim.dot`
+   or another saved DOT graph selected by the binary; do not perform a
+   prose-only review and call it a factory run.
+3. Otherwise, construct and run the binary spec-generation command below.
+4. For read-only graph reference output, use `/factory-spec --show`.
 
 ```bash
 export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$HOME/projects/dark-factory}"
@@ -112,8 +111,9 @@ start → explore_in → explore_fanout → {explore_concept, explore_auth,
   next fix loop.
 - If `--backend echo` was used, label the run as a wiring smoke, not a
   real validation. Echo-mode review verdicts are not real LLM verdicts.
-- Do not claim an in-Claude workflow or `Skill()` result is a factory run
-  unless the binary proof block below is present.
+- Do not claim an in-Claude workflow or `Skill()` result is a factory run.
+  The only valid proof is an actual `dark-factory` binary invocation plus the
+  required proof block from that run.
 
 End every `/fs` response with this proof block. Missing any required line means
 the run is unproven:
@@ -151,7 +151,7 @@ needed and saved/echoed.
 
 ## See also
 
-- `/factory-spec` — detailed skill workflow for legacy spec generation
+- `/factory-spec` — graph reference and read-only spec tooling
 - `/f` — full Dark Factory loop; also binary-first by default
 - `$DARK_FACTORY_HOME/.claude/workflows/dark-factory.md` — optional source
   material for binary-owned dynamic graph generation; not proof by itself

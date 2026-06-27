@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 # tempdir and have the gate bind to ctx.workdir's HEAD SHA explicitly.
 _READ_ONLY_BRANCH_TYPES = frozenset({
     "gate_es", "gate_er", "gate_code_standards", "gate_slash",
-    "holdout_eval",
+    "holdout_eval", "parallel_reviewer",
 })
 
 

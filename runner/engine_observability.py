@@ -22,7 +22,14 @@ from ._classify import _classify_outcome
 from .handlers import Context
 from .parser import Node, is_exit_node, is_start_node
 
-_VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards", "gate_audit"}
+_VALIDATION_TYPES = {
+    "holdout_eval",
+    "gate_es",
+    "gate_er",
+    "gate_code_standards",
+    "gate_audit",
+    "parallel_reviewer",
+}
 
 # Per-run runner logs land here so a crash always leaves a diagnosable
 # traceback on disk even when no CXDB is attached. Monkeypatchable in tests.

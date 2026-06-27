@@ -29,7 +29,13 @@ _STYLE_RULE_RE = re.compile(
 )
 _STYLE_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _VALIDATION_TIMEOUT_MIN_SECONDS = 60
-_VALIDATION_TYPES = {"holdout_eval", "gate_es", "gate_er", "gate_code_standards"}
+_VALIDATION_TYPES = {
+    "holdout_eval",
+    "gate_es",
+    "gate_er",
+    "gate_code_standards",
+    "parallel_reviewer",
+}
 
 # Rationale (jleechan-arr): the roadmap at
 # ``docs/plans/factory_improvement_analysis.md`` section "Dynamic LLM Timeouts &

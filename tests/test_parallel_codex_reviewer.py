@@ -37,6 +37,19 @@ def _mock_ctx(tmp_path: Path) -> Context:
     )
 
 
+def test_parallel_reviewer_is_registered_as_validation_and_read_only_branch_type():
+    """The reviewer lane must be treated like gate/reviewer infrastructure."""
+    from runner.engine_branches import _READ_ONLY_BRANCH_TYPES
+    from runner.engine_observability import _VALIDATION_TYPES as ENGINE_VALIDATION_TYPES
+    from runner.parser import _VALIDATION_TYPES as PARSER_VALIDATION_TYPES
+    from runner.handlers import TYPE_REGISTRY
+
+    assert "parallel_reviewer" in TYPE_REGISTRY
+    assert "parallel_reviewer" in ENGINE_VALIDATION_TYPES
+    assert "parallel_reviewer" in PARSER_VALIDATION_TYPES
+    assert "parallel_reviewer" in _READ_ONLY_BRANCH_TYPES
+
+
 def test_parallel_reviewer_runs_both_lanes_and_logs_distinct_outputs(tmp_path, monkeypatch):
     """Both lanes execute and leave separate artifacts in metadata/events."""
     node = _node_with_prompt(tmp_path)

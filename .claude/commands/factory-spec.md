@@ -29,12 +29,12 @@ Pipeline decision table:
 **Usage**:
 
 ```
-/fs <spec description>          # create mode — runs spec_gen (main + attractor)
-/fs --review <spec_path>        # review an existing main spec (no pipeline run)
-/fs --review                    # review spec/feature.md (default path)
-/fs --review-attractor <path>   # review an existing attractor spec
-/fs --skip-attractor <desc>     # create mode but skip the attractor phase
-/fs --show                      # show pipeline graphs (read-only reference)
+/factory-spec <spec description>          # create mode — runs spec_gen (main + attractor)
+/factory-spec --review <spec_path>        # reference review helper, not /fs proof
+/factory-spec --review                    # reference review helper for spec/feature.md
+/factory-spec --review-attractor <path>   # reference review helper for attractor spec
+/factory-spec --skip-attractor <desc>     # create mode but skip the attractor phase
+/factory-spec --show                      # show pipeline graphs (read-only reference)
 /factory --pipeline <dot> ...   # execute feature pipeline after both specs ready
 ```
 
@@ -49,10 +49,9 @@ Parse `$ARGUMENTS` and execute the `factory-spec` reference workflow:
 2. **Step 0 (create mode only):** classify greenfield vs brownfield — feeds
    the goal/context string passed to the pipeline (see skill).
 3. **Create mode only:** report auto-chosen options (pinned pipeline + goal
-   string) and ask user to confirm **before any pipeline invocation**. Review
-   (`--review` / `--review-attractor`) and show (`--show`) modes are
-   in-session and read-only — no pipeline is invoked, so no confirmation
-   step applies.
+   string) and ask user to confirm **before any pipeline invocation**.
+   Reference-only helper modes here do not satisfy `/fs`; `/fs` itself is
+   binary-backed and must emit its proof block.
 4. **Run the binary-first workflow** as defined in `.claude/skills/factory-spec/SKILL.md`.
    Create mode is **pinned to `pipelines/slim/spec_gen.dot`** and runs it
    only after the step-3 confirmation. The pipeline produces BOTH
