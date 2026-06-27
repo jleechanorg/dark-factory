@@ -89,13 +89,17 @@ def test_lint_findings_flags_zizmor_template_injection(tmp_path):
 
 
 def test_lint_findings_flags_ios_video_config(tmp_path):
-    """The ios_video_config pattern fires on `video=` in json files (warn).
+    """The ios_video_config pattern fires on `video=` in iOS simctl paths (warn).
 
     The simctl recorder config is an INI-style `.json` blob with `video=`
-    codec flags. The test fixture mirrors that."""
+    codec flags. The path-gate (jleechan-fpi, audit-2026-06-27 Lane F) restricts
+    the pattern to files whose path contains `ios` or `simctl`. We put the
+    fixture inside an `ios/` subdir to satisfy that gate."""
     from runner.pre_review_lint import lint_findings
 
-    (tmp_path / "sim_config.json").write_text(
+    ios_dir = tmp_path / "ios" / "simctl"
+    ios_dir.mkdir(parents=True)
+    (ios_dir / "sim_config.json").write_text(
         "video=h264\n"
         "mask=alpha\n"
     )
@@ -104,6 +108,81 @@ def test_lint_findings_flags_ios_video_config(tmp_path):
     assert len(matches) == 1, findings
     assert matches[0]["severity"] == "warn"
     assert matches[0]["line"] == 1
+
+
+def test_lint_findings_ios_video_config_does_not_fire_globally(tmp_path):
+    """Regression for jleechan-fpi: ios_video_config must NOT fire globally.
+
+    A fibonacci-style worktree with a stray `video=1280` in a generic
+    JSON config (e.g. `fibonacci.json` at the workdir root, no `ios` or
+    `simctl` anywhere in the path) must not produce an ios_video_config
+    finding — the pattern leaks the iOS benchmark shape into every
+    reviewer's prompt if gated only by the json glob."""
+    from runner.pre_review_lint import lint_findings
+
+    # Simulate a fibonacci worktree root with a generic JSON config.
+    fib_root = tmp_path / "fibonacci-bench-2026-06-26"
+    fib_root.mkdir()
+    (fib_root / "fibonacci.json").write_text(
+        "{\n"
+        "  \"max_value\": 1280,\n"
+        "  \"video\": \"tutorial-recording-not-applicable\",\n"
+        "  \"codec\": \"h264\"\n"
+        "}\n"
+    )
+    # Also throw in an unrelated python file to ensure the global patterns
+    # still work — the test is that ONLY ios_video_config is gated, not the
+    # whole scanner.
+    (fib_root / "module.py").write_text(
+        "from datetime import datetime\n"
+        "def now():\n"
+        "    return datetime.utcnow()\n"
+    )
+
+    findings = lint_findings(fib_root)
+    ios_matches = [f for f in findings if f["pattern_id"] == "ios_video_config"]
+    assert ios_matches == [], (
+        "ios_video_config leaked into non-iOS workdir: %r" % ios_matches
+    )
+    # Sanity: the global py_datetime_utcnow still fires — the gate only
+    # restricts ios_video_config, not the whole scanner.
+    py_matches = [f for f in findings if f["pattern_id"] == "py_datetime_utcnow"]
+    assert len(py_matches) == 1, findings
+
+
+def test_lint_findings_ios_video_config_fires_when_workdir_named_ios(tmp_path):
+    """The path-gate also accepts the workdir name itself matching ios/simctl.
+
+    Some users drop the fixture at the workdir root with no `ios/`
+    subdirectory; the gate should still fire if the workdir name is, say,
+    `ios-simulator-bench` because the absolute path contains `ios`."""
+    from runner.pre_review_lint import lint_findings
+
+    ios_root = tmp_path / "ios-simulator-bench"
+    ios_root.mkdir()
+    (ios_root / "recorder.json").write_text(
+        "video=h264\n"
+    )
+    findings = lint_findings(ios_root)
+    matches = [f for f in findings if f["pattern_id"] == "ios_video_config"]
+    assert len(matches) == 1, findings
+
+
+def test_lint_findings_ios_video_config_fires_via_substring_in_subpath(tmp_path):
+    """The path-gate matches substrings, not just whole path components.
+
+    A file at `tmp/.../simctl-recorder/cfg.json` should still trigger
+    even though the directory name is `simctl-recorder`, not exactly
+    `simctl`. This mirrors real-world layouts where the iOS rig lives
+    under a `simctl-recorder/` subdir rather than the canonical name."""
+    from runner.pre_review_lint import lint_findings
+
+    subdir = tmp_path / "simctl-recorder"
+    subdir.mkdir()
+    (subdir / "cfg.json").write_text("video=h264\n")
+    findings = lint_findings(tmp_path)
+    matches = [f for f in findings if f["pattern_id"] == "ios_video_config"]
+    assert len(matches) == 1, findings
 
 
 def test_lint_findings_deduplicates_same_pattern_at_same_line(tmp_path):
