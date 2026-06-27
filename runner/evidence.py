@@ -262,6 +262,24 @@ def _collect_node_sidecars(
 ) -> list[dict]:
     event_path = str(event_log_path) if event_log_path else None
     run_log_path = pathlib.Path.home() / ".dark-factory" / "logs" / f"{run_id}.log"
+    event_refs: dict[tuple[int, str], dict[str, str]] = {}
+    if event_log_path:
+        try:
+            for line in pathlib.Path(event_log_path).read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                seq = item.get("seq")
+                node = item.get("node")
+                if seq is None or node is None:
+                    continue
+                key = (int(seq), str(node))
+                refs = event_refs.setdefault(key, {})
+                for k, v in item.items():
+                    if isinstance(k, str) and (k.endswith("_path") or k.endswith("_sha256")) and v:
+                        refs[k] = str(v)
+        except Exception:
+            event_refs = {}
     return [
         {
             "seq": step["seq"],
@@ -272,7 +290,8 @@ def _collect_node_sidecars(
                 k: str(v)
                 for k, v in step["metadata"].items()
                 if isinstance(k, str) and (k.endswith("_path") or k.endswith("_sha256")) and v
-            },
+            }
+            | event_refs.get((int(step["seq"]), str(step["node"])), {}),
             "log_refs": {
                 "events": event_path,
                 "run_log": str(run_log_path) if run_log_path.exists() else None,
@@ -319,6 +338,8 @@ def _copy_events(event_log_path: Optional[pathlib.Path], bundle_dir: pathlib.Pat
         return None
     target = bundle_dir / "events.jsonl"
     try:
+        if source.resolve() == target.resolve():
+            return target
         shutil.copy2(source, target)
     except Exception:
         return None

@@ -317,7 +317,14 @@ def test_cli_creates_default_evidence_bundle_under_run_id(tmp_path):
     assert (bundle / "summary.json").exists()
     summary = json.loads((bundle / "summary.json").read_text(encoding="utf-8"))
     assert summary["final_outcome"] == payload["final_outcome"]
+    assert summary["events_path"] == str(bundle / "events.jsonl")
     assert (bundle / "command.txt").exists()
     assert (bundle / "node_io.jsonl").exists()
     assert (bundle / "events.jsonl").exists()
+    node_io = [
+        json.loads(line)
+        for line in (bundle / "node_io.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any("transcript_path" in item["io_refs"] for item in node_io)
     assert not list((tmp_path / "evidence").glob("_pending-*"))
