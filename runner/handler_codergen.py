@@ -16,9 +16,27 @@ files would change the ``TYPE_REGISTRY`` contract. The runtime dispatch
 lives in ``runner/handlers.py:resolve``.
 
 All monkeypatched helper symbols (``_sanitized_env``, ``_sandboxed_args``,
-``_get_claude_executable``, ``_ao_wait_idle``, ``_render_prompt``) are looked
-up via the ``runner.handlers`` shim (late binding) so that
-``monkeypatch.setattr("runner.handlers._X", ...)`` still takes effect.
+``_sandboxed_args_for_workdir``, ``_get_claude_executable``, ``_ao_wait_idle``,
+``_render_prompt``) are looked up via the ``runner.handlers`` shim (late
+binding) so that ``monkeypatch.setattr("runner.handlers._X", ...)`` still
+takes effect.
+
+Sealed-path sandbox contract (jleechan-113)
+-------------------------------------------
+
+Implementing-agent coder subprocesses (claude, codex, agy, plus the parallel
+codex shadow review) run inside ``ctx.workdir``. They use
+``_sandboxed_args_for_workdir`` so the sandbox-exec deny rules cover BOTH
+``$DARK_FACTORY_HOLDOUTS`` (the sealed sibling repo) AND the operator-only
+sealed docs at ``<ctx.workdir>/benchmarks/*/{README,DESIGN,SCORING,SCENARIOS}.md``.
+This prevents the implementing agent from reading held-back design notes or
+scoring rubrics while coding.
+
+The AO ``spawn`` / ``send`` calls deliberately continue to use the legacy
+``_sandboxed_args`` because the AO orchestrator's own subprocess does not
+read benchmark docs from ``ctx.workdir`` — the AO worker writes inside its
+own AO-managed worktree, and the sandbox there is enforced at a different
+layer (see ``tests/test_ao_sandbox.py`` for the AO-specific test coverage).
 
 Per-backend timeout defaults
 ----------------------------
@@ -202,13 +220,13 @@ def _start_shadow_codex_review(
         shadow.launch_error = "codex executable not found"
         return shadow
 
-    args = _handlers_shim._sandboxed_args([
+    args = _handlers_shim._sandboxed_args_for_workdir([
         "codex",
         "exec",
         "--yolo",
         "--skip-git-repo-check",
         prompt,
-    ])
+    ], ctx.workdir)
     if args is None:
         shadow.launch_error = "sandbox-exec unavailable"
         return shadow
@@ -764,7 +782,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         if model_name:
             claude_cmd += ["--model", str(model_name)]
         claude_cmd.append(prompt_text)
-        args = _handlers_shim._sandboxed_args(claude_cmd)
+        args = _handlers_shim._sandboxed_args_for_workdir(claude_cmd, ctx.workdir)
         if args is None:
             return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
         try:
@@ -812,7 +830,10 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             _stash_diff(node, ctx)
         return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     elif backend == "codex":
-        args = _handlers_shim._sandboxed_args(["codex", "exec", "--yolo", "--skip-git-repo-check", prompt_text])
+        args = _handlers_shim._sandboxed_args_for_workdir(
+            ["codex", "exec", "--yolo", "--skip-git-repo-check", prompt_text],
+            ctx.workdir,
+        )
         if args is None:
             return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
         timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
@@ -874,7 +895,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             "do not enter planning mode, do not ask for approval, "
             "print a concise completion summary, and stop."
         )
-        args = _handlers_shim._sandboxed_args([
+        args = _handlers_shim._sandboxed_args_for_workdir([
             "agy",
             "--add-dir",
             str(ctx.workdir),
@@ -883,7 +904,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             f"{timeout_s}s",
             "--print",
             launch_prompt,
-        ])
+        ], ctx.workdir)
         if args is None:
             return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
         proc = subprocess.Popen(

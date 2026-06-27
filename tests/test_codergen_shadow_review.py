@@ -59,6 +59,7 @@ def test_review_codergen_runs_parallel_codex_shadow_review(tmp_path, monkeypatch
 
     monkeypatch.setattr("runner.handler_codergen.shutil.which", lambda name: "/usr/bin/codex")
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda args: args)
+    monkeypatch.setattr("runner.handlers._sandboxed_args_for_workdir", lambda args, workdir: args)
     monkeypatch.setattr("runner.handlers._sanitized_env", lambda: {})
     monkeypatch.setattr("runner.handler_codergen.subprocess.Popen", _FakePopen)
 
