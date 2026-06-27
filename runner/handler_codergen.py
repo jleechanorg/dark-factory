@@ -85,7 +85,7 @@ class _ShadowCodexReview:
 
 def _shadow_review_enabled(node: "Node", ctx: "Context", backend: str) -> bool:
     """True when a review node should get a parallel plain-Codex check."""
-    raw = node.attrs.get("shadow_codex_review", "true")
+    raw = node.attrs.get("shadow_codex_review", ctx.state.get("_df_shadow_codex_review", "false"))
     if isinstance(raw, str) and raw.strip().lower() in {"false", "0", "no", "off"}:
         return False
     if raw is False:

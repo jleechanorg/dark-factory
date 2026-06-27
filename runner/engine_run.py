@@ -122,6 +122,7 @@ def _run_single_node(
             setattr(ctx, "_df_current_seq", seq)
             setattr(ctx, "_df_current_attempt", attempt_index)
             setattr(ctx, "_df_current_node", node.name)
+            ctx.state.setdefault("_df_shadow_codex_review", "true")
             return _obs._write_node_input_sidecar(ctx, seq, node, attempt_index)
 
         results = _persist._run_with_retries(

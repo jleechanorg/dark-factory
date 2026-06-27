@@ -158,6 +158,77 @@ def test_execute_gate_writes_exact_prompt_sidecar(tmp_path, monkeypatch):
     assert any('"event": "node_prompt"' in line and '"node": "evidence"' in line for line in events)
 
 
+def test_execute_gate_runs_parallel_codex_shadow_review(tmp_path, monkeypatch):
+    """Factory-run gates should compare the normal reviewer with a simple
+    parallel Codex review and log both outputs.
+    """
+    import subprocess as _sp
+    from runner.handlers import _execute_gate, Context as HCtx
+
+    fake_sha = "b" * 40
+    popen_cmds: list[list[str]] = []
+
+    class _FakePopen:
+        pid = 12345
+
+        def __init__(self, cmd, **kwargs):
+            popen_cmds.append(cmd)
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return (
+                f"head_sha: {fake_sha}\n"
+                "## Review Verdict\nfail\n\n"
+                "## Blocking Findings\n"
+                "1. Severity: blocker\n"
+                "   Evidence: artifact missing from bundle.\n"
+                "   Why it matters: evidence reviewer should feed this to coder.\n"
+                "   Fix: regenerate the bundle.\n\n"
+                "verdict: fail\n",
+                "",
+            )
+
+    def _fake_run(cmd, **kwargs):
+        return _sp.CompletedProcess(
+            cmd,
+            0,
+            stdout=f"head_sha: {fake_sha}\nverdict: pass\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _FakePopen)
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude", run_id="gateshadow1")
+    ctx.state["_df_shadow_codex_review"] = "true"
+    ctx.event_log_path = tmp_path / "events.jsonl"
+    setattr(ctx, "_df_current_seq", 9)
+    setattr(ctx, "_df_current_attempt", 1)
+    setattr(ctx, "_df_current_node", "gate_er")
+
+    result = _execute_gate("NORMAL GATE PROMPT", fake_sha, 300, ctx, "gate_er", "claude")
+
+    assert result.outcome == "failure"
+    assert popen_cmds
+    assert popen_cmds[0][:4] == ["codex", "exec", "--yolo", "--skip-git-repo-check"]
+    assert "## Parallel Codex Gate Review" in result.output
+    assert "artifact missing from bundle" in result.output
+    assert result.metadata["shadow_codex_gate_review"] == "true"
+    assert result.metadata["shadow_codex_gate_outcome"] == "failure"
+    assert result.metadata["shadow_codex_gate_verdict"] == "fail"
+    prompt_path = pathlib.Path(result.metadata["shadow_codex_gate_prompt_path"])
+    output_path = pathlib.Path(result.metadata["shadow_codex_gate_output_path"])
+    assert prompt_path.exists()
+    assert output_path.exists()
+    assert "review this evidence" in prompt_path.read_text()
+    assert "NORMAL GATE PROMPT" in prompt_path.read_text()
+    assert "artifact missing from bundle" in output_path.read_text()
+    events = ctx.event_log_path.read_text()
+    assert '"event": "shadow_gate_prompt"' in events
+    assert '"event": "shadow_gate_result"' in events
+
+
 def test_execute_gate_runs_minimax_with_correct_env(monkeypatch, tmp_path):
     """_execute_gate with backend='minimax' invokes the claude CLI but with
     ANTHROPIC_BASE_URL set to the minimax gateway. The recorded reviewer

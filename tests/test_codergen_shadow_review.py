@@ -55,6 +55,7 @@ def test_review_codergen_runs_parallel_codex_shadow_review(tmp_path, monkeypatch
     )
     ctx.state["_last_diff"] = "diff --git a/demo.py b/demo.py"
     ctx.state["_last_changed_files"] = "- demo.py"
+    ctx.state["_df_shadow_codex_review"] = "true"
 
     monkeypatch.setattr("runner.handler_codergen.shutil.which", lambda name: "/usr/bin/codex")
     monkeypatch.setattr("runner.handlers._sandboxed_args", lambda args: args)

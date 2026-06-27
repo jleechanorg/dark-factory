@@ -33,6 +33,8 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import runner.handlers as _handlers_shim
@@ -42,6 +44,264 @@ from .handler_core import Result
 if TYPE_CHECKING:
     from .parser import Node
     from .handler_core import Context
+
+
+@dataclass
+class _ShadowGateReview:
+    prompt: str = ""
+    proc: subprocess.Popen | None = None
+    prompt_path: str = ""
+    prompt_sha256: str = ""
+    launch_error: str = ""
+    started_at: float = 0.0
+
+
+def _shadow_gate_enabled(ctx: "Context") -> bool:
+    raw = ctx.state.get("_df_shadow_codex_review", "false")
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"true", "1", "yes", "on"}
+    return bool(raw)
+
+
+def _shadow_gate_prompt(name: str, prompt: str, expected_sha: str, ctx: "Context") -> str:
+    target = "evidence" if name in {"gate_es", "gate_er", "es", "er", "evidence_review"} else "diff"
+    return f"""\
+review this {target}
+
+You are the parallel plain-Codex reviewer for a Dark Factory gate.
+Review the current workspace independently from the normal gate prompt.
+Focus on blocker-first findings a coder can act on next.
+
+Goal:
+{ctx.goal}
+
+Gate:
+{name}
+
+Expected HEAD SHA:
+{expected_sha}
+
+Normal gate prompt for comparison:
+```
+{prompt}
+```
+
+Return this exact free-form shape:
+
+## Review Verdict
+pass | fail
+
+## Blocking Findings
+1. Severity: concise issue title.
+   Evidence: exact file/function/run/artifact/line or say none.
+   Why it matters: behavioral or merge-readiness impact.
+   Fix: smallest concrete coder action.
+
+## Evidence Checked
+- Exact commands, files, logs, screenshots, videos, URLs, or artifacts inspected.
+
+## Required Next Actions
+1. Smallest patch or evidence regeneration step.
+2. Exact verification command or artifact to rerun.
+
+Include this line near the top:
+head_sha: {expected_sha}
+
+End with this machine-readable routing line:
+verdict: <pass|fail>
+"""
+
+
+def _start_shadow_gate_review(
+    name: str,
+    prompt: str,
+    expected_sha: str,
+    timeout: int,
+    ctx: "Context",
+) -> _ShadowGateReview | None:
+    if not _shadow_gate_enabled(ctx):
+        return None
+    shadow_prompt = _shadow_gate_prompt(name, prompt, expected_sha, ctx)
+    shadow = _ShadowGateReview(prompt=shadow_prompt, started_at=time.monotonic())
+    seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
+    attempt = int(getattr(ctx, "_df_current_attempt", 1))
+    node_name = str(getattr(ctx, "_df_current_node", name))
+    try:
+        from . import engine_observability as _obs
+
+        prompt_path, prompt_sha = _obs._write_input_sidecar(
+            ctx,
+            seq,
+            node_name,
+            attempt,
+            shadow_prompt,
+            kind="shadow_codex_gate_prompt",
+        )
+        shadow.prompt_path = prompt_path or ""
+        shadow.prompt_sha256 = prompt_sha or ""
+        if prompt_path:
+            _obs._emit_event(
+                ctx,
+                "shadow_gate_prompt",
+                {
+                    "node": node_name,
+                    "attempt": str(attempt),
+                    "shadow_backend": "codex",
+                    "shadow_prompt_path": shadow.prompt_path,
+                    "shadow_prompt_sha256": shadow.prompt_sha256,
+                },
+                seq,
+            )
+    except Exception:
+        pass
+    if shutil.which("codex") is None:
+        shadow.launch_error = "codex executable not found"
+        return shadow
+    args = _gate_subprocess_args("codex", shadow_prompt, ctx, timeout)
+    if args is None:
+        shadow.launch_error = "sandbox-exec unavailable"
+        return shadow
+    try:
+        shadow.proc = subprocess.Popen(
+            args,
+            cwd=ctx.workdir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            env=_gate_subprocess_env("codex"),
+        )
+    except Exception as exc:
+        shadow.launch_error = f"{type(exc).__name__}: {exc}"
+    return shadow
+
+
+def _finish_shadow_gate_review(
+    result: "Result",
+    shadow: _ShadowGateReview | None,
+    name: str,
+    expected_sha: str,
+    timeout: int,
+    ctx: "Context",
+) -> "Result":
+    if shadow is None:
+        return result
+
+    returncode = ""
+    timed_out = False
+    if shadow.launch_error:
+        output = f"shadow codex gate review did not run: {shadow.launch_error}"
+        verdict = "unknown"
+        shadow_outcome = "error"
+        head_sha_status = "missing"
+    else:
+        proc = shadow.proc
+        if proc is None:
+            output = "shadow codex gate review did not run: missing process handle"
+            verdict = "unknown"
+            shadow_outcome = "error"
+            head_sha_status = "missing"
+        else:
+            remaining = max(1, timeout - int(time.monotonic() - shadow.started_at))
+            try:
+                stdout, stderr = proc.communicate(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                proc.kill()
+                stdout, stderr = proc.communicate()
+            returncode = str(proc.returncode if proc.returncode is not None else "")
+            output = (stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
+            if timed_out and not output:
+                output = f"shadow codex gate review timed out after {timeout} seconds"
+            verdict, normalized = _handlers_shim._parse_verdict(output)
+            sha_ok, observed_sha = _handlers_shim._verify_head_sha_echo(output, expected_sha)
+            head_sha_status = (
+                "matched" if sha_ok and observed_sha
+                else ("mismatched" if observed_sha else "missing")
+            )
+            if proc.returncode != 0 or timed_out:
+                shadow_outcome = "error"
+            elif not sha_ok and normalized in {"success", "unknown"}:
+                shadow_outcome = "error"
+            else:
+                shadow_outcome = normalized
+
+    output_path = ""
+    output_sha = ""
+    seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
+    attempt = int(getattr(ctx, "_df_current_attempt", 1))
+    node_name = str(getattr(ctx, "_df_current_node", name))
+    try:
+        from . import engine_observability as _obs
+
+        output_path, output_sha = _obs._write_input_sidecar(
+            ctx,
+            seq,
+            node_name,
+            attempt,
+            output,
+            kind="shadow_codex_gate_output",
+        )
+        _obs._emit_event(
+            ctx,
+            "shadow_gate_result",
+            {
+                "node": node_name,
+                "attempt": str(attempt),
+                "shadow_backend": "codex",
+                "shadow_outcome": shadow_outcome,
+                "shadow_verdict": verdict,
+                "shadow_returncode": returncode,
+                "shadow_head_sha_status": head_sha_status,
+                "shadow_output_path": output_path or "",
+                "shadow_output_sha256": output_sha or "",
+            },
+            seq,
+        )
+    except Exception:
+        pass
+
+    metadata = dict(result.metadata)
+    metadata.update(
+        {
+            "shadow_codex_gate_review": "true",
+            "shadow_codex_gate_outcome": shadow_outcome,
+            "shadow_codex_gate_verdict": verdict,
+            "shadow_codex_gate_returncode": returncode,
+            "shadow_codex_gate_head_sha_status": head_sha_status,
+            "shadow_codex_gate_timed_out": "true" if timed_out else "false",
+            "shadow_codex_gate_prompt_path": shadow.prompt_path,
+            "shadow_codex_gate_prompt_sha256": shadow.prompt_sha256,
+            "shadow_codex_gate_output_path": output_path or "",
+            "shadow_codex_gate_output_sha256": output_sha or "",
+        }
+    )
+    comparison = (
+        "\n\n---\n\n"
+        "## Parallel Codex Gate Review\n"
+        f"{output}\n\n"
+        "## Gate Review Comparison\n"
+        f"- Normal gate outcome: {result.outcome}\n"
+        f"- Normal gate verdict: {result.metadata.get('verdict', 'unknown')}\n"
+        f"- Shadow Codex outcome: {shadow_outcome}\n"
+        f"- Shadow Codex verdict: {verdict}\n"
+        f"- Shadow Codex head_sha_status: {head_sha_status}\n"
+    )
+    final_outcome = result.outcome
+    if result.outcome == "success" and shadow_outcome != "success":
+        final_outcome = "failure"
+    updates = dict(result.context_updates)
+    updates[f"{name}.shadow_codex_gate_output"] = output
+    updates[f"{name}.shadow_codex_gate_outcome"] = shadow_outcome
+    updates[f"{name}.shadow_codex_gate_output_path"] = output_path or ""
+    return Result(
+        outcome=final_outcome,
+        output=result.output + comparison,
+        metadata=metadata,
+        preferred_label=result.preferred_label,
+        suggested_next_ids=result.suggested_next_ids,
+        context_updates=updates,
+    )
 
 
 def _gate_subprocess_args(backend: str, prompt: str, ctx: "Context", timeout: int) -> Optional[list[str]]:
@@ -161,6 +421,11 @@ def _run_gate_once(
                       "reviewer_backend": reviewer_backend, "sandbox": "unavailable",
                       **prompt_meta},
         )
+    shadow_review = _start_shadow_gate_review(name, prompt, expected_sha, timeout, ctx)
+
+    def _finalize(result: "Result") -> "Result":
+        return _finish_shadow_gate_review(result, shadow_review, name, expected_sha, timeout, ctx)
+
     # agy enforces its own --print-timeout; give the outer wait a small buffer
     # so we read agy's timeout message rather than killing it first.
     run_timeout = timeout + 30 if backend == "agy" else timeout
@@ -180,29 +445,29 @@ def _run_gate_once(
             return v
 
         combined = _as_text(exc.stdout) + "\n" + _as_text(exc.stderr)
-        return Result(
+        return _finalize(Result(
             outcome="failure",
             output=combined.strip() or f"gate {name} timed out after {run_timeout}s",
             metadata={"slash_command": name, "verdict": "unknown",
                       "head_sha_status": "missing", "timed_out": "true",
                       "reviewer_backend": reviewer_backend, **prompt_meta},
-        )
+        ))
     except FileNotFoundError as exc:
-        return Result(
+        return _finalize(Result(
             outcome="error",
             output=f"gate {name} backend {reviewer_backend!r} not found: {exc}",
             metadata={"slash_command": name, "verdict": "unknown",
                       "head_sha_status": "missing", "reviewer_backend": reviewer_backend,
                       "backend_missing": "true", **prompt_meta},
-        )
+        ))
     except Exception as exc:
-        return Result(
+        return _finalize(Result(
             outcome="error",
             output=f"gate {name} subprocess failed: {exc}",
             metadata={"slash_command": name, "verdict": "unknown",
                       "head_sha_status": "missing", "reviewer_backend": reviewer_backend,
                       **prompt_meta},
-        )
+        ))
     combined = proc.stdout + "\n" + proc.stderr
     verdict, normalized = _handlers_shim._parse_verdict(combined, gate_strict=gate_strict)
     # SHA binding check comes BEFORE collapsing to pass/fail so a spoofed-pass
@@ -220,7 +485,7 @@ def _run_gate_once(
         "matched" if sha_ok and observed_sha
         else ("mismatched" if observed_sha else "missing")
     )
-    return Result(
+    return _finalize(Result(
         outcome=outcome,
         output=proc.stdout,
         metadata={
@@ -231,7 +496,7 @@ def _run_gate_once(
             "reviewer_backend": reviewer_backend,
             **prompt_meta,
         },
-    )
+    ))
 
 
 def _is_gate_infra_failure(result: "Result") -> bool:
