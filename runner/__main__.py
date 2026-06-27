@@ -278,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
                 p.error(f"--state requires KEY=VALUE format, got: {kv!r}")
             k, v = kv.split("=", 1)
             ctx.state[k] = v
+        ctx.state.setdefault("_df_shadow_codex_review", "true")
         if args.feature:
             ctx.state["feature"] = args.feature
         if args.backend == "ao":
