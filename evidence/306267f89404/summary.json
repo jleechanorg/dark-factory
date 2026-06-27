@@ -1,0 +1,19 @@
+{
+  "command": "dark-factory --pipeline /Users/jleechan/projects/dark-factory/pipelines/factory/hello.dot --goal smoke --backend echo --feature hello",
+  "cxdb_path": "/Users/jleechan/projects/dark-factory/evidence/306267f89404/_run.sqlite",
+  "cxdb_sha256": "8a2abf421a3372eb1a82c9a5d5054e5c62bbb7615bf864ae328000edad000ae1",
+  "ended_ts": 1782558767.581054,
+  "events_path": "/Users/jleechan/projects/dark-factory/evidence/306267f89404/events.jsonl",
+  "exit_reached": true,
+  "extract_path": "/Users/jleechan/projects/dark-factory/evidence/306267f89404/cxdb-306267f89404.sqlite",
+  "extract_sha256": "324325f75b87e07d77cfc18546dac0118aa6e9d40800f4828ecfc3a9ce0b0222",
+  "final_outcome": "success",
+  "goal": "smoke",
+  "node_io_path": "node_io.jsonl",
+  "pipeline_name": "hello",
+  "pipeline_path": "/Users/jleechan/projects/dark-factory/pipelines/factory/hello.dot",
+  "run_id": "306267f89404",
+  "started_ts": 1782558765.7543502,
+  "steps": 15,
+  "wall_clock_ms": 1826
+}
