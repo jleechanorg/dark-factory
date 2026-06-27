@@ -1,0 +1,8 @@
+# Plan: smoke
+
+Read `specs/hello.md` and write a one-paragraph plan for the implementation.
+Do not write code yet.
+
+## Rules
+
+- You have full read-write tool access to the current workspace. Use your tools to inspect, build, run tests, and verify the repository state as needed.
