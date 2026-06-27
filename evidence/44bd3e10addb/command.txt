@@ -1,0 +1,1 @@
+dark-factory --workdir /Users/jleechan/.worktrees/dark-factory/audit-2026-06-27 --pipeline pipelines/factory/pr_gates.dot --goal 'PR #113 Lane C slim/spec+evidence harmonization gates' --state target_pr=113 --state feature=lane-C-slim-spec-evidence --cxdb /Users/jleechan/.dark-factory/cxdb.sqlite

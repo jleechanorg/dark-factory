@@ -1,0 +1,4 @@
+{
+  "_note": "Holdout evaluator output is redacted to preserve the adversarial seal. Only verdict-level metadata is bundled; the raw scenarios remain in the sealed holdouts repo.",
+  "verdict": "pass"
+}

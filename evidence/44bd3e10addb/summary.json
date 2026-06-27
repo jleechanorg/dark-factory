@@ -1,0 +1,19 @@
+{
+  "command": "dark-factory --workdir /Users/jleechan/.worktrees/dark-factory/audit-2026-06-27 --pipeline pipelines/factory/pr_gates.dot --goal 'PR #113 Lane C slim/spec+evidence harmonization gates' --state target_pr=113 --state feature=lane-C-slim-spec-evidence --cxdb /Users/jleechan/.dark-factory/cxdb.sqlite",
+  "cxdb_path": "/Users/jleechan/.dark-factory/cxdb.sqlite",
+  "cxdb_sha256": "7555ba39362cb56252a87c89e8a728512dc6834126d43b1bf20f0a3aa2add940",
+  "ended_ts": 1782594018.582517,
+  "events_path": "/Users/jleechan/.worktrees/dark-factory/audit-2026-06-27/evidence/44bd3e10addb/events.jsonl",
+  "exit_reached": false,
+  "extract_path": "/Users/jleechan/.worktrees/dark-factory/audit-2026-06-27/evidence/44bd3e10addb/cxdb-44bd3e10addb.sqlite",
+  "extract_sha256": "388e33dc90733c2387ed2e952436984595e4b62ff406ebb5167a7877a0fc6b3f",
+  "final_outcome": "exhausted",
+  "goal": "PR #113 Lane C slim/spec+evidence harmonization gates",
+  "node_io_path": "node_io.jsonl",
+  "pipeline_name": "pr_gates",
+  "pipeline_path": "/Users/jleechan/.worktrees/dark-factory/audit-2026-06-27/pipelines/factory/pr_gates.dot",
+  "run_id": "44bd3e10addb",
+  "started_ts": 1782593983.888871,
+  "steps": 10,
+  "wall_clock_ms": 34693
+}

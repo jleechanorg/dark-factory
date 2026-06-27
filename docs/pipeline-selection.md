@@ -107,6 +107,16 @@ Resolver audit metadata lands in the gate's `Result.metadata`:
 `prefer_adversarial`, `reviewer_backend_resolution` — so the operator/CXDB
 can see exactly which backend graded the diff and why.
 
+## Benchmark prompt shape (intentionally per-benchmark)
+
+`airbnb-clone` uses a `sprint × 3` shape (sequential
+plan→implement→verify→fix loops, one per sprint), while `amazon-clone` uses
+a `slice × parallel × fix` shape (multiple disjoint slice graphs that can
+be dispatched concurrently, each with its own fix loop). The two shapes are
+**intentional and benchmark-owned**, not a canonical contract that needs
+harmonization. See [docs/benchmark-shape.md](benchmark-shape.md) for the
+rationale and what to copy when authoring a new benchmark.
+
 ## Short names (expanded by skill)
 
 `gates`, `hello`, `pr_gates`, `minimal_pr`, `minimal_feature`, `minimal_research`, `bug_fix`, `review_slim`, `review_full`, `spec_gen`
