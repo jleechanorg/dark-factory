@@ -52,3 +52,27 @@ def test_exit_node_sha_pinning(tmp_path, monkeypatch):
     assert res.outcome == "error"
     assert "exit blocked: HEAD SHA changed" in res.output
     assert res.metadata["exit_sha_status"] == "mismatched"
+
+
+def test_auto_wip_commit_skipped_in_test_mode(tmp_path, monkeypatch):
+    import subprocess
+    from runner.engine_run import _auto_wip_commit_on_exhaustion
+    
+    # Track if subprocess.run was called
+    called = []
+    def fake_run(*args, **kwargs):
+        called.append(args)
+        return subprocess.CompletedProcess(args[0], 0, stdout="", stderr="")
+        
+    monkeypatch.setattr("runner.engine_run.subprocess.run", fake_run)
+    
+    # Create a dummy .git directory to satisfy conditions
+    (tmp_path / ".git").mkdir()
+    
+    # Setup dummy context
+    ctx = Context(goal="test wip", workdir=tmp_path)
+    
+    # Since we are running under pytest, this should return early without executing subprocess.run
+    _auto_wip_commit_on_exhaustion(ctx, "test exhaustion")
+    
+    assert not called, "subprocess.run should not have been called under pytest"

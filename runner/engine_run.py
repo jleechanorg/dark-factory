@@ -47,6 +47,11 @@ def _auto_wip_commit_on_exhaustion(ctx: "Context", reason: str) -> None:
       - worktree clean (`git status --porcelain` empty) → noop
       - subprocess failures → silently swallowed (best-effort)
     """
+    # Skip auto-WIP commit if running under pytest / test mode to avoid polluting the repo
+    import sys
+    import os
+    if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ or os.environ.get("DARK_FACTORY_TESTING") == "1":
+        return
     try:
         workdir = pathlib.Path(getattr(ctx, "workdir", "") or "")
         if not workdir or not workdir.exists():
