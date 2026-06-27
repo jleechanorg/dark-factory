@@ -34,3 +34,9 @@ specs/skeptic-report.json
 
 # But: rendered diagram PNGs in diagrams/png/ are canonical docs, not test artifacts
 !diagrams/png/*.png
+
+# Dark-factory background runner WIP-exhausted commits previously registered
+# this path as a gitlink (mode 160000) without a .gitmodules entry, breaking
+# actions/checkout for every new PR. Block it at the index level so future
+# factory runs cannot re-introduce the broken state.
+worktree_factory_evolve/
