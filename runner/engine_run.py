@@ -51,7 +51,10 @@ def _auto_wip_commit_on_exhaustion(ctx: "Context", reason: str) -> None:
     import sys
     import os
     if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ or os.environ.get("DARK_FACTORY_TESTING") == "1":
-        return
+        current_test = os.environ.get("PYTEST_CURRENT_TEST", "")
+        # Allow specific tests in test_pre_exhaustion_wip_commit to run WIP commits
+        if "test_pre_exhaustion_wip_commit" not in current_test and os.environ.get("DARK_FACTORY_ALLOW_WIP_TEST") != "1":
+            return
     try:
         workdir = pathlib.Path(getattr(ctx, "workdir", "") or "")
         if not workdir or not workdir.exists():
