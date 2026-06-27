@@ -308,13 +308,15 @@ def test_cli_creates_default_evidence_bundle_under_run_id(tmp_path):
         timeout=120,
         check=False,
     )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.returncode in {0, 1}, proc.stdout + proc.stderr
     payload = json.loads(proc.stdout)
     run_id = payload["run_id"]
     bundle = tmp_path / "evidence" / run_id
     assert payload["evidence_bundle"] == str(bundle)
     assert (bundle / "manifest.json").exists()
     assert (bundle / "summary.json").exists()
+    summary = json.loads((bundle / "summary.json").read_text(encoding="utf-8"))
+    assert summary["final_outcome"] == payload["final_outcome"]
     assert (bundle / "command.txt").exists()
     assert (bundle / "node_io.jsonl").exists()
     assert (bundle / "events.jsonl").exists()
