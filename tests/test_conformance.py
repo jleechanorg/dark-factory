@@ -126,6 +126,20 @@ def test_level5_valid_passes():
     assert payload["diagnostics"] == [], payload
 
 
+def test_level5_factory_graphs_accept_parallel_reviewer_hard_tier():
+    """Typed parallel reviewer nodes satisfy the cross-vendor hard tier."""
+    for path in (
+        "pipelines/factory/gates.dot",
+        "pipelines/factory/pr_gates.dot",
+        "pipelines/factory/level5_feature.dot",
+    ):
+        proc = run_conformance("validate", path)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        payload = json.loads(proc.stdout)
+        error_diags = [d for d in payload["diagnostics"] if d.get("severity") == "error"]
+        assert error_diags == [], (path, payload)
+
+
 def test_level5_missing_gate_fails():
     proc = run_conformance("validate", "tests/fixtures/level5_missing_gate.dot")
     assert proc.returncode == 1, proc.stdout + proc.stderr

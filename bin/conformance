@@ -105,6 +105,21 @@ def _diagnostic(rule: str, severity: str, message: str, node_id: str | None = No
 # are exempt so iteration lanes don't fight the rule.
 
 _LEVEL5_HARD_TIER_REVIEWERS = ("codex exec", "agy --print", "claude -p")
+_LEVEL5_PARALLEL_REVIEWER_PRIORITY = ("codex", "minimax", "agy", "claude-sonnet")
+
+
+def _vendor_name(name: str) -> str:
+    value = name.strip().lower()
+    if value in {"claude", "claude-sonnet"}:
+        return "claude"
+    return value
+
+
+def _priority_crosses_vendor(priority: list[str], graph_vendor: str | None) -> bool:
+    if graph_vendor is None:
+        return True
+    graph_vendor = _vendor_name(graph_vendor)
+    return any(_vendor_name(item) != graph_vendor for item in priority)
 
 
 def _is_level5_path(path: pathlib.Path) -> bool:
@@ -127,13 +142,33 @@ def _is_level5_path(path: pathlib.Path) -> bool:
 
 
 def _has_cross_vendor_reviewer(graph, graph_backend: str | None) -> bool:
-    """A reviewer node whose `command` starts with a known reviewer CLI AND
-    is not the same vendor family as the graph's `backend` attribute (if
-    set). Empty/unset backend always passes the cross-vendor requirement
-    (the runner decides at run-time).
+    """A reviewer node whose backend can be cross-vendor.
+
+    Legacy graphs used raw tool commands (`codex exec`, `agy --print`,
+    `claude -p`). New graphs should use `type="parallel_reviewer"` with a
+    backend priority queue so the normal review and shadow Codex output are
+    one logged/audited node. Empty/unset graph backend always passes the
+    cross-vendor requirement because the runner decides at run-time.
     """
     graph_vendor = (graph_backend or "").strip().lower() or None
     for node in graph.nodes.values():
+        node_type = str(node.attrs.get("type", "") or "").strip().lower()
+        if node_type == "parallel_reviewer":
+            raw_priority = str(node.attrs.get("backend_priority", "") or "").strip()
+            priority = (
+                [p.strip() for p in raw_priority.split(",") if p.strip()]
+                if raw_priority
+                else list(_LEVEL5_PARALLEL_REVIEWER_PRIORITY)
+            )
+            prefer_adversarial = (
+                str(node.attrs.get("prefer_adversarial", "") or "").strip().lower()
+                in {"true", "1", "yes", "on"}
+            )
+            if prefer_adversarial:
+                return True
+            if _priority_crosses_vendor(priority, graph_vendor):
+                return True
+
         command = str(node.attrs.get("command", "") or "").strip().lower()
         if not command:
             continue
@@ -200,7 +235,7 @@ def _check_level5(graph, path: pathlib.Path) -> list[dict]:
                 "missing_hard_tier_gate",
                 "error",
                 "Level-5 graph must contain a cross-vendor adversarial "
-                "reviewer node (command starting with one of: "
+                "reviewer node (type=\"parallel_reviewer\" or command starting with one of: "
                 + ", ".join(_LEVEL5_HARD_TIER_REVIEWERS)
                 + ") that is not the same vendor as the graph backend.",
             )
