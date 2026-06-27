@@ -8,8 +8,9 @@
 //     a single-phase .dot invocation; the Claude Workflow orchestrator
 //     is responsible for dispatching these as separate .dot runs.
 //   * Hard-tier reviewers (gate_er / gate_skeptic / adversarial_reviewer)
-//     are always present; `bin/conformance validate` rejects factory
-//     pipelines that drop them.
+//     are always present; adversarial_reviewer is a parallel primary+shadow
+//     reviewer, not a raw serial `codex exec` tool. `bin/conformance validate`
+//     rejects factory pipelines that drop them.
 //   * Soft-tier nodes (holdout_eval / healer / spec_validation) are
 //     present by default; skip flags allow opt-out on iteration lanes.
 //   * `graph [level5="true"]` forces the level5 rule even on non-factory
@@ -73,9 +74,10 @@ digraph Level5Feature {
         timeout=600
     ]
     adversarial_reviewer [
-        type="tool",
-        label="Adversarial reviewer (cross-vendor)",
-        command="codex exec --yolo --skip-git-repo-check",
+        type="parallel_reviewer",
+        label="Adversarial reviewer (primary + shadow Codex)",
+        backend_priority="codex,minimax,agy,claude-sonnet",
+        prefer_adversarial="true",
         timeout=600
     ]
     gate_er [

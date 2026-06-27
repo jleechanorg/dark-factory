@@ -25,13 +25,6 @@ def test_gate_echo_seeded_outcome(monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
-    # adversarial_reviewer is type=tool; mock it so it honors ctx.state
-    # seeding (the real _tool handler runs subprocesses, not echo).
-    def fake_tool(node, ctx):
-        pre = ctx.state.get(f"{node.name}.outcome")
-        return Result(outcome=pre or "success", output=f"fake_tool({node.name})")
-    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_tool)
-
     g = parse(_pipeline("gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
     ctx.state["gate_skeptic.outcome"] = "success"
@@ -62,11 +55,6 @@ def test_cxdb_records_steps(tmp_path, monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
-    def fake_tool(node, ctx):
-        pre = ctx.state.get(f"{node.name}.outcome")
-        return Result(outcome=pre or "success", output=f"fake_tool({node.name})")
-    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_tool)
-
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(_pipeline("gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=db_path)
@@ -122,11 +110,6 @@ def test_healer_reports_gate_infra_errors(tmp_path, monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
-    def fake_tool(node, ctx):
-        pre = ctx.state.get(f"{node.name}.outcome")
-        return Result(outcome=pre or "success", output=f"fake_tool({node.name})")
-    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_tool)
-
     g = parse(_pipeline("gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=tmp_path / "cxdb.sqlite")
     ctx.state["gate_skeptic.outcome"] = "success"
@@ -146,11 +129,6 @@ def test_healer_no_failures(tmp_path, monkeypatch):
     def fake_holdout(node, ctx):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
-    def fake_tool(node, ctx):
-        pre = ctx.state.get(f"{node.name}.outcome")
-        return Result(outcome=pre or "success", output=f"fake_tool({node.name})")
-    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_tool)
-
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(_pipeline("gates.dot"))
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=db_path)

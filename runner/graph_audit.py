@@ -71,7 +71,7 @@ TOPOLOGY_ONLY_SHAPES: frozenset[str] = frozenset({"point", "component", "tripleo
 # that gate / holdout the workflow at the boundary between coder output
 # and merge readiness.
 _REVIEWER_TYPE_NAMES: frozenset[str] = frozenset(
-    {"gate_es", "gate_er", "gate_code_standards", "holdout_eval"}
+    {"gate_es", "gate_er", "gate_code_standards", "holdout_eval", "parallel_reviewer"}
 )
 
 

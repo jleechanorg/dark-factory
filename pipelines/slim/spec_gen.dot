@@ -20,13 +20,14 @@ digraph SpecGenFactory {
     prompt="@prompts/slim/plan.md"
   ]
 
-  // Cold adversarial reviewer: a different vendor than the coder that wrote
-  // the spec. Uses the adversarial-review priority queue
-  // (codex > minimax > agy > claude-sonnet) via backend_priority= so the
-  // reviewer is never the run-level coder backend. goal_gate=true means a
-  // "failure" verdict routes to fix_main; "success" routes to plan_attractor.
+  // Cold adversarial reviewer plus parallel Codex comparison. The primary
+  // lane uses the adversarial-review priority queue (codex > minimax > agy >
+  // claude-sonnet) via backend_priority=, while the handler also starts the
+  // always-on shadow Codex reviewer and hands both rich outputs downstream.
+  // goal_gate=true means a "failure" verdict routes to fix_main; "success"
+  // routes to plan_attractor.
   review_main [
-    type="gate_er",
+    type="parallel_reviewer",
     label="Cold Review: Main Spec",
     class="review",
     backend_priority="codex,minimax,agy,claude-sonnet",
@@ -61,7 +62,7 @@ digraph SpecGenFactory {
   ]
 
   review_attractor [
-    type="gate_er",
+    type="parallel_reviewer",
     label="Cold Review: Attractor Spec",
     class="review",
     backend_priority="codex,minimax,agy,claude-sonnet",

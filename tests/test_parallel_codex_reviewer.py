@@ -12,8 +12,11 @@ import subprocess
 
 from pathlib import Path
 
+from runner.parser import parse
 from runner.handlers import Context, _parallel_reviewer  # noqa: F401
 from conftest import make_node
+
+ROOT = Path(__file__).parent.parent
 
 
 def _node_with_prompt(tmp_path: Path) -> object:
@@ -48,6 +51,18 @@ def test_parallel_reviewer_is_registered_as_validation_and_read_only_branch_type
     assert "parallel_reviewer" in ENGINE_VALIDATION_TYPES
     assert "parallel_reviewer" in PARSER_VALIDATION_TYPES
     assert "parallel_reviewer" in _READ_ONLY_BRANCH_TYPES
+
+
+def test_production_pipelines_do_not_use_raw_codex_exec_reviewer_tools():
+    """Reviewer CLIs must be first-class typed nodes, not opaque tool commands."""
+    offenders: list[str] = []
+    for path in sorted((ROOT / "pipelines").rglob("*.dot")):
+        graph = parse(path)
+        for node in graph.nodes.values():
+            command = str(node.attrs.get("command", ""))
+            if node.attrs.get("type") == "tool" and "codex exec" in command:
+                offenders.append(f"{path.relative_to(ROOT)}:{node.name}")
+    assert offenders == []
 
 
 def test_parallel_reviewer_runs_both_lanes_and_logs_distinct_outputs(tmp_path, monkeypatch):

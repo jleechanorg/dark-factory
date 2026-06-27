@@ -78,16 +78,11 @@ def _seed_other_gates(ctx: Context) -> None:
 
 
 def _mock_adversarial_reviewer(monkeypatch) -> None:
-    """Replace `tool` and `gate_skeptic` handlers with echo-seeded fakes so
-    the Level-5 pre-gate nodes (between holdout and gate_es) honor
-    ctx.state seeding instead of trying to run real CLIs."""
-    def fake_tool(node, ctx):
-        pre = ctx.state.get(f"{node.name}.outcome")
-        return Result(outcome=pre or "success", output=f"fake_tool({node.name})")
-    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_tool)
+    """Replace gate_skeptic so SHA tests focus on the target gate."""
     # gate_skeptic has no registered handler; default _codergen only honors
     # ctx.state seeding in echo backend. Register an echo-seeded fake so
-    # backend=claude tests don't try to call a real LLM.
+    # backend=claude tests don't try to call a real LLM. adversarial_reviewer
+    # is now type=parallel_reviewer and honors ctx.state directly.
     def fake_skeptic(node, ctx):
         pre = ctx.state.get(f"{node.name}.outcome")
         return Result(outcome=pre or "success", output=f"fake_skeptic({node.name})")

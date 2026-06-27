@@ -167,11 +167,12 @@ def test_spec_gen_plan_main_prompt_is_plan_md():
     assert g.nodes["plan_main"].attrs.get("prompt") == "@prompts/slim/plan.md"
 
 
-def test_spec_gen_review_main_is_gate_er():
-    """review_main must be type=gate_er for cold adversarial review."""
+def test_spec_gen_review_main_is_parallel_reviewer():
+    """review_main must run primary review plus shadow Codex comparison."""
     g = parse(SPEC_GEN)
-    assert g.nodes["review_main"].attrs.get("type") == "gate_er", (
-        "review_main must be type=gate_er to use adversarial priority queue"
+    assert g.nodes["review_main"].attrs.get("type") == "parallel_reviewer", (
+        "review_main must be type=parallel_reviewer to preserve adversarial "
+        "priority queue review while logging the parallel Codex comparison"
     )
 
 
@@ -248,11 +249,12 @@ def test_spec_gen_plan_attractor_prompt_is_plan_attractor_md():
     )
 
 
-def test_spec_gen_review_attractor_is_gate_er():
-    """review_attractor must be type=gate_er for cold adversarial review."""
+def test_spec_gen_review_attractor_is_parallel_reviewer():
+    """review_attractor must run primary review plus shadow Codex comparison."""
     g = parse(SPEC_GEN)
-    assert g.nodes["review_attractor"].attrs.get("type") == "gate_er", (
-        "review_attractor must be type=gate_er to use adversarial priority queue"
+    assert g.nodes["review_attractor"].attrs.get("type") == "parallel_reviewer", (
+        "review_attractor must be type=parallel_reviewer to preserve adversarial "
+        "priority queue review while logging the parallel Codex comparison"
     )
 
 
@@ -300,7 +302,7 @@ def test_spec_gen_happy_path_explore_plan_main_review_main_plan_attractor_review
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
 
     g = parse(SPEC_GEN)
-    # Pin both plan nodes to echo; gate_er in echo mode reads outcome from ctx.state.
+    # Pin both plan nodes to echo; reviewer echo mode reads outcome from ctx.state.
     g.nodes["plan_main"].attrs["backend"] = "echo"
     g.nodes["plan_attractor"].attrs["backend"] = "echo"
 
@@ -348,9 +350,9 @@ def test_spec_gen_fix_main_loop_on_review_main_failure(monkeypatch, tmp_path):
 
     # First review_main visit fails; second succeeds.
     call_count = {"n": 0}
-    original_handler = handlers_mod._gate_er  # noqa: SLF001
+    original_handler = TYPE_REGISTRY["parallel_reviewer"]
 
-    def patched_gate_er(node, _ctx):
+    def patched_parallel_reviewer(node, _ctx):
         if node.name == "review_main":
             call_count["n"] += 1
             if call_count["n"] == 1:
@@ -360,7 +362,7 @@ def test_spec_gen_fix_main_loop_on_review_main_failure(monkeypatch, tmp_path):
             return Result(outcome="success", output="spec approved after fix")
         return original_handler(node, _ctx)
 
-    monkeypatch.setitem(TYPE_REGISTRY, "gate_er", patched_gate_er)
+    monkeypatch.setitem(TYPE_REGISTRY, "parallel_reviewer", patched_parallel_reviewer)
 
     history = run(g, ctx, checkpoint=tmp_path / "checkpoint.json")
 
@@ -386,9 +388,9 @@ def test_spec_gen_fix_attractor_loop_on_review_attractor_failure(monkeypatch, tm
 
     # First review_attractor visit fails; second succeeds.
     call_count = {"n": 0}
-    original_handler = handlers_mod._gate_er  # noqa: SLF001
+    original_handler = TYPE_REGISTRY["parallel_reviewer"]
 
-    def patched_gate_er(node, _ctx):
+    def patched_parallel_reviewer(node, _ctx):
         if node.name == "review_attractor":
             call_count["n"] += 1
             if call_count["n"] == 1:
@@ -398,7 +400,7 @@ def test_spec_gen_fix_attractor_loop_on_review_attractor_failure(monkeypatch, tm
             return Result(outcome="success", output="attractor spec approved after fix")
         return original_handler(node, _ctx)
 
-    monkeypatch.setitem(TYPE_REGISTRY, "gate_er", patched_gate_er)
+    monkeypatch.setitem(TYPE_REGISTRY, "parallel_reviewer", patched_parallel_reviewer)
 
     history = run(g, ctx, checkpoint=tmp_path / "checkpoint.json")
 

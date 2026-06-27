@@ -165,6 +165,18 @@ def _coalesce_parallel_outcome(primary: str, shadow: str) -> str:
 def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     prompt = _handlers_shim._render_prompt(node, ctx)
+    if ctx.backend in ("echo", "mock_llm"):
+        hint = ctx.state.get(f"{node.name}.outcome", "success")
+        return Result(
+            outcome=hint,
+            output=f"echo parallel reviewer {node.name}: pre-seeded {hint}",
+            metadata={
+                "slash_command": node.name,
+                "verdict": "echo:" + str(hint),
+                "reviewer_backend": str(ctx.backend),
+                "parallel_reviewer": "echo",
+            },
+        )
     backend, backend_meta = _resolve_gate_backend(node, ctx)
 
     timeout = _handlers_shim._coerce_timeout(

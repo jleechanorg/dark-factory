@@ -130,25 +130,21 @@ def test_level5_feature_dot_has_hard_tier_reviewers():
     assert "gate_skeptic" in node_names, (
         f"reference .dot must contain a gate_skeptic node (got nodes: {sorted(node_names)})"
     )
-    # adversarial_reviewer: name-based check (the Lane B rule resolves
-    # via `command=codex exec ...` prefix on a `type="tool"` node).
+    # adversarial_reviewer: name-based check. The node is implemented by the
+    # parallel reviewer handler so the primary and shadow Codex reviews are
+    # one audited gate instead of a raw serial shell tool.
     assert "adversarial_reviewer" in node_names, (
         "reference .dot must contain an adversarial_reviewer node"
     )
 
 
-def test_level5_feature_dot_has_cross_vendor_reviewer_command():
-    """The adversarial_reviewer must carry a `command=` starting with a
-    Lane-B-recognized cross-vendor CLI (`codex exec`, `agy --print`, or
-    `claude -p`). Without that, the level5 conformance rule rejects it."""
+def test_level5_feature_dot_has_parallel_adversarial_reviewer():
+    """The adversarial_reviewer must use the parallel reviewer node type."""
     g = parse(ROOT / "pipelines" / "factory" / "level5_feature.dot")
     rev = g.nodes["adversarial_reviewer"]
-    cmd = str(rev.attrs.get("command", "") or "").strip().lower()
-    valid_prefixes = ("codex exec", "agy --print", "claude -p")
-    assert any(cmd.startswith(p) for p in valid_prefixes), (
-        f"adversarial_reviewer command must start with one of {valid_prefixes}, "
-        f"got: {cmd!r}"
-    )
+    assert rev.attrs.get("type") == "parallel_reviewer"
+    assert "codex" in str(rev.attrs.get("backend_priority", ""))
+    assert str(rev.attrs.get("prefer_adversarial", "")).lower() == "true"
 
 
 def test_level5_feature_dot_has_soft_tier_nodes():
@@ -191,17 +187,13 @@ def test_gates_dot_has_gate_skeptic_and_adversarial_reviewer():
     )
 
 
-def test_gates_dot_adversarial_reviewer_has_cross_vendor_command():
-    """Migrated gates.dot's adversarial_reviewer must carry a Lane-B
-    recognized reviewer CLI command."""
+def test_gates_dot_adversarial_reviewer_is_parallel():
+    """Migrated gates.dot's adversarial_reviewer must be parallelized."""
     g = parse(_pipeline("gates.dot"))
     rev = g.nodes["adversarial_reviewer"]
-    cmd = str(rev.attrs.get("command", "") or "").strip().lower()
-    valid_prefixes = ("codex exec", "agy --print", "claude -p")
-    assert any(cmd.startswith(p) for p in valid_prefixes), (
-        f"gates.dot adversarial_reviewer command must start with one of "
-        f"{valid_prefixes}, got: {cmd!r}"
-    )
+    assert rev.attrs.get("type") == "parallel_reviewer"
+    assert "codex" in str(rev.attrs.get("backend_priority", ""))
+    assert str(rev.attrs.get("prefer_adversarial", "")).lower() == "true"
 
 
 def test_pr_gates_dot_has_level5_graph_attribute():
@@ -224,17 +216,13 @@ def test_pr_gates_dot_has_gate_skeptic_and_adversarial_reviewer():
     )
 
 
-def test_pr_gates_dot_adversarial_reviewer_has_cross_vendor_command():
-    """Migrated pr_gates.dot's adversarial_reviewer must carry a Lane-B
-    recognized reviewer CLI command."""
+def test_pr_gates_dot_adversarial_reviewer_is_parallel():
+    """Migrated pr_gates.dot's adversarial_reviewer must be parallelized."""
     g = parse(_pipeline("pr_gates.dot"))
     rev = g.nodes["adversarial_reviewer"]
-    cmd = str(rev.attrs.get("command", "") or "").strip().lower()
-    valid_prefixes = ("codex exec", "agy --print", "claude -p")
-    assert any(cmd.startswith(p) for p in valid_prefixes), (
-        f"pr_gates.dot adversarial_reviewer command must start with one of "
-        f"{valid_prefixes}, got: {cmd!r}"
-    )
+    assert rev.attrs.get("type") == "parallel_reviewer"
+    assert "codex" in str(rev.attrs.get("backend_priority", ""))
+    assert str(rev.attrs.get("prefer_adversarial", "")).lower() == "true"
 
 
 def test_migrated_gates_still_have_fix_loop():
