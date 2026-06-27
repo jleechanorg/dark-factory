@@ -1,0 +1,19 @@
+{
+  "command": "dark-factory --pipeline /private/tmp/main-worktree/pipelines/factory/hello.dot --goal smoke --backend echo --feature does-not-exist",
+  "cxdb_path": "/private/tmp/main-worktree/evidence/53e734aabd11/_run.sqlite",
+  "cxdb_sha256": "3baef31c1d8e3af1c9a03dcd3ca4ba96374dd324c9bddfdeb0277756189e5b0d",
+  "ended_ts": 1782585396.014488,
+  "events_path": "/private/tmp/main-worktree/evidence/53e734aabd11/events.jsonl",
+  "exit_reached": false,
+  "extract_path": "/private/tmp/main-worktree/evidence/53e734aabd11/cxdb-53e734aabd11.sqlite",
+  "extract_sha256": "76ac429f1d75f44601754c9085a0ab2238f888ac46e7bc407cfbf5f35fdf0df3",
+  "final_outcome": "exhausted",
+  "goal": "smoke",
+  "node_io_path": "node_io.jsonl",
+  "pipeline_name": "hello",
+  "pipeline_path": "/private/tmp/main-worktree/pipelines/factory/hello.dot",
+  "run_id": "53e734aabd11",
+  "started_ts": 1782585394.625924,
+  "steps": 21,
+  "wall_clock_ms": 1388
+}
