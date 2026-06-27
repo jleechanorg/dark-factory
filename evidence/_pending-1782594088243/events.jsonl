@@ -1,0 +1,10 @@
+{"backend": "echo", "event": "run_start", "goal": "smoke", "pipeline": "hello", "run_id": "e7cf4b821a6a", "seq": 0, "ts": 1782594092.795372}
+{"attempt": "1", "event": "node_start", "node": "start", "run_id": "e7cf4b821a6a", "seq": 0, "ts": 1782594092.804505}
+{"attempt": "1", "event": "node_input", "input_path": "/Users/jleechan/.dark-factory/runs/e7cf4b821a6a/inputs/0_start_1_input.txt", "input_sha256": "e48010b1d4e230d3eb139f01d152641447c31915b4cfd0128e88161a21ec6145", "node": "start", "run_id": "e7cf4b821a6a", "seq": 0, "ts": 1782594092.820866}
+{"attempt": "1", "event": "node_result", "input_path": "/Users/jleechan/.dark-factory/runs/e7cf4b821a6a/inputs/0_start_1_input.txt", "input_sha256": "e48010b1d4e230d3eb139f01d152641447c31915b4cfd0128e88161a21ec6145", "max_retries": "0", "node": "start", "outcome": "success", "run_id": "e7cf4b821a6a", "seq": 0, "transcript_path": "/Users/jleechan/.dark-factory/runs/e7cf4b821a6a/transcripts/0_start_1.txt", "transcript_sha256": "956b6a72714f15538de7db2bdb28e18e5651024aff8db31faf1672a33f67a379", "ts": 1782594092.8216221}
+{"event": "checkpoint", "node": "start", "path": "/Users/jleechan/.dark-factory/runs/e7cf4b821a6a/checkpoint.json", "run_id": "e7cf4b821a6a", "seq": 0, "ts": 1782594092.829238}
+{"event": "step", "node": "start", "outcome": "success", "preview": "start: 'smoke'", "run_id": "e7cf4b821a6a", "seq": 0, "ts": 1782594092.8294349}
+{"event": "node_complete", "is_exit": "False", "node": "start", "outcome": "success", "preview": "start: 'smoke'", "run_id": "e7cf4b821a6a", "seq": 1, "ts": 1782594092.834719}
+{"event": "transition", "from": "start", "outcome": "success", "run_id": "e7cf4b821a6a", "seq": 1, "to": "explore_in", "ts": 1782594092.836931}
+{"attempt": "1", "event": "node_start", "node": "explore_in", "run_id": "e7cf4b821a6a", "seq": 1, "ts": 1782594092.8371022}
+{"attempt": "1", "event": "node_input", "input_path": "/Users/jleechan/.dark-factory/runs/e7cf4b821a6a/inputs/1_explore_in_1_input.txt", "input_sha256": "58c8b58d4c92379c833d8a534c1e4b3b8a1454a251f4fa408174ea393d2f7d15", "node": "explore_in", "run_id": "e7cf4b821a6a", "seq": 1, "ts": 1782594092.8376052}
