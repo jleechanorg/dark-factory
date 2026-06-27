@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import shutil
 import shlex
 import time
 import sys
@@ -181,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
             default=None,
             help=(
                 "Directory to materialise a per-run evidence bundle (manifest, "
-                "per-step files, single-run CXDB extract). Requires --cxdb."
+                "per-step files, single-run CXDB extract). Defaults to evidence/<run-id>."
             ),
         )
         p.add_argument(
@@ -255,6 +256,15 @@ def main(argv: list[str] | None = None) -> int:
         if not args.goal:
             p.error("--goal is required unless --preflight is set")
 
+        explicit_evidence_bundle = args.evidence_bundle is not None
+        evidence_staging_dir = None
+        if args.evidence_bundle is None:
+            evidence_root = args.workdir / "evidence"
+            evidence_staging_dir = evidence_root / f"_pending-{int(time.time() * 1000)}"
+            args.evidence_bundle = evidence_staging_dir
+        if args.evidence_bundle is not None:
+            args.evidence_bundle.mkdir(parents=True, exist_ok=True)
+
         if args.evidence_bundle is not None and args.events is None:
             args.events = args.evidence_bundle / "events.jsonl"
 
@@ -262,7 +272,6 @@ def main(argv: list[str] | None = None) -> int:
             # The bundle's `cxdb-<run_id>.sqlite` extract needs a source CXDB —
             # auto-provision one in the bundle dir if none was supplied so the
             # CLI is forgiving for ad-hoc smoke runs.
-            args.evidence_bundle.mkdir(parents=True, exist_ok=True)
             args.cxdb = args.evidence_bundle / "_run.sqlite"
 
         graph = parse(pipeline_path)
@@ -301,6 +310,28 @@ def main(argv: list[str] | None = None) -> int:
             max_steps=args.max_steps,
         )
 
+        final_evidence_bundle = args.evidence_bundle
+        if (
+            args.evidence_bundle is not None
+            and not explicit_evidence_bundle
+            and evidence_staging_dir is not None
+            and ctx.run_id is not None
+        ):
+            old_cxdb = args.cxdb
+            old_events = args.events
+            final_evidence_bundle = args.workdir / "evidence" / ctx.run_id
+            if final_evidence_bundle.exists():
+                shutil.rmtree(final_evidence_bundle)
+            args.evidence_bundle.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(args.evidence_bundle), str(final_evidence_bundle))
+            args.evidence_bundle = final_evidence_bundle
+            if old_cxdb is not None and pathlib.Path(old_cxdb).parent == evidence_staging_dir:
+                args.cxdb = final_evidence_bundle / pathlib.Path(old_cxdb).name
+                ctx.cxdb_path = args.cxdb
+            if old_events is not None and pathlib.Path(old_events).parent == evidence_staging_dir:
+                args.events = final_evidence_bundle / "events.jsonl"
+                ctx.event_log_path = args.events
+
         if args.evidence_bundle is not None and ctx.run_id is not None:
             # Lazy import so the CLI module stays cheap to load.
             from .evidence import write_bundle
@@ -337,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
                 else None
             ),
             "events": str(ctx.event_log_path) if ctx.event_log_path else None,
+            "evidence_bundle": str(args.evidence_bundle) if args.evidence_bundle else None,
             "steps": len(history),
             "final_outcome": history[-1].outcome if history else "empty",
             "trace": [

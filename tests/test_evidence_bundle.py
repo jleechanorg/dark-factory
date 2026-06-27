@@ -279,3 +279,43 @@ def test_cli_evidence_bundle_flag_creates_bundle(tmp_path):
     assert summary["final_outcome"] in {"success", "failure"}
     assert summary["cxdb_path"] == str(cxdb)
     assert summary["steps"] == len(rows)
+
+
+def test_cli_creates_default_evidence_bundle_under_run_id(tmp_path):
+    """Every CLI run should leave evidence/<run-id>/ unless explicitly disabled."""
+    cxdb = tmp_path / "default-evidence.sqlite"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "runner",
+            "--pipeline",
+            str(_pipeline("hello.dot")),
+            "--goal",
+            "default evidence smoke",
+            "--backend",
+            "echo",
+            "--feature",
+            "hello",
+            "--workdir",
+            str(tmp_path),
+            "--cxdb",
+            str(cxdb),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    payload = json.loads(proc.stdout)
+    run_id = payload["run_id"]
+    bundle = tmp_path / "evidence" / run_id
+    assert payload["evidence_bundle"] == str(bundle)
+    assert (bundle / "manifest.json").exists()
+    assert (bundle / "summary.json").exists()
+    assert (bundle / "command.txt").exists()
+    assert (bundle / "node_io.jsonl").exists()
+    assert (bundle / "events.jsonl").exists()
+    assert not list((tmp_path / "evidence").glob("_pending-*"))
