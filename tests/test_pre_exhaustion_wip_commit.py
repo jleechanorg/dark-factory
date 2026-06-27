@@ -43,7 +43,7 @@ def _init_git_repo(path: pathlib.Path) -> None:
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(path), check=True)
     for key, value in [
         ("user.name", "test"),
-        ("user.email", "test@example.com"),
+        ("user.email", "jleechan2015@users.noreply.github.com"),
         ("commit.gpgsign", "false"),
     ]:
         subprocess.run(
