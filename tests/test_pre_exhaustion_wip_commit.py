@@ -16,7 +16,11 @@ import subprocess
 import sys
 
 import os
-os.environ["DARK_FACTORY_ALLOW_WIP_TEST"] = "1"
+import pytest
+
+@pytest.fixture(autouse=True)
+def _allow_wip_test(monkeypatch):
+    monkeypatch.setenv("DARK_FACTORY_ALLOW_WIP_TEST", "1")
 
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
