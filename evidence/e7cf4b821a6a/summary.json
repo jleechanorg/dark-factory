@@ -1,0 +1,19 @@
+{
+  "command": "dark-factory --pipeline /Users/jleechan/.worktrees/dark-factory/audit-2026-06-27/pipelines/factory/hello.dot --goal smoke --backend echo --feature does-not-exist",
+  "cxdb_path": "/Users/jleechan/.worktrees/dark-factory/audit-2026-06-27/evidence/e7cf4b821a6a/_run.sqlite",
+  "cxdb_sha256": "15798d1beb01f694a6cba53ace23fc3a2c0bb230ba343613da425a4d9bd393bd",
+  "ended_ts": 1782594108.535691,
+  "events_path": "/Users/jleechan/.worktrees/dark-factory/audit-2026-06-27/evidence/e7cf4b821a6a/events.jsonl",
+  "exit_reached": false,
+  "extract_path": "/Users/jleechan/.worktrees/dark-factory/audit-2026-06-27/evidence/e7cf4b821a6a/cxdb-e7cf4b821a6a.sqlite",
+  "extract_sha256": "eee3b2b0bed75eb0337536004ab26657f614306b35c229eedb4941800f5acd14",
+  "final_outcome": "exhausted",
+  "goal": "smoke",
+  "node_io_path": "node_io.jsonl",
+  "pipeline_name": "hello",
+  "pipeline_path": "/Users/jleechan/.worktrees/dark-factory/audit-2026-06-27/pipelines/factory/hello.dot",
+  "run_id": "e7cf4b821a6a",
+  "started_ts": 1782594092.024469,
+  "steps": 21,
+  "wall_clock_ms": 16511
+}
