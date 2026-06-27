@@ -1,0 +1,1 @@
+dark-factory --pipeline /private/var/folders/j0/byd1z6px50v88lf679bgt0h00000gn/T/pytest-of-jleechan/pytest-418/test_cli_perf_log_in_summary0/minimal.dot --goal 'cli perf' --backend echo --perf-log-dir /private/var/folders/j0/byd1z6px50v88lf679bgt0h00000gn/T/pytest-of-jleechan/pytest-418/test_cli_perf_log_in_summary0/cli-perf
