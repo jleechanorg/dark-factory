@@ -43,21 +43,21 @@ For each `fail` finding: confirm the rationale applies to the diff (the runner s
    For each file changed, identify related files that were NOT changed but may now contradict the change. Specifically:
    - For each changed symbol, you MUST explicitly name the unchanged consumers/callers you checked.
    - If a production constant/class/enum changed: search for all prompt files (`prompts/`, `*instruction*.md`, `*system*.md`) that reference the same entity and check for contradictions.
-   - If a test was added/modified: check the test's call chain — trace every helper it calls and verify no hardcoded values create a mismatch (e.g. hardcoded campaign class vs `self.args.class_name`).
+   - If a test was added/modified: check the test's call chain — trace every helper it calls and verify no hardcoded values create a mismatch (e.g. hardcoded `--role admin` vs the user-supplied `--role guest` flag).
    - If config/classification logic changed: verify all consumers of that classification are consistent.
 
 4. **Evidence quality check** (not URL presence): If the PR body or spec references a gist or evidence URL, retrieve and read the evidence bundle. Verify:
    - Raw test pass rates are ≥ 100% (not "1/2 raw")
-   - Required artifact files exist: `llm_request_responses.jsonl`, server logs or HTTP captures, `streaming_evidence.json`
+   - Required artifact files exist: `<run-trace.jsonl>`, server logs or HTTP captures, `<primary-evidence.json>`
    - Evidence SHA matches PR HEAD SHA
-   - No "single_organic_level_up: FAIL" or similar failures in evidence.md
+   - No "expected outcome failed" or similar failures in evidence.md
    Evidence gate passing due to URL presence alone is insufficient — read the content.
    - **Visual cross-check** (mandatory when `.png`/`.mp4` artifacts exist in the bundle): Open and view 3–5 representative frames. Cross-check: do the frames show what the PR claims works? Look for error banners during "connected" periods, undismissed system dialogs, raw JSON rendered as user-facing text, or empty content where narrative should appear. Counting files or checking metadata (byte size, codec, frame count) without viewing pixel content is the G10 anti-pattern.
 
 5. **Test call-chain tracing**: For any new or modified test, trace the full call chain:
-   - Does the campaign/character class match what the assertions expect?
+   - Does the role/category match what the assertions expect?
    - Are there parameterized fixtures that may bleed into hardcoded scenarios?
-   - Will the test pass for ALL parameter combinations (e.g. `--class-name wizard` on a Fighter atomicity test)?
+   - Will the test pass for ALL parameter combinations (e.g. `--role admin` on a category-A vs category-B atomicity test)?
 
 Return a concise verdict:
 - `success` only if ALL five steps pass, tests run and pass, and no blocking issues remain.

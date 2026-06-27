@@ -260,7 +260,19 @@ def _gate_audit(node: "Node", ctx: "Context") -> "Result":
         elif isinstance(evidence_paths_raw, list):
             evidence_paths = evidence_paths_raw
     else:
-        for standard_name in ("gemini_http_request_responses.jsonl", "gemini_http_responses.jsonl", "evidence.jsonl"):
+        # Vendor-neutral defaults first, then any project-local aliases from
+        # ``<workdir>/.dark-factory/evidence.yaml`` (preserves Gemini-shaped
+        # filenames like ``gemini_http_request_responses.jsonl`` for existing
+        # callers without forcing them on every project).
+        probed = list(DEFAULT_EVIDENCE_FILENAMES)
+        probed.extend(_load_evidence_aliases(ctx.workdir))
+        # De-dupe while preserving order so missing-artifact errors list each
+        # missing file exactly once.
+        seen: set[str] = set()
+        for standard_name in probed:
+            if standard_name in seen:
+                continue
+            seen.add(standard_name)
             if (ctx.workdir / standard_name).is_file():
                 evidence_paths.append(standard_name)
 
