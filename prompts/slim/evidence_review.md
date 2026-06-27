@@ -13,7 +13,7 @@ ${goal}
 2. **Evidence quality checks**:
    - Scenario pass rate: must be 100% (3/3 or equivalent)
    - Evidence SHA must match HEAD SHA of the PR branch
-   - Required artifacts: `run.json`, `streaming_evidence.json`, `llm_request_responses.jsonl` (or equivalent captures)
+   - Required artifacts: `run.json` plus a primary evidence artifact (e.g. `<primary-evidence.json>`) and a run-trace capture (e.g. `<run-trace.jsonl>`), or equivalent feature-specific captures
    - Provenance fields must be populated (not blank)
    - Repro instructions must be present
 
@@ -26,8 +26,8 @@ ${goal}
    - **Cross-check PR claims against frame content**:
      - Does the PR claim a feature "works"? → Do the frames show the feature working from the user's perspective (readable text, correct UI state, no error banners)?
      - Does the PR claim "connection established"? → Is there a "No connection" or error banner visible in any frame during the connected period?
-     - Does the PR claim "streaming works"? → Do the frames show rendered narrative prose, or raw JSON / escaped characters?
-     - Does the PR claim "native app works"? → Are there undismissed system dialogs, permission prompts, or blocking overlays?
+     - Does the PR claim "real-time feature works"? → Do the frames show rendered user-visible content, or raw JSON / escaped characters?
+     - Does the PR claim "desktop/mobile/web app works"? → Are there undismissed system dialogs, permission prompts, or blocking overlays?
    - **Negative signals** (any of these in a frame during the "working" period is a gap):
      - Error banners or "No connection" indicators while data is flowing
      - System dialogs (e.g., "Open in App?") that were never dismissed
