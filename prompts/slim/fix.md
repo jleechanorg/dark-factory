@@ -9,6 +9,12 @@ Previous node result (free-form output from the gate/reviewer/tool that routed
 here):
 ${state._last_output}
 
+Review Verdict:
+${state._last_verdict}
+
+Coder Handoff:
+${state._last_coder_handoff}
+
 The runner wires the most recent goal_gate test failure into ctx.state
 when present. If `last_test_output` is set, treat it as the source of
 truth for what is actually broken — read the failing test stderr/stdout

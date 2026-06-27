@@ -107,6 +107,22 @@ def _auto_wip_commit_on_exhaustion(ctx: "Context", reason: str) -> None:
         return
 
 
+def _extract_coder_handoff(text: str) -> str:
+    """Extract ## Coder Handoff section from reviewer output."""
+    if not text:
+        return ""
+    import re
+    # Match ## Coder Handoff (case-insensitive) and extract until next markdown header (e.g. ## or #) or end of string.
+    pattern = re.compile(
+        r"##\s*Coder\s+Handoff\b(.*?)(?=^(?:#+|\s*##)\s|\Z)",
+        re.IGNORECASE | re.DOTALL | re.MULTILINE
+    )
+    match = pattern.search(text)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
 def _run_single_node(
     node: Node,
     ctx: Context,
@@ -134,7 +150,21 @@ def _run_single_node(
             ctx.state.update(attempt.context_updates)
             ctx.state["_last_node"] = node.name
             ctx.state["_last_outcome"] = attempt.outcome
-            ctx.state["_last_output"] = attempt.output
+            ctx.state["_last_output"] = attempt.output[:4000]
+            
+            # Surface Coder Handoff section + verdict token (P5)
+            verdict = attempt.metadata.get("verdict")
+            if verdict:
+                ctx.state["_last_verdict"] = verdict
+            else:
+                ctx.state.pop("_last_verdict", None)
+
+            handoff = _extract_coder_handoff(attempt.output)
+            if handoff:
+                ctx.state["_last_coder_handoff"] = handoff
+            else:
+                ctx.state.pop("_last_coder_handoff", None)
+
             normalized_results.append(attempt)
             records.append(
                 _persist.StepRecord(

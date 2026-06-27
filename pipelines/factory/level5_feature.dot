@@ -71,6 +71,8 @@ digraph Level5Feature {
     gate_skeptic [
         type="gate_skeptic",
         label="Skeptic (inverted-incentive review)",
+        backend_priority="codex,minimax,agy,claude-sonnet",
+        prefer_adversarial="true",
         timeout=600
     ]
     adversarial_reviewer [
@@ -83,6 +85,9 @@ digraph Level5Feature {
     gate_er [
         type="gate_er",
         label="/er Evidence Review",
+        backend_priority="codex,minimax,agy,claude-sonnet",
+        prefer_adversarial="true",
+        gate_strict="true",
         timeout=600
     ]
 

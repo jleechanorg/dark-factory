@@ -144,8 +144,10 @@ def test_default_event_log_path_uses_final_cxdb_run_id(monkeypatch, tmp_path):
     assert {event["run_id"] for event in events} == {ctx.run_id}
 
 
-def test_cli_invocation_green():
+def test_cli_invocation_green(tmp_path):
     """End-to-end: run the CLI with the real holdout evaluator against the impl tree."""
+    import shutil
+    shutil.copytree(ROOT / "impl", tmp_path / "impl")
     proc = subprocess.run(
         [
             sys.executable, "-m", "runner",
@@ -153,6 +155,7 @@ def test_cli_invocation_green():
             "--goal", "smoke",
             "--backend", "echo",
             "--feature", "hello",
+            "--workdir", str(tmp_path),
         ],
         cwd=ROOT,
         capture_output=True,
@@ -165,7 +168,7 @@ def test_cli_invocation_green():
     assert '"final_outcome": "success"' in proc.stdout
 
 
-def test_cli_feature_flag_overrides_dot_feature():
+def test_cli_feature_flag_overrides_dot_feature(tmp_path):
     proc = subprocess.run(
         [
             sys.executable, "-m", "runner",
@@ -173,6 +176,7 @@ def test_cli_feature_flag_overrides_dot_feature():
             "--goal", "smoke",
             "--backend", "echo",
             "--feature", "does-not-exist",
+            "--workdir", str(tmp_path),
         ],
         cwd=ROOT,
         capture_output=True,

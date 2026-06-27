@@ -485,6 +485,9 @@ def _run_gate_once(
         "matched" if sha_ok and observed_sha
         else ("mismatched" if observed_sha else "missing")
     )
+    context_updates = {}
+    if outcome == "success":
+        context_updates["_last_validated_head_sha"] = expected_sha
     return _finalize(Result(
         outcome=outcome,
         output=proc.stdout,
@@ -496,6 +499,7 @@ def _run_gate_once(
             "reviewer_backend": reviewer_backend,
             **prompt_meta,
         },
+        context_updates=context_updates,
     ))
 
 
