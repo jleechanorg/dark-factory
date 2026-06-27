@@ -57,7 +57,7 @@ def test_production_pipelines_do_not_use_raw_codex_exec_reviewer_tools():
     """Reviewer CLIs must be first-class typed nodes, not opaque tool commands."""
     offenders: list[str] = []
     for path in sorted((ROOT / "pipelines").rglob("*.dot")):
-        graph = parse(path)
+        graph = parse(path, require_start_exit=False)
         for node in graph.nodes.values():
             command = str(node.attrs.get("command", ""))
             if node.attrs.get("type") == "tool" and "codex exec" in command:

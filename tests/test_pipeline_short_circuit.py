@@ -101,6 +101,10 @@ def test_gate_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path):
         pre = ctx.state.get(f"{node.name}.outcome")
         return Result(outcome=pre or "success", output=f"fake_skeptic({node.name})")
     monkeypatch.setitem(TYPE_REGISTRY, "gate_skeptic", fake_skeptic)
+    def fake_parallel_reviewer(node, ctx):
+        pre = ctx.state.get(f"{node.name}.outcome")
+        return Result(outcome=pre or "success", output=f"fake_parallel_reviewer({node.name})")
+    monkeypatch.setitem(TYPE_REGISTRY, "parallel_reviewer", fake_parallel_reviewer)
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()

@@ -78,15 +78,19 @@ def _seed_other_gates(ctx: Context) -> None:
 
 
 def _mock_adversarial_reviewer(monkeypatch) -> None:
-    """Replace gate_skeptic so SHA tests focus on the target gate."""
+    """Replace pre-gate reviewers so SHA tests focus on the target gate."""
     # gate_skeptic has no registered handler; default _codergen only honors
     # ctx.state seeding in echo backend. Register an echo-seeded fake so
-    # backend=claude tests don't try to call a real LLM. adversarial_reviewer
-    # is now type=parallel_reviewer and honors ctx.state directly.
+    # backend=claude tests don't try to call a real LLM.
     def fake_skeptic(node, ctx):
         pre = ctx.state.get(f"{node.name}.outcome")
         return Result(outcome=pre or "success", output=f"fake_skeptic({node.name})")
     monkeypatch.setitem(TYPE_REGISTRY, "gate_skeptic", fake_skeptic)
+
+    def fake_parallel_reviewer(node, ctx):
+        pre = ctx.state.get(f"{node.name}.outcome")
+        return Result(outcome=pre or "success", output=f"fake_parallel_reviewer({node.name})")
+    monkeypatch.setitem(TYPE_REGISTRY, "parallel_reviewer", fake_parallel_reviewer)
 
 
 def test_gate_missing_head_sha_echo_is_error(tmp_path, monkeypatch):
