@@ -74,7 +74,8 @@ Include:
   NOT at the attractor when partial writes exist; the system is NOT
   at the attractor when the server still synthesizes a planning block
   on the prompt-full-sheet path; the system is NOT at the attractor
-  when the model never emits a `level_up_signal` field."
+  when the model never emits an upgrade-signal (or commit-signal)
+  field."
 
 ## Rules
 
