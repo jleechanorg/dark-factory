@@ -14,7 +14,7 @@ This benchmark is intentionally larger than a frontend exercise. It is meant to 
 
 The full product surface is public and must be given to the coding agent.
 The coding agent receives all user stories, data model requirements, route requirements, launch commands, and quality expectations in this file.
-The held-back evaluator should contain exact seed identifiers, exact adversarial inputs, exact browser interaction order, exact viewport sizes, exact Firestore rule probes, exact malformed payloads, exact coupon combinations, exact race cases, and exact scoring thresholds that are not required for ordinary implementation understanding.
+The split between visible product requirements and operator-only evaluation guidance — including exact seed identifiers, adversarial inputs, browser interaction order, viewport sizes, security-rule probes, malformed payloads, coupon combinations, race cases, and scoring thresholds — is defined in `README.md` ("Revealed vs. operator-only") and `SCORING.md`. This file (the public `spec.md`) describes the product; it intentionally does not enumerate which categories of probes the held-back evaluator contains.
 This split tests conformance without hiding core product requirements.
 
 ## Source Size Requirement
@@ -2023,15 +2023,7 @@ Observability notes:
 
 ## Held-Back Evaluator Guidance
 
-- The evaluator should keep exact product IDs, user IDs, coupon codes, order IDs, and review IDs outside the public spec.
-- The evaluator should keep exact browser viewport dimensions outside the public spec.
-- The evaluator should keep exact adversarial payloads outside the public spec.
-- The evaluator should keep exact role-escalation attempts outside the public spec.
-- The evaluator should keep exact stale inventory and stale total scenarios outside the public spec.
-- The evaluator should keep exact Firestore rules read/write probes outside the public spec.
-- The evaluator should keep exact source-line counting file globs outside the public spec while preserving the public counting principle.
-- The evaluator should keep exact scoring weights outside the public spec.
-- The evaluator should not hide any major user story, required route family, required collection family, or required launch command.
+The categories of material the held-back evaluator keeps out of the public spec — and the principle that no major user story, required route family, required collection family, or required launch command is hidden — are defined for the operator in `README.md` ("Revealed vs. operator-only") and `SCORING.md`. This section exists to point at those operator docs; it does not enumerate the held-back categories in the public spec, because listing them here would defeat the purpose of keeping them out of the public spec.
 
 ## Launch Contract
 

@@ -25,6 +25,10 @@ This benchmark currently has two execution scopes:
 
 ### Sealed from coder agents
 
+The held-back evaluator may keep out the following operator-defined categories
+of material; the implementing agent should not be able to enumerate them by
+reading the public spec, the README, or `SCORING.md`:
+
 - Exact holdout scenario names and IDs.
 - Concrete input values used by the evaluator.
 - Playwright selectors and assertion code.
@@ -34,7 +38,18 @@ This benchmark currently has two execution scopes:
 
 The visible spec must be complete enough to implement the product fairly. The
 sealed layer hides adversarial examples and scoring internals, not material
-user-story requirements.
+user-story requirements. The scoring weights and category breakdown are listed
+in `SCORING.md`; this README does not duplicate them.
+
+### What is intentionally NOT enumerated in the public spec
+
+To preserve the value of the held-back layer, the public `spec.md` does not list
+which held-back probe categories exist (e.g. whether role-escalation probes or
+race-case probes are present in the held-back evaluator). The implementing
+agent must implement the visible product requirements on the merits, and the
+held-back evaluator decides what additional adversarial material it brings.
+`SCORING.md` describes the scoring categories without disclosing which probes
+contribute to each.
 
 ## Methods
 
