@@ -6,10 +6,14 @@
 **Pass Threshold:** 70/100 points  
 
 **Disclosure model (recommendation A, 2026-06-27 audit):** this file lists the
-visible thresholds the implementing agent should target — Lighthouse > 70,
-axe-core < 5 violations, concrete viewport/responsive criteria, etc. — as
-pass/fail targets. The held-back evaluator adds additional probes beyond these
-visible thresholds; the implementing agent cannot enumerate them by reading
+visible targets the implementing agent should aim at — Lighthouse Performance
+score ≥ 70, axe-core accessibility violations < 5 of `serious`/`critical`
+impact, concrete viewport/responsive criteria, etc. Some of these targets
+appear in the 100-point core score; the audit and accessibility audits
+(Lighthouse ≥ 70, axe-core < 5) are scored in the Evidence bonus section
+(§7.2 / §7.3, +5 of the 10 bonus points), not as gating line items in the
+70/100 pass threshold. The held-back evaluator adds additional probes beyond
+these visible targets; the implementing agent cannot enumerate them by reading
 this file. This model is shared with `benchmarks/airbnb-clone/visible_acceptance.md`.
 
 ---
