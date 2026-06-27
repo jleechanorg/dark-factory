@@ -310,3 +310,73 @@ def test_prompts_with_state_dot_test_path_are_bug_fix_lane_only() -> None:
             f"${{state.bug_fix.test_path}}; this is the bug_fix lane's "
             f"contract and should not leak into other prompts."
         )
+
+
+# ---------------------------------------------------------------------------
+# Domain-agnosticism invariants (jleechan-9bi / Lane A audit-2026-06-27)
+# ---------------------------------------------------------------------------
+
+
+# Banned terms: any reappearance in the slim/review.md reviewer prompt is
+# a regression of the domain-agnosticism audit. The list is exhaustive as of
+# 2026-06-27 and mirrors the per-bead acceptance criteria.
+DOMAIN_BIAS_TERMS: tuple[str, ...] = (
+    # world-architect / D&D-shaped phrasing
+    "level-up",
+    "level_up",
+    "world_logic",
+    "wizard",
+    "Fighter",
+    "campaign class",
+    # streaming-app evidence filename baked in as universal
+    "streaming_evidence",
+)
+
+
+@pytest.mark.parametrize("banned_term", DOMAIN_BIAS_TERMS)
+def test_slim_review_prompt_contains_no_domain_bias_terms(banned_term: str) -> None:
+    """``prompts/slim/review.md`` is the slim-lane reviewer prompt and
+    must remain domain-agnostic. Any reappearance of a D&D /
+    world-architect term (``level-up``, ``wizard``, ``Fighter``,
+    ``campaign class``, ...) or the streaming-app-specific evidence
+    filename (``streaming_evidence``) means a refactor accidentally
+    re-leaked the legacy benchmark-specific phrasing into the generic
+    reviewer. This pins the 2026-06-27 audit Lane A acceptance criteria
+    for bead ``jleechan-9bi``.
+    """
+    text = _read_prompt("prompts/slim/review.md")
+    assert banned_term not in text, (
+        f"prompts/slim/review.md contains banned domain-bias term "
+        f"{banned_term!r}. The slim reviewer prompt must remain "
+        f"domain-agnostic; replace with the generic phrasing documented "
+        f"in the 2026-06-27 audit goal file "
+        f"(.dark-factory/audit-2026-06-27-goal.md Lane A)."
+    )
+
+
+DOMAIN_BIAS_FILENAMES: tuple[str, ...] = (
+    "streaming_evidence.json",
+    "llm_request_responses.jsonl",
+)
+
+
+@pytest.mark.parametrize("banned_filename", DOMAIN_BIAS_FILENAMES)
+def test_slim_review_prompt_contains_no_vendor_specific_filenames(
+    banned_filename: str,
+) -> None:
+    """``prompts/slim/review.md`` references canonical evidence
+    filenames in step 4 (Evidence quality check). Those filenames must
+    be vendor-neutral placeholders (``<primary-evidence.json>``,
+    ``<run-trace.jsonl>``) rather than streaming-app-specific defaults
+    (``streaming_evidence.json``) or LLM-vendor-specific JSONL
+    (``llm_request_responses.jsonl``).
+
+    Pinned by bead ``jleechan-9bi`` (Lane A, audit-2026-06-27).
+    """
+    text = _read_prompt("prompts/slim/review.md")
+    assert banned_filename not in text, (
+        f"prompts/slim/review.md contains vendor/streaming-specific "
+        f"filename {banned_filename!r}. Replace with a generic "
+        f"placeholder (``<primary-evidence.json>`` or "
+        f"``<run-trace.jsonl>``)."
+    )
