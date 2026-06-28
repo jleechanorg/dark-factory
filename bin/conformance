@@ -202,6 +202,73 @@ def _check_level5(graph, path: pathlib.Path) -> list[dict]:
 
     # --- HARD TIER (errors) ---
 
+    skip_explore = str(graph_attrs.get("skip_explore", "")).strip().lower() == "true"
+    skip_plan = str(graph_attrs.get("skip_plan", "")).strip().lower() == "true"
+    skip_implement = str(graph_attrs.get("skip_implement", "")).strip().lower() == "true"
+    skip_fix = str(graph_attrs.get("skip_fix", "")).strip().lower() == "true"
+
+    has_explore = False
+    has_plan = False
+    has_implement = False
+    has_fix = False
+
+    for node in graph.nodes.values():
+        name_lower = node.name.lower()
+        # Mirror runner/parser.py:_selector_matches — `class` is a space- or
+        # comma-separated token list (e.g. "codergen explore"). Membership check
+        # only, never scalar compare.
+        class_tokens = (
+            str(node.attrs.get("class", ""))
+            .replace(",", " ")
+            .lower()
+            .split()
+        )
+        if name_lower == "explore" or "explore" in class_tokens:
+            has_explore = True
+        if name_lower == "plan" or "plan" in class_tokens:
+            has_plan = True
+        if name_lower == "implement" or "implement" in class_tokens:
+            has_implement = True
+        if name_lower == "fix" or "fix" in class_tokens:
+            has_fix = True
+
+    if not has_explore and not skip_explore:
+        diagnostics.append(
+            _diagnostic(
+                "missing_coding_role",
+                "error",
+                "Level-5 graph must contain an explore node (name='explore' or class='explore'), "
+                "or opt out with graph [skip_explore=\"true\"].",
+            )
+        )
+    if not has_plan and not skip_plan:
+        diagnostics.append(
+            _diagnostic(
+                "missing_coding_role",
+                "error",
+                "Level-5 graph must contain a plan node (name='plan' or class='plan'), "
+                "or opt out with graph [skip_plan=\"true\"].",
+            )
+        )
+    if not has_implement and not skip_implement:
+        diagnostics.append(
+            _diagnostic(
+                "missing_coding_role",
+                "error",
+                "Level-5 graph must contain an implement node (name='implement' or class='implement'), "
+                "or opt out with graph [skip_implement=\"true\"].",
+            )
+        )
+    if not has_fix and not skip_fix:
+        diagnostics.append(
+            _diagnostic(
+                "missing_coding_role",
+                "error",
+                "Level-5 graph must contain a fix node (name='fix' or class='fix'), "
+                "or opt out with graph [skip_fix=\"true\"].",
+            )
+        )
+
     has_gate_er = False
     has_gate_skeptic = False
     for node in graph.nodes.values():

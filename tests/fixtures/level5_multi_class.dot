@@ -1,9 +1,6 @@
-// Minimal Level-5 compliant fixture — satisfies all hard-tier gates and
-// declares soft-tier nodes (holdout, healer, spec_validation) explicitly so
-// the conformance validator should produce zero diagnostics.
-digraph level5_valid {
+digraph level5_multi_class {
     graph [
-        goal="Level-5 reference fixture for conformance validate tests."
+        goal="Level-5 fixture where coding roles are declared via multi-token `class` attributes."
         backend="claude"
         level5="true"
         test_fixture="true"
@@ -13,10 +10,12 @@ digraph level5_valid {
     start [shape=Mdiamond, label="Start"]
     exit  [shape=Msquare,  label="Exit"]
 
-    explore   [type="codergen", prompt="@prompts/hello/explore.md"]
-    plan      [type="codergen", prompt="@prompts/hello/plan.md"]
-    implement [type="codergen", prompt="@prompts/hello/implement.md"]
-    fix       [type="codergen", prompt="@prompts/hello/fix.md", max_visits="3"]
+    // Coding roles declared via space-separated `class` tokens,
+    // mirroring how real graphs combine role + styling classes.
+    explore   [type="codergen", class="codergen explore", prompt="@prompts/hello/explore.md"]
+    plan      [type="codergen", class="codergen plan",    prompt="@prompts/hello/plan.md"]
+    implement [type="codergen", class="codergen,implement", prompt="@prompts/hello/implement.md"]
+    fix       [type="codergen", class="codergen,fix",       prompt="@prompts/hello/fix.md", max_visits="3"]
 
     holdout         [type="holdout_eval", label="Holdout Eval", feature="hello", timeout=600]
     gate_er         [type="gate_er",      label="/er Evidence Review",            timeout=600]

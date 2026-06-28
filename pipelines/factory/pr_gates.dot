@@ -3,6 +3,9 @@ digraph pr_gates {
         goal="PR validation: sealed holdouts + 3 adversarial gates."
         level5="true"
         label="PR Gates"
+        skip_explore="true"
+        skip_plan="true"
+        skip_implement="true"
     ]
     rankdir=LR
 

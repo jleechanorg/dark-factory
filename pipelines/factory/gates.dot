@@ -3,6 +3,9 @@ digraph gates {
         goal="Full validation: holdout + 3 adversarial gates."
         level5="true"
         label="Gates"
+        skip_explore="true"
+        skip_plan="true"
+        skip_implement="true"
     ]
     rankdir=LR
 
