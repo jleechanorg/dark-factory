@@ -279,8 +279,6 @@ def _find_unregistered_handler_refs(graph: Graph) -> list[tuple[str, str]]:
         t = node.attrs.get("type")
         if not t:
             continue  # no explicit type → shape/name/default → always resolves
-        if t in {"codergen", "dynamic"}:
-            continue
         if t in handlers.TYPE_REGISTRY:
             continue
         if node.shape in handlers.REGISTRY:

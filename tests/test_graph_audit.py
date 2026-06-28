@@ -369,6 +369,7 @@ def test_gate_skeptic_counts_as_reviewer_for_g1(tmp_path):
 
 
 @pytest.mark.parametrize("bad_type", [
+    "dynamic",
     "fake_typo_gate",
     "gate_erx",
     "parallel_reviwer",
