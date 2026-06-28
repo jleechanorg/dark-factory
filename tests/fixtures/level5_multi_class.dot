@@ -1,0 +1,50 @@
+digraph level5_multi_class {
+    graph [
+        goal="Level-5 fixture where coding roles are declared via multi-token `class` attributes."
+        backend="claude"
+        level5="true"
+        test_fixture="true"
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    // Coding roles declared via space-separated `class` tokens,
+    // mirroring how real graphs combine role + styling classes.
+    explore   [type="codergen", class="codergen explore", prompt="@prompts/hello/explore.md"]
+    plan      [type="codergen", class="codergen plan",    prompt="@prompts/hello/plan.md"]
+    implement [type="codergen", class="codergen,implement", prompt="@prompts/hello/implement.md"]
+    fix       [type="codergen", class="codergen,fix",       prompt="@prompts/hello/fix.md", max_visits="3"]
+
+    holdout         [type="holdout_eval", label="Holdout Eval", feature="hello", timeout=600]
+    gate_er         [type="gate_er",      label="/er Evidence Review",            timeout=600]
+    gate_skeptic    [type="gate_skeptic", label="Skeptic (inverted incentive)",   timeout=600]
+    adversarial     [type="tool",         label="Cross-vendor adversarial reviewer",
+                     command="codex exec --yolo review --pr ${state.pr_url}",
+                     timeout=600]
+    healer          [type="tool",         label="CXDB failure cluster",
+                     command="df-healer --cxdb ${state.cxdb_path}",
+                     timeout=600]
+    spec_validation [type="codergen",     prompt="@prompts/hello/spec_validation.md"]
+
+    start -> explore
+    explore -> plan [condition="outcome=success"]
+    explore -> fix  [condition="outcome!=success"]
+    plan -> implement [condition="outcome=success"]
+    plan -> fix  [condition="outcome!=success"]
+    implement -> holdout
+    holdout -> gate_er [condition="outcome=success"]
+    holdout -> fix     [condition="outcome!=success"]
+    gate_er -> gate_skeptic [condition="outcome=success"]
+    gate_er -> fix         [condition="outcome!=success"]
+    gate_skeptic -> adversarial [condition="outcome=success"]
+    gate_skeptic -> fix         [condition="outcome!=success"]
+    adversarial -> spec_validation [condition="outcome=success"]
+    adversarial -> fix            [condition="outcome!=success"]
+    spec_validation -> exit [condition="outcome=success"]
+    spec_validation -> fix  [condition="outcome!=success"]
+    fix -> healer [condition="outcome=exhausted"]
+    fix -> holdout [condition="outcome!=exhausted"]
+    healer -> exit
+}

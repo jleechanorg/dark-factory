@@ -159,6 +159,23 @@ def test_level5_with_skip_passes():
     assert payload["diagnostics"] == [], payload
 
 
+def test_level5_multi_class_role_attributes_pass():
+    """`class` is a space- or comma-separated token list, not a scalar.
+
+    Real graphs combine the role token with routing/styling classes
+    (`class="codergen explore"` or `class="codergen,implement"`). The
+    coding-role check must tokenize before comparing, the same way
+    `runner.parser._selector_matches` does — otherwise valid graphs
+    false-fail with `missing_coding_role`. Regression test for the Codex
+    cold-review finding on PR #130.
+    """
+    proc = run_conformance("validate", "tests/fixtures/level5_multi_class.dot")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    payload = json.loads(proc.stdout)
+    error_diags = [d for d in payload["diagnostics"] if d.get("severity") == "error"]
+    assert error_diags == [], payload
+
+
 def test_slim_pipelines_exempt_from_level5():
     """Slim pipelines must remain free of Level-5 hard-tier enforcement."""
     proc = run_conformance("validate", "pipelines/slim/minimal_feature.dot")

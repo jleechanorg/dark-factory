@@ -214,14 +214,22 @@ def _check_level5(graph, path: pathlib.Path) -> list[dict]:
 
     for node in graph.nodes.values():
         name_lower = node.name.lower()
-        class_val = str(node.attrs.get("class", "")).strip().lower()
-        if name_lower == "explore" or class_val == "explore":
+        # Mirror runner/parser.py:_selector_matches — `class` is a space- or
+        # comma-separated token list (e.g. "codergen explore"). Membership check
+        # only, never scalar compare.
+        class_tokens = (
+            str(node.attrs.get("class", ""))
+            .replace(",", " ")
+            .lower()
+            .split()
+        )
+        if name_lower == "explore" or "explore" in class_tokens:
             has_explore = True
-        if name_lower == "plan" or class_val == "plan":
+        if name_lower == "plan" or "plan" in class_tokens:
             has_plan = True
-        if name_lower == "implement" or class_val == "implement":
+        if name_lower == "implement" or "implement" in class_tokens:
             has_implement = True
-        if name_lower == "fix" or class_val == "fix":
+        if name_lower == "fix" or "fix" in class_tokens:
             has_fix = True
 
     if not has_explore and not skip_explore:
