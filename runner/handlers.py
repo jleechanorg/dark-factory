@@ -127,6 +127,7 @@ from .handler_universal_prompts import (
     _gate_code_standards,
     UNIVERSAL_DEAD_CODE_PROMPT,
     _gate_dead_code,
+    _gate_skeptic,
 )
 
 # Net-LOC + slash + pytest gates.
@@ -201,6 +202,7 @@ TYPE_REGISTRY: "dict[str, Handler]" = {
     "gate_code_standards": _gate_code_standards,
     "gate_net_loc": _gate_net_loc,
     "gate_dead_code": _gate_dead_code,
+    "gate_skeptic": _gate_skeptic,
     "gate_slash": _gate_slash,
     "gate_red": _gate_red,
     "gate_green": _gate_green,

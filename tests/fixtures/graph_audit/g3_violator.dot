@@ -1,0 +1,6 @@
+digraph g3_violator {
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+    gate_skeptic [type="gate_skeptic", timeout=600]
+    start -> gate_skeptic -> exit
+}

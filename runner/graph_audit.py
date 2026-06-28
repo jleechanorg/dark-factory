@@ -71,8 +71,24 @@ TOPOLOGY_ONLY_SHAPES: frozenset[str] = frozenset({"point", "component", "tripleo
 # that gate / holdout the workflow at the boundary between coder output
 # and merge readiness.
 _REVIEWER_TYPE_NAMES: frozenset[str] = frozenset(
-    {"gate_es", "gate_er", "gate_code_standards", "holdout_eval", "parallel_reviewer"}
+    {"gate_es", "gate_er", "gate_skeptic", "gate_code_standards", "holdout_eval", "parallel_reviewer"}
 )
+
+# Hard-tier reviewer type names. A node declaring ``type=<one-of-these>``
+# in a .dot MUST have its handler registered in
+# ``runner.handlers.TYPE_REGISTRY`` or the runtime resolver falls through
+# to ``_codergen`` (silent regression — gate_skeptic P0 bug class).
+# Mirrors the bead-jleechan-0qy.5 contract: every hard-tier reviewer
+# class has a real handler; missing handler = fail loudly here, not at
+# runtime.
+_HARD_TIER_REVIEWER_TYPES: frozenset[str] = frozenset({
+    "gate_es",
+    "gate_er",
+    "gate_skeptic",
+    "gate_code_standards",
+    "holdout_eval",
+    "parallel_reviewer",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +126,7 @@ class Violation:
     ``message``     — human-readable explanation; one short line.
     """
 
-    kind: Literal["G1", "G2"]
+    kind: Literal["G1", "G2", "G3", "R1"]
     pipeline: str
     location: str
     message: str
@@ -243,6 +259,32 @@ def _is_outcome_failure_condition(condition: Optional[str]) -> bool:
 # recursive DFS with a ``visited + reviewer_seen`` state so we don't
 # re-explore branches that already passed through a reviewer.
 # ---------------------------------------------------------------------------
+
+
+def _find_unregistered_handler_refs(graph: Graph) -> list[tuple[str, str]]:
+    """Return ``[(node_name, type_name), ...]`` for every node whose
+    explicit ``type="..."`` attribute references a handler NOT in
+    ``runner.handlers.TYPE_REGISTRY`` and NOT resolved by shape/name
+    fallbacks.
+
+    Mirrors ``_resolved_type_label``'s contract. A node with NO explicit
+    ``type=`` attribute resolves via shape/name/default and is always
+    OK. Only nodes that EXPLICITLY say ``type="foo"`` where ``foo`` is
+    not in TYPE_REGISTRY and not shape-resolvable are flagged.
+    """
+    bad: list[tuple[str, str]] = []
+    for name, node in graph.nodes.items():
+        if name in {"start", "exit"}:
+            continue
+        t = node.attrs.get("type")
+        if not t:
+            continue  # no explicit type → shape/name/default → always resolves
+        if t in handlers.TYPE_REGISTRY:
+            continue
+        if node.shape in handlers.REGISTRY:
+            continue
+        bad.append((name, str(t)))
+    return bad
 
 
 def _find_unreviewed_code_paths(graph: Graph) -> list[tuple[str, ...]]:
@@ -395,6 +437,31 @@ def audit_graph(path: pathlib.Path) -> list[Violation]:
         ]
 
     violations: list[Violation] = []
+
+    # G3 / R1 — node explicitly references a handler type the runner
+    # cannot resolve. Two flavors:
+    #   (a) hard-tier reviewer types not registered (gate_skeptic P0
+    #       bug class) — emits "G3";
+    #   (b) any other type-typo (gate_erx, parallel_reviwer, etc.)
+    #       that would silently fall through to _codergen — emits "R1".
+    unresolved = _find_unregistered_handler_refs(graph)
+    for node_name, type_name in unresolved:
+        is_hard_tier = type_name in _HARD_TIER_REVIEWER_TYPES
+        violations.append(
+            Violation(
+                kind="G3" if is_hard_tier else "R1",
+                pipeline=relpath,
+                location=node_name,
+                message=(
+                    f"node {node_name!r} declares type={type_name!r} but "
+                    f"{type_name!r} is not in runner.handlers.TYPE_REGISTRY. "
+                    f"Runtime resolver falls through to _codergen "
+                    f"(silent regression)"
+                    + (" — hard-tier reviewer MUST be registered"
+                       if is_hard_tier else "")
+                ),
+            )
+        )
 
     # G1 — at least one path from start to exit that visits a
     # code-producer and zero reviewers.
