@@ -85,6 +85,8 @@ def test_resolved_type_label_matches_engine(name, attrs, want_label):
         ({"type": "gate_es"}, False, True),
         # type="gate_er" — reviewer.
         ({"type": "gate_er"}, False, True),
+        # type="gate_skeptic" — reviewer.
+        ({"type": "gate_skeptic"}, False, True),
         # type="gate_code_standards" — reviewer.
         ({"type": "gate_code_standards"}, False, True),
         # type="holdout_eval" — reviewer (the only behavioral gate).
@@ -291,9 +293,10 @@ def test_g3_registered_types_pass(tmp_path):
             exit  [shape=Msquare]
             reviewer_es [type="gate_es", timeout=120]
             reviewer_er [type="gate_er", timeout=120]
+            reviewer_skeptic [type="gate_skeptic", timeout=120]
             reviewer_holdout [type="holdout_eval", timeout=120]
             reviewer_parallel [type="parallel_reviewer", timeout=120]
-            start -> reviewer_es -> reviewer_er -> reviewer_holdout -> reviewer_parallel -> exit
+            start -> reviewer_es -> reviewer_er -> reviewer_skeptic -> reviewer_holdout -> reviewer_parallel -> exit
         }
     """))
     violations = graph_audit.audit_graph(p)
@@ -340,6 +343,28 @@ def test_g3_library_fragment_is_exempt(tmp_path):
     g3_or_r1 = [v for v in violations if v.kind in ("G3", "R1")]
     assert g3_or_r1 == [], (
         f"library fragment should be exempt from G3/R1; got: {g3_or_r1}"
+    )
+
+
+def test_gate_skeptic_counts_as_reviewer_for_g1(tmp_path):
+    """Regression: gate_skeptic must satisfy reviewer coverage.
+
+    The handler was registered for runtime dispatch, but graph_audit also
+    needs to classify it as a reviewer so G1 does not flag valid Level-5
+    graphs as missing review coverage.
+    """
+    p = _write_dot(tmp_path, "skeptic_reviewer.dot", """\
+        digraph skeptic_reviewer {
+            start [shape=Mdiamond]
+            exit  [shape=Msquare]
+            coder [type="codergen", prompt="@prompts/slim/implement.md", timeout=120]
+            gate_skeptic [type="gate_skeptic", timeout=120]
+            start -> coder -> gate_skeptic -> exit
+        }
+    """)
+    violations = graph_audit.audit_graph(p)
+    assert not any(v.kind == "G1" for v in violations), (
+        f"gate_skeptic should satisfy G1 reviewer coverage, got: {violations}"
     )
 
 
