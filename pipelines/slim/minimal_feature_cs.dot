@@ -52,6 +52,7 @@ digraph MinimalFeatureFactoryCS {
   holdout [
     type="holdout_eval",
     label="Behavioral Holdouts",
+    feature="${state.feature}",
     validation=true,
     goal_gate=true,
     timeout=600,

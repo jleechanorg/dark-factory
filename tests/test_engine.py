@@ -188,6 +188,42 @@ def test_cli_feature_flag_overrides_dot_feature(tmp_path):
     assert '"final_outcome": "success"' not in proc.stdout
 
 
+def test_cli_missing_holdout_feature_fails_before_run(tmp_path):
+    dot = tmp_path / "missing_feature.dot"
+    dot.write_text(
+        'digraph missing_feature {\n'
+        '  start [shape=Mdiamond]\n'
+        '  holdout [type="holdout_eval", feature="${state.feature}"]\n'
+        '  fix [type="codergen", prompt="@prompts/hello/fix.md"]\n'
+        '  exit [shape=Msquare]\n'
+        '  start -> holdout\n'
+        '  holdout -> exit [condition="outcome=success"]\n'
+        '  holdout -> fix [condition="outcome!=success"]\n'
+        '  fix -> holdout\n'
+        '}\n'
+    )
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "runner",
+            "--pipeline", str(dot),
+            "--goal", "smoke",
+            "--backend", "echo",
+            "--workdir", str(tmp_path),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert proc.returncode == 2
+    assert "holdout_eval requires feature metadata before execution" in proc.stderr
+    assert "missing for node(s): holdout" in proc.stderr
+    assert '"node": "fix"' not in proc.stdout
+    assert not (tmp_path / "evidence").exists()
+
+
 def test_max_steps_before_exit_is_failure():
     """A run that stops before reaching exit must not report success."""
     g = parse(_pipeline("hello.dot"))

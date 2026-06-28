@@ -221,6 +221,24 @@ def _tcp_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
         return False
 
 
+def _missing_feature_result(node: "Node", ctx: "Context", detail: str | None = None) -> "Result":
+    pipeline = str(ctx.state.get("_pipeline") or ctx.state.get("pipeline") or "<unknown>")
+    lines = [
+        "holdout_eval is missing required feature metadata.",
+        f"- node: {node.name}",
+        f"- pipeline: {pipeline}",
+        f"- workdir: {ctx.workdir}",
+        f"- goal: {ctx.goal}",
+    ]
+    if detail:
+        lines.append(f"- detail: {detail}")
+    lines.extend([
+        "- required: set node feature=\"<holdout-feature>\" or ctx.state['feature'] before this node runs.",
+        "- impact: sealed holdouts were not executed; fix the graph/run configuration before changing product code.",
+    ])
+    return Result(outcome="failure", output="\n".join(lines))
+
+
 def _holdout_eval(node: "Node", ctx: "Context") -> "Result":
     """Run the sealed holdout evaluator in a separate process.
 
@@ -246,10 +264,10 @@ def _holdout_eval(node: "Node", ctx: "Context") -> "Result":
     if isinstance(feature, str) and "${state." in feature:
         feature = _handlers_shim._substitute_state(feature, ctx)
         if "${state." in feature:
-            return Result(outcome="failure", output=f"unresolved feature path: {node_feature!r}")
+            return _missing_feature_result(node, ctx, f"unresolved feature placeholder {node_feature!r}")
     feature = str(feature or "").strip()
     if not feature:
-        return Result(outcome="failure", output="no feature attribute or state")
+        return _missing_feature_result(node, ctx)
 
     eval_script = repo_path / "evaluator" / "run.py"
     try:

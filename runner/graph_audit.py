@@ -126,7 +126,7 @@ class Violation:
     ``message``     — human-readable explanation; one short line.
     """
 
-    kind: Literal["G1", "G2", "G3", "R1"]
+    kind: Literal["G1", "G2", "G3", "G4", "R1"]
     pipeline: str
     location: str
     message: str
@@ -284,6 +284,21 @@ def _find_unregistered_handler_refs(graph: Graph) -> list[tuple[str, str]]:
         if node.shape in handlers.REGISTRY:
             continue
         bad.append((name, str(t)))
+    return bad
+
+
+def _find_unconfigured_holdout_refs(graph: Graph) -> list[str]:
+    """Return holdout_eval nodes that do not declare how to find a feature."""
+    bad: list[str] = []
+    for name, node in graph.nodes.items():
+        if _resolved_type_label(node) != "holdout_eval":
+            continue
+        feature = str(node.attrs.get("feature") or "").strip()
+        if feature and (feature == "${state.feature}" or "${state.feature}" not in feature):
+            continue
+        if str(node.attrs.get("allow_missing_feature") or "").lower() == "true":
+            continue
+        bad.append(name)
     return bad
 
 
@@ -463,6 +478,21 @@ def audit_graph(path: pathlib.Path) -> list[Violation]:
             )
         )
 
+    for node_name in _find_unconfigured_holdout_refs(graph):
+        violations.append(
+            Violation(
+                kind="G4",
+                pipeline=relpath,
+                location=node_name,
+                message=(
+                    f"holdout_eval node {node_name!r} has no feature. Set "
+                    'feature="<holdout-feature>" or feature="${state.feature}", '
+                    'or add allow_missing_feature="true" for an intentional '
+                    "holdout-less/externally configured path."
+                ),
+            )
+        )
+
     # G1 — at least one path from start to exit that visits a
     # code-producer and zero reviewers.
     code_producers = [n for n in graph.nodes.values() if _is_code_producing(n)]
@@ -540,7 +570,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         prog="python -m runner.graph_audit",
         description=(
             "Static structural audit for dark-factory pipelines. "
-            "Exits 0 if no G1/G2 violations are found under the "
+            "Exits 0 if no graph-audit violations are found under the "
             "given directory, 1 otherwise."
         ),
     )
@@ -560,7 +590,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     if not violations:
-        print("OK: no G1/G2 violations found.")
+        print("OK: no graph-audit violations found.")
         return 0
 
     print(_format_report(violations))

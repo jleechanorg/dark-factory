@@ -14,7 +14,7 @@ import traceback
 from .engine import run
 from .handlers import Context
 from .panic_hook import PANIC_EXIT_CODE
-from .parser import parse, validate_pipeline
+from .parser import Graph, parse, validate_pipeline
 from .paths import resolve_factory_path, resolve_pipeline_path
 
 _PANIC_DIR = pathlib.Path.home() / ".dark-factory" / "panics"
@@ -71,6 +71,37 @@ def _record_cxdb_panic(
                 cxdb.close()
             except Exception:
                 pass
+
+
+def _missing_holdout_feature_nodes(graph: Graph, state: dict[str, str]) -> list[str]:
+    """Return holdout nodes that cannot resolve a feature before execution."""
+    missing: list[str] = []
+    for name, node in graph.nodes.items():
+        if str(node.attrs.get("type") or "") != "holdout_eval":
+            continue
+        if str(node.attrs.get("allow_missing_feature") or "").lower() == "true":
+            continue
+        feature = str(node.attrs.get("feature") or "").strip()
+        if not feature:
+            if not str(state.get("feature") or "").strip():
+                missing.append(name)
+            continue
+        unresolved = False
+        resolved = feature
+        while "${state." in resolved:
+            start = resolved.find("${state.")
+            end = resolved.find("}", start)
+            if end == -1:
+                unresolved = True
+                break
+            key = resolved[start + len("${state."):end]
+            value = str(state.get(key) or "")
+            if not value:
+                unresolved = True
+            resolved = resolved[:start] + value + resolved[end + 1:]
+        if unresolved or not resolved.strip():
+            missing.append(name)
+    return missing
 
 
 def _handle_panic(
@@ -314,6 +345,25 @@ def main(argv: list[str] | None = None) -> int:
         if not args.goal:
             p.error("--goal is required unless --preflight is set")
 
+        graph = parse(pipeline_path)
+        initial_state: dict[str, str] = {}
+        for kv in args.state:
+            if "=" not in kv:
+                p.error(f"--state requires KEY=VALUE format, got: {kv!r}")
+            k, v = kv.split("=", 1)
+            initial_state[k] = v
+        initial_state.setdefault("_df_shadow_codex_review", "true")
+        if args.feature:
+            initial_state["feature"] = args.feature
+        missing_feature_nodes = _missing_holdout_feature_nodes(graph, initial_state)
+        if missing_feature_nodes:
+            p.error(
+                "holdout_eval requires feature metadata before execution; "
+                f"missing for node(s): {', '.join(missing_feature_nodes)}. "
+                'Pass --feature <feature>, pass --state feature=<feature>, set node feature="<holdout-feature>", '
+                'or mark allow_missing_feature="true" for intentional opt-outs.'
+            )
+
         explicit_evidence_bundle = args.evidence_bundle is not None
         evidence_staging_dir = None
         if args.evidence_bundle is None:
@@ -332,7 +382,6 @@ def main(argv: list[str] | None = None) -> int:
             # CLI is forgiving for ad-hoc smoke runs.
             args.cxdb = args.evidence_bundle / "_run.sqlite"
 
-        graph = parse(pipeline_path)
         perf_log_root = None if args.no_perf_log else args.perf_log_dir
         ctx = Context(
             goal=args.goal,
@@ -342,14 +391,7 @@ def main(argv: list[str] | None = None) -> int:
             event_log_path=args.events,
             perf_log_root=perf_log_root,
         )
-        for kv in args.state:
-            if "=" not in kv:
-                p.error(f"--state requires KEY=VALUE format, got: {kv!r}")
-            k, v = kv.split("=", 1)
-            ctx.state[k] = v
-        ctx.state.setdefault("_df_shadow_codex_review", "true")
-        if args.feature:
-            ctx.state["feature"] = args.feature
+        ctx.state.update(initial_state)
         if args.backend == "ao":
             if not args.ao_project:
                 p.error("--backend ao requires --ao-project")

@@ -98,6 +98,37 @@ def test_detect_recognises_package_json_start_script(tmp_path):
     assert _detect_emulator_backend(tmp_path) == "node_start"
 
 
+def test_holdout_missing_feature_returns_actionable_handoff(tmp_path):
+    node = Node(name="holdout", attrs={"type": "holdout_eval"})
+    ctx = Context(goal="validate evidence", workdir=tmp_path, backend="echo")
+    ctx.state["_pipeline"] = "pr_gates"
+
+    result = _holdout_eval(node, ctx)
+
+    assert result.outcome == "failure"
+    assert "no feature attribute or state" not in result.output
+    assert "holdout_eval is missing required feature metadata" in result.output
+    assert "node: holdout" in result.output
+    assert "pipeline: pr_gates" in result.output
+    assert "set node feature" in result.output
+    assert "sealed holdouts were not executed" in result.output
+
+
+def test_holdout_unresolved_state_feature_returns_actionable_handoff(tmp_path):
+    node = Node(name="holdout", attrs={"type": "holdout_eval", "feature": "${state.feature}"})
+    ctx = Context(goal="validate evidence", workdir=tmp_path, backend="echo")
+    ctx.state["_pipeline"] = "pr_gates"
+
+    result = _holdout_eval(node, ctx)
+
+    assert result.outcome == "failure"
+    assert "unresolved feature path" not in result.output
+    assert "holdout_eval is missing required feature metadata" in result.output
+    assert "unresolved feature placeholder" in result.output
+    assert "${state.feature}" in result.output
+    assert "sealed holdouts were not executed" in result.output
+
+
 def test_detect_handles_missing_or_unreadable_files_gracefully(tmp_path):
     """Detection must not raise when manifests are partial or unreadable."""
     import json as _json
