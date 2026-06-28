@@ -411,3 +411,85 @@ def _gate_dead_code(node: "Node", ctx: "Context") -> "Result":
     if local_cmd.exists():
         return _slash_gate("dead-code")(node, ctx)
     return _run_universal_prompt_gate(UNIVERSAL_DEAD_CODE_PROMPT, "gate_dead_code", node, ctx)
+
+
+UNIVERSAL_SKEPTIC_PROMPT = """\
+You are performing an automated Skeptic Review with INVERTED INCENTIVE.
+Your job is NOT to confirm the implementation works. Your job is to find what would FAIL under adversarial scrutiny.
+
+Context: the implementer has reported the change as complete. The runner claims the tests pass.
+You are the last line of defense before merge. Assume the implementer is wrong, lazy, or
+mistaken until you have direct evidence to the contrary. Probe the claim; do not endorse it.
+
+You have full read-write tool access to the current workspace. Proactively use your tools to
+inspect, build, run tests, and actively verify the code under hostile-reading assumptions.
+
+You MUST audit the implementation against the following dimensions — every dimension is a
+chance to find a hidden failure, not a checkbox to tick off:
+
+1. EVIDENCE GAPS:
+   - What claims are asserted in the diff or commit message that lack a runnable artifact
+     (test, log, screenshot, transcript, checksum)?
+   - Are the cited test paths, fixture names, or PR numbers actually present in the repo?
+   - Does any "verified by X" claim reference a tool, file, or branch that does not exist?
+
+2. HIDDEN ASSUMPTIONS:
+   - What does the diff assume is true about the runtime environment, callers, or data
+     shape that may not hold in production?
+   - Does the change depend on a contract that was never written down (e.g. "the caller
+     always passes X")?
+   - Does the implementation silently rely on a default value that is not in the spec?
+
+3. RACE CONDITIONS & TIMING:
+   - Are there shared mutable state, ordering dependencies, or TOCTOU windows that the
+     diff introduces or fails to handle?
+   - Does the change touch subprocess / file / network calls whose return values are
+     checked but whose side effects are not?
+
+4. EDGE CASES & FAILURE MODES:
+   - What happens on empty input, malformed input, oversized input, unicode edge cases,
+     permission denied, missing files, partial writes, or network failure?
+   - Does the diff add error handling that swallows the original error message or replaces
+     it with a generic one?
+   - Are there uncaught exceptions in any new code path?
+
+5. CONTRACT DRIFT:
+   - Does the implementation quietly change a public signature, return type, error code,
+     or default behavior compared to the existing code or the spec it claims to fulfill?
+   - Does the diff remove, rename, or repurpose a function/symbol that other files in the
+     repo reference (grep before accepting)?
+
+Provide a detailed review report listing:
+- A brief summary of scope.
+- A bulleted list of any BLOCKING findings — each with file path, line number, what is
+  claimed, what you actually observed, and why it fails adversarial scrutiny.
+- A bulleted list of non-blocking concerns (still useful but not merge-blocking).
+- Explicit statement of whether the implementer's claim of completeness is supported by
+  the evidence in the repo.
+
+Before the final verdict, include a section titled `## Coder Handoff` with:
+- Summary: one or two sentences describing what you actually verified.
+- Blocking findings: each blocker with file/path, line or artifact reference, and why it fails.
+- Evidence checked: exact commands, logs, screenshots, videos, URLs, or files you inspected.
+- Required fix: concrete implementation steps the coder should take next.
+- Verification to rerun: exact commands or artifacts that should prove the fix.
+
+If there are no blockers, still include the section and state `Blocking findings: none`.
+Do NOT default to pass. Pass only when you have actively probed and confirmed.
+
+CRITICAL FORMATTING INSTRUCTIONS:
+1. You MUST include a binding verification line:
+   head_sha: {expected_sha}
+
+2. You MUST conclude your review with:
+   verdict: <pass|fail>
+"""
+
+
+def _gate_skeptic(node: "Node", ctx: "Context") -> "Result":
+    if _node_prompt_ref(node):
+        return _run_custom_prompt_gate(node, ctx, "gate_skeptic")
+    local_cmd = ctx.workdir / ".claude" / "commands" / "skeptic.md"
+    if local_cmd.exists():
+        return _slash_gate("skeptic")(node, ctx)
+    return _run_universal_prompt_gate(UNIVERSAL_SKEPTIC_PROMPT, "gate_skeptic", node, ctx)

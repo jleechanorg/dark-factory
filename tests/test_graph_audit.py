@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import pathlib
 import sys
+import textwrap
 
 import pytest
 
@@ -267,4 +268,104 @@ def test_audit_pipelines_dir_is_clean():
     assert violations == [], (
         f"Expected 0 violations in real pipelines/; got {len(violations)}:\n"
         + "\n".join(f"  {v.kind} {v.pipeline}:{v.location} {v.message}" for v in violations)
+    )
+
+
+# ---------------------------------------------------------------------------
+# G3 / R1 — registered-handler enforcement (bead jleechan-0qy.5)
+# ---------------------------------------------------------------------------
+
+
+def _write_dot(tmp_path: pathlib.Path, name: str, body: str) -> pathlib.Path:
+    p = tmp_path / name
+    p.write_text(textwrap.dedent(body), encoding="utf-8")
+    return p
+
+
+def test_g3_registered_types_pass(tmp_path):
+    """Every TYPE_REGISTRY key + the built-in fallbacks must NOT be
+    flagged as unregistered. Confirms the G3/R1 check does not over-flag."""
+    p = _write_dot(tmp_path, "clean.dot", textwrap.dedent("""\
+        digraph clean {
+            start [shape=Mdiamond]
+            exit  [shape=Msquare]
+            reviewer_es [type="gate_es", timeout=120]
+            reviewer_er [type="gate_er", timeout=120]
+            reviewer_holdout [type="holdout_eval", timeout=120]
+            reviewer_parallel [type="parallel_reviewer", timeout=120]
+            start -> reviewer_es -> reviewer_er -> reviewer_holdout -> reviewer_parallel -> exit
+        }
+    """))
+    violations = graph_audit.audit_graph(p)
+    assert not any(v.kind in ("G3", "R1") for v in violations), (
+        f"unexpected G3/R1 violations: "
+        f"{[(v.kind, v.location, v.message) for v in violations if v.kind in ('G3', 'R1')]}"
+    )
+
+
+def test_g3_gate_skeptic_unregistered_fails(tmp_path, monkeypatch):
+    """The P0 bug class: type='gate_skeptic' without TYPE_REGISTRY entry
+    must fail loudly. Without this guard, the runtime silently runs
+    gate_skeptic as _codergen — a silent regression.
+
+    We temporarily remove 'gate_skeptic' from TYPE_REGISTRY to simulate
+    the pre-fix state and confirm the G3 check fires."""
+    import runner.handlers as handlers_mod
+    monkeypatch.delitem(handlers_mod.TYPE_REGISTRY, "gate_skeptic", raising=False)
+    import importlib
+    importlib.reload(graph_audit)
+    try:
+        fixture_path = (
+            pathlib.Path(__file__).parent / "fixtures" / "graph_audit" / "g3_violator.dot"
+        )
+        violations = graph_audit.audit_graph(fixture_path)
+        g3 = [v for v in violations if v.kind == "G3"]
+        assert len(g3) == 1, f"expected 1 G3 violation, got {len(g3)}: {g3}"
+        assert g3[0].location == "gate_skeptic"
+        assert "TYPE_REGISTRY" in g3[0].message
+    finally:
+        importlib.reload(graph_audit)
+
+
+def test_g3_library_fragment_is_exempt(tmp_path):
+    """Files whose raw text contains `include="@..."` are include-only
+    fragments (e.g. pipelines/_base.dot). They are NOT runnable, so the
+    G3 contract does not apply — same exemption G1/G2 already get."""
+    p = tmp_path / "_base.dot"
+    p.write_text('include="@prompts/fragment.md"\n', encoding="utf-8")
+    # Library-skip happens inside audit_graph() (see runner/graph_audit.py
+    # parse-error branch — the `include="@"` raw-text check). Use it
+    # directly because audit_graphs() expects a directory Path.
+    violations = graph_audit.audit_graph(p)
+    g3_or_r1 = [v for v in violations if v.kind in ("G3", "R1")]
+    assert g3_or_r1 == [], (
+        f"library fragment should be exempt from G3/R1; got: {g3_or_r1}"
+    )
+
+
+@pytest.mark.parametrize("bad_type", [
+    "fake_typo_gate",
+    "gate_erx",
+    "parallel_reviwer",
+    "hypothetical_future_gate",
+])
+def test_g3_unregistered_type_is_flagged(tmp_path, bad_type):
+    """Any type='X' where X is not in TYPE_REGISTRY and not shape-resolvable
+    must be flagged. Covers typos and hypothetical future types."""
+    p = _write_dot(tmp_path, f"{bad_type}.dot", textwrap.dedent(f"""\
+        digraph {bad_type} {{
+            start [shape=Mdiamond]
+            exit  [shape=Msquare]
+            n [type="{bad_type}", timeout=120]
+            start -> n -> exit
+        }}
+    """))
+    violations = graph_audit.audit_graph(p)
+    flagged = [
+        v for v in violations
+        if v.kind in ("G3", "R1") and v.location == "n"
+    ]
+    assert len(flagged) == 1, (
+        f"expected 1 G3/R1 violation for type={bad_type!r}; got {len(flagged)}: "
+        f"{[(v.kind, v.location, v.message) for v in flagged]}"
     )
