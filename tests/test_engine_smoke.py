@@ -20,6 +20,33 @@ from runner.healer import report  # noqa: E402
 from runner.parser import parse  # noqa: E402
 
 
+def test_holdout_missing_feature_handoff_reaches_fix_prompt(tmp_path):
+    fix_prompt = tmp_path / "fix.md"
+    fix_prompt.write_text(
+        "fix sees:\n${state._last_output}\n",
+        encoding="utf-8",
+    )
+    dot = tmp_path / "missing_feature_handoff.dot"
+    dot.write_text(
+        "digraph missing_feature_handoff {\n"
+        "  start [shape=Mdiamond]\n"
+        "  holdout [type=\"holdout_eval\"]\n"
+        f"  fix [type=\"codergen\", backend=\"echo\", prompt=\"@{fix_prompt}\", max_visits=\"1\"]\n"
+        "  exit [shape=Msquare]\n"
+        "  start -> holdout\n"
+        "  holdout -> fix [condition=\"outcome!=success\"]\n"
+        "  fix -> exit\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    history = run(parse(dot), Context(goal="validate evidence", workdir=tmp_path, backend="echo"), max_steps=6)
+    fix = next(step for step in history if step.node == "fix")
+
+    assert "holdout_eval is missing required feature metadata" in fix.output_preview
+    assert "no feature attribute or state" not in fix.output_preview
+
+
 def test_gate_echo_seeded_outcome(monkeypatch):
     """Gate handlers in echo mode pull outcome from ctx.state."""
     def fake_holdout(node, ctx):

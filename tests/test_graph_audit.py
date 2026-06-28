@@ -294,7 +294,7 @@ def test_g3_registered_types_pass(tmp_path):
             reviewer_es [type="gate_es", timeout=120]
             reviewer_er [type="gate_er", timeout=120]
             reviewer_skeptic [type="gate_skeptic", timeout=120]
-            reviewer_holdout [type="holdout_eval", timeout=120]
+            reviewer_holdout [type="holdout_eval", feature="hello", timeout=120]
             reviewer_parallel [type="parallel_reviewer", timeout=120]
             start -> reviewer_es -> reviewer_er -> reviewer_skeptic -> reviewer_holdout -> reviewer_parallel -> exit
         }
@@ -304,6 +304,39 @@ def test_g3_registered_types_pass(tmp_path):
         f"unexpected G3/R1 violations: "
         f"{[(v.kind, v.location, v.message) for v in violations if v.kind in ('G3', 'R1')]}"
     )
+
+
+def test_g4_holdout_without_feature_fails(tmp_path):
+    p = _write_dot(tmp_path, "missing_holdout_feature.dot", """\
+        digraph missing_holdout_feature {
+            start [shape=Mdiamond]
+            exit  [shape=Msquare]
+            holdout [type="holdout_eval", timeout=120]
+            start -> holdout -> exit
+        }
+    """)
+
+    violations = graph_audit.audit_graph(p)
+    g4 = [v for v in violations if v.kind == "G4"]
+
+    assert len(g4) == 1, f"expected 1 G4 violation, got {g4}"
+    assert g4[0].location == "holdout"
+    assert "feature" in g4[0].message
+
+
+def test_g4_holdout_state_feature_passes(tmp_path):
+    p = _write_dot(tmp_path, "state_feature_holdout.dot", """\
+        digraph state_feature_holdout {
+            start [shape=Mdiamond]
+            exit  [shape=Msquare]
+            holdout [type="holdout_eval", feature="${state.feature}", timeout=120]
+            start -> holdout -> exit
+        }
+    """)
+
+    violations = graph_audit.audit_graph(p)
+
+    assert not any(v.kind == "G4" for v in violations), violations
 
 
 def test_g3_gate_skeptic_unregistered_fails(tmp_path, monkeypatch):

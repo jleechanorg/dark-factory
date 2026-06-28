@@ -12,7 +12,7 @@ digraph pr_gates {
     // Holdout-always policy: PR diffs run the sealed behavioral holdouts
     // first — evidence gates grade the diff's story, holdouts grade its
     // behavior. Feature comes from --feature / ctx.state["feature"].
-    holdout         [type="holdout_eval",        label="Behavioral Holdouts",          timeout=600]
+    holdout         [type="holdout_eval",        label="Behavioral Holdouts",          feature="${state.feature}", timeout=600]
     gate_skeptic [
         type="gate_skeptic",
         label="Skeptic (inverted-incentive review)",

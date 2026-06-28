@@ -96,6 +96,7 @@ digraph Level5Feature {
     holdout_eval [
         type="holdout_eval",
         label="Behavioral Holdouts",
+        feature="${state.feature}",
         timeout=600
     ]
     healer [
