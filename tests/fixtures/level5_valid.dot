@@ -13,6 +13,8 @@ digraph level5_valid {
     start [shape=Mdiamond, label="Start"]
     exit  [shape=Msquare,  label="Exit"]
 
+    explore   [type="codergen", prompt="@prompts/hello/explore.md"]
+    plan      [type="codergen", prompt="@prompts/hello/plan.md"]
     implement [type="codergen", prompt="@prompts/hello/implement.md"]
     fix       [type="codergen", prompt="@prompts/hello/fix.md", max_visits="3"]
 
@@ -27,7 +29,12 @@ digraph level5_valid {
                      timeout=600]
     spec_validation [type="codergen",     prompt="@prompts/hello/spec_validation.md"]
 
-    start -> implement -> holdout
+    start -> explore
+    explore -> plan [condition="outcome=success"]
+    explore -> fix  [condition="outcome!=success"]
+    plan -> implement [condition="outcome=success"]
+    plan -> fix  [condition="outcome!=success"]
+    implement -> holdout
     holdout -> gate_er [condition="outcome=success"]
     holdout -> fix     [condition="outcome!=success"]
     gate_er -> gate_skeptic [condition="outcome=success"]

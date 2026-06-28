@@ -10,6 +10,8 @@ digraph level5_with_skip {
         test_fixture="true"
         skip_holdout="true"
         skip_spec_validation="true"
+        skip_explore="true"
+        skip_plan="true"
     ]
     rankdir=LR
 
