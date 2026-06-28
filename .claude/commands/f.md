@@ -64,6 +64,51 @@ echo "$ARGUMENTS"
 - **Open PR exists** AND goal is unrelated → **ask the user** which mode
   they meant. Do not silently route.
 
+### Step 0.5: auto-detect CLI backend (NEW — added 2026-06-27)
+
+When the user invokes Claude via a wrapper function in `~/.bashrc` (e.g.
+`claudem`, `clauded`, `codex`, `agy`), bash exports a `BASH_FUNC_<wrapper>%%`
+environment variable. `/f` reads these to pick the right `--backend` flag for
+the dark-factory binary, so the LLM that runs the audit is the same one the
+user picked from their shell.
+
+```bash
+# Detect which bash wrapper (if any) launched this Claude session
+detect_cli_backend() {
+  if   [ -n "${BASH_FUNC_claudem%%:-}"  ]; then echo "minimax"
+  elif [ -n "${BASH_FUNC_clauded%%:-}"  ]; then echo "claude"
+  elif [ -n "${BASH_FUNC_agy%%:-}"      ]; then echo "agy"
+  elif [ -n "${BASH_FUNC_codex%%:-}"    ]; then echo "codex"
+  elif [ -n "${BASH_FUNC_claude%%:-}"   ]; then echo "claude"
+  else                                              echo "claude"  # default
+  fi
+}
+
+DETECTED_BACKEND="$(detect_cli_backend)"
+```
+
+| Bash wrapper | `--backend` flag | Notes |
+|---|---|---|
+| `claudem` (minimax) | `minimax` | `ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic, ANTHROPIC_MODEL=MiniMax-M3` |
+| `clauded` | `claude` | Anthropic Sonnet / Opus via the user's normal subscription |
+| `agy` | `agy` | Antigravity backend |
+| `codex` | `codex` | OpenAI Codex |
+| `claude` (default) | `claude` | Anthropic direct |
+
+**Override precedence** (highest to lowest):
+1. Explicit `--backend <x>` flag in `$ARGUMENTS` wins.
+2. `BASH_FUNC_*` env var (this Step 0.5 detection).
+3. Hardcoded default (`claude`).
+
+**Honesty rule**: Always echo the detected wrapper + override status in the
+proof block, e.g.:
+```
+# CLI backend: minimax (detected from BASH_FUNC_claudem%%); --backend flag: minimax
+```
+
+If the user passed `--backend X` explicitly, that wins and the proof block
+should say `# CLI backend: <detected>, but --backend flag override: <X>`.
+
 ### Default path: invoke the dark-factory binary
 
 After Step 0 resolves PR-vs-feature, select the appropriate pipeline or
@@ -88,10 +133,12 @@ export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$HOME/projects/dark-factory}"
 export DARK_FACTORY_HOLDOUTS="${DARK_FACTORY_HOLDOUTS:-$HOME/projects/dark-factory-holdouts}"
 export PATH="$HOME/.local/bin:$PATH"
 cd <target repo>   # the repo the work lands in
+# Backend: prefer explicit --backend flag, else Step 0.5 detection, else 'claude'
+BACKEND="<DETECTED_BACKEND or --backend override>"
 dark-factory \
   --pipeline <CHOSEN_OR_GENERATED_DOT> \
   --goal "<1-line LLM rationale + scope>" \
-  --backend <echo for smoke | claude/codex/agy/minimax for real> \
+  --backend "$BACKEND" \
   [--feature <holdout-feature-if-applicable>] \
   [--state <KEY>=<VALUE> if needed] \
   --cxdb ~/.dark-factory/cxdb.sqlite
@@ -147,6 +194,7 @@ End every `/f` response with this proof block. Missing any required line means
 the factory run is unproven and must be reported as such:
 
 ```bash
+# CLI backend: <detected-or-override> (source: <BASH_FUNC_X%%|explicit --backend|default>)
 # Literal command run:
 cd /Users/jleechan/projects/<target-repo>
 DARK_FACTORY_HOME=~/projects/dark-factory \
