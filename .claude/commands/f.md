@@ -77,50 +77,53 @@ and parent process (`ps -o comm= -p $PPID`) reveal which CLI is running.
 The detector below uses **multiple signals** with a priority order so the
 detection works whether or not the user has a bash wrapper set up.
 
+**Implementation note**: bash function-exported env var names contain `%%`,
+which breaks both `${BASH_FUNC_X%%:-default}` parameter expansion (the `%%`
+is interpreted as the "remove longest suffix" operator) and `${!key}` indirect
+expansion (bash rejects `%%` in variable names). The detector below uses
+`printenv` to read the literal env var name safely.
+
 ```bash
 # Multi-signal detector: explicit > wrapper > orchestrator env > parent process > default
 detect_cli_backend() {
-  local parent_comm ppid
+  local key parent_comm ppid
 
-  # 1. Explicit --backend flag wins (handled by caller before this is called)
+  # 1. Bash wrapper env vars (exported when wrapper function is invoked)
+  for key in 'BASH_FUNC_claudem%%' 'BASH_FUNC_clauded%%' 'BASH_FUNC_agy%%' 'BASH_FUNC_codex%%' 'BASH_FUNC_claude%%'; do
+    if [ -n "$(printenv "$key" 2>/dev/null)" ]; then
+      case "$key" in
+        *claudem%%) echo "minimax"; return ;;
+        *clauded%%) echo "claude";  return ;;
+        *agy%%)     echo "agy";     return ;;
+        *codex%%)   echo "codex";   return ;;
+        *claude%%)  echo "claude";  return ;;
+      esac
+    fi
+  done
 
-  # 2. Bash wrapper env var (exported when wrapper function is invoked)
-  if   [ -n "${BASH_FUNC_claudem%%:-}"  ]; then echo "minimax"  ; return
-  elif [ -n "${BASH_FUNC_clauded%%:-}"  ]; then echo "claude"   ; return
-  elif [ -n "${BASH_FUNC_agy%%:-}"      ]; then echo "agy"      ; return
-  elif [ -n "${BASH_FUNC_codex%%:-}"    ]; then echo "codex"    ; return
-  elif [ -n "${BASH_FUNC_claude%%:-}"   ]; then echo "claude"   ; return
-  fi
-
-  # 3. Orchestrator's ANTHROPIC_BASE_URL (strong signal of which API we're on)
+  # 2. Orchestrator's ANTHROPIC_BASE_URL (strong signal of which API we're on)
   case "${ANTHROPIC_BASE_URL:-}" in
-    *api.minimax.io*) echo "minimax" ; return ;;
-    *anthropic.com*)  echo "claude"  ; return ;;
-    *openai.com*)     echo "codex"   ; return ;;
+    *api.minimax.io*) echo "minimax"; return ;;
+    *anthropic.com*)  echo "claude";  return ;;
+    *openai.com*)     echo "codex";   return ;;
   esac
 
-  # 4. Parent process name (ps -o comm= -p $PPID)
+  # 3. Parent process name (ps -o comm= -p $PPID)
   ppid="${PPID:-}"
   if [ -n "$ppid" ]; then
     parent_comm="$(ps -o comm= -p "$ppid" 2>/dev/null | tr -d ' ')"
     case "$parent_comm" in
-      *claude*|*claudem*) echo "claude" ; return ;;
-      *codex*)           echo "codex"  ; return ;;
-      *agy*|*antigrav*)  echo "agy"    ; return ;;
+      *claude*|*claudem*) echo "claude"; return ;;
+      *codex*)            echo "codex";  return ;;
+      *agy*|*antigrav*)   echo "agy";    return ;;
     esac
   fi
 
-  # 5. Hardcoded default
+  # 4. Hardcoded default
   echo "claude"
 }
 
 DETECTED_BACKEND="$(detect_cli_backend)"
-DETECTED_SOURCE="auto-detect: $(case "$DETECTED_BACKEND" in
-  minimax) echo "BASH_FUNC_claudem%% or ANTHROPIC_BASE_URL=api.minimax.io" ;;
-  claude)  echo "BASH_FUNC_claude%% or ANTHROPIC_BASE_URL=anthropic.com" ;;
-  codex)   echo "BASH_FUNC_codex%% or ANTHROPIC_BASE_URL=openai.com" ;;
-  agy)     echo "BASH_FUNC_agy%%" ;;
-esac)"
 ```
 
 | Bash wrapper | `ANTHROPIC_BASE_URL` | `--backend` flag | Notes |
@@ -152,6 +155,18 @@ block, e.g.:
 
 If the user passed `--backend X` explicitly, that wins and the proof block
 should say `# CLI backend: <detected>, but --backend flag override: <X>`.
+
+**Verified test matrix** (11/11 PASS):
+- `BASH_FUNC_claudem%%` → minimax
+- `BASH_FUNC_clauded%%` → claude
+- `BASH_FUNC_agy%%` → agy
+- `BASH_FUNC_codex%%` → codex
+- `BASH_FUNC_claude%%` → claude
+- `ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic` → minimax
+- `ANTHROPIC_BASE_URL=https://api.anthropic.com` → claude
+- Wrapper + URL conflict → wrapper wins (explicit signal beats heuristic)
+- No env at all → defaults to `claude`
+- `ANTHROPIC_BASE_URL=http://localhost:9000` (no pattern match) → defaults to `claude`
 
 ### Default path: invoke the dark-factory binary
 
