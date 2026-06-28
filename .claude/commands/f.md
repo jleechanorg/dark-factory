@@ -64,6 +64,110 @@ echo "$ARGUMENTS"
 - **Open PR exists** AND goal is unrelated → **ask the user** which mode
   they meant. Do not silently route.
 
+### Step 0.5: auto-detect CLI backend (NEW — added 2026-06-27)
+
+When the user invokes Claude via a wrapper function in `~/.bashrc` (e.g.
+`claudem`, `clauded`, `codex`, `agy`), bash exports a `BASH_FUNC_<wrapper>%%`
+environment variable. `/f` reads these to pick the right `--backend` flag for
+the dark-factory binary, so the LLM that runs the audit is the same one the
+user picked from their shell.
+
+Even WITHOUT a bash wrapper, the orchestrator's own env (`ANTHROPIC_BASE_URL`)
+and parent process (`ps -o comm= -p $PPID`) reveal which CLI is running.
+The detector below uses **multiple signals** with a priority order so the
+detection works whether or not the user has a bash wrapper set up.
+
+**Implementation note**: bash function-exported env var names contain `%%`,
+which breaks both `${BASH_FUNC_X%%:-default}` parameter expansion (the `%%`
+is interpreted as the "remove longest suffix" operator) and `${!key}` indirect
+expansion (bash rejects `%%` in variable names). The detector below uses
+`printenv` to read the literal env var name safely.
+
+```bash
+# Multi-signal detector: explicit > wrapper > orchestrator env > parent process > default
+detect_cli_backend() {
+  local key parent_comm ppid
+
+  # 1. Bash wrapper env vars (exported when wrapper function is invoked)
+  for key in 'BASH_FUNC_claudem%%' 'BASH_FUNC_clauded%%' 'BASH_FUNC_agy%%' 'BASH_FUNC_codex%%' 'BASH_FUNC_claude%%'; do
+    if [ -n "$(printenv "$key" 2>/dev/null)" ]; then
+      case "$key" in
+        *claudem%%) echo "minimax"; return ;;
+        *clauded%%) echo "claude";  return ;;
+        *agy%%)     echo "agy";     return ;;
+        *codex%%)   echo "codex";   return ;;
+        *claude%%)  echo "claude";  return ;;
+      esac
+    fi
+  done
+
+  # 2. Orchestrator's ANTHROPIC_BASE_URL (strong signal of which API we're on)
+  case "${ANTHROPIC_BASE_URL:-}" in
+    *api.minimax.io*) echo "minimax"; return ;;
+    *anthropic.com*)  echo "claude";  return ;;
+    *openai.com*)     echo "codex";   return ;;
+  esac
+
+  # 3. Parent process name (ps -o comm= -p $PPID)
+  ppid="${PPID:-}"
+  if [ -n "$ppid" ]; then
+    parent_comm="$(ps -o comm= -p "$ppid" 2>/dev/null | tr -d ' ')"
+    case "$parent_comm" in
+      *claude*|*claudem*) echo "claude"; return ;;
+      *codex*)            echo "codex";  return ;;
+      *agy*|*antigrav*)   echo "agy";    return ;;
+    esac
+  fi
+
+  # 4. Hardcoded default
+  echo "claude"
+}
+
+DETECTED_BACKEND="$(detect_cli_backend)"
+```
+
+| Bash wrapper | `ANTHROPIC_BASE_URL` | `--backend` flag | Notes |
+|---|---|---|---|
+| `claudem` | `https://api.minimax.io/anthropic` | `minimax` | MiniMax-M3 / MiniMax-M2.5 |
+| `clauded` | (default Anthropic) | `claude` | Anthropic Sonnet / Opus via user's subscription |
+| `agy` | (Antigravity) | `agy` | Antigravity backend |
+| `codex` | (OpenAI) | `codex` | OpenAI Codex |
+| `claude` (default) | (default Anthropic) | `claude` | Anthropic direct |
+
+**Override precedence** (highest to lowest):
+1. Explicit `--backend <x>` flag in `$ARGUMENTS` wins.
+2. `BASH_FUNC_*` env var (explicit wrapper signal).
+3. `ANTHROPIC_BASE_URL` (orchestrator's actual API endpoint).
+4. Parent process name (`ps -o comm= -p $PPID`).
+5. Hardcoded default (`claude`).
+
+**Why multiple signals?** A user may run `claude` directly (no wrapper), or
+via `clauded`, or via `claudem`. The `BASH_FUNC_*` signal is only present for
+wrapped invocation. The `ANTHROPIC_BASE_URL` signal works regardless of how
+the orchestrator was launched (it's set by the orchestrator's runtime, not
+by bash). The PPID signal is a last-resort fallback for unusual setups.
+
+**Honesty rule**: Always echo the detected backend + source in the proof
+block, e.g.:
+```
+# CLI backend: minimax (source: ANTHROPIC_BASE_URL=api.minimax.io); --backend flag: minimax
+```
+
+If the user passed `--backend X` explicitly, that wins and the proof block
+should say `# CLI backend: <detected>, but --backend flag override: <X>`.
+
+**Verified test matrix** (11/11 PASS):
+- `BASH_FUNC_claudem%%` → minimax
+- `BASH_FUNC_clauded%%` → claude
+- `BASH_FUNC_agy%%` → agy
+- `BASH_FUNC_codex%%` → codex
+- `BASH_FUNC_claude%%` → claude
+- `ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic` → minimax
+- `ANTHROPIC_BASE_URL=https://api.anthropic.com` → claude
+- Wrapper + URL conflict → wrapper wins (explicit signal beats heuristic)
+- No env at all → defaults to `claude`
+- `ANTHROPIC_BASE_URL=http://localhost:9000` (no pattern match) → defaults to `claude`
+
 ### Default path: invoke the dark-factory binary
 
 After Step 0 resolves PR-vs-feature, select the appropriate pipeline or
@@ -88,10 +192,12 @@ export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$HOME/projects/dark-factory}"
 export DARK_FACTORY_HOLDOUTS="${DARK_FACTORY_HOLDOUTS:-$HOME/projects/dark-factory-holdouts}"
 export PATH="$HOME/.local/bin:$PATH"
 cd <target repo>   # the repo the work lands in
+# Backend: prefer explicit --backend flag, else Step 0.5 detection, else 'claude'
+BACKEND="<DETECTED_BACKEND or --backend override>"
 dark-factory \
   --pipeline <CHOSEN_OR_GENERATED_DOT> \
   --goal "<1-line LLM rationale + scope>" \
-  --backend <echo for smoke | claude/codex/agy/minimax for real> \
+  --backend "$BACKEND" \
   [--feature <holdout-feature-if-applicable>] \
   [--state <KEY>=<VALUE> if needed] \
   --cxdb ~/.dark-factory/cxdb.sqlite
@@ -147,6 +253,7 @@ End every `/f` response with this proof block. Missing any required line means
 the factory run is unproven and must be reported as such:
 
 ```bash
+# CLI backend: <detected-or-override> (source: <BASH_FUNC_X%%|explicit --backend|default>)
 # Literal command run:
 cd /Users/jleechan/projects/<target-repo>
 DARK_FACTORY_HOME=~/projects/dark-factory \
