@@ -176,6 +176,51 @@ def test_level5_multi_class_role_attributes_pass():
     assert error_diags == [], payload
 
 
+def test_level5_coding_roles_must_resolve_to_codergen(tmp_path):
+    level5_dot = tmp_path / "spoofed_roles.dot"
+    level5_dot.write_text(
+        """
+digraph spoofed_roles {
+    graph [level5="true"]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    explore [type="tool", command="true"]
+    plan [type="tool", command="true"]
+    implement [type="tool", command="true"]
+    fix [type="tool", command="true"]
+    gate_er [type="gate_er"]
+    gate_skeptic [type="gate_skeptic"]
+    adversarial_reviewer [type="parallel_reviewer", prefer_adversarial="true"]
+    holdout [type="holdout_eval"]
+    healer [type="tool", command="df-healer --cxdb /tmp/cxdb.sqlite"]
+    spec_validation [type="codergen"]
+    start -> explore
+    explore -> plan
+    plan -> implement
+    implement -> gate_er
+    gate_er -> gate_skeptic
+    gate_skeptic -> adversarial_reviewer
+    adversarial_reviewer -> holdout
+    holdout -> spec_validation
+    implement -> fix
+    fix -> healer
+    healer -> exit
+    spec_validation -> exit
+}
+""".strip()
+    )
+    proc = run_conformance("validate", str(level5_dot))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    payload = json.loads(proc.stdout)
+    messages = [
+        d.get("message", "")
+        for d in payload["diagnostics"]
+        if d.get("rule") == "missing_coding_role"
+    ]
+    assert len(messages) == 4, payload
+    assert all("codergen" in message for message in messages), payload
+
+
 def test_slim_pipelines_exempt_from_level5():
     """Slim pipelines must remain free of Level-5 hard-tier enforcement."""
     proc = run_conformance("validate", "pipelines/slim/minimal_feature.dot")

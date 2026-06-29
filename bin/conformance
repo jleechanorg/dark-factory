@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from runner.engine import run as run_graph  # noqa: E402
-from runner.handlers import Context, TYPE_REGISTRY  # noqa: E402
+from runner.handlers import Context, TYPE_REGISTRY, resolve  # noqa: E402
 from runner.parser import is_exit_node, is_start_node, parse  # noqa: E402
 from runner.prompt_substitution_audit import (  # noqa: E402
     audit_prompts as audit_prompts_tree,
@@ -189,6 +189,10 @@ def _has_cross_vendor_reviewer(graph, graph_backend: str | None) -> bool:
     return False
 
 
+def _is_codergen_node(node) -> bool:
+    return resolve(node) is TYPE_REGISTRY["codergen"]
+
+
 def _check_level5(graph, path: pathlib.Path) -> list[dict]:
     """Run the Level-5 rule set; return diagnostics (empty when exempt)."""
     diagnostics: list[dict] = []
@@ -213,6 +217,8 @@ def _check_level5(graph, path: pathlib.Path) -> list[dict]:
     has_fix = False
 
     for node in graph.nodes.values():
+        if not _is_codergen_node(node):
+            continue
         name_lower = node.name.lower()
         # Mirror runner/parser.py:_selector_matches — `class` is a space- or
         # comma-separated token list (e.g. "codergen explore"). Membership check
@@ -237,7 +243,7 @@ def _check_level5(graph, path: pathlib.Path) -> list[dict]:
             _diagnostic(
                 "missing_coding_role",
                 "error",
-                "Level-5 graph must contain an explore node (name='explore' or class='explore'), "
+                "Level-5 graph must contain a codergen explore node (name='explore' or class='explore'), "
                 "or opt out with graph [skip_explore=\"true\"].",
             )
         )
@@ -246,7 +252,7 @@ def _check_level5(graph, path: pathlib.Path) -> list[dict]:
             _diagnostic(
                 "missing_coding_role",
                 "error",
-                "Level-5 graph must contain a plan node (name='plan' or class='plan'), "
+                "Level-5 graph must contain a codergen plan node (name='plan' or class='plan'), "
                 "or opt out with graph [skip_plan=\"true\"].",
             )
         )
@@ -255,7 +261,7 @@ def _check_level5(graph, path: pathlib.Path) -> list[dict]:
             _diagnostic(
                 "missing_coding_role",
                 "error",
-                "Level-5 graph must contain an implement node (name='implement' or class='implement'), "
+                "Level-5 graph must contain a codergen implement node (name='implement' or class='implement'), "
                 "or opt out with graph [skip_implement=\"true\"].",
             )
         )
@@ -264,7 +270,7 @@ def _check_level5(graph, path: pathlib.Path) -> list[dict]:
             _diagnostic(
                 "missing_coding_role",
                 "error",
-                "Level-5 graph must contain a fix node (name='fix' or class='fix'), "
+                "Level-5 graph must contain a codergen fix node (name='fix' or class='fix'), "
                 "or opt out with graph [skip_fix=\"true\"].",
             )
         )
