@@ -96,7 +96,29 @@ direct           then /f (full gated pipeline) unless waived by routing verdict
  merge-     model verdict in-place       ▼
  watch      vs re-roll]                 [HUMAN_HELD + Healer report]
              ▼ (re-roll-worthy)
-           [Re-Roll Engine §5]
+            [Re-Roll Engine §5]
+```
+
+```mermaid
+graph TD
+    A[GitHub Issue with factory label] -->|Intake Normalizer| B[Bead Queue br]
+    B -->|Daemon Poll Loop| C{Routing Decision}
+    C -->|Small Task| D[Direct aow Worker]
+    C -->|Standard Task| E[dark-factory /fs spec gen]
+    E --> F[dark-factory /f gated pipeline]
+    D --> G[PR Opened]
+    F --> G
+    G --> H[Ownership Handoff: aow session remediation mode]
+    H --> I[In-place Remediation Loop: CI/Review comments]
+    I --> J{Daemon Green Verifier}
+    J -->|7-green passes| K[Readiness Report + Merge Watch]
+    J -->|CHANGES_REQUESTED| L{Re-Roll Verdict}
+    L -->|In-place fixable| I
+    L -->|Re-roll-worthy| M[Re-Roll Engine]
+    M -->|Stop & Quiesce session| N[Mutate Spec append-only]
+    N -->|Fresh Attempt Branch| O[Re-dispatch]
+    O --> B
+    J -->|Stalled/Timeout| P[HUMAN_HELD + Healer Report]
 ```
 
 ### 3.1 Intake contract (adapted from Symphony §11)
@@ -281,6 +303,7 @@ All existing operator policies bind the daemon; none are relaxed:
   
   **Detailed Telemetry Log**: In addition to CXDB events, the daemon logs structured JSON payloads for every steering action, containing:
   - Timestamp, bead ID, and active attempt branch.
+  - Steering classification: **human-initiated** (e.g., human PR reviews, manual bead actions, manual re-roll commands) vs. **automated** (e.g., bot reviews, automated test suite failures, or automated model-judged re-rolls).
   - Model verdict (in-place vs. re-roll) with the raw reasoning block.
   - In-place remediation logs: the exact prompt/nudge dispatched by the SCM loop and the agent's stdout/stderr response.
   - Spec mutation diffs: the old spec vs. mutated spec.
@@ -305,7 +328,7 @@ A daily harness audit job (same launchd domain, runs daily):
 A weekly hygiene sweep (same launchd domain, separate low-frequency job):
 
 - Flags verifier rules referencing files/modules that no longer exist, for removal.
-- **Constraint Pruning**: Re-evaluates and prunes accumulated negative assertions/lint rules against the upgraded baseline models and mainline architecture to prevent rule-bloat and context-window congestion.
+- **Constraint Pruning**: Re-evaluates and prunes accumulated negative assertions/lint rules against the upgraded baseline models and mainline architecture to prevent rule-bloat and context-window congestion. This includes auditing rules against newly deployed model updates, pruning constraints that the upgraded models natively satisfy without prompting.
 - Compacts per-run telemetry into the run-summary index, preserving metrics and dropping per-tool trace rows.
 - Backstop-reclaims any stale per-bead locks that startup reconciliation hasn't already reclaimed (§3.2); reports stale claims for operator review.
 
