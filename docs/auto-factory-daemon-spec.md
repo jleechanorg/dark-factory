@@ -51,8 +51,9 @@ Upstream-first, made explicit for this project: **all AO integration is wrapper 
 
 ### 2.3 Default Coder & Fallback Configuration
 
-- **Default Coder**: The primary executing agent for implementing tasks is **Claude Code** (`claude-code`), spawned within the `aow` worker session.
-- **Fallback AO Worker**: In the event that the primary Claude Code agent hits API rate limits, quota exhaustion, or execution failures, it is paired with the **Minimax** (`minimax`) backend as the default fallback AO worker. This fallback is orchestrated natively by AO's fallback chain handler, automatically respawning the session with Minimax on the same PR branch to prevent stranded tasks.
+- **Default Coder**: The primary executing agent for implementing tasks is the **Claude Code** (`claude-code`) agent harness, configured to run using the **Minimax** (`minimax`) model provider/backend.
+- **Fallback Chain**: In the event that the primary Minimax backend hits API rate limits, quota exhaustion, or execution failures, AO's native fallback chain handler (`fork-reaction-agent-fallback.ts`) automatically respawns the session using the next model in the configured fallback chain (e.g. `claude-sonnet`), preserving the active session context on the PR branch.
+
 
 ## 3. Topology & Data Flow
 
