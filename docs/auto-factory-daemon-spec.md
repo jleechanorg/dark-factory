@@ -51,7 +51,7 @@ Upstream-first, made explicit for this project: **all AO integration is wrapper 
 
 ### 2.3 Default Coder & Fallback Configuration
 
-- **Default Coder**: The primary executing agent for implementing tasks is the **Claude Code** (`claude-code`) agent harness, configured to run using the **Minimax** (`minimax`) model provider/backend.
+- **Default Coder**: The primary executing agent for implementing tasks is the **Claude Code** (`claude-code`) agent harness, running inside an **AO worker** (`aow`) session and configured to use the **Minimax** (`minimax`) model provider/backend.
 - **Fallback Chain**: In the event that the primary Minimax backend hits API rate limits, quota exhaustion, or execution failures, AO's native fallback chain handler (`fork-reaction-agent-fallback.ts`) automatically respawns the session using the next model in the configured fallback chain (e.g. `claude-sonnet`), preserving the active session context on the PR branch.
 
 
@@ -363,9 +363,11 @@ The default review fleet consists of the following `agy` CLI-based reviewer agen
 4.  **`alignment` (General Reviewer)**: Checks global alignment between the updated `spec.md`, the implementation code, the design goals, and the telemetry evidence.
 5.  **`/er` (Evidence Reviewer)**: Audits the evidence bundle (JSONL log, videos, test outputs) to ensure it satisfies the evidence standard (matching SHA, LLM-layer pass rate > 0%, clear provenance).
 
-### 10.2 Chained & Parallel Skeptic Execution
-- **Zero Worktree Overhead**: Instead of creating separate worktrees for each reviewer, reviews are executed headlessly against the active session's existing workspace using the `ao skeptic` CLI.
-- **Reviewer Fallback Chain**: Review execution integrates with the `agent-orchestrator` fallback chain handler (`fork-reaction-agent-fallback.ts`). If a primary reviewer (e.g. Codex) experiences rate-limiting, quota exhaustion, or timeout, AO automatically falls back to the next model/agent in the chain (e.g. Claude or Gemini), preventing a blocked PR.
+### 10.2 Chained & Parallel Review Execution
+- **Zero Worktree Overhead**: Instead of creating separate worktrees for each reviewer, reviews are executed headlessly in parallel tmux panes (`review-<worker-id>`) reusing the active worker's existing workspace, driven by the native AO `Reviewer` framework (`launcher.go`).
+- **Read-Only Sandboxing (PR #2194)**: Reviewer sessions run with a strict read-only tool allowlist (restricting actions to `Read`, `Grep`, `Glob`, `git diff`, and `gh api`). Write/Edit tools are explicitly blocked to prevent reviewers from modifying the worktree.
+- **Verdict Submission Loop**: The reviewer agents post their reviews to GitHub as comments via `gh api`, then submit the final verdict back to the orchestrator using `ao review submit`.
+- **Reviewer Fallback Chain**: Review execution integrates with the `agent-orchestrator` fallback chain handler (`fork-reaction-agent-fallback.ts`). If a primary reviewer experiences rate-limiting, quota exhaustion, or timeout, AO automatically falls back to the next model/agent in the chain (e.g. Claude or Gemini), preventing a blocked PR.
 - **Remediation Iteration Capping**: The PR remediation loop iterates under a combined ceiling of `max_visits` (in-place fixes, default 3) and `max_cycles` (durable re-rolls, default 5). A PR is considered green only when all fleet reviews pass and `7-green` is achieved.
 
 ## 11. Accept / Adapt / Reject Ledger (vs. ASF-SR-2.3 and Symphony)
