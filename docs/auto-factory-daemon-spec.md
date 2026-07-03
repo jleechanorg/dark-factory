@@ -25,6 +25,8 @@ Human engineers manage work items; they do not supervise agents.
 The stack composes three existing systems plus one new thin daemon. The composition is governed by one rule that resolves the otherwise-fatal overlap between them:
 
 > **Single remediation owner.** At any moment, exactly one control plane may write to a PR's branch. **Every open factory PR is owned by exactly one `aow` session** (§4.1) that performs all *in-place* remediation — CI fixes, review-comment responses, merge conflicts — natively. The daemon never pushes fixes alongside AO; it owns exactly two things: **read-only verification** (7-green assessment, evidence floor) and the **re-roll decision** (structural rejection → stop the AO session and confirm quiescence → fresh branch → re-dispatch). A re-roll supersedes the attempt entirely, so the two owners never interleave on one branch.
+> 
+> **AO Native SCM Reactions.** The `agent-orchestrator`'s internal `scm.Observer` and `reactions.go` natively poll SCM PRs and dispatch nudges to the active session when CI fails or review comments are received. The daemon explicitly relies on these built-in loops for all in-place fixes rather than implementing its own prompt injection mechanisms.
 
 | Layer | System | Role | Provenance |
 |---|---|---|---|
@@ -109,6 +111,8 @@ Normalization (Symphony §11.3): labels lowercased, `blocked_by` from bead depen
 
 **GitHub intake is a separate pre-poll normalizer step**, not a tracker adapter: it lists labeled issues via authenticated `gh`, converts each to a bead, and posts the bead ID back as a comment. Conversion is idempotent: the bead's **`external-ref` field** (a real `br` field) is set to `<owner>/<repo>#<issue_number>` at creation and checked before any create — a crash between `br create` and the comment must not produce a second bead; the missing comment is posted on the next tick.
 
+**AO Intake Integration.** Although `agent-orchestrator` has a native `trackerintake` module that polls GitHub issues and spawns sessions, it lacks human-facing queue management (bead prioritization, sorting, dependencies). To avoid duplication, the daemon's pre-poll normalizer maps GitHub issues to beads, and the daemon serves as the scheduler. AO's native `trackerintake` is disabled for factory projects to prevent duplicate spawning, while AO's session database acts as the single source of truth for active worker sessions.
+
 **Write boundary** (Symphony §11.5 — the daemon is a scheduler and reader; dispatched agents write through their own tools). The daemon's own writes, exhaustively:
 (a) the normalizer's bead-ID comment;
 (b) re-roll writes to spec files and bead status (§5);
@@ -124,7 +128,7 @@ Normalization (Symphony §11.3): labels lowercased, `blocked_by` from bead depen
 - **Beads (`br`) hold what humans manage:** status, priority, labels, assignee, `external-ref`, dependencies. `br` has a fixed field set with no arbitrary metadata and no atomic counters — the daemon does not pretend otherwise.
 - **CXDB (the daemon's SQLite, already used by the factory) holds all machine state**, keyed by bead ID under a reserved daemon namespace: overlay states (§5.5), the re-roll cycle counter, the cumulative autonomy clock, reviewer verdicts (§3.1d), and the branch-creation registry (§5.3.6). SQLite transactions give the atomic read-modify-write that overlay transitions and the cycle counter require.
 
-On startup, reconciliation rebuilds in-memory state from: CXDB (machine state), `br` (human-facing status), `aow` session listing (live executions), and `gh` PR/review state (ground truth). Reconciliation **reclaims** any per-bead lock file with no live holder immediately (it does not wait for the weekly sweep). Any bead whose recorded state contradicts observed reality (e.g. RECOVERY recorded but no re-roll branch exists) goes to HUMAN_HELD with a report rather than being "repaired" by guesswork.
+On startup, reconciliation rebuilds in-memory state from: CXDB (machine state), `br` (human-facing status), `aow` session listing (live executions), and `gh` PR/review state (ground truth). The daemon reclaims active AO sessions natively on startup by querying `aow session ls` and verifying process status rather than maintaining a duplicate daemon process tree. Reconciliation **reclaims** any per-bead lock file with no live holder immediately (it does not wait for the weekly sweep) to prevent deadlock on daemon crash. Any bead whose recorded state contradicts observed reality (e.g. RECOVERY recorded but no re-roll branch exists) goes to HUMAN_HELD with a report rather than being "repaired" by guesswork.
 
 ### 3.3 Routing decision (ZFC-compliant)
 
@@ -141,7 +145,7 @@ The single-owner rule requires every open factory PR to have exactly one AO sess
 - **Small path:** the dispatching `aow` session created the branch and PR; it simply keeps ownership and its native loop runs.
 - **Standard path:** `/f` is a one-shot pipeline that exits when the PR opens — it leaves no persistent session. At PR-open, the daemon **attaches an `aow` session to the `/f`-produced branch** (spawned with the bead's spec as context, in remediation mode: respond to CI failures, review comments, and conflicts on this branch; do not expand scope). This is the named in-place owner for standard-path PRs; §4.3's stall detection keys on it like any other session.
 
-The AO native loop stays enabled for all daemon-dispatched sessions — it *is* the in-place owner. Exclusivity at the re-roll boundary is enforced by the handover protocol (§5.3.3), not by disabling AO's loop.
+Under the hood, the daemon leverages the AO daemon's native `scm.Observer` loop which registers ETags, performs diffs, and fires reaction nudges for PRs owned by active sessions. The daemon does not duplicate these SCM reads; it reads PR metadata directly from GitHub via the verifier loop (§4.2). The AO native loop stays enabled for all daemon-dispatched sessions — it *is* the in-place owner. Exclusivity at the re-roll boundary is enforced by the handover protocol (§5.3.3), not by disabling AO's loop.
 
 ### 4.2 Daemon green verifier (reader)
 
@@ -171,6 +175,8 @@ Reviewer comments are unstructured text. Extraction of constraints is delegated 
 - **Positive assertions** — actions the next attempt must take.
 - **Inhibition specs** — architectures, imports, or patterns the next attempt must avoid. These get priority: they shrink the agent's solution space, which is the highest-leverage correction for generation drift.
 
+**Harness-First Focus.** In alignment with the "fix the system, not the prompt" design principle, constraint extraction prioritizes identifying changes to the factory environment (codebase skills, tests, or workspace configs) rather than just appending prompt-level constraints for the agent.
+
 Where an inhibition spec expresses a mechanically checkable boundary (e.g. "no imports from `src/harness/` inside `src/modules/`"), the extractor **additionally** emits a deterministic verifier rule — a machine-readable lint policy written beside the spec — so the constraint is enforced by a gate, not just by prompt. Deterministic *enforcement* of a model-extracted rule is not a ZFC violation; deterministic *extraction* would be.
 
 **Holdout-leak screen.** Reviewer text is untrusted content: a human, a bot, or the sealed evaluator's report could quote holdout expectations into a PR comment. Before any reviewer text (extracted constraints or the raw snapshot of §5.4) is written into an artifact the implementing agent will read, a model screening call checks it for content that reveals holdout test internals (exact expected values, holdout file paths, scenario names). Flagged spans are redacted from the implementing-agent-visible copy; the unredacted original is retained in CXDB (operator-visible only) with the screening verdict. This preserves the Agent Isolation guarantee: nothing structurally hidden from the implementing agent may reach it via the review channel.
@@ -179,13 +185,14 @@ Where an inhibition spec expresses a mechanically checkable boundary (e.g. "no i
 
 Iterative patching accumulates context debt: each successive fix commit adds noise the next agent must reconcile. ASF-SR-2.3's answer is a hard reset + force-push; that conflicts with the standing force-push policy (explicit per-push human approval naming the branch — which an autonomous daemon structurally cannot obtain) and is rejected. The same clean-slate property is achieved without any history rewrite:
 
-1. **Lock.** Acquire the per-bead lock (atomic file creation in the daemon state directory). The verifier consults the same lock before treating a bead as ATTESTED-stable. Lock discipline: released on every exit from the re-roll path — success (REDISPATCHED), abort (freshness guard), failure (any step non-zero), and hold states (§5.5). Startup reconciliation reclaims orphaned locks immediately (§3.2); the weekly sweep (§8) is a backstop, not the primary reclaim path.
+1. **Lock.** Acquire the per-bead lock (atomic transaction in the CXDB SQLite state database or atomic file lock in the daemon state directory). The verifier consults the same lock before treating a bead as ATTESTED-stable. Lock discipline: released on every exit from the re-roll path — success (REDISPATCHED), abort (freshness guard), failure (any step non-zero), and hold states (§5.5). Startup reconciliation reclaims orphaned locks immediately (§3.2) to prevent deadlock on daemon crash; the weekly sweep (§8) is a backstop, not the primary reclaim path.
 2. **Freshness guard** (§5.1). Abort if review state changed.
-3. **Stop the AO session and confirm quiescence.** The owning `aow` session is stopped through AO's own session interface. Stopping is not enough: the engine then confirms the session reports a terminal state **and** the branch head SHA is stable across a confirmation read (an in-flight push racing the stop must land or fail before branch work begins). Only then is the handover from in-place owner to re-roll owner complete.
+3. **Stop the AO session and confirm quiescence.** The owning `aow` session is stopped through AO's own session interface. Stopping is not enough: the engine then actively queries the live `aow` process state (e.g., checks runtime PID status/exit codes or run file logs) rather than relying on state polling, confirming that the session reports a terminal state **and** the branch head SHA is stable across a confirmation read (an in-flight push racing the stop must land or fail before branch work begins). Only then is the handover from in-place owner to re-roll owner complete.
 4. **Baseline computation.** Fetch and compute the new baseline as the current head of the configured `base_branch` (per-repo config key, §7 — never implicit). Mainline drift needs no special case: nothing is reset; every re-roll cuts from current mainline by construction. The mutation layer records the baseline SHA.
 5. **Fresh attempt branch.** Create `factory/<bead_id>-r<n>` (n = re-roll cycle number) from the baseline. The rejected attempt branch `factory/<bead_id>-r<n-1>` is left untouched (the closed PR links it for audit) and is deleted only by decommissioning (§8) after the bead reaches a terminal state. No branch is ever reset or force-pushed, so the force-push policy is satisfied by construction, not by exception.
 6. **Ref registry.** Every branch the daemon creates is recorded (repo, ref, bead, cycle, created-at) in the CXDB branch registry at creation time. Deletion (§8) is permitted **only** for refs present in the registry — the `factory/*` name prefix is a convention, never an authorization. Enabling a new target repo requires a preflight assert that no non-daemon refs already exist under the configured namespace; collision aborts enablement with an operator report.
 7. **Old PR closure.** The superseded PR is closed with a comment linking the new attempt branch/PR and the mutation-layer block that superseded it.
+8. **Structured Telemetry.** Emit a structured lifecycle event (e.g., Cloud-Events-compatible payload) to the observability dashboard containing the bead ID, cycle index, baseline SHA, old PR URL, and next branch name.
 
 ### 5.4 Spec mutation grammar
 
@@ -271,6 +278,14 @@ All existing operator policies bind the daemon; none are relaxed:
 - **Stage 2 — enable the re-roll writer plane** once Stage 1's recorded verdicts and reconciliation behavior have been audited by the operator. The switch is a config flag, not a code change.
 - **Pilot scope:** exactly **one target repo** at launch, named in a single config file. Per-repo config keys: repo, intake label, branch namespace, **`base_branch`** (the baseline target for §5.3 — never implicit), budgets, concurrency, poll intervals (fast/slow tiers, §3), stage flag. Additional repos are a config change plus the namespace preflight (§5.3.6), not a code change.
 - **Logs & observability:** every dispatch, state transition, verdict, and re-roll event is recorded to CXDB and the factory's structured perf-log tree. Daemon events are not pipeline node visits, so they use a **reserved namespace** (a dedicated synthetic pipeline/node prefix, following the existing `__cross_run_circuit__` precedent) — keeping Healer clustering over real pipeline failures unpolluted while still giving the Healer visibility into daemon-level failure patterns (the second of the two runner changes, §5.7).
+  
+  **Detailed Telemetry Log**: In addition to CXDB events, the daemon logs structured JSON payloads for every steering action, containing:
+  - Timestamp, bead ID, and active attempt branch.
+  - Model verdict (in-place vs. re-roll) with the raw reasoning block.
+  - In-place remediation logs: the exact prompt/nudge dispatched by the SCM loop and the agent's stdout/stderr response.
+  - Spec mutation diffs: the old spec vs. mutated spec.
+  - Reviewer comments and extracted constraints (both positive and inhibition).
+  This log is stored locally under `~/Library/Logs/dark-factory/daemon.jsonl`.
 
 ## 8. Lifecycle Decommissioning & Hygiene (ASF §8, adapted)
 
@@ -280,9 +295,17 @@ On merge or close of a factory PR (observed by the merge-watch poll, §4.3):
 2. All remote attempt branches for the bead (`factory/<bead>-r*`) are deleted — registry-verified refs only (§5.3.6).
 3. The bead is closed with a reason linking the merged PR; beads are archived by the `br` tool's own lifecycle, not a parallel archive tree.
 
+A daily harness audit job (same launchd domain, runs daily):
+
+- **Harness Violation Scan**: Shells out to `claude --print /harness --audit` or runs a script that processes the last 24 hours of the detailed telemetry log (`daemon.jsonl`).
+- **Failure Classification**: Identifies and groups recurrent re-rolls, manual interventions, or long-running remediation loops.
+- **Root-Cause Analysis (5 Whys)**: Executes the `/harness` 5-whys protocol for the most frequent failure clusters to determine why the current skills, prompts, or test templates failed to prevent the errors.
+- **Auto-remediation**: Automatically updates the global instructions in `~/.claude/CLAUDE.md` or repo-local skills to close harness gaps (using `harness --fix`), and commits these changes to the tracking branch to continuously reduce the need for steering.
+
 A weekly hygiene sweep (same launchd domain, separate low-frequency job):
 
 - Flags verifier rules referencing files/modules that no longer exist, for removal.
+- **Constraint Pruning**: Re-evaluates and prunes accumulated negative assertions/lint rules against the upgraded baseline models and mainline architecture to prevent rule-bloat and context-window congestion.
 - Compacts per-run telemetry into the run-summary index, preserving metrics and dropping per-tool trace rows.
 - Backstop-reclaims any stale per-bead locks that startup reconciliation hasn't already reclaimed (§3.2); reports stale claims for operator review.
 
