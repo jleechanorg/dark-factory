@@ -54,6 +54,11 @@ Upstream-first, made explicit for this project: **all AO integration is wrapper 
 - **Default Coder**: The primary executing agent for implementing tasks is the **Claude Code** (`claude-code`) agent harness, running inside an **AO worker** (`aow`) session and configured to use the **Minimax** (`minimax`) model provider/backend.
 - **Fallback Chain**: In the event that the primary Minimax backend hits API rate limits, quota exhaustion, or execution failures, AO's native fallback chain handler (`fork-reaction-agent-fallback.ts`) automatically respawns the session using the next model in the configured fallback chain (e.g. `claude-sonnet`), preserving the active session context on the PR branch.
 
+### 2.4 Discardable Component & Plugin Design
+
+In alignment with the "dorodango" architecture (polish, discard, rebuild), the daemon's integration adapters are designed as loosely coupled, disposable wrappers. If Claude Code improves its built-in workflows or `agent-orchestrator-mirror` merges new features (such as first-class multi-agent review coordination, automatic SCM observers, or dashboard views), the corresponding daemon component/plugin is discarded and replaced by the new upstream implementation. Standard interface boundaries (JSON payloads over CLI/IPC) are maintained to allow plug-and-play swaps of intake, execution, or review components.
+
+
 
 ## 3. Topology & Data Flow
 
@@ -167,7 +172,16 @@ Whether a task takes the small path (direct `aow` worker) or the standard path (
 
 **Every PR requires an independent reviewer.** The standard path gets adversarial review inside `/f` (reviewer nodes, holdout eval). The small path has no pipeline, so before it can report ready, at least one independent reviewer signal (codex cold review, CodeRabbit APPROVED, or a reviewer run the daemon triggers per §3.1d) must exist for the current head SHA. A PR with zero independent review never reaches ready-to-merge, on either path (repo operating rule: every non-trivial pipeline has a reviewer separate from the implementing agent).
 
+### 3.4 Local Bead Communication Fail-Safe (Offline Mode)
+
+When GitHub is down (manifesting as API timeouts, DNS resolution failures, or HTTP 5xx responses during pre-poll or verification checks), the daemon and the executing agents fall back to a **local bead-state communication protocol**:
+
+1. **Bead-Centric Coordination**: Instead of relying on GitHub Issues, PR state changes, or webhooks, agents read, write, and transition task states directly using the local bead queue files (`.beads/` state).
+2. **Parallel Offline Handoffs**: Multiple executing agent sessions can update the beads in parallel to communicate intermediate review verdicts, test outcomes, or remediation status.
+3. **Queue Prioritization Focus**: During a GitHub outage, the daemon stops checking remote issues and focuses exclusively on the local bead queue, scheduling and executing local tasks, and dispatching workers against local branches. Once GitHub connection is restored, the daemon reconciles the local state with GitHub SCM.
+
 ## 4. PR Ownership, Verification, and Remediation
+
 
 ### 4.1 Ownership handoff at PR-open
 
@@ -363,12 +377,13 @@ The default review fleet consists of the following `agy` CLI-based reviewer agen
 4.  **`alignment` (General Reviewer)**: Checks global alignment between the updated `spec.md`, the implementation code, the design goals, and the telemetry evidence.
 5.  **`/er` (Evidence Reviewer)**: Audits the evidence bundle (JSONL log, videos, test outputs) to ensure it satisfies the evidence standard (matching SHA, LLM-layer pass rate > 0%, clear provenance).
 
-### 10.2 Chained & Parallel Review Execution
-- **Zero Worktree Overhead**: Instead of creating separate worktrees for each reviewer, reviews are executed headlessly in parallel tmux panes (`review-<worker-id>`) reusing the active worker's existing workspace, driven by the native AO `Reviewer` framework (`launcher.go`).
-- **Read-Only Sandboxing (PR #2194)**: Reviewer sessions run with a strict read-only tool allowlist (restricting actions to `Read`, `Grep`, `Glob`, `git diff`, and `gh api`). Write/Edit tools are explicitly blocked to prevent reviewers from modifying the worktree.
+### 10.2 Combined Reviewer Execution (Skeptic Mode) & Test Allowance
+- **Combined Skeptic Flow**: The fleet of reviewers runs together as a single combined skeptic-like execution flow (mirroring the original `ao skeptic` behavior) in parallel tmux panes (`review-<worker-id>`) sharing the active worker's existing workspace, managed via the native AO `Reviewer` framework.
+- **Test Execution Allowance (No Read-Only Hard-Block)**: Unlike hard sandboxed environments that block execution, reviewers are permitted to run tests and verification scripts locally. Protection against workspace corruption is enforced by instructing the reviewer agents via system prompts never to edit files or commit changes, rather than blocking tool execution.
 - **Verdict Submission Loop**: The reviewer agents post their reviews to GitHub as comments via `gh api`, then submit the final verdict back to the orchestrator using `ao review submit`.
 - **Reviewer Fallback Chain**: Review execution integrates with the `agent-orchestrator` fallback chain handler (`fork-reaction-agent-fallback.ts`). If a primary reviewer experiences rate-limiting, quota exhaustion, or timeout, AO automatically falls back to the next model/agent in the chain (e.g. Claude or Gemini), preventing a blocked PR.
 - **Remediation Iteration Capping**: The PR remediation loop iterates under a combined ceiling of `max_visits` (in-place fixes, default 3) and `max_cycles` (durable re-rolls, default 5). A PR is considered green only when all fleet reviews pass and `7-green` is achieved.
+
 
 ## 11. Accept / Adapt / Reject Ledger (vs. ASF-SR-2.3 and Symphony)
 
