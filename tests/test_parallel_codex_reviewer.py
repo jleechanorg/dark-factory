@@ -167,3 +167,97 @@ def test_parallel_reviewer_maps_shadow_errors_to_error(tmp_path, monkeypatch):
     assert result.metadata["parallel_reviewer_primary_outcome"] == "success"
     assert result.metadata["shadow_codex_gate_outcome"] == "error"
     assert result.metadata.get("parallel_reviewer_outcome") == "error"
+
+
+def test_parallel_reviewer_launches_all_shadows_before_awaiting(tmp_path, monkeypatch):
+    """N shadow lanes are Popen-launched before any communicate() (true concurrency)."""
+    node = _node_with_prompt(tmp_path)
+    ctx = _mock_ctx(tmp_path)
+    ctx.state["_df_shadow_backends"] = "codex,minimax"
+    expected_sha = "c" * 40
+
+    call_log: list[str] = []
+
+    class _ShadowPopen:
+        _pid = 30000
+
+        def __init__(self, args, **kwargs):
+            call_log.append(f"popen:{args[0]}")
+            self.args = args
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            call_log.append("communicate")
+            return (
+                f"head_sha: {expected_sha}\n## Review Verdict\npass\n\nverdict: pass\n",
+                "",
+            )
+
+    def _fake_run(cmd, **kwargs):
+        call_log.append(f"run:{cmd[0]}")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=f"head_sha: {expected_sha}\nverdict: pass\n", stderr="",
+        )
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda wd: expected_sha)
+    monkeypatch.setattr("runner.handlers._get_claude_executable", lambda: "claude")
+    monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/" + str(name))
+    monkeypatch.setattr("runner.handler_dispatch.subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _ShadowPopen)
+
+    result = _parallel_reviewer(node, ctx)
+
+    popen_idxs = [i for i, e in enumerate(call_log) if e.startswith("popen:")]
+    communicate_idxs = [i for i, e in enumerate(call_log) if e == "communicate"]
+    assert len(popen_idxs) == 2, call_log
+    assert len(communicate_idxs) == 2, call_log
+    # Both launches happen before EITHER await -> concurrent launch.
+    assert max(popen_idxs) < min(communicate_idxs), call_log
+    assert result.outcome == "success"
+    assert result.metadata["shadow_codex_gate_outcome"] == "success"
+    assert result.metadata["shadow_minimax_gate_outcome"] == "success"
+    assert "codex" in result.metadata["parallel_reviewer_shadow_backends"]
+    assert "minimax" in result.metadata["parallel_reviewer_shadow_backends"]
+
+
+def test_parallel_reviewer_one_shadow_real_fail_maps_to_failure_not_error(tmp_path, monkeypatch):
+    """One shadow passing + one shadow real-fail (not infra) => failure, not error."""
+    node = _node_with_prompt(tmp_path)
+    ctx = _mock_ctx(tmp_path)
+    ctx.state["_df_shadow_backends"] = "codex,minimax"
+    expected_sha = "d" * 40
+
+    class _ShadowPopen:
+        def __init__(self, args, **kwargs):
+            self.args = args
+            self.returncode = 0  # clean exit -> real verdict, not infra error
+            # codex passes, minimax fails, keyed off the executable name in args
+            joined = " ".join(str(a) for a in args)
+            self._fail = "claude" in joined  # minimax routes through the claude binary
+
+        def communicate(self, timeout=None):
+            verdict = "fail" if self._fail else "pass"
+            return (
+                f"head_sha: {expected_sha}\n## Review Verdict\n{verdict}\n\nverdict: {verdict}\n",
+                "",
+            )
+
+    def _fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=f"head_sha: {expected_sha}\nverdict: pass\n", stderr="",
+        )
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda wd: expected_sha)
+    monkeypatch.setattr("runner.handlers._get_claude_executable", lambda: "claude")
+    monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/" + str(name))
+    monkeypatch.setattr("runner.handler_dispatch.subprocess.run", _fake_run)
+    monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _ShadowPopen)
+
+    result = _parallel_reviewer(node, ctx)
+
+    assert result.metadata["shadow_codex_gate_outcome"] == "success"
+    assert result.metadata["shadow_minimax_gate_outcome"] == "failure"
+    assert result.outcome == "failure"
+    assert result.metadata.get("parallel_reviewer_outcome") == "failure"

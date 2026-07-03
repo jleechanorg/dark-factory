@@ -54,6 +54,7 @@ class _ShadowGateReview:
     prompt_sha256: str = ""
     launch_error: str = ""
     started_at: float = 0.0
+    backend: str = "codex"
 
 
 def _shadow_gate_enabled(ctx: "Context") -> bool:
@@ -112,17 +113,26 @@ verdict: <pass|fail>
 """
 
 
-def _start_shadow_gate_review(
+def _launch_shadow_gate_review(
     name: str,
     prompt: str,
     expected_sha: str,
     timeout: int,
     ctx: "Context",
+    backend: str = "codex",
 ) -> _ShadowGateReview | None:
-    if not _shadow_gate_enabled(ctx):
-        return None
+    """Spawn a shadow reviewer on ``backend`` (no enable-gate).
+
+    This is the generalized spawn body; callers must perform their own
+    enable check (see :func:`_start_shadow_gate_review` for the single-codex
+    back-compat wrapper, or :func:`handler_parallel_reviewer._parallel_reviewer`
+    for the N-way lane orchestrator). Returns the populated
+    :class:`_ShadowGateReview` even when launch fails — failures are recorded
+    via ``launch_error`` so the caller can surface them as ``shadow_outcome``
+    rather than masking them.
+    """
     shadow_prompt = _shadow_gate_prompt(name, prompt, expected_sha, ctx)
-    shadow = _ShadowGateReview(prompt=shadow_prompt, started_at=time.monotonic())
+    shadow = _ShadowGateReview(prompt=shadow_prompt, started_at=time.monotonic(), backend=backend)
     seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
     attempt = int(getattr(ctx, "_df_current_attempt", 1))
     node_name = str(getattr(ctx, "_df_current_node", name))
@@ -135,7 +145,7 @@ def _start_shadow_gate_review(
             node_name,
             attempt,
             shadow_prompt,
-            kind="shadow_codex_gate_prompt",
+            kind=f"shadow_{backend}_gate_prompt",
         )
         shadow.prompt_path = prompt_path or ""
         shadow.prompt_sha256 = prompt_sha or ""
@@ -146,7 +156,7 @@ def _start_shadow_gate_review(
                 {
                     "node": node_name,
                     "attempt": str(attempt),
-                    "shadow_backend": "codex",
+                    "shadow_backend": backend,
                     "shadow_prompt_path": shadow.prompt_path,
                     "shadow_prompt_sha256": shadow.prompt_sha256,
                 },
@@ -154,10 +164,11 @@ def _start_shadow_gate_review(
             )
     except Exception:
         pass
-    if shutil.which("codex") is None:
-        shadow.launch_error = "codex executable not found"
+    probe_bin = "codex" if backend == "codex" else ("agy" if backend == "agy" else _handlers_shim._get_claude_executable())
+    if shutil.which(probe_bin) is None:
+        shadow.launch_error = f"{backend} executable not found"
         return shadow
-    args = _gate_subprocess_args("codex", shadow_prompt, ctx, timeout)
+    args = _gate_subprocess_args(backend, shadow_prompt, ctx, timeout)
     if args is None:
         shadow.launch_error = "sandbox-exec unavailable"
         return shadow
@@ -169,11 +180,30 @@ def _start_shadow_gate_review(
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
-            env=_gate_subprocess_env("codex"),
+            env=_gate_subprocess_env(backend),
         )
     except Exception as exc:
         shadow.launch_error = f"{type(exc).__name__}: {exc}"
     return shadow
+
+
+def _start_shadow_gate_review(
+    name: str,
+    prompt: str,
+    expected_sha: str,
+    timeout: int,
+    ctx: "Context",
+    backend: str = "codex",
+) -> _ShadowGateReview | None:
+    """Back-compat wrapper: gate-on-enable then spawn the shadow reviewer.
+
+    Preserves the legacy ``_df_shadow_codex_review`` enable flag and the
+    single-codex default. New code should prefer the N-way
+    ``handler_parallel_reviewer._parallel_reviewer`` orchestrator instead.
+    """
+    if not _shadow_gate_enabled(ctx):
+        return None
+    return _launch_shadow_gate_review(name, prompt, expected_sha, timeout, ctx, backend)
 
 
 def _finish_shadow_gate_review(
@@ -186,6 +216,10 @@ def _finish_shadow_gate_review(
 ) -> "Result":
     if shadow is None:
         return result
+
+    backend = shadow.backend or "codex"
+    prefix = f"shadow_{backend}_gate_"
+    label = backend.capitalize()
 
     returncode = ""
     timed_out = False
@@ -240,7 +274,7 @@ def _finish_shadow_gate_review(
             node_name,
             attempt,
             output,
-            kind="shadow_codex_gate_output",
+            kind=f"shadow_{backend}_gate_output",
         )
         _obs._emit_event(
             ctx,
@@ -248,7 +282,7 @@ def _finish_shadow_gate_review(
             {
                 "node": node_name,
                 "attempt": str(attempt),
-                "shadow_backend": "codex",
+                "shadow_backend": backend,
                 "shadow_outcome": shadow_outcome,
                 "shadow_verdict": verdict,
                 "shadow_returncode": returncode,
@@ -264,36 +298,36 @@ def _finish_shadow_gate_review(
     metadata = dict(result.metadata)
     metadata.update(
         {
-            "shadow_codex_gate_review": "true",
-            "shadow_codex_gate_outcome": shadow_outcome,
-            "shadow_codex_gate_verdict": verdict,
-            "shadow_codex_gate_returncode": returncode,
-            "shadow_codex_gate_head_sha_status": head_sha_status,
-            "shadow_codex_gate_timed_out": "true" if timed_out else "false",
-            "shadow_codex_gate_prompt_path": shadow.prompt_path,
-            "shadow_codex_gate_prompt_sha256": shadow.prompt_sha256,
-            "shadow_codex_gate_output_path": output_path or "",
-            "shadow_codex_gate_output_sha256": output_sha or "",
+            f"{prefix}review": "true",
+            f"{prefix}outcome": shadow_outcome,
+            f"{prefix}verdict": verdict,
+            f"{prefix}returncode": returncode,
+            f"{prefix}head_sha_status": head_sha_status,
+            f"{prefix}timed_out": "true" if timed_out else "false",
+            f"{prefix}prompt_path": shadow.prompt_path,
+            f"{prefix}prompt_sha256": shadow.prompt_sha256,
+            f"{prefix}output_path": output_path or "",
+            f"{prefix}output_sha256": output_sha or "",
         }
     )
     comparison = (
         "\n\n---\n\n"
-        "## Parallel Codex Gate Review\n"
+        f"## Parallel {label} Gate Review\n"
         f"{output}\n\n"
         "## Gate Review Comparison\n"
         f"- Normal gate outcome: {result.outcome}\n"
         f"- Normal gate verdict: {result.metadata.get('verdict', 'unknown')}\n"
-        f"- Shadow Codex outcome: {shadow_outcome}\n"
-        f"- Shadow Codex verdict: {verdict}\n"
-        f"- Shadow Codex head_sha_status: {head_sha_status}\n"
+        f"- Shadow {label} outcome: {shadow_outcome}\n"
+        f"- Shadow {label} verdict: {verdict}\n"
+        f"- Shadow {label} head_sha_status: {head_sha_status}\n"
     )
     final_outcome = result.outcome
     if result.outcome == "success" and shadow_outcome != "success":
         final_outcome = "failure"
     updates = dict(result.context_updates)
-    updates[f"{name}.shadow_codex_gate_output"] = output
-    updates[f"{name}.shadow_codex_gate_outcome"] = shadow_outcome
-    updates[f"{name}.shadow_codex_gate_output_path"] = output_path or ""
+    updates[f"{name}.{prefix}output"] = output
+    updates[f"{name}.{prefix}outcome"] = shadow_outcome
+    updates[f"{name}.{prefix}output_path"] = output_path or ""
     return Result(
         outcome=final_outcome,
         output=result.output + comparison,

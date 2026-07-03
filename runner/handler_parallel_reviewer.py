@@ -10,6 +10,8 @@ behavior is aligned with existing lanes (`_resolve_gate_backend`,
 
 from __future__ import annotations
 
+import json
+
 from typing import TYPE_CHECKING
 
 import runner.handlers as _handlers_shim
@@ -21,6 +23,8 @@ from .handler_dispatch import (
     _is_gate_infra_failure,
     _resolve_gate_backend,
     _execute_gate,
+    _launch_shadow_gate_review,
+    _parse_priority_env,
     _start_shadow_gate_review,
 )
 
@@ -35,6 +39,20 @@ def _shadow_codex_review_enabled(ctx: "Context") -> bool:
     if isinstance(raw, str):
         return raw.strip().lower() in {"true", "1", "yes", "on"}
     return bool(raw)
+
+
+def _parse_shadow_backends(ctx: "Context") -> list[str]:
+    """Return the list of shadow reviewer backends for this context.
+
+    Reads ``ctx.state["_df_shadow_backends"]`` (comma-separated, same parser
+    as the adversarial priority queue) and returns the cleaned list. Empty or
+    missing input yields ``[]``, which signals the orchestrator to fall back
+    to the legacy single-codex shadow gate.
+    """
+    raw = ctx.state.get("_df_shadow_backends", "")
+    if not isinstance(raw, str):
+        raw = str(raw)
+    return _parse_priority_env(raw)
 
 
 def _run_primary_review(
@@ -153,12 +171,13 @@ def _record_primary_output(
     )
 
 
-def _coalesce_parallel_outcome(primary: str, shadow: str) -> str:
-    """Conservative merge: both lanes must pass for success."""
-    if primary == "success" and shadow == "success":
-        return "success"
-    if primary == "error" or shadow == "error":
+def _coalesce_parallel_outcome(primary: str, shadows: list[str]) -> str:
+    """Conservative N-way merge: all lanes must pass for success; any errored lane => error; else failure."""
+    outcomes = [primary, *shadows]
+    if any(o == "error" for o in outcomes):
         return "error"
+    if all(o == "success" for o in outcomes):
+        return "success"
     return "failure"
 
 
@@ -186,15 +205,19 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     expected_sha = _handlers_shim._worktree_head_sha(ctx.workdir)
     gate_strict = _gate_strict_flag(node)
 
-    shadow = None
-    if _shadow_codex_review_enabled(ctx):
-        shadow = _start_shadow_gate_review(
-            node.name,
-            prompt,
-            expected_sha,
-            timeout,
-            ctx,
-        )
+    # Determine shadow lanes BEFORE running primary so Popen launches happen
+    # before primary (and before any communicate()). True concurrency.
+    shadow_backends = _parse_shadow_backends(ctx)
+    shadows = []
+    if shadow_backends:
+        for b in shadow_backends:
+            shadows.append(_launch_shadow_gate_review(
+                node.name, prompt, expected_sha, timeout, ctx, backend=b,
+            ))
+    elif _shadow_codex_review_enabled(ctx):
+        s = _start_shadow_gate_review(node.name, prompt, expected_sha, timeout, ctx)
+        if s:
+            shadows.append(s)
 
     primary = _run_primary_review(
         prompt,
@@ -211,23 +234,32 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     primary = _record_primary_output(node.name, attempt, primary, seq, ctx)
     primary.metadata.update(backend_meta)
 
-    if not shadow:
+    if not shadows:
         return primary
 
-    result = _finish_shadow_gate_review(primary, shadow, node.name, expected_sha, timeout, ctx)
-    shadow_outcome = str(result.metadata.get("shadow_codex_gate_outcome", "unknown"))
-    final_outcome = _coalesce_parallel_outcome(primary.outcome, shadow_outcome)
-
-    if final_outcome != result.outcome:
-        merged_metadata = dict(result.metadata)
-        merged_metadata["parallel_reviewer_outcome"] = final_outcome
-        return Result(
-            outcome=final_outcome,
-            output=result.output,
-            metadata=merged_metadata,
-            preferred_label=result.preferred_label,
-            suggested_next_ids=result.suggested_next_ids,
-            context_updates=result.context_updates,
-        )
-
-    return result
+    result = primary
+    shadow_outcomes = []
+    for shadow in shadows:
+        result = _finish_shadow_gate_review(result, shadow, node.name, expected_sha, timeout, ctx)
+        shadow_outcomes.append(str(result.metadata.get(f"shadow_{shadow.backend}_gate_outcome", "unknown")))
+    final_outcome = _coalesce_parallel_outcome(primary.outcome, shadow_outcomes)
+    shadow_reviews = {
+        s.backend: {
+            "outcome": str(result.metadata.get(f"shadow_{s.backend}_gate_outcome", "unknown")),
+            "verdict": str(result.metadata.get(f"shadow_{s.backend}_gate_verdict", "unknown")),
+            "head_sha_status": str(result.metadata.get(f"shadow_{s.backend}_gate_head_sha_status", "unknown")),
+        }
+        for s in shadows
+    }
+    merged_metadata = dict(result.metadata)
+    merged_metadata["parallel_reviewer_shadow_backends"] = ",".join(s.backend for s in shadows)
+    merged_metadata["shadow_reviews"] = json.dumps(shadow_reviews, sort_keys=True)
+    merged_metadata["parallel_reviewer_outcome"] = final_outcome
+    return Result(
+        outcome=final_outcome,
+        output=result.output,
+        metadata=merged_metadata,
+        preferred_label=result.preferred_label,
+        suggested_next_ids=result.suggested_next_ids,
+        context_updates=result.context_updates,
+    )
