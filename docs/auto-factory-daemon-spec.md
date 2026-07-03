@@ -102,6 +102,7 @@ direct           then /f (full gated pipeline) unless waived by routing verdict
 ```mermaid
 graph TD
     A[GitHub Issue with factory label] -->|Intake Normalizer| B[Bead Queue br]
+    Z[Manual Bead Input] --> B
     B -->|Daemon Poll Loop| C{Routing Decision}
     C -->|Small Task| D[Direct aow Worker]
     C -->|Standard Task| E[dark-factory /fs spec gen]
@@ -132,6 +133,8 @@ graph TD
 Normalization (Symphony §11.3): labels lowercased, `blocked_by` from bead dependency edges, `priority` integer-or-null, ISO-8601 timestamps.
 
 **GitHub intake is a separate pre-poll normalizer step**, not a tracker adapter: it lists labeled issues via authenticated `gh`, converts each to a bead, and posts the bead ID back as a comment. Conversion is idempotent: the bead's **`external-ref` field** (a real `br` field) is set to `<owner>/<repo>#<issue_number>` at creation and checked before any create — a crash between `br create` and the comment must not produce a second bead; the missing comment is posted on the next tick.
+
+**Manual Bead Input.** The daemon natively supports dispatching manually created beads directly from the `br` queue. If a bead has no `external-ref` (meaning it was created directly by a human operator and is not backed by a GitHub issue), the daemon bypasses GitHub comment updates and issue-state tracking for that bead, but still performs full routing, dispatching, PR creation, 7-green verification, and re-rolling. When a re-roll occurs on a manual bead, the daemon appends to the local spec file and creates a new branch, skipping the PR closure comment.
 
 **AO Intake Integration.** Although `agent-orchestrator` has a native `trackerintake` module that polls GitHub issues and spawns sessions, it lacks human-facing queue management (bead prioritization, sorting, dependencies). To avoid duplication, the daemon's pre-poll normalizer maps GitHub issues to beads, and the daemon serves as the scheduler. AO's native `trackerintake` is disabled for factory projects to prevent duplicate spawning, while AO's session database acts as the single source of truth for active worker sessions.
 
