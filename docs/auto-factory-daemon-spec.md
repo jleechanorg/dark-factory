@@ -49,6 +49,11 @@ So the adoption decision is:
 
 Upstream-first, made explicit for this project: **all AO integration is wrapper code living in dark-factory** — the daemon drives `aow` exclusively through its public CLI/session surface (`spawn`, `session`, `send`, `stop`, `status`, `review`). The upstream tree at `~/projects/agent-orchestrator-mirror` stays byte-identical to `AgentWrapper/agent-orchestrator` main and is updated only by fast-forward syncs. If AO lacks a capability the daemon needs, the gap is closed by (in order): a wrapper/adapter in this repo, an AO plugin mechanism if upstream provides one, or an upstream contribution PR — never by patching the mirror. If upstream later ships what a wrapper does, the wrapper is deleted in favor of upstream (fork-adjustment ledger discipline).
 
+### 2.3 Default Coder & Fallback Configuration
+
+- **Default Coder**: The primary executing agent for implementing tasks is **Claude Code** (`claude-code`), spawned within the `aow` worker session.
+- **Fallback AO Worker**: In the event that the primary Claude Code agent hits API rate limits, quota exhaustion, or execution failures, it is paired with the **Minimax** (`minimax`) backend as the default fallback AO worker. This fallback is orchestrated natively by AO's fallback chain handler, automatically respawning the session with Minimax on the same PR branch to prevent stranded tasks.
+
 ## 3. Topology & Data Flow
 
 ```
