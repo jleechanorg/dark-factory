@@ -345,7 +345,24 @@ A weekly hygiene sweep (same launchd domain, separate low-frequency job):
 - **Multi-tracker generality beyond beads (+ GitHub intake)** — Symphony's contract permits more later; the pilot does not build it.
 - **Rewriting review comments into code patches directly** — the unit of correction is the spec, never the diff (spec-mutation over code modification, ASF §2).
 
-## 10. Accept / Adapt / Reject Ledger (vs. ASF-SR-2.3 and Symphony)
+## 10. Review Agent Fleet & Parallel Review Orchestration
+
+To optimize performance and minimize token usage, the daemon supports running review gates either through hardcoded sequential nodes in the `.dot` graph (which can be slow and run in isolated sandboxes) or by delegating them to a fleet of specialized review agents executing as parallel AO workers.
+
+### 10.1 Review Fleet Composition
+The default review fleet consists of the following `agy` CLI-based reviewer agents:
+1.  **`/zfc` (Zero Framework Cognition Reviewer)**: Audits the PR diff against framework cognition guidelines. It flags dependency bloat, unnecessary third-party package imports, or excessive abstraction wrappers, recommending native standard-library alternatives.
+2.  **`/code-standards` (Code Standards Reviewer)**: Enforces formatting consistency, codebase architecture, import direction rules (e.g. prohibiting imports from the test harness into the module implementation), and comment/docstring preservation.
+3.  **`correctness` (Codex Reviewer)**: The primary logic correctness agent. It evaluates the implementation against edge cases, exception handling, data parsing, and concurrency safety.
+4.  **`alignment` (General Reviewer)**: Checks global alignment between the updated `spec.md`, the implementation code, the design goals, and the telemetry evidence.
+5.  **`/er` (Evidence Reviewer)**: Audits the evidence bundle (JSONL log, videos, test outputs) to ensure it satisfies the evidence standard (matching SHA, LLM-layer pass rate > 0%, clear provenance).
+
+### 10.2 Chained & Parallel Skeptic Execution
+- **Zero Worktree Overhead**: Instead of creating separate worktrees for each reviewer, reviews are executed headlessly against the active session's existing workspace using the `ao skeptic` CLI.
+- **Reviewer Fallback Chain**: Review execution integrates with the `agent-orchestrator` fallback chain handler (`fork-reaction-agent-fallback.ts`). If a primary reviewer (e.g. Codex) experiences rate-limiting, quota exhaustion, or timeout, AO automatically falls back to the next model/agent in the chain (e.g. Claude or Gemini), preventing a blocked PR.
+- **Remediation Iteration Capping**: The PR remediation loop iterates under a combined ceiling of `max_visits` (in-place fixes, default 3) and `max_cycles` (durable re-rolls, default 5). A PR is considered green only when all fleet reviews pass and `7-green` is achieved.
+
+## 11. Accept / Adapt / Reject Ledger (vs. ASF-SR-2.3 and Symphony)
 
 | Source element | Verdict | Disposition |
 |---|---|---|
