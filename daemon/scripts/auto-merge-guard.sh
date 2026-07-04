@@ -62,13 +62,13 @@ while read -r num branch; do
   echo "PR $num: assessment $verdict"
   # mergeable?
   [ "$(gh pr view "$num" --repo "$REPO" --json mergeable --jq .mergeable)" = "MERGEABLE" ] || { echo "PR $num: not MERGEABLE (conflicts) — skip"; continue; }
-  echo "PR $num: all gates green + all_green assessment + mergeable — merging"
+  echo "PR $num: gates red-free + mergeable — merging"
   gh pr merge "$num" --repo "$REPO" --squash 2>&1 | tail -1
   sleep 3
   if [ "$(gh pr view "$num" --repo "$REPO" --json state --jq .state)" = "MERGED" ]; then
     echo "$now_epoch" >> "$RATE_FILE"
     bead="$(printf '%s' "$branch" | sed -E 's|^factory/||; s|-r[0-9]+$||')"
-    br close "$bead" --reason "Merged via factory PR #$num (auto-merge-guard: all_green verified)" 2>/dev/null | tail -1
+    br close "$bead" --reason "Merged via factory PR #$num (auto-merge-guard: no-red gate policy verified)" 2>/dev/null | tail -1
     "$H" ready "$bead" "$num" 2>/dev/null | tail -1 || true
     echo "PR $num MERGED, bead $bead closed+READY"
   fi
