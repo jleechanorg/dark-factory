@@ -1,6 +1,6 @@
 # Auto-Factory Daemon — Architectural Specification (No-Code)
 
-**Status:** Draft r5 — restructured for minimal component gap mapping
+**Status:** Draft r5 — restructured for minimal component gap mapping & combined 7/8-green skeptic reviews
 **Code status:** Declarative blueprint only — zero implementation code
 **Owner repo:** dark-factory (`$DARK_FACTORY_HOME`)
 
@@ -8,39 +8,45 @@
 
 ## Executive Summary
 
-The Auto-Factory Daemon solves the Level-5 backward-recovery path for automated software engineering. While the factory currently dispatches tasks to create PRs, PR rejections (`CHANGES_REQUESTED`) force human operators to manually reset branches and steer agents. The daemon automates this loop by polling a bead queue, scheduling task execution, verifying PRs against the 7-green standard, and executing re-rolls. Under the "single remediation owner" rule, in-place remediation remains owned by active worker sessions, while the daemon handles read-only verification and structural re-rolls (stopping the worker, computing baseline, creating fresh branches, extracting constraints, mutating specs append-only, and re-dispatching). To minimize bloat, the daemon relies on wrapper components that interface with the underlying execution engine. Every component is justified by showing it bridges a gap that neither the interactive coding workflows nor the execution engine natively handles.
+The Auto-Factory Daemon automates the **backward-recovery path** in Level-5 automated software pipelines. When a human or automated review rejects a PR (`CHANGES_REQUESTED`), the daemon manages the feedback loop without human intervention.
+
+### Key Tenets:
+*   **Decoupled Control Planes (Single-Owner)**: To prevent concurrent write conflicts, a single active `aow` worker session owns all *in-place* commits on a branch, while the daemon exclusively performs *read-only* verification and *structural re-rolls* (branch reset, spec mutation, and re-dispatch).
+*   **Wrapper-First & Discardable Components**: The daemon is implemented as a thin scheduler wrapping existing workflows. Components are designed to be discarded if upstream tools (Claude Code or `agent-orchestrator-mirror`) later absorb their functionality.
+*   **Offline Fail-Safe**: If GitHub is down, agents and the daemon coordinate via a parallel local bead-file protocol to prevent pipeline stalls.
+*   **7/8-Green Skeptic verification**: PRs are verified against standard SCM gates (CI, conflicts, comments, CodeRabbit) combined with adversarial Skeptic reviewer runs to ensure evidence compliance and logic correctness before release.
 
 ---
 
 ## Table of Contents
 
-1. Executive Summary
-2. Table of Contents
-3. System Topologies & Diagrams
-   3.1 SCM and State Data Flow
-   3.2 Mermaid State Machine Diagram
-4. Remaining Details
-   4.1 Component Definition, Needs, and Gaps
-       4.1.1 Intake Normalizer
-       4.1.2 Thin Poller (Scheduler)
-       4.1.3 Task Router
-       4.1.4 SCM Observer & Verification Loop
-       4.1.5 Re-Roll Engine
-       4.1.6 Local Bead Communication Fail-Safe (Offline Mode)
-       4.1.7 Combined Review Fleet Orchestrator
-       4.1.8 Hygiene & Maintenance Sweeps
-   4.2 Detailed Specifications
-       4.2.1 Component Stack & Discardable Design
-       4.2.2 Default Coder & Fallback Configuration
-       4.2.3 Intake & Durable-State Split (Symphony §7 & §11)
-       4.2.4 PR Ownership & Handoff
-       4.2.5 Verifier Gates & Evidence Floors
-       4.2.6 Re-Roll Handover, Constraint Extraction & Branching
-       4.2.7 Spec Mutation Grammar & Overlay States
-       4.2.8 Safety Envelope & Cumulative Time-Box
-       4.2.9 Two-Stage Pilot Deployment
-   4.3 Appendix A — Adversarial Review Ledger
-   4.4 Appendix B — Open Questions
+1.  [Executive Summary](#executive-summary)
+2.  [Table of Contents](#table-of-contents)
+3.  [System Topologies & Diagrams](#system-topologies--diagrams)
+    *   3.1 [SCM and State Data Flow](#31-scm-and-state-data-flow)
+    *   3.2 [Mermaid State Machine Diagram](#32-mermaid-state-machine-diagram)
+4.  [Remaining Details](#remaining-details)
+    *   4.1 [Component Definition, Needs, and Gaps](#41-component-definition-needs-and-gaps)
+        *   4.1.1 [Intake Normalizer](#411-intake-normalizer)
+        *   4.1.2 [Thin Poller (Scheduler)](#412-thin-poller-scheduler)
+        *   4.1.3 [Task Router](#413-task-router)
+        *   4.1.4 [SCM Observer & Verification Loop](#414-scm-observer--verification-loop)
+        *   4.1.5 [Re-Roll Engine](#415-re-roll-engine)
+        *   4.1.6 [Local Bead Communication Fail-Safe (Offline Mode)](#416-local-bead-communication-fail-safe-offline-mode)
+        *   4.1.7 [Combined Review Fleet Orchestrator](#417-combined-review-fleet-orchestrator)
+        *   4.1.8 [Hygiene & Maintenance Sweeps](#418-hygiene--maintenance-sweeps)
+    *   4.2 [Detailed Specifications](#42-detailed-specifications)
+        *   4.2.1 [Component Stack & Discardable Design](#421-component-stack--discardable-design)
+        *   4.2.2 [Default Coder & Fallback Configuration](#422-default-coder--fallback-configuration)
+        *   4.2.3 [Intake & Durable-State Split (Symphony §7 & §11)](#423-intake--durable-state-split-symphony-7--11)
+        *   4.2.4 [PR Ownership & Handoff](#424-pr-ownership--handoff)
+        *   4.2.5 [Verifier Gates (7/8-Green) & Evidence Floors](#425-verifier-gates-78-green--evidence-floors)
+        *   4.2.6 [Re-Roll Handover, Constraint Extraction & Branching](#426-re-roll-handover-constraint-extraction--branching)
+        *   4.2.7 [Spec Mutation Grammar & Overlay States](#427-spec-mutation-grammar--overlay-states)
+        *   4.2.8 [Safety Envelope & Cumulative Time-Box](#428-safety-envelope--cumulative-time-box)
+        *   4.2.9 [Two-Stage Pilot Deployment](#429-two-stage-pilot-deployment)
+    *   4.3 [Appendix A — Adversarial Review Ledger](#43-appendix-a--adversarial-review-ledger)
+    *   4.4 [Appendix B — Open Questions](#44-appendix-b--open-questions)
 
 ---
 
@@ -141,9 +147,9 @@ graph TD
 *   **Gap Proof:** The mirror has no task-routing logic; it accepts a workspace and runs a session. Claude Code has no model-based pipeline routing.
 
 #### 4.1.4 SCM Observer & Verification Loop
-*   **Definition:** A verifier that polls SCM PR metadata to independently validate the 7-green gates, evidence floor, and review decisions.
+*   **Definition:** A verifier that polls SCM PR metadata to independently validate the 7/8-green gates, evidence floor, and review decisions.
 *   **Need:** Ensures that the PR has met the rigorous evidence standards before release.
-*   **Gap Proof:** While AO's native loop reacts SCM updates within the workspace, it cannot verify the overall 7-green status, check evidence compliance, or trigger cross-attempt re-rolls. Claude Code cannot autonomously verify PR state.
+*   **Gap Proof:** While AO's native loop reacts to SCM updates within the workspace, it cannot verify the overall 7-green status, check evidence compliance, or trigger cross-attempt re-rolls. Claude Code cannot autonomously verify PR state.
 
 #### 4.1.5 Re-Roll Engine
 *   **Definition:** An automated processor that stops active worker sessions, resets branches to mainline, extracts constraints from rejection text, screens for leaks, mutates spec files append-only, and re-dispatches.
@@ -198,8 +204,17 @@ The single-owner rule requires every open factory PR to have exactly one AO sess
 *   **Standard path:** `/f` is a one-shot pipeline that exits when the PR opens. At PR-open, the daemon attaches an `aow` session to the `/f`-produced branch (spawned with the bead's spec as context in remediation mode).
 *   The daemon leverages the AO daemon's native `scm.Observer` loop which registers ETags, performs diffs, and fires reaction nudges for PRs owned by active sessions.
 
-#### 4.2.5 Verifier Gates & Evidence Floors
-Each fast-tick, the daemon independently evaluates the PR against the full 7-green definition — CI conclusions via check-runs, `mergeable`, `reviewDecision`, review-thread resolution via GraphQL `isResolved`, evidence gate. Additional floors, enforced regardless of target-repo tooling:
+#### 4.2.5 Verifier Gates (7/8-Green) & Evidence Floors
+Each fast-tick, the daemon independently evaluates the PR against the full **7/8-green** definition (as implemented in `~/.claude/commands/green.md` and `~/.claude/skills/pr-green-definition.md`):
+1.  **CI Green**: All check-runs (e.g. GitHub Actions) report a `success` conclusion.
+2.  **No Conflicts**: The SCM mergeable status is `true` (no git conflicts).
+3.  **CodeRabbit APPROVED**: The latest review from the `coderabbitai` bot is `APPROVED`.
+4.  **Bugbot Clean**: Zero error-severity review remarks from `cursor[bot]`.
+5.  **Comments Resolved**: All PR review comment threads have GraphQL `isResolved` set to `true`.
+6.  **Evidence Review (`/er`)**: The `/er` verification workflow/comment returns a `PASS` verdict.
+7.  **Skeptic PASS**: Runs the Skeptic review loop using `ao skeptic verify --pr N`. Under the daemon, this represents the combined execution of the specialized reviewer fleet. A PR is considered green only when all fleet reviews pass.
+
+Additional floors are enforced regardless of target-repo tooling:
 *   **Evidence floor:** production diffs over 100 non-test LOC require at least Layer-2 integration evidence (real callstack, mocks only at external API boundaries). Unit-only proof is insufficient.
 *   **Independent-reviewer floor:** A PR with zero independent review never reaches ready-to-merge.
 
@@ -237,7 +252,7 @@ Each fast-tick, the daemon independently evaluates the PR against the full 7-gre
 
 #### 4.2.8 Safety Envelope & Cumulative Time-Box
 All existing operator policies bind the daemon:
-*   **AO spawn cap:** ≤ 20 concurrent workers, batches ≤ 10.
+*   **AO spawn cap:** **≤ 30 concurrent workers**, batches ≤ 15.
 *   **Autonomy time-box:** Wall-clock autonomous processing time accumulates across a bead's entire chain. When the cumulative clock exceeds 3 hours, the bead enters HUMAN_HELD. Nothing on the automated path resets the clock.
 *   **Force-push: never.** Re-rolls create fresh branches.
 *   **Branch deletion:** Only refs in the daemon's own creation registry.
