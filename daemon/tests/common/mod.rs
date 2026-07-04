@@ -17,10 +17,16 @@ use std::collections::HashMap;
 
 /// Scripted `Tracker` fake: pre-seeded candidates + a call log of every method
 /// invocation (method name + key args), so tests can assert both output and
-/// call shape (e.g. "create_bead called exactly once").
+/// call shape (e.g. "create_bead called exactly once"). `candidates` is a
+/// `RefCell` so `create_bead` can append the newly-created bead back onto the
+/// list, mirroring real `br`'s durable-store idempotency: a bead `br create`
+/// just wrote shows up on the very next `br list` (`fetch_candidates`) call.
+/// Without this, a caller that re-runs `intake::normalize` on a later tick
+/// (e.g. the Task 10 tick loop) would see the same external_ref as "unknown"
+/// forever and create a duplicate bead every tick.
 #[derive(Default)]
 pub struct FakeTracker {
-    pub candidates: Vec<Bead>,
+    pub candidates: RefCell<Vec<Bead>>,
     pub create_bead_result: RefCell<Option<Result<String, String>>>,
     pub calls: RefCell<Vec<String>>,
 }
@@ -34,7 +40,7 @@ impl FakeTracker {
 impl Tracker for FakeTracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError> {
         self.calls.borrow_mut().push("fetch_candidates".into());
-        Ok(self.candidates.clone())
+        Ok(self.candidates.borrow().clone())
     }
 
     fn create_bead(
@@ -46,7 +52,7 @@ impl Tracker for FakeTracker {
         self.calls
             .borrow_mut()
             .push(format!("create_bead({title},{body},{external_ref})"));
-        match self.create_bead_result.borrow().as_ref() {
+        let result = match self.create_bead_result.borrow().as_ref() {
             Some(Ok(id)) => Ok(id.clone()),
             Some(Err(e)) => Err(DaemonError::Tool {
                 tool: "br".into(),
@@ -54,7 +60,15 @@ impl Tracker for FakeTracker {
                 stderr: e.clone(),
             }),
             None => Ok("fake-bead-1".into()),
+        };
+        if let Ok(id) = &result {
+            self.candidates.borrow_mut().push(Bead {
+                id: id.clone(),
+                title: title.to_string(),
+                external_ref: Some(external_ref.to_string()),
+            });
         }
+        result
     }
 
     fn comment_external(&self, external_ref: &str, body: &str) -> Result<(), DaemonError> {
