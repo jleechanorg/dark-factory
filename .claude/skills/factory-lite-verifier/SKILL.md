@@ -96,11 +96,16 @@ The harness records the verdict; for `reroll_worthy` it also parks the bead
 `HUMAN_HELD` (stage-1 substitution). `in_place_fixable` leaves the bead
 ATTESTED — the owning coder keeps fixing in place.
 
-## 5. Stalled session
+## 5. Stalled-session sweep (DISPATCHED beads too)
 
-A DISPATCHED/ATTESTED bead with no PR activity for an implausible window and
-no responsive coder → `$H park <bead_id> "session_stalled"`. Autonomy-clock
-increments are the coder tick's job — this skill never calls `autonomy-tick`.
+`$H list DISPATCHED` — these beads never appear in step 1, so sweep them here
+every tick: a DISPATCHED bead whose coder has produced no PR and no branch
+activity (`gh api repos/$TARGET_REPO/branches/<branch>` 404s or its last
+commit is older than ~30 min) with `autonomy_secs >= 1800` → the coder died
+silently: `$H park <bead_id> "coder_silent"`. Likewise an ATTESTED bead with
+no PR activity for an implausible window and no responsive coder →
+`$H park <bead_id> "session_stalled"`. Autonomy-clock increments are the
+coder tick's job — this skill never calls `autonomy-tick`.
 
 ## 6. End-of-tick summary
 
