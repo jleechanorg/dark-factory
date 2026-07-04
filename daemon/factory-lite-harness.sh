@@ -164,9 +164,14 @@ prev-gate-assessment) # prev-gate-assessment <pr_number> — prints previous (se
 ready) # ready <bead_id> <pr_number> — terminal transition; verifier stops driving this bead
   [ $# -eq 3 ] || die "usage: ready <bead_id> <pr_number>"
   valid_pr "$3"; require_state "$2" ATTESTED; require_pr "$2" "$3"
-  # terminal transition requires an evidenced all-green assessment for THIS pr
+  # terminal transition requires an evidenced assessment for THIS pr with NO red
+  # gate (no-red policy — all_green is never true here since bot gates are
+  # perpetually 'unknown'; requiring all_green=true would make READY unreachable).
   last_ga="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$3[,}]" | tail -1 || true)"
-  printf '%s' "$last_ga" | grep -q '"all_green": *true' || die "ready refused: no all_green=true GATE_ASSESSMENT for pr $3"
+  [ -n "$last_ga" ] && printf '%s' "$last_ga" | python3 -c 'import json,sys
+try: g=json.loads(sys.stdin.read())["context"]["gates"]
+except Exception: sys.exit(1)
+sys.exit(0 if not any(v=="red" for v in g.values()) else 1)' || die "ready refused: no red-free GATE_ASSESSMENT for pr $3"
   sql "UPDATE bead_overlay SET state='READY', updated_at='$(now)' WHERE bead_id='$(q "$2")';"
   emit "$2" "$(get_field "$2" attempt)" READY READY_FOR_MERGE '{}' "{\"pr_number\":$3}"
   echo "ok"
@@ -212,11 +217,20 @@ print(d[0]["status"])' 2>&1)" || die "could not parse br show --json output for 
     # A closed br bead + an evidenced all-green assessment = the PR merged and
     # the work succeeded (transition READY), NOT abandoned-underneath. This
     # resolves the ready-vs-sweep race regardless of ordering.
-    merged_green=""
+    # Success signal = the same no-red policy the merge guard uses (all_green is
+    # never true here — CodeRabbit/Bugbot gates are perpetually 'unknown'). A
+    # closed bead whose latest assessment has no RED gate = merged-and-done.
+    merged_ok=""
     if [ -n "$pr_number" ] && [ "$pr_number" != "None" ]; then
-      merged_green="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$pr_number[,}]" | grep '"all_green": *true' | tail -1 || true)"
+      last_ga="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$pr_number[,}]" | tail -1 || true)"
+      if [ -n "$last_ga" ] && printf '%s' "$last_ga" | python3 -c 'import json,sys
+try: g=json.loads(sys.stdin.read())["context"]["gates"]
+except Exception: sys.exit(1)
+sys.exit(0 if not any(v=="red" for v in g.values()) else 1)'; then
+        merged_ok="yes"
+      fi
     fi
-    if [ -n "$merged_green" ]; then
+    if [ -n "$merged_ok" ]; then
       sql "UPDATE bead_overlay SET state='READY', updated_at='$(now)' WHERE bead_id='$(q "$bead_id")';"
       emit "$bead_id" "$(get_field "$bead_id" attempt)" READY READY_FOR_MERGE '{}' "{\"pr_number\":$pr_number,\"note\":\"closed_after_merge\"}"
       echo "ready"
