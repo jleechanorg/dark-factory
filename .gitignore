@@ -47,3 +47,9 @@ worktree_factory_evolve/
 
 # Rust daemon crate build artifacts (Cargo.lock IS committed — binary crate)
 daemon/target/
+
+# stray test/verify artifacts (cargo test scratch, DoD smoke)
+test.db
+.scratch_daemon_verify/
+**/*.db-wal
+**/*.db-shm
