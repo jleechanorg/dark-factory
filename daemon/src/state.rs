@@ -129,7 +129,7 @@ impl SqliteStateStore {
     /// and ensure the schema from `contracts/schema.sql` exists.
     pub fn open(path: &Path) -> Result<Self, DaemonError> {
         let conn = Connection::open(path).map_err(|e| tool_err("open", e))?;
-        Self::configure(&conn)?;
+        Self::configure(&conn, false)?;
         conn.execute_batch(include_str!("../contracts/schema.sql"))
             .map_err(|e| tool_err("apply schema", e))?;
         Ok(Self { conn })
@@ -139,19 +139,35 @@ impl SqliteStateStore {
     /// (normally `include_str!("../contracts/schema.sql")`).
     pub fn open_in_memory_with_schema(schema_sql: &str) -> Result<Self, DaemonError> {
         let conn = Connection::open_in_memory().map_err(|e| tool_err("open", e))?;
-        Self::configure(&conn)?;
+        Self::configure(&conn, true)?;
         conn.execute_batch(schema_sql)
             .map_err(|e| tool_err("apply schema", e))?;
         Ok(Self { conn })
     }
 
-    fn configure(conn: &Connection) -> Result<(), DaemonError> {
+    /// `is_memory` distinguishes the two `configure` call sites: `open()` (file-backed,
+    /// `is_memory=false`) and `open_in_memory_with_schema()` (`is_memory=true`). WAL is a
+    /// documented no-op against `:memory:` connections, so failures/non-"wal" readbacks are
+    /// ignored there; on a real file, a failure to switch journal modes (unsupported
+    /// filesystem, permissions, NFS, etc.) must not be silently swallowed (jleechan-8in).
+    fn configure(conn: &Connection, is_memory: bool) -> Result<(), DaemonError> {
         conn.busy_timeout(std::time::Duration::from_millis(5000))
             .map_err(|e| tool_err("busy_timeout", e))?;
-        // WAL is a no-op (and briefly errors) against :memory: connections; ignore there.
-        let _: rusqlite::Result<String> =
+        let mode: rusqlite::Result<String> =
             conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0));
-        Ok(())
+        if is_memory {
+            // WAL is a no-op (and briefly errors) against :memory: connections; ignore there.
+            return Ok(());
+        }
+        match mode {
+            Ok(mode) if mode.eq_ignore_ascii_case("wal") => Ok(()),
+            Ok(mode) => Err(DaemonError::Config(format!(
+                "PRAGMA journal_mode=WAL did not take effect on file-backed DB: got \"{mode}\""
+            ))),
+            Err(e) => Err(DaemonError::Config(format!(
+                "PRAGMA journal_mode=WAL failed on file-backed DB: {e}"
+            ))),
+        }
     }
 }
 
@@ -400,5 +416,58 @@ mod tests {
         s.register_branch("b2", "factory/b1-r1").unwrap(); // re-register same branch, different bead
         let branches = s.owned_branches().unwrap();
         assert_eq!(branches, vec!["factory/b1-r1".to_string()]);
+    }
+
+    /// jleechan-8in: file-backed `open()` must not silently swallow a failed
+    /// `PRAGMA journal_mode=WAL`. This asserts the happy path actually took
+    /// effect (readback == "wal") on a real temp-file-backed connection —
+    /// proving `configure(is_memory=false)` verifies rather than discards.
+    #[test]
+    fn open_on_real_file_actually_sets_wal_mode() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "dark-factory-state-test-{}-{}.sqlite",
+            std::process::id(),
+            now_iso8601().replace([':', '-', 'T', 'Z'], "")
+        ));
+        let _cleanup = TempFileGuard(path.clone());
+
+        let s = SqliteStateStore::open(&path).unwrap();
+        let mode: String = s
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+    }
+
+    /// jleechan-8in: a non-"wal" (or errored) readback on a file-backed connection
+    /// must propagate as `DaemonError::Config`, not be discarded. Exercises
+    /// `configure` directly with `is_memory=false` against an in-memory connection
+    /// (WAL cannot take effect there), which is exactly the failure mode the bead
+    /// describes for real files with unsupported filesystems/permissions/NFS.
+    #[test]
+    fn configure_file_backed_propagates_wal_failure_as_config_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        let err = SqliteStateStore::configure(&conn, false).unwrap_err();
+        match err {
+            DaemonError::Config(msg) => {
+                assert!(
+                    msg.contains("journal_mode=WAL"),
+                    "error message should mention the failing pragma: {msg}"
+                );
+            }
+            other => panic!("expected DaemonError::Config, got {other:?}"),
+        }
+    }
+
+    /// Cleans up the temp file (+ WAL/SHM sidecars) created by
+    /// `open_on_real_file_actually_sets_wal_mode`, even on panic.
+    struct TempFileGuard(std::path::PathBuf);
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
+            }
+        }
     }
 }
