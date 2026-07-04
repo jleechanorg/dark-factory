@@ -46,10 +46,15 @@ while :; do
     exit 0
   fi
   echo "[$(date -u +%FT%TZ)] tick begin" >> "$LOG"
-  # per-tick timeout = 90% of interval or 20m, whichever is larger
-  TICK_TIMEOUT=$(( INTERVAL * 9 / 10 > 1200 ? INTERVAL * 9 / 10 : 1200 ))
+  # per-tick timeout = 90% of interval or 45m, whichever is larger — a tick now
+  # waits for its background coders (see env below), so it must outlive the
+  # longest coder; a long tick simply delays the next one (sleep runs after)
+  TICK_TIMEOUT=$(( INTERVAL * 9 / 10 > 2700 ? INTERVAL * 9 / 10 : 2700 ))
   rc=0
-  ( cd "$REPO_DIR" && timeout "$TICK_TIMEOUT" \
+  # CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0: wait for background coder subagents
+  # instead of killing them at 600s (f-signoff P2 — confirmed killing Task-10's
+  # coder 2026-07-04T17:48Z). TICK_TIMEOUT still bounds the whole tick.
+  ( cd "$REPO_DIR" && CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 timeout "$TICK_TIMEOUT" \
         claude -p --dangerously-skip-permissions "$PROMPT" ) >> "$LOG" 2>&1 || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "[$(date -u +%FT%TZ)] tick FAILED (rc=$rc) — continuing to next tick" >> "$LOG"
