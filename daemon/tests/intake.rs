@@ -73,6 +73,8 @@ fn already_known_external_ref_is_not_duplicated() {
     tracker.candidates.borrow_mut().push(Bead {
         id: "existing-bead".into(),
         title: "issue 42".into(),
+        description: String::new(),
+        file_tree_summary: String::new(),
         external_ref: Some("owner/repo#42".into()),
     });
 
@@ -142,6 +144,8 @@ fn mixed_batch_only_creates_bead_for_new_write_tier_issue() {
     tracker.candidates.borrow_mut().push(Bead {
         id: "existing-bead-3".into(),
         title: "issue 3".into(),
+        description: String::new(),
+        file_tree_summary: String::new(),
         external_ref: Some("owner/repo#3".into()),
     });
 

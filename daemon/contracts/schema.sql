@@ -8,7 +8,7 @@ PRAGMA busy_timeout = 5000;
 CREATE TABLE IF NOT EXISTS bead_overlay (
   bead_id       TEXT PRIMARY KEY,
   state         TEXT NOT NULL CHECK (state IN
-                  ('QUEUED','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',
+                  ('QUEUED','DISPATCHING','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',
                    'REDISPATCHED','BUDGET_HELD','HUMAN_HELD')),
   attempt       INTEGER NOT NULL DEFAULT 1,   -- r<n> counter
   reroll_count  INTEGER NOT NULL DEFAULT 0,

@@ -15,6 +15,8 @@ fn fake_tracker_records_calls_and_returns_scripted_response() {
         candidates: std::cell::RefCell::new(vec![Bead {
             id: "b1".into(),
             title: "t".into(),
+            description: String::new(),
+            file_tree_summary: String::new(),
             external_ref: Some("owner/repo#5".into()),
         }]),
         create_bead_result: std::cell::RefCell::new(Some(Ok("bead-42".into()))),

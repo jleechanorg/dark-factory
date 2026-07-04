@@ -65,6 +65,8 @@ impl Tracker for FakeTracker {
             self.candidates.borrow_mut().push(Bead {
                 id: id.clone(),
                 title: title.to_string(),
+                description: body.to_string(),
+                file_tree_summary: String::new(),
                 external_ref: Some(external_ref.to_string()),
             });
         }
