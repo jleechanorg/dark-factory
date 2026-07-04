@@ -182,8 +182,9 @@ The stack composes three existing systems plus one new thin daemon. The composit
 *   **Discardable Design:** In alignment with the "dorodango" architecture (polish, discard, rebuild), the daemon's integration adapters are designed as loosely coupled, disposable wrappers. If Claude Code improves its built-in workflows or `agent-orchestrator-mirror` merges new features, the corresponding daemon component/plugin is discarded and replaced by the new upstream implementation. Standard interface boundaries (JSON payloads over CLI/IPC) are maintained to allow plug-and-play swaps of intake, execution, or review components.
 
 #### 4.2.2 Default Coder & Fallback Configuration
-*   **Default Coder**: The primary executing agent for implementing tasks is the **Claude Code** (`claude-code`) agent harness, running inside an **AO worker** (`aow`) session and configured to use the **Minimax** (`minimax`) model provider/backend.
-*   **Fallback Chain**: In the event that the primary Minimax backend hits API rate limits, quota exhaustion, or execution failures, AO's native fallback chain handler (`fork-reaction-agent-fallback.ts`) automatically respawns the session using the next model in the configured fallback chain (e.g. `claude-sonnet`), preserving the active session context on the PR branch.
+*   **Default Coder**: The primary executing agent for implementing tasks is the **Minimax** (`minimax`) agent harness, running inside an **AO worker** (`aow`) session.
+    *   *Verification Note*: The operator verified that the Go-based `agent-orchestrator-mirror` repository does not currently contain a native Go agent adapter for `minimax` under `backend/internal/adapters/agent/`. However, the fork repository `/Users/jleechan/project_agento/agent-orchestrator` has a fully functional `@jleechanorg/ao-plugin-agent-minimax` plugin. For the pilot, the minimax Go adapter must be synced from the fork, or registered dynamically.
+*   **Fallback Chain**: In the event that the primary Minimax agent hits API rate limits, quota exhaustion, or execution failures, AO's native fallback chain handler (`fork-reaction-agent-fallback.ts`) automatically respawns the session using the next model/agent in the configured fallback chain (e.g. `claude-code` or `claude-sonnet`), preserving the active session context on the PR branch.
 
 #### 4.2.3 Intake & Durable-State Split (Symphony §7 & §11)
 *   **Intake contract:** The daemon's tracker adapter targets beads exclusively. REQUIRED operations, normalized to Symphony's domain model:
@@ -213,9 +214,14 @@ Each fast-tick, the daemon independently evaluates the PR against the full **7/8
 4.  **Bugbot Clean**: Zero error-severity review remarks from `cursor[bot]`.
 5.  **Comments Resolved**: All PR review comment threads have GraphQL `isResolved` set to `true`.
 6.  **Evidence Review (`/er`)**: The `/er` verification workflow/comment returns a `PASS` verdict.
-7.  **Skeptic PASS**: Runs the Skeptic review loop using `ao skeptic verify --pr N`. Under the daemon, this represents the combined execution of the specialized reviewer fleet. A PR is considered green only when all fleet reviews pass.
+7.  **Skeptic PASS**: Runs the Skeptic review loop. Under the daemon, the Skeptic review represents the combined execution of the specialized reviewer fleet:
+    *   **Default Reviewer**: The default reviewer agent is the **`agy` CLI** running inside an **AO worker** session.
+    *   **Evidence & General Reviewer Chain**: For the high-stakes `/er` (Evidence Reviewer) and `alignment` (General Reviewer) gates, the review execution is routed through a prioritized fallback chain:
+        `codex` (running GPT-5.5) -> `claude-code` (running Sonnet) -> `agy` -> `minimax`.
+        If a model in the chain experiences API timeouts, rate limits, or errors, AO automatically falls back to the next model to guarantee review completion.
 
 Additional floors and optimizations are enforced:
+
 *   **SCM API Rate-Limit Optimization**: The verifier loop implements ETag-based conditional requests for all SCM metadata fetches. If no changes are detected on a PR, the poll frequency dynamically backs off from the fast tier (1 minute) to a slower tier (up to 10 minutes) to conserve API quota.
 *   **Evidence floor:** production diffs over 100 non-test LOC require at least Layer-2 integration evidence (real callstack, mocks only at external API boundaries). Unit-only proof is insufficient.
 *   **Independent-reviewer floor:** A PR with zero independent review never reaches ready-to-merge.
