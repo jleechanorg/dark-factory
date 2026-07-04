@@ -11,14 +11,15 @@ use std::path::Path;
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OverlayState {
     Queued,       // bead accepted by intake, awaiting dispatch
-    Dispatched,   // worker/pipeline running, no PR yet
-    Attested,     // PR open, under verification
-    Ready,        // terminal: 7-green, readiness posted, daemon stops driving
-    ReRoll,       // re-roll in progress (Stage 2)
-    Recovery,     // spec mutated, awaiting re-dispatch (Stage 2)
+    Dispatching, // dispatch intent + branch registered, spawn not yet confirmed (spec §4.2.2/§4.2.4)
+    Dispatched,  // worker/pipeline running, no PR yet
+    Attested,    // PR open, under verification
+    Ready,       // terminal: 7-green, readiness posted, daemon stops driving
+    ReRoll,      // re-roll in progress (Stage 2)
+    Recovery,    // spec mutated, awaiting re-dispatch (Stage 2)
     Redispatched, // handed back to the queue
-    BudgetHeld,   // budget exhaustion (monitoring-only in Stage 1/2)
-    HumanHeld,    // terminal until human action
+    BudgetHeld,  // budget exhaustion (monitoring-only in Stage 1/2)
+    HumanHeld,   // terminal until human action
 }
 
 impl OverlayState {
@@ -26,6 +27,7 @@ impl OverlayState {
     pub fn as_str(&self) -> &'static str {
         match self {
             OverlayState::Queued => "QUEUED",
+            OverlayState::Dispatching => "DISPATCHING",
             OverlayState::Dispatched => "DISPATCHED",
             OverlayState::Attested => "ATTESTED",
             OverlayState::Ready => "READY",
@@ -45,6 +47,7 @@ impl OverlayState {
     pub fn from_str(s: &str) -> Result<Self, DaemonError> {
         match s {
             "QUEUED" => Ok(OverlayState::Queued),
+            "DISPATCHING" => Ok(OverlayState::Dispatching),
             "DISPATCHED" => Ok(OverlayState::Dispatched),
             "ATTESTED" => Ok(OverlayState::Attested),
             "READY" => Ok(OverlayState::Ready),
@@ -312,10 +315,11 @@ mod tests {
     }
 
     #[test]
-    fn all_nine_overlay_states_accepted_by_schema() {
+    fn all_ten_overlay_states_accepted_by_schema() {
         let s = store();
         for (i, state) in [
             OverlayState::Queued,
+            OverlayState::Dispatching,
             OverlayState::Dispatched,
             OverlayState::Attested,
             OverlayState::Ready,
