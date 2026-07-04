@@ -12,5 +12,6 @@ pub mod intake;
 pub mod router;
 pub mod state;
 pub mod telemetry;
+pub mod tick;
 pub mod tools;
 pub mod verifier;

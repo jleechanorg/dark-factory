@@ -69,8 +69,8 @@ fn already_known_external_ref_is_not_duplicated() {
     scm.issues.push(issue(42, "alice"));
     scm.permissions.insert("alice".into(), Permission::Write);
 
-    let mut tracker = FakeTracker::new();
-    tracker.candidates.push(Bead {
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
         id: "existing-bead".into(),
         title: "issue 42".into(),
         external_ref: Some("owner/repo#42".into()),
@@ -138,8 +138,8 @@ fn mixed_batch_only_creates_bead_for_new_write_tier_issue() {
     scm.permissions.insert("alice".into(), Permission::Write);
     scm.permissions.insert("mallory".into(), Permission::Read);
 
-    let mut tracker = FakeTracker::new();
-    tracker.candidates.push(Bead {
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
         id: "existing-bead-3".into(),
         title: "issue 3".into(),
         external_ref: Some("owner/repo#3".into()),
