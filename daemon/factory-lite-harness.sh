@@ -20,8 +20,14 @@ cfg() { # cfg <key> — naive toml scalar read (deterministic; lite-only)
   grep -E "^${1}[[:space:]]*=" "$CONFIG" | head -1 | sed -E 's/^[^=]+=[[:space:]]*//; s/^"//; s/"[[:space:]]*(#.*)?$//; s/[[:space:]]*(#.*)?$//'
 }
 
-sql() { sqlite3 "$DB" "$@"; }
+sql() { sqlite3 -cmd '.timeout 5000' "$DB" "$@"; }  # per-connection busy_timeout (PRAGMA in schema only binds the init conn)
 q() { printf '%s' "$1" | sed "s/'/''/g"; }  # sqlite string escape
+js() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }  # safe JSON string literal
+valid_bead_id() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid bead_id (must be [A-Za-z0-9._-]): $1"; }
+valid_branch()  { [[ "$1" =~ ^factory/[A-Za-z0-9._-]+-r[0-9]+$ ]] || die "branch must match factory/<bead_id>-r<n>: $1"; }
+valid_pr()      { [[ "$1" =~ ^[0-9]+$ ]] || die "pr_number must be numeric: $1"; }
+# assert the caller-supplied pr matches the overlay row (drift guard)
+require_pr() { local stored; stored="$(get_field "$1" pr_number)"; [ "$stored" = "$2" ] || die "pr_number $2 != overlay row's $stored for $1"; }
 
 VALID_STATES="QUEUED DISPATCHED ATTESTED READY RE_ROLL RECOVERY REDISPATCHED BUDGET_HELD HUMAN_HELD"
 valid_state() { case " $VALID_STATES " in *" $1 "*) ;; *) die "invalid state: $1";; esac; }
@@ -59,6 +65,7 @@ init)
 
 intake-upsert) # intake-upsert <bead_id> <title>
   [ $# -eq 3 ] || die "usage: intake-upsert <bead_id> <title>"
+  valid_bead_id "$2"
   local_exists="$(sql "SELECT count(*) FROM bead_overlay WHERE bead_id='$(q "$2")';")"
   sql "INSERT INTO bead_overlay (bead_id,state,attempt,updated_at)
        VALUES ('$(q "$2")','QUEUED',1,'$(now)') ON CONFLICT(bead_id) DO NOTHING;"
@@ -74,7 +81,7 @@ route-record) # route-record <bead_id> <SMALL_PATH|STANDARD_PATH> [note]
   [ $# -ge 3 ] || die "usage: route-record <bead_id> <verdict> [note]"
   case "$3" in SMALL_PATH|STANDARD_PATH) ;; *) die "invalid routing verdict: $3";; esac
   require_state "$2" QUEUED
-  emit "$2" "$(get_field "$2" attempt)" QUEUED TASK_ROUTED '{}' "{\"routingVerdict\":\"$3\",\"note\":$(printf '%s' "${4:-}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
+  emit "$2" "$(get_field "$2" attempt)" QUEUED TASK_ROUTED '{}' "{\"routingVerdict\":\"$3\",\"note\":$(js "${4:-}")}"
   echo "ok"
   ;;
 
@@ -88,14 +95,16 @@ capacity) # capacity — prints dispatchable slot count this tick
 
 dispatch-record) # dispatch-record <bead_id> <branch>
   [ $# -eq 3 ] || die "usage: dispatch-record <bead_id> <branch>"
-  case "$3" in factory/*) ;; *) die "branch must match factory/<bead_id>-r<n>: $3";; esac
+  valid_bead_id "$2"; valid_branch "$3"
   require_state "$2" QUEUED
   [ "$("$0" capacity)" -gt 0 ] || die "over capacity — dispatch refused"
+  owner="$(sql "SELECT bead_id FROM branch_registry WHERE branch='$(q "$3")';")"
+  [ -z "$owner" ] || [ "$owner" = "$2" ] || die "branch $3 already registered to $owner"
   sql "INSERT INTO branch_registry (branch,bead_id,created_at)
        VALUES ('$(q "$3")','$(q "$2")','$(now)') ON CONFLICT(branch) DO NOTHING;
        UPDATE bead_overlay SET state='DISPATCHED', branch='$(q "$3")', updated_at='$(now)'
        WHERE bead_id='$(q "$2")';"
-  emit "$2" "$(get_field "$2" attempt)" DISPATCHED TASK_DISPATCHED '{}' "{\"activeModel\":\"minimax\",\"branch\":\"$3\"}"
+  emit "$2" "$(get_field "$2" attempt)" DISPATCHED TASK_DISPATCHED '{}' "{\"activeModel\":\"minimax\",\"branch\":$(js "$3")}"
   echo "ok"
   ;;
 
@@ -104,7 +113,7 @@ pr-opened) # pr-opened <bead_id> <pr_number> <url>
   [[ "$3" =~ ^[0-9]+$ ]] || die "pr_number must be numeric"
   require_state "$2" DISPATCHED
   sql "UPDATE bead_overlay SET state='ATTESTED', pr_number=$3, updated_at='$(now)' WHERE bead_id='$(q "$2")';"
-  emit "$2" "$(get_field "$2" attempt)" ATTESTED PR_OPENED '{}' "{\"pr_number\":$3,\"url\":\"$4\"}"
+  emit "$2" "$(get_field "$2" attempt)" ATTESTED PR_OPENED '{}' "{\"pr_number\":$3,\"url\":$(js "$4")}"
   echo "ok"
   ;;
 
@@ -126,7 +135,7 @@ autonomy-tick) # autonomy-tick <elapsed_secs> — increments actives, warns at 8
 
 gate-assessment) # gate-assessment <bead_id> <pr_number> <gates_json>  (gates: 7 keys, green|red|unknown)
   [ $# -eq 4 ] || die "usage: gate-assessment <bead_id> <pr_number> <gates_json>"
-  require_state "$2" ATTESTED
+  valid_pr "$3"; require_state "$2" ATTESTED; require_pr "$2" "$3"
   python3 - "$4" <<'PY' || die "invalid gates json"
 import json, sys
 g = json.loads(sys.argv[1])
@@ -147,14 +156,17 @@ PY
 
 prev-gate-assessment) # prev-gate-assessment <pr_number> — prints previous (second-to-last) assessment or empty
   [ $# -eq 2 ] || die "usage: prev-gate-assessment <pr_number>"
+  valid_pr "$2"
   m="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$2[,}]" || true)"
   if [ "$(printf '%s\n' "$m" | grep -c .)" -ge 2 ]; then printf '%s\n' "$m" | tail -2 | head -1; fi
   ;;
 
 ready) # ready <bead_id> <pr_number> — terminal transition; verifier stops driving this bead
   [ $# -eq 3 ] || die "usage: ready <bead_id> <pr_number>"
-  [[ "$3" =~ ^[0-9]+$ ]] || die "pr_number must be numeric"
-  require_state "$2" ATTESTED
+  valid_pr "$3"; require_state "$2" ATTESTED; require_pr "$2" "$3"
+  # terminal transition requires an evidenced all-green assessment for THIS pr
+  last_ga="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$3[,}]" | tail -1 || true)"
+  printf '%s' "$last_ga" | grep -q '"all_green": *true' || die "ready refused: no all_green=true GATE_ASSESSMENT for pr $3"
   sql "UPDATE bead_overlay SET state='READY', updated_at='$(now)' WHERE bead_id='$(q "$2")';"
   emit "$2" "$(get_field "$2" attempt)" READY READY_FOR_MERGE '{}' "{\"pr_number\":$3}"
   echo "ok"
@@ -163,7 +175,7 @@ ready) # ready <bead_id> <pr_number> — terminal transition; verifier stops dri
 reroll-verdict) # reroll-verdict <bead_id> <pr_number> <in_place_fixable|reroll_worthy> <rationale>
   [ $# -eq 5 ] || die "usage: reroll-verdict <bead_id> <pr_number> <verdict> <rationale>"
   case "$4" in in_place_fixable|reroll_worthy) ;; *) die "invalid verdict: $4";; esac
-  require_state "$2" ATTESTED
+  valid_pr "$3"; require_state "$2" ATTESTED; require_pr "$2" "$3"
   rat_json="$(printf '%s' "$5" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
   emit "$2" "$(get_field "$2" attempt)" ATTESTED REROLL_VERDICT_RECORDED '{}' "{\"pr_number\":$3,\"verdict\":\"$4\",\"rationale\":$rat_json}"
   if [ "$4" = "reroll_worthy" ]; then  # stage 1: record + park, never execute
@@ -175,6 +187,7 @@ reroll-verdict) # reroll-verdict <bead_id> <pr_number> <in_place_fixable|reroll_
 
 park) # park <bead_id> <reason>
   [ $# -eq 3 ] || die "usage: park <bead_id> <reason>"
+  valid_bead_id "$2"
   sql "UPDATE bead_overlay SET state='HUMAN_HELD', updated_at='$(now)' WHERE bead_id='$(q "$2")';"
   emit "$2" "$(get_field "$2" attempt)" HUMAN_HELD PARKED_HUMAN_HELD '{}' "{\"reason\":$(printf '%s' "$3" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
   echo "ok"
