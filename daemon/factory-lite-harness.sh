@@ -113,7 +113,7 @@ autonomy-tick) # autonomy-tick <elapsed_secs> — increments actives, warns at 8
   box="$(cfg autonomy_timebox_secs)"; warn=$(( box * 8 / 10 ))
   sql "UPDATE bead_overlay SET autonomy_secs = autonomy_secs + $2, updated_at='$(now)'
        WHERE state IN ('DISPATCHED','ATTESTED');"
-  for b in $(sql "SELECT bead_id FROM bead_overlay WHERE state IN ('DISPATCHED','ATTESTED') AND autonomy_secs >= $warn AND autonomy_secs <= $box;"); do
+  for b in $(sql "SELECT bead_id FROM bead_overlay WHERE state IN ('DISPATCHED','ATTESTED') AND autonomy_secs >= $warn AND autonomy_secs <= $box AND autonomy_secs - $2 < $warn;"); do
     emit "$b" "$(get_field "$b" attempt)" "$(get_field "$b" state)" BUDGET_WARNING "{\"elapsedAutonomySeconds\":$(get_field "$b" autonomy_secs)}" '{"reason":"autonomy_80pct"}'
   done
   for b in $(sql "SELECT bead_id FROM bead_overlay WHERE state IN ('DISPATCHED','ATTESTED') AND autonomy_secs > $box;"); do
@@ -146,7 +146,8 @@ PY
 
 prev-gate-assessment) # prev-gate-assessment <pr_number> — prints previous (second-to-last) assessment or empty
   [ $# -eq 2 ] || die "usage: prev-gate-assessment <pr_number>"
-  grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$2[,}]" | tail -2 | head -1 || true
+  m="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$2[,}]" || true)"
+  if [ "$(printf '%s\n' "$m" | grep -c .)" -ge 2 ]; then printf '%s\n' "$m" | tail -2 | head -1; fi
   ;;
 
 ready) # ready <bead_id> <pr_number> — terminal transition; verifier stops driving this bead
