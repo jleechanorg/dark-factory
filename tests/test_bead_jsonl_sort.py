@@ -19,6 +19,7 @@ if anyone upgrades br or writes the JSONL by hand with a different order.
 """
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -75,14 +76,19 @@ def test_jsonl_no_duplicate_ids() -> None:
 
 
 def test_br_sync_preserves_id_sort(tmp_path: Path) -> None:
-    """
-    if shutil.which("br") is None:
-        pytest.skip("br CLI not on PATH (not a beads-enabled runner)")RED: a br operation + sync must not re-sort the JSONL.
+    """RED: a br operation + sync must not re-sort the JSONL.
 
     Builds a tiny in-place fixture, makes a 1-bead change, runs
     `br sync --flush-only`, and asserts the resulting JSONL is still
     id-sorted. If br's writer ever stops sorting by id, this test catches it.
     """
+    # The `br` CLI is installed locally (~/projects/.cargo/bin/br) but not in
+    # GitHub Actions CI runners — skip gracefully when it's absent so the
+    # test isn't a hard requirement for green CI. The pre-flight CI contract
+    # is "binary present on PATH"; when it's not, the invariant under test
+    # is unreachable on this host, not violated.
+    if shutil.which("br") is None:
+        pytest.skip("`br` CLI not on PATH (not a beads-enabled runner)")
     fixture = tmp_path / ".beads"
     fixture.mkdir(parents=True)
     (fixture / "config.yaml").write_text("issue_prefix: jsonlsort-test\n")
