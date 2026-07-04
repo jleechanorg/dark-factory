@@ -44,3 +44,6 @@ specs/skeptic-report.json
 # actions/checkout for every new PR. Block it at the index level so future
 # factory runs cannot re-introduce the broken state.
 worktree_factory_evolve/
+
+# Rust daemon crate build artifacts (Cargo.lock IS committed — binary crate)
+daemon/target/
