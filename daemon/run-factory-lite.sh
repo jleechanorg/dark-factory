@@ -54,7 +54,13 @@ while :; do
   # CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0: wait for background coder subagents
   # instead of killing them at 600s (f-signoff P2 — confirmed killing Task-10's
   # coder 2026-07-04T17:48Z). TICK_TIMEOUT still bounds the whole tick.
-  ( cd "$REPO_DIR" && CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 timeout "$TICK_TIMEOUT" \
+  # Holdout isolation: strip DARK_FACTORY_HOLDOUTS and any *HOLDOUT* var from the
+  # tick (and thus its spawned coder subagents), mirroring the Python runner's
+  # _sanitized_env — coder/implementing agents must never see holdout paths.
+  HOLDOUT_UNSETS=(-u DARK_FACTORY_HOLDOUTS)
+  while IFS='=' read -r k _; do case "$k" in *HOLDOUT*) HOLDOUT_UNSETS+=(-u "$k");; esac; done < <(env)
+  ( cd "$REPO_DIR" && CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 \
+        env "${HOLDOUT_UNSETS[@]}" timeout "$TICK_TIMEOUT" \
         claude -p --dangerously-skip-permissions "$PROMPT" ) >> "$LOG" 2>&1 || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "[$(date -u +%FT%TZ)] tick FAILED (rc=$rc) — continuing to next tick" >> "$LOG"
