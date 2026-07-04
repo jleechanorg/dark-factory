@@ -3,12 +3,11 @@
 // these modules are exercised only by their own unit tests, so allow dead_code at the
 // crate level rather than deleting spec-mandated fields/variants ahead of the tasks
 // that consume them.
+//
+// Modules live in `lib.rs` (see that file) so `daemon/tests/*` integration tests
+// can `use daemon::tools::{...}`; future tasks wire `daemon::{...}` modules into
+// the poll loop here as they're consumed.
 #![allow(dead_code)]
-
-mod config;
-mod errors;
-mod state;
-mod telemetry;
 
 fn main() {
     println!("auto-factory daemon (stage 1)");
