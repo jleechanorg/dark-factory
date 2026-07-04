@@ -83,7 +83,11 @@ Intentionally empty — kept so step numbers stay stable across revisions.
 
 ## 6. Detect PRs opened by dispatched coders
 
-For every row in `$H list DISPATCHED` with a `branch`:
+For every row in `$H list DISPATCHED`: first `$H bead-closed-check <bead_id>`
+— guards against a coder closing the bead directly (work already shipped
+elsewhere) instead of opening a PR (see jleechan-tdl). If it prints `parked`,
+the row is now `HUMAN_HELD`; skip the rest of this step for that bead this
+tick. Otherwise, for rows with a `branch`:
 
 ```bash
 gh pr list --repo "$TARGET_REPO" --head "<branch>" --state open --json number,url

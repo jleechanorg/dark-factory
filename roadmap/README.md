@@ -2,6 +2,7 @@
 
 ## Recent activity (by day)
 
+- [2026-07-03](activity/2026-07-03.md)
 - [2026-06-27](activity/2026-06-27.md) — Compliance review: factory non-converging on `fix` (16+ WIP exhausted chain); 10 ranked gaps; 10 proposed beads awaiting operator decision
 - [2026-06-27-factory-runs-the-factory](activity/2026-06-27-factory-runs-the-factory.md) — Adversarial spec-producer mode + mandatory command-line echo contract for /fs and /f
 

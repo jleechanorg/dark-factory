@@ -8,6 +8,7 @@ set -euo pipefail
 
 DB="${AFD_DB:-$HOME/.dark-factory/daemon-cxdb.sqlite}"
 LOG="${AFD_LOG:-$HOME/Library/Logs/dark-factory/daemon.jsonl}"
+BR_BIN="${AFD_BR_BIN:-br}"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SCHEMA="$REPO_DIR/daemon/contracts/schema.sql"
 CONFIG="$REPO_DIR/config/daemon.toml"
@@ -113,7 +114,7 @@ autonomy-tick) # autonomy-tick <elapsed_secs> — increments actives, warns at 8
   box="$(cfg autonomy_timebox_secs)"; warn=$(( box * 8 / 10 ))
   sql "UPDATE bead_overlay SET autonomy_secs = autonomy_secs + $2, updated_at='$(now)'
        WHERE state IN ('DISPATCHED','ATTESTED');"
-  for b in $(sql "SELECT bead_id FROM bead_overlay WHERE state IN ('DISPATCHED','ATTESTED') AND autonomy_secs >= $warn AND autonomy_secs <= $box;"); do
+  for b in $(sql "SELECT bead_id FROM bead_overlay WHERE state IN ('DISPATCHED','ATTESTED') AND autonomy_secs >= $warn AND autonomy_secs <= $box AND autonomy_secs - $2 < $warn;"); do
     emit "$b" "$(get_field "$b" attempt)" "$(get_field "$b" state)" BUDGET_WARNING "{\"elapsedAutonomySeconds\":$(get_field "$b" autonomy_secs)}" '{"reason":"autonomy_80pct"}'
   done
   for b in $(sql "SELECT bead_id FROM bead_overlay WHERE state IN ('DISPATCHED','ATTESTED') AND autonomy_secs > $box;"); do
@@ -134,13 +135,20 @@ assert set(g) == keys, f"gate keys must be exactly {sorted(keys)}"
 assert all(v in ("green","red","unknown") for v in g.values()), "gate values must be green|red|unknown"
 PY
   all_green="$(python3 -c 'import json,sys; g=json.loads(sys.argv[1]); print("true" if all(v=="green" for v in g.values()) else "false")' "$4")"
+  # cooldown decision is the HARNESS's call, not the LLM's: ready iff the most
+  # recent PRIOR assessment for this PR (before this emit) was also not-all-green
+  prior_last="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$3[,}]" | tail -1 || true)"
+  cooldown="false"
+  if [ -n "$prior_last" ] && printf '%s' "$prior_last" | grep -q '"all_green": false'; then cooldown="true"; fi
   emit "$2" "$(get_field "$2" attempt)" ATTESTED GATE_ASSESSMENT '{}' "{\"pr_number\":$3,\"gates\":$4,\"all_green\":$all_green}"
   echo "$all_green"
+  echo "cooldown_ready=$cooldown"
   ;;
 
 prev-gate-assessment) # prev-gate-assessment <pr_number> — prints previous (second-to-last) assessment or empty
   [ $# -eq 2 ] || die "usage: prev-gate-assessment <pr_number>"
-  grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$2[,}]" | tail -2 | head -1 || true
+  m="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$2[,}]" || true)"
+  if [ "$(printf '%s\n' "$m" | grep -c .)" -ge 2 ]; then printf '%s\n' "$m" | tail -2 | head -1; fi
   ;;
 
 ready) # ready <bead_id> <pr_number> — terminal transition; verifier stops driving this bead
@@ -172,6 +180,31 @@ park) # park <bead_id> <reason>
   echo "ok"
   ;;
 
+bead-closed-check) # bead-closed-check <bead_id> — detect a bead closed underneath a DISPATCHED/ATTESTED row
+  [ $# -eq 2 ] || die "usage: bead-closed-check <bead_id>"
+  bead_id="$2"
+  [ -n "$(get_field "$bead_id" bead_id)" ] || die "unknown bead_id (no overlay row): $bead_id"
+  br_json="$("$BR_BIN" show "$bead_id" --json 2>/dev/null)" || die "br show failed for $bead_id"
+  status="$(printf '%s' "$br_json" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+if not d:
+    raise SystemExit("br show returned no records for bead")
+print(d[0]["status"])' 2>&1)" || die "could not parse br show --json output for $bead_id: $status"
+  cur_state="$(get_field "$bead_id" state)"
+  if [ "$status" != "closed" ]; then
+    echo "open"
+  elif [ "$cur_state" = "DISPATCHED" ] || [ "$cur_state" = "ATTESTED" ]; then
+    branch="$(get_field "$bead_id" branch)"
+    pr_number="$(get_field "$bead_id" pr_number)"
+    sql "UPDATE bead_overlay SET state='HUMAN_HELD', updated_at='$(now)' WHERE bead_id='$(q "$bead_id")';"
+    ctx="$(python3 -c 'import json,sys; print(json.dumps({"reason":"bead_closed_underneath","prior_state":sys.argv[1],"branch":(sys.argv[2] or None),"pr_number":(int(sys.argv[3]) if sys.argv[3] not in ("", "None") else None)}))' "$cur_state" "$branch" "$pr_number")"
+    emit "$bead_id" "$(get_field "$bead_id" attempt)" HUMAN_HELD PARKED_HUMAN_HELD '{}' "$ctx"
+    echo "parked"
+  else
+    echo "already_terminal"
+  fi
+  ;;
+
 tick-summary) # tick-summary <role>
   [ $# -eq 2 ] || die "usage: tick-summary <coder|verifier>"
   counts="$(sql -json "SELECT state, count(*) AS n FROM bead_overlay GROUP BY state;" | python3 -c 'import json,sys; d=json.load(sys.stdin) if (s:=sys.stdin) else []; print(json.dumps({r["state"].lower(): r["n"] for r in d}))' 2>/dev/null || echo '{}')"
@@ -186,6 +219,6 @@ list) # list <STATE> — bead_id|pr_number|branch|attempt rows
   ;;
 
 *)
-  die "unknown subcommand: ${1:-<none>}. Valid: init intake-upsert route-record capacity dispatch-record pr-opened autonomy-tick gate-assessment prev-gate-assessment ready reroll-verdict park tick-summary list"
+  die "unknown subcommand: ${1:-<none>}. Valid: init intake-upsert route-record capacity dispatch-record pr-opened autonomy-tick gate-assessment prev-gate-assessment ready reroll-verdict park bead-closed-check tick-summary list"
   ;;
 esac

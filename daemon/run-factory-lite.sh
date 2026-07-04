@@ -22,10 +22,16 @@ LOG="$LOG_DIR/factory-lite-$ROLE.log"
 mkdir -p "$LOG_DIR" "$HOME/.dark-factory"
 
 # single-instance guard: exactly one loop per role (prevents capacity TOCTOU races)
+# FLOCK_BLOCK=1: wait for the lock instead of failing (graceful takeover from a retiring loop)
 exec 9>"$HOME/.dark-factory/factory-lite-$ROLE.lock"
-if ! flock -n 9; then
-  echo "another factory-lite-$ROLE loop is already running — refusing to start" >&2
-  exit 3
+if [ "${FLOCK_BLOCK:-0}" = "1" ]; then
+  echo "[$(date -u +%FT%TZ)] waiting for factory-lite-$ROLE lock (takeover mode)..."
+  flock 9
+else
+  if ! flock -n 9; then
+    echo "another factory-lite-$ROLE loop is already running — refusing to start" >&2
+    exit 3
+  fi
 fi
 
 PROMPT="Invoke the factory-lite-$ROLE skill with the Skill tool and execute exactly one tick, then stop. Follow the skill and .claude/skills/factory-lite/CONTRACT.md exactly — especially every NEVER rule."

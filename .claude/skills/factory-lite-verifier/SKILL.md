@@ -65,7 +65,10 @@ Every gate value is `green` / `red` / `unknown` — `unknown` means "could not
 determine" (API error, timeout). Never collapse `unknown` into `red` or `green`.
 
 Record (one call per PR): `$H gate-assessment <bead_id> <pr> '<gates_json>'`
-— the harness validates the 7 keys/values and prints `true|false` (all_green).
+— the harness validates the 7 keys/values and prints two lines:
+`true|false` (all_green) and `cooldown_ready=true|false`. The cooldown
+decision is the harness's, computed from the telemetry log — never
+re-derive it yourself.
 
 ## 3. All green → readiness, then STOP
 
@@ -79,9 +82,10 @@ Do NOT merge — merge authority is never delegated to this skill.
 
 ## 4. CHANGES_REQUESTED → cooldown, then model verdict
 
-If any gate is `red`: check `$H prev-gate-assessment <pr>` — if empty or the
-previous assessment did NOT show the same red gate, stop here (one-tick
-cooldown, spec §4.2.6). If it was also red last tick:
+If any gate is `red`: use the `cooldown_ready=` line that `gate-assessment`
+just printed. `cooldown_ready=false` → stop here (one-tick cooldown, spec
+§4.2.6) — do NOT grep the log or second-guess the harness.
+`cooldown_ready=true` → proceed:
 
 Use **your own judgment as the LLM** — read the actual review comments — to
 decide `in_place_fixable` (owning coder session can fix without branch reset)
@@ -99,11 +103,16 @@ ATTESTED — the owning coder keeps fixing in place.
 ## 5. Stalled-session sweep (DISPATCHED beads too)
 
 `$H list DISPATCHED` — these beads never appear in step 1, so sweep them here
-every tick: a DISPATCHED bead whose coder has produced no PR and no branch
-activity (`gh api repos/$TARGET_REPO/branches/<branch>` 404s or its last
-commit is older than ~30 min) with `autonomy_secs >= 1800` → the coder died
-silently: `$H park <bead_id> "coder_silent"`. Likewise an ATTESTED bead with
-no PR activity for an implausible window and no responsive coder →
+every tick. For every DISPATCHED **and** ATTESTED row swept in this step,
+call `$H bead-closed-check <bead_id>` FIRST — guards against a coder having
+closed the bead directly (work already shipped elsewhere) instead of
+following the PR path (see jleechan-tdl). If it prints `parked`, the row is
+now `HUMAN_HELD`; skip the rest of this step's checks for that bead this
+tick. Otherwise continue: a DISPATCHED bead whose coder has produced no PR
+and no branch activity (`gh api repos/$TARGET_REPO/branches/<branch>` 404s or
+its last commit is older than ~30 min) with `autonomy_secs >= 1800` → the
+coder died silently: `$H park <bead_id> "coder_silent"`. Likewise an ATTESTED
+bead with no PR activity for an implausible window and no responsive coder →
 `$H park <bead_id> "session_stalled"`. Autonomy-clock increments are the
 coder tick's job — this skill never calls `autonomy-tick`.
 
