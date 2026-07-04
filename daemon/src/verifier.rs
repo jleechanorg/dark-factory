@@ -74,16 +74,17 @@ pub enum SkepticVerdict {
     Fail(String),
 }
 
-/// Parse the Stage-1 Skeptic verdict grammar. ZFC note: this is NOT judgment —
-/// the verdict word itself was already produced by a model (the lite
-/// verifier's recorded `GATE_ASSESSMENT` event, or an `Llm::judge` adversarial
-/// call per design doc §5); this function only recognizes the three fixed
-/// grammar tokens the model contract requires it to emit, exactly like
-/// `runner/handlers.py::_parse_verdict`'s anchored-marker parsing for
-/// pass/warn/fail in the Python pipeline runner. Anything else is a parse
-/// failure, not a heuristic guess.
-pub fn parse_skeptic_verdict(raw: &str) -> Option<SkepticVerdict> {
-    let trimmed = raw.trim();
+/// The marker prefixes that anchor an authoritative verdict line (spec
+/// Appendix C.3, mirroring `runner/handler_verdict.py::_MARKER_RE`'s
+/// `verdict:|overall:|normalized:` grammar).
+const VERDICT_MARKERS: [&str; 3] = ["verdict:", "overall:", "normalized:"];
+
+/// Parse a `pass|warn|fail` token (case-insensitive) from the start of
+/// `text`, returning the built `SkepticVerdict` plus the remainder of the
+/// line as the reason/detail string. Returns `None` if `text` does not begin
+/// with a recognized token.
+fn token_to_verdict(text: &str) -> Option<SkepticVerdict> {
+    let trimmed = text.trim();
     let (token, rest) = match trimmed.split_once(char::is_whitespace) {
         Some((t, r)) => (t, r.trim()),
         None => (trimmed, ""),
@@ -94,6 +95,52 @@ pub fn parse_skeptic_verdict(raw: &str) -> Option<SkepticVerdict> {
         "fail" => Some(SkepticVerdict::Fail(rest.to_string())),
         _ => None,
     }
+}
+
+/// Scan `raw` for a marker line (`verdict:`/`overall:`/`normalized:`,
+/// case-insensitive) followed by a recognized token. Returns the LAST such
+/// match found (later marker lines override earlier progress lines), mirroring
+/// `runner/handler_verdict.py::_MARKER_RE` taking `matches[-1]`. `None` if no
+/// line carries a marker with a valid trailing token.
+fn find_marker_verdict(raw: &str) -> Option<SkepticVerdict> {
+    let mut found = None;
+    for line in raw.lines() {
+        let lower = line.to_ascii_lowercase();
+        for marker in VERDICT_MARKERS {
+            if let Some(idx) = lower.find(marker) {
+                let after = &line[idx + marker.len()..];
+                if let Some(verdict) = token_to_verdict(after) {
+                    found = Some(verdict);
+                }
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// Parse the Stage-1 Skeptic verdict grammar. ZFC note: this is NOT judgment —
+/// the verdict word itself was already produced by a model (the lite
+/// verifier's recorded `GATE_ASSESSMENT` event, or an `Llm::judge` adversarial
+/// call per design doc §5); this function only recognizes the three fixed
+/// grammar tokens the model contract requires it to emit, exactly like
+/// `runner/handlers.py::_parse_verdict`'s anchored-marker parsing for
+/// pass/warn/fail in the Python pipeline runner. Anything else is a parse
+/// failure, not a heuristic guess.
+///
+/// Strategy (spec Appendix C.3, mirrors `_parse_verdict`'s priority order):
+///   1. Scan all lines for a marker (`verdict:`/`overall:`/`normalized:`,
+///      case-insensitive) followed by a `pass|warn|fail` token; the LAST
+///      marker match wins so an authoritative closing line overrides earlier
+///      progress chatter.
+///   2. Only when no marker line is present at all, fall back to the
+///      original standalone-token behavior: the whole input is treated as
+///      `<token> [rest...]`.
+pub fn parse_skeptic_verdict(raw: &str) -> Option<SkepticVerdict> {
+    if let Some(verdict) = find_marker_verdict(raw) {
+        return Some(verdict);
+    }
+    token_to_verdict(raw)
 }
 
 /// `verifier`-local input for the two gates `PrSnapshot` doesn't cover: the
@@ -497,5 +544,53 @@ mod tests {
         );
         assert_eq!(parse_skeptic_verdict("maybe?"), None);
         assert_eq!(parse_skeptic_verdict(""), None);
+    }
+
+    #[test]
+    fn parse_skeptic_verdict_marker_anchored_anywhere_in_message() {
+        // Marker line is NOT first — hardening case from jleechan-j7d: the
+        // old bare-leading-token parser would have looked at line 1
+        // ("Reviewing the diff...") and returned None, even though an
+        // authoritative marker line follows later in the message.
+        let msg = "Reviewing the diff...\nChecked tests, looks solid.\nVerdict: PASS\n";
+        assert_eq!(parse_skeptic_verdict(msg), Some(SkepticVerdict::Pass));
+
+        let msg = "Some notes here.\noverall: FAIL needs more coverage\n";
+        assert_eq!(
+            parse_skeptic_verdict(msg),
+            Some(SkepticVerdict::Fail("needs more coverage".into()))
+        );
+
+        let msg = "intro line\nnormalized: warn minor nit\n";
+        assert_eq!(
+            parse_skeptic_verdict(msg),
+            Some(SkepticVerdict::Warn("minor nit".into()))
+        );
+    }
+
+    #[test]
+    fn parse_skeptic_verdict_no_marker_falls_back_to_bare_token() {
+        // No marker anywhere in the text — old bare-leading-token behavior
+        // must still work exactly as before this hardening fix.
+        assert_eq!(parse_skeptic_verdict("pass"), Some(SkepticVerdict::Pass));
+        assert_eq!(
+            parse_skeptic_verdict("fail wrong approach"),
+            Some(SkepticVerdict::Fail("wrong approach".into()))
+        );
+        assert_eq!(parse_skeptic_verdict("no marker or token here"), None);
+    }
+
+    #[test]
+    fn parse_skeptic_verdict_marker_wins_over_unrelated_bare_token() {
+        // Message has an unrelated bare "fail" token on its own outside of
+        // any marker line, AND a real marker line elsewhere. The marker line
+        // must win — this is the exact misclassification the hardening
+        // sweep is closing (mirrors runner/handler_verdict.py's
+        // "verdict: not a fail" anchoring discipline).
+        let msg = "Earlier attempt: fail\nVerdict: PASS\n";
+        assert_eq!(parse_skeptic_verdict(msg), Some(SkepticVerdict::Pass));
+
+        let msg = "fail\nMore context.\nVerdict: PASS\nFooter mentions fail again.\n";
+        assert_eq!(parse_skeptic_verdict(msg), Some(SkepticVerdict::Pass));
     }
 }
