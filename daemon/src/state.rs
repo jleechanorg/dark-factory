@@ -37,6 +37,11 @@ impl OverlayState {
         }
     }
 
+    // Mirrors `OverlayState::as_str` (SCREAMING_SNAKE_CASE strings tied to
+    // contracts/schema.sql's CHECK constraint) rather than the general-purpose
+    // parsing `std::str::FromStr` implies, so the inherent method is kept
+    // instead of adding a trait impl clippy would consider more idiomatic here.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, DaemonError> {
         match s {
             "QUEUED" => Ok(OverlayState::Queued),
