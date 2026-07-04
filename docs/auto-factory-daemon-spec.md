@@ -1,6 +1,6 @@
 # Auto-Factory Daemon — Architectural Specification (No-Code)
 
-**Status:** Draft r5 — restructured for minimal component gap mapping & combined 7/8-green skeptic reviews
+**Status:** Final r1 — resolved open questions and validated architecture
 **Code status:** Declarative blueprint only — zero implementation code
 **Owner repo:** dark-factory (`$DARK_FACTORY_HOME`)
 
@@ -284,8 +284,13 @@ All existing operator policies bind the daemon:
 
 ---
 
-## Appendix B — Open Questions
+## Appendix B — Resolved Design Choices
 
-1. Per-repo spec-directory convention for `/fs` output in non-dark-factory target repos.
-2. Exact shape of the per-bead scope key for the circuit-breaker streak query and the Healer namespace handling.
-3. `aow` session-attach semantics for a branch the session didn't create — verified against the real CLI.
+1. **Per-Repo Spec-Directory Convention**: For repositories other than `dark-factory`, the spec directory defaults to `.factory/specs/` at the repository root. A repository may override this by specifying a custom path in its `.factory.toml` config file (e.g. `spec_path = "docs/specs/"`).
+2. **Circuit-Breaker & Healer Scope Key**: The unique scope key is formatted as a colon-separated string: `<owner>:<repo>:<bead_id>`. The Healer uses this scope key as its grouping prefix, allowing failure diagnostics to compile per-bead and per-repository.
+3. **AO Session-Attach Semantics**: When attaching an AO session to a branch created outside the session, the daemon invokes:
+   ```bash
+   aow attach --branch <branch_name> --bead <bead_id> --remediation
+   ```
+   This attaches the worker session directly to the target branch in remediation mode, providing the session with the spec as its initial context.
+
