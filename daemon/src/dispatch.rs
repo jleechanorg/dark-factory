@@ -12,12 +12,25 @@ use crate::tools::{Bead, Sessions, SpawnSpec};
 /// Dispatch as many `ready` beads as the safety envelope allows.
 ///
 /// Free slots = `min(max_workers - active_count, max_batch)` (spec §4.2.8).
-/// Spawns strictly in `ready` order, up to that many. Each spawn:
+/// Spawns strictly in `ready` order, up to that many. Each spawn is made
+/// failure-atomic (spec §4.2.2/§4.2.4): the DISPATCHING intent + branch
+/// registration are made durable BEFORE the worker process exists, and any
+/// failure after a successful spawn is rolled back so no live session is
+/// ever left untracked on disk:
 ///   1. Loads (or defaults to a fresh QUEUED) the bead's overlay.
 ///   2. Computes the attempt branch `factory/<bead_id>-r<attempt>`.
-///   3. Calls `sessions.spawn(&SpawnSpec { .. })`.
-///   4. Registers the branch in the store's branch registry.
-///   5. Saves the overlay with `state = Dispatched` and `branch` set.
+///   3. Registers the branch in the store's branch registry.
+///   4. Persists the overlay with `state = Dispatching` and `branch` set —
+///      the durable "about to spawn" record. Nothing has been spawned yet,
+///      so a failure here needs no rollback; the error just propagates and
+///      the bead is left at its prior on-disk state.
+///   5. Calls `sessions.spawn(&SpawnSpec { .. })`.
+///   6. Saves the overlay with `state = Dispatched` to confirm the spawn.
+///      If THIS save fails, the spawn already succeeded and would otherwise
+///      be exactly the "spawn succeeds, store error leaves an untracked live
+///      session" bug this closes: roll back by calling
+///      `sessions.stop(&session_id)` on the just-spawned worker, then
+///      propagate the original save error.
 ///
 /// Returns the number of beads actually spawned. Never spawns past the cap;
 /// if zero slots are free, returns `Ok(0)` without calling `sessions.spawn`
@@ -47,18 +60,34 @@ pub fn dispatch_ready(
 
         let branch = format!("factory/{}-r{}", bead.id, overlay.attempt);
 
+        // Register the branch + persist the DISPATCHING intent BEFORE
+        // spawning a worker. Neither creates a live process, so a failure
+        // here needs no rollback.
+        store.register_branch(&bead.id, &branch)?;
+
+        overlay.state = OverlayState::Dispatching;
+        overlay.branch = Some(branch.clone());
+        store.save(&overlay)?;
+
         let spec = SpawnSpec {
             bead_id: bead.id.clone(),
             branch: branch.clone(),
             prompt: bead.title.clone(),
         };
-        sessions.spawn(&spec)?;
-
-        store.register_branch(&bead.id, &branch)?;
+        let session_id = sessions.spawn(&spec)?;
 
         overlay.state = OverlayState::Dispatched;
-        overlay.branch = Some(branch);
-        store.save(&overlay)?;
+        if let Err(save_err) = store.save(&overlay) {
+            // The worker process now exists but the daemon failed to
+            // durably record it as DISPATCHED. Kill the just-spawned worker
+            // so no live session survives without a matching on-disk record
+            // (spec §4.2.2/§4.2.4 failure-atomicity). If `stop` ITSELF fails
+            // we now have an untracked live session we can't even kill —
+            // that's a more urgent operator-facing failure than the original
+            // save error, so it takes priority and is returned instead.
+            sessions.stop(&session_id)?;
+            return Err(save_err);
+        }
 
         dispatched += 1;
     }
@@ -126,16 +155,27 @@ mod tests {
         }
     }
 
-    /// Local unit-test fake mirroring `tests/common/mod.rs`'s `FakeStateStore`.
+    /// Local unit-test fake mirroring `tests/common/mod.rs`'s `FakeStateStore`,
+    /// plus a `fail_save_for_state` hook so rollback-on-save-failure tests can
+    /// script the SECOND save (the DISPATCHED confirmation) to fail while the
+    /// first save (the DISPATCHING intent) still succeeds.
     #[derive(Default)]
     struct FakeStateStore {
         overlays: RefCell<HashMap<String, BeadOverlay>>,
         branches: RefCell<Vec<String>>,
+        fail_save_for_state: Option<OverlayState>,
     }
 
     impl FakeStateStore {
         fn new() -> Self {
             Self::default()
+        }
+
+        fn failing_on(state: OverlayState) -> Self {
+            Self {
+                fail_save_for_state: Some(state),
+                ..Self::default()
+            }
         }
     }
 
@@ -145,6 +185,13 @@ mod tests {
         }
 
         fn save(&self, overlay: &BeadOverlay) -> Result<(), DaemonError> {
+            if self.fail_save_for_state == Some(overlay.state) {
+                return Err(DaemonError::Tool {
+                    tool: "sqlite".into(),
+                    rc: -1,
+                    stderr: format!("scripted save failure for {}", overlay.state.as_str()),
+                });
+            }
             self.overlays
                 .borrow_mut()
                 .insert(overlay.bead_id.clone(), overlay.clone());
@@ -182,6 +229,8 @@ mod tests {
             .map(|i| Bead {
                 id: format!("bead-{i}"),
                 title: format!("title {i}"),
+                description: String::new(),
+                file_tree_summary: String::new(),
                 external_ref: None,
             })
             .collect()
@@ -295,5 +344,64 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(spawn_calls, ["spawn(bead-0)"]);
+    }
+
+    #[test]
+    fn branch_registered_and_dispatching_intent_saved_before_spawn() {
+        // Failure-atomicity contract: `register_branch` + the DISPATCHING
+        // save must both be durable BEFORE `Sessions::spawn` is ever called,
+        // so a crash between them and the spawn leaves an accurate on-disk
+        // record rather than a phantom worker with nothing tracking it.
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let n = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(n, 1);
+
+        // Final state is DISPATCHED (spawn + confirmation both succeeded),
+        // but the branch registry write happened unconditionally up front.
+        assert_eq!(store.branches.borrow().as_slice(), ["factory/bead-0-r1"]);
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Dispatched);
+    }
+
+    #[test]
+    fn save_failure_after_spawn_rolls_back_via_stop_and_propagates_error() {
+        // Reproduces the exact bug this hardening closes: spawn succeeds,
+        // then the DISPATCHED confirmation save fails. Before the fix this
+        // left an untracked live session; after the fix, `Sessions::stop`
+        // is called on the just-spawned session and the original save error
+        // propagates to the caller instead of being swallowed.
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::failing_on(OverlayState::Dispatched);
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        assert!(
+            matches!(err, DaemonError::Tool { .. }),
+            "expected the scripted save error to propagate, got {err:?}"
+        );
+
+        let calls = sessions.calls.borrow();
+        assert!(
+            calls.iter().any(|c| c == "spawn(bead-0)"),
+            "spawn must still have been called: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "stop(fake-session-1)"),
+            "the just-spawned session must be stopped on save failure: {calls:?}"
+        );
+
+        // The DISPATCHING intent (persisted before spawn) is still on disk —
+        // rollback kills the process but deliberately does not erase the
+        // record that a dispatch was attempted, so the Healer/operator can
+        // see it rather than the bead silently reverting to QUEUED.
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Dispatching);
+        assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(store.branches.borrow().as_slice(), ["factory/bead-0-r1"]);
     }
 }
