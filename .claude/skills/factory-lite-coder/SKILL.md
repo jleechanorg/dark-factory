@@ -70,9 +70,12 @@ Select up to `$free` routed QUEUED beads, then:
    parallel dispatch is the point of the fan-out. Each prompt must contain:
    the bead id, full title/description, the exact branch name (the coder
    creates it off origin/<base_branch>, commits, pushes, opens a PR with
-   `Beads: <bead_id>` in the body — and NEVER merges), and for
-   `STANDARD_PATH` beads: direct it to run the repo's `/fs` + `/f` flow
-   rather than hand-rolling a diff.
+   `Beads: <bead_id>` in the body — and NEVER merges), an isolation
+   requirement (the coder MUST do its work in its own `git worktree add
+   /tmp/factory-<bead_id>-r<n> -b <branch> origin/<base_branch>` and remove
+   the worktree after pushing — never check out branches in the shared repo
+   working tree), and for `STANDARD_PATH` beads: direct it to run the repo's
+   `/fs` + `/f` flow rather than hand-rolling a diff.
 
 ## 5. (reserved)
 
