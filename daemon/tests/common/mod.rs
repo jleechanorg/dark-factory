@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 use daemon::errors::DaemonError;
+use daemon::state::{BeadOverlay, StateStore};
 use daemon::tools::{
     Bead, Issue, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs,
 };
@@ -247,5 +248,51 @@ impl Llm for FakeLlm {
             Some(Err(e)) => Err(DaemonError::Parse(e.clone())),
             None => Ok(String::new()),
         }
+    }
+}
+
+/// Scripted `StateStore` fake: in-memory overlay map + branch registry, plus a
+/// call log. No SQLite involved — downstream tasks (dispatch, verifier) unit-test
+/// against this instead of `SqliteStateStore` (design doc §3).
+#[derive(Default)]
+pub struct FakeStateStore {
+    pub overlays: RefCell<HashMap<String, BeadOverlay>>,
+    pub branches: RefCell<Vec<String>>,
+    pub calls: RefCell<Vec<String>>,
+}
+
+impl FakeStateStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl StateStore for FakeStateStore {
+    fn load(&self, bead_id: &str) -> Result<Option<BeadOverlay>, DaemonError> {
+        self.calls.borrow_mut().push(format!("load({bead_id})"));
+        Ok(self.overlays.borrow().get(bead_id).cloned())
+    }
+
+    fn save(&self, overlay: &BeadOverlay) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("save({})", overlay.bead_id));
+        self.overlays
+            .borrow_mut()
+            .insert(overlay.bead_id.clone(), overlay.clone());
+        Ok(())
+    }
+
+    fn register_branch(&self, bead_id: &str, branch: &str) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("register_branch({bead_id},{branch})"));
+        self.branches.borrow_mut().push(branch.to_string());
+        Ok(())
+    }
+
+    fn owned_branches(&self) -> Result<Vec<String>, DaemonError> {
+        self.calls.borrow_mut().push("owned_branches".into());
+        Ok(self.branches.borrow().clone())
     }
 }
