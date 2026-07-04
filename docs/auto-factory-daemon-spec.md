@@ -1,6 +1,6 @@
 # Auto-Factory Daemon — Architectural Specification (No-Code)
 
-**Status:** Final r2 — integrated /advice Round 3 findings (circuit-breaker, quiescence timeout, intake auth)
+**Status:** Final r3 — integrated Round 4 AAR of external spec variant ASF-SR-2.4 (telemetry schema, prompt contracts, pre-PR states)
 **Code status:** Declarative blueprint only — zero implementation code
 **Owner repo:** dark-factory (`$DARK_FACTORY_HOME`)
 
@@ -199,7 +199,7 @@ The stack composes three existing systems plus one new thin daemon. The composit
 *   **AO Intake Integration:** AO's native `trackerintake` is disabled for factory projects to prevent duplicate spawning, while AO's session database acts as the single source of truth for active worker sessions.
 *   **Durable-state split:**
     *   **Beads (`br`)** hold what humans manage: status, priority, labels, assignee, `external-ref`, dependencies.
-    *   **CXDB (SQLite)** holds all machine state: overlay states, the re-roll cycle counter, the cumulative autonomy clock, reviewer verdicts, and the branch-creation registry.
+    *   **CXDB (SQLite)** holds all machine state: overlay states, the re-roll cycle counter, the cumulative autonomy clock, reviewer verdicts, the branch-creation registry, and the per-bead task manifest (the dispatch-time task breakdown — machine state, not a separate file ledger).
 *   On startup, reconciliation rebuilds in-memory state from CXDB, `br`, and the `aow` session listing.
 
 #### 4.2.4 PR Ownership & Handoff
@@ -250,6 +250,7 @@ Additional floors and optimizations are enforced:
 #### 4.2.7 Spec Mutation Grammar & Overlay States
 *   **Spec mutation grammar:** The spec file for the bead is append-only. Each re-roll appends one block containing the source event, attesting reviewer, superseded attempt, extracted constraints, and raw feedback snapshot. Atomicity is guaranteed via write-temp -> fsync -> rename.
 *   **Overlay States:**
+    *   Pre-PR lifecycle (previously implicit, named in r3): *QUEUED* (bead accepted by intake, awaiting dispatch) -> *DISPATCHED* (worker or pipeline running, no PR yet) -> *ATTESTED* (PR open).
     *   *ATTESTED* (on PR rejection + cooldown) -> *RE_ROLL*
     *   *RE_ROLL* (on abort) -> *ATTESTED*
     *   *RE_ROLL* (on success) -> *RECOVERY*
@@ -263,7 +264,7 @@ Additional floors and optimizations are enforced:
 
 #### 4.2.8 Safety Envelope & Cumulative Time-Box
 All existing operator policies bind the daemon:
-*   **AO spawn cap:** **≤ 30 concurrent workers**, batches ≤ 15.
+*   **AO spawn cap:** **≤ 30 concurrent workers**, batches ≤ 15 (operator ao-spawn-safety policy aligned to these values 2026-07-03).
 *   **Autonomy time-box:** Wall-clock autonomous processing time accumulates across a bead's entire chain. When the cumulative clock exceeds 3 hours, the bead enters HUMAN_HELD. Nothing on the automated path resets the clock.
 *   **Token expenditure monitoring:** Per-bead token spend is tracked in CXDB as a monitoring metric (sum of coder tokens + reviewer chain tokens across all attempts). The daemon emits a warning to telemetry at 80% of a configurable per-bead token budget. This is a **monitoring-only** metric in Stage 1/2; it does not gate execution, since the 3hr time-box and circuit-breaker already bound runaway cost. The metric exists to inform budget decisions and detect cost anomalies before they become operator surprises.
 *   **Force-push: never.** Re-rolls create fresh branches.
@@ -272,14 +273,30 @@ All existing operator policies bind the daemon:
 *   **Holdout isolation:** Sanitized environments and holdout-leak screens remain active.
 
 #### 4.2.9 Two-Stage Pilot Deployment
-*   **Runtime:** macOS launchd agent on the operator's workstation.
+*   **Runtime:** macOS launchd agent on the operator's workstation. The plist ships as a template committed to this repo (placeholder home paths, e.g. `@HOME@`), installed via an installer script — never a hand-edited file in `~/Library/LaunchAgents` with hardcoded absolute paths.
 *   **Stage 1 — verifier plane only (re-roll disabled):** Intake, routing, dispatch, ownership handoff, and verifier run; re-roll verdicts are recorded but not executed (beads park in HUMAN_HELD).
 *   **Stage 2 — enable the re-roll writer plane:** Enabled via a config flag after auditing Stage 1 behavior. **Prerequisites for Stage 2 enablement:**
     1.  Minimax adapter smoke test passes end-to-end in the daemon's AO session lifecycle (attach, remediate, quiesce).
     2.  Constraint-extraction fuzz run: ≥ 50 synthetic rejection comments processed without circuit-breaker false positives or holdout-leak false negatives.
     3.  Quiescence timeout validated: confirm the 60s hard timeout correctly aborts mid-push races in a controlled test.
-*   **Pilot scope:** Exactly one target repo named in a single config file.
-*   **Telemetry Log:** Logs structured JSON payloads to `~/Library/Logs/dark-factory/daemon.jsonl` classifying actions as human-initiated vs. automated, alongside diffs and verdicts.
+*   **Pilot scope:** Exactly one target repo named in a single config file: `config/daemon.toml` (TOML; operational thresholds, model chains, worker caps, tick rates).
+*   **Telemetry Log:** Logs structured JSON payloads to `~/Library/Logs/dark-factory/daemon.jsonl` classifying actions as human-initiated vs. automated, alongside diffs and verdicts. Event schema (one JSON object per line):
+
+    ```json
+    {
+      "timestamp": "2026-07-03T19:00:00.000Z",
+      "beadId": "jleechan-xyz",
+      "attemptId": 3,
+      "lifecycleState": "RECOVERY",
+      "eventType": "CONSTRAINT_MUTATION_SUCCESS",
+      "metrics": {
+        "consumedUSD": 6.85,
+        "elapsedAutonomySeconds": 5420,
+        "extractedConstraints": { "positiveAssertionsCount": 1, "inhibitionSpecsCount": 2 }
+      },
+      "context": { "targetBranch": "factory/<bead_id>-r<n>", "baseCommit": "<sha>", "activeModel": "minimax" }
+    }
+    ```
 
 ---
 
@@ -297,6 +314,20 @@ All existing operator policies bind the daemon:
     *   🔄 **ADAPT P1-4:** Per-feature token budget cap → monitoring-only metric (circuit-breaker + time-box already bound cost) — integrated in §4.2.8.
     *   🔄 **ADAPT P2-8:** Constraint confidence score → subsumed by circuit-breaker (P0-1) as the pragmatic detection mechanism.
     *   ❌ **REJECT P2-7:** Partial replay on re-roll — contradicts dorodango philosophy; fresh-from-zero prevents context debt by design.
+*   **Round 4 - AAR of external spec variant ASF-SR-2.4 (r2→r3):** 3-reviewer /advice panel (Opus subagent, web research, agy CLI) triaged 13 deltas; 2 accepted, 4 adapted, 7 rejected:
+    *   ✅ **ACCEPT:** Concrete telemetry JSON event schema — integrated in §4.2.9.
+    *   ✅ **ACCEPT:** Config file named `config/daemon.toml` — integrated in §4.2.9.
+    *   🔄 **ADAPT:** Pre-PR overlay states named (QUEUED/DISPATCHED before ATTESTED) — integrated in §4.2.7.
+    *   🔄 **ADAPT:** Per-bead task manifest recorded in CXDB machine state, not a `.factory/tasks/` file ledger — integrated in §4.2.3.
+    *   🔄 **ADAPT:** Declarative prompt contracts pinned as Appendix C (pointers, not inline prompt text; ZFC mislabel "Zero-Failure-Class" corrected to Zero-Framework Cognition; verdict grammar aligned to the runner's `pass|warn|fail`).
+    *   🔄 **ADAPT:** launchd plist as repo template with placeholder paths — integrated in §4.2.9.
+    *   ❌ **REJECT:** Node.js `src/` implementation layout in the spec (violates the no-code contract; stack is an implementation-phase choice).
+    *   ❌ **REJECT:** `.factory/beads/` second bead store (split-brain vs the `br` ledger in `.beads/`).
+    *   ❌ **REJECT:** In-place `--force-with-lease` PR rotation (violates "Force-push: never"; Renovate/Dependabot same-branch prior art noted, but their tiny-deterministic-diff model does not transfer to full re-rolls, which orphan review-comment anchors).
+    *   ❌ **REJECT:** `git merge-base` baseline computation (stale fork point; research confirmed current-head-of-base is the reference design, cf. Renovate rebasing).
+    *   ❌ **REJECT:** Budget hard-gate (Round 3 ADAPT P1-4 stands for Stage 1/2; research evidence that time-boxes bound wall-clock but not spend-rate is earmarked for Stage 3 reconsideration).
+    *   ❌ **REJECT:** Intake auth weakened to "any collaborator" (Round 3 ACCEPT P0-3 write-tier minimum stands).
+    *   ❌ **REJECT:** Omission of Round 3 items (circuit-breaker, quiescence timeout, retry-vs-fallback, ETag keying) — the variant was generated from a pre-r2 snapshot.
 
 ---
 
@@ -310,3 +341,12 @@ All existing operator policies bind the daemon:
    ```
    This attaches the worker session directly to the target branch in remediation mode, providing the session with the spec as its initial context.
 
+---
+
+## Appendix C — Declarative Prompt Contracts (reference, not code)
+
+Three LLM roles carry the daemon's judgment (ZFC: Zero-Framework Cognition — routing and feedback interpretation live in model calls, never in keyword heuristics in daemon code). Full prompt texts are implementation artifacts authored under `prompts/daemon/` at build time; this spec pins only their contracts:
+
+1. **Task Router** — input: bead title/description, file tree, dependency map. Output JSON: `{ "routingVerdict": "SMALL_PATH" | "STANDARD_PATH", "justification": "<one sentence>" }`. Routing is model judgment over the whole task shape; no file-count or keyword rules in daemon code.
+2. **Constraint Extractor + Holdout-Leak Screen** — input: rejection review text. Output JSON: `{ "inhibitionSpecs": [...], "positiveAssertions": [...], "securityRedactionEncountered": <bool> }`. Inhibition specs take precedence; holdout internals are redacted before spec mutation (§4.2.6).
+3. **Skeptic Reviewer** — input: diff + spec manifest + validation history. Output verdict uses the runner's normalized grammar (`pass | warn | fail`, marker line `verdict: <token>`), plus `blockingIssues[]`. Binary `PASS/FAIL`-only schemas from external variants are non-conforming.
