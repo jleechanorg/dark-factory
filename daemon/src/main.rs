@@ -1,7 +1,7 @@
 // Task 10: tick loop wiring + CLI flags (design doc §5, spec §4.2.2/§4.2.9).
 // Modules live in `lib.rs` (see that file) so `daemon/tests/*` integration
 // tests can `use daemon::{...}`; this binary just drives the poll loop.
-#![allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 
 use daemon::config::{self, Config};
 use daemon::errors::DaemonError;
@@ -43,8 +43,10 @@ fn parse_args(argv: impl Iterator<Item = String>) -> Args {
 /// this is what makes `--dry-run` structurally incapable of an SCM write or a
 /// session spawn (there is no code path to one), not merely a flag checked at
 /// the call site.
+#[cfg(any(test, debug_assertions))]
 struct NoopAdapters;
 
+#[cfg(any(test, debug_assertions))]
 impl Tracker for NoopAdapters {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError> {
         Ok(Vec::new())
@@ -57,6 +59,7 @@ impl Tracker for NoopAdapters {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
 impl Scm for NoopAdapters {
     fn labeled_issues(&self, _label: &str) -> Result<Vec<Issue>, DaemonError> {
         Ok(Vec::new())
@@ -74,6 +77,7 @@ impl Scm for NoopAdapters {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
 impl Sessions for NoopAdapters {
     fn active_count(&self) -> Result<usize, DaemonError> {
         Ok(0)
@@ -96,6 +100,7 @@ impl Sessions for NoopAdapters {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
 impl Vcs for NoopAdapters {
     fn base_head(&self, _base_branch: &str) -> Result<String, DaemonError> {
         Ok(String::new())
@@ -108,11 +113,13 @@ impl Vcs for NoopAdapters {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
 impl Llm for NoopAdapters {
     fn judge(&self, _prompt: &str) -> Result<String, DaemonError> {
         Ok(String::new())
     }
 }
+
 
 fn default_config_path() -> PathBuf {
     let live = PathBuf::from("config/daemon.toml");
@@ -169,12 +176,21 @@ fn run(args: Args) -> Result<(), DaemonError> {
         Box<dyn Sessions>,
         Box<dyn Llm>,
     ) = if args.dry_run {
-        (
-            Box::new(NoopAdapters),
-            Box::new(NoopAdapters),
-            Box::new(NoopAdapters),
-            Box::new(NoopAdapters),
-        )
+        #[cfg(any(test, debug_assertions))]
+        {
+            (
+                Box::new(NoopAdapters),
+                Box::new(NoopAdapters),
+                Box::new(NoopAdapters),
+                Box::new(NoopAdapters),
+            )
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            return Err(DaemonError::Config(
+                "NoopAdapters / --dry-run is disabled/gated in production release builds".into(),
+            ));
+        }
     } else {
         use daemon::adapters::{CliScm, CliSessions, CliTracker, ChainLlm};
         (
