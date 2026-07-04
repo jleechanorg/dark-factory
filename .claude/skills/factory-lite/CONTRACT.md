@@ -252,9 +252,23 @@ All binding mutations — CXDB writes, state transitions, cap enforcement,
 telemetry emission — MUST go through `daemon/factory-lite-harness.sh`
 (subcommands: init, intake-upsert, route-record, capacity, dispatch-record,
 pr-opened, autonomy-tick, gate-assessment, prev-gate-assessment, ready,
-reroll-verdict, park, tick-summary, list). The sqlite3/telemetry one-liners in
-§3-§4 above are the REFERENCE SPEC of what the harness does internally — skills
-must NOT run them directly. The LLM supplies only typed judgment verdicts
-(routing, gate values, reroll verdicts) as harness arguments; the harness
-validates every enum and refuses illegal transitions. This keeps the telemetry
-and CXDB deterministic — they are the data the Rust daemon inherits.
+reroll-verdict, park, bead-closed-check, tick-summary, list). The
+sqlite3/telemetry one-liners in §3-§4 above are the REFERENCE SPEC of what the
+harness does internally — skills must NOT run them directly. The LLM supplies
+only typed judgment verdicts (routing, gate values, reroll verdicts) as
+harness arguments; the harness validates every enum and refuses illegal
+transitions. This keeps the telemetry and CXDB deterministic — they are the
+data the Rust daemon inherits.
+
+**`bead-closed-check <bead_id>`** (added 2026-07-04, jleechan-tdl): guards
+against the case where the underlying `br` bead is closed by a path the
+harness never observed (e.g. a coder subagent discovers the work already
+shipped under a different bead id and closes this bead directly instead of
+opening a PR). Both skills call it per DISPATCHED/ATTESTED row every tick,
+before their existing PR-detection / stalled-session logic. If `br show
+<bead_id> --json` reports `status=closed` while the overlay row is still
+`DISPATCHED` or `ATTESTED`, the harness parks it `HUMAN_HELD` (reusing the
+existing terminal parking state — see
+`daemon/contracts/bead-closed-check.spec.md` for the full contract and the
+rationale for not inventing a 9th state) and emits `PARKED_HUMAN_HELD` with
+`reason="bead_closed_underneath"`. No new state, no new event type.
