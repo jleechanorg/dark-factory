@@ -4,8 +4,8 @@ Bootstrap for the Auto-Factory Daemon: the automated backward-recovery loop
 that manages PR feedback (`CHANGES_REQUESTED` → re-dispatch) without human
 intervention. Behavior is specified in
 [`docs/auto-factory-daemon-spec.md`](../docs/auto-factory-daemon-spec.md)
-(**Final r3** — integrated Round 4 AAR of external spec variant ASF-SR-2.4:
-telemetry schema, prompt contracts, pre-PR states). Shape (crate layout,
+(**Final r3.1** — Round 4 AAR of external spec variant ASF-SR-2.4 plus the
+READY terminal overlay state from the 2026-07-03 adversarial review). Shape (crate layout,
 traits, LOC budget) is specified in
 [`docs/auto-factory-daemon-design-rust.md`](../docs/auto-factory-daemon-design-rust.md).
 **If the two disagree, the spec wins.**
@@ -36,8 +36,8 @@ the eventual Rust daemon implements natively.
 Rust daemon honor identically, zero migration:
 
 - **`schema.sql`** — schema for `~/.dark-factory/daemon-cxdb.sqlite`.
-  `bead_overlay` (8-state `CHECK`: `QUEUED`, `DISPATCHED`, `ATTESTED`,
-  `RE_ROLL`, `RECOVERY`, `REDISPATCHED`, `BUDGET_HELD`, `HUMAN_HELD`) plus
+  `bead_overlay` (9-state `CHECK`: `QUEUED`, `DISPATCHED`, `ATTESTED`,
+  `READY`, `RE_ROLL`, `RECOVERY`, `REDISPATCHED`, `BUDGET_HELD`, `HUMAN_HELD`) plus
   `branch_registry`, the deletion guard — only branches recorded here may
   ever be deleted (spec §4.2.8).
 - **`daemon.toml.example`** — config contract (spec §4.2.9, design doc §5):
