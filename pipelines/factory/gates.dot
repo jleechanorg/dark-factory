@@ -1,6 +1,6 @@
 digraph gates {
     graph [
-        goal="Full validation: holdout + 3 adversarial gates."
+        goal="Full validation: holdout + Phase 5 N-shadow panel + /es + /code_standards."
         level5="true"
         label="Gates"
         skip_explore="true"
@@ -13,31 +13,9 @@ digraph gates {
     exit  [shape=Msquare,  label="Exit"]
 
     holdout         [type="holdout_eval",        label="Holdout Eval", feature="hello", timeout=600]
-    gate_skeptic [
-        type="gate_skeptic",
-        label="Skeptic (inverted-incentive review)",
-        backend_priority="codex,minimax,agy,claude-sonnet",
-        prefer_adversarial="true",
-        timeout=600
-    ]
-    adversarial_reviewer [
-        type="parallel_reviewer",
-        label="Adversarial reviewer (primary + shadow Codex)",
-        backend_priority="codex,minimax,agy,claude-sonnet",
-        prefer_adversarial="true",
-        timeout=600
-    ]
     gate_es [
         type="gate_es",
         label="/es Evidence Standards",
-        backend_priority="codex,minimax,agy,claude-sonnet",
-        prefer_adversarial="true",
-        gate_strict="true",
-        timeout=600
-    ]
-    gate_er [
-        type="gate_er",
-        label="/er Evidence Review",
         backend_priority="codex,minimax,agy,claude-sonnet",
         prefer_adversarial="true",
         gate_strict="true",
@@ -48,6 +26,30 @@ digraph gates {
         label="/code_standards (ZFC + leveling + RCF)",
         backend_priority="codex,minimax,agy,claude-sonnet",
         prefer_adversarial="true",
+        gate_strict="true",
+        timeout=600
+    ]
+
+    // ─── qw5: Phase 5 N-shadow fan-out (Beads: jleechan-qw5) ────────────────
+    // Pilot scope: collapse the prior holdout → gate_skeptic → adversarial_reviewer
+    // → gate_es → gate_er → gate_cs chain into
+    //   holdout → review_parallel_phase5 → gate_es → gate_cs
+    // where review_parallel_phase5 fans out ONE primary + THREE Codex shadow
+    // reviewers against a single combined prompt (skeptic + adversarial + /er
+    // roles). The runner applies the conservative coalesce: any error → error,
+    // any fail/partial/warn → failure, all-pass only → success.
+    //
+    // NOTE: the prior gate_skeptic / adversarial_reviewer / gate_er node
+    // DEFINITIONS are kept in this file's sibling graphs (slim/ etc.) for any
+    // pipeline that still references them. They were removed here because the
+    // runner enforces "no unreachable nodes from start" (parser.parse raises).
+    review_parallel_phase5 [
+        type="parallel_reviewer",
+        label="Phase 5 panel (skeptic + adversarial + /er — 1 primary + 3 shadows)",
+        prompt="@prompts/slim/review_parallel_phase5.md",
+        backend_priority="minimax,agy,codex,claude-sonnet",
+        prefer_adversarial="true",
+        n_shadows="3",
         gate_strict="true",
         timeout=600
     ]
@@ -65,20 +67,14 @@ digraph gates {
     ]
 
     start -> holdout
-    holdout -> gate_skeptic [condition="outcome=success"]
-    holdout -> fix         [condition="outcome!=success"]
+    holdout -> review_parallel_phase5 [condition="outcome=success"]
+    holdout -> fix                    [condition="outcome!=success"]
 
-    gate_skeptic -> adversarial_reviewer [condition="outcome=success"]
-    gate_skeptic -> fix                  [condition="outcome!=success"]
+    review_parallel_phase5 -> gate_es [condition="outcome=success"]
+    review_parallel_phase5 -> fix     [condition="outcome!=success"]
 
-    adversarial_reviewer -> gate_es [condition="outcome=success"]
-    adversarial_reviewer -> fix     [condition="outcome!=success"]
-
-    gate_es -> gate_er [condition="outcome=success"]
+    gate_es -> gate_cs [condition="outcome=success"]
     gate_es -> fix     [condition="outcome!=success"]
-
-    gate_er -> gate_cs [condition="outcome=success"]
-    gate_er -> fix     [condition="outcome!=success"]
 
     gate_cs -> exit
     fix -> holdout

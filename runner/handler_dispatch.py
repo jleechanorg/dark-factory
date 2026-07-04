@@ -54,6 +54,7 @@ class _ShadowGateReview:
     prompt_sha256: str = ""
     launch_error: str = ""
     started_at: float = 0.0
+    shadow_index: int | None = None
 
 
 def _shadow_gate_enabled(ctx: "Context") -> bool:
@@ -118,14 +119,31 @@ def _start_shadow_gate_review(
     expected_sha: str,
     timeout: int,
     ctx: "Context",
+    shadow_index: int | None = None,
 ) -> _ShadowGateReview | None:
-    if not _shadow_gate_enabled(ctx):
+    """Start one Codex shadow reviewer (or one slot of N concurrent shadows).
+
+    When ``shadow_index`` is provided (1-based), each downstream artifact is
+    keyed with a ``_{index}`` suffix and the event payload carries
+    ``shadow_index``. When ``shadow_index`` is None (the legacy single-shadow
+    path), keys remain unsuffixed for back-compat with existing tests and
+    downstream readers.
+    """
+    # Legacy state flag enables 1 shadow; n_shadows node attribute overrides
+    # with N independent shadow slots (one per shadow_index). When the caller
+    # explicitly passes shadow_index, the legacy flag is irrelevant.
+    if shadow_index is None and not _shadow_gate_enabled(ctx):
         return None
     shadow_prompt = _shadow_gate_prompt(name, prompt, expected_sha, ctx)
-    shadow = _ShadowGateReview(prompt=shadow_prompt, started_at=time.monotonic())
+    shadow = _ShadowGateReview(
+        prompt=shadow_prompt,
+        started_at=time.monotonic(),
+        shadow_index=shadow_index,
+    )
     seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
     attempt = int(getattr(ctx, "_df_current_attempt", 1))
     node_name = str(getattr(ctx, "_df_current_node", name))
+    sidecar_suffix = f"_{shadow_index}" if shadow_index is not None else ""
     try:
         from . import engine_observability as _obs
 
@@ -135,7 +153,7 @@ def _start_shadow_gate_review(
             node_name,
             attempt,
             shadow_prompt,
-            kind="shadow_codex_gate_prompt",
+            kind=f"shadow_codex_gate_prompt{sidecar_suffix}",
         )
         shadow.prompt_path = prompt_path or ""
         shadow.prompt_sha256 = prompt_sha or ""
@@ -147,6 +165,7 @@ def _start_shadow_gate_review(
                     "node": node_name,
                     "attempt": str(attempt),
                     "shadow_backend": "codex",
+                    "shadow_index": shadow_index if shadow_index is not None else 0,
                     "shadow_prompt_path": shadow.prompt_path,
                     "shadow_prompt_sha256": shadow.prompt_sha256,
                 },
@@ -183,6 +202,7 @@ def _finish_shadow_gate_review(
     expected_sha: str,
     timeout: int,
     ctx: "Context",
+    shadow_index: int | None = None,
 ) -> "Result":
     if shadow is None:
         return result
@@ -226,6 +246,13 @@ def _finish_shadow_gate_review(
             else:
                 shadow_outcome = normalized
 
+    sidecar_suffix = f"_{shadow_index}" if shadow_index is not None else ""
+    if shadow_index is not None:
+        out_label = f"Shadow Codex #{shadow_index}"
+        section_title = f"## {out_label} Gate Review"
+    else:
+        out_label = "Parallel Codex"
+        section_title = "## Parallel Codex Gate Review"
     output_path = ""
     output_sha = ""
     seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
@@ -240,7 +267,7 @@ def _finish_shadow_gate_review(
             node_name,
             attempt,
             output,
-            kind="shadow_codex_gate_output",
+            kind=f"shadow_codex_gate_output{sidecar_suffix}",
         )
         _obs._emit_event(
             ctx,
@@ -249,6 +276,7 @@ def _finish_shadow_gate_review(
                 "node": node_name,
                 "attempt": str(attempt),
                 "shadow_backend": "codex",
+                "shadow_index": shadow_index if shadow_index is not None else 0,
                 "shadow_outcome": shadow_outcome,
                 "shadow_verdict": verdict,
                 "shadow_returncode": returncode,
@@ -262,30 +290,50 @@ def _finish_shadow_gate_review(
         pass
 
     metadata = dict(result.metadata)
-    metadata.update(
-        {
-            "shadow_codex_gate_review": "true",
-            "shadow_codex_gate_outcome": shadow_outcome,
-            "shadow_codex_gate_verdict": verdict,
-            "shadow_codex_gate_returncode": returncode,
-            "shadow_codex_gate_head_sha_status": head_sha_status,
-            "shadow_codex_gate_timed_out": "true" if timed_out else "false",
-            "shadow_codex_gate_prompt_path": shadow.prompt_path,
-            "shadow_codex_gate_prompt_sha256": shadow.prompt_sha256,
-            "shadow_codex_gate_output_path": output_path or "",
-            "shadow_codex_gate_output_sha256": output_sha or "",
-        }
-    )
+    if shadow_index is not None:
+        # Indexed-suffix keys for the N-shadow fan-out path.
+        metadata.update(
+            {
+                f"shadow_codex_gate_outcome_{shadow_index}": shadow_outcome,
+                f"shadow_codex_gate_verdict_{shadow_index}": verdict,
+                f"shadow_codex_gate_returncode_{shadow_index}": returncode,
+                f"shadow_codex_gate_head_sha_status_{shadow_index}": head_sha_status,
+                f"shadow_codex_gate_timed_out_{shadow_index}": "true" if timed_out else "false",
+                f"shadow_codex_gate_prompt_path_{shadow_index}": shadow.prompt_path,
+                f"shadow_codex_gate_prompt_sha256_{shadow_index}": shadow.prompt_sha256,
+                f"shadow_codex_gate_output_path_{shadow_index}": output_path or "",
+                f"shadow_codex_gate_output_sha256_{shadow_index}": output_sha or "",
+            }
+        )
+        # Update the parallel-reviewer-wide summary keys ONLY once, after all
+        # shadows have joined. The handler orchestrates that write.
+    else:
+        # Legacy single-shadow keys (back-compat for older tests/observers).
+        metadata.update(
+            {
+                "shadow_codex_gate_review": "true",
+                "shadow_codex_gate_outcome": shadow_outcome,
+                "shadow_codex_gate_verdict": verdict,
+                "shadow_codex_gate_returncode": returncode,
+                "shadow_codex_gate_head_sha_status": head_sha_status,
+                "shadow_codex_gate_timed_out": "true" if timed_out else "false",
+                "shadow_codex_gate_prompt_path": shadow.prompt_path,
+                "shadow_codex_gate_prompt_sha256": shadow.prompt_sha256,
+                "shadow_codex_gate_output_path": output_path or "",
+                "shadow_codex_gate_output_sha256": output_sha or "",
+            }
+        )
+
     comparison = (
         "\n\n---\n\n"
-        "## Parallel Codex Gate Review\n"
+        f"{section_title}\n"
         f"{output}\n\n"
         "## Gate Review Comparison\n"
         f"- Normal gate outcome: {result.outcome}\n"
         f"- Normal gate verdict: {result.metadata.get('verdict', 'unknown')}\n"
-        f"- Shadow Codex outcome: {shadow_outcome}\n"
-        f"- Shadow Codex verdict: {verdict}\n"
-        f"- Shadow Codex head_sha_status: {head_sha_status}\n"
+        f"- {out_label} outcome: {shadow_outcome}\n"
+        f"- {out_label} verdict: {verdict}\n"
+        f"- {out_label} head_sha_status: {head_sha_status}\n"
     )
     final_outcome = result.outcome
     if result.outcome == "success" and shadow_outcome != "success":
@@ -302,6 +350,33 @@ def _finish_shadow_gate_review(
         suggested_next_ids=result.suggested_next_ids,
         context_updates=updates,
     )
+
+
+def _coalesce_n_shadow_outcomes(
+    primary_outcome: str,
+    shadow_outcomes: list[tuple[int | None, str, str]],
+) -> tuple[str, str]:
+    """Conservative merge of N-shadow outcomes.
+
+    ``shadow_outcomes`` is a list of ``(index, normalized_outcome, raw_verdict)``
+    triples. Per /advice 2026-06-27 Reviewer A: NO reviewer-shopping. Any
+    ``error`` dominates to ``error``. Any shadow that normalized to ``failure``
+    OR carries a raw verdict of ``warn`` (conservative qw5 policy: a flagged
+    concern must surface, not be silently promoted) dominates to ``failure``.
+    Otherwise the merge is ``success`` only when ALL shadows + primary are
+    success.
+    """
+    if any(o == "error" for _, o, _ in shadow_outcomes):
+        return "error", "error"
+    flagged = any(
+        o != "success" or r == "warn"
+        for _, o, r in shadow_outcomes
+    )
+    if flagged:
+        return "failure", "failure"
+    if primary_outcome == "success":
+        return "success", "success"
+    return "failure", "failure"
 
 
 def _gate_subprocess_args(backend: str, prompt: str, ctx: "Context", timeout: int) -> Optional[list[str]]:
