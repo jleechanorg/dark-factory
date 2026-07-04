@@ -45,8 +45,8 @@ The Auto-Factory Daemon automates the **backward-recovery path** in Level-5 auto
         *   4.2.7 [Spec Mutation Grammar & Overlay States](#427-spec-mutation-grammar--overlay-states)
         *   4.2.8 [Safety Envelope & Cumulative Time-Box](#428-safety-envelope--cumulative-time-box)
         *   4.2.9 [Two-Stage Pilot Deployment](#429-two-stage-pilot-deployment)
-    *   4.3 [Appendix A — Adversarial Review Ledger](#43-appendix-a--adversarial-review-ledger)
-    *   4.4 [Appendix B — Open Questions](#44-appendix-b--open-questions)
+5.  [Appendix A — Adversarial Review Ledger](#appendix-a--adversarial-review-ledger)
+6.  [Appendix B — Open Questions](#appendix-b--open-questions)
 
 ---
 
@@ -190,6 +190,7 @@ The stack composes three existing systems plus one new thin daemon. The composit
     1. `fetch_candidate_issues()` — `br list --status open --label factory --json`, one configured target repo.
     2. `fetch_issues_by_states(state_names)` — startup terminal cleanup.
     3. `fetch_issue_states_by_ids(ids)` — active-run reconciliation.
+*   **Intake Authorization & Security**: To prevent unauthorized users from triggering execution runs, the pre-poll normalizer validates labeling events and issue creators against the SCM repository's collaborator APIs. Issues created or labeled by non-collaborators are ignored and logged for audit.
 *   **GitHub intake is a separate pre-poll normalizer step**, converting issues to beads using `external-ref` = `<owner>/<repo>#<issue_number>` to ensure idempotency.
 *   **Manual Bead Input:** The daemon natively supports dispatching manually created beads directly from the `br` queue. If a bead has no `external-ref`, the daemon bypasses GitHub status updates but still performs full routing, dispatching, PR creation, and re-rolling.
 *   **AO Intake Integration:** AO's native `trackerintake` is disabled for factory projects to prevent duplicate spawning, while AO's session database acts as the single source of truth for active worker sessions.
@@ -214,7 +215,8 @@ Each fast-tick, the daemon independently evaluates the PR against the full **7/8
 6.  **Evidence Review (`/er`)**: The `/er` verification workflow/comment returns a `PASS` verdict.
 7.  **Skeptic PASS**: Runs the Skeptic review loop using `ao skeptic verify --pr N`. Under the daemon, this represents the combined execution of the specialized reviewer fleet. A PR is considered green only when all fleet reviews pass.
 
-Additional floors are enforced regardless of target-repo tooling:
+Additional floors and optimizations are enforced:
+*   **SCM API Rate-Limit Optimization**: The verifier loop implements ETag-based conditional requests for all SCM metadata fetches. If no changes are detected on a PR, the poll frequency dynamically backs off from the fast tier (1 minute) to a slower tier (up to 10 minutes) to conserve API quota.
 *   **Evidence floor:** production diffs over 100 non-test LOC require at least Layer-2 integration evidence (real callstack, mocks only at external API boundaries). Unit-only proof is insufficient.
 *   **Independent-reviewer floor:** A PR with zero independent review never reaches ready-to-merge.
 
@@ -268,7 +270,7 @@ All existing operator policies bind the daemon:
 
 ---
 
-### 4.3 Appendix A — Adversarial Review Ledger
+## Appendix A — Adversarial Review Ledger
 
 *   **Round 1 - Consistency & Gaps:** Addressed lock lifecycles, push guards, time-box loops, and standard path PR owners (all 28 findings integrated in r2 and r3).
 *   **Round 2 - Verification Pass:** Integrated manual bead scopes, offline fail-safes, and 5-whys daily auditing (all 6 findings integrated in r4).
@@ -276,7 +278,7 @@ All existing operator policies bind the daemon:
 
 ---
 
-### 4.4 Appendix B — Open Questions
+## Appendix B — Open Questions
 
 1. Per-repo spec-directory convention for `/fs` output in non-dark-factory target repos.
 2. Exact shape of the per-bead scope key for the circuit-breaker streak query and the Healer namespace handling.
