@@ -209,10 +209,23 @@ print(d[0]["status"])' 2>&1)" || die "could not parse br show --json output for 
   elif [ "$cur_state" = "DISPATCHED" ] || [ "$cur_state" = "ATTESTED" ]; then
     branch="$(get_field "$bead_id" branch)"
     pr_number="$(get_field "$bead_id" pr_number)"
-    sql "UPDATE bead_overlay SET state='HUMAN_HELD', updated_at='$(now)' WHERE bead_id='$(q "$bead_id")';"
-    ctx="$(python3 -c 'import json,sys; print(json.dumps({"reason":"bead_closed_underneath","prior_state":sys.argv[1],"branch":(sys.argv[2] or None),"pr_number":(int(sys.argv[3]) if sys.argv[3] not in ("", "None") else None)}))' "$cur_state" "$branch" "$pr_number")"
-    emit "$bead_id" "$(get_field "$bead_id" attempt)" HUMAN_HELD PARKED_HUMAN_HELD '{}' "$ctx"
-    echo "parked"
+    # A closed br bead + an evidenced all-green assessment = the PR merged and
+    # the work succeeded (transition READY), NOT abandoned-underneath. This
+    # resolves the ready-vs-sweep race regardless of ordering.
+    merged_green=""
+    if [ -n "$pr_number" ] && [ "$pr_number" != "None" ]; then
+      merged_green="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$pr_number[,}]" | grep '"all_green": *true' | tail -1 || true)"
+    fi
+    if [ -n "$merged_green" ]; then
+      sql "UPDATE bead_overlay SET state='READY', updated_at='$(now)' WHERE bead_id='$(q "$bead_id")';"
+      emit "$bead_id" "$(get_field "$bead_id" attempt)" READY READY_FOR_MERGE '{}' "{\"pr_number\":$pr_number,\"note\":\"closed_after_merge\"}"
+      echo "ready"
+    else
+      sql "UPDATE bead_overlay SET state='HUMAN_HELD', updated_at='$(now)' WHERE bead_id='$(q "$bead_id")';"
+      ctx="$(python3 -c 'import json,sys; print(json.dumps({"reason":"bead_closed_underneath","prior_state":sys.argv[1],"branch":(sys.argv[2] or None),"pr_number":(int(sys.argv[3]) if sys.argv[3] not in ("", "None") else None)}))' "$cur_state" "$branch" "$pr_number")"
+      emit "$bead_id" "$(get_field "$bead_id" attempt)" HUMAN_HELD PARKED_HUMAN_HELD '{}' "$ctx"
+      echo "parked"
+    fi
   else
     echo "already_terminal"
   fi
