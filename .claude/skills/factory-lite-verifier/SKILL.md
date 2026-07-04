@@ -49,8 +49,35 @@ gh api graphql -f query='
 | 3 | `coderabbit` | latest `coderabbitai[bot]` review `APPROVED` |
 | 4 | `bugbot` | zero error-severity `cursor[bot]` comments |
 | 5 | `comments_resolved` | every reviewThread `isResolved=true` |
-| 6 | `evidence_review` | >100 non-test changed LOC requires integration evidence in PR body; ≤100 LOC or docs/tests-only passes |
+| 6 | `evidence_review` | full /er rubric — see "Gate 6" section below |
 | 7 | `skeptic` | parallel minimax adversarial review (below) |
+
+**Gate 6 — Evidence Review (/er rubric).** Judge the PR body's evidence
+against the actual diff (`gh pr diff`), all five criteria; evidence is what
+the PR *shows*, never what it *claims*:
+
+1. **Class floor:** >100 non-test production LOC requires Layer-2 evidence —
+   a real multi-component call stack exercised end-to-end, mocks only at
+   external API boundaries (a CI job running the full suite on the PR head
+   qualifies). Unit-only evidence for such a diff = `red`. Docs-only,
+   tests-only, or ≤100 LOC: unit evidence or `N/A — no behavior change` passes.
+2. **Provenance:** evidence must include the command run, its actual output
+   (pass/fail counts, not adjectives), tied to the PR's current head. Bare
+   assertions ("all tests pass", "verified locally") with no output = `red`.
+3. **Independent witness:** at least one cited artifact must be verifiable by
+   someone other than the authoring agent — a CI check on the PR, a pasted
+   re-runnable command output, a linked action log. Evidence existing only as
+   the coder's own narration = `red` (circular).
+4. **Vacuous-pass scan:** confirm the cited tests actually exercise the
+   changed code — check the named test files/functions against the diff's
+   modules. A green suite that never touches the new code proves nothing = `red`.
+5. **Claim–diff match:** every behavioral claim in the PR body must map to a
+   hunk in the diff. Flag in the gate reason any hunk with NO corresponding
+   claim — undisclosed changes are how scope creep ships.
+
+`green` only when all five hold; `red` names the failed criterion in the gate
+reason; `unknown` is reserved for infra failures *retrieving* evidence (API
+errors) — weak evidence is `red`, never `unknown`.
 
 **Gate 7 — Skeptic, PARALLEL:** if multiple ATTESTED PRs need review this
 tick, spawn ALL their Skeptic reviewers in ONE message — one Agent tool call
