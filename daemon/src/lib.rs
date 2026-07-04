@@ -15,3 +15,5 @@ pub mod telemetry;
 pub mod tick;
 pub mod tools;
 pub mod verifier;
+pub mod adapters;
+

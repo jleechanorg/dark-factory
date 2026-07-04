@@ -151,7 +151,6 @@ fn run(args: Args) -> Result<(), DaemonError> {
     let telemetry_log = default_telemetry_log();
     let db_path = default_state_db_path();
 
-    let adapters = NoopAdapters;
     let store: Box<dyn StateStore> = if args.dry_run {
         // --dry-run never persists to the real on-disk CXDB either — an
         // in-memory store with the same schema keeps the tick loop's write
@@ -164,15 +163,38 @@ fn run(args: Args) -> Result<(), DaemonError> {
         Box::new(SqliteStateStore::open(&db_path)?)
     };
 
+    let (scm, tracker, sessions, llm): (
+        Box<dyn Scm>,
+        Box<dyn Tracker>,
+        Box<dyn Sessions>,
+        Box<dyn Llm>,
+    ) = if args.dry_run {
+        (
+            Box::new(NoopAdapters),
+            Box::new(NoopAdapters),
+            Box::new(NoopAdapters),
+            Box::new(NoopAdapters),
+        )
+    } else {
+        use daemon::adapters::{CliScm, CliSessions, CliTracker, ChainLlm};
+        (
+            Box::new(CliScm::new(cfg.target_repo.clone())),
+            Box::new(CliTracker),
+            Box::new(CliSessions::new(&cfg.target_repo, "claude-code")),
+            Box::new(ChainLlm),
+        )
+    };
+
     let deps = TickDeps {
-        scm: &adapters,
-        tracker: &adapters,
-        sessions: &adapters,
-        llm: &adapters,
+        scm: scm.as_ref(),
+        tracker: tracker.as_ref(),
+        sessions: sessions.as_ref(),
+        llm: llm.as_ref(),
         store: store.as_ref(),
         cfg: &cfg,
         telemetry_log: &telemetry_log,
     };
+
 
     if args.once {
         run_tick(&deps, 0)?;
