@@ -380,3 +380,79 @@ def test_slim_review_prompt_contains_no_vendor_specific_filenames(
         f"placeholder (``<primary-evidence.json>`` or "
         f"``<run-trace.jsonl>``)."
     )
+
+
+# ---------------------------------------------------------------------------
+# Domain-agnosticism invariants for the evidence-review gate prompt
+# (jleechan-3bu / 2026-06-27 cold prompt review)
+# ---------------------------------------------------------------------------
+
+
+# ``prompts/slim/evidence_review.md`` is the evidence-standards gate prompt
+# that every PR review funnel goes through. It must not hardcode
+# world-architect's streaming-app evidence schema (exact filenames or
+# streaming/native-app-specific phrasing) as if it were universal.
+EVIDENCE_REVIEW_BANNED_FILENAMES: tuple[str, ...] = (
+    "streaming_evidence.json",
+    "llm_request_responses.jsonl",
+)
+
+
+@pytest.mark.parametrize("banned_filename", EVIDENCE_REVIEW_BANNED_FILENAMES)
+def test_evidence_review_prompt_contains_no_vendor_specific_filenames(
+    banned_filename: str,
+) -> None:
+    """``prompts/slim/evidence_review.md`` step 2 (Evidence quality
+    checks) must reference vendor-neutral placeholders
+    (``<primary-evidence.json>``, ``<run-trace.jsonl>``) rather than
+    streaming-app-specific defaults (``streaming_evidence.json``) or
+    LLM-vendor-specific JSONL (``llm_request_responses.jsonl``). A CLI /
+    batch / library product under review will not have these exact
+    files, and a hardcoded filename check would falsely report
+    "evidence insufficient".
+
+    Pinned by bead ``jleechan-3bu`` (2026-06-27 cold prompt review,
+    subagent ab5497ff).
+    """
+    text = _read_prompt("prompts/slim/evidence_review.md")
+    assert banned_filename not in text, (
+        f"prompts/slim/evidence_review.md contains vendor/streaming-specific "
+        f"filename {banned_filename!r}. Replace with a generic "
+        f"placeholder (``<primary-evidence.json>`` or "
+        f"``<run-trace.jsonl>``)."
+    )
+
+
+EVIDENCE_REVIEW_BANNED_PHRASES: tuple[str, ...] = (
+    # streaming-app-specific claim phrasing that falsely narrows the
+    # "real-time feature works" check to LLM token streaming only
+    '"streaming works"',
+    # rendered narrative prose is world-architect's story-text framing;
+    # the generic check must accept any rendered user-visible content
+    "rendered narrative prose",
+    # "native app" implies iOS/Android; the check for undismissed system
+    # dialogs must also apply to desktop/web apps
+    '"native app works"',
+)
+
+
+@pytest.mark.parametrize("banned_phrase", EVIDENCE_REVIEW_BANNED_PHRASES)
+def test_evidence_review_prompt_contains_no_streaming_app_phrasing(
+    banned_phrase: str,
+) -> None:
+    """``prompts/slim/evidence_review.md`` step 4 (Visual evidence
+    cross-check) must use domain-agnostic claim phrasing
+    ("real-time feature works", "rendered user-visible content",
+    "desktop/mobile/web app works") instead of world-architect's
+    streaming/native-app-specific framing.
+
+    Pinned by bead ``jleechan-3bu`` (2026-06-27 cold prompt review,
+    subagent ab5497ff).
+    """
+    text = _read_prompt("prompts/slim/evidence_review.md")
+    assert banned_phrase not in text, (
+        f"prompts/slim/evidence_review.md contains streaming/native-app-"
+        f"specific phrasing {banned_phrase!r}. Replace with the generic "
+        f"phrasing (e.g. 'real-time feature works', 'rendered "
+        f"user-visible content', 'desktop/mobile/web app works')."
+    )
