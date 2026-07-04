@@ -75,7 +75,9 @@ def test_jsonl_no_duplicate_ids() -> None:
 
 
 def test_br_sync_preserves_id_sort(tmp_path: Path) -> None:
-    """RED: a br operation + sync must not re-sort the JSONL.
+    """
+    if shutil.which("br") is None:
+        pytest.skip("br CLI not on PATH (not a beads-enabled runner)")RED: a br operation + sync must not re-sort the JSONL.
 
     Builds a tiny in-place fixture, makes a 1-bead change, runs
     `br sync --flush-only`, and asserts the resulting JSONL is still
