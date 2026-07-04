@@ -380,3 +380,52 @@ def test_slim_review_prompt_contains_no_vendor_specific_filenames(
         f"placeholder (``<primary-evidence.json>`` or "
         f"``<run-trace.jsonl>``)."
     )
+
+
+# ---------------------------------------------------------------------------
+# Domain-agnosticism invariants — attractor templates (jleechan-cni /
+# 2026-06-27 cold prompt review, subagent ab5497ff)
+# ---------------------------------------------------------------------------
+
+
+ATTRACTOR_TEMPLATE_PROMPTS: tuple[str, ...] = (
+    "prompts/slim/plan_attractor.md",
+    "prompts/slim/fix_attractor.md",
+)
+
+# Banned terms: these two templates render as the general-purpose
+# attractor lane for ANY feature, not just world-architect's level-up
+# system. Any reappearance means a future edit re-leaked the
+# world-architect-specific example back into the generic template.
+ATTRACTOR_DOMAIN_BIAS_TERMS: tuple[str, ...] = (
+    "level-up",
+    "level_up",
+    "apply-level-up",
+    "world_logic",
+)
+
+
+@pytest.mark.parametrize("relpath", ATTRACTOR_TEMPLATE_PROMPTS)
+@pytest.mark.parametrize("banned_term", ATTRACTOR_DOMAIN_BIAS_TERMS)
+def test_attractor_templates_contain_no_domain_bias_terms(
+    relpath: str, banned_term: str
+) -> None:
+    """``prompts/slim/plan_attractor.md`` and ``prompts/slim/fix_attractor.md``
+    ship as the general-purpose attractor spec lane. An implementing
+    agent using these templates for a non-level-up feature must not be
+    modeling anti-states after D&D (world-architect). This pins the
+    acceptance criteria for bead ``jleechan-cni`` (HIGH-severity finding
+    from the 2026-06-27 cold prompt review, subagent ab5497ff): the
+    world-architect example (``level-up session`` / ``apply-level-up
+    signal`` / ``level_up_signal`` / ``world_logic.py``) must stay
+    replaced by domain-agnostic examples (e.g. "a version upgrade is
+    atomic across two files" or "checkout is atomic across
+    order+inventory+payment").
+    """
+    text = _read_prompt(relpath)
+    assert banned_term not in text, (
+        f"{relpath} contains banned domain-bias term {banned_term!r}. "
+        f"This template ships as the general-purpose attractor lane; "
+        f"replace world-architect-specific phrasing with a generic "
+        f"example (see bead jleechan-cni)."
+    )
