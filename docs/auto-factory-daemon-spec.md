@@ -1,8 +1,9 @@
 # Auto-Factory Daemon — Architectural Specification (No-Code)
 
-**Status:** Final r1 — resolved open questions and validated architecture
-**Code status:** Declarative blueprint only — zero implementation code
-**Owner repo:** dark-factory (`$DARK_FACTORY_HOME`)
+| **Status:** r2 — landscape claim tightened, re-roll branching split, structured rebase step, telemetry fields added, dangling skill reference removed
+| **Code status:** Declarative blueprint only — zero implementation code
+| **Owner repo:** dark-factory (`$DARK_FACTORY_HOME`)
+| **r1 → r2 changelog:** see Appendix C |
 
 ---
 
@@ -14,7 +15,7 @@ The Auto-Factory Daemon automates the **backward-recovery path** in Level-5 auto
 *   **Decoupled Control Planes (Single-Owner)**: To prevent concurrent write conflicts, a single active `aow` worker session owns all *in-place* commits on a branch, while the daemon exclusively performs *read-only* verification and *structural re-rolls* (branch reset, spec mutation, and re-dispatch).
 *   **Wrapper-First & Discardable Components**: The daemon is implemented as a thin scheduler wrapping existing workflows. Components are designed to be discarded if upstream tools (Claude Code or `agent-orchestrator-mirror`) later absorb their functionality.
 *   **Offline Fail-Safe**: If GitHub is down, agents and the daemon coordinate via a parallel local bead-file protocol to prevent pipeline stalls.
-*   **7/8-Green Skeptic verification**: PRs are verified against standard SCM gates (CI, conflicts, comments, CodeRabbit) combined with adversarial Skeptic reviewer runs to ensure evidence compliance and logic correctness before release.
+*   **7-Green Skeptic verification**: PRs are verified against standard SCM gates (CI, conflicts, comments, CodeRabbit) combined with adversarial Skeptic reviewer runs to ensure evidence compliance and logic correctness before release. The 7 conditions and the dual `/er` evidence tier are defined in `~/.claude/commands/green.md`; the daemon reads that file at startup and caches the rule set.
 
 ---
 
@@ -136,7 +137,7 @@ graph TD
 #### 4.1.1 Intake Normalizer
 *   **Definition:** An automated parser that fetches labeled GitHub issues, checks for duplicates, creates a matching bead file (`br`), and comments on the issue with the bead ID.
 *   **Need:** Translates loose human-facing interfaces into a structured, dependency-ordered queue.
-*   **Gap Proof:** Neither Claude Code nor the `agent-orchestrator-mirror` repository supports intake queue priority management, bead dependency resolution, assignee tracking, or custom queue status mappings. Claude Code is a session-level CLI with no polling capabilities.
+*   **Gap Proof:** Neither Claude Code nor the `agent-orchestrator-mirror` repository supports intake queue priority management, bead dependency resolution, assignee tracking, or custom queue status mappings. Claude Code is a session-level CLI with no polling capabilities. Symphony exposes a Reaction handler / `CHANGES_REQUESTED` reaction path, but it stops at the human review gate *and exposes no spec-mutation surface for re-entry* — the append-only spec-mutation grammar in §4.2.7 remains custom to this daemon.
 
 #### 4.1.2 Thin Poller (Scheduler)
 *   **Definition:** A lightweight poller that scans the bead queue, claims ready items, checks concurrent workspace capacities, and triggers dispatches.
@@ -208,8 +209,8 @@ The single-owner rule requires every open factory PR to have exactly one AO sess
 *   **Standard path:** `/f` is a one-shot pipeline that exits when the PR opens. At PR-open, the daemon attaches an `aow` session to the `/f`-produced branch (spawned with the bead's spec as context in remediation mode).
 *   The daemon leverages the AO daemon's native `scm.Observer` loop which registers ETags, performs diffs, and fires reaction nudges for PRs owned by active sessions.
 
-#### 4.2.5 Verifier Gates (7/8-Green) & Evidence Floors
-Each fast-tick, the daemon independently evaluates the PR against the full **7/8-green** definition (as implemented in `~/.claude/commands/green.md` and `~/.claude/skills/pr-green-definition.md`):
+#### 4.2.5 Verifier Gates (7-Green) & Evidence Floors
+Each fast-tick, the daemon independently evaluates the PR against the full **7-green** definition (as implemented in `~/.claude/commands/green.md`; the verifier emits a `GATE-<n>` line per gate and never infers pass from API return status alone):
 1.  **CI Green**: All check-runs (e.g. GitHub Actions) report a `success` conclusion.
 2.  **No Conflicts**: The SCM mergeable status is `true` (no git conflicts).
 3.  **CodeRabbit APPROVED**: The latest review from the `coderabbitai` bot is `APPROVED`.
@@ -225,7 +226,7 @@ Each fast-tick, the daemon independently evaluates the PR against the full **7/8
 Additional floors and optimizations are enforced:
 
 *   **SCM API Rate-Limit Optimization**: The verifier loop implements ETag-based conditional requests for all SCM metadata fetches. If no changes are detected on a PR, the poll frequency dynamically backs off from the fast tier (1 minute) to a slower tier (up to 10 minutes) to conserve API quota.
-*   **Evidence floor:** production diffs over 100 non-test LOC require at least Layer-2 integration evidence (real callstack, mocks only at external API boundaries). Unit-only proof is insufficient.
+*   **Evidence floor:** production diffs over 100 non-test LOC require at least Layer-2 integration evidence (real callstack, mocks only at external API boundaries). Unit-only proof is insufficient. The Gate 6 checklist (applied by the daemon's `/er` gate, not by the implementing agent) MUST verify before PASS: (a) the SHA in the evidence matches current HEAD, (b) the LLM-layer pass rate is `>0%`, (c) the evidence files/artifacts are uploaded and accessible (not pointing to `/tmp/`), and (d) a dynamic status check confirms the PR has not diverged since the evidence was captured.
 *   **Independent-reviewer floor:** A PR with zero independent review never reaches ready-to-merge.
 
 #### 4.2.6 Re-Roll Handover, Constraint Extraction & Branching
@@ -237,14 +238,32 @@ Additional floors and optimizations are enforced:
     1. **Lock:** Acquire the per-bead lock (atomic transaction in CXDB or file lock).
     2. **Freshness guard:** Abort if review state changed.
     3. **Stop AO session & confirm quiescence:** The owning `aow` session is stopped through AO's session interface. The engine queries process state, confirming a terminal state and branch head SHA stability before proceeding.
-    4. **Baseline computation:** Fetch and compute the new baseline as the current head of the configured `base_branch`.
-    5. **Fresh attempt branch:** Create `factory/<bead_id>-r<n>` from the baseline.
+    4. **Baseline computation & lineage-drift check:** Compute the attempt branch's original integration point via `git merge-base HEAD origin/main`. Compare against the current `base_branch` head:
+        * **No drift (merge-base == current base head)** → proceed to step 5.
+        * **Drift detected (commits ahead on base since merge-base)** → run a **structured rebase** (`git rebase --onto <merge-base> <merge-base> <new-base-head>` or, if conflicts, `git rebase --abort` + escalate to HUMAN_HELD) before re-dispatching. The worker must never re-run on a base that has already moved; without this guard the next CHANGES_REQUESTED cycle repeats the drift problem.
+    5. **Fresh attempt branch:** Create `factory/<bead_id>-r<n>` from the rebased baseline.
     6. **Ref registry:** Every branch the daemon creates is recorded in the CXDB branch registry.
     7. **Old PR closure:** The superseded PR is closed with a comment linking the new attempt branch.
-    8. **Structured Telemetry:** Emit a structured lifecycle event to the observability dashboard.
-*   **Constraint Extraction:** Comment text is parsed by an LLM to extract positive assertions and inhibition specs (which get priority).
+    8. **Structured Telemetry:** Emit a structured lifecycle event to the observability dashboard (see Telemetry fields below).
+*   **Re-roll branching modes (force-push policy):** Two distinct primitives, chosen by the re-roll verdict:
+    * **`--force-with-lease` (in-place, cosmetic fix-up)** — used when the re-roll verdict is `in-place fixable` (CI re-run, lint, evidence-stub refresh, reviewer comment that does not change spec semantics). The existing branch is updated; PR context, inline review threads, and commit SHA mental model are preserved.
+    * **Fresh branch + close old PR (substantive re-roll)** — used when the re-roll verdict is `re-roll-worthy` (constraint extraction changes the spec, harness updates, or the §4.2.6 lineage-drift rebase step ran). The old PR is closed with a comment linking the new attempt branch per step 7. Do not collapse these two — for a daemon that re-rolls on every CHANGES_REQUESTED, the noise floor of N force-pushes per PR is *worse* than the original "fresh-branch" pattern, and `force-with-lease` destroys any branch-protection linear-history requirement.
+*   **Constraint Extraction:** Comment text is parsed by an LLM to extract positive assertions and inhibition specs (which get priority). Two separate system prompts are used: one tuned for positive-assertion mining (look for "must", "should", "requires", "shall") and one for inhibition-spec mining ("don't", "must not", "forbidden", "remove"). A single combined prompt forces the model to flip attention modes and degrades both.
     *   *Harness-First Focus:* Prioritizes identifying changes to the factory environment (codebase skills, tests, or workspace configs) over prompt-level constraints.
     *   *Holdout-leak screen:* Reviewer text is screened for holdout test internals and redacted if necessary to preserve Agent Isolation.
+*   **Telemetry fields (per re-roll event):**
+    ```json
+    {
+      "eventType": "CONSTRAINT_MUTATION_SUCCESS | COSMETIC_FORCE_PUSH",
+      "rebaseStatus": "NOT_NEEDED | SUCCEEDED | CONFLICT_ABORTED",
+      "forcePushReason": "COSMETIC_FIXUP | NOT_APPLICABLE",
+      "driftCommits": <integer: commits ahead on origin/main since merge-base>,
+      "mergeBase": "<sha>",
+      "attemptBranch": "factory/<bead_id>-r<n>",
+      "supersededPR": <pr_number>
+    }
+    ```
+    `eventType` distinguishes a constraint-driven re-roll from a CI-driven cosmetic force-push; `rebaseStatus` records the §4.2.6 step-4 outcome; `forcePushReason` is `NOT_APPLICABLE` for the substantive re-roll path and one of `CI_RE_RUN | LINT_FIXUP | EVIDENCE_STUB_REFRESH | REVIEW_COMMENT_FIXUP` for the cosmetic path.
 
 #### 4.2.7 Spec Mutation Grammar & Overlay States
 *   **Spec mutation grammar:** The spec file for the bead is append-only. Each re-roll appends one block containing the source event, attesting reviewer, superseded attempt, extracted constraints, and raw feedback snapshot. Atomicity is guaranteed via write-temp -> fsync -> rename.
@@ -295,4 +314,22 @@ All existing operator policies bind the daemon:
    aow attach --branch <branch_name> --bead <bead_id> --remediation
    ```
    This attaches the worker session directly to the target branch in remediation mode, providing the session with the spec as its initial context.
+
+---
+
+## Appendix C — r1 → r2 Changelog
+
+Applied against `origin/main` SHA `b16551b` (the 1,600-word review feedback from 2026-07-03, plus the Cmux Gemini-surface observations in `worktree_auto_factory/GEMINI.md`).
+
+* **C1 — Landscape claim narrowed (§4.1.1 Gap Proof).** The previous wording implied Symphony has no `CHANGES_REQUESTED` reaction path. Corrected: Symphony does expose a Reaction handler / `CHANGES_REQUESTED` path; the genuine gap is the absence of a spec-mutation surface for re-entry. The append-only grammar in §4.2.7 remains custom.
+* **C2 — Re-roll branching split into two primitives (§4.2.6).** `--force-with-lease` is now reserved for *in-place cosmetic fix-ups* (CI re-run, lint, evidence-stub refresh, review comments that don't change spec semantics). Substantive re-rolls (`re-roll-worthy` verdicts and any path that triggered the lineage-drift rebase) keep the original fresh-branch + close-old-PR pattern. Rationale: for a daemon that re-rolls on every `CHANGES_REQUESTED`, N force-pushes per PR is a worse noise floor than the original close/recreate pattern, and force-with-lease destroys branch-protection linear-history requirements.
+* **C3 — Lineage-drift structured rebase step added (§4.2.6 step 4).** Baseline computation now runs `git merge-base HEAD origin/main` and explicitly compares it against the current `base_branch` head. If drift is detected, a structured rebase is run before re-dispatch (with conflict-abort → HUMAN_HELD). Without this guard the worker re-runs on a base that has already moved, and the next `CHANGES_REQUESTED` cycle repeats the drift problem.
+* **C4 — Telemetry fields added (§4.2.6 telemetry block).** New event envelope: `eventType` (`CONSTRAINT_MUTATION_SUCCESS` vs `COSMETIC_FORCE_PUSH`), `rebaseStatus` (`NOT_NEEDED | SUCCEEDED | CONFLICT_ABORTED`), `forcePushReason` (`COSMETIC_FIXUP | NOT_APPLICABLE` plus the cosmetic sub-enum), `driftCommits`, `mergeBase`, `attemptBranch`, `supersededPR`. Postmortem can now distinguish a constraint-driven re-roll from a CI-driven cosmetic force-push.
+* **C5 — Two system prompts for Constraint Extraction (§4.2.6).** The single combined prompt is replaced by two: one tuned for positive-assertion mining ("must", "should", "requires", "shall") and one for inhibition-spec mining ("don't", "must not", "forbidden", "remove"). A single prompt forces the model to flip attention modes and degrades both.
+* **C6 — Dangling skill reference removed (§4.2.5).** `~/.claude/skills/pr-green-definition.md` is referenced as a normative source of truth but does not exist on the operator workstation. Replaced with a startup-time read of the canonical `~/.claude/commands/green.md` (which does exist and defines the 7 conditions and the dual `/er` evidence tier). The 7-green header normalization is consistent across §Executive Summary, §4.2.5, and Appendix C.
+* **C7 — Gate 6 evidence checklist made normative (§4.2.5 Evidence floor).** Folded the Cmux Gemini-surface checklist (SHA matches HEAD, LLM-layer pass rate `>0%`, evidence files uploaded and accessible not pointing at `/tmp/`, dynamic status re-check) into the Evidence floor so the daemon's `/er` gate enforces the same evidence discipline as a human reviewer. Attribution: `worktree_auto_factory/GEMINI.md §6 Gate 6 Evidence Standards`.
+* **Out of scope for r2 (filed as follow-up beads):**
+    * **B1 — `git_lib.sh` wrapper drift (prior review point #4).** The current spec does not name a `.factory/src/utils/git.js` abstraction, so there is nothing to remove. If a future implementation draft adds one, prefer `gh`/`git` one-liners over a thin wrapper (bead `orch-15x`-style anti-pattern history).
+    * **B2 — `minimax` (agent) vs `MiniMax` (model) naming conflation (§4.2.2).** Pre-existing ambiguity; track separately from the r2 review feedback.
+    * **B3 — §4.2.5 fallback chain reviewer ordering.** Independent of r2 review (no change requested in the 1,600-word feedback); reopen if a reviewer gate fails for the wrong reason.
 
