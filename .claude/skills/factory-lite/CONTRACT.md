@@ -6,7 +6,7 @@ Rust daemon (`docs/auto-factory-daemon-design-rust.md`) can drop in against the
 exact same `~/.dark-factory/daemon-cxdb.sqlite` file and the exact same
 `~/Library/Logs/dark-factory/daemon.jsonl` telemetry stream with zero migration.
 
-Source of truth for behavior: `docs/auto-factory-daemon-spec.md` (Final r1).
+Source of truth for behavior: `docs/auto-factory-daemon-spec.md` (Final r3).
 Source of truth for shape: `docs/auto-factory-daemon-design-rust.md`.
 If this file and the spec ever disagree, **the spec wins** — fix this file.
 
@@ -45,6 +45,7 @@ Exactly 8 states, `SCREAMING_SNAKE_CASE`, matching `schema.sql`'s CHECK constrai
 | `QUEUED` | bead accepted by intake, awaiting dispatch |
 | `DISPATCHED` | worker/pipeline running, no PR yet |
 | `ATTESTED` | PR open, under verification |
+| `READY` | terminal: all 7 gates green, readiness posted; verifier stops driving |
 | `RE_ROLL` | re-roll in progress (Stage 2 only) |
 | `RECOVERY` | spec mutated, awaiting re-dispatch (Stage 2 only) |
 | `REDISPATCHED` | handed back to the queue (Stage 2 only) |
@@ -57,6 +58,7 @@ Pre-PR path (both skills touch this):
 ```
 QUEUED --(dispatch: capacity free + routing verdict)--> DISPATCHED
 DISPATCHED --(gh pr list --head finds an open PR)--> ATTESTED
+ATTESTED --(all 7 gates green; harness `ready`)--> READY   [terminal]
 ```
 
 Post-PR path (spec §4.2.7, verbatim edges — Stage 2 states included for

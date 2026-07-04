@@ -49,6 +49,7 @@ pub enum OverlayState {
     Queued,        // bead accepted by intake, awaiting dispatch
     Dispatched,    // worker/pipeline running, no PR yet
     Attested,      // PR open, under verification
+    Ready,         // terminal: 7-green, readiness posted, daemon stops driving
     ReRoll,        // re-roll in progress (Stage 2)
     Recovery,      // spec mutated, awaiting re-dispatch (Stage 2)
     Redispatched,  // handed back to the queue
@@ -142,8 +143,9 @@ pub struct Config {
 }
 pub fn load(path: &Path) -> Result<Config, DaemonError>;
 
-// telemetry.rs — schema pinned by spec §4.2.9
+// telemetry.rs — schema pinned by spec §4.2.9 (camelCase field names on the wire)
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TelemetryEvent<'a> {
     pub timestamp: String, pub bead_id: &'a str, pub attempt_id: u32,
     pub lifecycle_state: OverlayState, pub event_type: &'a str,

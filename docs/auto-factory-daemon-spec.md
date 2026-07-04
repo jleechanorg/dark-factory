@@ -1,6 +1,6 @@
 # Auto-Factory Daemon — Architectural Specification (No-Code)
 
-**Status:** Final r3 — integrated Round 4 AAR of external spec variant ASF-SR-2.4 (telemetry schema, prompt contracts, pre-PR states)
+**Status:** Final r3.1 — r3 + READY terminal overlay state (adversarial-review finding, 2026-07-03)
 **Code status:** Declarative blueprint only — zero implementation code
 **Owner repo:** dark-factory (`$DARK_FACTORY_HOME`)
 
@@ -251,6 +251,7 @@ Additional floors and optimizations are enforced:
 *   **Spec mutation grammar:** The spec file for the bead is append-only. Each re-roll appends one block containing the source event, attesting reviewer, superseded attempt, extracted constraints, and raw feedback snapshot. Atomicity is guaranteed via write-temp -> fsync -> rename.
 *   **Overlay States:**
     *   Pre-PR lifecycle (previously implicit, named in r3): *QUEUED* (bead accepted by intake, awaiting dispatch) -> *DISPATCHED* (worker or pipeline running, no PR yet) -> *ATTESTED* (PR open).
+    *   *ATTESTED* (all 7 gates green; readiness posted) -> *READY* — terminal on the automated path; the daemon stops driving (added r3.1 so "stops driving" is a mechanized state, not a behavior note).
     *   *ATTESTED* (on PR rejection + cooldown) -> *RE_ROLL*
     *   *RE_ROLL* (on abort) -> *ATTESTED*
     *   *RE_ROLL* (on success) -> *RECOVERY*
