@@ -1,4 +1,5 @@
 # Beads Project Configuration
-# issue_prefix: dark-factory
+issue_prefix: jleechan
+sync-branch: beads-sync
 # default_priority: 2
 # default_type: task
