@@ -287,7 +287,10 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 /// yet in Stage 1 (no `Vcs`/`Scm` method returns a diff LOC count in the
 /// traits this task is scoped to) — `non_test_changed_loc` defaults to `0`,
 /// which is honestly "floor not exceeded" rather than a guessed pass; wiring a
-/// real LOC count is a follow-up, not silently faked here.
+/// real LOC count is a follow-up, not silently faked here. Likewise Stage 1
+/// has no wired `/er` runner yet, so `er_verdict` is honestly `Absent` (gate 6
+/// -> `Unknown`, never a guessed `Pass`) until a real `/er` invocation is
+/// wired in (bead jleechan-3rf, verifier.rs `evidence_floor_gate`).
 fn skeptic_evidence(llm: &dyn Llm, bead_id: &str, pr: u64) -> Result<PrEvidence, DaemonError> {
     let prompt = format!(
         "You are the Stage-1 Skeptic gate for an autonomous coding factory.\n\
@@ -301,6 +304,7 @@ fn skeptic_evidence(llm: &dyn Llm, bead_id: &str, pr: u64) -> Result<PrEvidence,
     Ok(PrEvidence {
         non_test_changed_loc: 0,
         has_integration_evidence_marker: false,
+        er_verdict: verifier::ErVerdict::Absent,
         skeptic_verdict,
     })
 }

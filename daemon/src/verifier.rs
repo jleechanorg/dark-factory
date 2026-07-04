@@ -96,6 +96,19 @@ pub fn parse_skeptic_verdict(raw: &str) -> Option<SkepticVerdict> {
     }
 }
 
+/// Gate 6's `/er` (evidence review) verdict grammar (spec §4.2.5: "gate 6 =
+/// '/er returns PASS'"). `Absent` is the honest default when no `/er` run has
+/// been recorded yet — it is deliberately distinct from `Fail` so callers
+/// never treat "no evidence review happened" as a free pass, matching the
+/// `Unknown` vs `Red` discipline used elsewhere in this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ErVerdict {
+    Pass,
+    Fail,
+    #[default]
+    Absent,
+}
+
 /// `verifier`-local input for the two gates `PrSnapshot` doesn't cover: the
 /// evidence floor (gate 6) and the Skeptic review (gate 7). See the module
 /// doc comment for why these live here instead of on `tools::PrSnapshot`.
@@ -106,13 +119,36 @@ pub struct PrEvidence {
     /// Whether the PR body/comments carry an integration-evidence marker
     /// (Layer-2+ proof, not unit-only) for diffs over the LOC floor.
     pub has_integration_evidence_marker: bool,
+    /// The `/er` (evidence review) verdict (spec §4.2.5 gate 6). This is the
+    /// PRIMARY gate-6 signal — the LOC floor below is an ADDITIONAL floor on
+    /// top of it, not a substitute for it (hardening sweep P1, bead
+    /// jleechan-3rf: gate 6 must be "`/er` returns PASS", not just the LOC
+    /// floor). Defaults to `Absent` when no `/er` run is recorded.
+    pub er_verdict: ErVerdict,
     /// Recorded verdict for gate 7, already parsed by `parse_skeptic_verdict`
     /// (or produced directly by an `Llm` adversarial call under Stage 1).
     /// `None` means no verdict is available yet (gate 7 -> `Unknown`).
     pub skeptic_verdict: Option<SkepticVerdict>,
 }
 
+/// Gate 6 (spec §4.2.5): green only when `/er` returned `Pass` AND the
+/// non-test-LOC floor also passes (integration-evidence marker present above
+/// the floor). An absent `/er` verdict is `Unknown` — we cannot say the
+/// evidence is bad, only that no evidence review has been recorded yet — and
+/// an explicit `/er` `Fail` is `Red`, naming the failed gate. Both must clear
+/// before the LOC floor is even consulted, since a passing LOC floor never
+/// substitutes for a missing/failing `/er` run.
 fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
+    match evidence.er_verdict {
+        ErVerdict::Absent => {
+            return GateResult::Unknown("no /er verdict recorded".to_string());
+        }
+        ErVerdict::Fail => {
+            return GateResult::Red("/er verdict is FAIL".to_string());
+        }
+        ErVerdict::Pass => {}
+    }
+
     if evidence.non_test_changed_loc <= EVIDENCE_FLOOR_LOC {
         return GateResult::Green;
     }
@@ -287,6 +323,7 @@ mod tests {
         PrEvidence {
             non_test_changed_loc: 10,
             has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
         }
     }
@@ -380,6 +417,7 @@ mod tests {
         let evidence = PrEvidence {
             non_test_changed_loc: 150,
             has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
         };
 
@@ -400,6 +438,7 @@ mod tests {
         let evidence = PrEvidence {
             non_test_changed_loc: 150,
             has_integration_evidence_marker: true,
+            er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
         };
 
@@ -417,6 +456,7 @@ mod tests {
         let evidence = PrEvidence {
             non_test_changed_loc: 100, // exactly at the floor, not over it
             has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
         };
 
@@ -434,6 +474,7 @@ mod tests {
         let evidence = PrEvidence {
             non_test_changed_loc: 10,
             has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Fail("wrong fix".into())),
         };
 
@@ -454,6 +495,7 @@ mod tests {
         let evidence = PrEvidence {
             non_test_changed_loc: 10,
             has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Warn("minor nit".into())),
         };
 
@@ -471,6 +513,7 @@ mod tests {
         let evidence = PrEvidence {
             non_test_changed_loc: 10,
             has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Pass,
             skeptic_verdict: None,
         };
 
@@ -497,5 +540,159 @@ mod tests {
         );
         assert_eq!(parse_skeptic_verdict("maybe?"), None);
         assert_eq!(parse_skeptic_verdict(""), None);
+    }
+
+    // --- Gate 6 (evidence review) hardening: bead jleechan-3rf ---
+    // Spec §4.2.5: gate 6 = "/er returns PASS"; the LOC floor is an
+    // ADDITIONAL floor on top of that, never a substitute for it. These
+    // cases cross er_verdict (Pass/Fail/Absent) with the LOC floor
+    // (under/over) to pin down that gate 6 is green ONLY when both hold.
+
+    #[test]
+    fn er_absent_is_unknown_even_when_loc_floor_passes() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            non_test_changed_loc: 10, // well under the floor
+            has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Absent,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+        };
+
+        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+
+        assert!(!report.all_green);
+        assert!(
+            matches!(
+                gate(&report, GateName::EvidenceFloor),
+                GateResult::Unknown(_)
+            ),
+            "absent /er verdict must be Unknown, not a free pass: {:?}",
+            gate(&report, GateName::EvidenceFloor)
+        );
+    }
+
+    #[test]
+    fn er_fail_is_red_even_when_loc_floor_passes() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            non_test_changed_loc: 10, // well under the floor
+            has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Fail,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+        };
+
+        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+
+        assert!(!report.all_green);
+        match gate(&report, GateName::EvidenceFloor) {
+            GateResult::Red(reason) => assert_eq!(reason, "/er verdict is FAIL"),
+            other => panic!("expected Red(\"/er verdict is FAIL\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn er_pass_with_small_diff_is_green() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            non_test_changed_loc: 10,
+            has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+        };
+
+        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+
+        assert!(gate(&report, GateName::EvidenceFloor).is_green());
+        assert!(report.all_green);
+    }
+
+    #[test]
+    fn er_pass_with_large_diff_and_no_evidence_marker_is_still_red() {
+        // /er PASS alone does not waive the LOC floor: both must hold.
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            non_test_changed_loc: 150,
+            has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+        };
+
+        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+
+        assert!(!report.all_green);
+        match gate(&report, GateName::EvidenceFloor) {
+            GateResult::Red(reason) => assert_eq!(reason, "evidence floor"),
+            other => panic!("expected Red(\"evidence floor\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn er_pass_with_large_diff_and_evidence_marker_is_green() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            non_test_changed_loc: 150,
+            has_integration_evidence_marker: true,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+        };
+
+        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+
+        assert!(gate(&report, GateName::EvidenceFloor).is_green());
+        assert!(report.all_green);
+    }
+
+    #[test]
+    fn er_absent_with_large_diff_and_evidence_marker_is_still_unknown() {
+        // Even a passing LOC floor (marker present) never upgrades an
+        // absent /er verdict to green — absent stays Unknown.
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            non_test_changed_loc: 150,
+            has_integration_evidence_marker: true,
+            er_verdict: ErVerdict::Absent,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+        };
+
+        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+
+        assert!(!report.all_green);
+        assert!(matches!(
+            gate(&report, GateName::EvidenceFloor),
+            GateResult::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn er_fail_with_large_diff_and_evidence_marker_is_still_red() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            non_test_changed_loc: 150,
+            has_integration_evidence_marker: true,
+            er_verdict: ErVerdict::Fail,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+        };
+
+        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+
+        assert!(!report.all_green);
+        match gate(&report, GateName::EvidenceFloor) {
+            GateResult::Red(reason) => assert_eq!(reason, "/er verdict is FAIL"),
+            other => panic!("expected Red(\"/er verdict is FAIL\"), got {other:?}"),
+        }
     }
 }

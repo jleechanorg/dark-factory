@@ -10,7 +10,17 @@
 // "appears" (scripted onto the overlay + `PrSnapshot`) -> verifier reports
 // all-green. `run_tick` is driven twice: tick 0 does intake+route+dispatch,
 // tick 1 (fast tier always runs; slow tier is due again since our ratio
-// forces it) promotes DISPATCHED->ATTESTED and assesses the gates to READY.
+// forces it) promotes DISPATCHED->ATTESTED and assesses the gates.
+//
+// Gate 6 note (bead jleechan-3rf hardening): gate 6 is now "`/er` returns
+// PASS" (spec §4.2.5 item 6), not just the LOC floor. Stage 1's
+// `tick::skeptic_evidence` has no wired `/er` data source yet (only the
+// Skeptic's `pass|warn|fail` judge call is wired) so it honestly reports
+// `ErVerdict::Absent`, which makes gate 6 `Unknown` rather than a guessed
+// `Green`. That means this all-other-gates-green scenario parks
+// HUMAN_HELD instead of reaching READY — an honest reflection of the real
+// gap (wiring a real `/er` invocation into Stage 1 is tracked separately),
+// not a regression in this test's scenario.
 mod common;
 
 use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker};
@@ -143,10 +153,19 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
         summary2.gates_assessed, 1,
         "the ATTESTED bead should be gate-assessed this tick"
     );
-    assert_eq!(summary2.beads_ready, 1, "an all-green PR should reach READY");
+    // Gate 6 (evidence review) is `Unknown` in this scenario: Stage 1's
+    // `skeptic_evidence` has no wired `/er` source yet, so `er_verdict`
+    // honestly defaults to `Absent` rather than a guessed `Pass`. An
+    // `Unknown` gate forces `all_green=false` (same as a `Red` gate — see
+    // `verifier::GateReport` doc comment), so the bead parks HUMAN_HELD
+    // under the Stage-1 substitution rule instead of reaching READY.
     assert_eq!(
-        summary2.beads_parked_human_held, 0,
-        "an all-green PR must never be parked HUMAN_HELD"
+        summary2.beads_ready, 0,
+        "gate 6 (/er) is Unknown with no wired /er source, so this PR must not reach READY"
+    );
+    assert_eq!(
+        summary2.beads_parked_human_held, 1,
+        "an Unknown gate 6 must park the bead HUMAN_HELD, not silently pass it"
     );
 
     let final_overlay = store
@@ -155,8 +174,8 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
         .expect("overlay should still exist");
     assert_eq!(
         final_overlay.state,
-        OverlayState::Ready,
-        "final overlay state must be the terminal READY state"
+        OverlayState::HumanHeld,
+        "final overlay state must be HUMAN_HELD while gate 6 (/er) is Unknown"
     );
 
     // --- Telemetry: >=5 events in schema order, real JSONL on disk ---
@@ -175,13 +194,18 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
         .iter()
         .map(|e| e["eventType"].as_str().unwrap().to_string())
         .collect();
+    // Gate 6 (/er) is Unknown in this scenario (no wired /er source — see the
+    // module doc comment above), so the Stage-1 substitution rule fires:
+    // `REROLL_VERDICT_RECORDED` + `PARKED_HUMAN_HELD` instead of
+    // `READY_FOR_MERGE`.
     for required in [
         "INTAKE_BEAD_CREATED",
         "TASK_ROUTED",
         "TASK_DISPATCHED",
         "PR_OPENED",
         "GATE_ASSESSMENT",
-        "READY_FOR_MERGE",
+        "REROLL_VERDICT_RECORDED",
+        "PARKED_HUMAN_HELD",
         "TICK",
     ] {
         assert!(
@@ -189,13 +213,17 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
             "expected a {required} telemetry event, got: {event_types:?}"
         );
     }
+    assert!(
+        !event_types.iter().any(|e| e == "READY_FOR_MERGE"),
+        "gate 6 (/er) is Unknown, so READY_FOR_MERGE must never be emitted: {event_types:?}"
+    );
 
     // Schema order (plan Task 10 Step 1: ">=5 schema-ordered events"): the
     // lifecycle events must appear in causal order, not merely be present. The
     // first-occurrence index of each stage must strictly increase — a bead is
     // created before it is routed, routed before dispatched, its PR opens
-    // before the gates are assessed, and it is only marked ready-for-merge
-    // after assessment. Asserting first-occurrence indices (rather than exact
+    // before the gates are assessed, and it is only parked HUMAN_HELD after
+    // assessment. Asserting first-occurrence indices (rather than exact
     // adjacency) keeps the check robust to the interleaved `TICK` summary event
     // while still failing loudly if the pipeline ever emits out of order.
     let first_index = |needle: &str| -> usize {
@@ -210,7 +238,8 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
         "TASK_DISPATCHED",
         "PR_OPENED",
         "GATE_ASSESSMENT",
-        "READY_FOR_MERGE",
+        "REROLL_VERDICT_RECORDED",
+        "PARKED_HUMAN_HELD",
     ];
     for pair in ordered.windows(2) {
         assert!(
