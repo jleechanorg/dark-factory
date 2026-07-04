@@ -19,7 +19,14 @@ MAX_WALL="${3:-14400}"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG_DIR="$HOME/Library/Logs/dark-factory"
 LOG="$LOG_DIR/factory-lite-$ROLE.log"
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" "$HOME/.dark-factory"
+
+# single-instance guard: exactly one loop per role (prevents capacity TOCTOU races)
+exec 9>"$HOME/.dark-factory/factory-lite-$ROLE.lock"
+if ! flock -n 9; then
+  echo "another factory-lite-$ROLE loop is already running — refusing to start" >&2
+  exit 3
+fi
 
 PROMPT="Invoke the factory-lite-$ROLE skill with the Skill tool and execute exactly one tick, then stop. Follow the skill and .claude/skills/factory-lite/CONTRACT.md exactly — especially every NEVER rule."
 
@@ -35,9 +42,11 @@ while :; do
   echo "[$(date -u +%FT%TZ)] tick begin" >> "$LOG"
   # per-tick timeout = 90% of interval or 20m, whichever is larger
   TICK_TIMEOUT=$(( INTERVAL * 9 / 10 > 1200 ? INTERVAL * 9 / 10 : 1200 ))
-  if ! ( cd "$REPO_DIR" && timeout "$TICK_TIMEOUT" \
-        claude -p --dangerously-skip-permissions "$PROMPT" ) >> "$LOG" 2>&1; then
-    echo "[$(date -u +%FT%TZ)] tick FAILED (rc=$?) — continuing to next tick" >> "$LOG"
+  rc=0
+  ( cd "$REPO_DIR" && timeout "$TICK_TIMEOUT" \
+        claude -p --dangerously-skip-permissions "$PROMPT" ) >> "$LOG" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "[$(date -u +%FT%TZ)] tick FAILED (rc=$rc) — continuing to next tick" >> "$LOG"
   fi
   echo "[$(date -u +%FT%TZ)] tick end — sleeping ${INTERVAL}s" >> "$LOG"
   sleep "$INTERVAL"

@@ -93,6 +93,24 @@ if [[ -d "${REPO_ROOT}/.githooks" ]]; then
   fi
 fi
 
+# Install the bead-JSONL auto-sorter pre-commit hook — root-cause fix
+# for the +1686/-1685 noise pattern (worldai PR #7848 et al.). Defense in
+# depth on top of the CI guard in tests/test_bead_jsonl_sort.py.
+#
+# Conditional: skips when scripts/install-beads-hook.sh is absent
+# (older clones without the bead machinery) or when .beads/ is absent
+# (repo without an initialized br workspace). Both checks are
+# independent: a fresh fork with .beads/ but no scripts/ still no-ops,
+# and a fresh clone with scripts/ but no .beads/ also no-ops.
+#
+# Idempotent: the installer overwrites .git/hooks/pre-commit on every
+# install.sh run, so re-running after a feat/bead-sort-root-cause
+# update picks up the latest hook version.
+if [[ -f "${REPO_ROOT}/scripts/install-beads-hook.sh" && -d "${REPO_ROOT}/.beads" ]]; then
+  echo "==> Installing bead-JSONL sort pre-commit hook"
+  bash "${REPO_ROOT}/scripts/install-beads-hook.sh"
+fi
+
 chmod +x "${BIN_DIR}/dark-factory" "${BIN_DIR}/df-healer" "${BIN_DIR}/df-validate"
 
 if [[ "${LINK}" -eq 1 ]]; then

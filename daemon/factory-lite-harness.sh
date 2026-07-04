@@ -22,7 +22,7 @@ cfg() { # cfg <key> — naive toml scalar read (deterministic; lite-only)
 sql() { sqlite3 "$DB" "$@"; }
 q() { printf '%s' "$1" | sed "s/'/''/g"; }  # sqlite string escape
 
-VALID_STATES="QUEUED DISPATCHED ATTESTED RE_ROLL RECOVERY REDISPATCHED BUDGET_HELD HUMAN_HELD"
+VALID_STATES="QUEUED DISPATCHED ATTESTED READY RE_ROLL RECOVERY REDISPATCHED BUDGET_HELD HUMAN_HELD"
 valid_state() { case " $VALID_STATES " in *" $1 "*) ;; *) die "invalid state: $1";; esac; }
 
 now() { date -u +%FT%TZ; }
@@ -140,13 +140,15 @@ PY
 
 prev-gate-assessment) # prev-gate-assessment <pr_number> — prints previous (second-to-last) assessment or empty
   [ $# -eq 2 ] || die "usage: prev-gate-assessment <pr_number>"
-  grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep "\"pr_number\": *$2" | tail -2 | head -1 || true
+  grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$2[,}]" | tail -2 | head -1 || true
   ;;
 
-ready) # ready <bead_id> <pr_number>
+ready) # ready <bead_id> <pr_number> — terminal transition; verifier stops driving this bead
   [ $# -eq 3 ] || die "usage: ready <bead_id> <pr_number>"
+  [[ "$3" =~ ^[0-9]+$ ]] || die "pr_number must be numeric"
   require_state "$2" ATTESTED
-  emit "$2" "$(get_field "$2" attempt)" ATTESTED READY_FOR_MERGE '{}' "{\"pr_number\":$3}"
+  sql "UPDATE bead_overlay SET state='READY', updated_at='$(now)' WHERE bead_id='$(q "$2")';"
+  emit "$2" "$(get_field "$2" attempt)" READY READY_FOR_MERGE '{}' "{\"pr_number\":$3}"
   echo "ok"
   ;;
 
