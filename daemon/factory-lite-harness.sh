@@ -134,8 +134,14 @@ assert set(g) == keys, f"gate keys must be exactly {sorted(keys)}"
 assert all(v in ("green","red","unknown") for v in g.values()), "gate values must be green|red|unknown"
 PY
   all_green="$(python3 -c 'import json,sys; g=json.loads(sys.argv[1]); print("true" if all(v=="green" for v in g.values()) else "false")' "$4")"
+  # cooldown decision is the HARNESS's call, not the LLM's: ready iff the most
+  # recent PRIOR assessment for this PR (before this emit) was also not-all-green
+  prior_last="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$3[,}]" | tail -1 || true)"
+  cooldown="false"
+  if [ -n "$prior_last" ] && printf '%s' "$prior_last" | grep -q '"all_green": false'; then cooldown="true"; fi
   emit "$2" "$(get_field "$2" attempt)" ATTESTED GATE_ASSESSMENT '{}' "{\"pr_number\":$3,\"gates\":$4,\"all_green\":$all_green}"
   echo "$all_green"
+  echo "cooldown_ready=$cooldown"
   ;;
 
 prev-gate-assessment) # prev-gate-assessment <pr_number> — prints previous (second-to-last) assessment or empty
