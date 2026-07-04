@@ -241,3 +241,18 @@ pressure overrides them.
 8. **Read-only on PRs in Stage 1.** The verifier skill never pushes commits,
    never closes PRs, never edits existing review threads — it only reads PR
    state and posts new comments (readiness summary).
+
+---
+
+## §7 Harness supremacy (added 2026-07-03 per /advice Round: Opus mitigation)
+
+All binding mutations — CXDB writes, state transitions, cap enforcement,
+telemetry emission — MUST go through `daemon/factory-lite-harness.sh`
+(subcommands: init, intake-upsert, route-record, capacity, dispatch-record,
+pr-opened, autonomy-tick, gate-assessment, prev-gate-assessment, ready,
+reroll-verdict, park, tick-summary, list). The sqlite3/telemetry one-liners in
+§3-§4 above are the REFERENCE SPEC of what the harness does internally — skills
+must NOT run them directly. The LLM supplies only typed judgment verdicts
+(routing, gate values, reroll verdicts) as harness arguments; the harness
+validates every enum and refuses illegal transitions. This keeps the telemetry
+and CXDB deterministic — they are the data the Rust daemon inherits.
