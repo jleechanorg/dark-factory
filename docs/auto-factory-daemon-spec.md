@@ -54,6 +54,7 @@ The Auto-Factory Daemon automates the **backward-recovery path** in Level-5 auto
 
 ### 3.1 SCM and State Data Flow
 
+```text
 [GitHub Issue (label: factory)]
               │  (pre-poll Intake Normalizer: issue → bead, idempotent;
               │   bead ID posted back to issue)
@@ -99,6 +100,7 @@ direct           then /f (full gated pipeline) unless waived by routing verdict
  watch      vs re-roll]                 [HUMAN_HELD + Healer report]
               ▼ (re-roll-worthy)
              [Re-Roll Engine]
+```
 
 ### 3.2 Mermaid State Machine Diagram
 
