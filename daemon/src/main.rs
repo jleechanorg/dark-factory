@@ -1,3 +1,6 @@
+mod config;
+mod errors;
+
 fn main() {
     println!("auto-factory daemon (stage 1)");
 }
