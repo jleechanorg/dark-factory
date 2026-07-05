@@ -152,10 +152,65 @@ fn find_marker_verdict(raw: &str) -> Option<SkepticVerdict> {
 ///      original standalone-token behavior: the whole input is treated as
 ///      `<token> [rest...]`.
 pub fn parse_skeptic_verdict(raw: &str) -> Option<SkepticVerdict> {
-    if let Some(verdict) = find_marker_verdict(raw) {
-        return Some(verdict);
+    let mut current_subsystem = None;
+    let mut gate7_verdict = None;
+    let mut gha_verdict = None;
+    let mut signoff_verdict = None;
+
+    for line in raw.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("subsystem: gate-7") || lower.contains("subsystem: llm") {
+            current_subsystem = Some("gate-7");
+            continue;
+        } else if lower.contains("subsystem: gha") || lower.contains("subsystem: workflow") {
+            current_subsystem = Some("gha");
+            continue;
+        } else if lower.contains("subsystem: sign-off") || lower.contains("subsystem: review") {
+            current_subsystem = Some("sign-off");
+            continue;
+        }
+
+        if let Some(verdict) = find_marker_verdict(line).or_else(|| token_to_verdict(line)) {
+            match current_subsystem {
+                Some("gate-7") => gate7_verdict = Some(verdict),
+                Some("gha") => gha_verdict = Some(verdict),
+                Some("sign-off") => signoff_verdict = Some(verdict),
+                _ => {
+                    // Fallback: if no subsystem was specified, default to gate-7
+                    gate7_verdict = Some(verdict);
+                }
+            }
+        }
     }
-    token_to_verdict(raw)
+
+    if gate7_verdict.is_some() && gha_verdict.is_none() && signoff_verdict.is_none() {
+        if !raw.to_ascii_lowercase().contains("subsystem:") {
+            return gate7_verdict;
+        }
+    }
+
+    let v_g7 = gate7_verdict?;
+    let v_gha = gha_verdict?;
+    let v_so = signoff_verdict?;
+
+    let mut fails = Vec::new();
+    let mut warns = Vec::new();
+
+    for v in &[v_g7, v_gha, v_so] {
+        match v {
+            SkepticVerdict::Fail(reason) => fails.push(reason.clone()),
+            SkepticVerdict::Warn(note) => warns.push(note.clone()),
+            _ => {}
+        }
+    }
+
+    if !fails.is_empty() {
+        Some(SkepticVerdict::Fail(fails.join("; ")))
+    } else if !warns.is_empty() {
+        Some(SkepticVerdict::Warn(warns.join("; ")))
+    } else {
+        Some(SkepticVerdict::Pass)
+    }
 }
 
 /// `verifier`-local input for the two gates `PrSnapshot` doesn't cover: the
@@ -978,6 +1033,29 @@ mod tests {
 
         let msg = "fail\nMore context.\nVerdict: PASS\nFooter mentions fail again.\n";
         assert_eq!(parse_skeptic_verdict(msg), Some(SkepticVerdict::Pass));
+    }
+
+    #[test]
+    fn parse_skeptic_verdict_three_subsystems() {
+        // All three present and green
+        let msg = "subsystem: gate-7\nverdict: pass\n\
+                   subsystem: gha\nverdict: pass\n\
+                   subsystem: sign-off\nverdict: pass\n";
+        assert_eq!(parse_skeptic_verdict(msg), Some(SkepticVerdict::Pass));
+
+        // One fails -> overall fail
+        let msg = "subsystem: gate-7\nverdict: pass\n\
+                   subsystem: gha\nverdict: fail (compile error)\n\
+                   subsystem: sign-off\nverdict: pass\n";
+        assert_eq!(
+            parse_skeptic_verdict(msg),
+            Some(SkepticVerdict::Fail("(compile error)".into()))
+        );
+
+        // One missing -> overall None (unknown)
+        let msg = "subsystem: gate-7\nverdict: pass\n\
+                   subsystem: sign-off\nverdict: pass\n";
+        assert_eq!(parse_skeptic_verdict(msg), None);
     }
 
     #[test]

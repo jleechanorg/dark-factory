@@ -724,10 +724,11 @@ impl Scm for CliScm {
         struct GhCheck {
             state: String,
             bucket: String,
+            name: String,
         }
         let checks_out = match run_tool(
             "gh",
-            &["pr", "checks", &pr_str, "--repo", &self.repo, "--json", "state,bucket"],
+            &["pr", "checks", &pr_str, "--repo", &self.repo, "--json", "state,bucket,name"],
             30,
         ) {
             Ok(out) => out,
@@ -745,11 +746,12 @@ impl Scm for CliScm {
                 }
                 #[derive(serde::Deserialize)]
                 struct RestCheckRun {
+                    name: String,
                     status: String,
                     conclusion: Option<String>,
                 }
                 let rest_cr: RestCheckRuns = serde_json::from_str(&cr_json).unwrap_or(RestCheckRuns { check_runs: vec![] });
-                
+
                 let legacy_checks: Vec<GhCheck> = rest_cr.check_runs.into_iter().map(|cr| {
                     let (state, bucket) = if cr.status == "completed" {
                         match cr.conclusion.as_deref() {
@@ -760,7 +762,7 @@ impl Scm for CliScm {
                     } else {
                         ("PENDING".to_string(), "pending".to_string())
                     };
-                    GhCheck { state, bucket }
+                    GhCheck { state, bucket, name: cr.name }
                 }).collect();
                 serde_json::to_string(&legacy_checks).unwrap_or_else(|_| "[]".to_string())
             }
@@ -835,10 +837,26 @@ impl Scm for CliScm {
         )?;
         let unresolved_thread_count = unresolved_thread_count_from_gql(&gql_out)?;
 
-        let pr_comments = view.comments.into_iter().map(|c| crate::tools::PrComment {
+        let mut pr_comments: Vec<crate::tools::PrComment> = view.comments.into_iter().map(|c| crate::tools::PrComment {
             author: c.author.login,
             body: c.body,
         }).collect();
+
+        for c in &checks {
+            if c.name.to_lowercase().contains("skeptic") {
+                if c.bucket == "pass" || c.state == "SUCCESS" {
+                    pr_comments.push(crate::tools::PrComment {
+                        author: "github-actions".to_string(),
+                        body: "skeptic check run: verdict: pass".to_string(),
+                    });
+                } else if c.bucket == "fail" || c.state == "FAILURE" {
+                    pr_comments.push(crate::tools::PrComment {
+                        author: "github-actions".to_string(),
+                        body: "skeptic check run: verdict: fail".to_string(),
+                    });
+                }
+            }
+        }
 
         let pr_files = view.files.into_iter().map(|f| crate::tools::PrFile {
             path: f.path,
@@ -974,29 +992,8 @@ impl CliSessions {
             agent: agent.to_string(),
         }
     }
-}
 
-impl Sessions for CliSessions {
-    fn active_count(&self) -> Result<usize, DaemonError> {
-        let out = run_tool("ao", &["status", "--json"], 30)?;
-        let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
-        let mut count = 0;
-        if let Some(arr) = data.as_array() {
-            for entry in arr {
-                if let Some(activity) = entry.get("activity").and_then(|v| v.as_str()) {
-                    if activity != "exited" && activity != "missing" {
-                        count += 1;
-                    }
-                }
-            }
-        }
-        Ok(count)
-    }
-
-    fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+    fn run_spawn_process(&self, agent: &str, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
         let home = std::env::var("HOME").unwrap_or_default();
         let holdouts = std::env::var("DARK_FACTORY_HOLDOUTS")
             .unwrap_or_else(|_| format!("{}/projects/dark-factory-holdouts", home));
@@ -1021,7 +1018,7 @@ impl Sessions for CliSessions {
             .arg("--project")
             .arg(&self.project)
             .arg("--agent")
-            .arg(&self.agent)
+            .arg(agent)
             .arg("--name")
             .arg(display_name)
             .arg("--branch")
@@ -1060,7 +1057,7 @@ impl Sessions for CliSessions {
             }
             let err_msg = String::from_utf8_lossy(&stderr_buf);
             return Err(DaemonError::Tool {
-                tool: "ao spawn".to_string(),
+                tool: format!("ao spawn --agent {agent}"),
                 rc: status.code().unwrap_or(-1),
                 stderr: err_msg.into_owned(),
             });
@@ -1082,9 +1079,191 @@ impl Sessions for CliSessions {
             Ok(SessionId(name))
         } else {
             Err(DaemonError::Parse(format!(
-                "ao spawn produced no session name: {out}"
+                "ao spawn --agent {agent} produced no SESSION= line: {out}"
             )))
         }
+    }
+
+    fn spawn_with_fallback(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+        let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
+            .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
+        
+        let mut fallback_agents = Vec::new();
+        fallback_agents.push(self.agent.clone());
+        for part in fallback_str.split("->") {
+            let part_trimmed = part.trim().to_string();
+            let mapped_agent = if part_trimmed == "aow" {
+                "minimax".to_string()
+            } else {
+                part_trimmed
+            };
+            if !mapped_agent.is_empty() && !fallback_agents.contains(&mapped_agent) {
+                fallback_agents.push(mapped_agent);
+            }
+        }
+
+        let mut last_err = None;
+        for agent in &fallback_agents {
+            match self.run_spawn_process(agent, spec) {
+                Ok(sess) => return Ok(sess),
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            DaemonError::Config("No agents in fallback chain could be run".into())
+        }))
+    }
+}
+
+impl Sessions for CliSessions {
+    fn active_count(&self) -> Result<usize, DaemonError> {
+        let out = run_tool("ao", &["status", "--json"], 30)?;
+        let json_start = out.find('[').unwrap_or(0);
+        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse ao status: {e}"))
+        })?;
+        let mut count = 0;
+        if let Some(arr) = data.as_array() {
+            for entry in arr {
+                if let Some(activity) = entry.get("activity").and_then(|v| v.as_str()) {
+                    if activity != "exited" && activity != "missing" {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+        self.spawn_with_fallback(spec)
+    }
+
+    fn spawn_batch(&self, specs: &[SpawnSpec]) -> Result<Vec<SessionId>, DaemonError> {
+        let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
+            .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
+        
+        let mut fallback_agents = Vec::new();
+        fallback_agents.push(self.agent.clone());
+        for part in fallback_str.split("->") {
+            let part_trimmed = part.trim().to_string();
+            let mapped_agent = if part_trimmed == "aow" {
+                "minimax".to_string()
+            } else {
+                part_trimmed
+            };
+            if !mapped_agent.is_empty() && !fallback_agents.contains(&mapped_agent) {
+                fallback_agents.push(mapped_agent);
+            }
+        }
+
+        let mut results = vec![None; specs.len()];
+        let mut active_indices: Vec<usize> = (0..specs.len()).collect();
+
+        for agent in &fallback_agents {
+            if active_indices.is_empty() {
+                break;
+            }
+
+            let mut children = Vec::new();
+            for &idx in &active_indices {
+                let spec = &specs[idx];
+                let home = std::env::var("HOME").unwrap_or_default();
+                let holdouts = std::env::var("DARK_FACTORY_HOLDOUTS")
+                    .unwrap_or_else(|_| format!("{}/projects/dark-factory-holdouts", home));
+                let profile = format!(
+                    "(version 1)\n(allow default)\n(deny file-read* (subpath \"{}\"))\n(deny file-write* (subpath \"{}\"))\n",
+                    holdouts, holdouts
+                );
+
+                let mut cmd = if std::env::consts::OS == "macos" {
+                    let mut c = Command::new("sandbox-exec");
+                    c.arg("-p").arg(&profile);
+                    c.arg("ao");
+                    c
+                } else {
+                    Command::new("ao")
+                };
+                cmd.arg("spawn")
+                    .arg("--prompt")
+                    .arg(&spec.prompt)
+                    .arg("--project")
+                    .arg(&self.project)
+                    .arg("--agent")
+                    .arg(agent)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+
+                for (k, _) in std::env::vars() {
+                    if k == "DARK_FACTORY_HOLDOUTS" || k.to_uppercase().contains("HOLDOUT") {
+                        cmd.env_remove(k);
+                    }
+                }
+
+                match cmd.spawn() {
+                    Ok(child) => {
+                        children.push((idx, child, agent.clone()));
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            let mut next_active_indices = Vec::new();
+            for (idx, mut child, _ag) in children {
+                let status = match child.wait() {
+                    Ok(st) => st,
+                    Err(_) => {
+                        next_active_indices.push(idx);
+                        continue;
+                    }
+                };
+
+                let mut stdout_buf = Vec::new();
+                if let Some(mut stdout) = child.stdout {
+                    let _ = stdout.read_to_end(&mut stdout_buf);
+                }
+                let out = String::from_utf8_lossy(&stdout_buf);
+
+                if !status.success() {
+                    next_active_indices.push(idx);
+                    continue;
+                }
+
+                let mut sess_name = None;
+                for line in out.lines() {
+                    if line.starts_with("SESSION=") {
+                        sess_name = Some(line.split('=').nth(1).unwrap_or("").trim().to_string());
+                    }
+                }
+
+                if let Some(name) = sess_name {
+                    results[idx] = Some(SessionId(name));
+                } else {
+                    next_active_indices.push(idx);
+                }
+            }
+
+            active_indices = next_active_indices;
+        }
+
+        let mut final_ids = Vec::new();
+        for (idx, res) in results.into_iter().enumerate() {
+            match res {
+                Some(id) => final_ids.push(id),
+                None => {
+                    return Err(DaemonError::Tool {
+                        tool: "ao spawn batch".to_string(),
+                        rc: -1,
+                        stderr: format!("Failed to spawn session for spec prompt: {}", specs[idx].prompt),
+                    });
+                }
+            }
+        }
+
+        Ok(final_ids)
     }
 
     fn attach(&self, _branch: &str, _bead_id: &str) -> Result<SessionId, DaemonError> {

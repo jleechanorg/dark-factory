@@ -418,10 +418,12 @@ fn run(args: Args) -> Result<(), DaemonError> {
                 .unwrap_or(&cfg.target_repo)
                 .to_string()
         });
+        let default_agent = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT")
+            .unwrap_or_else(|_| "minimax".to_string());
         (
             Box::new(CliScm::new(cfg.target_repo.clone())),
             Box::new(CliTracker),
-            Box::new(CliSessions::new(&ao_project, "claude-code")),
+            Box::new(CliSessions::new(&ao_project, &default_agent)),
             Box::new(ChainLlm),
             Box::new(CliVcs),
         )

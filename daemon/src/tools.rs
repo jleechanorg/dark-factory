@@ -226,6 +226,13 @@ pub trait Sessions {
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError>;
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError>;
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError>;
+    fn spawn_batch(&self, specs: &[SpawnSpec]) -> Result<Vec<SessionId>, DaemonError> {
+        let mut ids = Vec::new();
+        for spec in specs {
+            ids.push(self.spawn(spec)?);
+        }
+        Ok(ids)
+    }
 }
 
 /// `git` CLI, always `git -C <workdir>`.
