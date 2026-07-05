@@ -261,3 +261,49 @@ def test_parallel_reviewer_one_shadow_real_fail_maps_to_failure_not_error(tmp_pa
     assert result.metadata["shadow_minimax_gate_outcome"] == "failure"
     assert result.outcome == "failure"
     assert result.metadata.get("parallel_reviewer_outcome") == "failure"
+
+
+# ─── qw5 followup #158: primary_outcome='error' dominates to 'error' ─────────
+# Per IRONCLAD exit criterion on issue #158:
+# when the primary lane hits infra failure (rc!=0, sandbox error, timeout)
+# but every shadow returns 'success', the conservative merge must surface
+# 'error' (not 'failure') so the Healer routes correctly.
+
+def test_coalesce_parallel_outcome_primary_error_dominates():
+    """Issue #158: primary='error' + shadows=['success'] merges to 'error'."""
+    from runner.handler_parallel_reviewer import _coalesce_parallel_outcome
+    assert _coalesce_parallel_outcome("error", ["success"]) == "error", (
+        "primary_outcome='error' must dominate"
+    )
+    assert _coalesce_parallel_outcome("error", ["success", "success", "success"]) == "error", (
+        "primary_outcome='error' must dominate across N shadows"
+    )
+
+
+# ─── qw5 followup #159: DARK_FACTORY_SHADOW_BACKEND env var overlay ──────────
+# Per IRONCLAD exit criterion on issue #159:
+# when the env var is set to a known backend name, _launch_shadow_gate_review
+# uses that backend instead of the default "codex". Default behavior is
+# unchanged when the env var is unset or has an unknown value.
+
+def test_dark_factory_shadow_backend_env_var_routes_to_minimax(monkeypatch):
+    """Issue #159: DARK_FACTORY_SHADOW_BACKEND=minimax → claude CLI + minimax gateway."""
+    monkeypatch.setattr("runner.handler_parallel_reviewer._shadow_codex_review_enabled", lambda ctx: True)
+    monkeypatch.setenv("DARK_FACTORY_SHADOW_BACKEND", "minimax")
+    from runner import handler_dispatch as hd
+    assert hd._resolve_shadow_backend_env() == "minimax"
+
+
+def test_dark_factory_shadow_backend_env_var_default_is_codex(monkeypatch):
+    """Issue #159: unset / unknown / empty → codex (back-compat)."""
+    monkeypatch.delenv("DARK_FACTORY_SHADOW_BACKEND", raising=False)
+    from runner import handler_dispatch as hd
+    assert hd._resolve_shadow_backend_env() == "codex"
+    monkeypatch.setenv("DARK_FACTORY_SHADOW_BACKEND", "")
+    assert hd._resolve_shadow_backend_env() == "codex"
+    monkeypatch.setenv("DARK_FACTORY_SHADOW_BACKEND", "bogus-unknown-backend")
+    assert hd._resolve_shadow_backend_env() == "codex"
+    monkeypatch.setenv("DARK_FACTORY_SHADOW_BACKEND", "agy")
+    assert hd._resolve_shadow_backend_env() == "agy"
+    monkeypatch.setenv("DARK_FACTORY_SHADOW_BACKEND", "claude-sonnet")
+    assert hd._resolve_shadow_backend_env() == "claude-sonnet"

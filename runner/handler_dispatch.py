@@ -57,6 +57,22 @@ class _ShadowGateReview:
     backend: str = "codex"
 
 
+def _resolve_shadow_backend_env() -> str:
+    """Resolve the override shadow backend from DARK_FACTORY_SHADOW_BACKEND env var.
+
+    Ironclad #159: lets pilots launched from launchd/cron override the
+    shadow backend without patching the dot file. Validation: only known
+    backends (codex, minimax, agy, claude-sonnet, claude) are honored;
+    empty or unknown values fall back to ``codex``.
+    """
+    raw = os.environ.get("DARK_FACTORY_SHADOW_BACKEND", "").strip().lower()
+    if not raw:
+        return "codex"
+    if raw not in {"codex", "minimax", "agy", "claude-sonnet", "claude"}:
+        return "codex"
+    return raw
+
+
 def _shadow_gate_enabled(ctx: "Context") -> bool:
     raw = ctx.state.get("_df_shadow_codex_review", "false")
     if isinstance(raw, str):
@@ -130,7 +146,15 @@ def _launch_shadow_gate_review(
     :class:`_ShadowGateReview` even when launch fails — failures are recorded
     via ``launch_error`` so the caller can surface them as ``shadow_outcome``
     rather than masking them.
+
+    Ironclad #159: when the caller didn't override ``backend``
+    (still the default "codex"), honor the ``DARK_FACTORY_SHADOW_BACKEND``
+    env var so launchd/cron-launched pilots can override the shadow
+    backend without patching the dot file. Caller-specified non-default
+    backends always win.
     """
+    if backend == "codex":
+        backend = _resolve_shadow_backend_env()
     shadow_prompt = _shadow_gate_prompt(name, prompt, expected_sha, ctx)
     shadow = _ShadowGateReview(prompt=shadow_prompt, started_at=time.monotonic(), backend=backend)
     seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
