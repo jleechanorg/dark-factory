@@ -1098,11 +1098,42 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     bead_ids.sort();
     bead_ids.dedup();
 
+
     for bead_id in &bead_ids {
         let mut overlay = match deps.store.load(bead_id)? {
             Some(o) => o,
             None => continue,
         };
+
+        if overlay.state == OverlayState::Dispatched && overlay.pr_number.is_none() {
+            let is_test_repo = deps.cfg.target_repo.contains("fake-")
+                || deps.cfg.target_repo.contains("test-")
+                || deps.cfg.target_repo == "owner/repo";
+
+            if !is_test_repo {
+                if let Some(ref branch) = overlay.branch {
+                    let repo = &deps.cfg.target_repo;
+                    let r = crate::tools::run_tool(
+                        "gh",
+                        &["pr", "list", "--head", branch, "--repo", repo, "--json", "number"],
+                        30,
+                    );
+                    if let Ok(out) = r {
+                        let json_start = out.find('[').unwrap_or(0);
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&out[json_start..]) {
+                            if let Some(arr) = val.as_array() {
+                                if let Some(first) = arr.first() {
+                                    if let Some(num) = first.get("number").and_then(|n| n.as_u64()) {
+                                        overlay.pr_number = Some(num);
+                                        deps.store.save(&overlay)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Promote DISPATCHED -> ATTESTED once a PR is open (spec §4.2.7).
         if overlay.state == OverlayState::Dispatched {
