@@ -968,13 +968,13 @@ fn skeptic_evidence(
         let body_lower = comment.body.to_ascii_lowercase();
         let author_lower = comment.author.to_ascii_lowercase();
 
-        if author_lower.contains("github-actions") || author_lower.contains("gha") {
-            if body_lower.contains("skeptic") {
-                if body_lower.contains("verdict: pass") || body_lower.contains("verdict: success") || body_lower.contains("verdict: pass") {
-                    gha_verdict = "verdict: pass";
-                } else if body_lower.contains("verdict: fail") || body_lower.contains("verdict: failure") {
-                    gha_verdict = "verdict: fail";
-                }
+        if (author_lower.contains("github-actions") || author_lower.contains("gha"))
+            && body_lower.contains("skeptic")
+        {
+            if body_lower.contains("verdict: pass") || body_lower.contains("verdict: success") {
+                gha_verdict = "verdict: pass";
+            } else if body_lower.contains("verdict: fail") || body_lower.contains("verdict: failure") {
+                gha_verdict = "verdict: fail";
             }
         }
 

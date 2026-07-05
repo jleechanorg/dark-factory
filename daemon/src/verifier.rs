@@ -183,10 +183,10 @@ pub fn parse_skeptic_verdict(raw: &str) -> Option<SkepticVerdict> {
         }
     }
 
-    if gate7_verdict.is_some() && gha_verdict.is_none() && signoff_verdict.is_none() {
-        if !raw.to_ascii_lowercase().contains("subsystem:") {
-            return gate7_verdict;
-        }
+    if gate7_verdict.is_some() && gha_verdict.is_none() && signoff_verdict.is_none()
+        && !raw.to_ascii_lowercase().contains("subsystem:")
+    {
+        return gate7_verdict;
     }
 
     let v_g7 = gate7_verdict?;

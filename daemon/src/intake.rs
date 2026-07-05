@@ -59,17 +59,21 @@ pub fn normalize(
     cfg: &Config,
 ) -> Result<Vec<String>, DaemonError> {
     let issues = scm.labeled_issues(FACTORY_LABEL)?;
+    eprintln!("[intake] fetched issues: {:?}", issues);
     if issues.is_empty() {
         return Ok(Vec::new());
     }
 
     let known_refs = tracker.fetch_all_external_refs()?;
+    eprintln!("[intake] known external refs: {:?}", known_refs);
 
     let mut created = Vec::new();
 
     for issue in issues {
+        eprintln!("[intake] processing issue: {} - ref: {}", issue.number, issue.external_ref);
         // Idempotency: already-known external_ref -> skip silently, no create_bead call.
         if known_refs.contains(&issue.external_ref) {
+            eprintln!("[intake] issue already known via external ref: {}", issue.external_ref);
             continue;
         }
 
@@ -78,7 +82,9 @@ pub fn normalize(
         // itself is the audit trail the caller records via telemetry, keyed
         // on issue.external_ref + issue.author_login.
         let permission = scm.collaborator_permission(&issue.author_login)?;
+        eprintln!("[intake] author permission: {:?} for {}", permission, issue.author_login);
         if !permission.is_write_tier() {
+            eprintln!("[intake] skip: author not in write tier");
             continue;
         }
 
@@ -108,6 +114,7 @@ pub fn normalize(
                 return Err(e);
             }
         };
+        eprintln!("[intake] created bead: {}", bead_id);
 
         let comment_body = format!(
             "🤖 **[dark-factory]** Auto-factory has picked up this task. Created tracking bead `{}`. Spawning worker session...",

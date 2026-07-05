@@ -986,9 +986,10 @@ pub struct CliSessions {
 }
 
 impl CliSessions {
-    pub fn new(project: &str, agent: &str) -> Self {
+    pub fn new(repo: &str, agent: &str) -> Self {
+        let project = repo.split('/').next_back().unwrap_or(repo).to_string();
         Self {
-            project: project.to_string(),
+            project,
             agent: agent.to_string(),
         }
     }
@@ -1203,11 +1204,8 @@ impl Sessions for CliSessions {
                     }
                 }
 
-                match cmd.spawn() {
-                    Ok(child) => {
-                        children.push((idx, child, agent.clone()));
-                    }
-                    Err(_) => {}
+                if let Ok(child) = cmd.spawn() {
+                    children.push((idx, child, agent.clone()));
                 }
             }
 
