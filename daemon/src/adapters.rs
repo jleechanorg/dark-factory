@@ -1376,6 +1376,47 @@ pub struct ChainLlm;
 /// expects.
 const FALLBACK_CWD: &str = ".";
 
+/// Anthropic weekly-limit bypass: re-invoke the `claude` binary against the
+/// MiniMax-hosted Anthropic-compatible endpoint instead of api.anthropic.com.
+/// Runs from `FALLBACK_CWD` for the same reason every other fallback step
+/// does (bead `jleechan-g1k`) — MiniMax is still driving the `claude` CLI, so
+/// it still reads AGENTS.md / `.claude/` from the invocation cwd.
+fn run_minimax_judge(claude_bin: &str, prompt: &str) -> Result<String, DaemonError> {
+    let minimax_key = std::env::var("MINIMAX_API_KEY").map_err(|e| {
+        DaemonError::Tool {
+            tool: "minimax".into(),
+            rc: -1,
+            stderr: format!("MINIMAX_API_KEY not set: {e}"),
+        }
+    })?;
+
+    let mut cmd = std::process::Command::new(claude_bin);
+    cmd.args(["--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt])
+        .current_dir(FALLBACK_CWD)
+        .stdin(std::process::Stdio::null())
+        .env("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
+        .env("ANTHROPIC_API_KEY", minimax_key);
+
+    let output = cmd.output().map_err(|e| DaemonError::Tool {
+        tool: "minimax".into(),
+        rc: -1,
+        stderr: format!("failed to run minimax: {e}"),
+    })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        Err(DaemonError::Tool {
+            tool: "minimax".into(),
+            rc: output.status.code().unwrap_or(-1),
+            stderr,
+        })
+    }
+}
+
 impl Llm for ChainLlm {
     fn is_real(&self) -> bool {
         true
@@ -1418,6 +1459,10 @@ impl Llm for ChainLlm {
             FALLBACK_CWD,
             120,
         );
+        if let Ok(out) = r {
+            return Ok(out);
+        }
+        let r = run_minimax_judge(&claude_bin, prompt);
         if let Ok(out) = r {
             return Ok(out);
         }
