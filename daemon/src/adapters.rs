@@ -987,7 +987,10 @@ pub struct CliSessions {
 
 impl CliSessions {
     pub fn new(repo: &str, agent: &str) -> Self {
-        let project = repo.split('/').next_back().unwrap_or(repo).to_string();
+        let mut project = repo.split('/').next_back().unwrap_or(repo).to_string();
+        if project == "worldarchitect.ai" {
+            project = "worldarchitect".to_string();
+        }
         Self {
             project,
             agent: agent.to_string(),
