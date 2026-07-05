@@ -25,7 +25,7 @@ use crate::intake;
 use crate::router::{self, RoutingVerdict};
 use crate::state::{BeadOverlay, OverlayState, StateStore};
 use crate::telemetry::{self, TelemetryEvent};
-use crate::tools::{Bead, Llm, Scm, Sessions, Tracker};
+use crate::tools::{Bead, Llm, Scm, SessionId, Sessions, Tracker};
 use crate::verifier::{self, PrEvidence};
 use std::path::Path;
 
@@ -118,7 +118,7 @@ fn emit(
 ///
 /// Stage gate: `deps.cfg.stage` must be `1` — this function only implements
 /// the Stage-1 substitution rule (re-roll verdicts recorded, never executed).
-pub fn run_tick(deps: &TickDeps, tick_index: u64) -> Result<TickSummary, DaemonError> {
+pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<TickSummary, DaemonError> {
     if deps.cfg.stage != 1 {
         return Err(DaemonError::Config(format!(
             "run_tick only implements the Stage-1 substitution rule (stage=1); got stage={}",
@@ -127,6 +127,115 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64) -> Result<TickSummary, DaemonE
     }
 
     let mut summary = TickSummary::default();
+
+    // Increment autonomy_secs and perform safety envelope & wedge detection checks for active beads
+    let active_overlays = deps.store.increment_active_autonomy(elapsed_secs)?;
+    for mut overlay in active_overlays {
+        // 1. Time-box envelope check
+        if overlay.autonomy_secs >= deps.cfg.autonomy_timebox_secs {
+            overlay.state = OverlayState::HumanHeld;
+            deps.store.save(&overlay)?;
+            emit(
+                deps.telemetry_log,
+                &overlay.bead_id,
+                overlay.attempt,
+                OverlayState::HumanHeld.as_str(),
+                "PARKED_HUMAN_HELD",
+                serde_json::json!({}),
+                serde_json::json!({"reason": "autonomy_timebox_exceeded"}),
+            )?;
+            summary.beads_parked_human_held += 1;
+            continue;
+        }
+
+        // 2. Budget warning (when autonomy time crosses 80% of the time-box)
+        let warning_threshold = (deps.cfg.autonomy_timebox_secs * 80) / 100;
+        if overlay.autonomy_secs >= warning_threshold
+            && (overlay.autonomy_secs.saturating_sub(elapsed_secs)) < warning_threshold
+        {
+            emit(
+                deps.telemetry_log,
+                &overlay.bead_id,
+                overlay.attempt,
+                overlay.state.as_str(),
+                "BUDGET_WARNING",
+                serde_json::json!({
+                    "autonomySecs": overlay.autonomy_secs,
+                    "thresholdSecs": warning_threshold,
+                }),
+                serde_json::json!({"message": "Autonomy time has crossed 80% of the time-box limit"}),
+            )?;
+        }
+
+        // 3. Wedge detection
+        match overlay.state {
+            OverlayState::Dispatched => {
+                if let Some(ref branch) = overlay.branch {
+                    if overlay.autonomy_secs >= 1800 {
+                        let last_commit_epoch = deps.scm.remote_branch_last_commit(branch)?;
+                        let now_epoch = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+
+                        let is_silent = match last_commit_epoch {
+                            None => true,
+                            Some(commit_time) => now_epoch.saturating_sub(commit_time) >= 1800,
+                        };
+
+                        if is_silent {
+                            overlay.state = OverlayState::HumanHeld;
+                            deps.store.save(&overlay)?;
+                            emit(
+                                deps.telemetry_log,
+                                &overlay.bead_id,
+                                overlay.attempt,
+                                OverlayState::HumanHeld.as_str(),
+                                "PARKED_HUMAN_HELD",
+                                serde_json::json!({}),
+                                serde_json::json!({"reason": "coder_silent"}),
+                            )?;
+                            summary.beads_parked_human_held += 1;
+                        }
+                    }
+                }
+            }
+            OverlayState::Attested => {
+                if let Some(pr_number) = overlay.pr_number {
+                    let pr_snapshot = deps.scm.pr_snapshot(pr_number)?;
+                    let now_epoch = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    if now_epoch.saturating_sub(pr_snapshot.updated_at_epoch) >= 1800 {
+                        let is_stalled_or_dead = if let Some(ref session_id_str) = overlay.session_id {
+                            let session_id = SessionId(session_id_str.clone());
+                            deps.sessions.is_quiescent(&session_id)?
+                        } else {
+                            true
+                        };
+
+                        if is_stalled_or_dead {
+                            overlay.state = OverlayState::HumanHeld;
+                            deps.store.save(&overlay)?;
+                            emit(
+                                deps.telemetry_log,
+                                &overlay.bead_id,
+                                overlay.attempt,
+                                OverlayState::HumanHeld.as_str(),
+                                "PARKED_HUMAN_HELD",
+                                serde_json::json!({}),
+                                serde_json::json!({"reason": "session_stalled"}),
+                            )?;
+                            summary.beads_parked_human_held += 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
     let slow_tier_due = {
         let ratio = (deps.cfg.slow_tick_secs / deps.cfg.fast_tick_secs.max(1)).max(1);
@@ -174,6 +283,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             spend_usd: 0.0,
             pr_number: None,
             branch: None,
+            session_id: None,
         };
         deps.store.save(&overlay)?;
         summary.beads_created += 1;

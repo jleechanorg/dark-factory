@@ -71,6 +71,7 @@ pub struct BeadOverlay {
     pub spend_usd: f64,     // monitoring-only metric (spec §4.2.8)
     pub pr_number: Option<u64>,
     pub branch: Option<String>,
+    pub session_id: Option<String>,
 }
 
 pub trait StateStore {
@@ -79,6 +80,7 @@ pub trait StateStore {
     fn register_branch(&self, bead_id: &str, branch: &str) -> Result<(), DaemonError>;
     /// Deletion guard: daemon may delete ONLY refs returned here (spec §4.2.8).
     fn owned_branches(&self) -> Result<Vec<String>, DaemonError>;
+    fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError>;
 }
 
 /// `StateStore` impl against `~/.dark-factory/daemon-cxdb.sqlite` (WAL mode,
@@ -176,7 +178,7 @@ impl StateStore for SqliteStateStore {
         self.conn
             .query_row(
                 "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
-                 pr_number, branch FROM bead_overlay WHERE bead_id = ?1",
+                 pr_number, branch, session_id FROM bead_overlay WHERE bead_id = ?1",
                 params![bead_id],
                 |row| {
                     let state_str: String = row.get(1)?;
@@ -191,6 +193,7 @@ impl StateStore for SqliteStateStore {
                             spend_usd: row.get(5)?,
                             pr_number: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
                             branch: row.get(7)?,
+                            session_id: row.get(8)?,
                         },
                     ))
                 },
@@ -255,6 +258,52 @@ impl StateStore for SqliteStateStore {
         }
         Ok(out)
     }
+
+    fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError> {
+        if elapsed_secs > 0 {
+            self.conn.execute(
+                "UPDATE bead_overlay SET autonomy_secs = autonomy_secs + ?1, updated_at = ?2 \
+                 WHERE state IN ('DISPATCHED', 'ATTESTED')",
+                params![elapsed_secs, now_iso8601()],
+            ).map_err(|e| tool_err("increment_active_autonomy update", e))?;
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id \
+             FROM bead_overlay WHERE state IN ('DISPATCHED', 'ATTESTED')"
+        ).map_err(|e| tool_err("increment_active_autonomy prepare", e))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, f64>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        }).map_err(|e| tool_err("increment_active_autonomy query", e))?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id) = r.map_err(|e| tool_err("increment_active_autonomy row", e))?;
+            let state = OverlayState::from_str(&state_str)?;
+            out.push(BeadOverlay {
+                bead_id,
+                state,
+                attempt: attempt as u32,
+                reroll_count: reroll_count as u32,
+                autonomy_secs: autonomy_secs as u64,
+                spend_usd,
+                pr_number: pr_number.map(|v| v as u64),
+                branch,
+                session_id,
+            });
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +327,7 @@ mod tests {
             spend_usd: 0.0,
             pr_number: None,
             branch: None,
+            session_id: None,
         };
         s.save(&o).unwrap();
         let got = s.load("b1").unwrap().unwrap();
@@ -300,6 +350,7 @@ mod tests {
             spend_usd: 0.5,
             pr_number: None,
             branch: None,
+            session_id: None,
         };
         s.save(&o).unwrap();
         o.state = OverlayState::Attested;
@@ -357,6 +408,7 @@ mod tests {
                 spend_usd: 0.0,
                 pr_number: None,
                 branch: None,
+                session_id: None,
             };
             s.save(&o).unwrap();
             let got = s.load(&o.bead_id).unwrap().unwrap();
@@ -388,6 +440,7 @@ mod tests {
             spend_usd: 0.0,
             pr_number: Some(7),
             branch: Some("factory/b1-r1".into()),
+            session_id: None,
         };
         s.save(&o).unwrap();
         s.register_branch("b1", "factory/b1-r1").unwrap();

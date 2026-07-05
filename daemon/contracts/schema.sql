@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   spend_usd     REAL    NOT NULL DEFAULT 0,   -- monitoring-only (spec §4.2.8)
   pr_number     INTEGER,
   branch        TEXT,
+  session_id    TEXT,
   updated_at    TEXT    NOT NULL              -- ISO-8601 UTC
 );
 

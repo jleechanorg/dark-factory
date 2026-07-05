@@ -115,6 +115,9 @@ impl Scm for NoopAdapters {
     fn close_pr(&self, _pr: u64, _comment: &str) -> Result<(), DaemonError> {
         Ok(())
     }
+    fn remote_branch_last_commit(&self, _branch: &str) -> Result<Option<u64>, DaemonError> {
+        Ok(None)
+    }
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -247,13 +250,22 @@ fn run(args: Args) -> Result<(), DaemonError> {
     };
 
     if args.once {
-        run_tick(&deps, 0)?;
+        run_tick(&deps, 0, 0)?;
         return Ok(());
     }
 
     let mut tick_index: u64 = 0;
+    let mut last_tick_time = std::time::Instant::now();
     loop {
-        run_tick(&deps, tick_index)?;
+        let now = std::time::Instant::now();
+        let elapsed_secs = if tick_index == 0 {
+            0
+        } else {
+            now.duration_since(last_tick_time).as_secs()
+        };
+        last_tick_time = now;
+
+        run_tick(&deps, tick_index, elapsed_secs)?;
         tick_index += 1;
         std::thread::sleep(std::time::Duration::from_secs(cfg.fast_tick_secs));
     }
