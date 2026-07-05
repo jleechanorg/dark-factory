@@ -17,3 +17,5 @@ pub mod tools;
 pub mod verifier;
 pub mod adapters;
 
+
+pub mod gates_compute;

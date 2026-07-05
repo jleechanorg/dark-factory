@@ -17,32 +17,72 @@ struct Args {
     /// Run exactly one tick then exit, instead of looping forever.
     once: bool,
     /// Construct every tool-boundary trait as a no-op stub that performs zero
-    /// subprocess calls, zero SCM writes, zero session spawns. This is the
-    /// only mode `main()` supports today because no `CliTracker`/`CliScm`/
-    /// `CliSessions`/`CliVcs`/`ChainLlm` production adapters exist yet
-    /// (design doc §4's "one production impl per trait" is a separate,
-    /// not-yet-scheduled task) — real dispatch requires those adapters first.
+    /// subprocess calls, zero SCM writes, zero session spawns.
     dry_run: bool,
 }
 
-fn parse_args(argv: impl Iterator<Item = String>) -> Args {
-    let mut args = Args::default();
-    for arg in argv.skip(1) {
-        match arg.as_str() {
-            "--once" => args.once = true,
-            "--dry-run" => args.dry_run = true,
-            _ => {}
+#[derive(Debug, Clone)]
+enum CommandMode {
+    Daemon(Args),
+    GatesCompute {
+        pr: u64,
+        repo: Option<String>,
+    },
+}
+
+fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CommandMode, String> {
+    let _bin_name = argv.next();
+    let next_arg = argv.next();
+    match next_arg.as_deref() {
+        Some("gates-compute") => {
+            let mut pr = None;
+            let mut repo = None;
+            while let Some(arg) = argv.next() {
+                match arg.as_str() {
+                    "--pr" => {
+                        if let Some(val) = argv.next() {
+                            let parsed_pr = val.parse::<u64>().map_err(|_| format!("Invalid PR number: {}", val))?;
+                            pr = Some(parsed_pr);
+                        } else {
+                            return Err("Missing value for --pr".to_string());
+                        }
+                    }
+                    "--repo" => {
+                        if let Some(val) = argv.next() {
+                            repo = Some(val);
+                        } else {
+                            return Err("Missing value for --repo".to_string());
+                        }
+                    }
+                    other => {
+                        return Err(format!("Unknown argument for gates-compute: {}", other));
+                    }
+                }
+            }
+            let pr = pr.ok_or_else(|| "Missing required argument --pr".to_string())?;
+            Ok(CommandMode::GatesCompute { pr, repo })
+        }
+        Some(first_flag) => {
+            let mut args = Args::default();
+            let mut all_args = vec![first_flag.to_string()];
+            all_args.extend(argv);
+            for arg in all_args {
+                match arg.as_str() {
+                    "--once" => args.once = true,
+                    "--dry-run" => args.dry_run = true,
+                    _ => {}
+                }
+            }
+            Ok(CommandMode::Daemon(args))
+        }
+        None => {
+            Ok(CommandMode::Daemon(Args::default()))
         }
     }
-    args
 }
 
 /// Read-only, zero-effect stub used for every tool boundary until the
-/// production `Cli*`/`ChainLlm` adapters (design doc §4) land. Every method
-/// returns an empty/neutral result and performs no subprocess invocation —
-/// this is what makes `--dry-run` structurally incapable of an SCM write or a
-/// session spawn (there is no code path to one), not merely a flag checked at
-/// the call site.
+/// production `Cli*`/`ChainLlm` adapters (design doc §4) land.
 #[cfg(any(test, debug_assertions))]
 struct NoopAdapters;
 
@@ -120,7 +160,6 @@ impl Llm for NoopAdapters {
     }
 }
 
-
 fn default_config_path() -> PathBuf {
     let live = PathBuf::from("config/daemon.toml");
     if live.exists() {
@@ -159,10 +198,6 @@ fn run(args: Args) -> Result<(), DaemonError> {
     let db_path = default_state_db_path();
 
     let store: Box<dyn StateStore> = if args.dry_run {
-        // --dry-run never persists to the real on-disk CXDB either — an
-        // in-memory store with the same schema keeps the tick loop's write
-        // path exercised (for the telemetry proof) without touching the
-        // operator's real state file.
         Box::new(SqliteStateStore::open_in_memory_with_schema(include_str!(
             "../contracts/schema.sql"
         ))?)
@@ -211,7 +246,6 @@ fn run(args: Args) -> Result<(), DaemonError> {
         telemetry_log: &telemetry_log,
     };
 
-
     if args.once {
         run_tick(&deps, 0)?;
         return Ok(());
@@ -226,10 +260,27 @@ fn run(args: Args) -> Result<(), DaemonError> {
 }
 
 fn main() {
-    let args = parse_args(std::env::args());
-    if let Err(e) = run(args) {
-        eprintln!("auto-factory daemon: fatal: {e}");
-        std::process::exit(1);
+    let mode = match parse_args(std::env::args()) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("auto-factory daemon: args: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match mode {
+        CommandMode::Daemon(args) => {
+            if let Err(e) = run(args) {
+                eprintln!("auto-factory daemon: fatal: {e}");
+                std::process::exit(1);
+            }
+        }
+        CommandMode::GatesCompute { pr, repo } => {
+            if let Err(e) = daemon::gates_compute::run_gates_compute(pr, repo) {
+                eprintln!("auto-factory daemon: gates-compute error: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -246,24 +297,74 @@ mod tests {
     #[test]
     fn parse_args_recognizes_once_and_dry_run() {
         let argv = vec!["daemon".to_string(), "--once".to_string(), "--dry-run".to_string()];
-        let args = parse_args(argv.into_iter());
-        assert!(args.once);
-        assert!(args.dry_run);
+        let mode = parse_args(argv.into_iter()).unwrap();
+        if let CommandMode::Daemon(args) = mode {
+            assert!(args.once);
+            assert!(args.dry_run);
+        } else {
+            panic!("expected Daemon mode");
+        }
     }
 
     #[test]
     fn parse_args_defaults_false_with_no_flags() {
         let argv = vec!["daemon".to_string()];
-        let args = parse_args(argv.into_iter());
-        assert!(!args.once);
-        assert!(!args.dry_run);
+        let mode = parse_args(argv.into_iter()).unwrap();
+        if let CommandMode::Daemon(args) = mode {
+            assert!(!args.once);
+            assert!(!args.dry_run);
+        } else {
+            panic!("expected Daemon mode");
+        }
     }
 
     #[test]
     fn parse_args_ignores_unknown_flags() {
         let argv = vec!["daemon".to_string(), "--bogus".to_string(), "--once".to_string()];
-        let args = parse_args(argv.into_iter());
-        assert!(args.once);
-        assert!(!args.dry_run);
+        let mode = parse_args(argv.into_iter()).unwrap();
+        if let CommandMode::Daemon(args) = mode {
+            assert!(args.once);
+            assert!(!args.dry_run);
+        } else {
+            panic!("expected Daemon mode");
+        }
+    }
+
+    #[test]
+    fn parse_args_recognizes_gates_compute_with_repo() {
+        let argv = vec![
+            "daemon".to_string(),
+            "gates-compute".to_string(),
+            "--pr".to_string(),
+            "161".to_string(),
+            "--repo".to_string(),
+            "foo/bar".to_string(),
+        ];
+        let mode = parse_args(argv.into_iter()).unwrap();
+        match mode {
+            CommandMode::GatesCompute { pr, repo } => {
+                assert_eq!(pr, 161);
+                assert_eq!(repo, Some("foo/bar".to_string()));
+            }
+            _ => panic!("Expected GatesCompute mode"),
+        }
+    }
+
+    #[test]
+    fn parse_args_recognizes_gates_compute_without_repo() {
+        let argv = vec![
+            "daemon".to_string(),
+            "gates-compute".to_string(),
+            "--pr".to_string(),
+            "161".to_string(),
+        ];
+        let mode = parse_args(argv.into_iter()).unwrap();
+        match mode {
+            CommandMode::GatesCompute { pr, repo } => {
+                assert_eq!(pr, 161);
+                assert_eq!(repo, None);
+            }
+            _ => panic!("Expected GatesCompute mode"),
+        }
     }
 }
