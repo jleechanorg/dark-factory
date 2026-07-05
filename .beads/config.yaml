@@ -1,4 +1,16 @@
 # Beads Project Configuration
-# issue_prefix: dark-factory
-# default_priority: 2
-# default_type: task
+# Mirrors jleechanorg/worldarchitect.ai PR #7270 (commit 380f1b5ee4, 2026-06-05):
+# `no-auto-flush: true` prevents agents from auto-flushing the entire SQLite
+# DB to .beads/issues.jsonl on every br command, which is the root cause of
+# the +1686/-1685 wholesale-rewrite noise seen in PRs that touch the JSONL.
+#
+# Beads still live in beads.db (source of truth); JSONL is only an export.
+# When you DO need to flush, do it deliberately: `br sync --flush-only`.
+issue-prefix: jleechan
+no-db: false
+no-daemon: true
+db: beads.db
+sync-branch: beads-sync
+no-sparse-checkout: true
+max-hash-length: 64
+no-auto-flush: true

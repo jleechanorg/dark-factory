@@ -1,0 +1,420 @@
+// Task 10: tick loop wiring (design doc §5, spec §4.2.2/§4.2.9). This is the
+// only module that calls every other module's public entry point in one
+// place: `intake::normalize`, `router::route`, `dispatch::dispatch_ready`,
+// `verifier::assess`, plus `telemetry::emit` + `StateStore`. Fast tier runs
+// every tick (ATTESTED beads -> verifier); slow tier (intake + route +
+// dispatch) runs every `slow_tick_secs / fast_tick_secs` ticks, tracked via
+// `TickCounter::slow_tier_due`. Startup reconciliation is implicit: overlays
+// live in SQLite (or the caller's `StateStore` impl) and are read fresh via
+// `StateStore::load` on every tick, so there is no separate in-memory cache to
+// rehydrate on process restart.
+//
+// Stage gate (spec §4.2.9, `.claude/skills/factory-lite/CONTRACT.md` §1
+// "Stage-1 substitution rule"): whenever a re-roll-worthy verdict would fire
+// (an ATTESTED bead's gate assessment is not all-green), Stage 1 NEVER enters
+// `RE_ROLL` or executes the Re-Roll Engine. It only emits
+// `REROLL_VERDICT_RECORDED` and parks the bead `HUMAN_HELD`. `cfg.stage` is
+// asserted to be `1` at the top of the gate path; any other value is a
+// `DaemonError::Config` since Stage 2 execution is out of scope for this
+// binary entirely (design doc says the Rust daemon IS the Stage 2 owner
+// eventually, but this task only implements the Stage-1 substitution rule).
+use crate::config::Config;
+use crate::dispatch;
+use crate::errors::DaemonError;
+use crate::intake;
+use crate::router::{self, RoutingVerdict};
+use crate::state::{BeadOverlay, OverlayState, StateStore};
+use crate::telemetry::{self, TelemetryEvent};
+use crate::tools::{Bead, Llm, Scm, Sessions, Tracker};
+use crate::verifier::{self, PrEvidence};
+use std::path::Path;
+
+/// Everything one `run_tick` call needs: the five tool-boundary trait objects,
+/// config, state store, and the telemetry log path. Bundled into one struct so
+/// `run_tick`'s signature stays readable and every call site (the binary's
+/// poll loop, `--once`, and the integration test) constructs it identically.
+pub struct TickDeps<'a> {
+    pub scm: &'a dyn Scm,
+    pub tracker: &'a dyn Tracker,
+    pub sessions: &'a dyn Sessions,
+    pub llm: &'a dyn Llm,
+    pub store: &'a dyn StateStore,
+    pub cfg: &'a Config,
+    pub telemetry_log: &'a Path,
+}
+
+/// Summary counters returned by `run_tick`, mirrored into the `TICK` telemetry
+/// event's `metrics` field (spec §4.2.9's "once per invocation, summarizing
+/// counts").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TickSummary {
+    pub beads_created: usize,
+    pub beads_routed: usize,
+    pub beads_dispatched: usize,
+    pub gates_assessed: usize,
+    pub beads_ready: usize,
+    pub beads_parked_human_held: usize,
+}
+
+/// Dependency-free ISO-8601 UTC timestamp, matching `state.rs::now_iso8601`'s
+/// discipline (design doc §2's five-crate budget excludes chrono). Duplicated
+/// here rather than made `pub` in `state.rs` to keep that already-merged
+/// Task-4 module's public surface unchanged by this task.
+fn now_iso8601() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (y, mo, d) = civil_from_days(days as i64);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// Howard Hinnant's civil_from_days algorithm (public domain), days since
+/// epoch -> (y, m, d). Mirrors `state.rs`'s private copy exactly.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn emit(
+    telemetry_log: &Path,
+    bead_id: &str,
+    attempt_id: u32,
+    lifecycle_state: &str,
+    event_type: &str,
+    metrics: serde_json::Value,
+    context: serde_json::Value,
+) -> Result<(), DaemonError> {
+    telemetry::emit(
+        telemetry_log,
+        &TelemetryEvent {
+            timestamp: now_iso8601(),
+            bead_id: bead_id.to_string(),
+            attempt_id,
+            lifecycle_state: lifecycle_state.to_string(),
+            event_type: event_type.to_string(),
+            metrics,
+            context,
+        },
+    )
+}
+
+/// Run one full tick: slow tier (intake -> route -> dispatch) then fast tier
+/// (verify every ATTESTED bead), then emit exactly one summarizing `TICK`
+/// event. `tick_index` selects whether the slow tier is due this call
+/// (`tick_index % (slow_tick_secs / fast_tick_secs).max(1) == 0`); pass `0` to
+/// always run the slow tier (used by `--once`).
+///
+/// Stage gate: `deps.cfg.stage` must be `1` — this function only implements
+/// the Stage-1 substitution rule (re-roll verdicts recorded, never executed).
+pub fn run_tick(deps: &TickDeps, tick_index: u64) -> Result<TickSummary, DaemonError> {
+    if deps.cfg.stage != 1 {
+        return Err(DaemonError::Config(format!(
+            "run_tick only implements the Stage-1 substitution rule (stage=1); got stage={}",
+            deps.cfg.stage
+        )));
+    }
+
+    let mut summary = TickSummary::default();
+
+    let slow_tier_due = {
+        let ratio = (deps.cfg.slow_tick_secs / deps.cfg.fast_tick_secs.max(1)).max(1);
+        tick_index.is_multiple_of(ratio)
+    };
+
+    if slow_tier_due {
+        run_slow_tier(deps, &mut summary)?;
+    }
+
+    run_fast_tier(deps, &mut summary)?;
+
+    emit(
+        deps.telemetry_log,
+        "_tick",
+        0,
+        "N/A",
+        "TICK",
+        serde_json::json!({
+            "beadsCreated": summary.beads_created,
+            "beadsRouted": summary.beads_routed,
+            "beadsDispatched": summary.beads_dispatched,
+            "gatesAssessed": summary.gates_assessed,
+            "beadsReady": summary.beads_ready,
+            "beadsParkedHumanHeld": summary.beads_parked_human_held,
+        }),
+        serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
+    )?;
+
+    Ok(summary)
+}
+
+/// Slow tier: intake new beads, route each freshly-queued bead, dispatch as
+/// many QUEUED beads as the safety envelope (30/15) allows.
+fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
+    let created = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
+    let mut routing_candidates: Vec<Bead> = Vec::new();
+    for bead_id in &created {
+        let overlay = BeadOverlay {
+            bead_id: bead_id.clone(),
+            state: OverlayState::Queued,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: None,
+        };
+        deps.store.save(&overlay)?;
+        summary.beads_created += 1;
+        emit(
+            deps.telemetry_log,
+            bead_id,
+            1,
+            OverlayState::Queued.as_str(),
+            "INTAKE_BEAD_CREATED",
+            serde_json::json!({}),
+            serde_json::json!({}),
+        )?;
+        // `Tracker::fetch_candidates` == `br list ...`; a real `br` would show
+        // this bead on the very next call since `br` is a durable store. Test
+        // fakes are static/pre-seeded, so route/dispatch this tick against the
+        // bead we just created directly rather than depending on the fake
+        // reflecting it back through `fetch_candidates`.
+        routing_candidates.push(Bead {
+            id: bead_id.clone(),
+            title: String::new(),
+            description: String::new(),
+            file_tree_summary: String::new(),
+            external_ref: None,
+        });
+    }
+
+    // Also pick up any bead left over from a prior tick that reached QUEUED
+    // but was never routed/dispatched (process restart resilience) — real
+    // `Tracker::fetch_candidates` reflects prior `create_bead` calls, so this
+    // covers that path in production even though the static test fake can't.
+    for bead in deps.tracker.fetch_candidates()? {
+        if !routing_candidates.iter().any(|b| b.id == bead.id) {
+            routing_candidates.push(bead);
+        }
+    }
+
+    let mut ready: Vec<Bead> = Vec::new();
+    for bead in &routing_candidates {
+        let overlay = match deps.store.load(&bead.id)? {
+            Some(o) if o.state == OverlayState::Queued => o,
+            _ => continue,
+        };
+
+        match router::route(deps.llm, bead) {
+            Ok(verdict) => {
+                summary.beads_routed += 1;
+                let verdict_str = match verdict {
+                    RoutingVerdict::SmallPath => "SMALL_PATH",
+                    RoutingVerdict::StandardPath => "STANDARD_PATH",
+                };
+                emit(
+                    deps.telemetry_log,
+                    &bead.id,
+                    overlay.attempt,
+                    OverlayState::Queued.as_str(),
+                    "TASK_ROUTED",
+                    serde_json::json!({}),
+                    serde_json::json!({"routingVerdict": verdict_str}),
+                )?;
+                ready.push(bead.clone());
+            }
+            Err(DaemonError::Parse(reason)) => {
+                // ZFC: an unparseable routing verdict is never guessed at —
+                // park the bead HUMAN_HELD per the same "unknown is not a
+                // silent default" discipline router.rs already enforces.
+                let mut held = overlay;
+                held.state = OverlayState::HumanHeld;
+                deps.store.save(&held)?;
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &bead.id,
+                    held.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": reason}),
+                )?;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+
+    if !ready.is_empty() {
+        let dispatched = dispatch::dispatch_ready(deps.sessions, deps.store, deps.cfg, &ready)?;
+        summary.beads_dispatched += dispatched;
+        for bead in ready.iter().take(dispatched) {
+            emit(
+                deps.telemetry_log,
+                &bead.id,
+                1,
+                OverlayState::Dispatched.as_str(),
+                "TASK_DISPATCHED",
+                serde_json::json!({}),
+                serde_json::json!({}),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Build gate 6/7's `PrEvidence` for one PR. Gate 7 (Skeptic) is Stage 1's
+/// only LLM call in the fast tier (spec §4.2.5 item 7, verifier.rs module doc:
+/// "Stage 1 Skeptic consumes ... an `Llm` adversarial call"): render a minimal
+/// review prompt, call `Llm::judge`, and strictly parse the reply through
+/// `verifier::parse_skeptic_verdict`'s fixed `pass|warn|fail` grammar — an
+/// unparseable reply becomes `None` (gate 7 -> `Unknown`, never a guessed
+/// `Green`/`Red`), matching the ZFC discipline `router.rs` and `verifier.rs`
+/// already enforce elsewhere in this crate.
+///
+/// The evidence floor (gate 6, non-test changed LOC) has no wired data source
+/// yet in Stage 1 (no `Vcs`/`Scm` method returns a diff LOC count in the
+/// traits this task is scoped to) — `non_test_changed_loc` defaults to `0`,
+/// which is honestly "floor not exceeded" rather than a guessed pass; wiring a
+/// real LOC count is a follow-up, not silently faked here. Likewise Stage 1
+/// has no wired `/er` runner yet, so `er_verdict` is honestly `Absent` (gate 6
+/// -> `Unknown`, never a guessed `Pass`) until a real `/er` invocation is
+/// wired in (bead jleechan-3rf, verifier.rs `evidence_floor_gate`).
+fn skeptic_evidence(llm: &dyn Llm, bead_id: &str, pr: u64) -> Result<PrEvidence, DaemonError> {
+    let prompt = format!(
+        "You are the Stage-1 Skeptic gate for an autonomous coding factory.\n\
+         Review bead {bead_id}'s PR #{pr} end-to-end (diff, evidence, tests) and \
+         judge whether it is ready to merge.\n\
+         Respond with exactly one line of the form:\n\
+         pass|warn <note>|fail <reason>",
+    );
+    let reply = llm.judge(&prompt)?;
+    let skeptic_verdict = verifier::parse_skeptic_verdict(&reply);
+    Ok(PrEvidence {
+        non_test_changed_loc: 0,
+        has_integration_evidence_marker: false,
+        er_verdict: verifier::ErVerdict::Absent,
+        skeptic_verdict,
+    })
+}
+
+/// Fast tier: for every bead whose overlay is `ATTESTED` (or freshly promoted
+/// from `DISPATCHED` because its PR is now open), assess all 7 gates. All
+/// green -> `READY` (terminal) + `READY_FOR_MERGE`. Not all green -> Stage-1
+/// substitution rule: emit `REROLL_VERDICT_RECORDED` and park `HUMAN_HELD`,
+/// never enter `RE_ROLL` or execute the Re-Roll Engine.
+fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
+    // In-flight beads are discovered via the branch registry (populated by
+    // `dispatch::dispatch_ready`'s `register_branch` call), not
+    // `Tracker::fetch_candidates` — a bead can be DISPATCHED/ATTESTED long
+    // after it drops out of `br list --status open --label factory` filters,
+    // and `branch_registry` is this store's authoritative "beads we're
+    // actively tracking" set (deletion-guard doc comment on
+    // `StateStore::owned_branches`).
+    let branches = deps.store.owned_branches()?;
+    let bead_ids: Vec<String> = branches
+        .iter()
+        .filter_map(|b| b.rsplit_once("-r").map(|(prefix, _attempt)| prefix))
+        .filter_map(|prefix| prefix.strip_prefix("factory/"))
+        .map(|s| s.to_string())
+        .collect();
+
+    for bead_id in &bead_ids {
+        let mut overlay = match deps.store.load(bead_id)? {
+            Some(o) => o,
+            None => continue,
+        };
+
+        // Promote DISPATCHED -> ATTESTED once a PR is open (spec §4.2.7).
+        if overlay.state == OverlayState::Dispatched {
+            if let Some(pr) = overlay.pr_number {
+                overlay.state = OverlayState::Attested;
+                deps.store.save(&overlay)?;
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "PR_OPENED",
+                    serde_json::json!({}),
+                    serde_json::json!({"pr_number": pr}),
+                )?;
+            }
+        }
+
+        if overlay.state != OverlayState::Attested {
+            continue;
+        }
+        let pr = match overlay.pr_number {
+            Some(pr) => pr,
+            None => continue,
+        };
+
+        let evidence = skeptic_evidence(deps.llm, bead_id, pr)?;
+        let report = verifier::assess(deps.scm, pr, deps.cfg, &evidence)?;
+        summary.gates_assessed += 1;
+        emit(
+            deps.telemetry_log,
+            bead_id,
+            overlay.attempt,
+            OverlayState::Attested.as_str(),
+            "GATE_ASSESSMENT",
+            serde_json::json!({}),
+            serde_json::json!({"all_green": report.all_green}),
+        )?;
+
+        if report.all_green {
+            overlay.state = OverlayState::Ready;
+            deps.store.save(&overlay)?;
+            summary.beads_ready += 1;
+            emit(
+                deps.telemetry_log,
+                bead_id,
+                overlay.attempt,
+                OverlayState::Ready.as_str(),
+                "READY_FOR_MERGE",
+                serde_json::json!({}),
+                serde_json::json!({}),
+            )?;
+        } else {
+            // Stage-1 substitution rule (CONTRACT.md §1): record the re-roll
+            // verdict, never execute it. Park HUMAN_HELD instead of RE_ROLL.
+            emit(
+                deps.telemetry_log,
+                bead_id,
+                overlay.attempt,
+                OverlayState::Attested.as_str(),
+                "REROLL_VERDICT_RECORDED",
+                serde_json::json!({}),
+                serde_json::json!({"stage": deps.cfg.stage}),
+            )?;
+            overlay.state = OverlayState::HumanHeld;
+            deps.store.save(&overlay)?;
+            summary.beads_parked_human_held += 1;
+            emit(
+                deps.telemetry_log,
+                bead_id,
+                overlay.attempt,
+                OverlayState::HumanHeld.as_str(),
+                "PARKED_HUMAN_HELD",
+                serde_json::json!({}),
+                serde_json::json!({"reason": "gate assessment not all-green (stage 1: recorded, not executed)"}),
+            )?;
+        }
+    }
+
+    Ok(())
+}

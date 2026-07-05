@@ -34,3 +34,20 @@ jobs:
 
       - name: Graph structural audit (G1/G2 dogfooding)
         run: python -m runner.graph_audit pipelines
+
+  daemon-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: cargo test (daemon crate)
+        working-directory: daemon
+        run: cargo test --verbose
+
+      - name: cargo clippy (deny warnings)
+        working-directory: daemon
+        run: cargo clippy -- -D warnings
