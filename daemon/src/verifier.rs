@@ -348,6 +348,10 @@ mod tests {
         fn close_pr(&self, _pr: u64, _comment: &str) -> Result<(), DaemonError> {
             Ok(())
         }
+
+        fn remote_branch_last_commit(&self, _branch: &str) -> Result<Option<u64>, DaemonError> {
+            Ok(None)
+        }
     }
 
     fn all_green_snapshot(pr: u64) -> PrSnapshot {
@@ -359,6 +363,7 @@ mod tests {
             bugbot_error_count: 0,
             unresolved_thread_count: 0,
             head_sha: "deadbeef".into(),
+            updated_at_epoch: 0,
         }
     }
 

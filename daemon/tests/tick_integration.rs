@@ -25,7 +25,7 @@ mod common;
 
 use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker};
 use daemon::config::Config;
-use daemon::state::{OverlayState, StateStore};
+use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{run_tick, TickDeps};
 use daemon::tools::{Issue, Permission, PrSnapshot};
 
@@ -90,6 +90,7 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
             telemetry_log: &telemetry_log,
         },
         0,
+        0,
     )
     .expect("tick 1 should succeed");
     assert_eq!(summary1.beads_created, 1, "one bead should be created from the new issue");
@@ -129,6 +130,7 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
             bugbot_error_count: 0,
             unresolved_thread_count: 0,
             head_sha: "deadbeef".into(),
+            updated_at_epoch: 0,
         },
     );
     // The router call already happened in tick 1; re-script the same `FakeLlm`
@@ -147,6 +149,7 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
             telemetry_log: &telemetry_log,
         },
         1,
+        0,
     )
     .expect("tick 2 should succeed");
     assert_eq!(
@@ -289,7 +292,7 @@ fn run_tick_rejects_non_stage_1_config() {
         telemetry_log: &telemetry_log,
     };
 
-    let err = run_tick(&deps, 0).expect_err("stage != 1 must be rejected, never silently executed");
+    let err = run_tick(&deps, 0, 0).expect_err("stage != 1 must be rejected, never silently executed");
     match err {
         daemon::errors::DaemonError::Config(msg) => {
             assert!(msg.contains("stage=2"), "error should name the offending stage: {msg}");
@@ -331,7 +334,7 @@ fn run_tick_never_calls_dispatch_when_router_parses_no_verdict() {
         telemetry_log: &telemetry_log,
     };
 
-    let summary = run_tick(&deps, 0).expect("tick should succeed even on a routing parse failure");
+    let summary = run_tick(&deps, 0, 0).expect("tick should succeed even on a routing parse failure");
     assert_eq!(summary.beads_created, 1);
     assert_eq!(summary.beads_routed, 0);
     assert_eq!(summary.beads_dispatched, 0);
@@ -347,6 +350,246 @@ fn run_tick_never_calls_dispatch_when_router_parses_no_verdict() {
 
     let overlay = store.load("fake-bead-1").unwrap().unwrap();
     assert_eq!(overlay.state, OverlayState::HumanHeld);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_autonomy_increment_and_timebox_envelope() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.autonomy_timebox_secs = 3600; // 1 hour for test
+
+    // Seed recent commit time for the branch to bypass wedge detection
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.remote_branches.insert("factory/bead-1-r1".into(), Some(now_epoch));
+
+    // Pre-seed a Dispatched bead with 50 minutes of autonomy
+    store.overlays.borrow_mut().insert(
+        "bead-1".into(),
+        BeadOverlay {
+            bead_id: "bead-1".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 3000, // 50 mins
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-1-r1".into()),
+            session_id: None,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_autonomy.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // Run tick with 300 seconds (5 minutes) elapsed
+    let _summary = run_tick(&deps, 1, 300).expect("tick should succeed");
+    
+    // Check autonomy_secs has incremented by 300 to 3300
+    let o = store.load("bead-1").unwrap().unwrap();
+    assert_eq!(o.autonomy_secs, 3300);
+    assert_eq!(o.state, OverlayState::Dispatched); // should still be Dispatched, below timebox
+
+    // Now run tick with another 400 seconds (total 3700, exceeding 3600 timebox)
+    let summary2 = run_tick(&deps, 2, 400).expect("tick should succeed");
+    let o2 = store.load("bead-1").unwrap().unwrap();
+    assert_eq!(o2.autonomy_secs, 3700);
+    assert_eq!(o2.state, OverlayState::HumanHeld); // should be parked HumanHeld
+    assert_eq!(summary2.beads_parked_human_held, 1);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_autonomy_budget_warning_crossing() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.autonomy_timebox_secs = 1000; // 80% is 800
+
+    // Seed bead below 80% threshold (e.g. 750 secs)
+    store.overlays.borrow_mut().insert(
+        "bead-2".into(),
+        BeadOverlay {
+            bead_id: "bead-2".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 750,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-2-r1".into()),
+            session_id: None,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_warning.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // Run tick with 60 seconds elapsed (new autonomy_secs = 810, crossing 800)
+    let _ = run_tick(&deps, 1, 60).unwrap();
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(logs.contains("BUDGET_WARNING"), "log must contain BUDGET_WARNING event: {}", logs);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_wedge_detection_dispatched_coder_silent() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    // Pre-seed a Dispatched bead with autonomy_secs >= 1800 (e.g. 1900)
+    store.overlays.borrow_mut().insert(
+        "bead-silent".into(),
+        BeadOverlay {
+            bead_id: "bead-silent".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 1900,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-silent-r1".into()),
+            session_id: None,
+        },
+    );
+
+    // Script scm remote branch to return None (does not exist)
+    scm.remote_branches.insert("factory/bead-silent-r1".into(), None);
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_wedge_silent.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // Run tick
+    let summary = run_tick(&deps, 1, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 1);
+
+    let o = store.load("bead-silent").unwrap().unwrap();
+    assert_eq!(o.state, OverlayState::HumanHeld);
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(logs.contains("PARKED_HUMAN_HELD"), "logs: {}", logs);
+    assert!(logs.contains("coder_silent"), "logs: {}", logs);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_wedge_detection_attested_session_stalled() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    // Pre-seed Attested bead with session_id
+    store.overlays.borrow_mut().insert(
+        "bead-stalled".into(),
+        BeadOverlay {
+            bead_id: "bead-stalled".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 500,
+            spend_usd: 0.0,
+            pr_number: Some(42),
+            branch: Some("factory/bead-stalled-r1".into()),
+            session_id: Some("session-abc123yz".into()),
+        },
+    );
+
+    // Mock PR snapshot with updated_at_epoch older than 30 minutes
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        42,
+        PrSnapshot {
+            pr_number: 42,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            head_sha: "deadbeef".into(),
+            updated_at_epoch: now_epoch - 2000, // older than 1800s
+        },
+    );
+
+    // Script sessions to be quiescent (stalled/dead)
+    sessions.quiescent = true;
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_wedge_stalled.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // Run tick
+    let summary = run_tick(&deps, 1, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 1);
+
+    let o = store.load("bead-stalled").unwrap().unwrap();
+    assert_eq!(o.state, OverlayState::HumanHeld);
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(logs.contains("session_stalled"), "logs: {}", logs);
 
     let _ = std::fs::remove_file(&telemetry_log);
 }

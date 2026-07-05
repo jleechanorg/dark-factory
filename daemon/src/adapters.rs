@@ -165,7 +165,7 @@ impl Scm for CliScm {
                 "--repo",
                 &self.repo,
                 "--json",
-                "mergeable,reviews,headRefOid",
+                "mergeable,reviews,headRefOid,updatedAt",
             ],
             30,
         )?;
@@ -175,6 +175,8 @@ impl Scm for CliScm {
             reviews: Vec<GhReview>,
             #[serde(rename = "headRefOid")]
             head_ref_oid: String,
+            #[serde(rename = "updatedAt")]
+            updated_at: String,
         }
         #[derive(serde::Deserialize)]
         struct GhReview {
@@ -310,6 +312,7 @@ impl Scm for CliScm {
             unresolved_thread_count = pr_data.review_threads.nodes.iter().filter(|n| !n.is_resolved).count() as u32;
         }
 
+        let updated_at_epoch = crate::tools::iso8601_to_epoch(&view.updated_at).unwrap_or(0);
         Ok(PrSnapshot {
             pr_number: pr,
             ci_success,
@@ -318,6 +321,7 @@ impl Scm for CliScm {
             bugbot_error_count,
             unresolved_thread_count,
             head_sha: view.head_ref_oid,
+            updated_at_epoch,
         })
     }
 
@@ -329,6 +333,41 @@ impl Scm for CliScm {
             30,
         )?;
         Ok(())
+    }
+
+    fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError> {
+        let path = format!("repos/{}/branches/{}", self.repo, branch);
+        let out = match run_tool("gh", &["api", &path], 30) {
+            Ok(o) => o,
+            Err(DaemonError::Tool { stderr, .. }) if stderr.contains("404") || stderr.contains("Not Found") || stderr.contains("not found") => {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        #[derive(serde::Deserialize)]
+        struct GhBranch {
+            commit: GhCommit,
+        }
+        #[derive(serde::Deserialize)]
+        struct GhCommit {
+            commit: GhCommitDetails,
+        }
+        #[derive(serde::Deserialize)]
+        struct GhCommitDetails {
+            committer: GhCommitter,
+        }
+        #[derive(serde::Deserialize)]
+        struct GhCommitter {
+            date: String,
+        }
+        let json_start = out.find('{').unwrap_or(0);
+        let resp: GhBranch = serde_json::from_str(&out[json_start..]).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse branch commit response: {e}"))
+        })?;
+        let epoch = crate::tools::iso8601_to_epoch(&resp.commit.commit.committer.date).ok_or_else(|| {
+            DaemonError::Parse(format!("failed to parse date: {}", resp.commit.commit.committer.date))
+        })?;
+        Ok(Some(epoch))
     }
 }
 

@@ -117,6 +117,7 @@ pub struct PrSnapshot {
     pub bugbot_error_count: u32,
     pub unresolved_thread_count: u32,
     pub head_sha: String,
+    pub updated_at_epoch: u64,
 }
 
 /// Parameters for spawning a new AO/`aow` session (design doc §4).
@@ -130,6 +131,36 @@ pub struct SpawnSpec {
 /// Opaque handle to an AO/`aow` session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(pub String);
+
+/// Helper function to convert ISO-8601 Zulu format to Unix epoch seconds
+fn days_from_civil(mut y: i64, m: u32, d: u32) -> i64 {
+    y -= if m <= 2 { 1 } else { 0 };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = ((153 * mp + 2) / 5) as u64 + d as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
+pub fn iso8601_to_epoch(s: &str) -> Option<u64> {
+    if s.len() < 19 {
+        return None;
+    }
+    let y: i64 = s[0..4].parse().ok()?;
+    let mo: u32 = s[5..7].parse().ok()?;
+    let d: u32 = s[8..10].parse().ok()?;
+    let h: u64 = s[11..13].parse().ok()?;
+    let mi: u64 = s[14..16].parse().ok()?;
+    let sec: u64 = s[17..19].parse().ok()?;
+
+    let days = days_from_civil(y, mo, d);
+    if days < 0 {
+        return None;
+    }
+    let epoch = (days as u64) * 86400 + h * 3600 + mi * 60 + sec;
+    Some(epoch)
+}
 
 /// `br` CLI. `fetch_candidates` == `br list --status open --label factory --json`.
 pub trait Tracker {
@@ -149,6 +180,7 @@ pub trait Scm {
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError>;
     fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError>;
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError>;
+    fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError>;
 }
 
 /// `ao` / `aow` CLIs.
