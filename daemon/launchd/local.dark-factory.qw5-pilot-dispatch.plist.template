@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template: local.dark-factory.qw5-pilot-dispatch.plist.template
+  Purpose: one-shot launchd timer that fires daemon/qw5-pilot-dispatch.sh
+           ~2h after this plist is bootstrapped. Self-unloads on first run.
+
+  Usage (manual install):
+    launchctl bootstrap gui/$UID "$HOME/Library/LaunchAgents/local.dark-factory.qw5-pilot-dispatch.plist"
+    # (or `launchctl load -w` for legacy) but launchctl bootstrap is preferred on macOS 11+.
+
+  Disarm:
+    rm /tmp/jleechan-qw5-dispatch.done
+    launchctl bootout gui/$UID "$HOME/Library/LaunchAgents/local.dark-factory.qw5-pilot-dispatch.plist"
+
+  Notes:
+    - The plist uses StartCalendarInterval with explicit Year/Month/Day/Hour/Minute
+      so it's a one-shot at the configured wall-clock time. After firing, the dispatch
+      script writes /tmp/jleechan-qw5-dispatch.done and self-unloads the plist.
+    - When you generate the real plist from this template, fill in @YEAR@, @MONTH@,
+      @DAY@, @HOUR@, @MINUTE@ with the target date/time for the dispatch.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.dark-factory.qw5-pilot-dispatch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/jleechan/projects/dark-factory/daemon/qw5-pilot-dispatch.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Year</key><integer>@YEAR@</integer>
+        <key>Month</key><integer>@MONTH@</integer>
+        <key>Day</key><integer>@DAY@</integer>
+        <key>Hour</key><integer>@HOUR@</integer>
+        <key>Minute</key><integer>@MINUTE@</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/jleechan-qw5-dispatch.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/jleechan-qw5-dispatch.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

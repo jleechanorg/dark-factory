@@ -44,3 +44,4 @@ specs/skeptic-report.json
 # actions/checkout for every new PR. Block it at the index level so future
 # factory runs cannot re-introduce the broken state.
 worktree_factory_evolve/
+daemon/target/
