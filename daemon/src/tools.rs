@@ -107,6 +107,19 @@ impl Permission {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PrComment {
+    pub author: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PrFile {
+    pub path: String,
+    pub additions: u32,
+    pub deletions: u32,
+}
+
 /// One gate's read from the SCM, gathered for the 7/8-green verifier (spec §4.2.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrSnapshot {
@@ -117,6 +130,9 @@ pub struct PrSnapshot {
     pub bugbot_error_count: u32,
     pub unresolved_thread_count: u32,
     pub head_sha: String,
+    pub body: String,
+    pub comments: Vec<PrComment>,
+    pub files: Vec<PrFile>,
 }
 
 /// Parameters for spawning a new AO/`aow` session (design doc §4).

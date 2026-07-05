@@ -304,6 +304,7 @@ fn skeptic_evidence(llm: &dyn Llm, bead_id: &str, pr: u64) -> Result<PrEvidence,
     let reply = llm.judge(&prompt)?;
     let skeptic_verdict = verifier::parse_skeptic_verdict(&reply);
     Ok(PrEvidence {
+        is_production: false,
         non_test_changed_loc: 0,
         has_integration_evidence_marker: false,
         er_verdict: verifier::ErVerdict::Absent,
@@ -363,7 +364,12 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             None => continue,
         };
 
-        let evidence = skeptic_evidence(deps.llm, bead_id, pr)?;
+        let mut evidence = skeptic_evidence(deps.llm, bead_id, pr)?;
+        let snapshot = deps.scm.pr_snapshot(pr)?;
+        evidence.er_verdict = verifier::parse_er_verdict(&snapshot.comments);
+        evidence.is_production = verifier::classify_production(&snapshot.files);
+        evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
+        evidence.has_integration_evidence_marker = verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
         let report = verifier::assess(deps.scm, pr, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
         emit(
