@@ -200,20 +200,20 @@ impl Scm for CliScm {
 
         let checks_out = run_tool(
             "gh",
-            &["pr", "checks", &pr_str, "--repo", &self.repo, "--json", "state,conclusion"],
+            &["pr", "checks", &pr_str, "--repo", &self.repo, "--json", "state,bucket"],
             30,
         )?;
         #[derive(serde::Deserialize)]
         struct GhCheck {
             state: String,
-            conclusion: String,
+            bucket: String,
         }
         let json_start_c = checks_out.find('[').unwrap_or(0);
         let checks: Vec<GhCheck> = serde_json::from_str(&checks_out[json_start_c..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse gh pr checks JSON: {e}"))
         })?;
         let ci_success = !checks.is_empty() && checks.iter().all(|c| {
-            c.state == "COMPLETED" && (c.conclusion == "SUCCESS" || c.conclusion == "NEUTRAL" || c.conclusion == "SKIPPED")
+            c.bucket == "pass" || c.bucket == "skipping"
         });
 
         let comments_out = run_tool(
