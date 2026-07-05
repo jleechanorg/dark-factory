@@ -1036,33 +1036,19 @@ impl CliSessions {
             }
         }
 
-        let mut child = cmd.spawn().map_err(|e| DaemonError::Tool {
+        let output = cmd.output().map_err(|e| DaemonError::Tool {
             tool: if std::env::consts::OS == "macos" { "sandbox-exec".to_string() } else { "ao".to_string() },
             rc: -1,
-            stderr: format!("spawn failed: {e}"),
+            stderr: format!("execution failed: {e}"),
         })?;
 
-        let status = child.wait().map_err(|e| DaemonError::Tool {
-            tool: if std::env::consts::OS == "macos" { "sandbox-exec".to_string() } else { "ao".to_string() },
-            rc: -1,
-            stderr: format!("wait failed: {e}"),
-        })?;
+        let out = String::from_utf8_lossy(&output.stdout);
 
-        let mut stdout_buf = Vec::new();
-        if let Some(mut stdout) = child.stdout {
-            let _ = stdout.read_to_end(&mut stdout_buf);
-        }
-        let out = String::from_utf8_lossy(&stdout_buf);
-
-        if !status.success() {
-            let mut stderr_buf = Vec::new();
-            if let Some(mut stderr) = child.stderr {
-                let _ = stderr.read_to_end(&mut stderr_buf);
-            }
-            let err_msg = String::from_utf8_lossy(&stderr_buf);
+        if !output.status.success() {
+            let err_msg = String::from_utf8_lossy(&output.stderr);
             return Err(DaemonError::Tool {
                 tool: format!("ao spawn --agent {agent}"),
-                rc: status.code().unwrap_or(-1),
+                rc: output.status.code().unwrap_or(-1),
                 stderr: err_msg.into_owned(),
             });
         }
