@@ -400,12 +400,14 @@ fn test_autonomy_increment_and_timebox_envelope() {
     let telemetry_log = std::env::temp_dir().join("afd_test_autonomy.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
+    let vcs = FakeVcs::new();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
         sessions: &sessions,
         llm: &llm,
         store: &store,
+        vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
     };
@@ -457,12 +459,14 @@ fn test_autonomy_budget_warning_crossing() {
     let telemetry_log = std::env::temp_dir().join("afd_test_warning.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
+    let vcs = FakeVcs::new();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
         sessions: &sessions,
         llm: &llm,
         store: &store,
+        vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
     };
@@ -507,12 +511,14 @@ fn test_wedge_detection_dispatched_coder_silent() {
     let telemetry_log = std::env::temp_dir().join("afd_test_wedge_silent.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
+    let vcs = FakeVcs::new();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
         sessions: &sessions,
         llm: &llm,
         store: &store,
+        vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
     };
@@ -571,6 +577,9 @@ fn test_wedge_detection_attested_session_stalled() {
             bugbot_error_count: 0,
             unresolved_thread_count: 0,
             head_sha: "deadbeef".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
             updated_at_epoch: now_epoch - 2000, // older than 1800s
         },
     );
@@ -581,12 +590,14 @@ fn test_wedge_detection_attested_session_stalled() {
     let telemetry_log = std::env::temp_dir().join("afd_test_wedge_stalled.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
+    let vcs = FakeVcs::new();
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
         sessions: &sessions,
         llm: &llm,
         store: &store,
+        vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
     };

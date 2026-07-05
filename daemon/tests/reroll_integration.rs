@@ -82,6 +82,7 @@ fn test_circuit_breaker() {
         spend_usd: 1.0,
         pr_number: Some(102),
         branch: Some("factory/bead-breaker-r2".into()),
+        session_id: None,
     };
     store.save(&bead).unwrap();
 
@@ -157,6 +158,7 @@ fn test_reroll_success() {
         spend_usd: 0.5,
         pr_number: Some(201),
         branch: Some("factory/bead-success-r1".into()),
+        session_id: None,
     };
     store.save(&bead).unwrap();
 
@@ -253,7 +255,7 @@ fn test_tick_stage2_integration() {
     };
 
     // --- Tick 1: Intake -> Route -> Dispatch ---
-    run_tick(&deps, 0).unwrap();
+    run_tick(&deps, 0, 0).unwrap();
     let overlay1 = store.load("fake-bead-1").unwrap().unwrap();
     assert_eq!(overlay1.state, OverlayState::Dispatched);
 
@@ -272,6 +274,10 @@ fn test_tick_stage2_integration() {
             bugbot_error_count: 0,
             unresolved_thread_count: 0,
             head_sha: "head-sha-abc".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 0,
         },
     );
 
@@ -316,7 +322,7 @@ fn test_tick_stage2_integration() {
     };
 
     // --- Tick 2: assess gates (fails) -> execute re-roll -> spec mutation -> recovery -> redispatched ---
-    let summary = run_tick(&deps_smart, 1).unwrap();
+    let summary = run_tick(&deps_smart, 1, 0).unwrap();
     assert_eq!(summary.gates_assessed, 1);
 
     // Verify that the bead was re-rolled, mutated, validated, and transitioned to REDISPATCHED!

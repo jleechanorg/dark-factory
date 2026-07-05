@@ -40,6 +40,27 @@ exec >>"$OUT" 2>>"$ERR"
 
 log "===== ${BEAD_ID} dispatch start ====="
 
+# Sourcing profiles to load user environment in launchd context
+for profile in "${HOME}/.bash_profile" "${HOME}/.bashrc" "${HOME}/.zshrc"; do
+  if [ -f "$profile" ]; then
+    source "$profile" 2>/dev/null || true
+  fi
+done
+
+# Ensure typical user paths are on PATH
+export PATH="/Users/jleechan/.local/bin:${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$PATH"
+
+# Sanity-check the minimax wrapper is on PATH.
+if ! command -v claudem >/dev/null; then
+  log "FATAL: claudem not on PATH (checked after path expansions)"
+  exit 64
+fi
+
+if [ ! -f "${REPO}/daemon/qw5-coder-prompt.md" ]; then
+  log "FATAL: coder prompt file missing at ${REPO}/daemon/qw5-coder-prompt.md"
+  exit 65
+fi
+
 # 1. Idempotency sentinel — self-unload and exit if already fired.
 if [ -f "$SENTINEL" ]; then
   log "sentinel ${SENTINEL} already present; self-unloading and exiting (no-op)"
@@ -69,26 +90,11 @@ export ANTHROPIC_API_KEY="${MINIMAX_API_KEY:-}"
 export ANTHROPIC_MODEL="MiniMax-M3"
 export ANTHROPIC_SMALL_FAST_MODEL="MiniMax-M3"
 export CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=0
-export PATH="$HOME/.local/bin:$PATH"
 log "minimax env vars set; ANTHROPIC_MODEL=${ANTHROPIC_MODEL}"
-
-# 4. Sanity-check the minimax wrapper is on PATH.
-if ! command -v claudem >/dev/null; then
-  log "FATAL: claudem not on PATH (source ~/.bashrc or use absolute path)"
-  exit 64
-fi
-
-# 5. Dispatch the coder subagent. The coder reads the prompt file directly and
-#    follows its binding specification (TDD-first, conservative coalesce,
-#    minimax-only, worktree-only, no merge).
-log "dispatching coder via claudem -p \$(cat ${REPO}/daemon/qw5-coder-prompt.md)"
-if [ ! -f "${REPO}/daemon/qw5-coder-prompt.md" ]; then
-  log "FATAL: coder prompt file missing at ${REPO}/daemon/qw5-coder-prompt.md"
-  exit 65
-fi
 
 cd "$WT"
 
+log "dispatching coder via claudem -p \$(cat ${REPO}/daemon/qw5-coder-prompt.md)"
 # Run with stdin closed to avoid interactive prompts in launchd context.
 claudem -p "$(cat "${REPO}/daemon/qw5-coder-prompt.md")" \
   </dev/null \
