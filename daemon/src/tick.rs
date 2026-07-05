@@ -25,7 +25,7 @@ use crate::intake;
 use crate::router::{self, RoutingVerdict};
 use crate::state::{BeadOverlay, OverlayState, StateStore};
 use crate::telemetry::{self, TelemetryEvent};
-use crate::tools::{Bead, Llm, Scm, SessionId, Sessions, Tracker};
+use crate::tools::{Bead, Llm, Scm, SessionId, Sessions, Tracker, Vcs};
 use crate::verifier::{self, PrEvidence};
 use std::path::Path;
 
@@ -39,6 +39,7 @@ pub struct TickDeps<'a> {
     pub sessions: &'a dyn Sessions,
     pub llm: &'a dyn Llm,
     pub store: &'a dyn StateStore,
+    pub vcs: &'a dyn Vcs,
     pub cfg: &'a Config,
     pub telemetry_log: &'a Path,
 }
@@ -119,9 +120,9 @@ fn emit(
 /// Stage gate: `deps.cfg.stage` must be `1` — this function only implements
 /// the Stage-1 substitution rule (re-roll verdicts recorded, never executed).
 pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<TickSummary, DaemonError> {
-    if deps.cfg.stage != 1 {
+    if deps.cfg.stage != 1 && deps.cfg.stage != 2 {
         return Err(DaemonError::Config(format!(
-            "run_tick only implements the Stage-1 substitution rule (stage=1); got stage={}",
+            "run_tick only implements stage 1 or 2; got stage={}",
             deps.cfg.stage
         )));
     }
@@ -323,7 +324,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     let mut ready: Vec<Bead> = Vec::new();
     for bead in &routing_candidates {
         let overlay = match deps.store.load(&bead.id)? {
-            Some(o) if o.state == OverlayState::Queued => o,
+            Some(o) if o.state == OverlayState::Queued || o.state == OverlayState::Redispatched => o,
             _ => continue,
         };
 
@@ -436,12 +437,14 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // actively tracking" set (deletion-guard doc comment on
     // `StateStore::owned_branches`).
     let branches = deps.store.owned_branches()?;
-    let bead_ids: Vec<String> = branches
+    let mut bead_ids: Vec<String> = branches
         .iter()
         .filter_map(|b| b.rsplit_once("-r").map(|(prefix, _attempt)| prefix))
         .filter_map(|prefix| prefix.strip_prefix("factory/"))
         .map(|s| s.to_string())
         .collect();
+    bead_ids.sort();
+    bead_ids.dedup();
 
     for bead_id in &bead_ids {
         let mut overlay = match deps.store.load(bead_id)? {
@@ -506,29 +509,116 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 serde_json::json!({}),
             )?;
         } else {
-            // Stage-1 substitution rule (CONTRACT.md §1): record the re-roll
-            // verdict, never execute it. Park HUMAN_HELD instead of RE_ROLL.
-            emit(
-                deps.telemetry_log,
-                bead_id,
-                overlay.attempt,
-                OverlayState::Attested.as_str(),
-                "REROLL_VERDICT_RECORDED",
-                serde_json::json!({}),
-                serde_json::json!({"stage": deps.cfg.stage}),
-            )?;
-            overlay.state = OverlayState::HumanHeld;
-            deps.store.save(&overlay)?;
-            summary.beads_parked_human_held += 1;
-            emit(
-                deps.telemetry_log,
-                bead_id,
-                overlay.attempt,
-                OverlayState::HumanHeld.as_str(),
-                "PARKED_HUMAN_HELD",
-                serde_json::json!({}),
-                serde_json::json!({"reason": "gate assessment not all-green (stage 1: recorded, not executed)"}),
-            )?;
+            if deps.cfg.stage == 1 {
+                // Stage-1 substitution rule (CONTRACT.md §1): record the re-roll
+                // verdict, never execute it. Park HUMAN_HELD instead of RE_ROLL.
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "REROLL_VERDICT_RECORDED",
+                    serde_json::json!({}),
+                    serde_json::json!({"stage": deps.cfg.stage}),
+                )?;
+                overlay.state = OverlayState::HumanHeld;
+                deps.store.save(&overlay)?;
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "gate assessment not all-green (stage 1: recorded, not executed)"}),
+                )?;
+            } else {
+                // Stage 2: execute re-roll engine
+                let mut reviewer = "verifier".to_string();
+                let mut feedback = Vec::new();
+                for (gate_name, result) in &report.results {
+                    if let verifier::GateResult::Red(ref reason) = result {
+                        feedback.push(format!("{gate_name:?}: {reason}"));
+                        if *gate_name == verifier::GateName::Skeptic {
+                            reviewer = "skeptic".to_string();
+                        } else if *gate_name == verifier::GateName::CodeRabbitApproved {
+                            reviewer = "coderabbit".to_string();
+                        }
+                    }
+                }
+                let review_text = feedback.join("\n");
+
+                let reroll_deps = crate::reroll::RerollDeps {
+                    scm: deps.scm,
+                    sessions: deps.sessions,
+                    vcs: deps.vcs,
+                    store: deps.store,
+                    llm: deps.llm,
+                    cfg: deps.cfg,
+                    telemetry_log: deps.telemetry_log,
+                    reviewer,
+                    review_text,
+                };
+
+                match crate::reroll::execute(&reroll_deps, &mut overlay) {
+                    Ok(crate::reroll::RerollOutcome::Rerolled { new_branch: _ }) => {
+                        // Perform recovery validation: check if spec is valid TOML
+                        let spec_path = Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", overlay.bead_id));
+                        let validation_pass = if spec_path.exists() {
+                            if let Ok(c) = std::fs::read_to_string(&spec_path) {
+                                toml::from_str::<serde_json::Value>(&c).is_ok()
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if validation_pass {
+                            overlay.state = OverlayState::Redispatched;
+                            deps.store.save(&overlay)?;
+                            emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::Redispatched.as_str(),
+                                "REDISPATCHED",
+                                serde_json::json!({}),
+                                serde_json::json!({}),
+                            )?;
+                        } else {
+                            overlay.state = OverlayState::HumanHeld;
+                            deps.store.save(&overlay)?;
+                            summary.beads_parked_human_held += 1;
+                            emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::HumanHeld.as_str(),
+                                "PARKED_HUMAN_HELD",
+                                serde_json::json!({}),
+                                serde_json::json!({"reason": "spec file validation failed in recovery"}),
+                            )?;
+                        }
+                    }
+                    Ok(crate::reroll::RerollOutcome::Held(reason)) => {
+                        summary.beads_parked_human_held += 1;
+                        // already saved to HumanHeld inside execute
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "PARKED_HUMAN_HELD",
+                            serde_json::json!({}),
+                            serde_json::json!({"reason": reason}),
+                        )?;
+                    }
+                    Ok(crate::reroll::RerollOutcome::Aborted(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
         }
     }
 

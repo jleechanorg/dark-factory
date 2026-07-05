@@ -81,6 +81,8 @@ pub trait StateStore {
     /// Deletion guard: daemon may delete ONLY refs returned here (spec §4.2.8).
     fn owned_branches(&self) -> Result<Vec<String>, DaemonError>;
     fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError>;
+    fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, feedback_text: &str) -> Result<(), DaemonError>;
+    fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError>;
 }
 
 /// `StateStore` impl against `~/.dark-factory/daemon-cxdb.sqlite` (WAL mode,
@@ -303,6 +305,42 @@ impl StateStore for SqliteStateStore {
             });
         }
         Ok(out)
+    }
+
+    fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, feedback_text: &str) -> Result<(), DaemonError> {
+        self.conn
+            .execute(
+                "INSERT INTO review_rejection (bead_id, attempt, reviewer, feedback_hash, feedback_text, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(bead_id, attempt) DO UPDATE SET \
+                   reviewer=excluded.reviewer, feedback_hash=excluded.feedback_hash, \
+                   feedback_text=excluded.feedback_text, created_at=excluded.created_at",
+                params![
+                    bead_id,
+                    attempt,
+                    reviewer,
+                    feedback_hash,
+                    feedback_text,
+                    now_iso8601(),
+                ],
+            )
+            .map_err(|e| tool_err("save_rejection", e))?;
+        Ok(())
+    }
+
+    fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError> {
+        self.conn
+            .query_row(
+                "SELECT reviewer, feedback_hash FROM review_rejection WHERE bead_id = ?1 AND attempt = ?2",
+                params![bead_id, attempt],
+                |row| {
+                    let reviewer: String = row.get(0)?;
+                    let feedback_hash: String = row.get(1)?;
+                    Ok((reviewer, feedback_hash))
+                },
+            )
+            .optional()
+            .map_err(|e| tool_err("load_rejection", e))
     }
 }
 

@@ -23,7 +23,7 @@
 // not a regression in this test's scenario.
 mod common;
 
-use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker};
+use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker, FakeVcs};
 use daemon::config::Config;
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{run_tick, TickDeps};
@@ -70,6 +70,7 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
     ));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
+    let vcs = FakeVcs::new();
     let telemetry_dir = std::env::temp_dir().join("afd_tick_integration_test");
     std::fs::create_dir_all(&telemetry_dir).unwrap();
     let telemetry_log = telemetry_dir.join(format!(
@@ -86,6 +87,7 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
             sessions: &sessions,
             llm: &llm,
             store: &store,
+            vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         },
@@ -148,6 +150,7 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
             sessions: &sessions,
             llm: &llm,
             store: &store,
+            vcs: &vcs,
             cfg: &cfg,
             telemetry_log: &telemetry_log,
         },
@@ -275,14 +278,15 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
 }
 
 #[test]
-fn run_tick_rejects_non_stage_1_config() {
+fn run_tick_rejects_non_stage_1_or_2_config() {
     let scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
-    cfg.stage = 2;
+    cfg.stage = 3;
+    let vcs = FakeVcs::new();
     let telemetry_log = std::env::temp_dir().join("afd_tick_integration_stage2_unused.jsonl");
 
     let deps = TickDeps {
@@ -291,6 +295,7 @@ fn run_tick_rejects_non_stage_1_config() {
         sessions: &sessions,
         llm: &llm,
         store: &store,
+        vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
     };
@@ -298,7 +303,7 @@ fn run_tick_rejects_non_stage_1_config() {
     let err = run_tick(&deps, 0, 0).expect_err("stage != 1 must be rejected, never silently executed");
     match err {
         daemon::errors::DaemonError::Config(msg) => {
-            assert!(msg.contains("stage=2"), "error should name the offending stage: {msg}");
+            assert!(msg.contains("stage=3"), "error should name the offending stage: {msg}");
         }
         other => panic!("expected DaemonError::Config, got {other:?}"),
     }
@@ -324,6 +329,7 @@ fn run_tick_never_calls_dispatch_when_router_parses_no_verdict() {
     *llm.response.borrow_mut() = Some(Ok("I think this looks fine, hard to say".into()));
     let store = FakeStateStore::new();
     let cfg = test_cfg();
+    let vcs = FakeVcs::new();
     let telemetry_log = std::env::temp_dir().join("afd_tick_integration_parse_fail.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -333,6 +339,7 @@ fn run_tick_never_calls_dispatch_when_router_parses_no_verdict() {
         sessions: &sessions,
         llm: &llm,
         store: &store,
+        vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
     };

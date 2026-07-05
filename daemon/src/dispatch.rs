@@ -165,6 +165,7 @@ mod tests {
     struct FakeStateStore {
         overlays: RefCell<HashMap<String, BeadOverlay>>,
         branches: RefCell<Vec<String>>,
+        rejections: RefCell<HashMap<(String, u32), (String, String)>>,
         fail_save_for_state: Option<OverlayState>,
     }
 
@@ -220,6 +221,15 @@ mod tests {
                 }
             }
             Ok(updated)
+        }
+
+        fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, _feedback_text: &str) -> Result<(), DaemonError> {
+            self.rejections.borrow_mut().insert((bead_id.to_string(), attempt), (reviewer.to_string(), feedback_hash.to_string()));
+            Ok(())
+        }
+
+        fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError> {
+            Ok(self.rejections.borrow().get(&(bead_id.to_string(), attempt)).cloned())
         }
     }
 

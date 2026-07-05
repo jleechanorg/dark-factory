@@ -208,15 +208,17 @@ fn run(args: Args) -> Result<(), DaemonError> {
         Box::new(SqliteStateStore::open(&db_path)?)
     };
 
-    let (scm, tracker, sessions, llm): (
+    let (scm, tracker, sessions, llm, vcs): (
         Box<dyn Scm>,
         Box<dyn Tracker>,
         Box<dyn Sessions>,
         Box<dyn Llm>,
+        Box<dyn Vcs>,
     ) = if args.dry_run {
         #[cfg(any(test, debug_assertions))]
         {
             (
+                Box::new(NoopAdapters),
                 Box::new(NoopAdapters),
                 Box::new(NoopAdapters),
                 Box::new(NoopAdapters),
@@ -230,12 +232,13 @@ fn run(args: Args) -> Result<(), DaemonError> {
             ));
         }
     } else {
-        use daemon::adapters::{CliScm, CliSessions, CliTracker, ChainLlm};
+        use daemon::adapters::{CliScm, CliSessions, CliTracker, ChainLlm, CliVcs};
         (
             Box::new(CliScm::new(cfg.target_repo.clone())),
             Box::new(CliTracker),
             Box::new(CliSessions::new(&cfg.target_repo, "claude-code")),
             Box::new(ChainLlm),
+            Box::new(CliVcs),
         )
     };
 
@@ -245,6 +248,7 @@ fn run(args: Args) -> Result<(), DaemonError> {
         sessions: sessions.as_ref(),
         llm: llm.as_ref(),
         store: store.as_ref(),
+        vcs: vcs.as_ref(),
         cfg: &cfg,
         telemetry_log: &telemetry_log,
     };

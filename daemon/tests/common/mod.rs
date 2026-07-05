@@ -286,6 +286,7 @@ impl Llm for FakeLlm {
 pub struct FakeStateStore {
     pub overlays: RefCell<HashMap<String, BeadOverlay>>,
     pub branches: RefCell<Vec<String>>,
+    pub rejections: RefCell<HashMap<(String, u32), (String, String)>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -335,5 +336,16 @@ impl StateStore for FakeStateStore {
             }
         }
         Ok(updated)
+    }
+
+    fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, _feedback_text: &str) -> Result<(), DaemonError> {
+        self.calls.borrow_mut().push(format!("save_rejection({bead_id},{attempt},{reviewer},{feedback_hash})"));
+        self.rejections.borrow_mut().insert((bead_id.to_string(), attempt), (reviewer.to_string(), feedback_hash.to_string()));
+        Ok(())
+    }
+
+    fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError> {
+        self.calls.borrow_mut().push(format!("load_rejection({bead_id},{attempt})"));
+        Ok(self.rejections.borrow().get(&(bead_id.to_string(), attempt)).cloned())
     }
 }
