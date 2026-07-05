@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use daemon::errors::DaemonError;
-use daemon::state::{BeadOverlay, StateStore};
+use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tools::{
     Bead, Issue, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs,
 };
@@ -87,6 +87,7 @@ pub struct FakeScm {
     pub issues: Vec<Issue>,
     pub permissions: HashMap<String, Permission>,
     pub pr_snapshots: HashMap<u64, PrSnapshot>,
+    pub remote_branches: HashMap<String, Option<u64>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -132,6 +133,17 @@ impl Scm for FakeScm {
             .borrow_mut()
             .push(format!("close_pr({pr},{comment})"));
         Ok(())
+    }
+
+    fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("remote_branch_last_commit({branch})"));
+        if let Some(&res) = self.remote_branches.get(branch) {
+            Ok(res)
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -274,6 +286,7 @@ impl Llm for FakeLlm {
 pub struct FakeStateStore {
     pub overlays: RefCell<HashMap<String, BeadOverlay>>,
     pub branches: RefCell<Vec<String>>,
+    pub rejections: RefCell<HashMap<(String, u32), (String, String)>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -310,5 +323,29 @@ impl StateStore for FakeStateStore {
     fn owned_branches(&self) -> Result<Vec<String>, DaemonError> {
         self.calls.borrow_mut().push("owned_branches".into());
         Ok(self.branches.borrow().clone())
+    }
+
+    fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.calls.borrow_mut().push(format!("increment_active_autonomy({elapsed_secs})"));
+        let mut updated = Vec::new();
+        let mut overlays = self.overlays.borrow_mut();
+        for overlay in overlays.values_mut() {
+            if overlay.state == OverlayState::Dispatched || overlay.state == OverlayState::Attested {
+                overlay.autonomy_secs += elapsed_secs;
+                updated.push(overlay.clone());
+            }
+        }
+        Ok(updated)
+    }
+
+    fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, _feedback_text: &str) -> Result<(), DaemonError> {
+        self.calls.borrow_mut().push(format!("save_rejection({bead_id},{attempt},{reviewer},{feedback_hash})"));
+        self.rejections.borrow_mut().insert((bead_id.to_string(), attempt), (reviewer.to_string(), feedback_hash.to_string()));
+        Ok(())
+    }
+
+    fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError> {
+        self.calls.borrow_mut().push(format!("load_rejection({bead_id},{attempt})"));
+        Ok(self.rejections.borrow().get(&(bead_id.to_string(), attempt)).cloned())
     }
 }

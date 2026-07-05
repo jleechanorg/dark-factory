@@ -22,9 +22,12 @@ digraph gates {
     ]
     adversarial_reviewer [
         type="parallel_reviewer",
-        label="Adversarial reviewer (primary + shadow Codex)",
-        backend_priority="codex,minimax,agy,claude-sonnet",
+        label="Adversarial reviewer (primary + N shadows, density-enforced)",
+        prompt="@prompts/slim/review_phase5_shadow.md",
+        backend_priority="minimax,agy,codex,claude-sonnet",
         prefer_adversarial="true",
+        n_shadows="3",
+        gate_strict="true",
         timeout=600
     ]
     gate_es [

@@ -25,7 +25,7 @@ use crate::intake;
 use crate::router::{self, RoutingVerdict};
 use crate::state::{BeadOverlay, OverlayState, StateStore};
 use crate::telemetry::{self, TelemetryEvent};
-use crate::tools::{Bead, Llm, Scm, Sessions, Tracker};
+use crate::tools::{Bead, Llm, Scm, SessionId, Sessions, Tracker, Vcs};
 use crate::verifier::{self, PrEvidence};
 use std::path::Path;
 
@@ -39,6 +39,7 @@ pub struct TickDeps<'a> {
     pub sessions: &'a dyn Sessions,
     pub llm: &'a dyn Llm,
     pub store: &'a dyn StateStore,
+    pub vcs: &'a dyn Vcs,
     pub cfg: &'a Config,
     pub telemetry_log: &'a Path,
 }
@@ -118,15 +119,124 @@ fn emit(
 ///
 /// Stage gate: `deps.cfg.stage` must be `1` — this function only implements
 /// the Stage-1 substitution rule (re-roll verdicts recorded, never executed).
-pub fn run_tick(deps: &TickDeps, tick_index: u64) -> Result<TickSummary, DaemonError> {
-    if deps.cfg.stage != 1 {
+pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<TickSummary, DaemonError> {
+    if deps.cfg.stage != 1 && deps.cfg.stage != 2 {
         return Err(DaemonError::Config(format!(
-            "run_tick only implements the Stage-1 substitution rule (stage=1); got stage={}",
+            "run_tick only implements stage 1 or 2; got stage={}",
             deps.cfg.stage
         )));
     }
 
     let mut summary = TickSummary::default();
+
+    // Increment autonomy_secs and perform safety envelope & wedge detection checks for active beads
+    let active_overlays = deps.store.increment_active_autonomy(elapsed_secs)?;
+    for mut overlay in active_overlays {
+        // 1. Time-box envelope check
+        if overlay.autonomy_secs >= deps.cfg.autonomy_timebox_secs {
+            overlay.state = OverlayState::HumanHeld;
+            deps.store.save(&overlay)?;
+            emit(
+                deps.telemetry_log,
+                &overlay.bead_id,
+                overlay.attempt,
+                OverlayState::HumanHeld.as_str(),
+                "PARKED_HUMAN_HELD",
+                serde_json::json!({}),
+                serde_json::json!({"reason": "autonomy_timebox_exceeded"}),
+            )?;
+            summary.beads_parked_human_held += 1;
+            continue;
+        }
+
+        // 2. Budget warning (when autonomy time crosses 80% of the time-box)
+        let warning_threshold = (deps.cfg.autonomy_timebox_secs * 80) / 100;
+        if overlay.autonomy_secs >= warning_threshold
+            && (overlay.autonomy_secs.saturating_sub(elapsed_secs)) < warning_threshold
+        {
+            emit(
+                deps.telemetry_log,
+                &overlay.bead_id,
+                overlay.attempt,
+                overlay.state.as_str(),
+                "BUDGET_WARNING",
+                serde_json::json!({
+                    "autonomySecs": overlay.autonomy_secs,
+                    "thresholdSecs": warning_threshold,
+                }),
+                serde_json::json!({"message": "Autonomy time has crossed 80% of the time-box limit"}),
+            )?;
+        }
+
+        // 3. Wedge detection
+        match overlay.state {
+            OverlayState::Dispatched => {
+                if let Some(ref branch) = overlay.branch {
+                    if overlay.autonomy_secs >= 1800 {
+                        let last_commit_epoch = deps.scm.remote_branch_last_commit(branch)?;
+                        let now_epoch = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+
+                        let is_silent = match last_commit_epoch {
+                            None => true,
+                            Some(commit_time) => now_epoch.saturating_sub(commit_time) >= 1800,
+                        };
+
+                        if is_silent {
+                            overlay.state = OverlayState::HumanHeld;
+                            deps.store.save(&overlay)?;
+                            emit(
+                                deps.telemetry_log,
+                                &overlay.bead_id,
+                                overlay.attempt,
+                                OverlayState::HumanHeld.as_str(),
+                                "PARKED_HUMAN_HELD",
+                                serde_json::json!({}),
+                                serde_json::json!({"reason": "coder_silent"}),
+                            )?;
+                            summary.beads_parked_human_held += 1;
+                        }
+                    }
+                }
+            }
+            OverlayState::Attested => {
+                if let Some(pr_number) = overlay.pr_number {
+                    let pr_snapshot = deps.scm.pr_snapshot(pr_number)?;
+                    let now_epoch = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    if now_epoch.saturating_sub(pr_snapshot.updated_at_epoch) >= 1800 {
+                        let is_stalled_or_dead = if let Some(ref session_id_str) = overlay.session_id {
+                            let session_id = SessionId(session_id_str.clone());
+                            deps.sessions.is_quiescent(&session_id)?
+                        } else {
+                            true
+                        };
+
+                        if is_stalled_or_dead {
+                            overlay.state = OverlayState::HumanHeld;
+                            deps.store.save(&overlay)?;
+                            emit(
+                                deps.telemetry_log,
+                                &overlay.bead_id,
+                                overlay.attempt,
+                                OverlayState::HumanHeld.as_str(),
+                                "PARKED_HUMAN_HELD",
+                                serde_json::json!({}),
+                                serde_json::json!({"reason": "session_stalled"}),
+                            )?;
+                            summary.beads_parked_human_held += 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
     let slow_tier_due = {
         let ratio = (deps.cfg.slow_tick_secs / deps.cfg.fast_tick_secs.max(1)).max(1);
@@ -174,6 +284,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             spend_usd: 0.0,
             pr_number: None,
             branch: None,
+            session_id: None,
         };
         deps.store.save(&overlay)?;
         summary.beads_created += 1;
@@ -213,7 +324,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     let mut ready: Vec<Bead> = Vec::new();
     for bead in &routing_candidates {
         let overlay = match deps.store.load(&bead.id)? {
-            Some(o) if o.state == OverlayState::Queued => o,
+            Some(o) if o.state == OverlayState::Queued || o.state == OverlayState::Redispatched => o,
             _ => continue,
         };
 
@@ -304,6 +415,7 @@ fn skeptic_evidence(llm: &dyn Llm, bead_id: &str, pr: u64) -> Result<PrEvidence,
     let reply = llm.judge(&prompt)?;
     let skeptic_verdict = verifier::parse_skeptic_verdict(&reply);
     Ok(PrEvidence {
+        is_production: false,
         non_test_changed_loc: 0,
         has_integration_evidence_marker: false,
         er_verdict: verifier::ErVerdict::Absent,
@@ -325,12 +437,14 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // actively tracking" set (deletion-guard doc comment on
     // `StateStore::owned_branches`).
     let branches = deps.store.owned_branches()?;
-    let bead_ids: Vec<String> = branches
+    let mut bead_ids: Vec<String> = branches
         .iter()
         .filter_map(|b| b.rsplit_once("-r").map(|(prefix, _attempt)| prefix))
         .filter_map(|prefix| prefix.strip_prefix("factory/"))
         .map(|s| s.to_string())
         .collect();
+    bead_ids.sort();
+    bead_ids.dedup();
 
     for bead_id in &bead_ids {
         let mut overlay = match deps.store.load(bead_id)? {
@@ -363,7 +477,12 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             None => continue,
         };
 
-        let evidence = skeptic_evidence(deps.llm, bead_id, pr)?;
+        let mut evidence = skeptic_evidence(deps.llm, bead_id, pr)?;
+        let snapshot = deps.scm.pr_snapshot(pr)?;
+        evidence.er_verdict = verifier::parse_er_verdict(&snapshot.comments);
+        evidence.is_production = verifier::classify_production(&snapshot.files);
+        evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
+        evidence.has_integration_evidence_marker = verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
         let report = verifier::assess(deps.scm, pr, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
         emit(
@@ -390,29 +509,116 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 serde_json::json!({}),
             )?;
         } else {
-            // Stage-1 substitution rule (CONTRACT.md §1): record the re-roll
-            // verdict, never execute it. Park HUMAN_HELD instead of RE_ROLL.
-            emit(
-                deps.telemetry_log,
-                bead_id,
-                overlay.attempt,
-                OverlayState::Attested.as_str(),
-                "REROLL_VERDICT_RECORDED",
-                serde_json::json!({}),
-                serde_json::json!({"stage": deps.cfg.stage}),
-            )?;
-            overlay.state = OverlayState::HumanHeld;
-            deps.store.save(&overlay)?;
-            summary.beads_parked_human_held += 1;
-            emit(
-                deps.telemetry_log,
-                bead_id,
-                overlay.attempt,
-                OverlayState::HumanHeld.as_str(),
-                "PARKED_HUMAN_HELD",
-                serde_json::json!({}),
-                serde_json::json!({"reason": "gate assessment not all-green (stage 1: recorded, not executed)"}),
-            )?;
+            if deps.cfg.stage == 1 {
+                // Stage-1 substitution rule (CONTRACT.md §1): record the re-roll
+                // verdict, never execute it. Park HUMAN_HELD instead of RE_ROLL.
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "REROLL_VERDICT_RECORDED",
+                    serde_json::json!({}),
+                    serde_json::json!({"stage": deps.cfg.stage}),
+                )?;
+                overlay.state = OverlayState::HumanHeld;
+                deps.store.save(&overlay)?;
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "gate assessment not all-green (stage 1: recorded, not executed)"}),
+                )?;
+            } else {
+                // Stage 2: execute re-roll engine
+                let mut reviewer = "verifier".to_string();
+                let mut feedback = Vec::new();
+                for (gate_name, result) in &report.results {
+                    if let verifier::GateResult::Red(ref reason) = result {
+                        feedback.push(format!("{gate_name:?}: {reason}"));
+                        if *gate_name == verifier::GateName::Skeptic {
+                            reviewer = "skeptic".to_string();
+                        } else if *gate_name == verifier::GateName::CodeRabbitApproved {
+                            reviewer = "coderabbit".to_string();
+                        }
+                    }
+                }
+                let review_text = feedback.join("\n");
+
+                let reroll_deps = crate::reroll::RerollDeps {
+                    scm: deps.scm,
+                    sessions: deps.sessions,
+                    vcs: deps.vcs,
+                    store: deps.store,
+                    llm: deps.llm,
+                    cfg: deps.cfg,
+                    telemetry_log: deps.telemetry_log,
+                    reviewer,
+                    review_text,
+                };
+
+                match crate::reroll::execute(&reroll_deps, &mut overlay) {
+                    Ok(crate::reroll::RerollOutcome::Rerolled { new_branch: _ }) => {
+                        // Perform recovery validation: check if spec is valid TOML
+                        let spec_path = Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", overlay.bead_id));
+                        let validation_pass = if spec_path.exists() {
+                            if let Ok(c) = std::fs::read_to_string(&spec_path) {
+                                toml::from_str::<serde_json::Value>(&c).is_ok()
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if validation_pass {
+                            overlay.state = OverlayState::Redispatched;
+                            deps.store.save(&overlay)?;
+                            emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::Redispatched.as_str(),
+                                "REDISPATCHED",
+                                serde_json::json!({}),
+                                serde_json::json!({}),
+                            )?;
+                        } else {
+                            overlay.state = OverlayState::HumanHeld;
+                            deps.store.save(&overlay)?;
+                            summary.beads_parked_human_held += 1;
+                            emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::HumanHeld.as_str(),
+                                "PARKED_HUMAN_HELD",
+                                serde_json::json!({}),
+                                serde_json::json!({"reason": "spec file validation failed in recovery"}),
+                            )?;
+                        }
+                    }
+                    Ok(crate::reroll::RerollOutcome::Held(reason)) => {
+                        summary.beads_parked_human_held += 1;
+                        // already saved to HumanHeld inside execute
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "PARKED_HUMAN_HELD",
+                            serde_json::json!({}),
+                            serde_json::json!({"reason": reason}),
+                        )?;
+                    }
+                    Ok(crate::reroll::RerollOutcome::Aborted(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
         }
     }
 

@@ -60,6 +60,10 @@ fn fake_scm_returns_scripted_permission_and_records_call() {
             bugbot_error_count: 0,
             unresolved_thread_count: 0,
             head_sha: "deadbeef".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 0,
         },
     );
 

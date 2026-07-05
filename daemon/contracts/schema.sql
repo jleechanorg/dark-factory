@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   spend_usd     REAL    NOT NULL DEFAULT 0,   -- monitoring-only (spec §4.2.8)
   pr_number     INTEGER,
   branch        TEXT,
+  session_id    TEXT,
   updated_at    TEXT    NOT NULL              -- ISO-8601 UTC
 );
 
@@ -24,4 +25,16 @@ CREATE TABLE IF NOT EXISTS branch_registry (
   branch     TEXT PRIMARY KEY,
   bead_id    TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+
+
+-- Circuit breaker: tracking of review rejections per attempt to detect consecutive failures
+CREATE TABLE IF NOT EXISTS review_rejection (
+  bead_id       TEXT NOT NULL,
+  attempt       INTEGER NOT NULL,
+  reviewer      TEXT NOT NULL,
+  feedback_hash TEXT NOT NULL,
+  feedback_text TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  PRIMARY KEY (bead_id, attempt)
 );

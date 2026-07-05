@@ -56,6 +56,7 @@ pub fn dispatch_ready(
             spend_usd: 0.0,
             pr_number: None,
             branch: None,
+            session_id: None,
         });
 
         let branch = format!("factory/{}-r{}", bead.id, overlay.attempt);
@@ -77,6 +78,7 @@ pub fn dispatch_ready(
         let session_id = sessions.spawn(&spec)?;
 
         overlay.state = OverlayState::Dispatched;
+        overlay.session_id = Some(session_id.0.clone());
         if let Err(save_err) = store.save(&overlay) {
             // The worker process now exists but the daemon failed to
             // durably record it as DISPATCHED. Kill the just-spawned worker
@@ -163,6 +165,7 @@ mod tests {
     struct FakeStateStore {
         overlays: RefCell<HashMap<String, BeadOverlay>>,
         branches: RefCell<Vec<String>>,
+        rejections: RefCell<HashMap<(String, u32), (String, String)>>,
         fail_save_for_state: Option<OverlayState>,
     }
 
@@ -206,6 +209,27 @@ mod tests {
 
         fn owned_branches(&self) -> Result<Vec<String>, DaemonError> {
             Ok(self.branches.borrow().clone())
+        }
+
+        fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError> {
+            let mut updated = Vec::new();
+            let mut overlays = self.overlays.borrow_mut();
+            for overlay in overlays.values_mut() {
+                if overlay.state == OverlayState::Dispatched || overlay.state == OverlayState::Attested {
+                    overlay.autonomy_secs += elapsed_secs;
+                    updated.push(overlay.clone());
+                }
+            }
+            Ok(updated)
+        }
+
+        fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, _feedback_text: &str) -> Result<(), DaemonError> {
+            self.rejections.borrow_mut().insert((bead_id.to_string(), attempt), (reviewer.to_string(), feedback_hash.to_string()));
+            Ok(())
+        }
+
+        fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError> {
+            Ok(self.rejections.borrow().get(&(bead_id.to_string(), attempt)).cloned())
         }
     }
 
@@ -311,6 +335,7 @@ mod tests {
                 spend_usd: 0.0,
                 pr_number: None,
                 branch: None,
+                session_id: None,
             })
             .unwrap();
         let cfg = cfg();

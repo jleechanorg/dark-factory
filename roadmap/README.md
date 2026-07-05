@@ -1,6 +1,7 @@
 # dark-factory roadmap
 
 ## Recent activity (by day)
+- [2026-07-05](activity/2026-07-05.md)
 
 - [2026-07-04](activity/2026-07-04.md)
 - [2026-07-03](activity/2026-07-03.md)
