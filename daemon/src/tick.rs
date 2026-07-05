@@ -1111,20 +1111,27 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 || deps.cfg.target_repo == "owner/repo";
 
             if !is_test_repo {
-                if let Some(ref branch) = overlay.branch {
+                if let Some(ref session_id) = overlay.session_id {
                     let repo = &deps.cfg.target_repo;
+                    let mut project = repo.split('/').next_back().unwrap_or(repo).to_string();
+                    if project == "worldarchitect.ai" {
+                        project = "worldarchitect".to_string();
+                    }
+
                     let r = crate::tools::run_tool(
-                        "gh",
-                        &["pr", "list", "--head", branch, "--repo", repo, "--json", "number"],
+                        "ao",
+                        &["status", "-p", &project, "--json"],
                         30,
                     );
                     if let Ok(out) = r {
                         let json_start = out.find('[').unwrap_or(0);
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&out[json_start..]) {
                             if let Some(arr) = val.as_array() {
-                                if let Some(first) = arr.first() {
-                                    if let Some(num) = first.get("number").and_then(|n| n.as_u64()) {
-                                        overlay.pr_number = Some(num);
+                                if let Some(entry) = arr.iter().find(|e| {
+                                    e.get("name").and_then(|v| v.as_str()) == Some(session_id.as_str())
+                                }) {
+                                    if let Some(pr_num) = entry.get("prNumber").and_then(|v| v.as_u64()) {
+                                        overlay.pr_number = Some(pr_num);
                                         deps.store.save(&overlay)?;
                                     }
                                 }
