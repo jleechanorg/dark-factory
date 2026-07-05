@@ -752,7 +752,7 @@ impl Scm for CliScm {
                 }
                 let rest_cr: RestCheckRuns = serde_json::from_str(&cr_json).unwrap_or(RestCheckRuns { check_runs: vec![] });
 
-                let legacy_checks: Vec<GhCheck> = rest_cr.check_runs.into_iter().map(|cr| {
+                let mut legacy_checks: Vec<GhCheck> = rest_cr.check_runs.into_iter().map(|cr| {
                     let (state, bucket) = if cr.status == "completed" {
                         match cr.conclusion.as_deref() {
                             Some("success") | Some("neutral") => ("SUCCESS".to_string(), "pass".to_string()),
@@ -764,6 +764,33 @@ impl Scm for CliScm {
                     };
                     GhCheck { state, bucket, name: cr.name }
                 }).collect();
+
+                // Some third-party CI (and older GitHub Apps) still post via
+                // the legacy Commit Status API instead of the Checks API —
+                // merge `/commits/{sha}/statuses` in too so those don't
+                // silently vanish from `checks` when the GraphQL `gh pr
+                // checks` call is rate-limited.
+                let statuses_url = format!("repos/{}/commits/{}/statuses", self.repo, view.head_ref_oid);
+                if let Ok(statuses_json) = run_tool("gh", &["api", &statuses_url], 30) {
+                    #[derive(serde::Deserialize)]
+                    struct RestStatus {
+                        context: String,
+                        state: String,
+                    }
+                    let rest_statuses: Vec<RestStatus> = serde_json::from_str(&statuses_json).unwrap_or_default();
+                    for s in rest_statuses {
+                        let bucket = match s.state.as_str() {
+                            "success" => "pass",
+                            "pending" => "pending",
+                            _ => "fail",
+                        };
+                        legacy_checks.push(GhCheck {
+                            state: s.state.to_uppercase(),
+                            bucket: bucket.to_string(),
+                            name: s.context,
+                        });
+                    }
+                }
                 serde_json::to_string(&legacy_checks).unwrap_or_else(|_| "[]".to_string())
             }
         };
@@ -834,8 +861,21 @@ impl Scm for CliScm {
                 &format!("query={query}"),
             ],
             30,
-        )?;
-        let unresolved_thread_count = unresolved_thread_count_from_gql(&gql_out)?;
+        );
+        // jleechan-qdw/GraphQL-rate-limit tolerance: a GraphQL failure here
+        // (rate limit, transient network) must not abort the whole
+        // `pr_snapshot` call — unresolved-thread count degrades to 0 (with a
+        // logged warning) rather than propagating the error via `?`.
+        let unresolved_thread_count = match gql_out {
+            Ok(gql_out_str) => unresolved_thread_count_from_gql(&gql_out_str).unwrap_or_else(|e| {
+                eprintln!("[warn] failed to parse unresolved-thread GraphQL response, defaulting to 0: {e:?}");
+                0
+            }),
+            Err(e) => {
+                eprintln!("[warn] GraphQL query failed, defaulting unresolved threads to 0: {e:?}");
+                0
+            }
+        };
 
         let mut pr_comments: Vec<crate::tools::PrComment> = view.comments.into_iter().map(|c| crate::tools::PrComment {
             author: c.author.login,
