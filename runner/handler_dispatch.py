@@ -64,6 +64,36 @@ def _shadow_gate_enabled(ctx: "Context") -> bool:
     return bool(raw)
 
 
+# Historical default — Codex was the original shadow backend. Operators can
+# pin an alternative (e.g. ``minimax``) via ``DARK_FACTORY_SHADOW_BACKEND`` when
+# Codex is rate-limited by its vendor; no-op when unset so existing callers
+# keep their Codex subprocess verbatim. Whitelist-validated against the
+# backends ``_gate_subprocess_args`` actually understands; unknown values
+# fall back to the historical default (defense-in-depth, not a ZFC switch).
+_SHADOW_BACKEND_WHITELIST = frozenset({"codex", "minimax", "agy", "claude-sonnet", "claude"})
+
+
+def _resolve_shadow_backend() -> str:
+    raw = os.environ.get("DARK_FACTORY_SHADOW_BACKEND", "codex").strip().lower()
+    if raw in _SHADOW_BACKEND_WHITELIST:
+        return raw
+    return "codex"
+
+
+def _shadow_backend_binary(backend: str) -> str:
+    """Resolve the subprocess executable name for a shadow backend.
+
+    ``codex`` maps to the Codex CLI; ``minimax`` (and the Claude-routed
+    fallbacks) map to the Claude CLI binary. Single source of truth for
+    binary-name routing so a future shadow backend can register here.
+    """
+    if backend == "codex":
+        return "codex"
+    # minimax + any claude-routed backend → Claude CLI on PATH (the
+    # env override in ``_gate_subprocess_env`` does the routing).
+    return _handlers_shim._get_claude_executable()
+
+
 def _shadow_gate_prompt(name: str, prompt: str, expected_sha: str, ctx: "Context") -> str:
     target = "evidence" if name in {"gate_es", "gate_er", "es", "er", "evidence_review"} else "diff"
     return f"""\
@@ -143,6 +173,8 @@ def _start_shadow_gate_review(
     seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
     attempt = int(getattr(ctx, "_df_current_attempt", 1))
     node_name = str(getattr(ctx, "_df_current_node", name))
+    shadow_backend = _resolve_shadow_backend()
+    shadow_binary = _shadow_backend_binary(shadow_backend)
     sidecar_suffix = f"_{shadow_index}" if shadow_index is not None else ""
     try:
         from . import engine_observability as _obs
@@ -164,7 +196,7 @@ def _start_shadow_gate_review(
                 {
                     "node": node_name,
                     "attempt": str(attempt),
-                    "shadow_backend": "codex",
+                    "shadow_backend": shadow_backend,
                     "shadow_index": shadow_index if shadow_index is not None else 0,
                     "shadow_prompt_path": shadow.prompt_path,
                     "shadow_prompt_sha256": shadow.prompt_sha256,
@@ -173,10 +205,10 @@ def _start_shadow_gate_review(
             )
     except Exception:
         pass
-    if shutil.which("codex") is None:
-        shadow.launch_error = "codex executable not found"
+    if shutil.which(shadow_binary) is None:
+        shadow.launch_error = f"{shadow_binary} executable not found"
         return shadow
-    args = _gate_subprocess_args("codex", shadow_prompt, ctx, timeout)
+    args = _gate_subprocess_args(shadow_backend, shadow_prompt, ctx, timeout)
     if args is None:
         shadow.launch_error = "sandbox-exec unavailable"
         return shadow
@@ -188,7 +220,7 @@ def _start_shadow_gate_review(
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
-            env=_gate_subprocess_env("codex"),
+            env=_gate_subprocess_env(shadow_backend),
         )
     except Exception as exc:
         shadow.launch_error = f"{type(exc).__name__}: {exc}"
@@ -275,7 +307,7 @@ def _finish_shadow_gate_review(
             {
                 "node": node_name,
                 "attempt": str(attempt),
-                "shadow_backend": "codex",
+                "shadow_backend": _resolve_shadow_backend(),
                 "shadow_index": shadow_index if shadow_index is not None else 0,
                 "shadow_outcome": shadow_outcome,
                 "shadow_verdict": verdict,
@@ -359,13 +391,22 @@ def _coalesce_n_shadow_outcomes(
     """Conservative merge of N-shadow outcomes.
 
     ``shadow_outcomes`` is a list of ``(index, normalized_outcome, raw_verdict)``
-    triples. Per /advice 2026-06-27 Reviewer A: NO reviewer-shopping. Any
-    ``error`` dominates to ``error``. Any shadow that normalized to ``failure``
-    OR carries a raw verdict of ``warn`` (conservative qw5 policy: a flagged
-    concern must surface, not be silently promoted) dominates to ``failure``.
-    Otherwise the merge is ``success`` only when ALL shadows + primary are
-    success.
+    triples. Per /advice 2026-06-27 Reviewer A and the qw5 conservative
+    intent: NO reviewer-shopping. Any ``error`` (either primary infra
+    failure or any shadow ``error``) dominates to ``error`` — infra
+    failures are a different failure class than quality concerns and must
+    surface as such so the Healer routes them correctly. Any shadow that
+    normalized to ``failure`` OR carries a raw verdict of ``warn``
+    (conservative qw5 policy: a flagged concern must surface, not be
+    silently promoted) dominates to ``failure``. Otherwise the merge is
+    ``success`` only when ALL shadows + primary are success.
+
+    Pinned by AGY pilot #2 reviewer at jleechan-qw5: infra failures on the
+    primary lane are distinct from shadow-side quality concerns; both
+    routes must surface without averaging.
     """
+    if primary_outcome == "error":
+        return "error", "error"
     if any(o == "error" for _, o, _ in shadow_outcomes):
         return "error", "error"
     flagged = any(

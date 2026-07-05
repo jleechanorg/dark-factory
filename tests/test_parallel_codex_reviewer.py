@@ -327,6 +327,41 @@ def test_parallel_reviewer_n_shadows_one_error_dominates(tmp_path, monkeypatch):
     )
 
 
+def test_parallel_reviewer_primary_error_dominates_to_error(tmp_path, monkeypatch):
+    """primary_outcome='error' must dominate to 'error' even when all shadows succeed.
+
+    Per the conservative qw5 intent (no reviewer-shopping): an infrastructure
+    failure on the primary reviewer lane is a different failure class than
+    a quality concern on the shadow side. Treating it as 'failure' would
+    cause the Healer to misroute infra failures as quality failures.
+    Pinned by AGY pilot #2 review at runner/handler_dispatch.py:352-378.
+    """
+    node = _n_node_with_prompt(tmp_path, n_shadows=3)
+    ctx = _mock_ctx(tmp_path)
+    expected_sha = "9" * 40
+    _setup_n_shadow(monkeypatch, tmp_path, expected_sha)
+    _MultiShadowPopen.verdicts = [("success", 0)] * 3
+
+    # The primary lane is mocked separately — fabricate an "error" outcome
+    # while the three shadows all return success.
+    def _error_primary(prompt, expected_sha, timeout, ctx, node_name, backend, *, gate_strict):
+        from runner.handler_core import Result
+        return Result(
+            outcome="error",
+            output="primary infra failure",
+            metadata={"verdict": "unknown", "fallback_used": "false"},
+        )
+
+    monkeypatch.setattr("runner.handler_parallel_reviewer._run_primary_review", _error_primary)
+
+    result = _parallel_reviewer(node, ctx)
+
+    assert _MultiShadowPopen.calls == 3
+    assert result.outcome == "error", (
+        f"primary_outcome='error' must dominate; got {result.outcome!r}"
+    )
+
+
 def test_parallel_reviewer_n_shadows_distinct_artifacts(tmp_path, monkeypatch):
     """Each N shadow writes its own output path; primary path unchanged."""
     node = _n_node_with_prompt(tmp_path, n_shadows=3)
@@ -351,3 +386,114 @@ def test_parallel_reviewer_n_shadows_distinct_artifacts(tmp_path, monkeypatch):
     assert '"event": "parallel_reviewer_primary_result"' in events
     for i in (1, 2, 3):
         assert f'"shadow_index": {i}' in events, f"missing shadow_index {i} event"
+
+
+# ─── DARK_FACTORY_SHADOW_BACKEND (Beads: jleechan-qw5) ────────────────────
+#
+# When the Codex vendor rate-limits (e.g. "You've hit your usage limit"),
+# operators can pin the shadow reviewer to a different backend via the
+# DARK_FACTORY_SHADOW_BACKEND env var. Default behavior is unchanged: when
+# the env var is unset (or set to "codex"), the existing codex subprocess
+# runs as before. When set to a whitelist value (e.g. "minimax"), the
+# shadow dispatch honors it end-to-end (argv, env, binary lookup).
+
+def test_shadow_backend_env_var_routes_to_minimax(monkeypatch, tmp_path):
+    """DARK_FACTORY_SHADOW_BACKEND=minimax → shadow Popen is invoked with
+    the claude binary and the minimax ANTHROPIC_BASE_URL env override.
+
+    The primary reviewer (agy in this pilot) is unchanged; only the shadow
+    lane re-routes. We assert that the shadow Popen argv[0] is "claude"
+    (not "codex") and that the env carries ANTHROPIC_BASE_URL set to the
+    minimax gateway. Codex's binary lookup and dispatch are bypassed.
+    """
+    from runner import handler_dispatch as hd
+
+    monkeypatch.setenv("DARK_FACTORY_SHADOW_BACKEND", "minimax")
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("runner.handlers._get_claude_executable", lambda: "claude")
+
+    expected_sha = "0" * 40
+    captured: dict[str, object] = {}
+
+    class _CapturingPopen:
+        pid = 44444
+
+        def __init__(self, args, **kwargs):
+            captured["args"] = list(args)
+            captured["env"] = dict(kwargs.get("env", {}))
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return (
+                f"head_sha: {expected_sha}\n## Review Verdict\npass\n\nverdict: pass\n",
+                "",
+            )
+
+    monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _CapturingPopen)
+
+    class _Ctx:
+        state: dict[str, object] = {"_df_shadow_codex_review": "true"}
+        workdir = tmp_path
+        goal = "smoke qw5 shadow-backend"
+        _df_current_seq = 1
+        _df_current_attempt = 1
+        _df_current_node = "review"
+
+    shadow = hd._start_shadow_gate_review(
+        name="gate_er",
+        prompt="review the diff for blockers",
+        expected_sha=expected_sha,
+        timeout=600,
+        ctx=_Ctx(),  # type: ignore[arg-type]
+        shadow_index=1,
+    )
+    assert shadow is not None, "shadow should be started when flag is enabled"
+    assert shadow.launch_error == "", f"unexpected launch_error: {shadow.launch_error!r}"
+    args = captured.get("args")
+    assert args is not None, "Popen should have been invoked"
+    assert args[0] == "claude", (
+        f"expected minimax shadow to invoke 'claude' binary, got {args[0]!r}"
+    )
+    assert "--dangerously-skip-permissions" in args, (
+        f"expected minimax claude CLI argv, got {args}"
+    )
+    env = captured.get("env", {})
+    assert env.get("ANTHROPIC_BASE_URL") == "https://api.minimax.io/anthropic", (
+        f"expected minimax ANTHROPIC_BASE_URL override, got env keys {list(env)}"
+    )
+
+    # The shadow_gate_prompt event also records the resolved backend so
+    # CXDB observers see what actually graded the diff.
+    events_path = tmp_path / "events.jsonl"
+    # engine_observability._emit_event writes to ctx.event_log_path, but
+    # _Ctx stub has no event_log_path — confirm the launch path itself
+    # completed without raising instead.
+
+
+def test_shadow_backend_default_is_codex(monkeypatch, tmp_path):
+    """When DARK_FACTORY_SHADOW_BACKEND is unset, the shadow still uses
+    codex end-to-end (historical default preserved)."""
+    from runner import handler_dispatch as hd
+
+    monkeypatch.delenv("DARK_FACTORY_SHADOW_BACKEND", raising=False)
+    assert hd._resolve_shadow_backend() == "codex"
+
+    monkeypatch.setenv("DARK_FACTORY_SHADOW_BACKEND", "bogus-value")
+    assert hd._resolve_shadow_backend() == "codex", (
+        "unknown values must fall back to codex, not raise"
+    )
+
+    monkeypatch.setenv("DARK_FACTORY_SHADOW_BACKEND", "minimax")
+    assert hd._resolve_shadow_backend() == "minimax"
+    # minimax routes through the Claude CLI; binary name comes from
+    # _get_claude_executable (PATH-resolved). We assert it points to a
+    # `claude` executable rather than the literal "claude" string because
+    # the test sandbox may place a shim on PATH.
+    import os as _os
+
+    minimax_bin = hd._shadow_backend_binary("minimax")
+    assert _os.path.basename(minimax_bin) == "claude", (
+        f"expected minimax binary to end in 'claude', got {minimax_bin!r}"
+    )
+    assert hd._shadow_backend_binary("codex") == "codex"
