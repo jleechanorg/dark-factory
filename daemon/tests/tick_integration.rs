@@ -129,6 +129,9 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
             bugbot_error_count: 0,
             unresolved_thread_count: 0,
             head_sha: "deadbeef".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
         },
     );
     // The router call already happened in tick 1; re-script the same `FakeLlm`

@@ -165,7 +165,7 @@ impl Scm for CliScm {
                 "--repo",
                 &self.repo,
                 "--json",
-                "mergeable,reviews,headRefOid",
+                "mergeable,reviews,headRefOid,body,comments,files",
             ],
             30,
         )?;
@@ -175,6 +175,9 @@ impl Scm for CliScm {
             reviews: Vec<GhReview>,
             #[serde(rename = "headRefOid")]
             head_ref_oid: String,
+            body: String,
+            comments: Vec<GhComment>,
+            files: Vec<GhFile>,
         }
         #[derive(serde::Deserialize)]
         struct GhReview {
@@ -182,8 +185,19 @@ impl Scm for CliScm {
             state: String,
         }
         #[derive(serde::Deserialize)]
+        struct GhComment {
+            author: GhAuthor,
+            body: String,
+        }
+        #[derive(serde::Deserialize)]
         struct GhAuthor {
             login: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct GhFile {
+            path: String,
+            additions: u32,
+            deletions: u32,
         }
         let json_start = view_out.find('{').unwrap_or(0);
         let view: GhPrView = serde_json::from_str(&view_out[json_start..]).map_err(|e| {
@@ -216,27 +230,9 @@ impl Scm for CliScm {
             c.state == "COMPLETED" && (c.conclusion == "SUCCESS" || c.conclusion == "NEUTRAL" || c.conclusion == "SKIPPED")
         });
 
-        let comments_out = run_tool(
-            "gh",
-            &["pr", "view", &pr_str, "--repo", &self.repo, "--json", "comments"],
-            30,
-        )?;
-        #[derive(serde::Deserialize)]
-        struct GhCommentsView {
-            comments: Vec<GhComment>,
-        }
-        #[derive(serde::Deserialize)]
-        struct GhComment {
-            author: GhAuthor,
-            body: String,
-        }
-        let json_start_comments = comments_out.find('{').unwrap_or(0);
-        let comments_view: GhCommentsView = serde_json::from_str(&comments_out[json_start_comments..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse gh pr comments JSON: {e}"))
-        })?;
         let mut bugbot_error_count = 0;
-        for comment in comments_view.comments {
-            let author = comment.author.login;
+        for comment in &view.comments {
+            let author = &comment.author.login;
             if author.contains("cursor") || author.contains("bugbot") {
                 let body = comment.body.to_lowercase();
                 if body.contains("error") || body.contains("fail") {
@@ -310,6 +306,17 @@ impl Scm for CliScm {
             unresolved_thread_count = pr_data.review_threads.nodes.iter().filter(|n| !n.is_resolved).count() as u32;
         }
 
+        let pr_comments = view.comments.into_iter().map(|c| crate::tools::PrComment {
+            author: c.author.login,
+            body: c.body,
+        }).collect();
+
+        let pr_files = view.files.into_iter().map(|f| crate::tools::PrFile {
+            path: f.path,
+            additions: f.additions,
+            deletions: f.deletions,
+        }).collect();
+
         Ok(PrSnapshot {
             pr_number: pr,
             ci_success,
@@ -318,6 +325,9 @@ impl Scm for CliScm {
             bugbot_error_count,
             unresolved_thread_count,
             head_sha: view.head_ref_oid,
+            body: view.body,
+            comments: pr_comments,
+            files: pr_files,
         })
     }
 

@@ -102,10 +102,12 @@ fn token_to_verdict(text: &str) -> Option<SkepticVerdict> {
 /// been recorded yet — it is deliberately distinct from `Fail` so callers
 /// never treat "no evidence review happened" as a free pass, matching the
 /// `Unknown` vs `Red` discipline used elsewhere in this module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ErVerdict {
     Pass,
+    Partial,
     Fail,
+    Inconclusive,
     #[default]
     Absent,
 }
@@ -161,6 +163,7 @@ pub fn parse_skeptic_verdict(raw: &str) -> Option<SkepticVerdict> {
 /// doc comment for why these live here instead of on `tools::PrSnapshot`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PrEvidence {
+    pub is_production: bool,
     /// Non-test changed LOC in the diff (spec §4.2.5 evidence floor).
     pub non_test_changed_loc: u32,
     /// Whether the PR body/comments carry an integration-evidence marker
@@ -186,14 +189,35 @@ pub struct PrEvidence {
 /// before the LOC floor is even consulted, since a passing LOC floor never
 /// substitutes for a missing/failing `/er` run.
 fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
-    match evidence.er_verdict {
-        ErVerdict::Absent => {
-            return GateResult::Unknown("no /er verdict recorded".to_string());
+    if evidence.is_production {
+        match evidence.er_verdict {
+            ErVerdict::Absent => {
+                return GateResult::Unknown("no /er verdict recorded".to_string());
+            }
+            ErVerdict::Pass => {}
+            ErVerdict::Partial => {
+                return GateResult::Red("/er verdict is PARTIAL (PRODUCTION requires PASS)".to_string());
+            }
+            ErVerdict::Fail => {
+                return GateResult::Red("/er verdict is FAIL".to_string());
+            }
+            ErVerdict::Inconclusive => {
+                return GateResult::Red("/er verdict is INCONCLUSIVE".to_string());
+            }
         }
-        ErVerdict::Fail => {
-            return GateResult::Red("/er verdict is FAIL".to_string());
+    } else {
+        match evidence.er_verdict {
+            ErVerdict::Absent => {
+                return GateResult::Unknown("no /er verdict recorded".to_string());
+            }
+            ErVerdict::Pass | ErVerdict::Partial => {}
+            ErVerdict::Fail => {
+                return GateResult::Red("/er verdict is FAIL".to_string());
+            }
+            ErVerdict::Inconclusive => {
+                return GateResult::Red("/er verdict is INCONCLUSIVE".to_string());
+            }
         }
-        ErVerdict::Pass => {}
     }
 
     if evidence.non_test_changed_loc <= EVIDENCE_FLOOR_LOC {
@@ -204,6 +228,134 @@ fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
     } else {
         GateResult::Red("evidence floor".to_string())
     }
+}
+
+pub fn parse_er_verdict(comments: &[crate::tools::PrComment]) -> ErVerdict {
+    for comment in comments.iter().rev() {
+        let body_lower = comment.body.to_ascii_lowercase();
+        let mut start_idx = 0;
+        let mut last_verdict = None;
+        while let Some(idx) = body_lower[start_idx..].find("/er") {
+            let absolute_idx = start_idx + idx;
+            let is_valid_start = absolute_idx == 0 || {
+                let prev_char = body_lower.as_bytes()[absolute_idx - 1] as char;
+                !prev_char.is_alphanumeric()
+            };
+            let is_valid_end = absolute_idx + 3 == body_lower.len() || {
+                let next_char = body_lower.as_bytes()[absolute_idx + 3] as char;
+                !next_char.is_alphanumeric() && next_char != '-' && next_char != '_'
+            };
+            if is_valid_start && is_valid_end {
+                let sub = &body_lower[absolute_idx + 3..];
+                let tokens: Vec<&str> = sub.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()).collect();
+                for token in tokens {
+                    match token {
+                        "pass" | "passed" => {
+                            last_verdict = Some(ErVerdict::Pass);
+                            break;
+                        }
+                        "partial" | "partially" => {
+                            last_verdict = Some(ErVerdict::Partial);
+                            break;
+                        }
+                        "fail" | "failed" => {
+                            last_verdict = Some(ErVerdict::Fail);
+                            break;
+                        }
+                        "inconclusive" => {
+                            last_verdict = Some(ErVerdict::Inconclusive);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            start_idx = absolute_idx + 3;
+        }
+        if let Some(v) = last_verdict {
+            return v;
+        }
+    }
+    ErVerdict::Absent
+}
+
+pub fn classify_production(files: &[crate::tools::PrFile]) -> bool {
+    for file in files {
+        let path = &file.path;
+        if path.starts_with("mvp_site/") 
+            && !path.starts_with("mvp_site/tests/") 
+            && !path.starts_with("mvp_site/test_integration/") 
+        {
+            return true;
+        }
+        
+        let path_lower = path.to_lowercase();
+        if path_lower.contains("prompt") || path_lower.starts_with("prompts/") {
+            return true;
+        }
+        if path.starts_with(".github/") {
+            return true;
+        }
+        if path_lower.contains("ci/") 
+            || path_lower.contains("/ci/")
+            || path_lower.starts_with("ci")
+            || path_lower.contains("deploy") 
+            || path_lower.contains("merge-safety")
+            || path_lower.contains("merge_safety")
+            || path_lower.contains("merge-guard")
+            || path_lower.contains("merge_guard")
+            || path_lower.contains("docker")
+            || path_lower.contains("jenkinsfile")
+            || path_lower.contains("travis")
+        {
+            return true;
+        }
+        if path_lower.starts_with("migrations/") 
+            || path_lower.contains("/migrations/") 
+            || path_lower.starts_with("db/")
+            || path_lower.contains("/db/")
+            || path_lower.ends_with("schema.sql")
+            || path_lower.ends_with("schema.db")
+            || path_lower.contains("migration")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn calculate_non_test_loc(files: &[crate::tools::PrFile]) -> u32 {
+    let mut total = 0;
+    for file in files {
+        let path_lower = file.path.to_lowercase();
+        let is_test = path_lower.contains("test") 
+            || path_lower.contains("/test/")
+            || path_lower.contains("/tests/");
+        if !is_test {
+            total += file.additions;
+        }
+    }
+    total
+}
+
+pub fn check_integration_marker(body: &str, comments: &[crate::tools::PrComment]) -> bool {
+    let lower_body = body.to_lowercase();
+    if lower_body.contains("has_integration_evidence_marker") 
+       || lower_body.contains("integration-evidence") 
+       || lower_body.contains("integration evidence") 
+    {
+        return true;
+    }
+    for comment in comments {
+        let lower_comment = comment.body.to_lowercase();
+        if lower_comment.contains("has_integration_evidence_marker") 
+           || lower_comment.contains("integration-evidence") 
+           || lower_comment.contains("integration evidence") 
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn skeptic_gate(evidence: &PrEvidence) -> GateResult {
@@ -359,6 +511,9 @@ mod tests {
             bugbot_error_count: 0,
             unresolved_thread_count: 0,
             head_sha: "deadbeef".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
         }
     }
 
@@ -368,6 +523,7 @@ mod tests {
 
     fn all_green_evidence() -> PrEvidence {
         PrEvidence {
+            is_production: true,
             non_test_changed_loc: 10,
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
@@ -462,6 +618,7 @@ mod tests {
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
+            is_production: true,
             non_test_changed_loc: 150,
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
@@ -483,6 +640,7 @@ mod tests {
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
+            is_production: true,
             non_test_changed_loc: 150,
             has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Pass,
@@ -501,6 +659,7 @@ mod tests {
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
+            is_production: true,
             non_test_changed_loc: 100, // exactly at the floor, not over it
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
@@ -519,6 +678,7 @@ mod tests {
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
+            is_production: true,
             non_test_changed_loc: 10,
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
@@ -540,6 +700,7 @@ mod tests {
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
+            is_production: true,
             non_test_changed_loc: 10,
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
@@ -558,6 +719,7 @@ mod tests {
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
+            is_production: true,
             non_test_changed_loc: 10,
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
@@ -601,6 +763,7 @@ mod tests {
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
+            is_production: true,
             non_test_changed_loc: 10, // well under the floor
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Absent,
@@ -648,6 +811,7 @@ mod tests {
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
+            is_production: true,
             non_test_changed_loc: 10, // well under the floor
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Fail,
@@ -669,6 +833,7 @@ mod tests {
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
+            is_production: true,
             non_test_changed_loc: 10,
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
@@ -688,6 +853,7 @@ mod tests {
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
+            is_production: true,
             non_test_changed_loc: 150,
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
@@ -709,6 +875,7 @@ mod tests {
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
+            is_production: true,
             non_test_changed_loc: 150,
             has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Pass,
@@ -729,6 +896,7 @@ mod tests {
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
+            is_production: true,
             non_test_changed_loc: 150,
             has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Absent,
@@ -750,6 +918,7 @@ mod tests {
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
+            is_production: true,
             non_test_changed_loc: 150,
             has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Fail,
@@ -789,5 +958,134 @@ mod tests {
 
         let msg = "fail\nMore context.\nVerdict: PASS\nFooter mentions fail again.\n";
         assert_eq!(parse_skeptic_verdict(msg), Some(SkepticVerdict::Pass));
+    }
+
+    #[test]
+    fn test_parse_er_verdict() {
+        use crate::tools::PrComment;
+        // Simple cases
+        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er PASS".into() }]), ErVerdict::Pass);
+        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er PARTIAL".into() }]), ErVerdict::Partial);
+        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er FAIL".into() }]), ErVerdict::Fail);
+        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er INCONCLUSIVE".into() }]), ErVerdict::Inconclusive);
+
+        // Latest comment wins (comments are in chronological order)
+        let comments = vec![
+            PrComment { author: "alice".into(), body: "/er FAIL".into() },
+            PrComment { author: "bob".into(), body: "/er PASS".into() },
+        ];
+        assert_eq!(parse_er_verdict(&comments), ErVerdict::Pass);
+
+        // Multiple verdicts in one comment: last one wins
+        let comments_multiple = vec![
+            PrComment { author: "alice".into(), body: "/er FAIL then /er PASS".into() },
+        ];
+        assert_eq!(parse_er_verdict(&comments_multiple), ErVerdict::Pass);
+
+        // Word boundary check: "/er-gate" or "/er_gate" should not match as "/er" command
+        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er-gate PASS".into() }]), ErVerdict::Absent);
+    }
+
+    #[test]
+    fn test_classify_production() {
+        use crate::tools::PrFile;
+        // Production cases
+        assert!(classify_production(&[PrFile { path: "mvp_site/src/main.rs".into(), additions: 1, deletions: 0 }]));
+        assert!(classify_production(&[PrFile { path: "prompts/custom.md".into(), additions: 1, deletions: 0 }]));
+        assert!(classify_production(&[PrFile { path: ".github/workflows/ci.yml".into(), additions: 1, deletions: 0 }]));
+        assert!(classify_production(&[PrFile { path: "deploy.sh".into(), additions: 1, deletions: 0 }]));
+        assert!(classify_production(&[PrFile { path: "contracts/schema.sql".into(), additions: 1, deletions: 0 }]));
+
+        // Non-production exclusions
+        assert!(!classify_production(&[PrFile { path: "mvp_site/tests/main_test.rs".into(), additions: 1, deletions: 0 }]));
+        assert!(!classify_production(&[PrFile { path: "mvp_site/test_integration/main_test.rs".into(), additions: 1, deletions: 0 }]));
+        assert!(!classify_production(&[PrFile { path: "daemon/src/main.rs".into(), additions: 1, deletions: 0 }]));
+    }
+
+    #[test]
+    fn test_calculate_non_test_loc() {
+        use crate::tools::PrFile;
+        let files = vec![
+            PrFile { path: "mvp_site/src/main.rs".into(), additions: 100, deletions: 0 },
+            PrFile { path: "mvp_site/tests/test_main.rs".into(), additions: 50, deletions: 0 },
+            PrFile { path: "daemon/src/lib.rs".into(), additions: 30, deletions: 0 },
+        ];
+        assert_eq!(calculate_non_test_loc(&files), 130);
+    }
+
+    #[test]
+    fn test_check_integration_marker() {
+        use crate::tools::PrComment;
+        // PR body contains marker
+        assert!(check_integration_marker("Here is the has_integration_evidence_marker", &[]));
+        assert!(check_integration_marker("Here is the integration-evidence proof", &[]));
+        assert!(check_integration_marker("Here is the integration evidence proof", &[]));
+
+        // Comment contains marker
+        let comments = vec![PrComment { author: "alice".into(), body: "Found integration evidence".into() }];
+        assert!(check_integration_marker("No marker here", &comments));
+
+        // Neither contains marker
+        assert!(!check_integration_marker("No marker here", &[]));
+    }
+
+    #[test]
+    fn test_evidence_floor_gate_production_vs_non_production() {
+        // PRODUCTION: Pass is Green, Partial is Red, Fail/Inconclusive/Absent are Red/Unknown
+        let prod_pass = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: None,
+        };
+        assert_eq!(evidence_floor_gate(&prod_pass), GateResult::Green);
+
+        let prod_partial = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Partial,
+            skeptic_verdict: None,
+        };
+        assert!(matches!(evidence_floor_gate(&prod_partial), GateResult::Red(_)));
+
+        // NON_PRODUCTION: Pass and Partial are Green
+        let non_prod_partial = PrEvidence {
+            is_production: false,
+            non_test_changed_loc: 10,
+            has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Partial,
+            skeptic_verdict: None,
+        };
+        assert_eq!(evidence_floor_gate(&non_prod_partial), GateResult::Green);
+
+        let non_prod_pass = PrEvidence {
+            is_production: false,
+            non_test_changed_loc: 10,
+            has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: None,
+        };
+        assert_eq!(evidence_floor_gate(&non_prod_pass), GateResult::Green);
+
+        // Fail/Inconclusive are Red for both
+        let prod_fail = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Fail,
+            skeptic_verdict: None,
+        };
+        assert!(matches!(evidence_floor_gate(&prod_fail), GateResult::Red(_)));
+
+        let non_prod_inconclusive = PrEvidence {
+            is_production: false,
+            non_test_changed_loc: 10,
+            has_integration_evidence_marker: false,
+            er_verdict: ErVerdict::Inconclusive,
+            skeptic_verdict: None,
+        };
+        assert!(matches!(evidence_floor_gate(&non_prod_inconclusive), GateResult::Red(_)));
     }
 }
