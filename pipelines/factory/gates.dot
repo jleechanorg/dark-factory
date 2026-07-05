@@ -46,7 +46,7 @@ digraph gates {
     review_parallel_phase5 [
         type="parallel_reviewer",
         label="Phase 5 panel (skeptic + adversarial + /er — 1 primary + 3 shadows)",
-        prompt="@prompts/slim/review.md",
+        prompt="@prompts/slim/review_phase5_shadow.md",
         backend_priority="minimax,agy,codex,claude-sonnet",
         prefer_adversarial="true",
         n_shadows="3",
