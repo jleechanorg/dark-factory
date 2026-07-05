@@ -25,3 +25,15 @@ CREATE TABLE IF NOT EXISTS branch_registry (
   bead_id    TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+
+-- Circuit breaker: tracking of review rejections per attempt to detect consecutive failures
+CREATE TABLE IF NOT EXISTS review_rejection (
+  bead_id       TEXT NOT NULL,
+  attempt       INTEGER NOT NULL,
+  reviewer      TEXT NOT NULL,
+  feedback_hash TEXT NOT NULL,
+  feedback_text TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  PRIMARY KEY (bead_id, attempt)
+);
