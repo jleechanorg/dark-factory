@@ -688,6 +688,11 @@ impl Sessions for CliSessions {
         for line in out.lines() {
             if line.starts_with("SESSION=") {
                 sess_name = Some(line.split('=').nth(1).unwrap_or("").trim().to_string());
+            } else if line.starts_with("spawned session ") {
+                let parts: Vec<&str> = line.strip_prefix("spawned session ").unwrap_or("").split_whitespace().collect();
+                if !parts.is_empty() {
+                    sess_name = Some(parts[0].to_string());
+                }
             }
         }
 
@@ -695,7 +700,7 @@ impl Sessions for CliSessions {
             Ok(SessionId(name))
         } else {
             Err(DaemonError::Parse(format!(
-                "ao spawn produced no SESSION= line: {out}"
+                "ao spawn produced no session name: {out}"
             )))
         }
     }
