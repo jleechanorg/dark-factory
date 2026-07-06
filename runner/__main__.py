@@ -240,12 +240,12 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument(
             "--backend",
             choices=["echo", "claude", "codex", "ao", "agy"],
-            default="echo",
+            default="ao",
             help="LLM backend for codergen nodes",
         )
         p.add_argument(
             "--ao-project",
-            default=None,
+            default="worldarchitect.ai",
             help="AO project ID (required when --backend ao). Stored in state['ao.project'].",
         )
         p.add_argument(
