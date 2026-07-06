@@ -729,11 +729,11 @@ impl Llm for ChainLlm {
         } else {
             "claude".to_string()
         };
-        let r = run_tool(&claude_bin, &["--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt], 120);
+        let r = run_tool(&claude_bin, &["--dangerously-skip-permissions", "--print", "--setting-sources", "", prompt], 120);
         if let Ok(out) = r {
             return Ok(out);
         }
-        let r = run_tool("agy", &["--print", "--dangerously-skip-permissions", prompt], 120);
+        let r = run_tool("agy", &["--dangerously-skip-permissions", "--print", prompt], 120);
         if let Ok(out) = r {
             return Ok(out);
         }
