@@ -20,7 +20,7 @@ set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
 REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo jleechanorg/dark-factory)"
 LOG="${AFD_LOG:-$HOME/Library/Logs/dark-factory/daemon.jsonl}"
-H="daemon/factory-lite-harness.sh"
+H="daemon/factory-overlay.sh"
 MAX_PER_HOUR="${1:-8}"
 RATE_FILE="$HOME/.dark-factory/merge-timestamps"
 mkdir -p "$(dirname "$RATE_FILE")"; touch "$RATE_FILE"
