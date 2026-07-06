@@ -281,7 +281,7 @@ All existing operator policies bind the daemon:
     2.  Constraint-extraction fuzz run: ≥ 50 synthetic rejection comments processed without circuit-breaker false positives or holdout-leak false negatives.
     3.  Quiescence timeout validated: confirm the 60s hard timeout correctly aborts mid-push races in a controlled test.
 *   **Pilot scope:** Exactly one target repo named in a single config file: `config/daemon.toml` (TOML; operational thresholds, model chains, worker caps, tick rates).
-*   **Telemetry Log:** Logs structured JSON payloads to `~/Library/Logs/dark-factory/daemon.jsonl` classifying actions as human-initiated vs. automated, alongside diffs and verdicts. Event schema (one JSON object per line):
+*   **Telemetry Log:** Logs structured JSON payloads to `~/Library/Logs/dark-factory/daemon.jsonl` classifying actions as human-initiated vs. automated, alongside diffs and verdicts. Event schema (one JSON object per line; for non-bead events such as `TICK`, `lifecycleState` is set to the sentinel value `"N/A"`):
 
     ```json
     {

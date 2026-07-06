@@ -258,7 +258,7 @@ sys.exit(0 if not any(v=="red" for v in g.values()) else 1)'; then
 tick-summary) # tick-summary <role>
   [ $# -eq 2 ] || die "usage: tick-summary <coder|verifier>"
   counts="$(sql -json "SELECT state, count(*) AS n FROM bead_overlay GROUP BY state;" | python3 -c 'import json,sys; d=json.load(sys.stdin) if (s:=sys.stdin) else []; print(json.dumps({r["state"].lower(): r["n"] for r in d}))' 2>/dev/null || echo '{}')"
-  emit "tick" 0 QUEUED TICK "$counts" "{\"role\":\"$2\"}"
+  emit "tick" 0 "N/A" TICK "$counts" "{\"role\":\"$2\"}"
   echo "ok"
   ;;
 

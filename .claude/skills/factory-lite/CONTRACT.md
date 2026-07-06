@@ -180,7 +180,7 @@ Log file: `~/Library/Logs/dark-factory/daemon.jsonl` (single flat file per
 spec §4.2.9 — NOT the per-repo/branch tree the Python runner's perf-log uses).
 Schema is BINDING — every field, every event, matches
 `docs/auto-factory-daemon-design-rust.md` §5 `TelemetryEvent` exactly:
-`timestamp, bead_id, attempt_id, lifecycle_state, event_type, metrics, context`.
+`timestamp, bead_id, attempt_id, lifecycle_state, event_type, metrics, context` (for non-bead events such as `event_type = "TICK"`, `lifecycle_state` is set to the sentinel value `"N/A"`).
 
 ```bash
 mkdir -p ~/Library/Logs/dark-factory
