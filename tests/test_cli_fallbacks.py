@@ -332,13 +332,17 @@ def test_gate_per_backend_missing_sets_backend_missing_metadata(monkeypatch, tmp
 def test_reviewer_gate_priority_queue_with_codex_missing_picks_codex(monkeypatch, tmp_path):
     """``_resolve_adversarial_backend`` picks the first entry that
     responds to ``--version`` (probe stubbed here). When the resolved
-    backend is then missing at run time, ``_execute_gate`` only attempts
-    the resolved backend and (if it's an infra failure) falls back to
-    ``claude`` -- it does NOT walk the rest of the priority queue.
+    backend is then missing at run time, ``_execute_gate`` walks the
+    infra-failure fallback chain in order: ``agy`` first (if not already
+    the resolved backend), then ``claude``. The chain
+    "codex (missing) -> agy (missing) -> claude (succeeds)" is the
+    canonical path now that agy→claude infra fallback was added (commit
+    981e26bd9).
 
-    The priority queue is a *first pass selector* -- one backend is
-    chosen, and either it works or we fall back to claude. The chain
-    "codex (missing) -> claude (succeeds)" is the canonical path.
+    Note: this test deliberately fails BOTH codex and agy in the stub so
+    the fallback walks all the way to claude. The companion test
+    ``test_reviewer_gate_priority_queue_agy_succeeds_after_codex_missing``
+    covers the "agy succeeds" mid-chain case.
     """
     fake_sha = "0" * 40
     seen: list[str] = []
@@ -353,11 +357,10 @@ def test_reviewer_gate_priority_queue_with_codex_missing_picks_codex(monkeypatch
     def _fake_run(cmd, **kwargs):
         first = os.path.basename(str(cmd[0]))
         seen.append(first)
-        if first == "codex":
-            # The probe said codex was installed, but the actual
-            # invocation finds the binary gone (e.g. uninstalled between
-            # probe and run, or a missing local checkout).
-            raise FileNotFoundError(2, "No such file or directory: codex")
+        if first in ("codex", "agy"):
+            # codex: probe said installed but binary missing at run time.
+            # agy: also simulated missing to force walk to claude.
+            raise FileNotFoundError(2, f"No such file or directory: {first}")
         # claude fallback: succeed with a real verdict + SHA echo.
         return _fake_completed(
             cmd, returncode=0,
@@ -390,8 +393,10 @@ def test_reviewer_gate_priority_queue_with_codex_missing_picks_codex(monkeypatch
     assert result.metadata["fallback_used"] == "true"
     assert result.metadata["fallback_from"] == "codex"
     assert result.metadata["reviewer_backend"] == "claude"
-    # Confirm the dispatch order: codex (FileNotFoundError) -> claude.
-    assert seen == ["codex", "claude"]
+    # Confirm the dispatch order: codex (FileNotFoundError) -> agy (also
+    # missing) -> claude (succeeds). The agy→claude fallback walks every
+    # entry until one is not an infra failure (handler_dispatch.py:_execute_gate).
+    assert seen == ["codex", "agy", "claude"]
 
 
 def test_reviewer_gate_priority_queue_all_uninstalled_falls_through(monkeypatch, tmp_path):
