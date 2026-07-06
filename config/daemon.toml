@@ -1,0 +1,10 @@
+target_repo = "jleechanorg/worldarchitect.ai"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"

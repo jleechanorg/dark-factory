@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::state::{BeadOverlay, OverlayState, StateStore};
-use crate::tools::{Llm, Scm, Sessions, Vcs, SessionId};
+use crate::tools::{Llm, Scm, Sessions, Vcs};
 use crate::telemetry::{self, TelemetryEvent};
 use crate::constraints;
 use std::path::Path;

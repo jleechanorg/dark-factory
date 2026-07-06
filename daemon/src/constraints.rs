@@ -21,43 +21,52 @@ struct LlmExtractorResponse {
 
 /// Screens the reviewer feedback text for holdout test internals or subpaths and redacts them.
 pub fn redact_holdouts(text: &str) -> (String, bool) {
-    let mut redacted = text.to_string();
+    let mut result = String::new();
     let mut encountered = false;
 
-    // Check environment variable using a temp placeholder that does not contain "holdout"
-    if redacted.contains("$DARK_FACTORY_HOLDOUTS") {
-        redacted = redacted.replace("$DARK_FACTORY_HOLDOUTS", "___TEMP_ENV_PLACEHOLDER___");
-        encountered = true;
-    }
-
-    let lower = redacted.to_lowercase();
-    if lower.contains("holdout") {
-        let mut result = String::new();
-        let mut last_idx = 0;
-        for (idx, _) in lower.match_indices("holdout") {
-            if idx < last_idx {
-                continue;
+    let mut chars = text.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            result.push(chars.next().unwrap());
+        } else {
+            let mut word = String::new();
+            while let Some(&nc) = chars.peek() {
+                if nc.is_whitespace() {
+                    break;
+                }
+                word.push(chars.next().unwrap());
             }
-            result.push_str(&redacted[last_idx..idx]);
-            // check if it's "holdouts"
-            if idx + 8 <= redacted.len() && redacted[idx..idx + 8].to_lowercase() == "holdouts" {
-                result.push_str("[REDACTED_HOLDOUTS]");
-                last_idx = idx + 8;
+
+            // Check for surrounding quotes or punctuation (e.g. at the start/end)
+            let mut start_idx = 0;
+            while start_idx < word.len() && (word.as_bytes()[start_idx] == b'"' || word.as_bytes()[start_idx] == b'\'' || word.as_bytes()[start_idx] == b'(' || word.as_bytes()[start_idx] == b'[' || word.as_bytes()[start_idx] == b'{') {
+                start_idx += 1;
+            }
+            let mut end_idx = word.len();
+            while end_idx > start_idx && (word.as_bytes()[end_idx - 1] == b'"' || word.as_bytes()[end_idx - 1] == b'\'' || word.as_bytes()[end_idx - 1] == b')' || word.as_bytes()[end_idx - 1] == b']' || word.as_bytes()[end_idx - 1] == b'}' || word.as_bytes()[end_idx - 1] == b'.' || word.as_bytes()[end_idx - 1] == b',' || word.as_bytes()[end_idx - 1] == b';' || word.as_bytes()[end_idx - 1] == b':') {
+                end_idx -= 1;
+            }
+
+            let core = &word[start_idx..end_idx];
+            let lower = core.to_lowercase();
+            if lower.contains("holdout") {
+                encountered = true;
+                result.push_str(&word[..start_idx]);
+                if lower.contains('/') || lower.contains('\\') || lower.contains('$') {
+                    result.push_str("[REDACTED_HOLDOUT_PATH]");
+                } else if lower.contains("holdouts") {
+                    result.push_str("[REDACTED_HOLDOUTS]");
+                } else {
+                    result.push_str("[REDACTED_HOLDOUT]");
+                }
+                result.push_str(&word[end_idx..]);
             } else {
-                result.push_str("[REDACTED_HOLDOUT]");
-                last_idx = idx + 7;
+                result.push_str(&word);
             }
-            encountered = true;
         }
-        result.push_str(&redacted[last_idx..]);
-        redacted = result;
     }
 
-    if encountered {
-        redacted = redacted.replace("___TEMP_ENV_PLACEHOLDER___", "[REDACTED_HOLDOUTS_ENV]");
-    }
-
-    (redacted, encountered)
+    (result, encountered)
 }
 
 /// Prompt the LLM using the Constraint Extractor contract and extract positive assertions
@@ -174,7 +183,6 @@ pub fn append_mutation(spec_path: &Path, block: &str) -> Result<(), DaemonError>
 mod tests {
     use super::*;
     use crate::tools::Llm;
-    use std::cell::RefCell;
 
     struct FakeLlm(String);
     impl Llm for FakeLlm {
@@ -190,18 +198,18 @@ mod tests {
         assert!(enc);
         assert_eq!(
             redacted,
-            "Fail: test in [REDACTED_HOLDOUTS_ENV]/scenario_1.py failed"
+            "Fail: test in [REDACTED_HOLDOUT_PATH] failed"
         );
 
         let text2 = "Check holdouts/test_foo.py";
         let (redacted2, enc2) = redact_holdouts(text2);
         assert!(enc2);
-        assert_eq!(redacted2, "Check [REDACTED_HOLDOUTS]/test_foo.py");
+        assert_eq!(redacted2, "Check [REDACTED_HOLDOUT_PATH]");
 
         let text3 = "Check holdout/test_foo.py";
         let (redacted3, enc3) = redact_holdouts(text3);
         assert!(enc3);
-        assert_eq!(redacted3, "Check [REDACTED_HOLDOUT]/test_foo.py");
+        assert_eq!(redacted3, "Check [REDACTED_HOLDOUT_PATH]");
 
         let text4 = "Normal feedback, no leak.";
         let (redacted4, enc4) = redact_holdouts(text4);

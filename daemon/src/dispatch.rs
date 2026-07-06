@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::state::{BeadOverlay, OverlayState, StateStore};
 use crate::tools::{Bead, Sessions, SpawnSpec};
+use crate::router::RoutingVerdict;
 
 /// Dispatch as many `ready` beads as the safety envelope allows.
 ///
@@ -39,14 +40,14 @@ pub fn dispatch_ready(
     sessions: &dyn Sessions,
     store: &dyn StateStore,
     cfg: &Config,
-    ready: &[Bead],
+    ready: &[(Bead, RoutingVerdict)],
 ) -> Result<usize, DaemonError> {
     let active = sessions.active_count()?;
     let free_slots = cfg.max_workers.saturating_sub(active);
     let batch = free_slots.min(cfg.max_batch);
 
     let mut dispatched = 0usize;
-    for bead in ready.iter().take(batch) {
+    for (bead, verdict) in ready.iter().take(batch) {
         let mut overlay = store.load(&bead.id)?.unwrap_or_else(|| BeadOverlay {
             bead_id: bead.id.clone(),
             state: OverlayState::Queued,
@@ -70,10 +71,26 @@ pub fn dispatch_ready(
         overlay.branch = Some(branch.clone());
         store.save(&overlay)?;
 
+        let prompt = match verdict {
+            RoutingVerdict::ResearchPath => {
+                format!(
+                    "Route to RESEARCH_PATH: Run /factory with pipelines/slim/minimal_research.dot to research: {}",
+                    bead.title
+                )
+            }
+            RoutingVerdict::GenericPath => {
+                format!(
+                    "Route to GENERIC_PATH: Run /factory with pipelines/slim/spec_gen.dot to handle: {}",
+                    bead.title
+                )
+            }
+            _ => bead.title.clone(),
+        };
+
         let spec = SpawnSpec {
             bead_id: bead.id.clone(),
             branch: branch.clone(),
-            prompt: bead.title.clone(),
+            prompt,
         };
         let session_id = sessions.spawn(&spec)?;
 
@@ -248,15 +265,15 @@ mod tests {
         }
     }
 
-    fn beads(n: usize) -> Vec<Bead> {
+    fn beads(n: usize) -> Vec<(Bead, RoutingVerdict)> {
         (0..n)
-            .map(|i| Bead {
+            .map(|i| (Bead {
                 id: format!("bead-{i}"),
                 title: format!("title {i}"),
                 description: String::new(),
                 file_tree_summary: String::new(),
                 external_ref: None,
-            })
+            }, RoutingVerdict::StandardPath))
             .collect()
     }
 

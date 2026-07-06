@@ -56,3 +56,32 @@ fn test_chain_llm_real_fallback() {
     let text = res.unwrap();
     assert!(!text.trim().is_empty());
 }
+
+#[test]
+fn test_cli_scm_offline_fallback() {
+    let scm = CliScm::new("jleechanorg/dark-factory".to_string());
+    let offline_dir = std::path::Path::new(".beads/offline");
+    std::fs::create_dir_all(&offline_dir).unwrap();
+    
+    let pr_file = offline_dir.join("pr_9999.json");
+    std::fs::write(&pr_file, r#"{
+        "ci_success": true,
+        "mergeable": true,
+        "coderabbit_approved": false,
+        "bugbot_error_count": 2,
+        "unresolved_thread_count": 1,
+        "head_sha": "abc123sha",
+        "body": "offline body",
+        "comments": [],
+        "files": []
+    }"#).unwrap();
+    
+    let snap = scm.pr_snapshot(9999).unwrap();
+    assert_eq!(snap.head_sha, "abc123sha");
+    assert_eq!(snap.body, "offline body");
+    assert_eq!(snap.bugbot_error_count, 2);
+    assert!(!snap.coderabbit_approved);
+    
+    let _ = std::fs::remove_file(pr_file);
+}
+

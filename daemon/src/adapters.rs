@@ -2,6 +2,10 @@ use crate::errors::DaemonError;
 use crate::tools::{Bead, Issue, Llm, Permission, PrSnapshot, run_tool, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 
 pub struct CliTracker;
 
@@ -82,16 +86,57 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
 
 pub struct CliScm {
     pub repo: String,
+    labeled_issues_cache: Mutex<HashMap<String, (Vec<Issue>, Instant)>>,
+    permission_cache: Mutex<HashMap<String, (Permission, Instant)>>,
+    pr_snapshot_cache: Mutex<HashMap<u64, (PrSnapshot, Instant)>>,
+    branch_commit_cache: Mutex<HashMap<String, (Option<u64>, Instant)>>,
 }
 
 impl CliScm {
     pub fn new(repo: String) -> Self {
-        Self { repo }
+        Self {
+            repo,
+            labeled_issues_cache: Mutex::new(HashMap::new()),
+            permission_cache: Mutex::new(HashMap::new()),
+            pr_snapshot_cache: Mutex::new(HashMap::new()),
+            branch_commit_cache: Mutex::new(HashMap::new()),
+        }
     }
 }
 
+
 impl Scm for CliScm {
     fn labeled_issues(&self, label: &str) -> Result<Vec<Issue>, DaemonError> {
+        let offline_path = std::path::Path::new(".beads/offline").join(format!("labeled_issues_{}.json", label));
+        if offline_path.exists() {
+            if let Ok(raw) = std::fs::read_to_string(&offline_path) {
+                #[derive(serde::Deserialize)]
+                struct OfflineIssue {
+                    number: u64,
+                    title: String,
+                    body: String,
+                    author_login: String,
+                }
+                if let Ok(issues_raw) = serde_json::from_str::<Vec<OfflineIssue>>(&raw) {
+                    let issues = issues_raw.into_iter().map(|issue| Issue {
+                        number: issue.number,
+                        title: issue.title,
+                        body: issue.body,
+                        author_login: issue.author_login,
+                        external_ref: format!("{}#{}", self.repo, issue.number),
+                    }).collect();
+                    return Ok(issues);
+                }
+            }
+        }
+        {
+            let cache = self.labeled_issues_cache.lock().unwrap();
+            if let Some((val, timestamp)) = cache.get(label) {
+                if timestamp.elapsed() < Duration::from_secs(60) {
+                    return Ok(val.clone());
+                }
+            }
+        }
         let out = run_tool(
             "gh",
             &[
@@ -123,17 +168,49 @@ impl Scm for CliScm {
         let gh_issues: Vec<GhIssue> = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse gh issue list: {e}"))
         })?;
-        let issues = gh_issues.into_iter().map(|issue| Issue {
+        let issues: Vec<Issue> = gh_issues.into_iter().map(|issue| Issue {
             number: issue.number,
             title: issue.title,
             body: issue.body.unwrap_or_default(),
             author_login: issue.author.login,
             external_ref: format!("{}#{}", self.repo, issue.number),
         }).collect();
+        {
+            let mut cache = self.labeled_issues_cache.lock().unwrap();
+            cache.insert(label.to_string(), (issues.clone(), Instant::now()));
+        }
         Ok(issues)
     }
 
+
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError> {
+        let offline_path = std::path::Path::new(".beads/offline").join(format!("permission_{}.json", login));
+        if offline_path.exists() {
+            if let Ok(raw) = std::fs::read_to_string(&offline_path) {
+                #[derive(serde::Deserialize)]
+                struct OfflinePermission {
+                    permission: String,
+                }
+                if let Ok(perm_raw) = serde_json::from_str::<OfflinePermission>(&raw) {
+                    let perm = match perm_raw.permission.as_str() {
+                        "admin" => Permission::Admin,
+                        "write" => Permission::Write,
+                        "triage" => Permission::Triage,
+                        "read" => Permission::Read,
+                        _ => Permission::None,
+                    };
+                    return Ok(perm);
+                }
+            }
+        }
+        {
+            let cache = self.permission_cache.lock().unwrap();
+            if let Some((val, timestamp)) = cache.get(login) {
+                if timestamp.elapsed() < Duration::from_secs(300) {
+                    return Ok(*val);
+                }
+            }
+        }
         let path = format!("repos/{}/collaborators/{}/permission", self.repo, login);
         let out = run_tool("gh", &["api", &path], 30)?;
         #[derive(serde::Deserialize)]
@@ -151,10 +228,56 @@ impl Scm for CliScm {
             "read" => Permission::Read,
             _ => Permission::None,
         };
+        {
+            let mut cache = self.permission_cache.lock().unwrap();
+            cache.insert(login.to_string(), (perm, Instant::now()));
+        }
         Ok(perm)
     }
 
+
     fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError> {
+        let offline_path = std::path::Path::new(".beads/offline").join(format!("pr_{}.json", pr));
+        if offline_path.exists() {
+            if let Ok(raw) = std::fs::read_to_string(&offline_path) {
+                #[derive(serde::Deserialize)]
+                struct OfflinePrSnapshot {
+                    ci_success: bool,
+                    mergeable: bool,
+                    coderabbit_approved: bool,
+                    bugbot_error_count: u32,
+                    unresolved_thread_count: u32,
+                    head_sha: String,
+                    body: String,
+                    comments: Vec<crate::tools::PrComment>,
+                    files: Vec<crate::tools::PrFile>,
+                    updated_at_epoch: Option<u64>,
+                }
+                if let Ok(snap) = serde_json::from_str::<OfflinePrSnapshot>(&raw) {
+                    return Ok(PrSnapshot {
+                        pr_number: pr,
+                        ci_success: snap.ci_success,
+                        mergeable: snap.mergeable,
+                        coderabbit_approved: snap.coderabbit_approved,
+                        bugbot_error_count: snap.bugbot_error_count,
+                        unresolved_thread_count: snap.unresolved_thread_count,
+                        head_sha: snap.head_sha,
+                        body: snap.body,
+                        comments: snap.comments,
+                        files: snap.files,
+                        updated_at_epoch: snap.updated_at_epoch.unwrap_or(0),
+                    });
+                }
+            }
+        }
+        {
+            let cache = self.pr_snapshot_cache.lock().unwrap();
+            if let Some((val, timestamp)) = cache.get(&pr) {
+                if timestamp.elapsed() < Duration::from_secs(60) {
+                    return Ok(val.clone());
+                }
+            }
+        }
         let pr_str = pr.to_string();
         let view_out = run_tool(
             "gh",
@@ -320,7 +443,7 @@ impl Scm for CliScm {
         }).collect();
 
         let updated_at_epoch = crate::tools::iso8601_to_epoch(&view.updated_at).unwrap_or(0);
-        Ok(PrSnapshot {
+        let snapshot = PrSnapshot {
             pr_number: pr,
             ci_success,
             mergeable,
@@ -332,24 +455,70 @@ impl Scm for CliScm {
             comments: pr_comments,
             files: pr_files,
             updated_at_epoch,
-        })
+        };
+        {
+            let mut cache = self.pr_snapshot_cache.lock().unwrap();
+            cache.insert(pr, (snapshot.clone(), Instant::now()));
+        }
+        Ok(snapshot)
     }
 
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
+        let offline_path = std::path::Path::new(".beads/offline").join(format!("pr_{}.json", pr));
+        if offline_path.exists() {
+            let _ = std::fs::remove_file(&offline_path);
+            {
+                let mut pr_cache = self.pr_snapshot_cache.lock().unwrap();
+                pr_cache.remove(&pr);
+                let mut issues_cache = self.labeled_issues_cache.lock().unwrap();
+                issues_cache.clear();
+            }
+            return Ok(());
+        }
         let pr_str = pr.to_string();
         run_tool(
             "gh",
             &["pr", "close", &pr_str, "--repo", &self.repo, "-c", comment],
             30,
         )?;
+        {
+            let mut pr_cache = self.pr_snapshot_cache.lock().unwrap();
+            pr_cache.remove(&pr);
+            let mut issues_cache = self.labeled_issues_cache.lock().unwrap();
+            issues_cache.clear();
+        }
         Ok(())
     }
 
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError> {
+        let offline_path = std::path::Path::new(".beads/offline").join(format!("branch_{}.json", branch));
+        if offline_path.exists() {
+            if let Ok(raw) = std::fs::read_to_string(&offline_path) {
+                #[derive(serde::Deserialize)]
+                struct OfflineBranch {
+                    last_commit_epoch: Option<u64>,
+                }
+                if let Ok(b) = serde_json::from_str::<OfflineBranch>(&raw) {
+                    return Ok(b.last_commit_epoch);
+                }
+            }
+        }
+        {
+            let cache = self.branch_commit_cache.lock().unwrap();
+            if let Some((val, timestamp)) = cache.get(branch) {
+                if timestamp.elapsed() < Duration::from_secs(60) {
+                    return Ok(*val);
+                }
+            }
+        }
         let path = format!("repos/{}/branches/{}", self.repo, branch);
         let out = match run_tool("gh", &["api", &path], 30) {
             Ok(o) => o,
             Err(DaemonError::Tool { stderr, .. }) if stderr.contains("404") || stderr.contains("Not Found") || stderr.contains("not found") => {
+                {
+                    let mut cache = self.branch_commit_cache.lock().unwrap();
+                    cache.insert(branch.to_string(), (None, Instant::now()));
+                }
                 return Ok(None);
             }
             Err(e) => return Err(e),
@@ -377,6 +546,10 @@ impl Scm for CliScm {
         let epoch = crate::tools::iso8601_to_epoch(&resp.commit.commit.committer.date).ok_or_else(|| {
             DaemonError::Parse(format!("failed to parse date: {}", resp.commit.commit.committer.date))
         })?;
+        {
+            let mut cache = self.branch_commit_cache.lock().unwrap();
+            cache.insert(branch.to_string(), (Some(epoch), Instant::now()));
+        }
         Ok(Some(epoch))
     }
 }
@@ -540,6 +713,10 @@ impl Vcs for CliVcs {
 pub struct ChainLlm;
 
 impl Llm for ChainLlm {
+    fn is_real(&self) -> bool {
+        true
+    }
+
     fn judge(&self, prompt: &str) -> Result<String, DaemonError> {
         let r = run_tool("codex", &["exec", "--yolo", "--skip-git-repo-check", prompt], 120);
         if let Ok(out) = r {

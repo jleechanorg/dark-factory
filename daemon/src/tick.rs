@@ -321,7 +321,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         }
     }
 
-    let mut ready: Vec<Bead> = Vec::new();
+    let mut ready: Vec<(Bead, RoutingVerdict)> = Vec::new();
     for bead in &routing_candidates {
         let overlay = match deps.store.load(&bead.id)? {
             Some(o) if o.state == OverlayState::Queued || o.state == OverlayState::Redispatched => o,
@@ -334,6 +334,8 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 let verdict_str = match verdict {
                     RoutingVerdict::SmallPath => "SMALL_PATH",
                     RoutingVerdict::StandardPath => "STANDARD_PATH",
+                    RoutingVerdict::ResearchPath => "RESEARCH_PATH",
+                    RoutingVerdict::GenericPath => "GENERIC_PATH",
                 };
                 emit(
                     deps.telemetry_log,
@@ -344,7 +346,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({}),
                     serde_json::json!({"routingVerdict": verdict_str}),
                 )?;
-                ready.push(bead.clone());
+                ready.push((bead.clone(), verdict));
             }
             Err(DaemonError::Parse(reason)) => {
                 // ZFC: an unparseable routing verdict is never guessed at —
@@ -371,7 +373,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     if !ready.is_empty() {
         let dispatched = dispatch::dispatch_ready(deps.sessions, deps.store, deps.cfg, &ready)?;
         summary.beads_dispatched += dispatched;
-        for bead in ready.iter().take(dispatched) {
+        for (bead, _) in ready.iter().take(dispatched) {
             emit(
                 deps.telemetry_log,
                 &bead.id,
@@ -404,7 +406,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 /// has no wired `/er` runner yet, so `er_verdict` is honestly `Absent` (gate 6
 /// -> `Unknown`, never a guessed `Pass`) until a real `/er` invocation is
 /// wired in (bead jleechan-3rf, verifier.rs `evidence_floor_gate`).
-fn skeptic_evidence(llm: &dyn Llm, bead_id: &str, pr: u64) -> Result<PrEvidence, DaemonError> {
+fn skeptic_evidence(deps: &TickDeps, bead_id: &str, pr: u64) -> Result<PrEvidence, DaemonError> {
     let prompt = format!(
         "You are the Stage-1 Skeptic gate for an autonomous coding factory.\n\
          Review bead {bead_id}'s PR #{pr} end-to-end (diff, evidence, tests) and \
@@ -412,8 +414,62 @@ fn skeptic_evidence(llm: &dyn Llm, bead_id: &str, pr: u64) -> Result<PrEvidence,
          Respond with exactly one line of the form:\n\
          pass|warn <note>|fail <reason>",
     );
-    let reply = llm.judge(&prompt)?;
-    let skeptic_verdict = verifier::parse_skeptic_verdict(&reply);
+
+    if !deps.llm.is_real() {
+        let reply = deps.llm.judge(&prompt)?;
+        let skeptic_verdict = verifier::parse_skeptic_verdict(&reply);
+        return Ok(PrEvidence {
+            is_production: false,
+            non_test_changed_loc: 0,
+            has_integration_evidence_marker: false,
+            er_verdict: verifier::ErVerdict::Absent,
+            skeptic_verdict,
+        });
+    }
+
+    let prompt_clone1 = prompt.clone();
+    let handle1 = std::thread::spawn(move || {
+        crate::tools::run_tool("codex", &["exec", "--yolo", "--skip-git-repo-check", &prompt_clone1], 120)
+    });
+
+    let prompt_clone2 = prompt.clone();
+    let handle2 = std::thread::spawn(move || {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let nvm_claude = format!("{}/.nvm/versions/node/v22.22.0/bin/claude", home);
+        let claude_bin = if std::path::Path::new(&nvm_claude).exists() {
+            nvm_claude
+        } else {
+            "claude".to_string()
+        };
+        crate::tools::run_tool(&claude_bin, &["--print", "--dangerously-skip-permissions", "--setting-sources", "", &prompt_clone2], 120)
+    });
+
+    let res1 = handle1.join().unwrap_or(Err(DaemonError::Tool { tool: "thread".into(), rc: -1, stderr: "join failed".into() }));
+    let res2 = handle2.join().unwrap_or(Err(DaemonError::Tool { tool: "thread".into(), rc: -1, stderr: "join failed".into() }));
+
+    let v1 = match &res1 {
+        Ok(reply) => verifier::parse_skeptic_verdict(reply),
+        Err(_) => None,
+    };
+
+    let v2 = match &res2 {
+        Ok(reply) => verifier::parse_skeptic_verdict(reply),
+        Err(_) => None,
+    };
+
+    let skeptic_verdict = match (v1, v2) {
+        (Some(verifier::SkepticVerdict::Fail(r1)), Some(verifier::SkepticVerdict::Fail(r2))) => Some(verifier::SkepticVerdict::Fail(format!("{r1} && {r2}"))),
+        (Some(verifier::SkepticVerdict::Fail(r)), _) => Some(verifier::SkepticVerdict::Fail(r)),
+        (_, Some(verifier::SkepticVerdict::Fail(r))) => Some(verifier::SkepticVerdict::Fail(r)),
+        (Some(verifier::SkepticVerdict::Warn(w1)), Some(verifier::SkepticVerdict::Warn(w2))) => Some(verifier::SkepticVerdict::Warn(format!("{w1} && {w2}"))),
+        (Some(verifier::SkepticVerdict::Warn(w)), _) => Some(verifier::SkepticVerdict::Warn(w)),
+        (_, Some(verifier::SkepticVerdict::Warn(w))) => Some(verifier::SkepticVerdict::Warn(w)),
+        (Some(verifier::SkepticVerdict::Pass), Some(verifier::SkepticVerdict::Pass)) => Some(verifier::SkepticVerdict::Pass),
+        (Some(verifier::SkepticVerdict::Pass), None) => Some(verifier::SkepticVerdict::Pass),
+        (None, Some(verifier::SkepticVerdict::Pass)) => Some(verifier::SkepticVerdict::Pass),
+        _ => None,
+    };
+
     Ok(PrEvidence {
         is_production: false,
         non_test_changed_loc: 0,
@@ -477,7 +533,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             None => continue,
         };
 
-        let mut evidence = skeptic_evidence(deps.llm, bead_id, pr)?;
+        let mut evidence = skeptic_evidence(deps, bead_id, pr)?;
         let snapshot = deps.scm.pr_snapshot(pr)?;
         evidence.er_verdict = verifier::parse_er_verdict(&snapshot.comments);
         evidence.is_production = verifier::classify_production(&snapshot.files);

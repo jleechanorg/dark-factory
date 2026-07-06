@@ -8,7 +8,7 @@ use daemon::reroll::{self, RerollDeps, RerollOutcome};
 use daemon::constraints;
 use daemon::tick::{run_tick, TickDeps};
 use daemon::errors::DaemonError;
-use daemon::tools::{Issue, Permission, PrSnapshot, Bead, Llm};
+use daemon::tools::{Issue, Permission, PrSnapshot, Llm};
 
 fn test_cfg() -> Config {
     Config {

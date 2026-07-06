@@ -219,6 +219,9 @@ pub trait Vcs {
 /// ZFC: ALL judgment goes through here — no keyword/heuristic routing in callers.
 pub trait Llm {
     fn judge(&self, prompt: &str) -> Result<String, DaemonError>;
+    fn is_real(&self) -> bool {
+        false
+    }
 }
 
 /// Shared subprocess helper for every `Cli*` impl: spawn `cmd args...`, drain

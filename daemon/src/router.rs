@@ -16,10 +16,12 @@ use serde::Deserialize;
 pub enum RoutingVerdict {
     SmallPath,
     StandardPath,
+    ResearchPath,
+    GenericPath,
 }
 
 /// Wire shape of the router LLM's JSON reply (spec Appendix C item 1):
-/// `{ "routingVerdict": "SMALL_PATH" | "STANDARD_PATH", "justification": "<one sentence>" }`.
+/// `{ "routingVerdict": "SMALL_PATH" | "STANDARD_PATH" | "RESEARCH_PATH" | "GENERIC_PATH", "justification": "<one sentence>" }`.
 #[derive(Debug, Deserialize)]
 struct RouterResponse {
     #[serde(rename = "routingVerdict")]
@@ -53,8 +55,11 @@ fn render_prompt(bead: &Bead) -> String {
 
     format!(
         "You are the Task Router for an autonomous coding factory.\n\
-         Judge whether this task is small enough for a single-shot \"small path\" \
-         implementation, or needs the full multi-gate \"standard path\".\n\
+         Judge which path this task should be routed to:\n\
+         - \"SMALL_PATH\": Small, direct single-shot code implementation.\n\
+         - \"STANDARD_PATH\": Standard multi-gate feature implementation.\n\
+         - \"RESEARCH_PATH\": Read-only research, analysis, or codebase investigation.\n\
+         - \"GENERIC_PATH\": General tasks that do not fit direct code implementation (e.g. documentation, testing, or spec generation).\n\n\
          Base your judgment on the whole shape of the task below — do not apply \
          keyword or file-count rules; use your own judgment of complexity, \
          ambiguity, and blast radius.\n\n\
@@ -64,7 +69,7 @@ fn render_prompt(bead: &Bead) -> String {
          Relevant file tree:\n{}\n\n\
          Respond with exactly one JSON object as the last thing in your reply, \
          of the form:\n\
-         {{\"routingVerdict\": \"SMALL_PATH\" | \"STANDARD_PATH\", \"justification\": \"<one sentence>\"}}",
+         {{\"routingVerdict\": \"SMALL_PATH\" | \"STANDARD_PATH\" | \"RESEARCH_PATH\" | \"GENERIC_PATH\", \"justification\": \"<one sentence>\"}}",
         bead.id, bead.title, description, file_tree,
     )
 }
@@ -103,6 +108,8 @@ pub fn route(llm: &dyn Llm, bead: &Bead) -> Result<RoutingVerdict, DaemonError> 
     match parsed.routing_verdict.as_str() {
         "SMALL_PATH" => Ok(RoutingVerdict::SmallPath),
         "STANDARD_PATH" => Ok(RoutingVerdict::StandardPath),
+        "RESEARCH_PATH" => Ok(RoutingVerdict::ResearchPath),
+        "GENERIC_PATH" => Ok(RoutingVerdict::GenericPath),
         other => Err(DaemonError::Parse(format!(
             "unrecognized routingVerdict token: {other:?}"
         ))),
@@ -169,6 +176,25 @@ mod tests {
         let verdict = route(&llm, &bead()).expect("should parse");
         assert_eq!(verdict, RoutingVerdict::StandardPath);
     }
+
+    #[test]
+    fn research_path_verdict_parses() {
+        let llm = FakeLlm::scripted(
+            r#"{"routingVerdict":"RESEARCH_PATH","justification":"just read codebase"}"#,
+        );
+        let verdict = route(&llm, &bead()).expect("should parse");
+        assert_eq!(verdict, RoutingVerdict::ResearchPath);
+    }
+
+    #[test]
+    fn generic_path_verdict_parses() {
+        let llm = FakeLlm::scripted(
+            r#"{"routingVerdict":"GENERIC_PATH","justification":"spec edit only"}"#,
+        );
+        let verdict = route(&llm, &bead()).expect("should parse");
+        assert_eq!(verdict, RoutingVerdict::GenericPath);
+    }
+
 
     #[test]
     fn prose_reply_is_parse_error_never_defaulted() {
