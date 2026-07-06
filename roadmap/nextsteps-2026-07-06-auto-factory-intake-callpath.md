@@ -208,3 +208,82 @@ Verified this run (`gh pr view`):
 ## Roadmap pointer (evening)
 
 - Updated `roadmap/README.md` — **Recent activity (rolling)** — 2026-07-06 evening harness entry
+
+---
+
+# Addendum — 2026-07-06 late evening — PR #8189 GHA fallback fix + quota-blocked dispatch
+
+## Table of contents (late-evening addendum)
+
+- [Executive summary (late)](#executive-summary-late)
+- [Context (late)](#context-late)
+- [Bead index (late)](#bead-index-late)
+- [Work queue (late)](#work-queue-late)
+- [PR / merge state (late)](#pr--merge-state-late)
+- [Learnings pointer (late)](#learnings-pointer-late)
+- [Roadmap pointer (late)](#roadmap-pointer-late)
+
+## Executive summary (late)
+
+- **New PR opened during this window:** [PR #8189](https://github.com/jleechanorg/worldarchitect.ai/pull/8189) — `fix(ci): support --break-system-packages in ensurepip fallback` (branch `fix/GHA-ensurepip-break-system-packages-fallback`). Head `3447e85a`, MERGEABLE, CI pass=13/fail=8/skip=9.
+- **Factory orchestration scripts still on disk but uncommitted:** `daemon/factory-overlay.sh` (modified) + `daemon/factory-intake-from-gh.sh` (untracked). Scripts restored from `stash@{0}` in commit `8e70c9075`, but these two are *not* on `main` yet.
+- **Quota-blocked dispatch:** individual quota hit during prior session (resets ~22:30Z). No new AO dispatches issued in this pass; readonly snapshot only.
+- **Three PRs remain OPEN and MERGEABLE:** #8189 (8 fail), #8060 (6 fail), #7888 (5 fail). None reachable to all-green today without further coder + verifier iterations.
+- **Stranded AO workers:** ~15 processes still alive (PID 25741 on PR #8061 since 09:16, PID 10644 `agy.real` since 14:12) — staleness vs merged-PR targets means they are wasted resources.
+- **Top sequence:** (1) land the 2 uncommitted files on `main`; (2) kill stranded AO workers; (3) restart `daemon/run-factory-lite.sh coder/verifier`; (4) dedupe the 4×#8060 and 2×#8116/#7888 bead duplicates; (5) one focused worker on **#7888** (lowest fail count) to green.
+
+## Context (late)
+
+Continuation of the auto-factory orchestration work. After the evening /nextsteps captured the offline-stack diagnosis, this pass opened and pushed PR #8189 to fix the self-hosted runner `ensurepip` PEP-668 bootstrap that had been failing the `Harness autonomy checks (self hosted)` job across multiple PRs. The fix was non-trivial — three commits on the branch before checks stabilised. Worker ran into the MiniMax-M3 individual quota mid-session, so dispatch work for #8060/#7888 was deferred. Repo: `jleechanorg/dark-factory` (main, 2 uncommitted files); target repo: `jleechanorg/worldarchitect.ai` (PRs #8189/#8060/#7888 still open). Read-only assessment only.
+
+## Bead index (late)
+
+| Bead | Title | Priority | Link |
+|------|-------|----------|------|
+| jleechan-mt675 | Fix self-hosted GHA runner python3-venv ensurepip fallback | P1 | [issue via factory PR #8189](https://github.com/jleechanorg/worldarchitect.ai/pull/8189) |
+| jleechan-93ft | Drive PR #7888 to /green (single bead, parent of ccfin duplicate) | P1 | `br show jleechan-93ft` |
+| jleechan-9byt.4 | Drive PR #8060 to 7-green + /er PASS | P1 | [issue #8170](https://github.com/jleechanorg/worldarchitect.ai/issues/8170) |
+| jleechan-ccfin | Duplicate of jleechan-93ft — park, do not redrive | P2 | `br show jleechan-ccfin` |
+| jleechan-bxjy | Force rebase #8060 onto origin/main | P0 | `br show jleechan-bxjy` |
+| jleechan-4uzw | Rebase PR #8060 to resolve dirty→MERGEABLE | P1 | `br show jleechan-4uzw` |
+| jleechan-38w8 | Land factory-intake-from-gh.sh + factory-overlay.sh on main | P0 | `br show jleechan-38w8` |
+| jleechan-imj | Stop orphan factory-lite loops | P1 | `br show jleechan-imj` |
+| jleechan-nyp1 | Make factory-ao-remediate.sh spawn async (non-blocking AF tick) | P1 | `br show jleechan-nyp1` |
+| jleechan-nmll | Daemon-triggered auto-tick (replace operator intake) | P1 | `br show jleechan-nmll` |
+
+## Work queue (late)
+
+1. **Land `daemon/factory-overlay.sh` + `daemon/factory-intake-from-gh.sh` on `main`** — tracks jleechan-38w8. Acceptance: `git ls-files daemon/factory-intake-from-gh.sh` returns the path; `daemon/factory-overlay.sh` matches `origin/main`; commit + push. **Blocker for any redrive.**
+
+2. **Kill stranded AO workers on already-merged PRs** — `pgrep -fl "ao spawn --claim-pr 806[14]" | xargs -r kill -TERM`. Acceptance: `ps -ef | rg "ao spawn" | wc -l` ≤ 5 (only the active driver should remain). **Frees GPU/CPU quota for the redrive.**
+
+3. **Restart factory-lite loops** — `nohup bash daemon/run-factory-lite.sh coder 240 43200 &` + `nohup bash daemon/run-factory-lite.sh verifier 120 43200 &`. Acceptance: `launchctl list | rg factory-lite` (or process table) shows both loops; first tick should route ≥1 QUEUED bead to DISPATCHED.
+
+4. **Dedupe overlay beads** — close the 3 jleechan-4uzw / jleechan-bxjy / jleechan-hslx duplicates (the parent jleechan-9byt.4/.1 stay); park jleechan-ccfin as duplicate of jleechan-93ft. Acceptance: `factory-overlay.sh list QUEUED` shows ≤7 rows.
+
+5. **Drive [PR #7888](https://github.com/jleechanorg/worldarchitect.ai/pull/7888) end-to-end** — single focused worker, jleechan-93ft bead; cc-finish-level-commit has the smallest fail count (5) and the most-attested bead (parent ccfin already cycled). Acceptance: `gh pr checks 7888 --json state,conclusion | jq '[.[] | select(.conclusion=="failure")] | length'` = 0.
+
+6. **Drive [PR #8060](https://github.com/jleechanorg/worldarchitect.ai/pull/8060)** — second priority (6 fails). Rebase first per jleechan-bxjy; then drive. Acceptance: all checks `conclusion=success`.
+
+7. **Verify [PR #8189](https://github.com/jleechanorg/worldarchitect.ai/pull/8189)** — new PR is already MERGEABLE; it just needs to land on `main` so subsequent PRs benefit from the GHA fallback fix. Acceptance: merged + worldai runner no longer fails `Harness autonomy checks`.
+
+## PR / merge state (late)
+
+Verified this run (`gh pr view` against `jleechanorg/worldarchitect.ai`):
+
+- [PR #8189](https://github.com/jleechanorg/worldarchitect.ai/pull/8189): **OPEN** — MERGEABLE, head `3447e85a`, CI pass=13/fail=8/skip=9 (Green Gate failing — GHA bootstrap now partially fixed)
+- [PR #8060](https://github.com/jleechanorg/worldarchitect.ai/pull/8060): **OPEN** — MERGEABLE, head `98faf53e`, CI pass=20/fail=6/skip=4
+- [PR #7888](https://github.com/jleechanorg/worldarchitect.ai/pull/7888): **OPEN** — MERGEABLE, head `c95249f4`, CI pass=23/fail=5/skip=2
+- [PR #8058](https://github.com/jleechanorg/worldarchitect.ai/pull/8058): **MERGED** @ 2026-07-06T17:31:32Z
+- [PR #8064](https://github.com/jleechanorg/worldarchitect.ai/pull/8064): **MERGED** @ 2026-07-06T17:32:01Z
+- [PR #8116](https://github.com/jleechanorg/worldarchitect.ai/pull/8116): **MERGED** @ 2026-07-06T17:42:33Z
+- [PR #8061](https://github.com/jleechanorg/worldarchitect.ai/pull/8061): **MERGED** @ 2026-07-06T17:53:33Z
+
+## Learnings pointer (late)
+
+- `~/roadmap/learnings-2026-07.md` — section **2026-07-06 (late) — GHA ensurepip fallback + quota-blocked dispatch**
+
+## Roadmap pointer (late)
+
+- Updated `roadmap/activity/2026-07-06.md` — late-evening entry appended (PR #8189 + quota-blocked dispatch).
+- `roadmap/README.md` — no new date link needed (same day).
