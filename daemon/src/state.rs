@@ -83,6 +83,9 @@ pub trait StateStore {
     fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError>;
     fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, feedback_text: &str) -> Result<(), DaemonError>;
     fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError>;
+    fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
+        Ok(())
+    }
 }
 
 /// `StateStore` impl against `~/.dark-factory/daemon-cxdb.sqlite` (WAL mode,
@@ -176,6 +179,16 @@ impl SqliteStateStore {
 }
 
 impl StateStore for SqliteStateStore {
+    fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
+        self.conn
+            .execute(
+                "UPDATE bead_overlay SET state = 'QUEUED' WHERE state = 'DISPATCHING'",
+                [],
+            )
+            .map_err(|e| tool_err("reconcile_dispatching", e))?;
+        Ok(())
+    }
+
     fn load(&self, bead_id: &str) -> Result<Option<BeadOverlay>, DaemonError> {
         self.conn
             .query_row(

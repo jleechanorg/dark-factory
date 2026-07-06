@@ -208,6 +208,8 @@ fn run(args: Args) -> Result<(), DaemonError> {
         Box::new(SqliteStateStore::open(&db_path)?)
     };
 
+    store.reconcile_dispatching()?;
+
     let (scm, tracker, sessions, llm, vcs): (
         Box<dyn Scm>,
         Box<dyn Tracker>,
