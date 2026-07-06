@@ -644,9 +644,11 @@ def _resolve_adversarial_backend(
     real fail|partial from the chosen backend is kept (the no-reviewer-shopping
     rule is load-bearing in ``_execute_gate``).
     """
-    if priority is None:
-        raw = os.environ.get("DARK_FACTORY_ADVERSARIAL_PRIORITY", "")
-        priority = _parse_priority_env(raw) if raw else list(_DEFAULT_ADVERSARIAL_PRIORITY)
+    raw = os.environ.get("DARK_FACTORY_ADVERSARIAL_PRIORITY", "")
+    if raw:
+        priority = _parse_priority_env(raw)
+    elif priority is None:
+        priority = list(_DEFAULT_ADVERSARIAL_PRIORITY)
     else:
         priority = [str(p) for p in priority if p]
 
