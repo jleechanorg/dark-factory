@@ -623,10 +623,15 @@ impl Sessions for CliSessions {
             holdouts, holdouts
         );
 
-        let mut cmd = Command::new("sandbox-exec");
-        cmd.arg("-p").arg(&profile);
-        cmd.arg("ao")
-            .arg("spawn")
+        let mut cmd = if std::env::consts::OS == "macos" {
+            let mut c = Command::new("sandbox-exec");
+            c.arg("-p").arg(&profile);
+            c.arg("ao");
+            c
+        } else {
+            Command::new("ao")
+        };
+        cmd.arg("spawn")
             .arg(&spec.prompt)
             .arg("--project")
             .arg(&self.project)
@@ -642,13 +647,13 @@ impl Sessions for CliSessions {
         }
 
         let mut child = cmd.spawn().map_err(|e| DaemonError::Tool {
-            tool: "sandbox-exec".to_string(),
+            tool: if std::env::consts::OS == "macos" { "sandbox-exec".to_string() } else { "ao".to_string() },
             rc: -1,
             stderr: format!("spawn failed: {e}"),
         })?;
 
         let status = child.wait().map_err(|e| DaemonError::Tool {
-            tool: "sandbox-exec".to_string(),
+            tool: if std::env::consts::OS == "macos" { "sandbox-exec".to_string() } else { "ao".to_string() },
             rc: -1,
             stderr: format!("wait failed: {e}"),
         })?;
