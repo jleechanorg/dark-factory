@@ -632,6 +632,7 @@ impl Sessions for CliSessions {
             Command::new("ao")
         };
         cmd.arg("spawn")
+            .arg("--prompt")
             .arg(&spec.prompt)
             .arg("--project")
             .arg(&self.project)
