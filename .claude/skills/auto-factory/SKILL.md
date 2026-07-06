@@ -10,13 +10,15 @@ The auto-factory is the agent-orchestrator-style system that drives worldai PRs 
 ## 0. Load contract + config
 
 ```bash
-H=daemon/factory-lite-harness.sh
+H=daemon/factory-overlay.sh
 CONFIG=config/daemon.toml
 [ -f "$CONFIG" ] || CONFIG=daemon/contracts/daemon.toml.example
 $H init  # idempotent
 ```
 
-Read the SKILL.md files at `.claude/skills/factory-lite-coder/SKILL.md` and `.claude/skills/factory-lite-verifier/SKILL.md` for the detailed coder/verifier tick protocols. This skill orchestrates BOTH.
+The overlay harness `daemon/factory-overlay.sh` is the canonical executable spec for the auto-factory state machine (restored from `e60b5a31b~1:daemon/factory-lite-harness.sh` and extended in PR #167). All sqlite3 mutations to `~/.dark-factory/daemon-cxdb.sqlite` flow through it. Subcommands: `init`, `intake-upsert`, `route-record`, `capacity`, `dispatch-record`, `pr-opened`, `autonomy-tick`, `gate-assessment`, `prev-gate-assessment`, `ready`, `reroll-verdict`, `park`, `park-duplicate`, `bead-closed-check`, `tick-summary`, `recover-held`, `unstick-dispatching`, `redrive-pr`, `list`.
+
+> Historical note: the original `daemon/factory-lite-harness.sh` and `daemon/run-factory-lite.sh` were removed in commit `e60b5a31b` (2026-07-05, jleechan-xrdx). The decommissioned factory-lite-coder / factory-lite-verifier skills are gone; their protocols are now inline in this skill + factory-af-tick.sh + factory-overlay.sh.
 
 ## 1. Intake (work pickup)
 
@@ -146,7 +148,7 @@ Any-red → `$H reroll-verdict <bead_id> <pr> <in_place_fixable|reroll_worthy> "
 ## Failure modes & recovery
 
 - **GH API rate-limited**: skip GH pickup, use beads-only mode; continue.
-- **Daemon DOWN** (no factory-lite loops running): restart via `nohup bash daemon/run-factory-lite.sh coder 240 43200 &` and `nohup bash daemon/run-factory-lite.sh verifier 120 43200 &`.
+- **Daemon DOWN** (no auto-factory tick loop running): invoke `bash daemon/factory-af-tick.sh` for one tick; for a 24/7 poll loop, install the launchd plist from `daemon/launchd/ai.dark-factory.af-tick.plist` (bead jleechan-57h0) and `launchctl bootstrap gui/$UID <plist>`.
 - **Bead stuck HUMAN_HELD**: query previous `gate-assessment` — if cooldown over, reset bead to QUEUED via direct sqlite3 update + increment attempt counter.
 - **PR ci_green stuck on pre-existing infra**: document in PR comment, treat as known-issue; do NOT block readiness.
 - **File-overlap conflict across multiple PRs**: serialize per stacked-PR single-writer rule.
