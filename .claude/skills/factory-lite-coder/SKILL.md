@@ -62,20 +62,47 @@ Select up to `$free` routed QUEUED beads, then:
    wait for a later tick. When in doubt, serialize.
 2. For each selected bead, register FIRST:
    `$H dispatch-record <bead_id> factory/<bead_id>-r<attempt>` (attempt from
-   `$H list QUEUED` output). The harness enforces caps and legal state — if it
-   refuses, do not spawn that coder.
+   `$H list QUEUED` output) **for new-work beads** — for `drive-existing-pr`
+   beads (detected via bead body fields or label — see below), use the
+   existing branch name instead. The harness enforces caps and legal state —
+   if it refuses, do not spawn that coder.
+
 3. **Spawn ALL selected coders in ONE message** — multiple Agent tool calls in
    a single response, each `subagent_type: "minimax-pair-coder"`,
    `run_in_background: true`. Never spawn serially (await one, then next) —
    parallel dispatch is the point of the fan-out. Each prompt must contain:
-   the bead id, full title/description, the exact branch name (the coder
-   creates it off origin/<base_branch>, commits, pushes, opens a PR with
-   `Beads: <bead_id>` in the body — and NEVER merges), an isolation
-   requirement (the coder MUST do its work in its own `git worktree add
-   /tmp/factory-<bead_id>-r<n> -b <branch> origin/<base_branch>` and remove
-   the worktree after pushing — never check out branches in the shared repo
-   working tree), and for `STANDARD_PATH` beads: direct it to run the repo's
-   `/fs` + `/f` flow rather than hand-rolling a diff.
+   the bead id, full title/description, **the exact branch name** (see
+   branch-selection rule below), an isolation requirement (the coder MUST do
+   its work in its own worktree and remove it after pushing — never check
+   out branches in the shared repo working tree), and for `STANDARD_PATH`
+   beads: direct it to run the repo's `/fs` + `/f` flow rather than
+   hand-rolling a diff.
+
+### Branch-selection rule (new — drive-existing-pr mode)
+
+If the bead body contains ALL of:
+- `existing_pr: <N>` (e.g., `existing_pr: 8058`)
+- `existing_branch: <name>` (e.g., `existing_branch: fix/quota-banner-modal-cta-7945`)
+- `target_repo: <owner>/<name>` (e.g., `target_repo: jleechanorg/worldarchitect.ai`)
+
+…then treat as **drive-existing-pr mode**. The coder MUST:
+1. `git fetch <remote> <existing_branch>` where `<remote>` is the configured
+   target-repo remote (`wa` for worldai, `origin` for dark-factory itself)
+2. Create a worktree off the existing branch:
+   `git worktree add /tmp/drive-<bead_id>-r<n> -b <existing_branch> <remote>/<existing_branch>`
+3. Apply fixes in that worktree
+4. Commit + push to the EXISTING branch (do NOT create `factory/<bead>-r<n>`):
+   `git push <remote> <existing_branch>`
+5. Comment on the existing PR with the bead id and progress:
+   `gh pr comment <N> --repo <target_repo> --body "Beads: <bead_id> — pushed fix: <summary>"`
+6. **NEVER open a new PR** — that creates the duplicate-PR anti-pattern
+
+If the bead body does NOT contain those fields, fall back to the default
+new-work mode: create `factory/<bead_id>-r<attempt>` off `origin/<base_branch>`,
+push to origin, open a new PR.
+
+Detection can also use bead labels: `drive-existing-pr` label forces
+drive-existing-pr mode regardless of body fields.
 
 ## 5. (reserved)
 

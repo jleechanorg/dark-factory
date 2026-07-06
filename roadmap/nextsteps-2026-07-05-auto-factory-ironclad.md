@@ -13,6 +13,7 @@
 ## Executive summary
 
 - **The agentf push guard is fixed.** The over-firing `agent-f([^a-z]|$)` pattern (which false-positived on path mentions like `~/.claude-agent-f`) was DROPPED 2026-07-05. The new pattern set is `agnt-f|agf-|jleechan-af|#agentf|agentf-` (5 patterns, all hyphenated tokens; no path-mention false positives). Verified by positive tests (agf-, Agnt-F, jleechan-af, #agentf all match) + negative test (`~/.claude-agent-f` no longer matches). Live `git push wa HEAD:refs/heads/test-agf-hook-verify` succeeded after the fix.
+- **ZFC and Auto-Factory Audit completed.** Audited `/f` auto-routing and the Rust auto-factory daemon implementation. Identified 3 routing constraints in `/f` auto-routing and 5 gaps between the Rust codebase and the `docs/auto-factory-daemon-spec.md` spec (lack of SCM ETag cache, lack of offline local bead protocol, naive security redaction, simple single-threaded loop pacing, and lack of dynamic analysis/spec routing). Filed 4 new P2 task beads to track these improvements.
 - **7 ironclad candidate PRs identified**, all `mergeable=MERGEABLE` as of this run:
   - dark-factory: PR #161 (qw5 followups, head `471a3657`); PR #133 (parallel-reviewer base, head `98417c8`, review=CHANGES_REQUESTED — needs CR re-trigger)
   - worldai: PR #8058 (quota banner, head `713d7b71`), PR #8116 (XP delta additive, head `cd6dae07`), PR #8064 (user-directive supremacy, head `c011a658`), PR #8060 (rewards box, head `7ac22a9f`), PR #8061 (Nocturna PR-green-drive docs, head `c8998bf5`)
@@ -23,7 +24,7 @@
 
 ## Context
 
-Session 2026-07-05 (this run). The user asked: (1) fix the agentf hook, (2) use /nextsteps for exit criteria, (3) focus on driving the ironclad candidate PRs to /green + /er + /code-standards. The hook was the over-firing push guard that was blocking the user's 2026-07-04 12h work. After the fix, a live `git push` to `jleechanorg/worldarchitect.ai` succeeded. The 4 worldai PRs that were CONFLICTING on prior `/green` checks are now `mergeable=MERGEABLE` (likely auto-resolved by worldai's main updating). The 5 worldai candidates from the prior design pass (#8057, #8116, #8064, #8060, #8061) are all MERGEABLE too.
+Session 2026-07-05 (this run). The user asked: (1) fix the agentf hook, (2) use /nextsteps for exit criteria, (3) focus on driving the ironclad candidate PRs to /green + /er + /code-standards. Separately, the user requested running /nextsteps and auditing the auto-factory daemon implementation and the original spec to identify areas of improvement. We created 4 new beads (`jleechan-q9ze`, `jleechan-iclg`, `jleechan-gfn6`, `jleechan-e28q`) to track these improvements.
 
 ## Bead index
 
@@ -35,6 +36,10 @@ Session 2026-07-05 (this run). The user asked: (1) fix the agentf hook, (2) use 
 | jleechan-2uoy | gates-compute subcommand | P1 | merged commit bb0d7f22 |
 | jleechan-2ka | Stage 2 Re-Roll Engine | P2 | Stage 1 substitution rule active |
 | jleechan-xrdx | Decommissioning Legacy Loop | P2 | time-box 2026-07-11 |
+| jleechan-q9ze | [daemon] Implement GitHub API ETag caching | P2 | br show jleechan-q9ze |
+| jleechan-iclg | [daemon] Implement offline bead local fallback | P2 | br show jleechan-iclg |
+| jleechan-gfn6 | [daemon] Add generic task/readonly routing in router | P2 | br show jleechan-gfn6 |
+| jleechan-e28q | [daemon] Harden security redaction logic in constraints | P2 | br show jleechan-e28q |
 
 ## Work queue
 
@@ -46,6 +51,10 @@ Session 2026-07-05 (this run). The user asked: (1) fix the agentf hook, (2) use 
 6. Drive PR #8060 to /green (rewards box, worldai). Current: mergeable=MERGEABLE.
 7. Drive PR #8061 to /green (4-green NON_PRODUCTION tier, Nocturna PR-green-drive docs, worldai). Current: mergeable=MERGEABLE.
 8. Re-test the agentf hook with a real merge of the worldai candidates. The fix means future force-pushes won't be blocked by the over-firing pattern.
+9. Implement GitHub API ETag caching in daemon SCM adapter (`jleechan-q9ze`) to prevent GH Actions rate limits.
+10. Implement offline local bead fail-safe fallback protocol (`jleechan-iclg`) when GitHub is down.
+11. Update Rust Router to support generic tasks and read-only research pipeline routing (`jleechan-gfn6`).
+12. Harden security redaction parsing in constraint extractor (`jleechan-e28q`).
 
 ## PR / merge state
 
@@ -59,8 +68,8 @@ Session 2026-07-05 (this run). The user asked: (1) fix the agentf hook, (2) use 
 
 ## Learnings pointer
 
-~/roadmap/learnings-2026-07.md — append: 2026-07-05 — agentf hook fix. Dropped over-firing agent-f pattern. New pattern set agnt-f|agf-|jleechan-af|#agentf|agentf- (all hyphenated; no path-mention false positives). Verified via live git push wa. All 4 prior CONFLICTING worldai PRs now auto-resolved to MERGEABLE.
+- `~/roadmap/learnings-2026-07.md` — section `2026-07-05 — ZFC and Auto-Factory Audit`
 
 ## Roadmap pointer
 
-Appended roadmap/activity/2026-07-05.md (create file with header). First entry for 2026-07-05.
+- Appended `roadmap/activity/2026-07-05.md` — Recent activity (per-day file)
