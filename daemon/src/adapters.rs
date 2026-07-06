@@ -39,20 +39,18 @@ impl Tracker for CliTracker {
     }
 
     fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
-        let out = run_tool("br", &["list", "--json"], 30)?;
-        let json_start = out.find('{').unwrap_or(0);
-        #[derive(serde::Deserialize)]
-        struct BrListOutput {
-            issues: Vec<BrIssue>,
-        }
-        #[derive(serde::Deserialize)]
-        struct BrIssue {
-            external_ref: Option<String>,
-        }
-        let data: BrListOutput = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse br list JSON: {e}"))
-        })?;
-        let refs = data.issues.into_iter().filter_map(|issue| issue.external_ref).collect();
+        // `br list --status all` returns zero rows; merge open + closed so closed beads
+        // (e.g. jleechan-9byt.5 → worldarchitect.ai#8171) block duplicate create_bead.
+        let mut refs = parse_external_refs_from_br_list(&run_tool(
+            "br",
+            &["list", "--status", "open", "--json"],
+            30,
+        )?)?;
+        refs.extend(parse_external_refs_from_br_list(&run_tool(
+            "br",
+            &["list", "--status", "closed", "--json"],
+            30,
+        )?)?);
         Ok(refs)
     }
 
@@ -91,6 +89,29 @@ impl Tracker for CliTracker {
             )))
         }
     }
+}
+
+/// Parse `external_ref` values from `br list --json` output.
+pub(crate) fn parse_external_refs_from_br_list(
+    out: &str,
+) -> Result<std::collections::HashSet<String>, DaemonError> {
+    let json_start = out.find('{').unwrap_or(0);
+    #[derive(serde::Deserialize)]
+    struct BrListOutput {
+        issues: Vec<BrIssue>,
+    }
+    #[derive(serde::Deserialize)]
+    struct BrIssue {
+        external_ref: Option<String>,
+    }
+    let data: BrListOutput = serde_json::from_str(&out[json_start..]).map_err(|e| {
+        DaemonError::Parse(format!("failed to parse br list JSON: {e}"))
+    })?;
+    Ok(data
+        .issues
+        .into_iter()
+        .filter_map(|issue| issue.external_ref)
+        .collect())
 }
 
 fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
@@ -988,6 +1009,26 @@ pub fn ci_success_from_check_buckets(buckets: &[&str], iteration_stub: bool) -> 
             .all(|b| matches!(*b, "pass" | "skipping" | "pending"))
     } else {
         buckets.iter().all(|b| matches!(*b, "pass" | "skipping"))
+    }
+}
+
+#[cfg(test)]
+mod external_ref_tests {
+    use super::parse_external_refs_from_br_list;
+
+    #[test]
+    fn fetch_all_external_refs_includes_closed_beads() {
+        let json = r#"{
+            "issues": [
+                {"id": "open-1", "external_ref": "owner/repo#1", "status": "open"},
+                {"id": "closed-1", "external_ref": "jleechanorg/worldarchitect.ai#8171", "status": "closed"},
+                {"id": "no-ref", "external_ref": null, "status": "closed"}
+            ]
+        }"#;
+        let refs = parse_external_refs_from_br_list(json).unwrap();
+        assert_eq!(refs.len(), 2);
+        assert!(refs.contains("owner/repo#1"));
+        assert!(refs.contains("jleechanorg/worldarchitect.ai#8171"));
     }
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deterministic /af one tick: intake + recover + AO dispatch for ATTESTED drive beads.
+# Deterministic /af one tick: intake + recover + AO dispatch for drive-existing-pr beads.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export BR_DB="${BR_DB:-$ROOT/.beads/beads.db}"
@@ -7,14 +7,37 @@ br() { command br --db "$BR_DB" "$@"; }
 O="$ROOT/daemon/factory-overlay.sh"
 I="$ROOT/daemon/factory-intake-from-gh.sh"
 R="$ROOT/daemon/factory-ao-remediate.sh"
-CONFIG="$ROOT/config/daemon.toml"
+DB="${AFD_DB:-$HOME/.dark-factory/daemon-cxdb.sqlite}"
 MAX_DISPATCH="${MAX_DISPATCH:-2}"
+
+TARGET_PRS=""
+args=("$@")
+i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+  if [ "${args[$i]}" = "--prs" ] && [ $((i + 1)) -lt "${#args[@]}" ]; then
+    TARGET_PRS="${args[$((i + 1))]}"
+    break
+  fi
+  i=$((i + 1))
+done
 
 cd "$ROOT"
 "$O" init
 "$O" unstick-dispatching
 "$O" recover-held
+for dup in jleechan-4uzw jleechan-bxjy jleechan-hslx jleechan-ccfin; do
+  sqlite3 "$DB" "SELECT state FROM bead_overlay WHERE bead_id='$dup';" 2>/dev/null | rg -q . && \
+    "$O" park-duplicate "$dup" "superseded-by-canonical-bead" 2>/dev/null || true
+done
 bash "$I"
+
+if br show jleechan-7re5 >/dev/null 2>&1; then
+  branch8189="$(gh pr view 8189 --repo jleechanorg/worldarchitect.ai --json headRefName -q .headRefName 2>/dev/null || true)"
+  "$O" intake-upsert jleechan-7re5 "[worldai] Fix GHA ensurepip fallback PR #8189" >/dev/null || true
+  if [ -n "$branch8189" ]; then
+    "$O" redrive-pr jleechan-7re5 8189 "$branch8189" >/dev/null || true
+  fi
+fi
 
 AO="$(bash "$ROOT/daemon/factory-ao-bin.sh" 2>/dev/null || true)"
 AO_CAP="${AO_MAX_CONCURRENT_SESSIONS:-30}"
@@ -22,7 +45,7 @@ if [ -n "$AO" ]; then
   if "$AO" session ls --json >/dev/null 2>&1; then
     ao_active="$("$AO" session ls --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(sum(1 for s in d.get("data",[]) if not s.get("isTerminated")))' 2>/dev/null || echo 0)"
   else
-    ao_active="$("$AO" session ls 2>/dev/null | rg -c '\[(spawning|running|active|working|pr_open)\]' || echo 0)"
+    ao_active="$("$AO" session ls -p worldarchitect 2>/dev/null | rg -c '\[(spawning|running|active|working|pr_open)\]' || echo 0)"
   fi
   if [ "${ao_active:-0}" -ge "$AO_CAP" ]; then
     echo "[af] AO cap: ${ao_active} active >= ${AO_CAP} — skipping dispatch (intake done)" >&2
@@ -30,18 +53,32 @@ if [ -n "$AO" ]; then
   fi
 fi
 
+pr_sql_filter=""
+if [ -n "$TARGET_PRS" ]; then
+  pr_sql_filter="AND pr_number IN ($(echo "$TARGET_PRS" | tr ',' ' ' | awk '{for(i=1;i<=NF;i++) printf "%s%s", (i>1?",":""), $i}'))"
+fi
+
 dispatched=0
 while IFS=$'\t' read -r bead_id pr branch; do
   [ -n "$bead_id" ] || continue
   [ "$dispatched" -ge "$MAX_DISPATCH" ] && break
+  if [ -n "$AO" ] && "$AO" session ls -p worldarchitect 2>/dev/null | rg "pulls/${pr}\\b" | rg -q '\[(spawning|running|active|working|pr_open)\]'; then
+    echo "[af] skip $bead_id PR #$pr (active session exists)" >&2
+    continue
+  fi
   echo "[af] remediate $bead_id PR #$pr"
   if bash "$R" "$bead_id" "$pr" 2>&1; then
-    dispatched=$((dispatched+1))
+    sqlite3 "$DB" "UPDATE bead_overlay SET state='DISPATCHED', updated_at='$(date -u +%Y-%m-%dT%H:%M:%SZ)' WHERE bead_id='$(printf "%s" "$bead_id" | sed "s/'/''/g")';" 2>/dev/null || true
+    dispatched=$((dispatched + 1))
   else
     echo "[af] skip $bead_id (ao spawn failed)" >&2
   fi
-done < <(sqlite3 "$HOME/.dark-factory/daemon-cxdb.sqlite" -separator $'\t' \
-  "SELECT bead_id, pr_number, coalesce(branch,'') FROM bead_overlay WHERE state='ATTESTED' AND pr_number IS NOT NULL ORDER BY CASE WHEN bead_id LIKE 'jleechan-%' THEN 0 ELSE 1 END, updated_at LIMIT 10;")
+done < <(sqlite3 "$DB" -separator $'\t' \
+  "SELECT bead_id, pr_number, coalesce(branch,'') FROM bead_overlay
+   WHERE state IN ('QUEUED','ATTESTED') AND pr_number IS NOT NULL
+   AND bead_id IN ('jleechan-9byt.4','jleechan-93ft','jleechan-7re5')
+   $pr_sql_filter
+   ORDER BY CASE bead_id WHEN 'jleechan-7re5' THEN 0 WHEN 'jleechan-93ft' THEN 1 WHEN 'jleechan-9byt.4' THEN 2 ELSE 9 END, updated_at LIMIT 10;")
 
 echo "af_dispatched=$dispatched"
 callpath run dark-factory ${1+"$@"} 2>/dev/null || true
