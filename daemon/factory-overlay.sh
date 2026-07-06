@@ -89,7 +89,7 @@ park-duplicate)
   attempt="$(sqlite3 -batch -noheader -cmd '.timeout 5000' "$DB" "SELECT attempt FROM bead_overlay WHERE bead_id='$bid';" 2>/dev/null | tail -1)"
   [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=1
   sql "UPDATE bead_overlay SET state='HUMAN_HELD', updated_at='$(now)' WHERE bead_id='$bid';"
-  emit "$2" "${attempt:-1}" HUMAN_HELD PARKED_DUPLICATE_BEAD "{"reason":$(printf '%s' "$3" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
+  emit "$2" "${attempt:-1}" HUMAN_HELD PARKED_DUPLICATE_BEAD "{\"reason\":$(printf '%s' "$3" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
   echo "parked $2"
   ;;
 list)
