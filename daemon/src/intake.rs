@@ -40,11 +40,7 @@ pub fn normalize(
         return Ok(Vec::new());
     }
 
-    let known_refs: std::collections::HashSet<String> = tracker
-        .fetch_candidates()?
-        .into_iter()
-        .filter_map(|bead| bead.external_ref)
-        .collect();
+    let known_refs = tracker.fetch_all_external_refs()?;
 
     let mut created = Vec::new();
 

@@ -184,6 +184,7 @@ pub fn iso8601_to_epoch(s: &str) -> Option<u64> {
 /// `br` CLI. `fetch_candidates` == `br list --status open --label factory --json`.
 pub trait Tracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError>;
+    fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError>;
     fn create_bead(
         &self,
         title: &str,

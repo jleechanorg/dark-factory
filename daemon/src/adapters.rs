@@ -38,6 +38,24 @@ impl Tracker for CliTracker {
         Ok(beads)
     }
 
+    fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
+        let out = run_tool("br", &["list", "--json"], 30)?;
+        let json_start = out.find('{').unwrap_or(0);
+        #[derive(serde::Deserialize)]
+        struct BrListOutput {
+            issues: Vec<BrIssue>,
+        }
+        #[derive(serde::Deserialize)]
+        struct BrIssue {
+            external_ref: Option<String>,
+        }
+        let data: BrListOutput = serde_json::from_str(&out[json_start..]).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse br list JSON: {e}"))
+        })?;
+        let refs = data.issues.into_iter().filter_map(|issue| issue.external_ref).collect();
+        Ok(refs)
+    }
+
     fn create_bead(
         &self,
         title: &str,

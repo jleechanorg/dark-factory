@@ -91,6 +91,9 @@ impl Tracker for NoopAdapters {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError> {
         Ok(Vec::new())
     }
+    fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
+        Ok(std::collections::HashSet::new())
+    }
     fn create_bead(&self, _title: &str, _body: &str, _external_ref: &str) -> Result<String, DaemonError> {
         Ok(String::new())
     }

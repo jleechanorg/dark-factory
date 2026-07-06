@@ -43,6 +43,16 @@ impl Tracker for FakeTracker {
         Ok(self.candidates.borrow().clone())
     }
 
+    fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
+        self.calls.borrow_mut().push("fetch_all_external_refs".into());
+        let refs = self.candidates
+            .borrow()
+            .iter()
+            .filter_map(|bead| bead.external_ref.clone())
+            .collect();
+        Ok(refs)
+    }
+
     fn create_bead(
         &self,
         title: &str,
