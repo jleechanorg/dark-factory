@@ -145,6 +145,8 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                 serde_json::json!({}),
                 serde_json::json!({"reason": "autonomy_timebox_exceeded"}),
             )?;
+            let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): autonomy time-box limit exceeded.");
+            let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
             summary.beads_parked_human_held += 1;
             continue;
         }
@@ -196,6 +198,8 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                                 serde_json::json!({}),
                                 serde_json::json!({"reason": "coder_silent"}),
                             )?;
+                            let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): coder silent/inactive on branch for 30 minutes.");
+                            let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
                             summary.beads_parked_human_held += 1;
                         }
                     }
@@ -229,6 +233,8 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                                 serde_json::json!({}),
                                 serde_json::json!({"reason": "session_stalled"}),
                             )?;
+                            let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): session stalled or quiescent on open PR.");
+                            let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
                             summary.beads_parked_human_held += 1;
                         }
                     }
@@ -275,6 +281,35 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     let created = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
     let mut routing_candidates: Vec<Bead> = Vec::new();
     for bead_id in &created {
+        let mut pr_number = None;
+        if deps.llm.is_real() {
+            if let Ok(candidates) = deps.tracker.fetch_candidates() {
+                if let Some(bead) = candidates.iter().find(|b| b.id == *bead_id) {
+                    if let Some(ref ext_ref) = bead.external_ref {
+                        if let Some((_, num_str)) = parse_external_ref(ext_ref) {
+                            if let Ok(num) = num_str.parse::<u64>() {
+                                if crate::tools::run_tool(
+                                    "gh",
+                                    &[
+                                        "pr",
+                                        "view",
+                                        &num.to_string(),
+                                        "--repo",
+                                        &deps.cfg.target_repo,
+                                        "--json",
+                                        "number",
+                                    ],
+                                    10,
+                                ).is_ok() {
+                                    pr_number = Some(num);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let overlay = BeadOverlay {
             bead_id: bead_id.clone(),
             state: OverlayState::Queued,
@@ -282,7 +317,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             reroll_count: 0,
             autonomy_secs: 0,
             spend_usd: 0.0,
-            pr_number: None,
+            pr_number,
             branch: None,
             session_id: None,
         };
@@ -365,6 +400,10 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({}),
                     serde_json::json!({"reason": reason}),
                 )?;
+                let comment_body = format!("🤖 **[dark-factory]** Router parse error (human held): {}", reason);
+                if let Some(ref ext_ref) = bead.external_ref {
+                    let _ = deps.tracker.comment_external(ext_ref, &comment_body);
+                }
             }
             Err(other) => return Err(other),
         }
@@ -383,6 +422,18 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 serde_json::json!({}),
                 serde_json::json!({}),
             )?;
+            let attempt = if let Ok(Some(o)) = deps.store.load(&bead.id) {
+                o.attempt
+            } else {
+                1
+            };
+            let comment_body = format!(
+                "🤖 **[dark-factory]** Spawned worker session in slot for bead `{}` (attempt {}). Branch: `factory/{}-r{}`.",
+                bead.id, attempt, bead.id, attempt
+            );
+            if let Some(ref ext_ref) = bead.external_ref {
+                let _ = deps.tracker.comment_external(ext_ref, &comment_body);
+            }
         }
     }
 
@@ -510,6 +561,31 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 
         // Promote DISPATCHED -> ATTESTED once a PR is open (spec §4.2.7).
         if overlay.state == OverlayState::Dispatched {
+            if overlay.pr_number.is_none() {
+                if let Some(ref branch) = overlay.branch {
+                    if let Ok(out) = crate::tools::run_tool(
+                        "gh",
+                        &[
+                            "pr",
+                            "list",
+                            "--head",
+                            branch,
+                            "--repo",
+                            &deps.cfg.target_repo,
+                            "--json",
+                            "number",
+                            "--jq",
+                            ".[0].number",
+                        ],
+                        30,
+                    ) {
+                        if let Ok(pr) = out.trim().parse::<u64>() {
+                            overlay.pr_number = Some(pr);
+                        }
+                    }
+                }
+            }
+
             if let Some(pr) = overlay.pr_number {
                 overlay.state = OverlayState::Attested;
                 deps.store.save(&overlay)?;
@@ -522,6 +598,11 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({}),
                     serde_json::json!({"pr_number": pr}),
                 )?;
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Worker session opened this pull request for bead `{}`. Beginning gate-by-gate safety verification...",
+                    bead_id
+                );
+                let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
             }
         }
 
@@ -564,6 +645,11 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 serde_json::json!({}),
                 serde_json::json!({}),
             )?;
+            let comment_body = format!(
+                "🤖 **[dark-factory]** All safety gates are now GREEN for bead `{}`. PR is merge-ready!",
+                bead_id
+            );
+            let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
         } else {
             if deps.cfg.stage == 1 {
                 // Stage-1 substitution rule (CONTRACT.md §1): record the re-roll
@@ -589,6 +675,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({}),
                     serde_json::json!({"reason": "gate assessment not all-green (stage 1: recorded, not executed)"}),
                 )?;
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Coder session parked (human held): gate assessment failed. Stage 1 configuration prevents re-roll."
+                );
+                let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
             } else {
                 // Stage 2: execute re-roll engine
                 let mut reviewer = "verifier".to_string();
@@ -643,6 +733,11 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 serde_json::json!({}),
                                 serde_json::json!({}),
                             )?;
+                            let comment_body = format!(
+                                "🤖 **[dark-factory]** Re-roll validation passed. Redispatched worker session (attempt {}). Branch: `factory/{}-r{}`.",
+                                overlay.attempt, bead_id, overlay.attempt
+                            );
+                            let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                         } else {
                             overlay.state = OverlayState::HumanHeld;
                             deps.store.save(&overlay)?;
@@ -656,6 +751,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 serde_json::json!({}),
                                 serde_json::json!({"reason": "spec file validation failed in recovery"}),
                             )?;
+                            let comment_body = format!(
+                                "🤖 **[dark-factory]** Coder session parked (human held): spec file validation failed in recovery."
+                            );
+                            let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                         }
                     }
                     Ok(crate::reroll::RerollOutcome::Held(reason)) => {
@@ -668,8 +767,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             OverlayState::HumanHeld.as_str(),
                             "PARKED_HUMAN_HELD",
                             serde_json::json!({}),
-                            serde_json::json!({"reason": reason}),
+                            serde_json::json!({"reason": reason.clone()}),
                         )?;
+                        let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): re-roll held. Reason: {}", reason);
+                        let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                     }
                     Ok(crate::reroll::RerollOutcome::Aborted(_)) => {}
                     Err(e) => return Err(e),
@@ -680,3 +781,31 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 
     Ok(())
 }
+
+fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = external_ref.split('#').collect();
+    if parts.len() == 2 {
+        Some((parts[0].to_string(), parts[1].to_string()))
+    } else {
+        None
+    }
+}
+
+fn post_scm_comment_by_bead_id(deps: &TickDeps, bead_id: &str, body: &str) -> Result<(), DaemonError> {
+    if let Ok(Some(overlay)) = deps.store.load(bead_id) {
+        if let Some(pr) = overlay.pr_number {
+            let ext_ref = format!("{}#{}", deps.cfg.target_repo, pr);
+            let _ = deps.tracker.comment_external(&ext_ref, body);
+            return Ok(());
+        }
+    }
+    if let Ok(candidates) = deps.tracker.fetch_candidates() {
+        if let Some(bead) = candidates.iter().find(|b| b.id == bead_id) {
+            if let Some(ref ext_ref) = bead.external_ref {
+                let _ = deps.tracker.comment_external(ext_ref, body);
+            }
+        }
+    }
+    Ok(())
+}
+

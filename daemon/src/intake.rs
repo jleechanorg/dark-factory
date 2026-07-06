@@ -65,6 +65,13 @@ pub fn normalize(
 
         let title = format!("{} ({})", issue.title, cfg.target_repo);
         let bead_id = tracker.create_bead(&title, &issue.body, &issue.external_ref)?;
+        
+        let comment_body = format!(
+            "🤖 **[dark-factory]** Auto-factory has picked up this task. Created tracking bead `{}`. Spawning worker session...",
+            bead_id
+        );
+        let _ = tracker.comment_external(&issue.external_ref, &comment_body);
+
         created.push(bead_id);
     }
 
