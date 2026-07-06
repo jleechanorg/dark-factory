@@ -532,27 +532,31 @@ impl Scm for CliScm {
         let checks: Vec<GhCheck> = serde_json::from_str(&checks_out[json_start_c..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse gh pr checks JSON: {e}"))
         })?;
+        let mut any_pending = false;
+        let mut any_failed = false;
+        for c in &checks {
+            if c.bucket == "pending" {
+                any_pending = true;
+            } else if c.bucket == "fail" || c.bucket == "cancel" {
+                any_failed = true;
+            }
+        }
         let ci_status = if checks.is_empty() {
             "unknown".to_string()
+        } else if any_pending {
+            "unknown".to_string()
+        } else if any_failed {
+            "red".to_string()
         } else {
-            let mut any_pending = false;
-            let mut any_failed = false;
-            for c in &checks {
-                if c.bucket == "pending" {
-                    any_pending = true;
-                } else if c.bucket == "fail" || c.bucket == "cancel" {
-                    any_failed = true;
-                }
-            }
-            if any_pending {
-                "unknown".to_string()
-            } else if any_failed {
-                "red".to_string()
-            } else {
-                "green".to_string()
-            }
+            "green".to_string()
         };
-        let ci_success = ci_status == "green";
+
+        let iteration_stub =
+            std::env::var("DARK_FACTORY_ITERATION_STUB").as_deref() == Ok("1");
+        let ci_success = ci_success_from_check_buckets(
+            &checks.iter().map(|c| c.bucket.as_str()).collect::<Vec<_>>(),
+            iteration_stub,
+        );
 
         let mut bugbot_error_count = 0;
         for comment in &view.comments {
@@ -970,3 +974,46 @@ impl Llm for ChainLlm {
         })
     }
 }
+
+/// CI gate input for `PrSnapshot.ci_success`. Production requires every bucket
+/// to be `pass` or `skipping`; `pending` is not green. Iteration stub may treat
+/// `pending` as acceptable but never `fail`/`cancel`.
+pub fn ci_success_from_check_buckets(buckets: &[&str], iteration_stub: bool) -> bool {
+    if buckets.is_empty() {
+        return false;
+    }
+    if iteration_stub {
+        buckets
+            .iter()
+            .all(|b| matches!(*b, "pass" | "skipping" | "pending"))
+    } else {
+        buckets.iter().all(|b| matches!(*b, "pass" | "skipping"))
+    }
+}
+
+#[cfg(test)]
+mod ci_bucket_tests {
+    use super::ci_success_from_check_buckets;
+
+    #[test]
+    fn production_pending_is_not_green() {
+        assert!(!ci_success_from_check_buckets(&["pass", "pending"], false));
+    }
+
+    #[test]
+    fn production_all_pass_or_skip_is_green() {
+        assert!(ci_success_from_check_buckets(&["pass", "skipping"], false));
+    }
+
+    #[test]
+    fn production_fail_is_not_green() {
+        assert!(!ci_success_from_check_buckets(&["pass", "fail"], false));
+    }
+
+    #[test]
+    fn iteration_stub_allows_pending_not_fail() {
+        assert!(ci_success_from_check_buckets(&["pass", "pending"], true));
+        assert!(!ci_success_from_check_buckets(&["pass", "fail"], true));
+    }
+}
+

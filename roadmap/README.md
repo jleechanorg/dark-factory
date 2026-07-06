@@ -11,6 +11,31 @@
 
 ## Recent activity (rolling)
 
+### 2026-07-06 (evening) — /harness: why factory is offline
+
+- **`/harness` analysis:** Factory offline = **no launchd route process** + **`factory-intake-from-gh.sh` missing** + `callpath route=FAIL`; overlay QUEUED/READY can be stale while stack is dead.
+- **Live state:** rust daemon down; no launchd factory job; intake script absent; 5 factory shell scripts staged locally; `ci_success_from_check_buckets` not on `main`.
+- **Open PRs:** [#8060](https://github.com/jleechanorg/worldarchitect.ai/pull/8060), [#7888](https://github.com/jleechanorg/worldarchitect.ai/pull/7888).
+- **Beads:** jleechan-38w8 (restore intake + commit scripts), jleechan-oale (harness liveness gate in auto-factory skill); tracks jleechan-a5p, jleechan-nmll.
+- **Nextsteps:** `roadmap/nextsteps-2026-07-06-auto-factory-intake-callpath.md` (evening addendum).
+
+### 2026-07-06 (PM) — /callpath trace + pending CI TDD fix
+
+- **Callpath:** dual lanes (parent `9byt.*` + remediation beads); 3 PRs merged manually; overlay READY @ 17:04 did not match live CI.
+- **TDD fix:** `ci_success_from_check_buckets` — pending ≠ green; stub no longer ignores fail; `recover-held` → QUEUED; integration test `drive_existing_pr_pending_ci_does_not_reach_ready`.
+- **Open PRs:** [#8060](https://github.com/jleechanorg/worldarchitect.ai/pull/8060), [#7888](https://github.com/jleechanorg/worldarchitect.ai/pull/7888).
+- **Bead:** jleechan-4b5.
+- **Nextsteps:** `roadmap/nextsteps-2026-07-06-auto-factory-intake-callpath.md` (PM addendum).
+
+### 2026-07-06 — Factory intake path + global /callpath
+
+- **Trigger label:** `factory` confirmed (no `autof`); `factory-intake-from-gh.sh` + `factory-overlay.sh` + `factory-tick.sh` replace decommissioned harness for GH→bead sync and recover-held.
+- **Global `/callpath`:** `~/.claude/commands/callpath.md` + `~/.claude/skills/callpath/scripts/callpath.sh` — pipeline trace for GH issues, beads, overlay sqlite, PR gates.
+- **Gap doc:** `docs/auto_factory_spec_gap_analysis.md` — direct-to-main (`DIRECT_PATH`) spec-only.
+- **Live state (callpath AMBER):** 6 worldai `factory` GH issues linked; overlay HUMAN_HELD=6 (factory-lite verifier re-parking); smoke #8164 QUEUED awaiting dispatch.
+- **Beads:** jleechan-imj (orphan factory-lite loops), jleechan-ptj (Rust recover-held).
+- **Nextsteps:** `roadmap/nextsteps-2026-07-06-auto-factory-intake-callpath.md`
+
 ### 2026-06-27 — P0 default Level-5 graph contract
 
 - Operator escalation: the default DOT graph contract is P0, not P3. A reference graph is not enough; `/f` and `/factory` must run the real `dark-factory` binary and always include or generate Level-5 default nodes unless the operator explicitly overrides the pipeline.

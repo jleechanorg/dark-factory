@@ -80,6 +80,8 @@ pub trait StateStore {
     fn register_branch(&self, bead_id: &str, branch: &str) -> Result<(), DaemonError>;
     /// Deletion guard: daemon may delete ONLY refs returned here (spec §4.2.8).
     fn owned_branches(&self) -> Result<Vec<String>, DaemonError>;
+    /// Reverse-lookup: branch → bead_id (used by fast_tier to find drive-existing-pr beads).
+    fn bead_id_for_branch(&self, branch: &str) -> Result<Option<String>, DaemonError>;
     fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError>;
     fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, feedback_text: &str) -> Result<(), DaemonError>;
     fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError>;
@@ -272,6 +274,21 @@ impl StateStore for SqliteStateStore {
             out.push(r.map_err(|e| tool_err("owned_branches row", e))?);
         }
         Ok(out)
+    }
+
+    fn bead_id_for_branch(&self, branch: &str) -> Result<Option<String>, DaemonError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT bead_id FROM branch_registry WHERE branch = ?1")
+            .map_err(|e| tool_err("bead_id_for_branch prepare", e))?;
+        let mut rows = stmt
+            .query_map(params![branch], |row| row.get::<_, String>(0))
+            .map_err(|e| tool_err("bead_id_for_branch query", e))?;
+        if let Some(Ok(bead)) = rows.next() {
+            Ok(Some(bead))
+        } else {
+            Ok(None)
+        }
     }
 
     fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError> {

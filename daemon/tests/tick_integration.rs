@@ -620,3 +620,221 @@ fn test_wedge_detection_attested_session_stalled() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+#[test]
+fn test_manual_bead_input_auto_queued_and_dispatched() {
+    let scm = FakeScm::new(); // no issues in SCM
+    let tracker = FakeTracker::new();
+    // Pre-seed a manual bead in the tracker candidates list (like `br list`)
+    tracker.candidates.borrow_mut().push(daemon::tools::Bead {
+        id: "manual-bead-123".into(),
+        title: "Test manual bead".into(),
+        description: "manually created".into(),
+        file_tree_summary: "".into(),
+        external_ref: None, // manual beads have no external_ref
+    });
+
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+    let store = FakeStateStore::new(); // empty database initially
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    
+    let telemetry_log = std::env::temp_dir().join("afd_manual_bead_test.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // Run tick 1: should detect manual bead in tracker, see no overlay,
+    // initialize QUEUED overlay, route it, and dispatch it!
+    let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
+    
+    assert_eq!(summary.beads_created, 1, "manual bead should be auto-created/initialized in DB");
+    assert_eq!(summary.beads_routed, 1, "manual bead should be routed");
+    assert_eq!(summary.beads_dispatched, 1, "manual bead should be dispatched");
+
+    let final_overlay = store.load("manual-bead-123").unwrap().unwrap();
+    assert_eq!(final_overlay.state, OverlayState::Dispatched);
+    assert_eq!(final_overlay.branch.as_deref(), Some("factory/manual-bead-123-r1"));
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn drive_existing_pr_pending_ci_does_not_reach_ready() {
+    // Regression: pending CI buckets must not yield READY (callpath 2026-07-06).
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    store.overlays.borrow_mut().insert(
+        "drive-bead".into(),
+        BeadOverlay {
+            bead_id: "drive-bead".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(8060),
+            branch: Some("fix/rewards-box-not-showing-8020-v2".into()),
+            session_id: None,
+        },
+    );
+    store.branches.borrow_mut().push("fix/rewards-box-not-showing-8020-v2".into());
+    store.branch_beads.borrow_mut().insert(
+        "fix/rewards-box-not-showing-8020-v2".into(),
+        "drive-bead".into(),
+    );
+
+    scm.pr_snapshots.insert(
+        8060,
+        PrSnapshot {
+            pr_number: 8060,
+            ci_success: false, // pending/fail checks on head
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            head_sha: "abc".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            ci_status: "unknown".into(),
+            coderabbit_status: "approved".into(),
+            ci_pending: true,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_pending_ci_test.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    assert_eq!(summary.gates_assessed, 0);
+    assert_eq!(summary.beads_ready, 0, "pending CI must not reach READY");
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let overlay = store.load("drive-bead").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::Attested);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn drive_existing_pr_failed_ci_parks_human_held() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    store.overlays.borrow_mut().insert(
+        "drive-bead".into(),
+        BeadOverlay {
+            bead_id: "drive-bead".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(8060),
+            branch: Some("fix/rewards-box-not-showing-8020-v2".into()),
+            session_id: None,
+        },
+    );
+    store.branches.borrow_mut().push("fix/rewards-box-not-showing-8020-v2".into());
+    store.branch_beads.borrow_mut().insert(
+        "fix/rewards-box-not-showing-8020-v2".into(),
+        "drive-bead".into(),
+    );
+
+    scm.pr_snapshots.insert(
+        8060,
+        PrSnapshot {
+            pr_number: 8060,
+            ci_success: false, // failed checks on head
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            head_sha: "abc".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            ci_status: "red".into(),
+            coderabbit_status: "approved".into(),
+            ci_pending: false,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_failed_ci_test.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    assert_eq!(summary.gates_assessed, 1);
+    assert_eq!(summary.beads_ready, 0, "failed CI must not reach READY");
+    assert_eq!(summary.beads_parked_human_held, 1);
+
+    let overlay = store.load("drive-bead").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}

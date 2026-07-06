@@ -359,8 +359,38 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     let mut ready: Vec<(Bead, RoutingVerdict)> = Vec::new();
     for bead in &routing_candidates {
         let overlay = match deps.store.load(&bead.id)? {
-            Some(o) if o.state == OverlayState::Queued || o.state == OverlayState::Redispatched => o,
-            _ => continue,
+            Some(o) => {
+                if o.state == OverlayState::Queued || o.state == OverlayState::Redispatched {
+                    o
+                } else {
+                    continue;
+                }
+            }
+            None => {
+                let o = BeadOverlay {
+                    bead_id: bead.id.clone(),
+                    state: OverlayState::Queued,
+                    attempt: 1,
+                    reroll_count: 0,
+                    autonomy_secs: 0,
+                    spend_usd: 0.0,
+                    pr_number: None,
+                    branch: None,
+                    session_id: None,
+                };
+                deps.store.save(&o)?;
+                summary.beads_created += 1;
+                emit(
+                    deps.telemetry_log,
+                    &bead.id,
+                    1,
+                    OverlayState::Queued.as_str(),
+                    "INTAKE_BEAD_CREATED",
+                    serde_json::json!({}),
+                    serde_json::json!({"manual": true}),
+                )?;
+                o
+            }
         };
 
         match router::route(deps.llm, bead) {
@@ -544,12 +574,12 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // actively tracking" set (deletion-guard doc comment on
     // `StateStore::owned_branches`).
     let branches = deps.store.owned_branches()?;
-    let mut bead_ids: Vec<String> = branches
-        .iter()
-        .filter_map(|b| b.rsplit_once("-r").map(|(prefix, _attempt)| prefix))
-        .filter_map(|prefix| prefix.strip_prefix("factory/"))
-        .map(|s| s.to_string())
-        .collect();
+    let mut bead_ids: Vec<String> = Vec::new();
+    for branch in &branches {
+        if let Ok(Some(bead_id)) = deps.store.bead_id_for_branch(branch) {
+            bead_ids.push(bead_id);
+        }
+    }
     bead_ids.sort();
     bead_ids.dedup();
 

@@ -182,6 +182,7 @@ mod tests {
     struct FakeStateStore {
         overlays: RefCell<HashMap<String, BeadOverlay>>,
         branches: RefCell<Vec<String>>,
+        branch_beads: RefCell<HashMap<String, String>>,
         rejections: RefCell<HashMap<(String, u32), (String, String)>>,
         fail_save_for_state: Option<OverlayState>,
     }
@@ -220,8 +221,14 @@ mod tests {
 
         fn register_branch(&self, bead_id: &str, branch: &str) -> Result<(), DaemonError> {
             self.branches.borrow_mut().push(branch.to_string());
-            let _ = bead_id;
+            self.branch_beads
+                .borrow_mut()
+                .insert(branch.to_string(), bead_id.to_string());
             Ok(())
+        }
+
+        fn bead_id_for_branch(&self, branch: &str) -> Result<Option<String>, DaemonError> {
+            Ok(self.branch_beads.borrow().get(branch).cloned())
         }
 
         fn owned_branches(&self) -> Result<Vec<String>, DaemonError> {

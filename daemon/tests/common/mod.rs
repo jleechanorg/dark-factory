@@ -296,6 +296,7 @@ impl Llm for FakeLlm {
 pub struct FakeStateStore {
     pub overlays: RefCell<HashMap<String, BeadOverlay>>,
     pub branches: RefCell<Vec<String>>,
+    pub branch_beads: RefCell<HashMap<String, String>>,
     pub rejections: RefCell<HashMap<(String, u32), (String, String)>>,
     pub calls: RefCell<Vec<String>>,
 }
@@ -327,7 +328,17 @@ impl StateStore for FakeStateStore {
             .borrow_mut()
             .push(format!("register_branch({bead_id},{branch})"));
         self.branches.borrow_mut().push(branch.to_string());
+        self.branch_beads
+            .borrow_mut()
+            .insert(branch.to_string(), bead_id.to_string());
         Ok(())
+    }
+
+    fn bead_id_for_branch(&self, branch: &str) -> Result<Option<String>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("bead_id_for_branch({branch})"));
+        Ok(self.branch_beads.borrow().get(branch).cloned())
     }
 
     fn owned_branches(&self) -> Result<Vec<String>, DaemonError> {
