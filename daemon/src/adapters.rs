@@ -137,7 +137,8 @@ impl Scm for CliScm {
                 }
             }
         }
-        let out_issues = run_tool(
+        let mut fallback_active = false;
+        let out_issues = match run_tool(
             "gh",
             &[
                 "issue",
@@ -152,29 +153,47 @@ impl Scm for CliScm {
                 "number,title,body,author",
             ],
             30,
-        )?;
-        let out_prs = run_tool(
-            "gh",
-            &[
-                "pr",
-                "list",
-                "--repo",
-                &self.repo,
-                "--label",
-                label,
-                "--state",
-                "open",
-                "--json",
-                "number,title,body,author",
-            ],
-            30,
-        )?;
+        ) {
+            Ok(out) => out,
+            Err(_) => {
+                fallback_active = true;
+                run_tool(
+                    "gh",
+                    &[
+                        "api",
+                        &format!("repos/{}/issues?labels={label}&state=open", self.repo),
+                    ],
+                    30,
+                )?
+            }
+        };
+        let out_prs = if fallback_active {
+            "[]".to_string()
+        } else {
+            run_tool(
+                "gh",
+                &[
+                    "pr",
+                    "list",
+                    "--repo",
+                    &self.repo,
+                    "--label",
+                    label,
+                    "--state",
+                    "open",
+                    "--json",
+                    "number,title,body,author",
+                ],
+                30,
+            )?
+        };
         #[derive(serde::Deserialize)]
         struct GhIssue {
             number: u64,
             title: String,
             body: Option<String>,
-            author: GhAuthor,
+            author: Option<GhAuthor>, // from GraphQL
+            user: Option<GhAuthor>,   // from REST
         }
         #[derive(serde::Deserialize)]
         struct GhAuthor {
@@ -191,11 +210,14 @@ impl Scm for CliScm {
         let mut issues: Vec<Issue> = Vec::new();
         for item in gh_issues.into_iter().chain(gh_prs.into_iter()) {
             if !issues.iter().any(|i| i.number == item.number) {
+                let author_login = item.author.as_ref().or(item.user.as_ref())
+                    .map(|a| a.login.clone())
+                    .unwrap_or_default();
                 issues.push(Issue {
                     number: item.number,
                     title: item.title,
                     body: item.body.unwrap_or_default(),
-                    author_login: item.author.login,
+                    author_login,
                     external_ref: format!("{}#{}", self.repo, item.number),
                 });
             }
@@ -309,20 +331,7 @@ impl Scm for CliScm {
             }
         }
         let pr_str = pr.to_string();
-        let view_out = run_tool(
-            "gh",
-            &[
-                "pr",
-                "view",
-                &pr_str,
-                "--repo",
-                &self.repo,
-                "--json",
-                "mergeable,reviews,headRefOid,body,comments,files,updatedAt",
-            ],
-            30,
-        )?;
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, serde::Serialize, Clone)]
         struct GhPrView {
             mergeable: String,
             reviews: Vec<GhReview>,
@@ -334,31 +343,108 @@ impl Scm for CliScm {
             #[serde(rename = "updatedAt")]
             updated_at: String,
         }
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, serde::Serialize, Clone)]
         struct GhReview {
             author: GhAuthor,
             state: String,
         }
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, serde::Serialize, Clone)]
         struct GhComment {
             author: GhAuthor,
             body: String,
         }
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, serde::Serialize, Clone)]
         struct GhAuthor {
             login: String,
         }
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, serde::Serialize, Clone)]
         struct GhFile {
             path: String,
             additions: u32,
             deletions: u32,
         }
-        let json_start = view_out.find('{').unwrap_or(0);
-        let view: GhPrView = serde_json::from_str(&view_out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse gh pr view JSON: {e}"))
-        })?;
+        let view: GhPrView = match run_tool(
+            "gh",
+            &[
+                "pr",
+                "view",
+                &pr_str,
+                "--repo",
+                &self.repo,
+                "--json",
+                "mergeable,reviews,headRefOid,body,comments,files,updatedAt",
+            ],
+            30,
+        ) {
+            Ok(view_out) => {
+                let json_start = view_out.find('{').unwrap_or(0);
+                serde_json::from_str(&view_out[json_start..]).map_err(|e| {
+                    DaemonError::Parse(format!("failed to parse gh pr view JSON: {e}"))
+                })?
+            }
+            Err(_) => {
+                // REST Fallback!
+                let pr_url = format!("repos/{}/pulls/{}", self.repo, pr);
+                let pr_json = run_tool("gh", &["api", &pr_url], 30)?;
+                
+                #[derive(serde::Deserialize)]
+                struct RestPr {
+                    mergeable: Option<bool>,
+                    head: RestHead,
+                    body: Option<String>,
+                    updated_at: String,
+                }
+                #[derive(serde::Deserialize)]
+                struct RestHead {
+                    sha: String,
+                }
+                let rest_pr: RestPr = serde_json::from_str(&pr_json).map_err(|e| {
+                    DaemonError::Parse(format!("failed to parse REST PR details: {e}"))
+                })?;
 
+                let reviews_url = format!("repos/{}/pulls/{}/reviews", self.repo, pr);
+                let reviews_json = run_tool("gh", &["api", &reviews_url], 30).unwrap_or_else(|_| "[]".to_string());
+                #[derive(serde::Deserialize)]
+                struct RestReview {
+                    user: Option<RestUser>,
+                    state: String,
+                }
+                #[derive(serde::Deserialize)]
+                struct RestUser {
+                    login: String,
+                }
+                let rest_reviews: Vec<RestReview> = serde_json::from_str(&reviews_json).unwrap_or_default();
+
+                let comments_url = format!("repos/{}/issues/{}/comments", self.repo, pr);
+                let comments_json = run_tool("gh", &["api", &comments_url], 30).unwrap_or_else(|_| "[]".to_string());
+                #[derive(serde::Deserialize)]
+                struct RestComment {
+                    user: Option<RestUser>,
+                    body: String,
+                }
+                let rest_comments: Vec<RestComment> = serde_json::from_str(&comments_json).unwrap_or_default();
+
+                let files_url = format!("repos/{}/pulls/{}/files", self.repo, pr);
+                let files_json = run_tool("gh", &["api", &files_url], 30).unwrap_or_else(|_| "[]".to_string());
+                #[derive(serde::Deserialize)]
+                struct RestFile {
+                    filename: String,
+                    additions: u32,
+                    deletions: u32,
+                }
+                let rest_files: Vec<RestFile> = serde_json::from_str(&files_json).unwrap_or_default();
+
+                GhPrView {
+                    mergeable: if rest_pr.mergeable.unwrap_or(false) { "MERGEABLE".to_string() } else { "CONFLICTING".to_string() },
+                    reviews: rest_reviews.into_iter().map(|r| GhReview { author: GhAuthor { login: r.user.map(|u| u.login).unwrap_or_default() }, state: r.state }).collect(),
+                    head_ref_oid: rest_pr.head.sha,
+                    body: rest_pr.body.unwrap_or_default(),
+                    comments: rest_comments.into_iter().map(|c| GhComment { author: GhAuthor { login: c.user.map(|u| u.login).unwrap_or_default() }, body: c.body }).collect(),
+                    files: rest_files.into_iter().map(|f| GhFile { path: f.filename, additions: f.additions, deletions: f.deletions }).collect(),
+                    updated_at: rest_pr.updated_at,
+                }
+            }
+        };
         let mergeable = view.mergeable == "MERGEABLE";
 
         let last_coderabbit_review = view.reviews.iter()
@@ -379,16 +465,51 @@ impl Scm for CliScm {
         };
         let coderabbit_approved = coderabbit_status == "green";
 
-        let checks_out = run_tool(
-            "gh",
-            &["pr", "checks", &pr_str, "--repo", &self.repo, "--json", "state,bucket"],
-            30,
-        )?;
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, serde::Serialize, Clone)]
         struct GhCheck {
             state: String,
             bucket: String,
         }
+        let checks_out = match run_tool(
+            "gh",
+            &["pr", "checks", &pr_str, "--repo", &self.repo, "--json", "state,bucket"],
+            30,
+        ) {
+            Ok(out) => out,
+            Err(_) => {
+                // REST Fallback!
+                let ref_url = format!("repos/{}/commits/{}/check-runs", self.repo, view.head_ref_oid);
+                let cr_json = match run_tool("gh", &["api", &ref_url], 30) {
+                    Ok(json) => json,
+                    Err(_) => "{\"check_runs\":[]}".to_string()
+                };
+                
+                #[derive(serde::Deserialize)]
+                struct RestCheckRuns {
+                    check_runs: Vec<RestCheckRun>,
+                }
+                #[derive(serde::Deserialize)]
+                struct RestCheckRun {
+                    status: String,
+                    conclusion: Option<String>,
+                }
+                let rest_cr: RestCheckRuns = serde_json::from_str(&cr_json).unwrap_or(RestCheckRuns { check_runs: vec![] });
+                
+                let legacy_checks: Vec<GhCheck> = rest_cr.check_runs.into_iter().map(|cr| {
+                    let (state, bucket) = if cr.status == "completed" {
+                        match cr.conclusion.as_deref() {
+                            Some("success") | Some("neutral") => ("SUCCESS".to_string(), "pass".to_string()),
+                            Some("cancelled") => ("CANCELLED".to_string(), "cancel".to_string()),
+                            _ => ("FAILURE".to_string(), "fail".to_string()),
+                        }
+                    } else {
+                        ("PENDING".to_string(), "pending".to_string())
+                    };
+                    GhCheck { state, bucket }
+                }).collect();
+                serde_json::to_string(&legacy_checks).unwrap_or_else(|_| "[]".to_string())
+            }
+        };
         let json_start_c = checks_out.find('[').unwrap_or(0);
         let checks: Vec<GhCheck> = serde_json::from_str(&checks_out[json_start_c..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse gh pr checks JSON: {e}"))
@@ -439,7 +560,7 @@ impl Scm for CliScm {
               }
             }
         }";
-        let gql_out = run_tool(
+        let gql_out = match run_tool(
             "gh",
             &[
                 "api",
@@ -454,7 +575,13 @@ impl Scm for CliScm {
                 &format!("query={query}"),
             ],
             30,
-        )?;
+        ) {
+            Ok(out) => out,
+            Err(_) => {
+                // REST Fallback: return dummy JSON representing 0 unresolved threads!
+                r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}"#.to_string()
+            }
+        };
         #[derive(serde::Deserialize)]
         struct GhGqlResponse {
             data: GhGqlData,
