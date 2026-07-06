@@ -137,10 +137,26 @@ impl Scm for CliScm {
                 }
             }
         }
-        let out = run_tool(
+        let out_issues = run_tool(
             "gh",
             &[
                 "issue",
+                "list",
+                "--repo",
+                &self.repo,
+                "--label",
+                label,
+                "--state",
+                "open",
+                "--json",
+                "number,title,body,author",
+            ],
+            30,
+        )?;
+        let out_prs = run_tool(
+            "gh",
+            &[
+                "pr",
                 "list",
                 "--repo",
                 &self.repo,
@@ -164,17 +180,26 @@ impl Scm for CliScm {
         struct GhAuthor {
             login: String,
         }
-        let json_start = out.find('[').unwrap_or(0);
-        let gh_issues: Vec<GhIssue> = serde_json::from_str(&out[json_start..]).map_err(|e| {
+        let json_start_issues = out_issues.find('[').unwrap_or(0);
+        let gh_issues: Vec<GhIssue> = serde_json::from_str(&out_issues[json_start_issues..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse gh issue list: {e}"))
         })?;
-        let issues: Vec<Issue> = gh_issues.into_iter().map(|issue| Issue {
-            number: issue.number,
-            title: issue.title,
-            body: issue.body.unwrap_or_default(),
-            author_login: issue.author.login,
-            external_ref: format!("{}#{}", self.repo, issue.number),
-        }).collect();
+        let json_start_prs = out_prs.find('[').unwrap_or(0);
+        let gh_prs: Vec<GhIssue> = serde_json::from_str(&out_prs[json_start_prs..]).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse gh pr list: {e}"))
+        })?;
+        let mut issues: Vec<Issue> = Vec::new();
+        for item in gh_issues.into_iter().chain(gh_prs.into_iter()) {
+            if !issues.iter().any(|i| i.number == item.number) {
+                issues.push(Issue {
+                    number: item.number,
+                    title: item.title,
+                    body: item.body.unwrap_or_default(),
+                    author_login: item.author.login,
+                    external_ref: format!("{}#{}", self.repo, item.number),
+                });
+            }
+        }
         {
             let mut cache = self.labeled_issues_cache.lock().unwrap();
             cache.insert(label.to_string(), (issues.clone(), Instant::now()));
