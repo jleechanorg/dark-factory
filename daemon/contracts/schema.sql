@@ -1,5 +1,7 @@
 -- Auto-Factory Daemon CXDB contract (spec §4.2.3, design doc §3).
--- Honored by BOTH factory-lite skills (via sqlite3 CLI) and the Rust daemon (rusqlite).
+-- Honored by daemon/factory-overlay.sh (bash path; restored in PR #167 from
+-- e60b5a31b~1:daemon/factory-lite-harness.sh) and the Rust daemon (rusqlite).
+-- The factory-lite skill plane was decommissioned in e60b5a31b.
 -- DB file: ~/.dark-factory/daemon-cxdb.sqlite  (separate from the runner's cxdb.sqlite)
 -- Init: sqlite3 ~/.dark-factory/daemon-cxdb.sqlite < daemon/contracts/schema.sql
 PRAGMA journal_mode = WAL;

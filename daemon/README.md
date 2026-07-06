@@ -15,20 +15,35 @@ traits, LOC budget) is specified in
 Before the Rust daemon exists, the same behavior runs as Claude Code skills
 that treat the spec as directly executable rather than translated by hand:
 
-- `.claude/skills/factory-lite/CONTRACT.md` — binding contract both skills
-  load **first**: config resolution, overlay states, CXDB one-liners,
-  telemetry emission, safety envelope (§4.2.8 — no force-push,
-  deletion-guarded branches, autonomy time-box).
-- `.claude/skills/factory-lite-coder/SKILL.md` — intake + routing + coder
-  dispatch tick.
-- `.claude/skills/factory-lite-verifier/SKILL.md` — 7/8-green gate
-  assessment, read-only on branches, never merges.
+- `.claude/skills/auto-factory/SKILL.md` — orchestrator: load contract,
+  intake (beads + GH issues), route (LLM-classified tier), dispatch
+  parallel coders, run verifier ticks, advance state through
+  QUEUED → DISPATCHED → ATTESTED → READY.
+- `daemon/factory-overlay.sh` — binding deterministic harness; restored in
+  [PR #167](https://github.com/jleechanorg/dark-factory/pull/167) from
+  `e60b5a31b~1:daemon/factory-lite-harness.sh`. Owns all sqlite3 mutations
+  to `~/.dark-factory/daemon-cxdb.sqlite`. 19 subcommands: `init`,
+  `intake-upsert`, `route-record`, `capacity`, `dispatch-record`,
+  `pr-opened`, `autonomy-tick`, `gate-assessment`, `prev-gate-assessment`,
+  `ready`, `reroll-verdict`, `park`, `park-duplicate`, `bead-closed-check`,
+  `tick-summary`, `recover-held`, `unstick-dispatching`, `redrive-pr`,
+  `list`.
+- `daemon/factory-af-tick.sh` — one deterministic /af tick (intake +
+  recover + AO dispatch for drive-existing-pr beads).
+- `daemon/factory-ao-remediate.sh` — spawns AO worker for an ATTESTED bead
+  with isolated worktree at `/tmp/<bead>-wt`.
+- `daemon/factory-tick.sh` — recover → unstick → intake-from-gh → callpath.
 
-All state mutation goes through `daemon/factory-lite-harness.sh`, a
+All state mutation goes through `daemon/factory-overlay.sh`, a
 deterministic (non-LLM) harness that validates every enum transition and
 refuses illegal ones — **the LLM supplies judgment, the harness owns
 mutations**, so stray model output can't corrupt state. This is the split
 the eventual Rust daemon implements natively.
+
+> Historical: the original factory-lite-coder / factory-lite-verifier skills
+> and `daemon/factory-lite-harness.sh` were removed in commit `e60b5a31b`
+> (2026-07-05, jleechan-xrdx). Their contracts were folded into
+> `daemon/factory-overlay.sh` + `.claude/skills/auto-factory/SKILL.md`.
 
 ## Binding contracts
 
