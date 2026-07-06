@@ -764,14 +764,16 @@ def _execute_gate(
     prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str, backend: str,
     *, gate_strict: bool = False,
 ) -> "Result":
-    """Run a reviewer gate on ``backend``; infra failures fall back to claude.
+    """Run a reviewer gate on ``backend``; infra failures fall back to agy, then claude.
 
     Routing rules:
       - Run the resolved backend. If the result is an *infrastructure*
         failure (missing binary, sandbox unavailable, timeout, unparseable
         output, SHA mismatch with no real verdict) and the backend is not
-        already claude-routed, fall back to ``claude`` — recorded in
-        metadata (``fallback_used`` / ``fallback_from``), never silent.
+        already agy/claude-routed:
+        1. If backend is not agy and not claude/claude-sonnet, fall back to ``agy``.
+        2. If backend is agy, or if the agy fallback also suffers an infra failure,
+           fall back to ``claude``.
       - A real ``fail``/``partial`` verdict from any backend is kept as-is
         (no-reviewer-shopping): only non-verdicts trigger the fallback.
       - Any result that is still an infra failure after routing carries
@@ -784,17 +786,25 @@ def _execute_gate(
     ``reviewer_backend: codex`` recorded in the result metadata.
     """
     result = _run_gate_once(backend, prompt, expected_sha, timeout, ctx, name, gate_strict=gate_strict)
-    # minimax shares the claude CLI binary but grades via a different
-    # gateway/model, so claude is still a genuine infra fallback for it.
-    claude_routed = backend in ("claude", "claude-sonnet")
-    if _is_gate_infra_failure(result) and not claude_routed:
-        fallback = _run_gate_once("claude", prompt, expected_sha, timeout, ctx, name, gate_strict=gate_strict)
-        fallback.metadata["fallback_used"] = "true"
-        fallback.metadata["fallback_from"] = backend
-        if _is_gate_infra_failure(fallback):
-            fallback.metadata["verdict"] = "infra_failure"
-        return fallback
-    result.metadata.setdefault("fallback_used", "false")
+
     if _is_gate_infra_failure(result):
-        result.metadata["verdict"] = "infra_failure"
+        fallback_backends = []
+        if backend not in ("agy", "claude", "claude-sonnet"):
+            fallback_backends.append("agy")
+        if backend not in ("claude", "claude-sonnet"):
+            fallback_backends.append("claude")
+
+        current_result = result
+        for fb_backend in fallback_backends:
+            fallback = _run_gate_once(fb_backend, prompt, expected_sha, timeout, ctx, name, gate_strict=gate_strict)
+            fallback.metadata["fallback_used"] = "true"
+            fallback.metadata["fallback_from"] = backend
+            current_result = fallback
+            if not _is_gate_infra_failure(current_result):
+                return current_result
+
+        current_result.metadata["verdict"] = "infra_failure"
+        return current_result
+
+    result.metadata.setdefault("fallback_used", "false")
     return result

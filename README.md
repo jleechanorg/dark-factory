@@ -60,7 +60,7 @@ Python under `runner/` is disposable *dorodango* — polish, discard, rebuild fr
 | **Two phases** | spec generation → factory execution |
 | **Runtime** | Python 3.13 (uv-managed) |
 | **Entry point** | `dark-factory` binary (not `python -m runner`) |
-| **Backends** | `claude`, `codex`, `agy`, `ao`, `mock_llm`/`echo` |
+| **Backends** | `ao` (default), `claude`, `codex`, `agy`, `mock_llm`/`echo` |
 | **Durable artifacts** | `.dot` pipeline graphs + `spec.md` (process + intent) |
 | **Observability** | CXDB SQLite event log + `df-healer` failure clustering |
 
@@ -78,7 +78,7 @@ Python under `runner/` is disposable *dorodango* — polish, discard, rebuild fr
 8. [Pipeline Catalog](#-pipeline-catalog)
 9. [Fail-Closed Observability: CXDB + Healer](#-fail-closed-observability-cxdb--healer)
 10. [Directory Layout](#-directory-layout)
-11. [Recommended default: Claude-based factories](#-recommended-default-claude-based-factories)
+11. [Recommended default: Agent Orchestrator (AO) with Antigravity](#-recommended-default-agent-orchestrator-ao-with-antigravity)
 12. [Execution Cookbook](#-execution-cookbook)
 13. [Sources & References](#-sources--references)
 
@@ -109,7 +109,7 @@ coding agent can build from with no hidden requirements. Either commit it to
 dark-factory \
   --pipeline benchmarks/attractor-spec-review/pipelines/review_slim.dot \
   --goal "Review specs/my_feature.md for completeness and ambiguity" \
-  --backend claude
+  --backend ao --ao-agent antigravity
 ```
 
 **Phase 2 — run the factory.** Pick the `.dot` sized to the project (see
@@ -121,7 +121,7 @@ cd ~/projects/my-app
 dark-factory \
   --pipeline pipelines/slim/minimal_feature.dot \
   --goal "Implement specs/my_feature.md" \
-  --backend claude \
+  --backend ao --ao-agent antigravity \
   --feature my_feature \
   --cxdb ~/.dark-factory/cxdb.sqlite
 
@@ -429,11 +429,9 @@ dark-factory/
 
 ---
 
-## ⭐ Recommended default: Claude-based factories
+## ⭐ Recommended default: Agent Orchestrator (AO) with Antigravity
 
-For day-to-day work, run the factory with `--backend claude` and **pick the `.dot`
-for the task** — do not default every run to a single pipeline. The full decision
-table is [docs/pipeline-selection.md](docs/pipeline-selection.md); the common picks:
+For day-to-day work, the factory runs with the `--backend ao` default (configured to use the `--ao-agent antigravity` plugin to route headlessly through the Antigravity CLI, but swappable to other agents like `--ao-agent claude-code`). **Pick the `.dot` for the task** — do not default every run to a single pipeline. The full decision table is [docs/pipeline-selection.md](docs/pipeline-selection.md); the common picks:
 
 | Task | Pipeline |
 |------|----------|
@@ -449,7 +447,7 @@ table is [docs/pipeline-selection.md](docs/pipeline-selection.md); the common pi
     afterward to cluster failures into a diagnosis. Merge confidence comes from
     outcome artifacts (holdouts, gates, CXDB history), not from reading the diff.
 *   **Keep adversarial cross-review independent.** Every non-trivial pipeline should
-    contain at least one reviewer node that is *separate* from the Claude coder —
+    contain at least one reviewer node that is *separate* from the coder agent —
     e.g. an independent reviewer `tool` node invoking `codex exec --yolo`. Because that
     reviewer never saw the implementation prompt, its verdict is genuinely adversarial.
     The slim pipelines (`minimal_feature.dot`, `minimal_pr.dot`) now ship this **by
@@ -481,7 +479,7 @@ cd ~/projects/my-app
 dark-factory \
   --pipeline pipelines/factory/gates.dot \
   --goal "<feature description>" \
-  --backend claude \
+  --backend ao --ao-agent antigravity \
   --feature <feature_name> \
   --cxdb ~/.dark-factory/cxdb.sqlite
 
@@ -529,7 +527,7 @@ cd ~/projects/my-app
 dark-factory \
   --pipeline pipelines/slim/minimal_feature.dot \
   --goal "Add user-facing feature X" \
-  --backend claude \
+  --backend ao --ao-agent antigravity \
   --feature my_feature \
   --cxdb ~/.dark-factory/cxdb.sqlite
 ```
@@ -541,7 +539,7 @@ cd ~/projects/my-app
 dark-factory \
   --pipeline pipelines/slim/minimal_pr.dot \
   --goal "Fix failing tests on PR branch" \
-  --backend claude \
+  --backend ao --ao-agent antigravity \
   --feature my_feature \
   --state 'slim.test_command=pytest tests/test_foo.py -v' \
   --cxdb ~/.dark-factory/cxdb.sqlite
@@ -554,7 +552,7 @@ cd ~/projects/my-app
 dark-factory \
   --pipeline pipelines/factory/gates.dot \
   --goal "Validate JWT middleware diff" \
-  --backend claude \
+  --backend ao --ao-agent antigravity \
   --feature auth_middleware \
   --cxdb ~/.dark-factory/cxdb.sqlite
 ```

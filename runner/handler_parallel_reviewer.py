@@ -82,33 +82,12 @@ def _run_primary_review(
             backend,
             gate_strict=gate_strict,
         )
-        # minimax shares the claude CLI binary but grades via a different
-        # gateway/model, so claude remains a meaningful infra fallback.
-        claude_routed = backend in ("claude", "claude-sonnet")
-        if _is_gate_infra_failure(result) and not claude_routed:
-            fallback = _execute_gate(
-                prompt,
-                expected_sha,
-                timeout,
-                ctx,
-                node_name,
-                "claude",
-                gate_strict=gate_strict,
-            )
-            fallback.metadata["fallback_used"] = "true"
-            fallback.metadata["fallback_from"] = backend
-            if _is_gate_infra_failure(fallback):
-                fallback.metadata["verdict"] = "infra_failure"
-            result = fallback
     finally:
         if prior_shadow_flag is None:
             ctx.state.pop("_df_shadow_codex_review", None)
         else:
             ctx.state["_df_shadow_codex_review"] = prior_shadow_flag
 
-    result.metadata.setdefault("fallback_used", "false")
-    if _is_gate_infra_failure(result):
-        result.metadata["verdict"] = "infra_failure"
     return result
 
 

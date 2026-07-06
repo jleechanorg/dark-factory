@@ -159,7 +159,8 @@ Do not always use `minimal_feature.dot` or `gates.dot` by default.
   dark-factory \
     --pipeline pipelines/factory/gates.dot \
     --goal "<goal_description>" \
-    --backend claude \
+    --backend ao \
+    --ao-agent antigravity \
     --feature <feature_name> \
     --cxdb ~/.dark-factory/cxdb.sqlite
   ```

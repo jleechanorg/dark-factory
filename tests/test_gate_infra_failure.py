@@ -14,7 +14,43 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 
 def test_execute_gate_codex_infra_failure_falls_back_to_claude(tmp_path, monkeypatch):
-    """codex missing (FileNotFoundError) → claude fallback, recorded in metadata."""
+    """codex and agy missing → claude fallback, recorded in metadata."""
+    import subprocess as _sp
+    from runner.handlers import _execute_gate, Context as HCtx
+
+    fake_sha = "f" * 40
+    seen: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        name = os.path.basename(cmd[0])
+        if name in ("codex", "agy"):
+            raise FileNotFoundError(f"{name}: command not found")
+        return _sp.CompletedProcess(
+            cmd, 0, stdout=f"head_sha: {fake_sha}\nverdict: pass\n", stderr=""
+        )
+
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+    result = _execute_gate("PROMPT", fake_sha, 300, ctx, "evidence", "codex")
+
+    assert result.outcome == "success"
+    assert result.metadata["fallback_used"] == "true"
+    assert result.metadata["fallback_from"] == "codex"
+    assert result.metadata["reviewer_backend"] == "claude"
+    assert os.path.basename(seen[0][0]) == "codex"
+    assert any(os.path.basename(c[0]) == "agy" for c in seen), (
+        "agy fallback must have been invoked after codex infra failure"
+    )
+    assert any(os.path.basename(c[0]) == "claude" for c in seen), (
+        "claude fallback must have been invoked after agy infra failure"
+    )
+
+
+def test_execute_gate_codex_infra_failure_falls_back_to_agy(tmp_path, monkeypatch):
+    """codex missing (FileNotFoundError) → agy fallback succeeds, recorded in metadata."""
     import subprocess as _sp
     from runner.handlers import _execute_gate, Context as HCtx
 
@@ -38,10 +74,13 @@ def test_execute_gate_codex_infra_failure_falls_back_to_claude(tmp_path, monkeyp
     assert result.outcome == "success"
     assert result.metadata["fallback_used"] == "true"
     assert result.metadata["fallback_from"] == "codex"
-    assert result.metadata["reviewer_backend"] == "claude"
+    assert result.metadata["reviewer_backend"] == "agy"
     assert os.path.basename(seen[0][0]) == "codex"
-    assert any(os.path.basename(c[0]) == "claude" for c in seen), (
-        "claude fallback must have been invoked after codex infra failure"
+    assert any(os.path.basename(c[0]) == "agy" for c in seen), (
+        "agy fallback must have been invoked after codex infra failure"
+    )
+    assert not any(os.path.basename(c[0]) == "claude" for c in seen), (
+        "claude fallback must not have been invoked since agy succeeded"
     )
 
 

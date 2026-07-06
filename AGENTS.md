@@ -78,7 +78,8 @@ dark-factory --pipeline pipelines/factory/hello.dot --goal "smoke test" --backen
 dark-factory \
   --pipeline pipelines/factory/gates.dot \
   --goal "<feature description>" \
-  --backend claude \
+  --backend ao \
+  --ao-agent antigravity \
   --feature <feature_name> \
   --cxdb ~/.dark-factory/cxdb.sqlite
 
@@ -129,8 +130,8 @@ Lookup order in `resolve(node)`:
 4. Default → `_codergen`
 
 Handler types:
-- `codergen` — render `prompt="@path"` (with `${goal}` and `${state.*}` substitution) and dispatch to the node's `backend`/`model` attribute or `ctx.backend`. The runner CLI accepts `echo` | `ao` | `claude` | `codex` | `agy`; per-node/model-stylesheet routing also supports `mock_llm` for test/conformance lanes.
-- `agy` backend — run Antigravity CLI headlessly with `agy --print --dangerously-skip-permissions`; node `timeout="..."` maps to `agy --print-timeout`.
+- `codergen` — render `prompt="@path"` (with `${goal}` and `${state.*}` substitution) and dispatch to the node's `backend`/`model` attribute or `ctx.backend`. The runner CLI accepts `echo` | `ao` | `claude` | `codex` | `agy`; per-node/model-stylesheet routing also supports `mock_llm` for test/conformance lanes. The default is `ao` (running `antigravity` agent under the hood via Agent Orchestrator).
+- `agy` backend — run Antigravity CLI directly and headlessly with `agy --print --dangerously-skip-permissions`; node `timeout="..."` maps to `agy --print-timeout`.
 - Reviewer/evaluator lanes are separate nodes: `tool` nodes can invoke `codex exec --yolo`, AO workers, or another reviewer CLI; `holdout_eval` runs the sealed Python evaluator from `$DARK_FACTORY_HOLDOUTS`.
 - `tool` — shell out to a `command="..."` attribute with optional `timeout`.
 - `human_gate` — block on stdin, or accept pre-seeded `ctx.state["<node>.outcome"]` for tests.
@@ -198,7 +199,7 @@ Each node emits `ENTER` on visit and `EXIT` with classified outcome (`success`, 
 3. Edge conditions are simple: `condition="key=value"` or `key!=value`. The runtime does *not* evaluate arbitrary expressions; encode richer logic in a handler.
 4. Prompt references use `prompt="@relative/path.md"` (the `@` is stripped by the parser). Templates support `${goal}` and `${state.<key>}` substitution only — no Jinja, no conditionals.
 5. Coder backends are swappable per run via `--backend` or per codergen node via
-   `backend="codex"` / `backend="claude"` / `backend="ao"` / `backend="agy"`. Use reviewer
+   `backend="codex"` / `backend="claude"` / `backend="ao"` / `backend="agy"`. The recommended default is `backend="ao"` with `--ao-agent antigravity` (running Antigravity CLI through Agent Orchestrator). Use reviewer
    `tool` nodes when separating coder and reviewer/evaluator CLIs.
 6. Use `model_stylesheet="path.model.css"` when a graph needs CSS-like
    backend/model routing without cluttering every node.

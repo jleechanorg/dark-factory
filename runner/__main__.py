@@ -250,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         p.add_argument(
             "--ao-agent",
-            default="claude-code",
+            default="antigravity",
             help="AO agent plugin to use when --backend ao (default: claude-code).",
         )
         p.add_argument("--checkpoint", type=pathlib.Path, default=None)
