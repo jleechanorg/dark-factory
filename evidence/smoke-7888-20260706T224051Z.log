@@ -1,0 +1,83 @@
+===== factory-overlay end-to-end smoke test (PR #7888) =====
+Timestamp: 2026-07-06T22:40:51Z
+Overlay: /Users/jleechan/projects/worktree_smoke_7888/daemon/factory-overlay.sh (364 lines)
+DB: /tmp/smoke-7888-cxdb.sqlite
+LOG: /tmp/smoke-7888-cxdb.jsonl
+CONFIG: /Users/jleechan/projects/worktree_smoke_7888/daemon/contracts/daemon.toml.example
+
+
+----- Step 0: init schema -----
+0a. factory-overlay init                           OK   | wal
+5000
+ok: schema applied to /tmp/smoke-7888-cxdb.sqlite
+  cmd: /Users/jleechan/projects/worktree_smoke_7888/daemon/factory-overlay.sh init
+
+----- Step 1: list QUEUED (pre-intake) -----
+Raw: ''
+  count=0
+  PASS: pre-intake list empty
+
+----- Step 2: intake-upsert jleechan-93ft -----
+2a. intake-upsert                                  OK   | created
+  cmd: /Users/jleechan/projects/worktree_smoke_7888/daemon/factory-overlay.sh intake-upsert jleechan-93ft PR #7888 cc_finish level verification
+2b. intake-upsert idempotent (same id)             OK   | exists
+  cmd: /Users/jleechan/projects/worktree_smoke_7888/daemon/factory-overlay.sh intake-upsert jleechan-93ft again
+
+----- Step 3: list QUEUED -> confirm jleechan-93ft present -----
+   {'bead_id': 'jleechan-93ft', 'pr_number': None, 'branch': None, 'attempt': 1, 'autonomy_secs': 0}
+  jleechan-93ft present in QUEUED: True
+  PASS: confirmed
+
+----- Step 4: redrive-pr jleechan-93ft 7888 fix/7887-cc-finish-level-commit -----
+4a. redrive-pr                                     OK   | redriven jleechan-93ft PR #7888
+  cmd: /Users/jleechan/projects/worktree_smoke_7888/daemon/factory-overlay.sh redrive-pr jleechan-93ft 7888 fix/7887-cc-finish-level-commit
+
+----- Step 5: list QUEUED (post-redrive) -----
+   {'bead_id': 'jleechan-93ft', 'pr_number': 7888, 'branch': 'fix/7887-cc-finish-level-commit', 'attempt': 2, 'autonomy_secs': 0}
+
+----- Step 6: route-record jleechan-93ft STANDARD_PATH -----
+6a. route-record                                   OK   | ok
+  cmd: /Users/jleechan/projects/worktree_smoke_7888/daemon/factory-overlay.sh route-record jleechan-93ft STANDARD_PATH drive PR #7888 to green
+
+----- Step 7: capacity -----
+7a. capacity                                       OK   | 15
+  cmd: /Users/jleechan/projects/worktree_smoke_7888/daemon/factory-overlay.sh capacity
+
+----- Step 8: dispatch-record jleechan-93ft fix/7887-cc-finish-level-commit -----
+8a. dispatch-record                                OK   | ok
+  cmd: /Users/jleechan/projects/worktree_smoke_7888/daemon/factory-overlay.sh dispatch-record jleechan-93ft fix/7887-cc-finish-level-commit
+
+----- Step 9: list DISPATCHED (must contain jleechan-93ft) -----
+   {'bead_id': 'jleechan-93ft', 'pr_number': 7888, 'branch': 'fix/7887-cc-finish-level-commit', 'attempt': 2, 'autonomy_secs': 0}
+  jleechan-93ft present in DISPATCHED: True
+  PASS: dispatch transition verified
+
+----- Step 10: redrivepr branch registry -----
+Branch registry row:
+fix/7887-cc-finish-level-commit|jleechan-93ft|2026-07-06T22:40:51Z
+
+----- Step 11: SKIP AO worker spawn (per task constraint) -----
+  Skipping factory-af-tick.sh / factory-ao-remediate.sh — quota-aware, verify overlay only.
+  What would happen next on a real run:
+    1. factory-af-tick.sh polls DISPATCHED state
+    2. Spawns AO coder into worktree at fix/7887-cc-finish-level-commit
+    3. Coder runs /green /advice /er until PR #7888 7-green
+    4. gate-assessment/pr-opened/ready transitions bead through ATTESTED -> READY
+
+----- Step 12: state distribution + CXDB log tail -----
+bead_overlay rows:
+jleechan-93ft|DISPATCHED|2|7888|fix/7887-cc-finish-level-commit
+
+branch_registry rows:
+fix/7887-cc-finish-level-commit|jleechan-93ft
+
+Recent CXDB log lines (full):
+{"ts": "2026-07-06T22:40:51Z", "beadId": "jleechan-93ft", "attempt": 1, "state": "QUEUED", "eventType": "INTAKE_BEAD_CREATED", "counts": {}, "context": {"title": "PR #7888 cc_finish level verification"}}
+{"ts": "2026-07-06T22:40:51Z", "beadId": "jleechan-93ft", "attempt": 2, "state": "QUEUED", "eventType": "REDRIVE_RESET", "counts": {}, "context": {"pr_number": 7888, "branch": "fix/7887-cc-finish-level-commit"}}
+{"ts": "2026-07-06T22:40:51Z", "beadId": "jleechan-93ft", "attempt": 2, "state": "QUEUED", "eventType": "TASK_ROUTED", "counts": {}, "context": {"routingVerdict": "STANDARD_PATH", "note": "drive PR #7888 to green"}}
+{"ts": "2026-07-06T22:40:51Z", "beadId": "jleechan-93ft", "attempt": 2, "state": "DISPATCHED", "eventType": "TASK_DISPATCHED", "counts": {}, "context": {"activeModel": "minimax", "branch": "fix/7887-cc-finish-level-commit"}}
+
+===== END smoke test =====
+Total bead_overlay rows: 1
+Total branch_registry rows: 1
+Total LOG lines:        4
