@@ -213,7 +213,7 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                         .unwrap_or_default()
                         .as_secs();
 
-                    if now_epoch.saturating_sub(pr_snapshot.updated_at_epoch) >= 1800 {
+                    if now_epoch.saturating_sub(pr_snapshot.updated_at_epoch) >= 1800 && !pr_snapshot.ci_pending {
                         let is_stalled_or_dead = if let Some(ref session_id_str) = overlay.session_id {
                             let session_id = SessionId(session_id_str.clone());
                             deps.sessions.is_quiescent(&session_id)?
@@ -616,6 +616,19 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 
         let mut evidence = skeptic_evidence(deps, bead_id, pr)?;
         let snapshot = deps.scm.pr_snapshot(pr)?;
+        if snapshot.ci_pending {
+            emit(
+                deps.telemetry_log,
+                bead_id,
+                overlay.attempt,
+                OverlayState::Attested.as_str(),
+                "VERIFICATION_PENDING",
+                serde_json::json!({}),
+                serde_json::json!({"message": "CI checks are still running (in progress), waiting for completion"}),
+            )?;
+            continue;
+        }
+
         evidence.er_verdict = verifier::parse_er_verdict(&snapshot.comments);
         evidence.is_production = verifier::classify_production(&snapshot.files);
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
@@ -710,7 +723,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 match crate::reroll::execute(&reroll_deps, &mut overlay) {
                     Ok(crate::reroll::RerollOutcome::Rerolled { new_branch: _ }) => {
                         // Perform recovery validation: check if spec is valid TOML
-                        let spec_path = Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", overlay.bead_id));
+                        let spec_path = std::path::Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", overlay.bead_id));
                         let validation_pass = if spec_path.exists() {
                             if let Ok(c) = std::fs::read_to_string(&spec_path) {
                                 toml::from_str::<serde_json::Value>(&c).is_ok()

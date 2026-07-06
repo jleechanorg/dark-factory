@@ -134,6 +134,9 @@ pub struct PrSnapshot {
     pub comments: Vec<PrComment>,
     pub files: Vec<PrFile>,
     pub updated_at_epoch: u64,
+    pub ci_status: String,
+    pub coderabbit_status: String,
+    pub ci_pending: bool,
 }
 
 /// Parameters for spawning a new AO/`aow` session (design doc §4).

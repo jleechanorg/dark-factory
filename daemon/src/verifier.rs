@@ -404,10 +404,14 @@ pub fn assess(
         }
     };
 
-    let ci = if snapshot.ci_success {
-        GateResult::Green
+    let ci = if !snapshot.ci_success {
+        if snapshot.ci_status == "unknown" {
+            GateResult::Unknown("CI check-run(s) are still pending/unknown".to_string())
+        } else {
+            GateResult::Red("CI check-run(s) not all success".to_string())
+        }
     } else {
-        GateResult::Red("CI check-run(s) not all success".to_string())
+        GateResult::Green
     };
 
     let no_conflicts = if snapshot.mergeable {
@@ -416,10 +420,14 @@ pub fn assess(
         GateResult::Red("PR is not mergeable (conflicts)".to_string())
     };
 
-    let coderabbit = if snapshot.coderabbit_approved {
-        GateResult::Green
+    let coderabbit = if !snapshot.coderabbit_approved {
+        if snapshot.coderabbit_status == "unknown" {
+            GateResult::Unknown("CodeRabbit review is still pending/unknown".to_string())
+        } else {
+            GateResult::Red("CodeRabbit review is not APPROVED".to_string())
+        }
     } else {
-        GateResult::Red("CodeRabbit review is not APPROVED".to_string())
+        GateResult::Green
     };
 
     let bugbot = if snapshot.bugbot_error_count == 0 {
@@ -519,6 +527,9 @@ mod tests {
             comments: vec![],
             files: vec![],
             updated_at_epoch: 0,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
         }
     }
 

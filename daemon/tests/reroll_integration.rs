@@ -278,6 +278,9 @@ fn test_tick_stage2_integration() {
             comments: vec![],
             files: vec![],
             updated_at_epoch: 0,
+            ci_status: "red".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
         },
     );
 

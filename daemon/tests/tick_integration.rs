@@ -136,6 +136,9 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
             comments: vec![],
             files: vec![],
             updated_at_epoch: 0,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
         },
     );
     // The router call already happened in tick 1; re-script the same `FakeLlm`
@@ -581,6 +584,9 @@ fn test_wedge_detection_attested_session_stalled() {
             comments: vec![],
             files: vec![],
             updated_at_epoch: now_epoch - 2000, // older than 1800s
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
         },
     );
 

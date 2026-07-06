@@ -279,6 +279,8 @@ impl Scm for CliScm {
                     updated_at_epoch: Option<u64>,
                 }
                 if let Ok(snap) = serde_json::from_str::<OfflinePrSnapshot>(&raw) {
+                    let ci_status = if snap.ci_success { "green".to_string() } else { "red".to_string() };
+                    let coderabbit_status = if snap.coderabbit_approved { "green".to_string() } else { "red".to_string() };
                     return Ok(PrSnapshot {
                         pr_number: pr,
                         ci_success: snap.ci_success,
@@ -291,6 +293,9 @@ impl Scm for CliScm {
                         comments: snap.comments,
                         files: snap.files,
                         updated_at_epoch: snap.updated_at_epoch.unwrap_or(0),
+                        ci_status,
+                        coderabbit_status,
+                        ci_pending: false,
                     });
                 }
             }
@@ -355,12 +360,24 @@ impl Scm for CliScm {
         })?;
 
         let mergeable = view.mergeable == "MERGEABLE";
-        let mut coderabbit_approved = false;
-        for r in &view.reviews {
-            if r.author.login.contains("coderabbit") {
-                coderabbit_approved = r.state == "APPROVED";
+
+        let last_coderabbit_review = view.reviews.iter()
+            .filter(|r| r.author.login.contains("coderabbit"))
+            .last();
+
+        let coderabbit_status = match last_coderabbit_review {
+            Some(r) => {
+                if r.state == "APPROVED" {
+                    "green".to_string()
+                } else if r.state == "CHANGES_REQUESTED" {
+                    "red".to_string()
+                } else {
+                    "unknown".to_string()
+                }
             }
-        }
+            None => "unknown".to_string(),
+        };
+        let coderabbit_approved = coderabbit_status == "green";
 
         let checks_out = run_tool(
             "gh",
@@ -376,9 +393,27 @@ impl Scm for CliScm {
         let checks: Vec<GhCheck> = serde_json::from_str(&checks_out[json_start_c..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse gh pr checks JSON: {e}"))
         })?;
-        let ci_success = !checks.is_empty() && checks.iter().all(|c| {
-            c.bucket == "pass" || c.bucket == "skipping"
-        });
+        let ci_status = if checks.is_empty() {
+            "unknown".to_string()
+        } else {
+            let mut any_pending = false;
+            let mut any_failed = false;
+            for c in &checks {
+                if c.bucket == "pending" {
+                    any_pending = true;
+                } else if c.bucket == "fail" || c.bucket == "cancel" {
+                    any_failed = true;
+                }
+            }
+            if any_pending {
+                "unknown".to_string()
+            } else if any_failed {
+                "red".to_string()
+            } else {
+                "green".to_string()
+            }
+        };
+        let ci_success = ci_status == "green";
 
         let mut bugbot_error_count = 0;
         for comment in &view.comments {
@@ -468,6 +503,7 @@ impl Scm for CliScm {
         }).collect();
 
         let updated_at_epoch = crate::tools::iso8601_to_epoch(&view.updated_at).unwrap_or(0);
+        let ci_pending = ci_status == "unknown";
         let snapshot = PrSnapshot {
             pr_number: pr,
             ci_success,
@@ -480,6 +516,9 @@ impl Scm for CliScm {
             comments: pr_comments,
             files: pr_files,
             updated_at_epoch,
+            ci_status,
+            coderabbit_status,
+            ci_pending,
         };
         {
             let mut cache = self.pr_snapshot_cache.lock().unwrap();

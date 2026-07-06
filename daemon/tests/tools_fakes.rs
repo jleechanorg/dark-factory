@@ -64,6 +64,9 @@ fn fake_scm_returns_scripted_permission_and_records_call() {
             comments: vec![],
             files: vec![],
             updated_at_epoch: 0,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
         },
     );
 
