@@ -9,7 +9,7 @@
 // `StateStore::load` on every tick, so there is no separate in-memory cache to
 // rehydrate on process restart.
 //
-// Stage gate (spec §4.2.9, `.claude/skills/factory-lite/CONTRACT.md` §1
+// Stage gate (spec §4.2.9, `docs/auto-factory-daemon-spec.md` §4.2.9
 // "Stage-1 substitution rule"): whenever a re-roll-worthy verdict would fire
 // (an ATTESTED bead's gate assessment is not all-green), Stage 1 NEVER enters
 // `RE_ROLL` or executes the Re-Roll Engine. It only emits

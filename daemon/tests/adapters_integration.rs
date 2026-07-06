@@ -28,6 +28,7 @@ fn test_cli_vcs_real_git() {
 }
 
 #[test]
+#[ignore] // Requires real `br` CLI — run locally with `cargo test -- --ignored`
 fn test_cli_tracker_real_br() {
     let tracker = CliTracker;
     let res = tracker.fetch_candidates();
@@ -35,6 +36,7 @@ fn test_cli_tracker_real_br() {
 }
 
 #[test]
+#[ignore] // Requires real `gh` CLI — run locally with `cargo test -- --ignored`
 fn test_cli_scm_real_gh() {
     let scm = CliScm::new("jleechanorg/dark-factory".to_string());
     let res = scm.labeled_issues("factory");
@@ -42,6 +44,7 @@ fn test_cli_scm_real_gh() {
 }
 
 #[test]
+#[ignore] // Requires real `ao` CLI — run locally with `cargo test -- --ignored`
 fn test_cli_sessions_real_ao() {
     let sessions = CliSessions::new("jleechanorg/dark-factory", "claude-code");
     let count = sessions.active_count();
@@ -49,6 +52,7 @@ fn test_cli_sessions_real_ao() {
 }
 
 #[test]
+#[ignore] // Requires real codex/claude/agy CLIs — run locally with `cargo test -- --ignored`
 fn test_chain_llm_real_fallback() {
     let llm = ChainLlm;
     let res = llm.judge("Respond with exactly: hello");
