@@ -135,7 +135,7 @@ pub fn run_gates_compute(pr: u64, repo_opt: Option<String>) -> Result<(), Daemon
     })?;
 
     let last_coderabbit_review = reviews_view.reviews.iter()
-        .filter(|r| r.author.login.contains("coderabbit"))
+        .filter(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED")
         .last();
 
     let coderabbit = match last_coderabbit_review {

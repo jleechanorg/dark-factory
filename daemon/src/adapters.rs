@@ -448,7 +448,7 @@ impl Scm for CliScm {
         let mergeable = view.mergeable == "MERGEABLE";
 
         let last_coderabbit_review = view.reviews.iter()
-            .filter(|r| r.author.login.contains("coderabbit"))
+            .filter(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED")
             .last();
 
         let coderabbit_status = match last_coderabbit_review {
