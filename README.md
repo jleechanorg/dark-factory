@@ -55,6 +55,13 @@ implementing agent is **structurally blind** to the holdouts and evaluator
 reading them. You version the `.dot` graph and the specs/holdouts/scoring contracts; the
 Python under `runner/` is disposable *dorodango* — polish, discard, rebuild from spec.
 
+### 🎯 The Ultimate Goal: Deprecating the Human Interactive Hat
+The ultimate objective of the auto-factory is to automate all coding LLM work. Humans should no longer write, edit, or read code during development, nor should they interact with coding LLMs in interactive chat sessions. 
+
+Instead:
+* **Humans only define intent**: Create GitHub issues or beads with clear requirements, or write comments on Pull Requests for feedback.
+* **Auto-Factory autonomously executes**: The daemon sweeps the queue, dispatches parallel coder agents, runs the verification ticks, and autonomously drives PRs to green/merged without human intervention.
+
 | | |
 |---|---|
 | **Two phases** | spec generation → factory execution |

@@ -12,6 +12,7 @@ The `dark-factory` repository implements the **Attractor Pattern**—a Level 5 a
 * **Level 5 Automation (The Dark Factory)**: Lights-off engineering. Humans own specs, holdouts, validation economics, and outcome audits. Agents write code, and independent review agents/sealed evaluators audit the behavior. Human diff review is a fallback, not the quality gate.
 * **Durable Artifacts vs. Dorodango**: The DOT graphs under `pipelines/` are the durable process code worth sharing. The Python code in `runner/` is treated as throwaway ("dorodango" — polish, discard, rebuild from spec). The true system intelligence accumulates in the **CXDB** event logs.
 * **Sealed Evaluator Isolation**: Implementing agents (under test) must **NEVER** read `holdouts/`, `runner/evaluator.py`, or any `_holdout/` test source files. This is enforced at runtime by `sandbox-exec` and by stripping `$DARK_FACTORY_HOLDOUTS` from the coder's environment. As an Antigravity agent, you must respect this boundary and never look inside these hidden directories.
+* **Deprecate human interactive hat**: Shift all coding LLM work to the auto-factory. Humans only create GitHub issues/beads and write comments on PRs for feedback. The auto-factory autonomously processes and drives branches to green without human-interactive coding sessions.
 
 ---
 

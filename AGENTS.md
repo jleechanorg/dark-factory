@@ -56,6 +56,7 @@ Operational rules:
    token budget on adversarial validation, it is probably under-testing.
 6. Treat `.dot` graphs as the durable process code. Runner code is disposable;
    graph shape, specs, holdouts, and scoring contracts are the important assets.
+7. **Deprecate human interactive hat**: All coding LLM work must be shifted to the auto-factory. Humans only define intent (create GitHub issues/beads) and write comments on PRs for feedback. The auto-factory autonomously processes and drives branches to green without human-interactive coding sessions.
 
 ## Setup
 
