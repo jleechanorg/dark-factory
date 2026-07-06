@@ -631,6 +631,8 @@ impl Sessions for CliSessions {
         } else {
             Command::new("ao")
         };
+        let display_name = spec.branch.strip_prefix("factory/").unwrap_or(&spec.branch);
+
         cmd.arg("spawn")
             .arg("--prompt")
             .arg(&spec.prompt)
@@ -638,6 +640,10 @@ impl Sessions for CliSessions {
             .arg(&self.project)
             .arg("--agent")
             .arg(&self.agent)
+            .arg("--name")
+            .arg(display_name)
+            .arg("--branch")
+            .arg(&spec.branch)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
