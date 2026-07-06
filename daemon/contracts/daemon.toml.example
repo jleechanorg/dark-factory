@@ -1,5 +1,8 @@
 # Auto-Factory Daemon config contract (spec §4.2.9, design doc §5).
-# Honored by BOTH factory-lite skills and the Rust daemon.
+# Honored by daemon/factory-overlay.sh (bash path; restored in PR #167 from
+# e60b5a31b~1:daemon/factory-lite-harness.sh) and the Rust daemon (production
+# path; same CXDB contract). The factory-lite skill plane was decommissioned
+# in commit e60b5a31b — do not re-introduce.
 # Live copy: config/daemon.toml (git-ignored per deployment).
 
 target_repo = "jleechanorg/dark-factory"  # exactly one repo (pilot scope)
