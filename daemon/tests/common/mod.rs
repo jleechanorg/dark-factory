@@ -29,6 +29,12 @@ use std::collections::HashMap;
 pub struct FakeTracker {
     pub candidates: RefCell<Vec<Bead>>,
     pub create_bead_result: RefCell<Option<Result<String, String>>>,
+    /// Scripts `create_bead` to fail with the exact `br create` duplicate
+    /// error shape (`DaemonError::duplicate_external_ref_bead_id` parses
+    /// it), simulating jleechan-u4gb: a concurrent/stale `fetch_all_external_refs`
+    /// snapshot missed a ref that `br create`'s own uniqueness check
+    /// correctly rejects. Value is the existing bead id to report.
+    pub create_bead_duplicate_of: RefCell<Option<String>>,
     pub fail_next_fetch_candidates: RefCell<Option<String>>,
     pub fail_next_comment: RefCell<Option<String>>,
     pub calls: RefCell<Vec<String>>,
@@ -72,6 +78,15 @@ impl Tracker for FakeTracker {
         self.calls
             .borrow_mut()
             .push(format!("create_bead({title},{body},{external_ref})"));
+        if let Some(existing_bead_id) = self.create_bead_duplicate_of.borrow_mut().take() {
+            return Err(DaemonError::Tool {
+                tool: "br".into(),
+                rc: 7,
+                stderr: format!(
+                    "Error: Configuration error: External reference '{external_ref}' already exists on issue {existing_bead_id}\n"
+                ),
+            });
+        }
         let result = match self.create_bead_result.borrow().as_ref() {
             Some(Ok(id)) => Ok(id.clone()),
             Some(Err(e)) => Err(DaemonError::Tool {

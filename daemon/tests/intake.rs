@@ -179,6 +179,77 @@ fn mixed_batch_only_creates_bead_for_new_write_tier_issue() {
     assert!(create_calls[0].contains("owner/repo#1"));
 }
 
+/// jleechan-u4gb: the `known_refs` pre-check is a bulk snapshot read that can
+/// race with reality (pagination skew, staleness, a duplicate entry within
+/// the same batch, etc.) and miss a ref that is actually already tracked.
+/// When that happens, `br create`'s own uniqueness constraint is the
+/// authoritative signal — `create_bead` fails with the exact "already
+/// exists on issue <id>" shape. `normalize` must treat that as an
+/// already-tracked skip (matching the known_refs.contains path), NOT
+/// propagate a tick-killing error that would retry forever against a ref
+/// that will always already exist.
+#[test]
+fn create_bead_duplicate_error_is_recovered_as_already_known() {
+    let mut scm = FakeScm::new();
+    scm.issues.push(issue(8227, "alice"));
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    // known_refs (derived from `candidates`) does NOT contain owner/repo#8227
+    // -- simulates the race: the pre-check snapshot missed it.
+    *tracker.create_bead_duplicate_of.borrow_mut() = Some("jleechan-vj89".into());
+
+    let cfg = test_cfg();
+
+    let created = intake::normalize(&scm, &tracker, &cfg).unwrap();
+
+    assert!(
+        created.is_empty(),
+        "duplicate create_bead race must not be reported as newly created: {created:?}"
+    );
+
+    let calls = tracker.calls.borrow();
+    assert_eq!(
+        calls.iter().filter(|c| c.starts_with("create_bead(")).count(),
+        1,
+        "expected exactly one create_bead attempt (which raced and was recovered)"
+    );
+    assert!(
+        calls.iter().all(|c| !c.starts_with("comment_external(")),
+        "must not post the 'picked up this task' comment for a ref that was already tracked: {calls:?}"
+    );
+}
+
+/// Same race, but for the existing-PR-adoption path (`normalize_labeled_prs`).
+#[test]
+fn pr_create_bead_duplicate_error_is_recovered_as_already_adopted() {
+    let mut scm = FakeScm::new();
+    scm.prs
+        .push(labeled_pr(8227, "alice", "feature/existing-pr-8227"));
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    *tracker.create_bead_duplicate_of.borrow_mut() = Some("jleechan-vj89".into());
+
+    let cfg = test_cfg();
+
+    let adopted = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+
+    assert!(
+        adopted.is_empty(),
+        "duplicate create_bead race must not produce a fresh adoption: {adopted:?}"
+    );
+    let calls = tracker.calls.borrow();
+    assert_eq!(
+        calls.iter().filter(|c| c.starts_with("create_bead(")).count(),
+        1
+    );
+    assert!(
+        calls.iter().all(|c| !c.starts_with("comment_external(")),
+        "must not post the adoption comment for a ref that was already tracked: {calls:?}"
+    );
+}
+
 #[test]
 fn new_factory_pr_from_write_tier_collaborator_creates_existing_pr_intake() {
     let mut scm = FakeScm::new();

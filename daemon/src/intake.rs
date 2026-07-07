@@ -83,8 +83,32 @@ pub fn normalize(
         }
 
         let title = format!("{} ({})", issue.title, cfg.target_repo);
-        let bead_id = tracker.create_bead(&title, &issue.body, &issue.external_ref)?;
-        
+        let bead_id = match tracker.create_bead(&title, &issue.body, &issue.external_ref) {
+            Ok(id) => id,
+            Err(e) => {
+                // jleechan-u4gb: the known_refs pre-check above is a bulk
+                // snapshot read that can race with a concurrent write (e.g.
+                // a duplicate labeled-issue entry within the same batch, or
+                // staleness/skew in the underlying `br list` snapshot) and
+                // miss a ref that was actually already tracked. `br create`'s
+                // own uniqueness constraint is authoritative and catches it
+                // at write time; treat that as "already tracked" (same
+                // outcome as the known_refs.contains skip above) instead of
+                // failing the whole tick and retrying forever — the ref will
+                // *always* already exist on retry, so propagating this as a
+                // transient error just burns exponential backoff for no
+                // benefit.
+                if let Some(existing_bead_id) = e.duplicate_external_ref_bead_id() {
+                    eprintln!(
+                        "auto-factory daemon: intake race recovered — external_ref {:?} already tracked by {existing_bead_id} (known_refs pre-check missed it); skipping create_bead",
+                        issue.external_ref
+                    );
+                    continue;
+                }
+                return Err(e);
+            }
+        };
+
         let comment_body = format!(
             "🤖 **[dark-factory]** Auto-factory has picked up this task. Created tracking bead `{}`. Spawning worker session...",
             bead_id
@@ -148,7 +172,23 @@ pub fn normalize_labeled_prs(
         }
 
         let title = format!("{} ({})", pr.title, cfg.target_repo);
-        let bead_id = tracker.create_bead(&title, &pr.body, &pr.external_ref)?;
+        let bead_id = match tracker.create_bead(&title, &pr.body, &pr.external_ref) {
+            Ok(id) => id,
+            Err(e) => {
+                // jleechan-u4gb: same write-time-vs-read-time race as
+                // intake::normalize above — `br create`'s uniqueness
+                // constraint is authoritative; treat a caught duplicate as
+                // already-adopted rather than failing the whole tick.
+                if let Some(existing_bead_id) = e.duplicate_external_ref_bead_id() {
+                    eprintln!(
+                        "auto-factory daemon: PR intake race recovered — external_ref {:?} already tracked by {existing_bead_id} (known_refs pre-check missed it); skipping create_bead",
+                        pr.external_ref
+                    );
+                    continue;
+                }
+                return Err(e);
+            }
+        };
         let comment_body = format!(
             "🤖 **[dark-factory]** Auto-factory has picked up this pull request. Created tracking bead `{}` and will verify the existing branch `{}`.",
             bead_id, pr.head_ref_name
