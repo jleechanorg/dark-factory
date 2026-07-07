@@ -9,6 +9,8 @@ use daemon::tick::{run_tick, TickDeps};
 use daemon::tools::{Bead, Issue, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 use std::path::{Path, PathBuf};
 
+const MAX_TICK_BACKOFF_SECS: u64 = 300;
+
 /// Parsed CLI flags (manual `std::env::args` parsing per Task 10 — no `clap`,
 /// staying inside the five-dependency budget from design doc §2).
 #[derive(Debug, Clone, Copy, Default)]
@@ -203,6 +205,118 @@ fn load_config(path: &Path) -> Result<Config, DaemonError> {
     config::load(path)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TickLoopAction {
+    Success {
+        consecutive_failures: u32,
+    },
+    TransientBackoff {
+        consecutive_failures: u32,
+        sleep_secs: u64,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TickAttempt {
+    tick_index: u64,
+    elapsed_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TickLoopState<T> {
+    tick_index: u64,
+    consecutive_failures: u32,
+    has_attempted: bool,
+    last_tick_time: T,
+}
+
+impl<T: Copy> TickLoopState<T> {
+    fn new(last_tick_time: T) -> Self {
+        Self {
+            tick_index: 0,
+            consecutive_failures: 0,
+            has_attempted: false,
+            last_tick_time,
+        }
+    }
+
+    fn begin_tick(
+        &mut self,
+        now: T,
+        elapsed_since_last_tick: impl FnOnce(T, T) -> u64,
+    ) -> TickAttempt {
+        let elapsed_secs = if self.has_attempted {
+            elapsed_since_last_tick(self.last_tick_time, now)
+        } else {
+            0
+        };
+        self.has_attempted = true;
+        self.last_tick_time = now;
+        TickAttempt {
+            tick_index: self.tick_index,
+            elapsed_secs,
+        }
+    }
+
+    fn apply_action(&mut self, action: &TickLoopAction) {
+        match action {
+            TickLoopAction::Success {
+                consecutive_failures,
+            } => {
+                self.consecutive_failures = *consecutive_failures;
+                self.tick_index += 1;
+            }
+            TickLoopAction::TransientBackoff {
+                consecutive_failures,
+                ..
+            } => {
+                self.consecutive_failures = *consecutive_failures;
+            }
+        }
+    }
+}
+
+fn apply_tick_action<T: Copy>(
+    tick_loop: &mut TickLoopState<T>,
+    action: &TickLoopAction,
+    mut reconcile_dispatching: impl FnMut() -> Result<(), DaemonError>,
+) -> Result<(), DaemonError> {
+    tick_loop.apply_action(action);
+    if matches!(action, TickLoopAction::TransientBackoff { .. }) {
+        reconcile_dispatching()?;
+    }
+    Ok(())
+}
+
+fn next_backoff_secs(base_tick_secs: u64, consecutive_failures: u32) -> u64 {
+    let base = base_tick_secs.max(1);
+    let exponent = consecutive_failures.saturating_sub(1).min(63);
+    base.saturating_mul(2_u64.saturating_pow(exponent))
+        .min(MAX_TICK_BACKOFF_SECS)
+}
+
+fn classify_tick_result<T>(
+    result: Result<T, DaemonError>,
+    base_tick_secs: u64,
+    consecutive_failures: u32,
+) -> Result<TickLoopAction, DaemonError> {
+    match result {
+        Ok(_) => Ok(TickLoopAction::Success {
+            consecutive_failures: 0,
+        }),
+        Err(err) if err.is_transient() => {
+            let consecutive_failures = consecutive_failures.saturating_add(1);
+            Ok(TickLoopAction::TransientBackoff {
+                consecutive_failures,
+                sleep_secs: next_backoff_secs(base_tick_secs, consecutive_failures),
+                error: err.to_string(),
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
 type DaemonAdapters = (
     Box<dyn Scm>,
     Box<dyn Tracker>,
@@ -271,20 +385,37 @@ fn run(args: Args) -> Result<(), DaemonError> {
         return Ok(());
     }
 
-    let mut tick_index: u64 = 0;
-    let mut last_tick_time = std::time::Instant::now();
+    let mut tick_loop = TickLoopState::new(std::time::Instant::now());
     loop {
         let now = std::time::Instant::now();
-        let elapsed_secs = if tick_index == 0 {
-            0
-        } else {
+        let attempt = tick_loop.begin_tick(now, |last_tick_time, now| {
             now.duration_since(last_tick_time).as_secs()
-        };
-        last_tick_time = now;
+        });
 
-        run_tick(&deps, tick_index, elapsed_secs)?;
-        tick_index += 1;
-        std::thread::sleep(std::time::Duration::from_secs(cfg.fast_tick_secs));
+        let action = classify_tick_result(
+            run_tick(&deps, attempt.tick_index, attempt.elapsed_secs),
+            cfg.fast_tick_secs,
+            tick_loop.consecutive_failures,
+        )?;
+        apply_tick_action(&mut tick_loop, &action, || store.reconcile_dispatching())?;
+
+        match action {
+            TickLoopAction::Success {
+                consecutive_failures: _,
+            } => {
+                std::thread::sleep(std::time::Duration::from_secs(cfg.fast_tick_secs));
+            }
+            TickLoopAction::TransientBackoff {
+                consecutive_failures: _,
+                sleep_secs,
+                error,
+            } => {
+                eprintln!(
+                    "auto-factory daemon: transient tick error: {error}; sleeping {sleep_secs}s before retry"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
+            }
+        }
     }
 }
 
@@ -395,5 +526,206 @@ mod tests {
             }
             _ => panic!("Expected GatesCompute mode"),
         }
+    }
+
+    #[test]
+    fn next_backoff_uses_min_base_and_exponential_sequence() {
+        assert_eq!(next_backoff_secs(0, 1), 1);
+        assert_eq!(next_backoff_secs(0, 2), 2);
+        assert_eq!(next_backoff_secs(0, 3), 4);
+        assert_eq!(next_backoff_secs(10, 1), 10);
+        assert_eq!(next_backoff_secs(10, 2), 20);
+        assert_eq!(next_backoff_secs(10, 3), 40);
+    }
+
+    #[test]
+    fn next_backoff_caps_at_five_minutes() {
+        assert_eq!(next_backoff_secs(60, 4), 300);
+        assert_eq!(next_backoff_secs(u64::MAX, u32::MAX), 300);
+    }
+
+    #[test]
+    fn classify_tick_result_resets_after_success() {
+        let action = classify_tick_result(Ok(()), 10, 3).unwrap();
+        assert_eq!(
+            action,
+            TickLoopAction::Success {
+                consecutive_failures: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_tick_result_backs_off_on_transient_errors() {
+        let err = DaemonError::Timeout("slow tool".to_string());
+        let action = classify_tick_result::<()>(Err(err), 10, 1).unwrap();
+
+        assert_eq!(
+            action,
+            TickLoopAction::TransientBackoff {
+                consecutive_failures: 2,
+                sleep_secs: 20,
+                error: "timeout: slow tool".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_tick_result_returns_fatal_errors() {
+        let err = DaemonError::Config("missing target_repo".to_string());
+        let fatal = classify_tick_result::<()>(Err(err), 10, 0).unwrap_err();
+
+        assert!(matches!(fatal, DaemonError::Config(_)));
+    }
+
+    #[test]
+    fn transient_tick_retries_same_index_until_success_advances() {
+        let mut state = TickLoopState {
+            tick_index: 12,
+            consecutive_failures: 0,
+            has_attempted: true,
+            last_tick_time: 100_u64,
+        };
+
+        let first_attempt = state.begin_tick(110, |last, now| now - last);
+        assert_eq!(
+            first_attempt,
+            TickAttempt {
+                tick_index: 12,
+                elapsed_secs: 10,
+            }
+        );
+
+        let transient = classify_tick_result::<()>(
+            Err(DaemonError::Tool {
+                tool: "gh".to_string(),
+                rc: 1,
+                stderr: "network unavailable".to_string(),
+            }),
+            10,
+            state.consecutive_failures,
+        )
+        .unwrap();
+        state.apply_action(&transient);
+        assert_eq!(state.tick_index, 12);
+
+        let retry_attempt = state.begin_tick(115, |last, now| now - last);
+        assert_eq!(retry_attempt.tick_index, 12);
+
+        let success = classify_tick_result(Ok(()), 10, state.consecutive_failures).unwrap();
+        state.apply_action(&success);
+        assert_eq!(state.tick_index, 13);
+        assert_eq!(state.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn transient_tick_anchors_elapsed_window_before_retry() {
+        let mut state = TickLoopState {
+            tick_index: 7,
+            consecutive_failures: 0,
+            has_attempted: true,
+            last_tick_time: 100_u64,
+        };
+
+        let failed_attempt = state.begin_tick(160, |last, now| now - last);
+        assert_eq!(
+            failed_attempt,
+            TickAttempt {
+                tick_index: 7,
+                elapsed_secs: 60,
+            }
+        );
+
+        let transient = classify_tick_result::<()>(
+            Err(DaemonError::Timeout("ao status timed out".to_string())),
+            10,
+            state.consecutive_failures,
+        )
+        .unwrap();
+        state.apply_action(&transient);
+
+        let retry_attempt = state.begin_tick(190, |last, now| now - last);
+        assert_eq!(
+            retry_attempt,
+            TickAttempt {
+                tick_index: 7,
+                elapsed_secs: 30,
+            }
+        );
+        assert_eq!(state.last_tick_time, 190);
+    }
+
+    #[test]
+    fn first_tick_retry_reports_elapsed_since_failed_attempt() {
+        let mut state = TickLoopState::new(100_u64);
+
+        let failed_attempt = state.begin_tick(160, |last, now| now - last);
+        assert_eq!(
+            failed_attempt,
+            TickAttempt {
+                tick_index: 0,
+                elapsed_secs: 0,
+            }
+        );
+
+        let transient = classify_tick_result::<()>(
+            Err(DaemonError::Timeout("initial tick timed out".to_string())),
+            10,
+            state.consecutive_failures,
+        )
+        .unwrap();
+        state.apply_action(&transient);
+
+        let retry_attempt = state.begin_tick(190, |last, now| now - last);
+        assert_eq!(
+            retry_attempt,
+            TickAttempt {
+                tick_index: 0,
+                elapsed_secs: 30,
+            }
+        );
+    }
+
+    #[test]
+    fn transient_tick_reconciles_dispatching_before_retry() {
+        let mut state = TickLoopState::new(100_u64);
+        let action = classify_tick_result::<()>(
+            Err(DaemonError::Tool {
+                tool: "ao".to_string(),
+                rc: 1,
+                stderr: "spawn failed".to_string(),
+            }),
+            10,
+            state.consecutive_failures,
+        )
+        .unwrap();
+        let mut reconcile_count = 0;
+
+        apply_tick_action(&mut state, &action, || {
+            reconcile_count += 1;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(reconcile_count, 1);
+        assert_eq!(state.tick_index, 0);
+        assert_eq!(state.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn successful_tick_does_not_reconcile_dispatching() {
+        let mut state = TickLoopState::new(100_u64);
+        let action = classify_tick_result(Ok(()), 10, state.consecutive_failures).unwrap();
+        let mut reconcile_count = 0;
+
+        apply_tick_action(&mut state, &action, || {
+            reconcile_count += 1;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(reconcile_count, 0);
+        assert_eq!(state.tick_index, 1);
+        assert_eq!(state.consecutive_failures, 0);
     }
 }
