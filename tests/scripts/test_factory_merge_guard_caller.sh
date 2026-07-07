@@ -89,10 +89,12 @@ chmod +x "$SBX/daemon/factory-ao-remediate.sh"
 
 # Stubbed ready-scheduler: records argv + env, exits 0. Crucially does
 # NOT touch gh / does NOT call `gh pr merge` — enforces the "no merge
-# side effect" guarantee from a behavioral angle.
+# side effect" guarantee from a behavioral angle. Also records
+# READY_SCHEDULER_REPO so the Codex P1 target-repo test can verify
+# propagation.
 cat > "$SBX/daemon/scripts/ready-scheduler.sh" <<STUB
 #!/usr/bin/env bash
-echo "[ready-scheduler-stub] called: argv=\$* AFD_LOG=\${AFD_LOG:-unset} READY_SCHEDULER_DISABLED=\${READY_SCHEDULER_DISABLED:-unset}" >> "$CALLS_LOG"
+echo "[ready-scheduler-stub] called: argv=\$* AFD_LOG=\${AFD_LOG:-unset} READY_SCHEDULER_DISABLED=\${READY_SCHEDULER_DISABLED:-unset} READY_SCHEDULER_REPO=\${READY_SCHEDULER_REPO:-unset}" >> "$CALLS_LOG"
 exit 0
 STUB
 chmod +x "$SBX/daemon/scripts/ready-scheduler.sh"
@@ -188,6 +190,31 @@ assert_grep "factory-af-tick.sh contains ready-scheduler call site" \
   'ready-scheduler\.sh' "$AF_TICK"
 assert_grep "factory-af-tick.sh honors READY_SCHEDULER_DISABLED" \
   'READY_SCHEDULER_DISABLED' "$AF_TICK"
+
+# ------------------------------------------------------------------
+# Codex P1 thread PRRT_kwDOSjv_9s6O0bY3: the scheduler MUST resolve the
+# target repo from config/daemon.toml (or an env var), NOT from
+# `gh repo view` against the local checkout — otherwise the autonomous
+# tick would scan dark-factory PRs and never the configured target
+# (jleechanorg/worldarchitect.ai). Verify the precedence order.
+# ------------------------------------------------------------------
+assert_grep "ready-scheduler.sh reads target_repo from config/daemon.toml" \
+  'config/daemon\.toml' "$READY_SCHEDULER_REAL"
+assert_grep "ready-scheduler.sh honors READY_SCHEDULER_REPO env override" \
+  'READY_SCHEDULER_REPO' "$READY_SCHEDULER_REAL"
+assert_grep "factory-af-tick.sh propagates READY_SCHEDULER_REPO" \
+  'READY_SCHEDULER_REPO' "$AF_TICK"
+
+# Behavioral proof: in the sandbox, set READY_SCHEDULER_REPO to a custom
+# value and verify the scheduler receives it. We can't observe `gh pr list`
+# output directly because the gh shim stubs to `[]`, but we can confirm
+# the env var made it through to the stub via the calls log.
+: > "$CALLS_LOG"
+READY_SCHEDULER_DISABLED=0 READY_SCHEDULER_REPO="jleechanorg/test-target" \
+  bash "$SBX/daemon/factory-af-tick.sh" --prs "" \
+  >"$SCRATCH_DIR/run_repo.out" 2>"$SCRATCH_DIR/run_repo.err" || true
+assert_grep "ready-scheduler.sh received READY_SCHEDULER_REPO env" \
+  'READY_SCHEDULER_REPO=jleechanorg/test-target' "$CALLS_LOG"
 
 # ------------------------------------------------------------------
 # Operator constraint enforcement (no merge side effect): the test stub

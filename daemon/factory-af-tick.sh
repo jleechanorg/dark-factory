@@ -139,7 +139,14 @@ callpath run dark-factory ${1+"$@"} 2>/dev/null || true
 # ---------------------------------------------------------------------------
 if [ -x "$G" ] && [ "$READY_SCHEDULER_DISABLED" != "1" ]; then
   echo "[af] ready scheduling step: ready-scheduler.sh (AFD_LOG=$LOG)"
-  AFD_LOG="$LOG" bash "$G" 2>&1 || echo "[af] ready-scheduler.sh exited non-zero (continuing)"
+  # Resolve the configured target repo and pass it explicitly so the
+  # scheduler scans the right PRs (Codex P1 thread PRRT_kwDOSjv_9s6O0bY3).
+  # Falls back to config/daemon.toml target_repo inside ready-scheduler.sh.
+  TARGET_REPO="${READY_SCHEDULER_REPO:-}"
+  if [ -z "$TARGET_REPO" ] && [ -f "$ROOT/config/daemon.toml" ]; then
+    TARGET_REPO="$(awk -F'"' '/^target_repo[[:space:]]*=/ {print $2; exit}' "$ROOT/config/daemon.toml" 2>/dev/null || true)"
+  fi
+  AFD_LOG="$LOG" READY_SCHEDULER_REPO="$TARGET_REPO" bash "$G" 2>&1 || echo "[af] ready-scheduler.sh exited non-zero (continuing)"
 else
   echo "[af] ready scheduling step: SKIPPED (READY_SCHEDULER_DISABLED=$READY_SCHEDULER_DISABLED scheduler_present=$([ -x "$G" ] && echo 1 || echo 0))"
 fi

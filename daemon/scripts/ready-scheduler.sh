@@ -37,7 +37,32 @@
 # Usage: daemon/scripts/ready-scheduler.sh
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
-REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo jleechanorg/dark-factory)"
+
+# Resolve the target repository. Resolution order (highest priority first):
+#   1. READY_SCHEDULER_REPO env var — explicit override from the daemon tick.
+#   2. config/daemon.toml `target_repo` — the daemon's configured target
+#      (default: jleechanorg/worldarchitect.ai). The factory-af-tick caller
+#      does not pass READY_SCHEDULER_REPO in the autonomous path, so the
+#      scheduler MUST read this config file rather than guessing from
+#      `gh repo view` (which would resolve to whatever the local checkout
+#      is — usually jleechanorg/dark-factory, NOT the target repo).
+#   3. gh repo view — only as a last resort, for ad-hoc local invocations
+#      where the operator has cd'd into the target repo.
+# Rationale (Codex review P1 on PR #179, reviewThread PRRT_kwDOSjv_9s6O0bY3):
+# when the factory tick runs in the dark-factory checkout and scans PRs,
+# resolving REPO from the local git remote lists dark-factory's factory/*
+# branches — never the target's. Without this precedence the scheduler
+# would silently pass on every target-repo PR and only ever fire on
+# dark-factory PRs (an unrelated log).
+REPO=""
+if [ -n "${READY_SCHEDULER_REPO:-}" ]; then
+  REPO="$READY_SCHEDULER_REPO"
+elif [ -f "config/daemon.toml" ]; then
+  REPO="$(awk -F'"' '/^target_repo[[:space:]]*=/ {print $2; exit}' "config/daemon.toml" 2>/dev/null || true)"
+fi
+if [ -z "$REPO" ]; then
+  REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo jleechanorg/dark-factory)"
+fi
 LOG="${AFD_LOG:-$HOME/Library/Logs/dark-factory/daemon.jsonl}"
 H="daemon/factory-overlay.sh"
 
