@@ -90,6 +90,17 @@ pub struct Issue {
     pub external_ref: String, // "<owner>/<repo>#<issue_number>"
 }
 
+/// An open GitHub pull request labeled for the factory intake sweep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabeledPr {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub author_login: String,
+    pub external_ref: String, // "<owner>/<repo>#<pr_number>"
+    pub head_ref_name: String,
+}
+
 /// Collaborator permission tier, coarsened to the write-tier gate (spec §4.2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
@@ -198,6 +209,7 @@ pub trait Tracker {
 /// TTL caches for repeated tick reads; a durable ETag cache is not wired yet.
 pub trait Scm {
     fn labeled_issues(&self, label: &str) -> Result<Vec<Issue>, DaemonError>;
+    fn labeled_prs(&self, label: &str) -> Result<Vec<LabeledPr>, DaemonError>;
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError>;
     fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError>;
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError>;

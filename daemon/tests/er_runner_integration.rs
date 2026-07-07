@@ -66,6 +66,13 @@ impl Scm for ScmMock {
             .push(format!("labeled_issues({label})"));
         Ok(self.issues.clone())
     }
+    fn labeled_prs(
+        &self,
+        label: &str,
+    ) -> Result<Vec<daemon::tools::LabeledPr>, daemon::errors::DaemonError> {
+        self.calls.borrow_mut().push(format!("labeled_prs({label})"));
+        Ok(Vec::new())
+    }
     fn collaborator_permission(
         &self,
         login: &str,

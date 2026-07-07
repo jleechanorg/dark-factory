@@ -10,7 +10,8 @@
 use daemon::errors::DaemonError;
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tools::{
-    Bead, Issue, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs,
+    Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec,
+    Tracker, Vcs,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -111,6 +112,7 @@ impl Tracker for FakeTracker {
 #[derive(Default)]
 pub struct FakeScm {
     pub issues: Vec<Issue>,
+    pub prs: Vec<LabeledPr>,
     pub permissions: HashMap<String, Permission>,
     pub pr_snapshots: HashMap<u64, PrSnapshot>,
     pub remote_branches: HashMap<String, Option<u64>>,
@@ -129,6 +131,13 @@ impl Scm for FakeScm {
             .borrow_mut()
             .push(format!("labeled_issues({label})"));
         Ok(self.issues.clone())
+    }
+
+    fn labeled_prs(&self, label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("labeled_prs({label})"));
+        Ok(self.prs.clone())
     }
 
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError> {

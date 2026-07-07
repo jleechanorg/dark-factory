@@ -469,7 +469,7 @@ pub fn assess(
 mod tests {
     use super::*;
     use crate::errors::DaemonError;
-    use crate::tools::{Issue, Permission, PrSnapshot};
+    use crate::tools::{Issue, LabeledPr, Permission, PrSnapshot};
     use std::cell::RefCell;
     use std::collections::HashMap;
 
@@ -486,6 +486,10 @@ mod tests {
 
     impl Scm for FakeScm {
         fn labeled_issues(&self, _label: &str) -> Result<Vec<Issue>, DaemonError> {
+            Ok(Vec::new())
+        }
+
+        fn labeled_prs(&self, _label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
             Ok(Vec::new())
         }
 

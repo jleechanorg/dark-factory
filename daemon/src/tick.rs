@@ -356,7 +356,19 @@ pub fn run_tick(
                                 let session_id = SessionId(session_id_str.clone());
                                 deps.sessions.is_quiescent(&session_id)?
                             } else {
-                                true
+                                emit(
+                                    deps.telemetry_log,
+                                    &overlay.bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Attested.as_str(),
+                                    "EXISTING_PR_WAITING",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "reason": "no_worker_session",
+                                        "pr_number": pr_number,
+                                    }),
+                                )?;
+                                false
                             };
 
                         if is_stalled_or_dead {
@@ -546,6 +558,52 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // so freshly-QUEUED beads aren't immediately re-parked by wedge
     // detection). The freshly-recovered QUEUED beads are picked up by the
     // routing_candidates loop below, so they get dispatched this same tick.
+    for adopted in intake::normalize_labeled_prs(deps.scm, deps.tracker, deps.cfg)? {
+        if adopted.newly_created {
+            summary.beads_created += 1;
+        }
+        deps.store
+            .register_branch(&adopted.bead_id, &adopted.head_ref_name)?;
+
+        let existing = deps.store.load(&adopted.bead_id)?;
+        let attempt = existing.as_ref().map(|o| o.attempt).unwrap_or(1);
+        let should_adopt = !matches!(
+            existing.as_ref().map(|o| o.state),
+            Some(OverlayState::Ready) | Some(OverlayState::HumanHeld)
+        );
+        if should_adopt {
+            let mut overlay = existing.unwrap_or(BeadOverlay {
+                bead_id: adopted.bead_id.clone(),
+                state: OverlayState::Attested,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: Some(adopted.pr_number),
+                branch: Some(adopted.head_ref_name.clone()),
+                session_id: None,
+            });
+            overlay.state = OverlayState::Attested;
+            overlay.pr_number = Some(adopted.pr_number);
+            overlay.branch = Some(adopted.head_ref_name.clone());
+            deps.store.save(&overlay)?;
+        }
+        emit(
+            deps.telemetry_log,
+            &adopted.bead_id,
+            attempt,
+            OverlayState::Attested.as_str(),
+            "EXISTING_PR_ADOPTED",
+            serde_json::json!({}),
+            serde_json::json!({
+                "pr_number": adopted.pr_number,
+                "branch": adopted.head_ref_name,
+                "external_ref": adopted.external_ref,
+                "newly_created": adopted.newly_created,
+            }),
+        )?;
+    }
+
     let created = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
     let tracker_candidates = deps.tracker.fetch_candidates()?;
     let mut routing_candidates: Vec<Bead> = Vec::new();

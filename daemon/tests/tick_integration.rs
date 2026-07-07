@@ -28,7 +28,7 @@ use daemon::er_runner;
 use daemon::errors::DaemonError;
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
-use daemon::tools::{Bead, Issue, Llm, Permission, PrComment, PrSnapshot, Scm};
+use daemon::tools::{Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrSnapshot, Scm};
 use daemon::verifier::SkepticVerdict;
 
 fn test_cfg() -> Config {
@@ -1165,6 +1165,220 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
     assert!(
         !logs.contains("COMMITS_OBSERVED_AFTER_STALL"),
         "must NOT emit COMMITS_OBSERVED_AFTER_STALL for diverged branches: {logs}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn factory_labeled_existing_pr_is_adopted_and_verified_without_spawn() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 701,
+        title: "Existing factory PR".into(),
+        body: "already has a branch".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#701".into(),
+        head_ref_name: "feature/already-open-pr".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    scm.pr_snapshots.insert(
+        701,
+        qdw_green_snapshot(
+            701,
+            vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+            }],
+        ),
+    );
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_existing_pr_adoption.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("factory-labeled PR should be adopted and verified");
+
+    assert_eq!(summary.beads_created, 1);
+    assert_eq!(summary.beads_dispatched, 0);
+    assert_eq!(summary.gates_assessed, 1);
+    assert_eq!(summary.beads_ready, 1);
+
+    let overlay = store.load("fake-bead-1").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::Ready);
+    assert_eq!(overlay.pr_number, Some(701));
+    assert_eq!(overlay.branch.as_deref(), Some("feature/already-open-pr"));
+    assert_eq!(
+        store.bead_id_for_branch("feature/already-open-pr").unwrap(),
+        Some("fake-bead-1".into())
+    );
+
+    let session_calls = sessions.calls.borrow();
+    assert!(
+        !session_calls.iter().any(|call| call.starts_with("spawn(")),
+        "existing PR adoption must not spawn a new session; calls: {session_calls:?}"
+    );
+    assert!(
+        !session_calls.iter().any(|call| call.starts_with("attach(")),
+        "existing PR adoption must not attach a remediation session during initial verification; calls: {session_calls:?}"
+    );
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("EXISTING_PR_ADOPTED") && telemetry.contains("READY_FOR_MERGE"),
+        "expected adoption and ready events, got:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn factory_labeled_existing_pr_second_tick_reuses_tracking_bead_without_spawn() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 702,
+        title: "Existing factory PR".into(),
+        body: "already has a branch".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#702".into(),
+        head_ref_name: "feature/already-open-pr-702".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    scm.pr_snapshots.insert(
+        702,
+        qdw_green_snapshot(
+            702,
+            vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+            }],
+        ),
+    );
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_existing_pr_adoption_idempotent.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let first = run_tick(&deps, 0, 0).expect("first tick adopts PR");
+    let second = run_tick(&deps, 1, 0).expect("second tick reuses adoption");
+
+    assert_eq!(first.beads_created, 1);
+    assert_eq!(second.beads_created, 0);
+    assert_eq!(second.beads_dispatched, 0);
+    assert_eq!(
+        store.bead_id_for_branch("feature/already-open-pr-702").unwrap(),
+        Some("fake-bead-1".into())
+    );
+    let create_calls: Vec<_> = tracker
+        .calls
+        .borrow()
+        .iter()
+        .filter(|call| call.starts_with("create_bead("))
+        .cloned()
+        .collect();
+    assert_eq!(
+        create_calls.len(),
+        1,
+        "second tick must not duplicate the tracking bead: {create_calls:?}"
+    );
+    let session_calls = sessions.calls.borrow();
+    assert!(
+        !session_calls.iter().any(|call| call.starts_with("spawn(")),
+        "repeated adoption must not spawn a session; calls: {session_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn factory_labeled_existing_pr_without_session_is_not_parked_as_stalled() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 703,
+        title: "Existing factory PR waiting on review".into(),
+        body: "already has a branch".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#703".into(),
+        head_ref_name: "feature/already-open-pr-703".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    let mut stale_unknown = qdw_green_snapshot(703, Vec::new());
+    stale_unknown.updated_at_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(1900);
+    scm.pr_snapshots.insert(703, stale_unknown);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_existing_pr_no_session_waiting.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    run_tick(&deps, 0, 0).expect("first tick adopts PR");
+    run_tick(&deps, 1, 1).expect("second tick must not false-park no-session PR");
+
+    let overlay = store.load("fake-bead-1").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::Attested);
+    assert_eq!(overlay.session_id, None);
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("EXISTING_PR_WAITING"),
+        "expected no-session waiting telemetry, got:\n{telemetry}"
+    );
+    assert!(
+        !telemetry.contains("\"reason\":\"session_stalled\""),
+        "existing PR without session must not be parked as session_stalled:\n{telemetry}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -2888,6 +3102,10 @@ impl Scm for QdwPostErRefetchScm {
         Ok(Vec::new())
     }
 
+    fn labeled_prs(&self, _label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
+        Ok(Vec::new())
+    }
+
     fn collaborator_permission(&self, _login: &str) -> Result<Permission, DaemonError> {
         Ok(Permission::None)
     }
@@ -2944,6 +3162,10 @@ impl QdwAssessRefetchScm {
 
 impl Scm for QdwAssessRefetchScm {
     fn labeled_issues(&self, _label: &str) -> Result<Vec<Issue>, DaemonError> {
+        Ok(Vec::new())
+    }
+
+    fn labeled_prs(&self, _label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
         Ok(Vec::new())
     }
 
