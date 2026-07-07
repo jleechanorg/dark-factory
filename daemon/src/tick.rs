@@ -68,22 +68,43 @@ pub struct TickSummary {
 /// review — the daemon stops blindly retrying past this point.
 const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
 
-/// Look up whether the PR attached to this `ATTESTED` overlay has CI in
-/// flight (`ci_pending=true`). Returns `false` for non-ATTESTED overlays
-/// and for ATTESTED overlays with no PR yet (treated as "not pending" so
-/// the wedge/timebox logic still runs). SCM errors are logged-and-ignored
-/// at the caller; this helper returns `false` so a transient SCM outage
-/// can't accidentally freeze the autonomy clock for healthy beads.
-fn ci_pending_for_attested(overlay: &BeadOverlay, scm: &dyn crate::tools::Scm) -> bool {
+/// Result of looking up CI-pending state for an active overlay (used by the
+/// autonomy/timebox bookkeeping in `run_tick`'s active-overlay loop).
+///
+/// `NotApplicable` covers non-`Attested` overlays and `Attested` overlays
+/// without a PR yet — the caller proceeds with normal timebox + wedge work
+/// for those (the autonomy clock must keep ticking regardless of which
+/// state the bead is in, except for `Attested + PR exists + ci_pending=true`
+/// where CI wall-clock would falsely count against the coder's budget).
+///
+/// `Known(ci_pending)` is the normal path: snapshot fetched, value known.
+///
+/// `SnapshotUnavailable` (jleechan-qdw) is the new third state — a
+/// transient `gh`/GraphQL/network hiccup on `pr_snapshot`. The caller MUST
+/// skip this overlay's timebox bump, timebox-park, and wedge-check for
+/// this tick (continue to the next overlay) and emit
+/// `BEAD_SNAPSHOT_TRANSIENT_ERROR` with `phase: "ci_pending"` /
+/// `"active_overlay"`. Leaving the bead `Attested` is deliberate: the
+/// next tick retries the snapshot fetch. The previous implementation
+/// collapsed `Err` to `false` here, which let the timebox-park branch
+/// false-park an `Attested` bead on a single transient snapshot error
+/// (bead 901 regression the audit caught).
+enum CiPendingStatus {
+    NotApplicable,
+    Known(bool),
+    SnapshotUnavailable,
+}
+
+fn ci_pending_for_attested(overlay: &BeadOverlay, scm: &dyn crate::tools::Scm) -> CiPendingStatus {
     if overlay.state != OverlayState::Attested {
-        return false;
+        return CiPendingStatus::NotApplicable;
     }
     match overlay.pr_number {
+        None => CiPendingStatus::NotApplicable,
         Some(pr) => match scm.pr_snapshot(pr) {
-            Ok(snap) => snap.ci_pending,
-            Err(_) => false,
+            Ok(snap) => CiPendingStatus::Known(snap.ci_pending),
+            Err(_) => CiPendingStatus::SnapshotUnavailable,
         },
-        None => false,
     }
 }
 
@@ -149,7 +170,11 @@ fn emit(
 ///
 /// Stage gate: `deps.cfg.stage` must be `1` — this function only implements
 /// the Stage-1 substitution rule (re-roll verdicts recorded, never executed).
-pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<TickSummary, DaemonError> {
+pub fn run_tick(
+    deps: &TickDeps,
+    tick_index: u64,
+    elapsed_secs: u64,
+) -> Result<TickSummary, DaemonError> {
     if deps.cfg.stage != 1 && deps.cfg.stage != 2 {
         return Err(DaemonError::Config(format!(
             "run_tick only implements stage 1 or 2; got stage={}",
@@ -181,10 +206,39 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
     // operator/CI wall-clock, not coder session time we are budgeting against).
     let active_overlays = deps.store.list_active_overlays()?;
     for mut overlay in active_overlays {
-        let ci_pending = ci_pending_for_attested(&overlay, deps.scm);
-        if !ci_pending && elapsed_secs > 0 {
-            overlay.autonomy_secs += elapsed_secs;
-            deps.store.bump_autonomy_secs(&overlay.bead_id, elapsed_secs)?;
+        // jleechan-qdw: per-overlay isolation. A snapshot fetch error in the
+        // ci_pending lookup must not bump the autonomy clock AND must not
+        // run the timebox-park / wedge-check branches for this overlay —
+        // any of those would risk false-parking a near-timebox bead on a
+        // single transient `gh`/GraphQL/network hiccup. Skip this overlay
+        // for the rest of the active-overlay loop and continue to the next.
+        match ci_pending_for_attested(&overlay, deps.scm) {
+            CiPendingStatus::SnapshotUnavailable => {
+                let _ = emit(
+                    deps.telemetry_log,
+                    &overlay.bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "BEAD_SNAPSHOT_TRANSIENT_ERROR",
+                    serde_json::json!({}),
+                    serde_json::json!({"phase": "ci_pending", "skip": "active_overlay"}),
+                );
+                continue;
+            }
+            CiPendingStatus::NotApplicable => {
+                if elapsed_secs > 0 {
+                    overlay.autonomy_secs += elapsed_secs;
+                    deps.store
+                        .bump_autonomy_secs(&overlay.bead_id, elapsed_secs)?;
+                }
+            }
+            CiPendingStatus::Known(ci_pending) => {
+                if !ci_pending && elapsed_secs > 0 {
+                    overlay.autonomy_secs += elapsed_secs;
+                    deps.store
+                        .bump_autonomy_secs(&overlay.bead_id, elapsed_secs)?;
+                }
+            }
         }
         // 1. Time-box envelope check
         if overlay.autonomy_secs >= deps.cfg.autonomy_timebox_secs {
@@ -253,7 +307,8 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                                 serde_json::json!({"reason": "coder_silent"}),
                             )?;
                             let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): coder silent/inactive on branch for 30 minutes.".to_string();
-                            let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
+                            let _ =
+                                post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
                             summary.beads_parked_human_held += 1;
                         }
                     }
@@ -261,19 +316,43 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
             }
             OverlayState::Attested => {
                 if let Some(pr_number) = overlay.pr_number {
-                    let pr_snapshot = deps.scm.pr_snapshot(pr_number)?;
+                    // jleechan-qdw: per-bead isolation. A transient
+                    // `gh`/GraphQL/network hiccup fetching THIS overlay's
+                    // PR snapshot must not abort the entire tick — one
+                    // bead's tool failure cannot wedge the wedge-detection
+                    // loop and freeze every other active overlay. Log the
+                    // error and skip to the next overlay; the wedge check
+                    // re-runs on the next tick when the snapshot succeeds.
+                    let pr_snapshot = match deps.scm.pr_snapshot(pr_number) {
+                        Ok(snap) => snap,
+                        Err(e) => {
+                            let _ = emit(
+                                deps.telemetry_log,
+                                &overlay.bead_id,
+                                overlay.attempt,
+                                OverlayState::Attested.as_str(),
+                                "BEAD_SNAPSHOT_TRANSIENT_ERROR",
+                                serde_json::json!({}),
+                                serde_json::json!({"error": format!("{e:?}"), "phase": "wedge_detection"}),
+                            );
+                            continue;
+                        }
+                    };
                     let now_epoch = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
 
-                    if now_epoch.saturating_sub(pr_snapshot.updated_at_epoch) >= 1800 && !pr_snapshot.ci_pending {
-                        let is_stalled_or_dead = if let Some(ref session_id_str) = overlay.session_id {
-                            let session_id = SessionId(session_id_str.clone());
-                            deps.sessions.is_quiescent(&session_id)?
-                        } else {
-                            true
-                        };
+                    if now_epoch.saturating_sub(pr_snapshot.updated_at_epoch) >= 1800
+                        && !pr_snapshot.ci_pending
+                    {
+                        let is_stalled_or_dead =
+                            if let Some(ref session_id_str) = overlay.session_id {
+                                let session_id = SessionId(session_id_str.clone());
+                                deps.sessions.is_quiescent(&session_id)?
+                            } else {
+                                true
+                            };
 
                         if is_stalled_or_dead {
                             // Bead `jleechan-ubas`: do NOT park a stalled
@@ -297,9 +376,8 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                             // assessment against the live PR state.
                             let mut commits_observed_after_exit = false;
                             if let Some(ref branch) = overlay.branch {
-                                if let Ok(ahead) = deps
-                                    .vcs
-                                    .is_remote_ahead(branch, &pr_snapshot.head_sha)
+                                if let Ok(ahead) =
+                                    deps.vcs.is_remote_ahead(branch, &pr_snapshot.head_sha)
                                 {
                                     if ahead {
                                         commits_observed_after_exit = true;
@@ -339,7 +417,8 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                                 serde_json::json!({"reason": "session_stalled"}),
                             )?;
                             let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): session stalled or quiescent on open PR.".to_string();
-                            let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
+                            let _ =
+                                post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
                             summary.beads_parked_human_held += 1;
                         }
                     }
@@ -436,7 +515,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                         "number",
                                     ],
                                     10,
-                                ).is_ok() {
+                                )
+                                .is_ok()
+                                {
                                     pr_number = Some(num);
                                 }
                             }
@@ -566,7 +647,10 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({}),
                     serde_json::json!({"reason": reason}),
                 )?;
-                let comment_body = format!("🤖 **[dark-factory]** Router parse error (human held): {}", reason);
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Router parse error (human held): {}",
+                    reason
+                );
                 if let Some(ref ext_ref) = bead.external_ref {
                     let _ = deps.tracker.comment_external(ext_ref, &comment_body);
                 }
@@ -646,7 +730,11 @@ fn skeptic_evidence(deps: &TickDeps, bead_id: &str, pr: u64) -> Result<PrEvidenc
 
     let prompt_clone1 = prompt.clone();
     let handle1 = std::thread::spawn(move || {
-        crate::tools::run_tool("codex", &["exec", "--yolo", "--skip-git-repo-check", &prompt_clone1], 120)
+        crate::tools::run_tool(
+            "codex",
+            &["exec", "--yolo", "--skip-git-repo-check", &prompt_clone1],
+            120,
+        )
     });
 
     let prompt_clone2 = prompt.clone();
@@ -658,11 +746,29 @@ fn skeptic_evidence(deps: &TickDeps, bead_id: &str, pr: u64) -> Result<PrEvidenc
         } else {
             "claude".to_string()
         };
-        crate::tools::run_tool(&claude_bin, &["--print", "--dangerously-skip-permissions", "--setting-sources", "", &prompt_clone2], 120)
+        crate::tools::run_tool(
+            &claude_bin,
+            &[
+                "--print",
+                "--dangerously-skip-permissions",
+                "--setting-sources",
+                "",
+                &prompt_clone2,
+            ],
+            120,
+        )
     });
 
-    let res1 = handle1.join().unwrap_or(Err(DaemonError::Tool { tool: "thread".into(), rc: -1, stderr: "join failed".into() }));
-    let res2 = handle2.join().unwrap_or(Err(DaemonError::Tool { tool: "thread".into(), rc: -1, stderr: "join failed".into() }));
+    let res1 = handle1.join().unwrap_or(Err(DaemonError::Tool {
+        tool: "thread".into(),
+        rc: -1,
+        stderr: "join failed".into(),
+    }));
+    let res2 = handle2.join().unwrap_or(Err(DaemonError::Tool {
+        tool: "thread".into(),
+        rc: -1,
+        stderr: "join failed".into(),
+    }));
 
     let v1 = match &res1 {
         Ok(reply) => verifier::parse_skeptic_verdict(reply),
@@ -674,18 +780,7 @@ fn skeptic_evidence(deps: &TickDeps, bead_id: &str, pr: u64) -> Result<PrEvidenc
         Err(_) => None,
     };
 
-    let skeptic_verdict = match (v1, v2) {
-        (Some(verifier::SkepticVerdict::Fail(r1)), Some(verifier::SkepticVerdict::Fail(r2))) => Some(verifier::SkepticVerdict::Fail(format!("{r1} && {r2}"))),
-        (Some(verifier::SkepticVerdict::Fail(r)), _) => Some(verifier::SkepticVerdict::Fail(r)),
-        (_, Some(verifier::SkepticVerdict::Fail(r))) => Some(verifier::SkepticVerdict::Fail(r)),
-        (Some(verifier::SkepticVerdict::Warn(w1)), Some(verifier::SkepticVerdict::Warn(w2))) => Some(verifier::SkepticVerdict::Warn(format!("{w1} && {w2}"))),
-        (Some(verifier::SkepticVerdict::Warn(w)), _) => Some(verifier::SkepticVerdict::Warn(w)),
-        (_, Some(verifier::SkepticVerdict::Warn(w))) => Some(verifier::SkepticVerdict::Warn(w)),
-        (Some(verifier::SkepticVerdict::Pass), Some(verifier::SkepticVerdict::Pass)) => Some(verifier::SkepticVerdict::Pass),
-        (Some(verifier::SkepticVerdict::Pass), None) => Some(verifier::SkepticVerdict::Pass),
-        (None, Some(verifier::SkepticVerdict::Pass)) => Some(verifier::SkepticVerdict::Pass),
-        _ => None,
-    };
+    let skeptic_verdict = combine_dual_verdict(v1, v2, bead_id, pr)?;
 
     Ok(PrEvidence {
         is_production: false,
@@ -694,6 +789,58 @@ fn skeptic_evidence(deps: &TickDeps, bead_id: &str, pr: u64) -> Result<PrEvidenc
         er_verdict: verifier::ErVerdict::Absent,
         skeptic_verdict,
     })
+}
+
+/// Combine two reviewer verdicts (one per subprocess) into a single
+/// `SkepticVerdict` for gate 7.
+///
+/// Single-pass success is preserved: if EITHER reviewer returns a usable
+/// verdict (`Fail`/`Warn`/`Pass`), that verdict wins (Fail beats Warn
+/// beats Pass in priority, and either side overrides `None`).
+///
+/// jleechan-qdw: when BOTH reviewers failed (tool errored OR reply was
+/// unparseable, i.e. `v1 == None && v2 == None`) the previous code
+/// returned `Ok(None)` — gate 7 became `Unknown`, `all_green` became
+/// `false`, and Stage-1's substitution rule parked the bead
+/// `HUMAN_HELD`. That is a false-park on a reviewer-tool outage (the
+/// bead is not known-bad; it is unjudged). Return `Err` instead so
+/// `run_fast_tier`'s per-bead catch-and-continue fires (phase =
+/// `skeptic_evidence`), the bead stays ATTESTED, and the next tick
+/// retries the reviewer call.
+pub fn combine_dual_verdict(
+    v1: Option<verifier::SkepticVerdict>,
+    v2: Option<verifier::SkepticVerdict>,
+    bead_id: &str,
+    pr: u64,
+) -> Result<Option<verifier::SkepticVerdict>, DaemonError> {
+    let combined = match (v1, v2) {
+        (Some(verifier::SkepticVerdict::Fail(r1)), Some(verifier::SkepticVerdict::Fail(r2))) => {
+            Some(verifier::SkepticVerdict::Fail(format!("{r1} && {r2}")))
+        }
+        (Some(verifier::SkepticVerdict::Fail(r)), _) => Some(verifier::SkepticVerdict::Fail(r)),
+        (_, Some(verifier::SkepticVerdict::Fail(r))) => Some(verifier::SkepticVerdict::Fail(r)),
+        (Some(verifier::SkepticVerdict::Warn(w1)), Some(verifier::SkepticVerdict::Warn(w2))) => {
+            Some(verifier::SkepticVerdict::Warn(format!("{w1} && {w2}")))
+        }
+        (Some(verifier::SkepticVerdict::Warn(w)), _) => Some(verifier::SkepticVerdict::Warn(w)),
+        (_, Some(verifier::SkepticVerdict::Warn(w))) => Some(verifier::SkepticVerdict::Warn(w)),
+        (Some(verifier::SkepticVerdict::Pass), Some(verifier::SkepticVerdict::Pass)) => {
+            Some(verifier::SkepticVerdict::Pass)
+        }
+        (Some(verifier::SkepticVerdict::Pass), None) => Some(verifier::SkepticVerdict::Pass),
+        (None, Some(verifier::SkepticVerdict::Pass)) => Some(verifier::SkepticVerdict::Pass),
+        _ => None,
+    };
+    if combined.is_none() {
+        return Err(DaemonError::Tool {
+            tool: "skeptic_evidence".into(),
+            rc: 1,
+            stderr: format!(
+                "both reviewers failed to produce a parseable verdict for bead {bead_id} PR #{pr}"
+            ),
+        });
+    }
+    Ok(combined)
 }
 
 /// Fast tier: for every bead whose overlay is `ATTESTED` (or freshly promoted
@@ -780,8 +927,43 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             None => continue,
         };
 
-        let mut evidence = skeptic_evidence(deps, bead_id, pr)?;
-        let mut snapshot = deps.scm.pr_snapshot(pr)?;
+        let mut evidence = match skeptic_evidence(deps, bead_id, pr) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "BEAD_PROCESSING_TRANSIENT_ERROR",
+                    serde_json::json!({}),
+                    serde_json::json!({"phase": "skeptic_evidence", "error": format!("{e:?}")}),
+                );
+                continue;
+            }
+        };
+        // jleechan-qdw: per-bead isolation. A transient `gh`/GraphQL/network
+        // hiccup fetching THIS bead's PR snapshot must not abort the fast
+        // tier for the rest of the in-flight beads — one bead's failure
+        // cannot stop another bead in the same tick from advancing. Log the
+        // failure via telemetry and skip to the next bead; the bead stays
+        // ATTESTED so the next tick retries the snapshot fetch (no false-
+        // green, no false-park on a single transient error).
+        let mut snapshot = match deps.scm.pr_snapshot(pr) {
+            Ok(snap) => snap,
+            Err(e) => {
+                let _ = emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "BEAD_SNAPSHOT_TRANSIENT_ERROR",
+                    serde_json::json!({}),
+                    serde_json::json!({"phase": "fast_tier", "error": format!("{e:?}")}),
+                );
+                continue;
+            }
+        };
         if snapshot.ci_pending {
             emit(
                 deps.telemetry_log,
@@ -803,7 +985,21 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let runner_outcome = crate::er_runner::maybe_run(deps, bead_id, pr, now_epoch)?;
+        let runner_outcome = match crate::er_runner::maybe_run(deps, bead_id, pr, now_epoch) {
+            Ok(out) => out,
+            Err(e) => {
+                let _ = emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "BEAD_PROCESSING_TRANSIENT_ERROR",
+                    serde_json::json!({}),
+                    serde_json::json!({"phase": "er_runner", "error": format!("{e:?}")}),
+                );
+                continue;
+            }
+        };
         // When the runner just posted a verdict this tick, prefer the
         // returned verdict over a re-parse of the refreshed snapshot —
         // `parse_er_verdict` would otherwise pick up any "/er" token
@@ -827,7 +1023,27 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         "attempt": count,
                     }),
                 )?;
-                snapshot = deps.scm.pr_snapshot(pr)?;
+                // jleechan-qdw: per-bead isolation for the post-/er refetch.
+                // If the refresh fails after posting, this bead's SCM view
+                // is transiently unavailable. Emit the outage and retry on a
+                // later tick rather than falling through into `assess()`,
+                // which performs another `pr_snapshot` and would turn the
+                // outage into Unknown/all_green=false -> HUMAN_HELD.
+                match deps.scm.pr_snapshot(pr) {
+                    Ok(snap) => snapshot = snap,
+                    Err(e) => {
+                        let _ = emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Attested.as_str(),
+                            "BEAD_SNAPSHOT_TRANSIENT_ERROR",
+                            serde_json::json!({}),
+                            serde_json::json!({"phase": "post_er_refetch", "error": format!("{e:?}")}),
+                        );
+                        continue;
+                    }
+                }
             }
             crate::er_runner::Outcome::AlreadyPosted(v) => {
                 emit(
@@ -851,7 +1067,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({"count": count}),
                 )?;
             }
-            crate::er_runner::Outcome::Cooldown { elapsed_secs, count } => {
+            crate::er_runner::Outcome::Cooldown {
+                elapsed_secs,
+                count,
+            } => {
                 emit(
                     deps.telemetry_log,
                     bead_id,
@@ -871,7 +1090,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         };
         evidence.is_production = verifier::classify_production(&snapshot.files);
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
-        evidence.has_integration_evidence_marker = verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
+        evidence.has_integration_evidence_marker =
+            verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
         let report = verifier::assess(deps.scm, pr, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
         emit(
@@ -962,7 +1182,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 match crate::reroll::execute(&reroll_deps, &mut overlay) {
                     Ok(crate::reroll::RerollOutcome::Rerolled { new_branch: _ }) => {
                         // Perform recovery validation: check if spec is valid TOML
-                        let spec_path = std::path::Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", overlay.bead_id));
+                        let spec_path = std::path::Path::new(&deps.cfg.spec_dir)
+                            .join(format!("{}.toml", overlay.bead_id));
                         let validation_pass = if spec_path.exists() {
                             if let Ok(c) = std::fs::read_to_string(&spec_path) {
                                 toml::from_str::<serde_json::Value>(&c).is_ok()
@@ -1043,7 +1264,11 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
     }
 }
 
-fn post_scm_comment_by_bead_id(deps: &TickDeps, bead_id: &str, body: &str) -> Result<(), DaemonError> {
+fn post_scm_comment_by_bead_id(
+    deps: &TickDeps,
+    bead_id: &str,
+    body: &str,
+) -> Result<(), DaemonError> {
     if let Ok(Some(overlay)) = deps.store.load(bead_id) {
         if let Some(pr) = overlay.pr_number {
             let ext_ref = format!("{}#{}", deps.cfg.target_repo, pr);
@@ -1060,4 +1285,3 @@ fn post_scm_comment_by_bead_id(deps: &TickDeps, bead_id: &str, body: &str) -> Re
     }
     Ok(())
 }
-

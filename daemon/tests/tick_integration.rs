@@ -25,9 +25,11 @@ mod common;
 
 use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker, FakeVcs};
 use daemon::config::Config;
+use daemon::errors::DaemonError;
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
-use daemon::tick::{run_tick, TickDeps};
-use daemon::tools::{Issue, Permission, PrSnapshot};
+use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
+use daemon::tools::{Issue, Llm, Permission, PrComment, PrSnapshot, Scm};
+use daemon::verifier::SkepticVerdict;
 
 fn test_cfg() -> Config {
     Config {
@@ -73,10 +75,7 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
     let vcs = FakeVcs::new();
     let telemetry_dir = std::env::temp_dir().join("afd_tick_integration_test");
     std::fs::create_dir_all(&telemetry_dir).unwrap();
-    let telemetry_log = telemetry_dir.join(format!(
-        "daemon-{}.jsonl",
-        std::process::id()
-    ));
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&telemetry_log);
 
     // --- Tick 1: intake -> route SMALL_PATH -> dispatch ---
@@ -95,9 +94,18 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
         0,
     )
     .expect("tick 1 should succeed");
-    assert_eq!(summary1.beads_created, 1, "one bead should be created from the new issue");
-    assert_eq!(summary1.beads_routed, 1, "the freshly created bead should be routed");
-    assert_eq!(summary1.beads_dispatched, 1, "the routed bead should be dispatched");
+    assert_eq!(
+        summary1.beads_created, 1,
+        "one bead should be created from the new issue"
+    );
+    assert_eq!(
+        summary1.beads_routed, 1,
+        "the freshly created bead should be routed"
+    );
+    assert_eq!(
+        summary1.beads_dispatched, 1,
+        "the routed bead should be dispatched"
+    );
 
     let overlay_after_tick1 = store
         .load("fake-bead-1")
@@ -303,10 +311,14 @@ fn run_tick_rejects_non_stage_1_or_2_config() {
         telemetry_log: &telemetry_log,
     };
 
-    let err = run_tick(&deps, 0, 0).expect_err("stage != 1 must be rejected, never silently executed");
+    let err =
+        run_tick(&deps, 0, 0).expect_err("stage != 1 must be rejected, never silently executed");
     match err {
         daemon::errors::DaemonError::Config(msg) => {
-            assert!(msg.contains("stage=3"), "error should name the offending stage: {msg}");
+            assert!(
+                msg.contains("stage=3"),
+                "error should name the offending stage: {msg}"
+            );
         }
         other => panic!("expected DaemonError::Config, got {other:?}"),
     }
@@ -347,7 +359,8 @@ fn run_tick_never_calls_dispatch_when_router_parses_no_verdict() {
         telemetry_log: &telemetry_log,
     };
 
-    let summary = run_tick(&deps, 0, 0).expect("tick should succeed even on a routing parse failure");
+    let summary =
+        run_tick(&deps, 0, 0).expect("tick should succeed even on a routing parse failure");
     assert_eq!(summary.beads_created, 1);
     assert_eq!(summary.beads_routed, 0);
     assert_eq!(summary.beads_dispatched, 0);
@@ -359,7 +372,10 @@ fn run_tick_never_calls_dispatch_when_router_parses_no_verdict() {
         .iter()
         .filter(|c| c.starts_with("spawn("))
         .count();
-    assert_eq!(spawn_call_count, 0, "an unroutable bead must never be dispatched");
+    assert_eq!(
+        spawn_call_count, 0,
+        "an unroutable bead must never be dispatched"
+    );
 
     let overlay = store.load("fake-bead-1").unwrap().unwrap();
     assert_eq!(overlay.state, OverlayState::HumanHeld);
@@ -382,7 +398,8 @@ fn test_autonomy_increment_and_timebox_envelope() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    scm.remote_branches.insert("factory/bead-1-r1".into(), Some(now_epoch));
+    scm.remote_branches
+        .insert("factory/bead-1-r1".into(), Some(now_epoch));
 
     // Pre-seed a Dispatched bead with 50 minutes of autonomy
     store.overlays.borrow_mut().insert(
@@ -417,7 +434,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
 
     // Run tick with 300 seconds (5 minutes) elapsed
     let _summary = run_tick(&deps, 1, 300).expect("tick should succeed");
-    
+
     // Check autonomy_secs has incremented by 300 to 3300
     let o = store.load("bead-1").unwrap().unwrap();
     assert_eq!(o.autonomy_secs, 3300);
@@ -478,7 +495,11 @@ fn test_autonomy_budget_warning_crossing() {
     let _ = run_tick(&deps, 1, 60).unwrap();
 
     let logs = std::fs::read_to_string(&telemetry_log).unwrap();
-    assert!(logs.contains("BUDGET_WARNING"), "log must contain BUDGET_WARNING event: {}", logs);
+    assert!(
+        logs.contains("BUDGET_WARNING"),
+        "log must contain BUDGET_WARNING event: {}",
+        logs
+    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
@@ -509,7 +530,8 @@ fn test_wedge_detection_dispatched_coder_silent() {
     );
 
     // Script scm remote branch to return None (does not exist)
-    scm.remote_branches.insert("factory/bead-silent-r1".into(), None);
+    scm.remote_branches
+        .insert("factory/bead-silent-r1".into(), None);
 
     let telemetry_log = std::env::temp_dir().join("afd_test_wedge_silent.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -881,8 +903,10 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
     sessions.quiescent = true;
 
     let mut vcs = FakeVcs::new();
-    vcs.heads
-        .insert("factory/bead-local-ahead-r1".into(), "local-head-ahead".into());
+    vcs.heads.insert(
+        "factory/bead-local-ahead-r1".into(),
+        "local-head-ahead".into(),
+    );
     // remote_ahead stays at its Default (false) — i.e. local is NOT a strict
     // ancestor of the remote head, so the bypass guard must NOT fire.
 
@@ -984,8 +1008,10 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
     sessions.quiescent = true;
 
     let mut vcs = FakeVcs::new();
-    vcs.heads
-        .insert("factory/bead-diverged-r1".into(), "local-head-diverged".into());
+    vcs.heads.insert(
+        "factory/bead-diverged-r1".into(),
+        "local-head-diverged".into(),
+    );
     // remote_ahead stays at its Default (false) — diverged branches are
     // neither remote-ahead nor remote-behind, so the bypass guard must
     // NOT fire.
@@ -1047,7 +1073,7 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
     let store = FakeStateStore::new(); // empty database initially
     let cfg = test_cfg();
     let vcs = FakeVcs::new();
-    
+
     let telemetry_log = std::env::temp_dir().join("afd_manual_bead_test.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -1065,14 +1091,23 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
     // Run tick 1: should detect manual bead in tracker, see no overlay,
     // initialize QUEUED overlay, route it, and dispatch it!
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
-    
-    assert_eq!(summary.beads_created, 1, "manual bead should be auto-created/initialized in DB");
+
+    assert_eq!(
+        summary.beads_created, 1,
+        "manual bead should be auto-created/initialized in DB"
+    );
     assert_eq!(summary.beads_routed, 1, "manual bead should be routed");
-    assert_eq!(summary.beads_dispatched, 1, "manual bead should be dispatched");
+    assert_eq!(
+        summary.beads_dispatched, 1,
+        "manual bead should be dispatched"
+    );
 
     let final_overlay = store.load("manual-bead-123").unwrap().unwrap();
     assert_eq!(final_overlay.state, OverlayState::Dispatched);
-    assert_eq!(final_overlay.branch.as_deref(), Some("factory/manual-bead-123-r1"));
+    assert_eq!(
+        final_overlay.branch.as_deref(),
+        Some("factory/manual-bead-123-r1")
+    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
@@ -1103,7 +1138,10 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             session_id: None,
         },
     );
-    store.branches.borrow_mut().push("fix/rewards-box-not-showing-8020-v2".into());
+    store
+        .branches
+        .borrow_mut()
+        .push("fix/rewards-box-not-showing-8020-v2".into());
     store.branch_beads.borrow_mut().insert(
         "fix/rewards-box-not-showing-8020-v2".into(),
         "drive-bead".into(),
@@ -1186,7 +1224,10 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             session_id: None,
         },
     );
-    store.branches.borrow_mut().push("fix/rewards-box-not-showing-8020-v2".into());
+    store
+        .branches
+        .borrow_mut()
+        .push("fix/rewards-box-not-showing-8020-v2".into());
     store.branch_beads.borrow_mut().insert(
         "fix/rewards-box-not-showing-8020-v2".into(),
         "drive-bead".into(),
@@ -1464,7 +1505,10 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             ci_pending: true,
         },
     );
-    store.branches.borrow_mut().push("factory/att-bead-r1".into());
+    store
+        .branches
+        .borrow_mut()
+        .push("factory/att-bead-r1".into());
     store
         .branch_beads
         .borrow_mut()
@@ -1557,7 +1601,10 @@ fn attested_ci_pending_does_not_timebox_park() {
             ci_pending: true,
         },
     );
-    store.branches.borrow_mut().push("factory/slow-ci-r1".into());
+    store
+        .branches
+        .borrow_mut()
+        .push("factory/slow-ci-r1".into());
     store
         .branch_beads
         .borrow_mut()
@@ -1744,7 +1791,10 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             ci_pending: false,
         },
     );
-    store.branches.borrow_mut().push("factory/att-active-r1".into());
+    store
+        .branches
+        .borrow_mut()
+        .push("factory/att-active-r1".into());
     store
         .branch_beads
         .borrow_mut()
@@ -1776,4 +1826,808 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// jleechan-qdw: per-bead / per-tick isolation in the fast tier. A
+// transient `gh`/GraphQL/network hiccup fetching ONE bead's PR snapshot
+// must not abort the entire tick — the next bead must still reach
+// READY. Companion regression `qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead`
+// covers the same isolation in the active-overlay / ci_pending path.
+//
+// Non-ignored: a regression here would silently let one bead's
+// transient snapshot failure block every other in-flight bead.
+#[test]
+fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
+    let store = FakeStateStore::new();
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    // Honest all-green fixture for PR 102 so it can actually reach READY:
+    //   * LLM returns "pass" so `skeptic_evidence` parses to SkepticVerdict::Pass (gate 7 Green)
+    //   * `/er PASS` comment so `parse_er_verdict` returns Pass (gate 6 Green)
+    //   * empty `files` so the non-test LOC floor is below EVIDENCE_FLOOR_LOC (Green)
+    //   * no production paths so `is_production = false` (Partial /er is allowed)
+    *llm.response.borrow_mut() = Some(Ok("pass".to_string()));
+
+    for (bead, pr) in [("qdw-bead-101", 101u64), ("qdw-bead-102", 102u64)] {
+        store
+            .save(&BeadOverlay {
+                bead_id: bead.into(),
+                state: OverlayState::Attested,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: Some(pr),
+                branch: Some(format!("factory/{bead}-r1")),
+                session_id: Some("sess-1".into()),
+            })
+            .unwrap();
+        store
+            .register_branch(bead, &format!("factory/{bead}-r1"))
+            .unwrap();
+    }
+    let fresh_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        102,
+        PrSnapshot {
+            pr_number: 102,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            head_sha: "deadbeef".into(),
+            body: String::new(),
+            comments: vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+            }],
+            files: Vec::new(),
+            // Fresh epoch so the wedge-detection check (>=30 min stale)
+            // does not park bead 102 — the qdw fix targets per-bead
+            // isolation, not the wedge heuristic.
+            updated_at_epoch: fresh_epoch,
+            ci_status: "green".into(),
+            coderabbit_status: "green".into(),
+            ci_pending: false,
+        },
+    );
+    // PR 101 deliberately has no scripted entry — `pr_snapshot(101)`
+    // returns Err and without qdw's per-bead catch, the tick aborts.
+
+    let telemetry_log =
+        std::env::temp_dir().join(format!("afd_qdw_per_bead_{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("tick must not abort when one bead's pr_snapshot errors");
+
+    // Strong assertions: bead 102 reaches READY in the same tick.
+    assert_eq!(
+        summary.gates_assessed, 1,
+        "only bead 102's gates should be assessed (bead 101's snapshot errored); got {summary:?}"
+    );
+    assert_eq!(
+        summary.beads_ready, 1,
+        "bead 102 must reach READY in the same tick as bead 101's snapshot failure; got {summary:?}"
+    );
+
+    let b102 = store.load("qdw-bead-102").unwrap().unwrap();
+    assert_eq!(
+        b102.state,
+        OverlayState::Ready,
+        "bead 102 must reach READY when its fixture is honestly all-green"
+    );
+
+    let b101 = store.load("qdw-bead-101").unwrap().unwrap();
+    assert_eq!(
+        b101.state,
+        OverlayState::Attested,
+        "bead 101 must stay ATTESTED on a single transient snapshot failure (no false-park); got {:?}",
+        b101.state
+    );
+
+    // Telemetry assertion: at least one BEAD_SNAPSHOT_TRANSIENT_ERROR event
+    // was emitted for the errored bead (qdw acceptance: per-bead catch
+    // must be observable via the telemetry stream, not silent).
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let saw_bste = telemetry
+        .lines()
+        .filter(|l| l.contains("BEAD_SNAPSHOT_TRANSIENT_ERROR"))
+        .count();
+    assert!(
+        saw_bste >= 1,
+        "expected at least one BEAD_SNAPSHOT_TRANSIENT_ERROR event for the errored bead; telemetry was:\n{telemetry}"
+    );
+    let saw_phase_fast_tier = telemetry.lines().any(|l| {
+        l.contains("BEAD_SNAPSHOT_TRANSIENT_ERROR") && l.contains("\"phase\":\"fast_tier\"")
+    });
+    assert!(
+        saw_phase_fast_tier,
+        "BEAD_SNAPSHOT_TRANSIENT_ERROR must carry phase=fast_tier for the snapshot fetch site"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// jleechan-qdw: regression for the audit-found gap. The previous
+// implementation collapsed `ci_pending_for_attested`'s `Err` to `false`,
+// which let the active-overlay timebox-park branch false-park a near-
+// timebox `Attested` bead on a single transient snapshot error.
+//
+// Two `Attested` beads are seeded:
+//   * bead 901: autonomy_secs = autonomy_timebox_secs - 1 (one second
+//     short of the timebox). PR 901 has no scripted snapshot —
+//     `pr_snapshot(901)` returns `Err`.
+//   * bead 902: healthy. PR 902 is honestly all-green.
+//
+// Invariants this test pins:
+//   1. Bead 901 stays `Attested` (NOT `HumanHeld`) even though it is
+//      one second from the timebox — a transient snapshot failure
+//      must not bump the autonomy clock AND must not trigger
+//      timebox-park / wedge-check this tick.
+//   2. Bead 902 reaches `Ready` in the same tick (per-bead isolation:
+//      one bead's snapshot error must not stop the healthy bead).
+//   3. Telemetry contains a `BEAD_SNAPSHOT_TRANSIENT_ERROR` event with
+//      `phase: "ci_pending"` for bead 901.
+#[test]
+fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
+    let store = FakeStateStore::new();
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+    *llm.response.borrow_mut() = Some(Ok("pass".to_string()));
+
+    // Bead 901: near timebox, no scripted PR snapshot (errors).
+    store
+        .save(&BeadOverlay {
+            bead_id: "qdw-near-timebox".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: cfg.autonomy_timebox_secs - 1,
+            spend_usd: 0.0,
+            pr_number: Some(901),
+            branch: Some("factory/qdw-near-timebox-r1".into()),
+            session_id: Some("sess-1".into()),
+        })
+        .unwrap();
+    store
+        .register_branch("qdw-near-timebox", "factory/qdw-near-timebox-r1")
+        .unwrap();
+
+    // Bead 902: healthy, all-green PR snapshot.
+    store
+        .save(&BeadOverlay {
+            bead_id: "qdw-healthy".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(902),
+            branch: Some("factory/qdw-healthy-r1".into()),
+            session_id: Some("sess-1".into()),
+        })
+        .unwrap();
+    store
+        .register_branch("qdw-healthy", "factory/qdw-healthy-r1")
+        .unwrap();
+
+    let fresh_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        902,
+        PrSnapshot {
+            pr_number: 902,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            head_sha: "cafebabe".into(),
+            body: String::new(),
+            comments: vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+            }],
+            files: Vec::new(),
+            updated_at_epoch: fresh_epoch,
+            ci_status: "green".into(),
+            coderabbit_status: "green".into(),
+            ci_pending: false,
+        },
+    );
+
+    let telemetry_log =
+        std::env::temp_dir().join(format!("afd_qdw_ci_pending_{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        // elapsed_secs=1 (non-zero) so the pre-fix `Err=>false` path
+        // would have bumped autonomy_secs to timebox and parked the
+        // bead this very tick — proving the regression existed. With
+        // the qdw `SnapshotUnavailable` branch in place, the bump is
+        // skipped and autonomy_secs stays exactly timebox - 1.
+        0,
+        1,
+    )
+    .expect("tick must not abort when one overlay's ci_pending snapshot errors");
+
+    // Invariant 1: bead 901 was NOT false-parked (must stay Attested)
+    // AND its autonomy_secs must stay exactly timebox - 1 (the bump
+    // path is gated by `ci_pending_for_attested` returning
+    // `SnapshotUnavailable`, which now short-circuits to `continue`
+    // before the elapsed_secs bump runs).
+    let b901 = store.load("qdw-near-timebox").unwrap().unwrap();
+    assert_eq!(
+        b901.autonomy_secs,
+        cfg.autonomy_timebox_secs - 1,
+        "near-timebox bead's autonomy_secs must stay exactly timebox - 1 (no bump on snapshot-unavailable); got {}",
+        b901.autonomy_secs
+    );
+    assert_eq!(
+        b901.state,
+        OverlayState::Attested,
+        "near-timebox bead must NOT be false-parked on a transient snapshot error; got {:?}",
+        b901.state
+    );
+
+    // Invariant 2: bead 902 reached Ready (per-bead isolation holds in
+    // the fast tier too).
+    let b902 = store.load("qdw-healthy").unwrap().unwrap();
+    assert_eq!(
+        b902.state,
+        OverlayState::Ready,
+        "healthy bead must still reach Ready in the same tick as the snapshot-failing bead; got {:?}",
+        b902.state
+    );
+    assert!(
+        summary.beads_ready >= 1,
+        "summary must report at least one bead reaching Ready despite the other bead's snapshot error; got {summary:?}"
+    );
+
+    // Invariant 3: telemetry records the ci_pending-phase transient error
+    // for bead 901 with the expected phase discriminator.
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let saw_ci_pending_phase = telemetry.lines().any(|l| {
+        l.contains("BEAD_SNAPSHOT_TRANSIENT_ERROR")
+            && l.contains("\"beadId\":\"qdw-near-timebox\"")
+            && l.contains("\"phase\":\"ci_pending\"")
+    });
+    assert!(
+        saw_ci_pending_phase,
+        "expected BEAD_SNAPSHOT_TRANSIENT_ERROR with phase=ci_pending for bead 901; telemetry was:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+struct QdwSequenceLlm {
+    replies: std::cell::RefCell<Vec<String>>,
+}
+
+impl QdwSequenceLlm {
+    fn new(replies: Vec<&str>) -> Self {
+        Self {
+            replies: std::cell::RefCell::new(
+                replies.into_iter().map(|reply| reply.to_string()).collect(),
+            ),
+        }
+    }
+}
+
+impl Llm for QdwSequenceLlm {
+    fn judge(&self, _prompt: &str) -> Result<String, DaemonError> {
+        let mut replies = self.replies.borrow_mut();
+        if replies.is_empty() {
+            return Err(DaemonError::Tool {
+                tool: "llm".into(),
+                rc: 1,
+                stderr: "no scripted QDW LLM reply".into(),
+            });
+        }
+        Ok(replies.remove(0))
+    }
+}
+
+struct QdwPostErRefetchScm {
+    target_pr: u64,
+    target_snapshot: PrSnapshot,
+    healthy_pr: u64,
+    healthy_snapshot: PrSnapshot,
+    target_calls: std::cell::RefCell<u32>,
+}
+
+impl QdwPostErRefetchScm {
+    fn new(
+        target_pr: u64,
+        target_snapshot: PrSnapshot,
+        healthy_pr: u64,
+        healthy_snapshot: PrSnapshot,
+    ) -> Self {
+        Self {
+            target_pr,
+            target_snapshot,
+            healthy_pr,
+            healthy_snapshot,
+            target_calls: std::cell::RefCell::new(0),
+        }
+    }
+}
+
+impl Scm for QdwPostErRefetchScm {
+    fn labeled_issues(&self, _label: &str) -> Result<Vec<Issue>, DaemonError> {
+        Ok(Vec::new())
+    }
+
+    fn collaborator_permission(&self, _login: &str) -> Result<Permission, DaemonError> {
+        Ok(Permission::None)
+    }
+
+    fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError> {
+        if pr == self.target_pr {
+            let mut calls = self.target_calls.borrow_mut();
+            *calls += 1;
+            if *calls >= 5 {
+                return Err(DaemonError::Tool {
+                    tool: "gh".into(),
+                    rc: 1,
+                    stderr: "scripted post_er_refetch outage".into(),
+                });
+            }
+            return Ok(self.target_snapshot.clone());
+        }
+        if pr == self.healthy_pr {
+            return Ok(self.healthy_snapshot.clone());
+        }
+        Err(DaemonError::Tool {
+            tool: "gh".into(),
+            rc: 1,
+            stderr: format!("no scripted snapshot for pr {pr}"),
+        })
+    }
+
+    fn close_pr(&self, _pr: u64, _comment: &str) -> Result<(), DaemonError> {
+        Ok(())
+    }
+
+    fn remote_branch_last_commit(&self, _branch: &str) -> Result<Option<u64>, DaemonError> {
+        Ok(None)
+    }
+}
+
+struct QdwAttemptStore {
+    inner: FakeStateStore,
+    er_attempts: std::cell::RefCell<std::collections::HashMap<String, (u32, Option<u64>)>>,
+}
+
+impl QdwAttemptStore {
+    fn new() -> Self {
+        Self {
+            inner: FakeStateStore::new(),
+            er_attempts: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl StateStore for QdwAttemptStore {
+    fn load(&self, bead_id: &str) -> Result<Option<BeadOverlay>, DaemonError> {
+        self.inner.load(bead_id)
+    }
+
+    fn save(&self, overlay: &BeadOverlay) -> Result<(), DaemonError> {
+        self.inner.save(overlay)
+    }
+
+    fn register_branch(&self, bead_id: &str, branch: &str) -> Result<(), DaemonError> {
+        self.inner.register_branch(bead_id, branch)
+    }
+
+    fn owned_branches(&self) -> Result<Vec<String>, DaemonError> {
+        self.inner.owned_branches()
+    }
+
+    fn bead_id_for_branch(&self, branch: &str) -> Result<Option<String>, DaemonError> {
+        self.inner.bead_id_for_branch(branch)
+    }
+
+    fn list_active_overlays(&self) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.inner.list_active_overlays()
+    }
+
+    fn bump_autonomy_secs(&self, bead_id: &str, delta_secs: u64) -> Result<(), DaemonError> {
+        self.inner.bump_autonomy_secs(bead_id, delta_secs)
+    }
+
+    fn increment_active_autonomy(
+        &self,
+        elapsed_secs: u64,
+    ) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.inner.increment_active_autonomy(elapsed_secs)
+    }
+
+    fn recover_human_held(&self, max_attempt: u32) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.inner.recover_human_held(max_attempt)
+    }
+
+    fn save_rejection(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+        reviewer: &str,
+        feedback_hash: &str,
+        feedback_text: &str,
+    ) -> Result<(), DaemonError> {
+        self.inner
+            .save_rejection(bead_id, attempt, reviewer, feedback_hash, feedback_text)
+    }
+
+    fn load_rejection(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+    ) -> Result<Option<(String, String)>, DaemonError> {
+        self.inner.load_rejection(bead_id, attempt)
+    }
+
+    fn er_runner_attempt(&self, bead_id: &str) -> Result<(u32, Option<u64>), DaemonError> {
+        Ok(self
+            .er_attempts
+            .borrow()
+            .get(bead_id)
+            .copied()
+            .unwrap_or((0, None)))
+    }
+
+    fn incr_er_runner_attempt(&self, bead_id: &str, now_epoch: u64) -> Result<u32, DaemonError> {
+        let mut attempts = self.er_attempts.borrow_mut();
+        let next = attempts
+            .get(bead_id)
+            .map(|(count, _)| count + 1)
+            .unwrap_or(1);
+        attempts.insert(bead_id.to_string(), (next, Some(now_epoch)));
+        Ok(next)
+    }
+
+    fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
+        self.inner.reconcile_dispatching()
+    }
+}
+
+fn qdw_green_snapshot(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
+    let fresh_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    PrSnapshot {
+        pr_number: pr,
+        ci_success: true,
+        mergeable: true,
+        coderabbit_approved: true,
+        bugbot_error_count: 0,
+        unresolved_thread_count: 0,
+        head_sha: format!("sha-{pr}"),
+        body: String::new(),
+        comments,
+        files: Vec::new(),
+        updated_at_epoch: fresh_epoch,
+        ci_status: "green".into(),
+        coderabbit_status: "green".into(),
+        ci_pending: false,
+    }
+}
+
+// jleechan-qdw: regression for the latest PR #184 inline blocker. After the
+// daemon posts a fresh `/er PASS`, the post-/er snapshot refetch can still
+// fail transiently. The old code emitted `BEAD_SNAPSHOT_TRANSIENT_ERROR` but
+// then fell through into `verifier::assess`, which performs another
+// `pr_snapshot(pr)`; that second outage became Unknown/all_green=false and
+// Stage 1 false-parked the otherwise posted/PASS bead to HUMAN_HELD.
+//
+// This pins the intended retry behavior:
+//   * the affected bead stays ATTESTED after post_er_refetch fails;
+//   * no assessment/reroll/park logic runs for that bead this tick;
+//   * a later healthy bead still reaches READY in the same tick.
+#[test]
+fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
+    let store = QdwAttemptStore::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = QdwSequenceLlm::new(vec![
+        "pass",     // affected bead: Skeptic gate
+        "/er PASS", // affected bead: posted /er verdict
+        "pass",     // healthy bead: Skeptic gate
+    ]);
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    store
+        .save(&BeadOverlay {
+            bead_id: "qdw-post-refetch-fails".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(1901),
+            branch: Some("factory/qdw-post-refetch-fails-r1".into()),
+            session_id: Some("sess-1".into()),
+        })
+        .unwrap();
+    store
+        .register_branch(
+            "qdw-post-refetch-fails",
+            "factory/qdw-post-refetch-fails-r1",
+        )
+        .unwrap();
+    store
+        .save(&BeadOverlay {
+            bead_id: "qdw-post-refetch-healthy".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(1902),
+            branch: Some("factory/qdw-post-refetch-healthy-r1".into()),
+            session_id: Some("sess-2".into()),
+        })
+        .unwrap();
+    store
+        .register_branch(
+            "qdw-post-refetch-healthy",
+            "factory/qdw-post-refetch-healthy-r1",
+        )
+        .unwrap();
+
+    let scm = QdwPostErRefetchScm::new(
+        1901,
+        qdw_green_snapshot(1901, Vec::new()),
+        1902,
+        qdw_green_snapshot(
+            1902,
+            vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+            }],
+        ),
+    );
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_qdw_post_er_refetch_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("post_er_refetch outage must not abort the tick");
+
+    let affected = store.load("qdw-post-refetch-fails").unwrap().unwrap();
+    assert_eq!(
+        affected.state,
+        OverlayState::Attested,
+        "post_er_refetch outage must leave the affected bead ATTESTED for retry, not HUMAN_HELD"
+    );
+    let healthy = store.load("qdw-post-refetch-healthy").unwrap().unwrap();
+    assert_eq!(
+        healthy.state,
+        OverlayState::Ready,
+        "later healthy bead must still reach READY after the affected bead is skipped"
+    );
+    assert_eq!(
+        summary.gates_assessed, 1,
+        "only the healthy bead should be assessed after post_er_refetch fails; got {summary:?}"
+    );
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "post_er_refetch outage must not park any bead HUMAN_HELD; got {summary:?}"
+    );
+    assert_eq!(
+        *scm.target_calls.borrow(),
+        5,
+        "affected PR should stop immediately after the failed post_er_refetch call; an assess() fall-through would add another pr_snapshot call"
+    );
+    let (er_attempt_count, _) = store
+        .er_runner_attempt("qdw-post-refetch-fails")
+        .expect("test store must expose /er runner attempts");
+    assert_eq!(
+        er_attempt_count, 1,
+        "post_er_refetch outage happens after the /er comment posts, so the affected bead must record one er_runner_attempt"
+    );
+
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls.iter().any(|call| {
+            call.contains("comment_external(owner/repo#1901,") && call.contains("/er PASS")
+        }),
+        "affected PR should receive the posted /er PASS comment before post_er_refetch fails; calls were: {tracker_calls:?}"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.lines().any(|line| {
+            line.contains("BEAD_SNAPSHOT_TRANSIENT_ERROR")
+                && line.contains("\"beadId\":\"qdw-post-refetch-fails\"")
+                && line.contains("\"phase\":\"post_er_refetch\"")
+        }),
+        "expected post_er_refetch transient telemetry for affected bead; telemetry was:\n{telemetry}"
+    );
+    assert!(
+        telemetry.lines().any(|line| {
+            line.contains("\"beadId\":\"qdw-post-refetch-fails\"")
+                && line.contains("\"eventType\":\"ER_RUNNER_POSTED\"")
+        }),
+        "affected bead must emit ER_RUNNER_POSTED before post_er_refetch fails; telemetry was:\n{telemetry}"
+    );
+    assert!(
+        !telemetry.lines().any(|line| {
+            line.contains("\"beadId\":\"qdw-post-refetch-fails\"")
+                && line.contains("\"eventType\":\"GATE_ASSESSMENT\"")
+        }),
+        "affected bead must not enter gate assessment after post_er_refetch outage; telemetry was:\n{telemetry}"
+    );
+    assert!(
+        !telemetry.lines().any(|line| {
+            line.contains("\"beadId\":\"qdw-post-refetch-fails\"")
+                && line.contains("\"eventType\":\"REROLL_VERDICT_RECORDED\"")
+        }),
+        "affected bead must not record a reroll verdict after post_er_refetch outage; telemetry was:\n{telemetry}"
+    );
+    assert!(
+        !telemetry.lines().any(|line| {
+            line.contains("\"beadId\":\"qdw-post-refetch-fails\"")
+                && line.contains("\"eventType\":\"PARKED_HUMAN_HELD\"")
+        }),
+        "affected bead must not emit PARKED_HUMAN_HELD after post_er_refetch outage; telemetry was:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// jleechan-qdw: helper-level coverage for the dual-reviewer combining
+// logic that feeds `skeptic_evidence`. The previous code returned
+// `Ok(None)` when BOTH reviewers failed, which let gate 7 = Unknown
+// cascade into a Stage-1 false-park. `combine_dual_verdict` now
+// returns `Err` in that case so `run_fast_tier`'s per-bead catch
+// keeps the bead ATTESTED. These tests pin both the new failure
+// contract and the preserved single-pass success contract.
+#[test]
+fn qdw_combine_dual_verdict_returns_err_when_both_reviewers_fail() {
+    let r = combine_dual_verdict(None, None, "qdw-bead-x", 7);
+    assert!(
+        matches!(r, Err(daemon::errors::DaemonError::Tool { ref tool, .. }) if tool == "skeptic_evidence"),
+        "expected Err(DaemonError::Tool {{ tool: \"skeptic_evidence\", .. }}) when both reviewers fail, got {r:?}"
+    );
+}
+
+#[test]
+fn qdw_combine_dual_verdict_preserves_single_pass_success() {
+    // Single-pass success: one reviewer returns Pass, the other failed.
+    let r = combine_dual_verdict(Some(SkepticVerdict::Pass), None, "b", 1);
+    assert!(
+        matches!(r, Ok(Some(SkepticVerdict::Pass))),
+        "single-pass Pass must be preserved; got {r:?}"
+    );
+    let r = combine_dual_verdict(None, Some(SkepticVerdict::Pass), "b", 1);
+    assert!(
+        matches!(r, Ok(Some(SkepticVerdict::Pass))),
+        "single-pass Pass must be preserved when only the second reviewer returned it; got {r:?}"
+    );
+    // Both reviewers Pass — same outcome, stronger signal.
+    let r = combine_dual_verdict(
+        Some(SkepticVerdict::Pass),
+        Some(SkepticVerdict::Pass),
+        "b",
+        1,
+    );
+    assert!(
+        matches!(r, Ok(Some(SkepticVerdict::Pass))),
+        "double Pass must still produce Pass; got {r:?}"
+    );
+}
+
+#[test]
+fn qdw_combine_dual_verdict_fail_beats_missing_or_warn() {
+    // One reviewer Fail + other missing — Fail wins (single-pass Fail preserved).
+    let r = combine_dual_verdict(Some(SkepticVerdict::Fail("bad".into())), None, "b", 1);
+    assert!(
+        matches!(r, Ok(Some(SkepticVerdict::Fail(_)))),
+        "Fail from one reviewer must be preserved when the other fails; got {r:?}"
+    );
+    // One Fail + one Pass — Fail wins.
+    let r = combine_dual_verdict(
+        Some(SkepticVerdict::Fail("bad".into())),
+        Some(SkepticVerdict::Pass),
+        "b",
+        1,
+    );
+    assert!(
+        matches!(r, Ok(Some(SkepticVerdict::Fail(_)))),
+        "Fail must beat Pass; got {r:?}"
+    );
+    // Both Fail — Fail merged with " && ".
+    let r = combine_dual_verdict(
+        Some(SkepticVerdict::Fail("a".into())),
+        Some(SkepticVerdict::Fail("b".into())),
+        "bead",
+        9,
+    );
+    match r {
+        Ok(Some(SkepticVerdict::Fail(reason))) => {
+            assert!(reason.contains("a") && reason.contains("b"))
+        }
+        other => panic!("expected merged Fail, got {other:?}"),
+    }
+    // One Warn + one Fail — Fail wins (Fail beats Warn).
+    let r = combine_dual_verdict(
+        Some(SkepticVerdict::Warn("soft".into())),
+        Some(SkepticVerdict::Fail("hard".into())),
+        "b",
+        1,
+    );
+    assert!(
+        matches!(r, Ok(Some(SkepticVerdict::Fail(_)))),
+        "Fail must beat Warn; got {r:?}"
+    );
+}
+
+#[test]
+fn qdw_combine_dual_verdict_one_fail_one_none_is_not_both_failed() {
+    // Single-reviewer Fail is a real signal (do NOT escalate to Err).
+    let r = combine_dual_verdict(Some(SkepticVerdict::Fail("reason".into())), None, "b", 1);
+    match r {
+        Ok(Some(SkepticVerdict::Fail(_))) => {}
+        other => {
+            panic!("expected Ok(Some(Fail)), not Err — single Fail is a real signal; got {other:?}")
+        }
+    }
 }
