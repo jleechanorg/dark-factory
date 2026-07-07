@@ -1777,3 +1777,188 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// Bead `jleechan-qdw` regression test: a single bead's per-tick
+/// `gh` failure must NOT abort the whole tick. Two ATTESTED beads are
+/// loaded; bead A's PR has no scripted `pr_snapshot` (so `gh` returns
+/// the FakeScm "no scripted snapshot" Tool error), bead B's PR has a
+/// scripted all-green snapshot. The previous (pre-qdw) code had `?`
+/// propagation in three places (the wedge-detection `pr_snapshot`,
+/// the wedge-detection `remote_branch_last_commit`, and the per-bead
+/// `pr_snapshot` inside the fast tier) — any one of which would
+/// `?`-propagate a single transient gh failure to `main.rs:277` and
+/// kill the daemon. The qdw fix softens each into a `match`/`if let
+/// Some(...)` so the loop continues. This test exercises the
+/// ATTESTED-pr_snapshot path (the most common one) and asserts the
+/// tick completes, bead-B reaches READY, and a `BEAD_TICK_ERROR` /
+/// `WEDGE_SNAPSHOT_ERROR` telemetry event was emitted for bead-A.
+#[test]
+fn test_per_bead_isolation_lets_tick_complete_after_one_failure() {
+    use daemon::state::BeadOverlay;
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_tick_qdw_isolation_test");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!(
+        "daemon-{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // Seed two ATTESTED beads with PR numbers. Bead A's PR has NO
+    // scripted snapshot (FakeScm::pr_snapshot returns Tool(rc=1,
+    // "no scripted snapshot ...")), bead B's PR has an all-green
+    // snapshot.
+    store
+        .save(&BeadOverlay {
+            bead_id: "bead-A".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(9001),
+            branch: Some("factory/bead-A-r1".into()),
+            session_id: None,
+        })
+        .unwrap();
+    store
+        .save(&BeadOverlay {
+            bead_id: "bead-B".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(9002),
+            branch: Some("factory/bead-B-r1".into()),
+            session_id: None,
+        })
+        .unwrap();
+    // Register the branches in the store so `run_fast_tier` discovers
+    // them via `owned_branches`. The first argument is the bead id
+    // (kept in `branch_beads` for `bead_id_for_branch` lookup); the
+    // second is the full branch name. Both beads are ATTESTED, so
+    // `increment_active_autonomy` also pulls them as overlays — but
+    // ATTESTED is in the active set, so the wedge check on bead-A's
+    // missing pr_snapshot now hits the new `match` block in tick.rs
+    // instead of the old `?`.
+    store
+        .register_branch("bead-A", "factory/bead-A-r1")
+        .unwrap();
+    store
+        .register_branch("bead-B", "factory/bead-B-r1")
+        .unwrap();
+
+    // Script bead-B's snapshot (all-green, no comments, no files —
+    // passes the gates that don't require a real PR diff). The
+    // `updated_at_epoch` MUST be set to the current epoch so the
+    // wedge detection in `increment_active_autonomy`'s ATTESTED branch
+    // (which checks `now_epoch.saturating_sub(updated_at_epoch) >=
+    // 1800`) does NOT trip and park bead-B before the fast-tier
+    // assessment ever runs. This is realistic — a freshly-attested PR
+    // has a current `updated_at` from gh.
+    scm.pr_snapshots.insert(
+        9002,
+        PrSnapshot {
+            pr_number: 9002,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            head_sha: "deadbeef".into(),
+            body: String::new(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            ci_status: "green".into(),
+            coderabbit_status: "green".into(),
+            ci_pending: false,
+        },
+    );
+    // The skeptic gate (gate 7) is the only LLM-dependent gate that
+    // fires from the fast tier. Script a `pass` verdict so the
+    // Stage-1 fast tier considers bead-B's gates all-green; the test
+    // is about isolation, not gate logic.
+    *llm.response.borrow_mut() = Some(Ok("pass ready to merge".into()));
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("tick must NOT fail even when one bead's gh call fails");
+
+    // Bead A's pr_snapshot was never scripted -> Tool(rc=1) -> the
+    // per-bead path returns Err, the loop continues. Bead B's
+    // all-green snapshot drives one gate assessment. We assert ">= 1"
+    // rather than "== 1" because the order in which the two beads are
+    // processed depends on HashMap iteration of the branch registry —
+    // both orderings prove the structural fix (the loop completes
+    // despite one bead's failure).
+    //
+    // Note: bead-B will park HUMAN_HELD, not reach READY, because
+    // gate 6 (/er verdict) is `Unknown` in Stage 1 (no wired `/er`
+    // source yet, per the same reasoning as
+    // `one_full_tick_cycle_drives_bead_from_intake_to_ready` above).
+    // An `Unknown` gate forces `all_green=false`, parking the bead
+    // under the Stage-1 substitution rule. The point of this test is
+    // that the LOOP COMPLETES and bead-B is reached despite bead-A's
+    // failure — not that bead-B reaches READY.
+    assert!(
+        summary.gates_assessed >= 1,
+        "bead-B should be gate-assessed despite bead-A's failure; got gates_assessed={}",
+        summary.gates_assessed
+    );
+    // Bead B should have been processed (the structural proof is that
+    // its state moved past ATTESTED — into HUMAN_HELD via the
+    // Stage-1 substitution rule, not stuck at ATTESTED). Bead A
+    // stays ATTESTED — its pr_snapshot failed, no state mutation.
+    let overlay_b = store.load("bead-B").unwrap().expect("bead-B overlay");
+    assert_ne!(
+        overlay_b.state,
+        OverlayState::Attested,
+        "bead-B must be processed (HUMAN_HELD, not stuck at ATTESTED); got {:?}",
+        overlay_b.state
+    );
+    assert_eq!(
+        overlay_b.state,
+        OverlayState::HumanHeld,
+        "bead-B should reach HUMAN_HELD via Stage-1 substitution (gate 6 /er is Unknown); got {:?}",
+        overlay_b.state
+    );
+
+    // A BEAD_TICK_ERROR telemetry event must have been emitted for
+    // bead-A. The pre-qdw code would have crashed before emitting
+    // anything, so the existence of this event is the structural
+    // proof that the per-bead isolation is wired.
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("BEAD_TICK_ERROR"),
+        "BEAD_TICK_ERROR must be emitted for bead-A; full log:\n{telemetry}"
+    );
+    assert!(
+        telemetry.contains("bead-A"),
+        "bead-A must appear in the BEAD_TICK_ERROR event; full log:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}

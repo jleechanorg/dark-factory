@@ -19,6 +19,7 @@ pub mod tools;
 pub mod verifier;
 pub mod adapters;
 pub mod er_runner;
+pub mod reliability;
 
 
 pub mod gates_compute;

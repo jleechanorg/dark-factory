@@ -229,7 +229,28 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
             OverlayState::Dispatched => {
                 if let Some(ref branch) = overlay.branch {
                     if overlay.autonomy_secs >= 1800 {
-                        let last_commit_epoch = deps.scm.remote_branch_last_commit(branch)?;
+                        // Bead `jleechan-qdw` — soften the gh 404/403 here
+                        // too: a single failure to read the branch's last
+                        // commit must NOT abort the whole tick. If we
+                        // can't tell whether the branch is silent, treat
+                        // it as silent (the conservative default) and
+                        // emit a telemetry event so the failure is
+                        // visible in the log.
+                        let last_commit_epoch = match deps.scm.remote_branch_last_commit(branch) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = emit(
+                                    deps.telemetry_log,
+                                    &overlay.bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Dispatched.as_str(),
+                                    "WEDGE_SNAPSHOT_ERROR",
+                                    serde_json::json!({}),
+                                    serde_json::json!({"error": e.to_string(), "source": "wedge_dispatched"}),
+                                );
+                                None
+                            }
+                        };
                         let now_epoch = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -261,7 +282,31 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
             }
             OverlayState::Attested => {
                 if let Some(pr_number) = overlay.pr_number {
-                    let pr_snapshot = deps.scm.pr_snapshot(pr_number)?;
+                    // Bead `jleechan-qdw` — wedge detection MUST NOT abort
+                    // the whole tick when one bead's `gh pr view` fails.
+                    // The pre-qdw code used `?` here, which propagated a
+                    // single transient gh failure to `main.rs:277` and
+                    // killed the daemon. The `if let Ok(snapshot) = ...`
+                    // pattern below softens the failure to a no-op for
+                    // this tick: if we can't fetch the snapshot we
+                    // simply can't run the wedge check, and the next
+                    // tick's per-bead work will re-attempt with
+                    // `isolate_per_bead` providing the safety net.
+                    let pr_snapshot = match deps.scm.pr_snapshot(pr_number) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = emit(
+                                deps.telemetry_log,
+                                &overlay.bead_id,
+                                overlay.attempt,
+                                OverlayState::Attested.as_str(),
+                                "WEDGE_SNAPSHOT_ERROR",
+                                serde_json::json!({}),
+                                serde_json::json!({"error": e.to_string(), "source": "wedge_detection"}),
+                            );
+                            continue;
+                        }
+                    };
                     let now_epoch = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -353,7 +398,7 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
         run_slow_tier(deps, &mut summary)?;
     }
 
-    run_fast_tier(deps, &mut summary)?;
+    run_fast_tier(deps, &mut summary, tick_index)?;
 
     emit(
         deps.telemetry_log,
@@ -701,7 +746,7 @@ fn skeptic_evidence(deps: &TickDeps, bead_id: &str, pr: u64) -> Result<PrEvidenc
 /// green -> `READY` (terminal) + `READY_FOR_MERGE`. Not all green -> Stage-1
 /// substitution rule: emit `REROLL_VERDICT_RECORDED` and park `HUMAN_HELD`,
 /// never enter `RE_ROLL` or execute the Re-Roll Engine.
-fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
+fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary, tick_index: u64) -> Result<(), DaemonError> {
     // In-flight beads are discovered via the branch registry (populated by
     // `dispatch::dispatch_ready`'s `register_branch` call), not
     // `Tracker::fetch_candidates` — a bead can be DISPATCHED/ATTESTED long
@@ -719,299 +764,338 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     bead_ids.sort();
     bead_ids.dedup();
 
-    for bead_id in &bead_ids {
-        let mut overlay = match deps.store.load(bead_id)? {
-            Some(o) => o,
-            None => continue,
-        };
+    // Bead `jleechan-qdw` — per-bead error isolation. The previous loop
+    // used `?` to propagate every error up to `main.rs:277`, which
+    // `exit(1)`-ed the daemon on a single gh 403/timeout. `isolate_per_bead`
+    // catches each bead's error and lets the loop continue to the next
+    // bead, so one transient failure can no longer kill the process (and
+    // therefore can no longer become a Restart=always rate-limit crash
+    // loop). Each failure is recorded as a `BEAD_TICK_ERROR` telemetry
+    // event for postmortem.
+    let isolated = crate::reliability::isolate_per_bead(&bead_ids, |bead_id| {
+        process_one_attested_bead(deps, bead_id, summary, tick_index)
+    });
+    // The closure captures `tick_index` for the BEAD_TICK_ERROR telemetry
+    // event below; keep a reference to silence the unused-variable lint
+    // when the bead list is empty.
+    let _ = tick_index;
+    let mut bead_tick_errors: u32 = 0;
+    for outcome in isolated {
+        match outcome.result {
+            Ok(()) => {}
+            Err(e) => {
+                bead_tick_errors += 1;
+                // Emit telemetry so the failure is visible in the log,
+                // but DO NOT abort the tick — that was the previous
+                // behavior, and the gap that motivated this fix.
+                let _ = emit(
+                    deps.telemetry_log,
+                    &outcome.bead_id,
+                    0,
+                    "N/A",
+                    "BEAD_TICK_ERROR",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "error": e.to_string(),
+                        "tick_index": tick_index,
+                        "source": "run_fast_tier",
+                    }),
+                );
+            }
+        }
+    }
+    // `bead_tick_errors` is currently only consumed via the telemetry
+    // event above; suppress the unused-assignment lint while keeping
+    // the variable for future use (e.g. consecutive-error backoff in
+    // `main.rs`).
+    let _ = bead_tick_errors;
 
-        // Promote DISPATCHED -> ATTESTED once a PR is open (spec §4.2.7).
-        if overlay.state == OverlayState::Dispatched {
-            if overlay.pr_number.is_none() {
-                if let Some(ref branch) = overlay.branch {
-                    if let Ok(out) = crate::tools::run_tool(
-                        "gh",
-                        &[
-                            "pr",
-                            "list",
-                            "--head",
-                            branch,
-                            "--repo",
-                            &deps.cfg.target_repo,
-                            "--json",
-                            "number",
-                            "--jq",
-                            ".[0].number",
-                        ],
-                        30,
-                    ) {
-                        if let Ok(pr) = out.trim().parse::<u64>() {
-                            overlay.pr_number = Some(pr);
-                        }
+    Ok(())
+}
+
+/// Per-bead work for one fast-titer ATTESTED bead. Extracted from
+/// `run_fast_tier` so the loop can drive it through
+/// `reliability::isolate_per_bead` — one bead's failure (gh 403, parse
+/// error, etc.) MUST NOT abort the whole tick.
+fn process_one_attested_bead(
+    deps: &TickDeps,
+    bead_id: &str,
+    summary: &mut TickSummary,
+    _tick_index: u64,
+) -> Result<(), DaemonError> {
+    let mut overlay = match deps.store.load(bead_id)? {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+
+    // Promote DISPATCHED -> ATTESTED once a PR is open (spec §4.2.7).
+    if overlay.state == OverlayState::Dispatched {
+        if overlay.pr_number.is_none() {
+            if let Some(ref branch) = overlay.branch {
+                if let Ok(out) = crate::tools::run_tool(
+                    "gh",
+                    &[
+                        "pr",
+                        "list",
+                        "--head",
+                        branch,
+                        "--repo",
+                        &deps.cfg.target_repo,
+                        "--json",
+                        "number",
+                        "--jq",
+                        ".[0].number",
+                    ],
+                    30,
+                ) {
+                    if let Ok(pr) = out.trim().parse::<u64>() {
+                        overlay.pr_number = Some(pr);
                     }
                 }
             }
-
-            if let Some(pr) = overlay.pr_number {
-                overlay.state = OverlayState::Attested;
-                deps.store.save(&overlay)?;
-                emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::Attested.as_str(),
-                    "PR_OPENED",
-                    serde_json::json!({}),
-                    serde_json::json!({"pr_number": pr}),
-                )?;
-                let comment_body = format!(
-                    "🤖 **[dark-factory]** Worker session opened this pull request for bead `{}`. Beginning gate-by-gate safety verification...",
-                    bead_id
-                );
-                let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
-            }
         }
 
-        if overlay.state != OverlayState::Attested {
-            continue;
-        }
-        let pr = match overlay.pr_number {
-            Some(pr) => pr,
-            None => continue,
-        };
-
-        let mut evidence = skeptic_evidence(deps, bead_id, pr)?;
-        let mut snapshot = deps.scm.pr_snapshot(pr)?;
-        if snapshot.ci_pending {
+        if let Some(pr) = overlay.pr_number {
+            overlay.state = OverlayState::Attested;
+            deps.store.save(&overlay)?;
             emit(
                 deps.telemetry_log,
                 bead_id,
                 overlay.attempt,
                 OverlayState::Attested.as_str(),
-                "VERIFICATION_PENDING",
+                "PR_OPENED",
                 serde_json::json!({}),
-                serde_json::json!({"message": "CI checks are still running (in progress), waiting for completion"}),
+                serde_json::json!({"pr_number": pr}),
             )?;
-            continue;
+            let comment_body = format!(
+                "🤖 **[dark-factory]** Worker session opened this pull request for bead `{}`. Beginning gate-by-gate safety verification...",
+                bead_id
+            );
+            let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
         }
+    }
 
-        // jleechan-qqq: if no `/er` verdict is recorded yet, dispatch an
-        // independent reviewer (claude/codex subprocess) and post the
-        // verdict as a PR comment. Re-fetch the snapshot so the just-
-        // posted comment is visible to `parse_er_verdict` below.
-        let now_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let runner_outcome = crate::er_runner::maybe_run(deps, bead_id, pr, now_epoch)?;
-        // When the runner just posted a verdict this tick, prefer the
-        // returned verdict over a re-parse of the refreshed snapshot —
-        // `parse_er_verdict` would otherwise pick up any "/er" token
-        // anywhere in the comment body, including in the runner's own
-        // formatted prefix, and could disagree with the verdict the
-        // runner just emitted. Only fall back to the snapshot when the
-        // runner DIDN'T post (cooldown/capped/already-present/no-op).
-        let mut posted_verdict: Option<verifier::ErVerdict> = None;
-        match runner_outcome {
-            crate::er_runner::Outcome::Posted { verdict, count } => {
-                posted_verdict = Some(verdict);
-                emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::Attested.as_str(),
-                    crate::er_runner::EVT_POSTED,
-                    serde_json::json!({}),
-                    serde_json::json!({
-                        "verdict": format!("{verdict:?}"),
-                        "attempt": count,
-                    }),
-                )?;
-                snapshot = deps.scm.pr_snapshot(pr)?;
-            }
-            crate::er_runner::Outcome::AlreadyPosted(v) => {
-                emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::Attested.as_str(),
-                    crate::er_runner::EVT_NOOP,
-                    serde_json::json!({}),
-                    serde_json::json!({"reason": "already_posted", "verdict": format!("{v:?}")}),
-                )?;
-            }
-            crate::er_runner::Outcome::Capped { count } => {
-                emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::Attested.as_str(),
-                    crate::er_runner::EVT_CAPPED,
-                    serde_json::json!({}),
-                    serde_json::json!({"count": count}),
-                )?;
-            }
-            crate::er_runner::Outcome::Cooldown { elapsed_secs, count } => {
-                emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::Attested.as_str(),
-                    crate::er_runner::EVT_NOOP,
-                    serde_json::json!({}),
-                    serde_json::json!({"reason": "cooldown", "elapsed_secs": elapsed_secs, "count": count}),
-                )?;
-            }
-            crate::er_runner::Outcome::NotApplicable => {}
-        }
+    if overlay.state != OverlayState::Attested {
+        return Ok(());
+    }
+    let pr = match overlay.pr_number {
+        Some(pr) => pr,
+        None => return Ok(()),
+    };
 
-        evidence.er_verdict = match posted_verdict {
-            Some(v) => v,
-            None => verifier::parse_er_verdict(&snapshot.comments),
-        };
-        evidence.is_production = verifier::classify_production(&snapshot.files);
-        evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
-        evidence.has_integration_evidence_marker = verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
-        let report = verifier::assess(deps.scm, pr, deps.cfg, &evidence)?;
-        summary.gates_assessed += 1;
+    let mut evidence = skeptic_evidence(deps, bead_id, pr)?;
+    let mut snapshot = deps.scm.pr_snapshot(pr)?;
+    if snapshot.ci_pending {
         emit(
             deps.telemetry_log,
             bead_id,
             overlay.attempt,
             OverlayState::Attested.as_str(),
-            "GATE_ASSESSMENT",
+            "VERIFICATION_PENDING",
             serde_json::json!({}),
-            serde_json::json!({"all_green": report.all_green}),
+            serde_json::json!({"message": "CI checks are still running (in progress), waiting for completion"}),
         )?;
+        return Ok(());
+    }
 
-        if report.all_green {
-            overlay.state = OverlayState::Ready;
-            deps.store.save(&overlay)?;
-            summary.beads_ready += 1;
+    // jleechan-qqq: if no `/er` verdict is recorded yet, dispatch an
+    // independent reviewer (claude/codex subprocess) and post the
+    // verdict as a PR comment. Re-fetch the snapshot so the just-
+    // posted comment is visible to `parse_er_verdict` below.
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let runner_outcome = crate::er_runner::maybe_run(deps, bead_id, pr, now_epoch)?;
+    // When the runner just posted a verdict this tick, prefer the
+    // returned verdict over a re-parse of the refreshed snapshot —
+    // `parse_er_verdict` would otherwise pick up any "/er" token
+    // anywhere in the comment body, including in the runner's own
+    // formatted prefix, and could disagree with the verdict the
+    // runner just emitted. Only fall back to the snapshot when the
+    // runner DIDN'T post (cooldown/capped/already-present/no-op).
+    let mut posted_verdict: Option<verifier::ErVerdict> = None;
+    match runner_outcome {
+        crate::er_runner::Outcome::Posted { verdict, count } => {
+            posted_verdict = Some(verdict);
             emit(
                 deps.telemetry_log,
                 bead_id,
                 overlay.attempt,
-                OverlayState::Ready.as_str(),
-                "READY_FOR_MERGE",
+                OverlayState::Attested.as_str(),
+                crate::er_runner::EVT_POSTED,
                 serde_json::json!({}),
-                serde_json::json!({}),
+                serde_json::json!({
+                    "verdict": format!("{verdict:?}"),
+                    "attempt": count,
+                }),
             )?;
-            let comment_body = format!(
-                "🤖 **[dark-factory]** All safety gates are now GREEN for bead `{}`. PR is merge-ready!",
-                bead_id
-            );
+            snapshot = deps.scm.pr_snapshot(pr)?;
+        }
+        crate::er_runner::Outcome::AlreadyPosted(v) => {
+            emit(
+                deps.telemetry_log,
+                bead_id,
+                overlay.attempt,
+                OverlayState::Attested.as_str(),
+                crate::er_runner::EVT_NOOP,
+                serde_json::json!({}),
+                serde_json::json!({"reason": "already_posted", "verdict": format!("{v:?}")}),
+            )?;
+        }
+        crate::er_runner::Outcome::Capped { count } => {
+            emit(
+                deps.telemetry_log,
+                bead_id,
+                overlay.attempt,
+                OverlayState::Attested.as_str(),
+                crate::er_runner::EVT_CAPPED,
+                serde_json::json!({}),
+                serde_json::json!({"count": count}),
+            )?;
+        }
+        crate::er_runner::Outcome::Cooldown { elapsed_secs, count } => {
+            emit(
+                deps.telemetry_log,
+                bead_id,
+                overlay.attempt,
+                OverlayState::Attested.as_str(),
+                crate::er_runner::EVT_NOOP,
+                serde_json::json!({}),
+                serde_json::json!({"reason": "cooldown", "elapsed_secs": elapsed_secs, "count": count}),
+            )?;
+        }
+        crate::er_runner::Outcome::NotApplicable => {}
+    }
+
+    evidence.er_verdict = match posted_verdict {
+        Some(v) => v,
+        None => verifier::parse_er_verdict(&snapshot.comments),
+    };
+    evidence.is_production = verifier::classify_production(&snapshot.files);
+    evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
+    evidence.has_integration_evidence_marker = verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
+    let report = verifier::assess(deps.scm, pr, deps.cfg, &evidence)?;
+    summary.gates_assessed += 1;
+    emit(
+        deps.telemetry_log,
+        bead_id,
+        overlay.attempt,
+        OverlayState::Attested.as_str(),
+        "GATE_ASSESSMENT",
+        serde_json::json!({}),
+        serde_json::json!({"all_green": report.all_green}),
+    )?;
+
+    if report.all_green {
+        overlay.state = OverlayState::Ready;
+        deps.store.save(&overlay)?;
+        summary.beads_ready += 1;
+        emit(
+            deps.telemetry_log,
+            bead_id,
+            overlay.attempt,
+            OverlayState::Ready.as_str(),
+            "READY_FOR_MERGE",
+            serde_json::json!({}),
+            serde_json::json!({}),
+        )?;
+        let comment_body = format!(
+            "🤖 **[dark-factory]** All safety gates are now GREEN for bead `{}`. PR is merge-ready!",
+            bead_id
+        );
+        let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+    } else {
+        if deps.cfg.stage == 1 {
+            // Stage-1 substitution rule (CONTRACT.md §1): record the re-roll
+            // verdict, never execute it. Park HUMAN_HELD instead of RE_ROLL.
+            emit(
+                deps.telemetry_log,
+                bead_id,
+                overlay.attempt,
+                OverlayState::Attested.as_str(),
+                "REROLL_VERDICT_RECORDED",
+                serde_json::json!({}),
+                serde_json::json!({"stage": deps.cfg.stage}),
+            )?;
+            overlay.state = OverlayState::HumanHeld;
+            deps.store.save(&overlay)?;
+            summary.beads_parked_human_held += 1;
+            emit(
+                deps.telemetry_log,
+                bead_id,
+                overlay.attempt,
+                OverlayState::HumanHeld.as_str(),
+                "PARKED_HUMAN_HELD",
+                serde_json::json!({}),
+                serde_json::json!({"reason": "gate assessment not all-green (stage 1: recorded, not executed)"}),
+            )?;
+            let comment_body =
+                "🤖 **[dark-factory]** Coder session parked (human held): gate assessment failed. Stage 1 configuration prevents re-roll."
+                    .to_string();
             let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
         } else {
-            if deps.cfg.stage == 1 {
-                // Stage-1 substitution rule (CONTRACT.md §1): record the re-roll
-                // verdict, never execute it. Park HUMAN_HELD instead of RE_ROLL.
-                emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::Attested.as_str(),
-                    "REROLL_VERDICT_RECORDED",
-                    serde_json::json!({}),
-                    serde_json::json!({"stage": deps.cfg.stage}),
-                )?;
-                overlay.state = OverlayState::HumanHeld;
-                deps.store.save(&overlay)?;
-                summary.beads_parked_human_held += 1;
-                emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::HumanHeld.as_str(),
-                    "PARKED_HUMAN_HELD",
-                    serde_json::json!({}),
-                    serde_json::json!({"reason": "gate assessment not all-green (stage 1: recorded, not executed)"}),
-                )?;
-                let comment_body =
-                    "🤖 **[dark-factory]** Coder session parked (human held): gate assessment failed. Stage 1 configuration prevents re-roll."
-                        .to_string();
-                let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
-            } else {
-                // Stage 2: execute re-roll engine
-                let mut reviewer = "verifier".to_string();
-                let mut feedback = Vec::new();
-                for (gate_name, result) in &report.results {
-                    if let verifier::GateResult::Red(ref reason) = result {
-                        feedback.push(format!("{gate_name:?}: {reason}"));
-                        if *gate_name == verifier::GateName::Skeptic {
-                            reviewer = "skeptic".to_string();
-                        } else if *gate_name == verifier::GateName::CodeRabbitApproved {
-                            reviewer = "coderabbit".to_string();
-                        }
+            // Stage 2: execute re-roll engine
+            let mut reviewer = "verifier".to_string();
+            let mut feedback = Vec::new();
+            for (gate_name, result) in &report.results {
+                if let verifier::GateResult::Red(ref reason) = result {
+                    feedback.push(format!("{gate_name:?}: {reason}"));
+                    if *gate_name == verifier::GateName::Skeptic {
+                        reviewer = "skeptic".to_string();
+                    } else if *gate_name == verifier::GateName::CodeRabbitApproved {
+                        reviewer = "coderabbit".to_string();
                     }
                 }
-                let review_text = feedback.join("\n");
+            }
+            let review_text = feedback.join("\n");
 
-                let reroll_deps = crate::reroll::RerollDeps {
-                    scm: deps.scm,
-                    sessions: deps.sessions,
-                    vcs: deps.vcs,
-                    store: deps.store,
-                    llm: deps.llm,
-                    cfg: deps.cfg,
-                    telemetry_log: deps.telemetry_log,
-                    reviewer,
-                    review_text,
-                };
+            let reroll_deps = crate::reroll::RerollDeps {
+                scm: deps.scm,
+                sessions: deps.sessions,
+                vcs: deps.vcs,
+                store: deps.store,
+                llm: deps.llm,
+                cfg: deps.cfg,
+                telemetry_log: deps.telemetry_log,
+                reviewer,
+                review_text,
+            };
 
-                match crate::reroll::execute(&reroll_deps, &mut overlay) {
-                    Ok(crate::reroll::RerollOutcome::Rerolled { new_branch: _ }) => {
-                        // Perform recovery validation: check if spec is valid TOML
-                        let spec_path = std::path::Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", overlay.bead_id));
-                        let validation_pass = if spec_path.exists() {
-                            if let Ok(c) = std::fs::read_to_string(&spec_path) {
-                                toml::from_str::<serde_json::Value>(&c).is_ok()
-                            } else {
-                                false
-                            }
+            match crate::reroll::execute(&reroll_deps, &mut overlay) {
+                Ok(crate::reroll::RerollOutcome::Rerolled { new_branch: _ }) => {
+                    // Perform recovery validation: check if spec is valid TOML
+                    let spec_path = std::path::Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", overlay.bead_id));
+                    let validation_pass = if spec_path.exists() {
+                        if let Ok(c) = std::fs::read_to_string(&spec_path) {
+                            toml::from_str::<serde_json::Value>(&c).is_ok()
                         } else {
                             false
-                        };
-
-                        if validation_pass {
-                            overlay.state = OverlayState::Redispatched;
-                            deps.store.save(&overlay)?;
-                            emit(
-                                deps.telemetry_log,
-                                bead_id,
-                                overlay.attempt,
-                                OverlayState::Redispatched.as_str(),
-                                "REDISPATCHED",
-                                serde_json::json!({}),
-                                serde_json::json!({}),
-                            )?;
-                            let comment_body = format!(
-                                "🤖 **[dark-factory]** Re-roll validation passed. Redispatched worker session (attempt {}). Branch: `factory/{}-r{}`.",
-                                overlay.attempt, bead_id, overlay.attempt
-                            );
-                            let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
-                        } else {
-                            overlay.state = OverlayState::HumanHeld;
-                            deps.store.save(&overlay)?;
-                            summary.beads_parked_human_held += 1;
-                            emit(
-                                deps.telemetry_log,
-                                bead_id,
-                                overlay.attempt,
-                                OverlayState::HumanHeld.as_str(),
-                                "PARKED_HUMAN_HELD",
-                                serde_json::json!({}),
-                                serde_json::json!({"reason": "spec file validation failed in recovery"}),
-                            )?;
-                            let comment_body =
-                                "🤖 **[dark-factory]** Coder session parked (human held): spec file validation failed in recovery."
-                                    .to_string();
-                            let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                         }
-                    }
-                    Ok(crate::reroll::RerollOutcome::Held(reason)) => {
-                        summary.beads_parked_human_held += 1;
-                        // already saved to HumanHeld inside execute
+                    } else {
+                        false
+                    };
+
+                    if validation_pass {
+                        overlay.state = OverlayState::Redispatched;
+                        deps.store.save(&overlay)?;
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Redispatched.as_str(),
+                            "REDISPATCHED",
+                            serde_json::json!({}),
+                            serde_json::json!({}),
+                        )?;
+                        let comment_body = format!(
+                            "🤖 **[dark-factory]** Re-roll validation passed. Redispatched worker session (attempt {}). Branch: `factory/{}-r{}`.",
+                            overlay.attempt, bead_id, overlay.attempt
+                        );
+                        let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+                    } else {
+                        overlay.state = OverlayState::HumanHeld;
+                        deps.store.save(&overlay)?;
                         emit(
                             deps.telemetry_log,
                             bead_id,
@@ -1019,18 +1103,33 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             OverlayState::HumanHeld.as_str(),
                             "PARKED_HUMAN_HELD",
                             serde_json::json!({}),
-                            serde_json::json!({"reason": reason.clone()}),
+                            serde_json::json!({"reason": "spec file validation failed in recovery"}),
                         )?;
-                        let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): re-roll held. Reason: {}", reason);
+                        let comment_body =
+                            "🤖 **[dark-factory]** Coder session parked (human held): spec file validation failed in recovery."
+                                .to_string();
                         let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                     }
-                    Ok(crate::reroll::RerollOutcome::Aborted(_)) => {}
-                    Err(e) => return Err(e),
                 }
+                Ok(crate::reroll::RerollOutcome::Held(reason)) => {
+                    // already saved to HumanHeld inside execute
+                    emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "PARKED_HUMAN_HELD",
+                        serde_json::json!({}),
+                        serde_json::json!({"reason": reason.clone()}),
+                    )?;
+                    let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): re-roll held. Reason: {}", reason);
+                    let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+                }
+                Ok(crate::reroll::RerollOutcome::Aborted(_)) => {}
+                Err(e) => return Err(e),
             }
         }
     }
-
     Ok(())
 }
 

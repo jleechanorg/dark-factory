@@ -1,4 +1,5 @@
 use crate::errors::DaemonError;
+use crate::reliability::EtagCache;
 use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -129,6 +130,12 @@ pub struct CliScm {
     permission_cache: Mutex<HashMap<String, (Permission, Instant)>>,
     pr_snapshot_cache: Mutex<HashMap<u64, (PrSnapshot, Instant)>>,
     branch_commit_cache: Mutex<HashMap<String, (Option<u64>, Instant)>>,
+    /// Bead `jleechan-qdw` — last-known-good cache for `gh` responses. When a
+    /// fresh `gh` call is rate-limited or times out, we serve the cached
+    /// body instead of parking every ATTESTED bead HUMAN_HELD. The TTL
+    /// caches above still drive the "fresh" path; this one is the survival
+    /// path during a GitHub outage / rate-limit window.
+    etag_cache: EtagCache,
 }
 
 impl CliScm {
@@ -139,6 +146,7 @@ impl CliScm {
             permission_cache: Mutex::new(HashMap::new()),
             pr_snapshot_cache: Mutex::new(HashMap::new()),
             branch_commit_cache: Mutex::new(HashMap::new()),
+            etag_cache: EtagCache::new(),
         }
     }
 }
@@ -402,7 +410,12 @@ impl Scm for CliScm {
             additions: u32,
             deletions: u32,
         }
-        let view: GhPrView = match run_tool(
+        let view: GhPrView = match crate::reliability::gh_with_cache(
+            &self.etag_cache,
+            &crate::reliability::EtagCache::key(
+                "GET",
+                &format!("repos/{}/pulls/{}:view", self.repo, pr),
+            ),
             "gh",
             &[
                 "pr",
@@ -415,7 +428,7 @@ impl Scm for CliScm {
             ],
             30,
         ) {
-            Ok(view_out) => {
+            Ok((view_out, _outcome)) => {
                 let json_start = view_out.find('{').unwrap_or(0);
                 serde_json::from_str(&view_out[json_start..]).map_err(|e| {
                     DaemonError::Parse(format!("failed to parse gh pr view JSON: {e}"))
