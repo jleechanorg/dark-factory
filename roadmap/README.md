@@ -20,6 +20,15 @@
 - **Beads:** jleechan-v2wv (#172), jleechan-ebe1 (#173), jleechan-t4m8 (ZFC dispatch); closed jleechan-38w8, jleechan-a5p.
 - **Nextsteps:** `roadmap/nextsteps-2026-07-06-launchd-ci-fixes.md`
 
+### 2026-07-06 (night) — Ultracode adversarial gap review: label→green is 2/6 stages functional
+
+- **53-agent workflow** (6 dimensions → adversarial refutation → synthesis): 42/46 findings confirmed. Report: `docs/factory-goal-gap-review-2026-07-06.md`.
+- **Verdict:** Intake GREEN; dispatch AMBER (2 real spawns ever, router fallback bug parks 6/8 beads); iterate/gates/merge/scheduling RED. Zero-touch label→green→merge has **never happened**; live state 8/8 HUMAN_HELD, all-zero-metric ticks.
+- **Corrections to prior entries:** Rust daemon WAS live (hand-launched, unsupervised); "shell/Rust paths aligned" is false; `docs/auto_factory_spec_gap_analysis.md` was never committed.
+- **Hooks installer review** (3 parallel agents): `setup-agent-hooks.sh` runtime claims all true, but 3 of 4 CLI templates rotated (only Codex fires); `--check` self-certifies the breakage. Report: `docs/setup-agent-hooks-review-2026-07-06.md`.
+- **Beads:** jleechan-1m4, g1k, gib, qqq (P0 blocker chain); 240, s3c, qdw, 3ff (P1); ydr (P2).
+- **Nextsteps:** `roadmap/nextsteps-2026-07-06-gap-review.md`.
+
 ### 2026-07-06 (evening) — /harness: why factory is offline
 
 - **`/harness` analysis:** Factory offline = **no launchd route process** + **`factory-intake-from-gh.sh` missing** + `callpath route=FAIL`; overlay QUEUED/READY can be stale while stack is dead.
