@@ -76,6 +76,15 @@ rc=$?
 set -e
 assert "route-record rejects bad verdict" "1" "$rc"
 
+# CR-6: dispatch-record on a non-existent bead must return rc=8 (EX_NOT_FOUND),
+# not rc=5 (EX_REQUIRE_STATE). The current implementation conflates "no row"
+# with "wrong state" — both produce empty `cur` from get_field.
+set +e
+out="$("$OVERLAY" dispatch-record jleechan-doesnot-exist fix/never >/dev/null 2>&1)"
+rc=$?
+set -e
+assert "dispatch-record missing bead returns rc=8 EX_NOT_FOUND" "8" "$rc"
+
 # 7. capacity returns a number
 cap="$("$OVERLAY" capacity)"
 [[ "$cap" =~ ^[0-9]+$ ]] || { echo "FAIL: capacity not numeric: $cap"; FAIL=$((FAIL+1)); }
@@ -94,7 +103,7 @@ out="$("$OVERLAY" route-record test-other STANDARD_PATH 2>&1)"
 out="$("$OVERLAY" dispatch-record test-other fix/test-branch 2>&1)"
 rc=$?
 set -e
-assert "dispatch-record rejects duplicate branch" "1" "$rc"
+assert "dispatch-record rejects duplicate branch (rc=4 EX_BRANCH_CONFLICT)" "4" "$rc"
 
 # 10. pr-opened DISPATCHED → ATTESTED
 out="$("$OVERLAY" pr-opened test-roundtrip 7888 https://github.com/jleechanorg/worldarchitect.ai/pull/7888)"
@@ -299,6 +308,44 @@ out="$("$OVERLAY" reroll-verdict test-reroll 5555 reroll_worthy 'merge conflict 
 assert "reroll-verdict ok" "ok" "$out"
 state="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='test-reroll';")"
 assert "reroll_worthy → HUMAN_HELD" "HUMAN_HELD" "$state"
+
+# 22. dispatch-record capacity IO failure → EX_IO (CR-7, capacity leg).
+# Simulate a broken `capacity` lookup (corrupt/missing schema) via a fake
+# `sqlite3` on PATH that fails ONLY the capacity subcommand's
+# `state IN ('DISPATCHED','ATTESTED')` query, and passes every other query
+# (existence check, state lookup, branch_registry, INSERT) through to the
+# real sqlite3 unchanged. This isolates the capacity leg specifically, the
+# same way the BR_BIN shim above isolates `br show` for bead-closed-check.
+FAKE_SQLITE_DIR="/tmp/test-overlay-$$-fakebin"
+mkdir -p "$FAKE_SQLITE_DIR"
+REAL_SQLITE3="$(command -v sqlite3)"
+cat > "$FAKE_SQLITE_DIR/sqlite3" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  case "\$arg" in
+    *"state IN ('DISPATCHED','ATTESTED')"*)
+      echo "fake-sqlite3: simulated disk I/O error" >&2
+      exit 10
+      ;;
+  esac
+done
+exec "$REAL_SQLITE3" "\$@"
+EOF
+chmod +x "$FAKE_SQLITE_DIR/sqlite3"
+
+"$OVERLAY" intake-upsert test-cap-iofail 'capacity IO failure test' >/dev/null
+"$OVERLAY" route-record test-cap-iofail STANDARD_PATH >/dev/null
+set +e
+out_capio="$(PATH="$FAKE_SQLITE_DIR:$PATH" "$OVERLAY" dispatch-record test-cap-iofail fix/cap-iofail-branch 2>&1)"
+rc_capio=$?
+set -e
+assert "dispatch-record capacity IO failure -> rc=9 EX_IO" "9" "$rc_capio"
+[[ "$out_capio" == *"capacity lookup failed"* ]] && echo "PASS: capacity IO failure message mentions capacity lookup" && PASS=$((PASS+1)) \
+  || { echo "FAIL: capacity IO failure message did not mention capacity lookup (got: $out_capio)"; FAIL=$((FAIL+1)); }
+# bead must remain QUEUED (no partial state mutation from the aborted dispatch)
+state_capio="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='test-cap-iofail';")"
+assert "capacity IO failure leaves bead in QUEUED (no partial mutation)" "QUEUED" "$state_capio"
+rm -rf "$FAKE_SQLITE_DIR"
 
 echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="

@@ -40,20 +40,48 @@ SCHEMA="$ROOT/daemon/contracts/schema.sql"
 CONFIG="${CONFIG:-$ROOT/config/daemon.toml}"
 [ -f "$CONFIG" ] || CONFIG="$ROOT/daemon/contracts/daemon.toml.example"
 
+# Structured exit codes for failure classes. Caller (factory-af-tick.sh and other
+# dispatchers) cases on $rc instead of parsing stderr substrings — ZFC-correct:
+# each subcommand reports the failure class via exit code, no keyword routing.
+#
+#   0  success
+#   1  generic / usage error (kept for backwards-compat with existing callers)
+#   2  invalid arguments (usage / validation)
+#   3  over capacity (capacity gate refused)
+#   4  branch conflict (branch already registered to a different bead)
+#   5  require_state (bead not in required state)
+#   6  valid_branch / valid_pr (input format invalid)
+#   7  valid_bead_id (input format invalid)
+#   8  not_found (bead has no overlay row)
+#   9  io_error (sqlite / fs failure)
+#  10  already_applied (state transition no-op)
+EX_USAGE=2
+EX_OVER_CAP=3
+EX_BRANCH_CONFLICT=4
+EX_REQUIRE_STATE=5
+EX_VALID_INPUT=6
+EX_BEAD_ID=7
+EX_NOT_FOUND=8
+EX_IO=9
+EX_NOOP=10
+
 die() { echo "factory-overlay: $*" >&2; exit 1; }
+# die_code <code> <msg> — emit stderr and exit with structured code.
+# Use this instead of `die` when the caller needs to case on the failure class.
+die_code() { local rc="$1"; shift; echo "factory-overlay: $*" >&2; exit "$rc"; }
 cfg() {
   grep -E "^${1}[[:space:]]*=" "$CONFIG" | head -1 | sed -E 's/^[^=]+=[[:space:]]*//; s/^"//; s/"[[:space:]]*(#.*)?$//; s/[[:space:]]*(#.*)?$//'
 }
 sql() { sqlite3 -cmd '.timeout 5000' "$DB" "$@"; }
 q() { printf '%s' "$1" | sed "s/'/''/g"; }
 js() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
-valid_bead_id() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid bead_id: $1"; }
+valid_bead_id() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die_code $EX_BEAD_ID "invalid bead_id: $1"; }
 valid_branch()  {
   [[ "$1" =~ ^factory/[A-Za-z0-9._-]+-r[0-9]+$ ]] && return 0
   if [[ "$1" =~ ^[A-Za-z0-9._/-]+$ ]] && [[ ! "$1" =~ ^factory/ ]] && [[ ! "$1" =~ ^refs/ ]] && [[ "$1" != "HEAD" ]]; then
     return 0
   fi
-  die "branch must match factory/<bead_id>-r<n> OR existing-PR branch name: $1"
+  die_code $EX_VALID_INPUT "branch must match factory/<bead_id>-r<n> OR existing-PR branch name: $1"
 }
 valid_pr() { [[ "$1" =~ ^[0-9]+$ ]] || die "pr_number must be numeric: $1"; }
 VALID_STATES="QUEUED DISPATCHING DISPATCHED ATTESTED READY RE_ROLL RECOVERY REDISPATCHED BUDGET_HELD HUMAN_HELD"
@@ -125,17 +153,69 @@ capacity)
   ;;
 
 dispatch-record)
-  [ $# -eq 3 ] || die "usage: dispatch-record <bead_id> <branch>"
-  valid_bead_id "$2"; valid_branch "$3"
-  require_state "$2" QUEUED
+  [ $# -eq 3 ] || die_code $EX_USAGE "usage: dispatch-record <bead_id> <branch>"
+  valid_bead_id "$2" || die_code $EX_BEAD_ID "invalid bead_id: $2"
+  valid_branch "$3"   || die_code $EX_VALID_INPUT "invalid branch: $3"
+  # CR-6: probe row count FIRST so a missing bead returns rc=8 (EX_NOT_FOUND)
+  # instead of the rc=5 (EX_REQUIRE_STATE) it would produce if we let `cur` be
+  # empty and matched the case fallback. get_field returns empty for both
+  # "no row" and "wrong state" — only an existence check distinguishes them.
+  if ! exists="$(sql "SELECT count(*) FROM bead_overlay WHERE bead_id='$(q "$2")';")" 2>/dev/null; then
+    die_code $EX_IO "existence lookup failed for $2"
+  fi
+  if [ "$exists" = "0" ]; then
+    die_code $EX_NOT_FOUND "bead has no overlay row: $2"
+  fi
+  if ! cur="$(get_field "$2" state)" 2>/dev/null; then
+    die_code $EX_IO "state lookup failed for $2"
+  fi
+  case " QUEUED " in *" $cur "*) ;; *) die_code $EX_REQUIRE_STATE "bead in state '$cur', expected one of: QUEUED";; esac
+  # CR-7 (capacity leg): "$0 capacity" recurses into a fresh invocation of this
+  # same script, which also runs under `set -euo pipefail`. If ITS internal
+  # `sql` call fails (missing table, corrupt DB), that subprocess exits with
+  # sqlite3's raw error code — and a bare assignment here would let that raw
+  # code propagate straight out of THIS process too, bypassing the structured
+  # EX_IO=9 contract. Capture explicitly, same pattern as the owner lookup below.
+  set +e
   cur_cap="$("$0" capacity)"
-  [ "$cur_cap" -gt 0 ] || die "over capacity — dispatch refused (capacity=$cur_cap)"
+  cap_rc=$?
+  set -e
+  if [ "$cap_rc" -ne 0 ]; then
+    die_code $EX_IO "capacity lookup failed (rc=$cap_rc)"
+  fi
+  [ "$cur_cap" -gt 0 ] || die_code $EX_OVER_CAP "over capacity — dispatch refused (capacity=$cur_cap)"
+  # CR-7: capture sql exit code so missing tables / corrupt DBs surface as EX_IO
+  # instead of silently passing through. set -e does NOT propagate rc from
+  # command substitutions that are immediately consumed (e.g., `if [ -n ]`),
+  # so the rc must be checked explicitly.
+  set +e
   owner="$(sql "SELECT bead_id FROM branch_registry WHERE branch='$(q "$3")';")"
-  [ -z "$owner" ] || [ "$owner" = "$2" ] || die "branch $3 already registered to $owner"
+  sql_rc=$?
+  set -e
+  if [ "$sql_rc" -ne 0 ]; then
+    die_code $EX_IO "branch_registry read failed (rc=$sql_rc) for $3"
+  fi
+  if [ -n "$owner" ] && [ "$owner" != "$2" ]; then
+    die_code $EX_BRANCH_CONFLICT "branch $3 already registered to $owner"
+  fi
+  # CR-7: capture INSERT/UPDATE errors so missing tables / corrupt DBs surface
+  # as EX_IO instead of silently leaving state inconsistent. The `sql` helper
+  # runs sqlite3 directly; without an explicit error capture, sqlite errors go
+  # to stderr and the script exits 0.
+  sql_err="$(mktemp -t factory_overlay_err.XXXXXX)"
+  set +e
   sql "INSERT INTO branch_registry (branch,bead_id,created_at)
        VALUES ('$(q "$3")','$(q "$2")','$(now)') ON CONFLICT(branch) DO NOTHING;
        UPDATE bead_overlay SET state='DISPATCHED', branch='$(q "$3")', updated_at='$(now)'
-       WHERE bead_id='$(q "$2")';"
+       WHERE bead_id='$(q "$2")';" 2>"$sql_err"
+  sql_rc=$?
+  set -e
+  if [ "$sql_rc" -ne 0 ]; then
+    err_msg="$(cat "$sql_err" 2>/dev/null | tr -d '\n' | head -c 200)"
+    rm -f "$sql_err"
+    die_code $EX_IO "dispatch-record write failed (rc=$sql_rc) for $2: $err_msg"
+  fi
+  rm -f "$sql_err"
   cur_attempt="$(get_field "$2" attempt)"
   emit "$2" "$cur_attempt" DISPATCHED TASK_DISPATCHED "{\"activeModel\":\"minimax\",\"branch\":$(js "$3")}"
   echo "ok"
