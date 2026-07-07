@@ -237,6 +237,36 @@ echo "closed" > /tmp/br-status
 out="$("$OVERLAY" bead-closed-check test-closed)"
 assert "bead-closed-check → ready after merge" "ready" "$out"
 
+# 16a. bead-closed-check on closed-after-merge WITH a fail gate → parked
+# (not ready). jleechan-240 follow-up: the bead-closed-check consumer
+# previously only blocked the literal "red" string. With the new fail
+# verdict vocabulary, a fail-gate assessment must park the bead instead
+# of marking it READY.
+"$OVERLAY" intake-upsert test-closed-fail 'closed-fail test' >/dev/null
+"$OVERLAY" route-record test-closed-fail STANDARD_PATH >/dev/null
+"$OVERLAY" dispatch-record test-closed-fail fix/closed-fail-branch >/dev/null
+"$OVERLAY" pr-opened test-closed-fail 1235 https://github.com/jleechanorg/worldarchitect.ai/pull/1235 >/dev/null
+gates_fail='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","code_standards":"pass","zfc":"fail"}'
+"$OVERLAY" gate-assessment test-closed-fail 1235 "$gates_fail" >/dev/null
+echo "closed" > /tmp/br-status
+out_fail="$("$OVERLAY" bead-closed-check test-closed-fail)"
+assert "bead-closed-check w/ zfc=fail → parked (jleechan-240)" "parked" "$out_fail"
+state_fail="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='test-closed-fail';")"
+assert "fail-gate closed-bead → HUMAN_HELD (not READY)" "HUMAN_HELD" "$state_fail"
+
+# 16b. bead-closed-check on closed-after-merge WITH a structured fail
+# evidence object → parked. Verifies the {verdict: "fail", evidence:[...]}
+# shape is honored by the consumer (not just the plain "fail" string).
+"$OVERLAY" intake-upsert test-closed-evfail 'closed-evfail test' >/dev/null
+"$OVERLAY" route-record test-closed-evfail STANDARD_PATH >/dev/null
+"$OVERLAY" dispatch-record test-closed-evfail fix/closed-evfail-branch >/dev/null
+"$OVERLAY" pr-opened test-closed-evfail 1236 https://github.com/jleechanorg/worldarchitect.ai/pull/1236 >/dev/null
+gates_evfail='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","code_standards":"pass","zfc":{"verdict":"fail","evidence":[{"path":"daemon/factory-overlay.sh","line":201,"msg":"keyword in app code"}]}}'
+"$OVERLAY" gate-assessment test-closed-evfail 1236 "$gates_evfail" >/dev/null
+echo "closed" > /tmp/br-status
+out_evfail="$("$OVERLAY" bead-closed-check test-closed-evfail)"
+assert "bead-closed-check w/ zfc={verdict:fail} → parked" "parked" "$out_evfail"
+
 # 17. park-duplicate
 "$OVERLAY" intake-upsert test-dup 'dup test' >/dev/null
 "$OVERLAY" route-record test-dup STANDARD_PATH >/dev/null

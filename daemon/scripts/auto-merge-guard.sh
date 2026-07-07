@@ -33,7 +33,7 @@ if [ "$recent" -ge "$MAX_PER_HOUR" ]; then
   exit 0
 fi
 
-latest_assessment_no_red() { # <pr_number> -> exit 0 if latest GATE_ASSESSMENT exists and has NO red gate
+latest_assessment_no_red() { # <pr_number> -> exit 0 if latest GATE_ASSESSMENT exists and has NO red/fail gate
   local pr="$1" last
   last="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$pr[,}]" | tail -1)"
   [ -n "$last" ] || return 1                       # never assessed → block
@@ -44,10 +44,29 @@ try:
     g = ctx["gates"]
 except Exception:
     sys.exit(1)                                    # unparseable → block
-reds = [k for k,v in g.items() if v == "red"]
-if reds:
-    print("RED:" + ",".join(reds)); sys.exit(1)    # any red → block
-print("no-red (unknowns ok: " + ",".join(k for k,v in g.items() if v=="unknown") + ")")
+# jleechan-240 expand: gate values can be a string ("pass"|"warn"|"fail"|"unknown")
+# or a structured object {"verdict": "...", "evidence":[...]}; the merge-authority
+# guard must block on any fail verdict, not the literal "red" string the original
+# 7-gate schema emitted. Legacy "red" is treated as fail (it was the original
+# blocking token); "warn" and "unknown" stay non-blocking per the documented
+# no-red merge policy (infra walls like CodeRabbit/Bugbot quota should not
+# deadlock the factory).
+ALIAS = {"pass":"pass","warn":"warn","fail":"fail","unknown":"unknown",
+         "green":"pass","red":"fail","yellow":"warn"}
+def verdict(v):
+    if isinstance(v, str):
+        return ALIAS.get(v, v)
+    if isinstance(v, dict):
+        return ALIAS.get(v.get("verdict",""), v.get("verdict",""))
+    return v
+fails = [k for k,v in g.items() if verdict(v) == "fail"]
+if fails:
+    print("FAIL:" + ",".join(fails)); sys.exit(1)   # any fail → block
+unknowns = [k for k,v in g.items() if verdict(v) == "unknown"]
+if unknowns:
+    print("no-fail (unknowns defer: " + ",".join(unknowns) + ")")
+else:
+    print("no-fail (all gates cleared)")
 sys.exit(0)'
 }
 

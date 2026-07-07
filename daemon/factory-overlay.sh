@@ -337,7 +337,18 @@ print((d[0] if isinstance(d, list) else d).get("status","unknown"))' 2>/dev/null
       if [ -n "$last_ga" ] && printf '%s' "$last_ga" | python3 -c 'import json,sys
 try: g=json.loads(sys.stdin.read())["context"]["gates"]
 except Exception: sys.exit(1)
-sys.exit(0 if not any(v=="red" for v in g.values()) else 1)'; then
+# jleechan-240 align guard with the verdict vocabulary accepted by
+# gate-assessment: block on fail (or the legacy "red" alias), including
+# the structured {"verdict":"fail", "evidence":[...]} shape. Warn and
+# unknown stay non-blocking per the documented no-red merge policy.
+ALIAS={"green":"pass","red":"fail","yellow":"warn","warn":"warn","unknown":"unknown","pass":"pass","fail":"fail"}
+def verdict(v):
+    if isinstance(v, str):
+        return ALIAS.get(v, v)
+    if isinstance(v, dict):
+        return ALIAS.get(v.get("verdict",""), v.get("verdict",""))
+    return v
+sys.exit(0 if not any(verdict(v) == "fail" for v in g.values()) else 1)'; then
         merged_ok="yes"
       fi
     fi
