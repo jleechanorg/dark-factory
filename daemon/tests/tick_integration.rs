@@ -282,7 +282,7 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
 
 #[test]
 fn run_tick_rejects_non_stage_1_or_2_config() {
-    let scm = FakeScm::new();
+    let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
@@ -435,7 +435,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
 
 #[test]
 fn test_autonomy_budget_warning_crossing() {
-    let scm = FakeScm::new();
+    let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
@@ -1240,6 +1240,540 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
 
     let overlay = store.load("drive-bead").unwrap().unwrap();
     assert_eq!(overlay.state, OverlayState::HumanHeld);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// jleechan-gib: automated HUMAN_HELD exit — recover_human_held requeues
+// beads whose attempt is below MAX_HUMAN_HELD_RECOVERY_ATTEMPT (=10),
+// zeros autonomy_secs, and emits a RECOVERED_FROM_HELD telemetry event.
+#[test]
+fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    // Pre-seed a HUMAN_HELD bead with attempt=2 (below the 10 cap)
+    store.overlays.borrow_mut().insert(
+        "bead-held".into(),
+        BeadOverlay {
+            bead_id: "bead-held".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 9999,
+            spend_usd: 0.0,
+            pr_number: Some(4242),
+            branch: Some("factory/bead-held-r2".into()),
+            session_id: None,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_recover_human_held_under.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        // tick_index=1 with fast_tick_secs==slow_tick_secs==60 means
+        // the slow tier fires (ratio=1, every tick), which is where
+        // the recovery step lives.
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    let overlay = store.load("bead-held").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Queued,
+        "bead must be requeued to QUEUED by automated HUMAN_HELD exit"
+    );
+    assert_eq!(overlay.attempt, 3, "attempt must increment by 1");
+    assert_eq!(overlay.autonomy_secs, 0, "autonomy_secs must reset to 0");
+    assert_eq!(
+        summary.beads_recovered_from_held, 1,
+        "summary counter must reflect the recovery"
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("RECOVERED_FROM_HELD"),
+        "RECOVERED_FROM_HELD event must be emitted; got: {log}"
+    );
+    assert!(
+        log.contains("\"prior_state\":\"HUMAN_HELD\""),
+        "telemetry metadata must record the prior HUMAN_HELD state; got: {log}"
+    );
+    assert!(
+        log.contains("\"pr_number\":4242"),
+        "telemetry metadata must carry the recovered PR number; got: {log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    // Pre-seed a HUMAN_HELD bead with attempt=10 (the cap)
+    store.overlays.borrow_mut().insert(
+        "bead-held-cap".into(),
+        BeadOverlay {
+            bead_id: "bead-held-cap".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 10,
+            reroll_count: 0,
+            autonomy_secs: 7,
+            spend_usd: 0.0,
+            pr_number: Some(9001),
+            branch: Some("factory/bead-held-cap-r10".into()),
+            session_id: None,
+        },
+    );
+    // Also seed one above the cap (defensive — matches the shell overlay)
+    store.overlays.borrow_mut().insert(
+        "bead-held-over".into(),
+        BeadOverlay {
+            bead_id: "bead-held-over".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 11,
+            reroll_count: 0,
+            autonomy_secs: 7,
+            spend_usd: 0.0,
+            pr_number: Some(9002),
+            branch: Some("factory/bead-held-over-r11".into()),
+            session_id: None,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_recover_human_held_at_cap.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    assert_eq!(
+        summary.beads_recovered_from_held, 0,
+        "beads at or above the cap must NOT be recovered"
+    );
+
+    let cap = store.load("bead-held-cap").unwrap().unwrap();
+    assert_eq!(
+        cap.state,
+        OverlayState::HumanHeld,
+        "at-cap bead must stay HUMAN_HELD for human review"
+    );
+    let over = store.load("bead-held-over").unwrap().unwrap();
+    assert_eq!(over.state, OverlayState::HumanHeld);
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !log.contains("RECOVERED_FROM_HELD"),
+        "no RECOVERED_FROM_HELD events must be emitted when both beads are at/above the cap; got: {log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// jleechan-gib: stop the autonomy clock during ci_pending. ATTESTED beads
+// whose PR has ci_pending=true must NOT have autonomy_secs incremented,
+// because CI wait time is wall-clock time the operator (or CI itself) owns,
+// not coder session time we are budgeting against.
+#[test]
+fn attested_ci_pending_does_not_bump_autonomy_secs() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.autonomy_timebox_secs = 3600; // 1h timebox so the bead survives the tick
+    let vcs = FakeVcs::new();
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.remote_branches
+        .insert("factory/att-bead-r1".into(), Some(now_epoch));
+
+    // Pre-seed an ATTESTED bead with autonomy_secs=500 and a PR whose ci_pending=true
+    store.overlays.borrow_mut().insert(
+        "att-bead".into(),
+        BeadOverlay {
+            bead_id: "att-bead".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 500,
+            spend_usd: 0.0,
+            pr_number: Some(7000),
+            branch: Some("factory/att-bead-r1".into()),
+            session_id: None,
+        },
+    );
+    scm.pr_snapshots.insert(
+        7000,
+        PrSnapshot {
+            pr_number: 7000,
+            ci_success: false,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            head_sha: "abc".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: now_epoch,
+            ci_status: "unknown".into(),
+            coderabbit_status: "approved".into(),
+            ci_pending: true,
+        },
+    );
+    store.branches.borrow_mut().push("factory/att-bead-r1".into());
+    store
+        .branch_beads
+        .borrow_mut()
+        .insert("factory/att-bead-r1".into(), "att-bead".into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_attested_ci_pending.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let _summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        // Pretend 600s elapsed since the last tick; ci_pending must freeze the clock.
+        600,
+    )
+    .expect("tick should succeed");
+
+    let overlay = store.load("att-bead").unwrap().unwrap();
+    assert_eq!(
+        overlay.autonomy_secs, 500,
+        "ci_pending=true must freeze the autonomy clock (no bump)"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// jleechan-54ky (sub-fix for jleechan-gib): an ATTESTED bead whose CI has
+// been pending for hours must NOT timebox-park to HUMAN_HELD. The 3h
+// timebox is supposed to bound coder session cost, not CI queue latency;
+// pausing the clock while ci_pending=true means a healthy PR that's
+// waiting on slow CI keeps its attempt slot instead of being silently
+// killed and then requiring shell recover-held churn.
+#[test]
+fn attested_ci_pending_does_not_timebox_park() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.autonomy_timebox_secs = 600; // 10 min — would park in one tick if clock runs
+    let vcs = FakeVcs::new();
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.remote_branches
+        .insert("factory/slow-ci-r1".into(), Some(now_epoch));
+
+    store.overlays.borrow_mut().insert(
+        "slow-ci".into(),
+        BeadOverlay {
+            bead_id: "slow-ci".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            // autonomy_secs is already 590s; one 600s tick would push it past 600.
+            autonomy_secs: 590,
+            spend_usd: 0.0,
+            pr_number: Some(7100),
+            branch: Some("factory/slow-ci-r1".into()),
+            session_id: None,
+        },
+    );
+    scm.pr_snapshots.insert(
+        7100,
+        PrSnapshot {
+            pr_number: 7100,
+            ci_success: false,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            head_sha: "ghi".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: now_epoch,
+            ci_status: "unknown".into(),
+            coderabbit_status: "approved".into(),
+            ci_pending: true,
+        },
+    );
+    store.branches.borrow_mut().push("factory/slow-ci-r1".into());
+    store
+        .branch_beads
+        .borrow_mut()
+        .insert("factory/slow-ci-r1".into(), "slow-ci".into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_ci_pending_no_timebox.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        600, // 10-minute tick; ci_pending=true means clock should NOT advance
+    )
+    .expect("tick should succeed");
+
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "ci_pending=true must NOT park the bead on the timebox envelope"
+    );
+    let overlay = store.load("slow-ci").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Attested,
+        "ATTESTED + ci_pending=true must stay ATTESTED while CI runs"
+    );
+    assert_eq!(
+        overlay.autonomy_secs, 590,
+        "ci_pending=true must freeze the autonomy clock at its current value"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// jleechan-54ky / jleechan-gib: a non-green recoverable PR must re-enter
+// the dispatch loop via the automated HUMAN_HELD exit (the slow-tier
+// recovery step), without requiring shell `recover-held` churn. We model
+// the loop end-to-end: a pre-seeded HUMAN_HELD bead (from a prior
+// non-green gates assessment, attempt=1) is requeued by the slow tier
+// and its `attempt` advances to 2, which is exactly what shell
+// `recover-held` would have done if anyone ran it. The slow tier now
+// does it for them.
+#[test]
+fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    // Prior tick parked this bead HUMAN_HELD after a non-green gates
+    // assessment (e.g. CodeRabbit CHANGES_REQUESTED). attempt=1 means
+    // there's plenty of headroom under the 10-cap.
+    store.overlays.borrow_mut().insert(
+        "non-green".into(),
+        BeadOverlay {
+            bead_id: "non-green".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 1,
+            reroll_count: 0,
+            // leftover autonomy_secs from the prior session — must be
+            // reset on recovery, matching shell `recover-held`.
+            autonomy_secs: 4321,
+            spend_usd: 0.0,
+            pr_number: Some(5050),
+            branch: Some("factory/non-green-r1".into()),
+            session_id: None,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_non_green_reentry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        // slow-tier-due (ratio=1, every tick fires both tiers)
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    // Recovery happened in slow tier BEFORE the slow tier's
+    // intake/route/dispatch pass even looked at the bead, so we expect:
+    //   - state -> QUEUED
+    //   - attempt -> 2
+    //   - autonomy_secs -> 0
+    //   - RECOVERED_FROM_HELD telemetry event with prior_state + pr_number
+    let overlay = store.load("non-green").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Queued,
+        "automated HUMAN_HELD exit must requeue the bead"
+    );
+    assert_eq!(
+        overlay.attempt, 2,
+        "attempt must advance; this is the attempt counter, not a NEW bead"
+    );
+    assert_eq!(
+        overlay.autonomy_secs, 0,
+        "autonomy_secs must reset (matches shell `recover-held`); the next dispatch starts fresh"
+    );
+    assert_eq!(overlay.pr_number, Some(5050));
+    assert_eq!(
+        summary.beads_recovered_from_held, 1,
+        "summary must reflect the recovery (no shell `recover-held` was invoked)"
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("RECOVERED_FROM_HELD"),
+        "RECOVERED_FROM_HELD event must be emitted by the Rust tick (no shell caller); got: {log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn attested_ci_not_pending_does_bump_autonomy_secs() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.autonomy_timebox_secs = 3600;
+    let vcs = FakeVcs::new();
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.remote_branches
+        .insert("factory/att-active-r1".into(), Some(now_epoch));
+
+    store.overlays.borrow_mut().insert(
+        "att-active".into(),
+        BeadOverlay {
+            bead_id: "att-active".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(7001),
+            branch: Some("factory/att-active-r1".into()),
+            session_id: None,
+        },
+    );
+    scm.pr_snapshots.insert(
+        7001,
+        PrSnapshot {
+            pr_number: 7001,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            head_sha: "def".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: now_epoch,
+            ci_status: "success".into(),
+            coderabbit_status: "approved".into(),
+            ci_pending: false,
+        },
+    );
+    store.branches.borrow_mut().push("factory/att-active-r1".into());
+    store
+        .branch_beads
+        .borrow_mut()
+        .insert("factory/att-active-r1".into(), "att-active".into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_attested_ci_not_pending.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let _summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        300,
+    )
+    .expect("tick should succeed");
+
+    let overlay = store.load("att-active").unwrap().unwrap();
+    assert_eq!(
+        overlay.autonomy_secs, 400,
+        "ci_pending=false must allow the autonomy clock to advance"
+    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
