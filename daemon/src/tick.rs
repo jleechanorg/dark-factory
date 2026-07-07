@@ -222,20 +222,42 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                         };
 
                         if is_stalled_or_dead {
-                            overlay.state = OverlayState::HumanHeld;
-                            deps.store.save(&overlay)?;
-                            emit(
-                                deps.telemetry_log,
-                                &overlay.bead_id,
-                                overlay.attempt,
-                                OverlayState::HumanHeld.as_str(),
-                                "PARKED_HUMAN_HELD",
-                                serde_json::json!({}),
-                                serde_json::json!({"reason": "session_stalled"}),
-                            )?;
-                            let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): session stalled or quiescent on open PR.");
-                            let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
-                            summary.beads_parked_human_held += 1;
+                            let mut advanced = false;
+                            if let Some(ref branch) = overlay.branch {
+                                if let Ok(local_head) = deps.vcs.head_sha(branch) {
+                                    if !local_head.is_empty() && pr_snapshot.head_sha != local_head {
+                                        advanced = true;
+                                    }
+                                }
+                            }
+
+                            if advanced {
+                                let branch = overlay.branch.as_ref().unwrap();
+                                eprintln!(
+                                    "commits observed after session_exit for bead {}: head_sha {} != local {}",
+                                    overlay.bead_id,
+                                    pr_snapshot.head_sha,
+                                    deps.vcs.head_sha(branch).unwrap_or_default()
+                                );
+                                let _ = crate::tools::run_tool("git", &["fetch", "origin", branch], 30);
+                                let _ = crate::tools::run_tool("git", &["branch", "-f", branch, &pr_snapshot.head_sha], 30);
+                                deps.store.save(&overlay)?;
+                            } else {
+                                overlay.state = OverlayState::HumanHeld;
+                                deps.store.save(&overlay)?;
+                                emit(
+                                    deps.telemetry_log,
+                                    &overlay.bead_id,
+                                    overlay.attempt,
+                                    OverlayState::HumanHeld.as_str(),
+                                    "PARKED_HUMAN_HELD",
+                                    serde_json::json!({}),
+                                    serde_json::json!({"reason": "session_stalled"}),
+                                )?;
+                                let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): session stalled or quiescent on open PR.");
+                                let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
+                                summary.beads_parked_human_held += 1;
+                            }
                         }
                     }
                 }
@@ -522,7 +544,7 @@ fn skeptic_evidence(deps: &TickDeps, bead_id: &str, pr: u64) -> Result<PrEvidenc
         } else {
             "claude".to_string()
         };
-        crate::tools::run_tool(&claude_bin, &["--print", "--dangerously-skip-permissions", "--setting-sources", "", &prompt_clone2], 120)
+        crate::tools::run_tool(&claude_bin, &["--print", "--setting-sources", "", &prompt_clone2], 120)
     });
 
     let res1 = handle1.join().unwrap_or(Err(DaemonError::Tool { tool: "thread".into(), rc: -1, stderr: "join failed".into() }));

@@ -622,6 +622,87 @@ fn test_wedge_detection_attested_session_stalled() {
 }
 
 #[test]
+fn test_wedge_detection_attested_session_not_stalled_if_advanced() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    // Pre-seed Attested bead with session_id
+    store.overlays.borrow_mut().insert(
+        "bead-stalled".into(),
+        BeadOverlay {
+            bead_id: "bead-stalled".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 500,
+            spend_usd: 0.0,
+            pr_number: Some(42),
+            branch: Some("factory/bead-stalled-r1".into()),
+            session_id: Some("session-abc123yz".into()),
+        },
+    );
+
+    // Mock PR snapshot with updated_at_epoch older than 30 minutes, but with advanced head SHA
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        42,
+        PrSnapshot {
+            pr_number: 42,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            head_sha: "newremotesha".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: now_epoch - 2000, // older than 1800s
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+        },
+    );
+
+    // Script sessions to be quiescent (stalled/exited)
+    sessions.quiescent = true;
+
+    // Set local branch head to be different (older)
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("factory/bead-stalled-r1".into(), "oldlocalsha".into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_wedge_not_stalled.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // Run tick: should NOT park because remote head SHA is different from local head SHA
+    let summary = run_tick(&deps, 1, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-stalled").unwrap().unwrap();
+    assert_eq!(o.state, OverlayState::Attested); // remains Attested, not parked
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
 fn test_manual_bead_input_auto_queued_and_dispatched() {
     let scm = FakeScm::new(); // no issues in SCM
     let tracker = FakeTracker::new();

@@ -265,6 +265,7 @@ fn run(args: Args) -> Result<(), DaemonError> {
 
     let mut tick_index: u64 = 0;
     let mut last_tick_time = std::time::Instant::now();
+    let mut consecutive_failures = 0;
     loop {
         let now = std::time::Instant::now();
         let elapsed_secs = if tick_index == 0 {
@@ -274,9 +275,28 @@ fn run(args: Args) -> Result<(), DaemonError> {
         };
         last_tick_time = now;
 
-        run_tick(&deps, tick_index, elapsed_secs)?;
+        match run_tick(&deps, tick_index, elapsed_secs) {
+            Ok(_) => {
+                consecutive_failures = 0;
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                eprintln!(
+                    "auto-factory daemon: tick {} failed (consecutive={}): {}",
+                    tick_index, consecutive_failures, e
+                );
+            }
+        }
         tick_index += 1;
-        std::thread::sleep(std::time::Duration::from_secs(cfg.fast_tick_secs));
+
+        let base_delay = cfg.fast_tick_secs;
+        let sleep_secs = if consecutive_failures > 0 {
+            let exponent = (consecutive_failures - 1).min(10);
+            (2u64.pow(exponent) * base_delay).min(300)
+        } else {
+            base_delay
+        };
+        std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
     }
 }
 

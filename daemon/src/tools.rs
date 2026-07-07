@@ -236,8 +236,13 @@ pub trait Llm {
 /// return `DaemonError::Timeout` if the deadline elapses first; non-zero exit
 /// -> `DaemonError::Tool`; otherwise stdout as a `String`.
 pub fn run_tool(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<String, DaemonError> {
+    run_tool_in_dir(cmd, args, ".", timeout_secs)
+}
+
+pub fn run_tool_in_dir(cmd: &str, args: &[&str], dir: &str, timeout_secs: u64) -> Result<String, DaemonError> {
     let mut child = Command::new(cmd)
         .args(args)
+        .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

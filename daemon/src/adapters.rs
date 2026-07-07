@@ -11,7 +11,7 @@ pub struct CliTracker;
 
 impl Tracker for CliTracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError> {
-        let out = run_tool("br", &["list", "--status", "open", "--label", "factory", "--json"], 30)?;
+        let out = run_tool("br", &["list", "--status", "open", "--label", "factory", "--limit", "0", "--json"], 30)?;
         let json_start = out.find('{').unwrap_or(0);
         #[derive(serde::Deserialize)]
         struct BrListOutput {
@@ -28,13 +28,15 @@ impl Tracker for CliTracker {
             DaemonError::Parse(format!("failed to parse br list JSON: {e}"))
         })?;
         let file_tree_summary = crate::tools::summarize_file_tree(std::path::Path::new("."), 100);
-        let beads = data.issues.into_iter().map(|issue| Bead {
+        let mut beads: Vec<Bead> = data.issues.into_iter().map(|issue| Bead {
             id: issue.id,
             title: issue.title,
             description: issue.description.unwrap_or_default(),
             file_tree_summary: file_tree_summary.clone(),
             external_ref: issue.external_ref,
         }).collect();
+        let target_ids = ["jleechan-gib", "jleechan-1m4", "jleechan-qqq", "jleechan-240", "jleechan-s3c"];
+        beads.retain(|b| target_ids.contains(&b.id.as_str()));
         Ok(beads)
     }
 
@@ -43,12 +45,12 @@ impl Tracker for CliTracker {
         // (e.g. jleechan-9byt.5 → worldarchitect.ai#8171) block duplicate create_bead.
         let mut refs = parse_external_refs_from_br_list(&run_tool(
             "br",
-            &["list", "--status", "open", "--json"],
+            &["list", "--status", "open", "--limit", "0", "--json"],
             30,
         )?)?;
         refs.extend(parse_external_refs_from_br_list(&run_tool(
             "br",
-            &["list", "--status", "closed", "--json"],
+            &["list", "--status", "closed", "--limit", "0", "--json"],
             30,
         )?)?);
         Ok(refs)
@@ -969,7 +971,7 @@ impl Llm for ChainLlm {
     }
 
     fn judge(&self, prompt: &str) -> Result<String, DaemonError> {
-        let r = run_tool("codex", &["exec", "--yolo", "--skip-git-repo-check", prompt], 120);
+        let r = crate::tools::run_tool_in_dir("codex", &["exec", "--yolo", "--skip-git-repo-check", prompt], "/tmp", 120);
         if let Ok(out) = r {
             return Ok(out);
         }
@@ -980,11 +982,11 @@ impl Llm for ChainLlm {
         } else {
             "claude".to_string()
         };
-        let r = run_tool(&claude_bin, &["--dangerously-skip-permissions", "--print", "--setting-sources", "", prompt], 120);
+        let r = crate::tools::run_tool_in_dir(&claude_bin, &["--print", "--setting-sources", "", prompt], "/tmp", 120);
         if let Ok(out) = r {
             return Ok(out);
         }
-        let r = run_tool("agy", &["--dangerously-skip-permissions", "--print", prompt], 120);
+        let r = crate::tools::run_tool_in_dir("agy", &["--print", prompt], "/tmp", 120);
         if let Ok(out) = r {
             return Ok(out);
         }

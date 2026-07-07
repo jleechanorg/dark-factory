@@ -1,4 +1,4 @@
-target_repo = "jleechanorg/worldarchitect.ai"
+target_repo = "jleechanorg/dark-factory"
 base_branch = "main"
 stage = 1
 max_workers = 30

@@ -1,6 +1,7 @@
 # dark-factory roadmap
 
 ## Recent activity (by day)
+- [2026-07-07](activity/2026-07-07.md)
 - [2026-07-06](activity/2026-07-06.md)
 - [2026-07-05](activity/2026-07-05.md)
 
@@ -10,6 +11,23 @@
 - [2026-06-27-factory-runs-the-factory](activity/2026-06-27-factory-runs-the-factory.md) — Adversarial spec-producer mode + mandatory command-line echo contract for /fs and /f
 
 ## Recent activity (rolling)
+
+### 2026-07-07 — PR #188: systemd daemon trigger slice, not E2E proof
+
+- **Opened:** PR [#188](https://github.com/jleechanorg/dark-factory/pull/188)
+  (`565bc99`) for `jleechan-1m4`: Linux `systemd --user` unit + installer,
+  `sd_notify` READY/WATCHDOG support, explicit `ao_project = "worldarchitect"`,
+  and a regression test proving newly-intaken beads dispatch with their real
+  tracker title instead of an empty prompt.
+- **Safety correction applied before PR:** service uses `Restart=on-failure`,
+  `WatchdogSec=7200s`, linger verification, and local CLI PATH coverage rather
+  than unconditional `Restart=always` with a short watchdog window.
+- **Evidence status:** this is a blocker slice only. It does **not** prove
+  label/bead -> daemon intake -> AO worker PR -> gates -> READY/merge. PR #188
+  still had `test` and `skeptic` in progress at the last check; Cursor Bugbot
+  skipped due usage limit, so it is not positive Bugbot evidence.
+- **Beads:** `jleechan-1m4` and `jleechan-nzia` moved to `in_progress`.
+- **Nextsteps:** `roadmap/nextsteps-2026-07-07-af-systemd-pr.md`.
 
 ### 2026-07-06 (takeover correction) — Ratchet sequencing + PR sweep reconciled
 
