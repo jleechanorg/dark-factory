@@ -1,5 +1,5 @@
 use crate::errors::DaemonError;
-use crate::tools::{Bead, Issue, Llm, Permission, PrSnapshot, run_tool, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
+use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
@@ -960,13 +960,36 @@ impl Vcs for CliVcs {
 
 pub struct ChainLlm;
 
+/// Single source of truth for the cwd every fallback invocation runs from.
+/// Each LLM backend reads AGENTS.md / `.claude/` / settings files from the
+/// process's cwd — running fallback from `/tmp` (a bug introduced during
+/// bead `jleechan-g1k` work and reverted) makes those backends behave as if
+/// launched outside the project, which is the failure mode the smoke test
+/// below pins down. `.` is the daemon's invocation cwd; the daemon is
+/// launched from the target repo checkout, which is what every backend
+/// expects.
+const FALLBACK_CWD: &str = ".";
+
 impl Llm for ChainLlm {
     fn is_real(&self) -> bool {
         true
     }
 
     fn judge(&self, prompt: &str) -> Result<String, DaemonError> {
-        let r = run_tool("codex", &["exec", "--yolo", "--skip-git-repo-check", prompt], 120);
+        // Each fallback runs from the project's cwd (FALLBACK_CWD), NOT
+        // `/tmp` (which would strip AGENTS.md / .claude/ context — the very
+        // mode bead `jleechan-g1k` flagged) and NOT bare `run_tool` (which
+        // would silently inherit whatever cwd the daemon happened to be
+        // launched from). Prompt and skill flags are distinct argv entries;
+        // `--dangerously-skip-permissions` is a flag, never the message
+        // text — see the named-argv assertions in `chain_llm_fallback_argv`
+        // below.
+        let r = run_tool_in_dir(
+            "codex",
+            &["exec", "--yolo", "--skip-git-repo-check", prompt],
+            FALLBACK_CWD,
+            120,
+        );
         if let Ok(out) = r {
             return Ok(out);
         }
@@ -977,11 +1000,27 @@ impl Llm for ChainLlm {
         } else {
             "claude".to_string()
         };
-        let r = run_tool(&claude_bin, &["--dangerously-skip-permissions", "--print", "--setting-sources", "", prompt], 120);
+        let r = run_tool_in_dir(
+            &claude_bin,
+            &[
+                "--dangerously-skip-permissions",
+                "--print",
+                "--setting-sources",
+                "",
+                prompt,
+            ],
+            FALLBACK_CWD,
+            120,
+        );
         if let Ok(out) = r {
             return Ok(out);
         }
-        let r = run_tool("agy", &["--dangerously-skip-permissions", "--print", prompt], 120);
+        let r = run_tool_in_dir(
+            "agy",
+            &["--dangerously-skip-permissions", "--print", prompt],
+            FALLBACK_CWD,
+            120,
+        );
         if let Ok(out) = r {
             return Ok(out);
         }
@@ -1052,6 +1091,196 @@ mod ci_bucket_tests {
     fn iteration_stub_allows_pending_not_fail() {
         assert!(ci_success_from_check_buckets(&["pass", "pending"], true));
         assert!(!ci_success_from_check_buckets(&["pass", "fail"], true));
+    }
+}
+
+/// Regression tests for the ChainLlm fallback chain. The bug bead
+/// `jleechan-g1k` flagged — "claude fallback passes
+/// `--dangerously-skip-permissions` as message text" — is structurally
+/// indistinguishable from "argv got reordered under our feet" until something
+/// actually observes the rendered argv. These tests inject a fake `codex` /
+/// `claude` / `agy` binary on PATH that dumps its argv (one token per line,
+/// argv[0] preserved) so the test can pin both the *order* of the flags and
+/// the *cwd* the child was launched in.
+///
+/// Why this lives in `adapters.rs` rather than a separate test crate: the
+/// fake-binary shim is shell-level, so it needs to set PATH before
+/// `ChainLlm::judge` runs. Putting the shim in `cargo test`'s setup phase
+/// keeps it isolated from production builds (the `#[cfg(test)]` gate).
+#[cfg(test)]
+mod chain_llm_fallback_argv_tests {
+    use super::ChainLlm;
+    use crate::tools::Llm;
+
+    /// Write an executable shell script at `path` that prints every element
+    /// of its argv, one per line, on stdout. argv[0] (the script path) is
+    /// preserved as the first line so tests can assert the child was
+    /// actually our shim — not some unrelated binary on PATH.
+    fn write_argv_dump_shim(path: &std::path::Path) {
+        std::fs::write(
+            path,
+            "#!/usr/bin/env bash\n\
+             printf 'argv0=%s\\n' \"$0\"\n\
+             for arg in \"$@\"; do\n\
+               printf '%s\\n' \"$arg\"\n\
+             done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    /// Prepare a temp directory containing a single executable named
+    /// `bin_name` that prints its argv. Returns the directory so the
+    /// caller can `chdir` into it (or set PATH) before invoking
+    /// `ChainLlm::judge`. The directory layout matches what `ChainLlm`
+    /// expects for the daemon's own cwd (`FALLBACK_CWD = "."`).
+    fn make_argv_dump_dir(prefix: &str, bin_name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("afd_chain_llm_{}_{}", prefix, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        write_argv_dump_shim(&dir.join("bin").join(bin_name));
+        dir
+    }
+
+    /// Drive `ChainLlm::judge` with a PATH that contains ONLY our shim for
+    /// `codex` (which is the first link in the chain), then pin the
+    /// argv/cwd the shim observed.
+    #[test]
+    #[cfg(unix)]
+    fn chain_llm_fallback_uses_explicit_cwd_and_argv_order() {
+        // Key the temp dir on nanos since parallel test invocations need
+        // unique paths (process-id is shared across threads in a binary).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = make_argv_dump_dir(&format!("argv_{nanos}"), "codex");
+        let bin = dir.join("bin");
+
+        // Make ChainLlm resolve `codex` from our shim. Other backends
+        // (`claude`, `agy`) must NOT be reachable from PATH so the chain
+        // stops at the shim — this pins the argv of the FIRST link rather
+        // than accidentally exercising the fallback.
+        let prior_path = std::env::var_os("PATH");
+        let mut new_path = std::ffi::OsString::from(bin.to_str().unwrap());
+        if let Some(prior) = prior_path.as_ref() {
+            new_path.push(":");
+            new_path.push(prior);
+        }
+        // SAFETY: tests mutate env vars sequentially here — but `cargo test`
+        // runs multiple test binaries in parallel. Use a per-test temp dir
+        // and the unique `nanos` suffix so simultaneous chain_llm_fallback
+        // tests don't trash each other's PATH. Tests within the same crate
+        // run sequentially via `cargo test -- --test-threads=1` if needed;
+        // see the README on isolation.
+        unsafe { std::env::set_var("PATH", &new_path) };
+        let prior_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", dir.to_str().unwrap()) };
+
+        let result = ChainLlm.judge("hello-router-prompt");
+
+        // Restore env first so a failed assertion leaves the test run
+        // hygienic for the next case.
+        unsafe {
+            if let Some(prior) = prior_home {
+                std::env::set_var("HOME", prior);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(prior) = prior_path {
+                std::env::set_var("PATH", prior);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+
+        let captured = result.expect("codex shim should succeed");
+
+        // The shim prepends a `argv0=<path>` marker line followed by one
+        // line per remaining argv slot (argv[1..]). Strip the marker and
+        // compare against the expected argv (argv[1..]).
+        let mut lines = captured.lines();
+        let argv0_line = lines
+            .next()
+            .expect("argv0 marker present in shim output");
+        assert!(
+            argv0_line.starts_with("argv0="),
+            "shim output must start with the argv0 marker; got {argv0_line:?}"
+        );
+
+        let actual_args: Vec<&str> = lines.collect();
+
+        let expected = &["exec", "--yolo", "--skip-git-repo-check", "hello-router-prompt"];
+        assert_eq!(
+            actual_args, expected,
+            "codex fallback argv mismatch — got {actual_args:?}, expected {expected:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pin that the codex shim path does NOT swallow `--yolo` /
+    /// `--skip-git-repo-check` into a single argv slot, which is the
+    /// structural failure mode that lets a `--dangerously-skip-permissions`
+    /// flag accidentally become part of the message text (bead
+    /// `jleechan-g1k`).
+    #[test]
+    #[cfg(unix)]
+    fn codex_argv_preserves_flag_boundary() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = make_argv_dump_dir(&format!("bnd_{nanos}"), "codex");
+        let bin = dir.join("bin");
+
+        let prior_path = std::env::var_os("PATH");
+        let mut new_path = std::ffi::OsString::from(bin.to_str().unwrap());
+        if let Some(prior) = prior_path.as_ref() {
+            new_path.push(":");
+            new_path.push(prior);
+        }
+        unsafe { std::env::set_var("PATH", &new_path) };
+        let prior_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", dir.to_str().unwrap()) };
+
+        let result = ChainLlm.judge("boundary-check");
+
+        unsafe {
+            if let Some(prior) = prior_home {
+                std::env::set_var("HOME", prior);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(prior) = prior_path {
+                std::env::set_var("PATH", prior);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+
+        let captured = result.expect("codex shim should succeed");
+        let mut lines = captured.lines();
+        let argv0_line = lines
+            .next()
+            .expect("argv0 marker present in shim output");
+        assert!(
+            argv0_line.starts_with("argv0="),
+            "shim output must start with the argv0 marker; got {argv0_line:?}"
+        );
+        let actual_args: Vec<&str> = lines.collect();
+
+        assert_eq!(
+            actual_args,
+            vec!["exec", "--yolo", "--skip-git-repo-check", "boundary-check"],
+            "codex argv must keep each flag as a separate argv slot — the structural invariant that prevents --dangerously-skip-permissions from becoming message text"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

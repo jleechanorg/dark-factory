@@ -621,6 +621,198 @@ fn test_wedge_detection_attested_session_stalled() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// Regression test for bead `jleechan-ubas` ("False-positive PARKED_HUMAN_HELD
+/// with new commits present"). When the AO worker session reports
+/// `is_quiescent=true`, but the PR's remote head SHA has advanced past the
+/// local branch head SHA, the daemon MUST emit
+/// `COMMITS_OBSERVED_AFTER_STALL` and stay in `ATTESTED` instead of
+/// flipping to `HUMAN_HELD`. Without this guard, the verifier would park
+/// beads whose coder sessions were forked/terminated externally (or whose
+/// AO state lost sync with the actual PR progress) even though real commits
+/// were still landing.
+#[test]
+fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "bead-ubas".into(),
+        BeadOverlay {
+            bead_id: "bead-ubas".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 500,
+            spend_usd: 0.0,
+            pr_number: Some(99),
+            branch: Some("factory/bead-ubas-r1".into()),
+            session_id: Some("session-ubas-1".into()),
+        },
+    );
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // PR snapshot's remote head_sha DIFFERS from FakeVcs's local head_sha —
+    // this is the structural difference from the regression-prevention
+    // test below: the bead SHOULD stay ATTESTED, not be parked.
+    scm.pr_snapshots.insert(
+        99,
+        PrSnapshot {
+            pr_number: 99,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            head_sha: "remote-head-advanced".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: now_epoch - 2000,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+        },
+    );
+
+    sessions.quiescent = true; // sessions report dead
+
+    let mut vcs = FakeVcs::new();
+    // Local branch SHA is older than the remote head SHA, signalling that
+    // the daemon's local checkout hasn't been updated but the PR has new
+    // commits on remote.
+    vcs.heads
+        .insert("factory/bead-ubas-r1".into(), "local-head-stale".into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_ubas_commits_observed.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 10).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "remote-ahead bead must NOT be parked (bead jleechan-ubas regression)"
+    );
+
+    let o = store.load("bead-ubas").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Attested,
+        "remote-ahead bead must stay in ATTESTED so the next fast-tier tick \
+         can re-run gate assessment against the live PR state"
+    );
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        logs.contains("COMMITS_OBSERVED_AFTER_STALL"),
+        "telemetry must record the COMMITS_OBSERVED_AFTER_STALL signal: {logs}"
+    );
+    assert!(
+        !logs.contains("\"reason\":\"session_stalled\""),
+        "must NOT emit session_stalled when remote is ahead of local: {logs}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Companion regression test: when the local branch head matches the
+/// remote head SHA, the original "session stalled" park path MUST still
+/// fire (i.e. the ubas guard is a positive guard, not a blanket skip).
+#[test]
+fn test_wedge_detection_still_parks_when_local_matches_remote() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "bead-genuinely-stalled".into(),
+        BeadOverlay {
+            bead_id: "bead-genuinely-stalled".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 500,
+            spend_usd: 0.0,
+            pr_number: Some(101),
+            branch: Some("factory/bead-genuinely-stalled-r1".into()),
+            session_id: Some("session-stuck-1".into()),
+        },
+    );
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let same_sha = "identical-head-no-progress".to_string();
+    scm.pr_snapshots.insert(
+        101,
+        PrSnapshot {
+            pr_number: 101,
+            head_sha: same_sha.clone(),
+            updated_at_epoch: now_epoch - 2000,
+            ci_pending: false,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+        },
+    );
+
+    sessions.quiescent = true;
+
+    let mut vcs = FakeVcs::new();
+    vcs.heads
+        .insert("factory/bead-genuinely-stalled-r1".into(), same_sha);
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_ubas_genuine_stall.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 10).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "matching-SHA + quiescent session MUST still park — the ubas guard \
+         applies only when remote is ahead, not when both sides agree"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 #[test]
 fn test_manual_bead_input_auto_queued_and_dispatched() {
     let scm = FakeScm::new(); // no issues in SCM
