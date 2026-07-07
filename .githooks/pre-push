@@ -10,4 +10,5 @@ command -v git-lfs >/dev/null 2>&1 || {
 }
 
 git lfs pre-push "$@"
+"$(git rev-parse --show-toplevel)/.githooks/pre-push-repro-artifact-guard.sh"
 "$(git rev-parse --show-toplevel)/.githooks/pre-push-graph-audit.sh" "$@"
