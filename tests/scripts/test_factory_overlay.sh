@@ -94,7 +94,7 @@ out="$("$OVERLAY" route-record test-other STANDARD_PATH 2>&1)"
 out="$("$OVERLAY" dispatch-record test-other fix/test-branch 2>&1)"
 rc=$?
 set -e
-assert "dispatch-record rejects duplicate branch" "1" "$rc"
+assert "dispatch-record rejects duplicate branch (rc=4 EX_BRANCH_CONFLICT)" "4" "$rc"
 
 # 10. pr-opened DISPATCHED → ATTESTED
 out="$("$OVERLAY" pr-opened test-roundtrip 7888 https://github.com/jleechanorg/worldarchitect.ai/pull/7888)"
