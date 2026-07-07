@@ -471,33 +471,71 @@ impl StateStore for SqliteStateStore {
     }
 
     fn recover_human_held(&self, max_attempt: u32) -> Result<Vec<BeadOverlay>, DaemonError> {
-        // One round-trip: bump attempt + flip state + zero autonomy_secs in
-        // a single UPDATE; the WHERE clause is the safety net (only HUMAN_HELD
-        // rows under max_attempt are touched). Mirrors the shell
-        // `recover-held` (daemon/factory-overlay.sh:319-333) exactly.
-        self.conn
-            .execute(
-                "UPDATE bead_overlay \
-                 SET state = 'QUEUED', attempt = attempt + 1, autonomy_secs = 0, updated_at = ?1 \
-                 WHERE state = 'HUMAN_HELD' AND attempt < ?2",
-                params![now_iso8601(), max_attempt as i64],
-            )
-            .map_err(|e| tool_err("recover_human_held update", e))?;
-        // Now SELECT the rows we just flipped, so the caller can emit
-        // RECOVERED_FROM_HELD telemetry with prior_state + pr_number.
-        let mut stmt = self
+        // P2 fix (Codex review): the post-UPDATE SELECT must return ONLY the
+        // rows we just flipped — earlier versions matched every QUEUED bead
+        // with autonomy_secs=0 in the DB, polluting recovery telemetry with
+        // beads that were never HUMAN_HELD. Capture the bead_ids first, then
+        // SELECT WHERE bead_id IN (...). rusqlite has no clean RETURNING
+        // support, so two statements + an in-memory id list is the simplest
+        // fix.
+        let mut id_stmt = self
             .conn
             .prepare(
-                "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
-                 pr_number, branch, session_id \
-                 FROM bead_overlay \
-                 WHERE state = 'QUEUED' AND autonomy_secs = 0 AND attempt <= ?1 \
-                 ORDER BY updated_at DESC",
+                "SELECT bead_id FROM bead_overlay \
+                 WHERE state = 'HUMAN_HELD' AND attempt < ?1",
             )
+            .map_err(|e| tool_err("recover_human_held id select prepare", e))?;
+        let recovered_ids: Vec<String> = id_stmt
+            .query_map(params![max_attempt as i64], |row| row.get::<_, String>(0))
+            .map_err(|e| tool_err("recover_human_held id select query", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if recovered_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // P2 fix (Codex review): clear stale PR metadata on requeue.
+        // `pr_number` and `session_id` belong to the prior (failed) attempt
+        // and would otherwise be carried into the new dispatch — `dispatch_ready`
+        // overwrites `branch` but leaves the other fields, so the fast tier
+        // would treat the freshly-DISPATCHED row as already ATTESTED against
+        // the dead PR and re-park on the same gate. `branch` is kept so the
+        // recovered-from telemetry still records what was being worked on;
+        // dispatch will rewrite it on the next attempt.
+        let placeholders = std::iter::repeat("?").take(recovered_ids.len()).collect::<Vec<_>>().join(",");
+        let update_sql = format!(
+            "UPDATE bead_overlay \
+             SET state = 'QUEUED', attempt = attempt + 1, autonomy_secs = 0, \
+                 pr_number = NULL, session_id = NULL, updated_at = ?1 \
+             WHERE bead_id IN ({})",
+            placeholders
+        );
+        let now = now_iso8601();
+        let mut update_params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(recovered_ids.len() + 1);
+        update_params.push(&now);
+        for id in &recovered_ids {
+            update_params.push(id as &dyn rusqlite::ToSql);
+        }
+        self.conn
+            .execute(&update_sql, &update_params[..])
+            .map_err(|e| tool_err("recover_human_held update", e))?;
+        // SELECT the exact rows we just flipped — bounded by the captured
+        // id list, not by state+autonomy heuristics that could match other rows.
+        let select_sql = format!(
+            "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
+             pr_number, branch, session_id \
+             FROM bead_overlay WHERE bead_id IN ({})",
+            placeholders
+        );
+        let mut select_params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(recovered_ids.len());
+        for id in &recovered_ids {
+            select_params.push(id as &dyn rusqlite::ToSql);
+        }
+        let mut stmt = self
+            .conn
+            .prepare(&select_sql)
             .map_err(|e| tool_err("recover_human_held prepare", e))?;
-        let recovered_max = max_attempt as i64 + 1; // rows we just bumped land in [1..max_attempt+1]
         let rows = stmt
-            .query_map(params![recovered_max], |row| {
+            .query_map(&select_params[..], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -991,6 +1029,24 @@ mod tests {
         assert_eq!(below.state, OverlayState::Queued);
         assert_eq!(below.attempt, 3);
         assert_eq!(below.autonomy_secs, 0);
+        // P2 (Codex): stale PR metadata must be cleared on requeue so the
+        // next dispatch doesn't conflate the fresh attempt with the dead PR.
+        assert_eq!(
+            below.pr_number, None,
+            "recover_human_held must clear pr_number to prevent stale-PR churn"
+        );
+        assert_eq!(
+            below.session_id, None,
+            "recover_human_held must clear session_id (belonged to the prior attempt)"
+        );
+        // branch is intentionally preserved so the recovered_from telemetry
+        // can still record what was being worked on; dispatch will rewrite
+        // it on the next attempt.
+        assert_eq!(
+            below.branch.as_deref(),
+            Some("factory/below-r2"),
+            "recover_human_held keeps branch as a stale-attempt breadcrumb"
+        );
 
         // `at-cap` and `over-cap` are still HUMAN_HELD
         let at_cap = store.load("at-cap").unwrap().unwrap();
@@ -1006,6 +1062,69 @@ mod tests {
         assert_eq!(dispatched.autonomy_secs, 100);
         let ready = store.load("ready").unwrap().unwrap();
         assert_eq!(ready.state, OverlayState::Ready);
+    }
+
+    /// P2 (Codex review): `recover_human_held` must return ONLY the rows
+    /// that were actually requeued — not every QUEUED bead with
+    /// `autonomy_secs = 0` (which is what the original heuristic-query did).
+    /// Pre-existing QUEUED beads with `autonomy_secs = 0` would otherwise
+    /// be reported as RECOVERED_FROM_HELD and pollute telemetry + the
+    /// tick summary. Run with a populated QUEUED backlog + a single
+    /// recoverable HUMAN_HELD bead, and assert the returned vec contains
+    /// only the bead we just recovered.
+    #[test]
+    fn recover_human_held_returns_only_rows_actually_recovered() {
+        let schema = include_str!("../contracts/schema.sql");
+        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
+
+        // Pre-existing QUEUED backlog with autonomy_secs=0 (these are
+        // exactly the rows that would have been incorrectly reported as
+        // RECOVERED_FROM_HELD before the fix).
+        for (id, attempt) in [("queued-a", 1), ("queued-b", 2), ("queued-c", 3)] {
+            store
+                .save(&BeadOverlay {
+                    bead_id: id.into(),
+                    state: OverlayState::Queued,
+                    attempt,
+                    reroll_count: 0,
+                    autonomy_secs: 0,
+                    spend_usd: 0.0,
+                    pr_number: None,
+                    branch: None,
+                    session_id: None,
+                })
+                .unwrap();
+        }
+
+        // One recoverable HUMAN_HELD bead.
+        store
+            .save(&BeadOverlay {
+                bead_id: "held-only".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 4321,
+                spend_usd: 0.0,
+                pr_number: Some(7777),
+                branch: Some("factory/held-only-r1".into()),
+                session_id: Some("session-xyz".into()),
+            })
+            .unwrap();
+
+        let recovered = store.recover_human_held(10).unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "only the HUMAN_HELD row should be reported as recovered"
+        );
+        assert_eq!(recovered[0].bead_id, "held-only");
+
+        // Pre-existing QUEUED rows are untouched.
+        for id in ["queued-a", "queued-b", "queued-c"] {
+            let o = store.load(id).unwrap().unwrap();
+            assert_eq!(o.state, OverlayState::Queued, "{id} must stay QUEUED");
+            assert_eq!(o.autonomy_secs, 0, "{id} autonomy_secs unchanged");
+        }
     }
 
     /// jleechan-54ky: `list_active_overlays` returns the active set
