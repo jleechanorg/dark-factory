@@ -123,6 +123,50 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
     }
 }
 
+fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
+    #[derive(serde::Deserialize)]
+    struct GhGqlResponse {
+        data: GhGqlData,
+    }
+    #[derive(serde::Deserialize)]
+    struct GhGqlData {
+        repository: GhGqlRepository,
+    }
+    #[derive(serde::Deserialize)]
+    struct GhGqlRepository {
+        #[serde(rename = "pullRequest")]
+        pull_request: Option<GhGqlPullRequest>,
+    }
+    #[derive(serde::Deserialize)]
+    struct GhGqlPullRequest {
+        #[serde(rename = "reviewThreads")]
+        review_threads: GhGqlReviewThreads,
+    }
+    #[derive(serde::Deserialize)]
+    struct GhGqlReviewThreads {
+        nodes: Vec<GhGqlNode>,
+    }
+    #[derive(serde::Deserialize)]
+    struct GhGqlNode {
+        #[serde(rename = "isResolved")]
+        is_resolved: bool,
+    }
+
+    let json_start = gql_out.find('{').unwrap_or(0);
+    let gql: GhGqlResponse = serde_json::from_str(&gql_out[json_start..]).map_err(|e| {
+        DaemonError::Parse(format!("failed to parse gh graphql JSON: {e}"))
+    })?;
+    let pr_data = gql.data.repository.pull_request.ok_or_else(|| {
+        DaemonError::Parse("gh graphql response omitted pullRequest".into())
+    })?;
+    Ok(pr_data
+        .review_threads
+        .nodes
+        .iter()
+        .filter(|n| !n.is_resolved)
+        .count() as u32)
+}
+
 pub struct CliScm {
     pub repo: String,
     labeled_issues_cache: Mutex<HashMap<String, (Vec<Issue>, Instant)>>,
@@ -600,7 +644,7 @@ impl Scm for CliScm {
               }
             }
         }";
-        let gql_out = match run_tool(
+        let gql_out = run_tool(
             "gh",
             &[
                 "api",
@@ -615,48 +659,8 @@ impl Scm for CliScm {
                 &format!("query={query}"),
             ],
             30,
-        ) {
-            Ok(out) => out,
-            Err(_) => {
-                // REST Fallback: return dummy JSON representing 0 unresolved threads!
-                r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}"#.to_string()
-            }
-        };
-        #[derive(serde::Deserialize)]
-        struct GhGqlResponse {
-            data: GhGqlData,
-        }
-        #[derive(serde::Deserialize)]
-        struct GhGqlData {
-            repository: GhGqlRepository,
-        }
-        #[derive(serde::Deserialize)]
-        struct GhGqlRepository {
-            #[serde(rename = "pullRequest")]
-            pull_request: Option<GhGqlPullRequest>,
-        }
-        #[derive(serde::Deserialize)]
-        struct GhGqlPullRequest {
-            #[serde(rename = "reviewThreads")]
-            review_threads: GhGqlReviewThreads,
-        }
-        #[derive(serde::Deserialize)]
-        struct GhGqlReviewThreads {
-            nodes: Vec<GhGqlNode>,
-        }
-        #[derive(serde::Deserialize)]
-        struct GhGqlNode {
-            #[serde(rename = "isResolved")]
-            is_resolved: bool,
-        }
-        let json_start_g = gql_out.find('{').unwrap_or(0);
-        let gql: GhGqlResponse = serde_json::from_str(&gql_out[json_start_g..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse gh graphql JSON: {e}"))
-        })?;
-        let mut unresolved_thread_count = 0;
-        if let Some(pr_data) = gql.data.repository.pull_request {
-            unresolved_thread_count = pr_data.review_threads.nodes.iter().filter(|n| !n.is_resolved).count() as u32;
-        }
+        )?;
+        let unresolved_thread_count = unresolved_thread_count_from_gql(&gql_out)?;
 
         let pr_comments = view.comments.into_iter().map(|c| crate::tools::PrComment {
             author: c.author.login,
@@ -1073,7 +1077,7 @@ pub fn ci_success_from_check_buckets(buckets: &[&str], iteration_stub: bool) -> 
 
 #[cfg(test)]
 mod external_ref_tests {
-    use super::parse_external_refs_from_br_list;
+    use super::{parse_external_refs_from_br_list, unresolved_thread_count_from_gql};
 
     #[test]
     fn fetch_all_external_refs_includes_closed_beads() {
@@ -1088,6 +1092,59 @@ mod external_ref_tests {
         assert_eq!(refs.len(), 2);
         assert!(refs.contains("owner/repo#1"));
         assert!(refs.contains("jleechanorg/worldarchitect.ai#8171"));
+    }
+
+    #[test]
+    fn graphql_thread_count_counts_unresolved_threads() {
+        let json = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {"isResolved": true},
+                                {"isResolved": false},
+                                {"isResolved": false}
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let count = unresolved_thread_count_from_gql(json).unwrap();
+
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn graphql_thread_count_parse_error_is_not_faked_as_zero() {
+        let err = unresolved_thread_count_from_gql("gh: GraphQL API rate limit exceeded")
+            .expect_err("invalid GraphQL output must fail closed");
+
+        assert!(
+            matches!(err, crate::errors::DaemonError::Parse(_)),
+            "expected parse error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn graphql_thread_count_missing_pull_request_is_not_faked_as_zero() {
+        let json = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": null
+                }
+            }
+        }"#;
+
+        let err = unresolved_thread_count_from_gql(json)
+            .expect_err("missing pullRequest must fail closed");
+
+        assert!(
+            matches!(err, crate::errors::DaemonError::Parse(_)),
+            "expected parse error, got {err:?}"
+        );
     }
 }
 
@@ -1346,4 +1403,3 @@ mod chain_llm_fallback_argv_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
-
