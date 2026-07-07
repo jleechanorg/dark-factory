@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Deterministic /af one tick: intake + recover + AO dispatch for drive-existing-pr beads.
-# The tick ends with a single, idempotent merge/ready step (auto-merge-guard.sh)
-# so the zero-touch label→green→merge path has an automatic caller for the
-# cutover X4 merge authority. AUTO_MERGE_DISABLED=1 silences the guard for the
-# single-writer guarantee during cutover (docs/cutover-exit-criteria.md X7).
+# The tick ends with a READY scheduling step (ready-scheduler.sh) that closes
+# Blocker #7 from docs/factory-goal-gap-review-2026-07-06.md WITHOUT taking
+# the merge side effect: the 7-green pre-merge checks are not yet enforceable
+# (gate 6 /er has no automated runner — bead jleechan-qqq still open), so we
+# transition beads to READY only and leave the actual merge to a future
+# authority that has the full 7-green evidence. READY scheduler is opt-out via
+# READY_SCHEDULER_DISABLED=1 (mirrors cutover X7's single-writer pattern).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export BR_DB="${BR_DB:-$ROOT/.beads/beads.db}"
@@ -11,11 +14,11 @@ br() { command br --db "$BR_DB" "$@"; }
 O="$ROOT/daemon/factory-overlay.sh"
 I="$ROOT/daemon/factory-intake-from-gh.sh"
 R="$ROOT/daemon/factory-ao-remediate.sh"
-G="$ROOT/daemon/scripts/auto-merge-guard.sh"
+G="$ROOT/daemon/scripts/ready-scheduler.sh"
 DB="${AFD_DB:-$HOME/.dark-factory/daemon-cxdb.sqlite}"
 LOG="${AFD_LOG:-$HOME/Library/Logs/dark-factory/daemon.jsonl}"
 MAX_DISPATCH="${MAX_DISPATCH:-2}"
-AUTO_MERGE_DISABLED="${AUTO_MERGE_DISABLED:-0}"
+READY_SCHEDULER_DISABLED="${READY_SCHEDULER_DISABLED:-0}"
 
 TARGET_PRS=""
 args=("$@")
@@ -127,15 +130,16 @@ done < <(sqlite3 "$DB" -separator $'\t' \
 echo "af_dispatched=$dispatched"
 callpath run dark-factory ${1+"$@"} 2>/dev/null || true
 
-# --- Merge/Ready step -----------------------------------------------------
-# Single automatic caller for the merge authority. The guard is the only
-# entity permitted to issue `gh pr merge` on a factory/* branch; coder and
-# reviewer sessions never invoke it. AUTO_MERGE_DISABLED=1 silences it for
-# cutover X7's single-writer guarantee.
+# --- READY scheduling step ------------------------------------------------
+# Block on jleechan-s3c / Blocker #7: gives the factory an automatic caller
+# for the READY transition (no `gh pr merge`). Merge authority stays with
+# the human operator until the 7-green gate is enforceable (jleechan-qqq).
+# READY_SCHEDULER_DISABLED=1 silences the scheduler for the cutover X7
+# single-writer pattern.
 # ---------------------------------------------------------------------------
-if [ -x "$G" ] && [ "$AUTO_MERGE_DISABLED" != "1" ]; then
-  echo "[af] merge/ready step: auto-merge-guard.sh (AFD_LOG=$LOG)"
-  AFD_LOG="$LOG" bash "$G" 2>&1 || echo "[af] auto-merge-guard.sh exited non-zero (continuing)"
+if [ -x "$G" ] && [ "$READY_SCHEDULER_DISABLED" != "1" ]; then
+  echo "[af] ready scheduling step: ready-scheduler.sh (AFD_LOG=$LOG)"
+  AFD_LOG="$LOG" bash "$G" 2>&1 || echo "[af] ready-scheduler.sh exited non-zero (continuing)"
 else
-  echo "[af] merge/ready step: SKIPPED (AUTO_MERGE_DISABLED=$AUTO_MERGE_DISABLED guard_present=$([ -x "$G" ] && echo 1 || echo 0))"
+  echo "[af] ready scheduling step: SKIPPED (READY_SCHEDULER_DISABLED=$READY_SCHEDULER_DISABLED scheduler_present=$([ -x "$G" ] && echo 1 || echo 0))"
 fi

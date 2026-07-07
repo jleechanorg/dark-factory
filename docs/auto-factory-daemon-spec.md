@@ -270,23 +270,25 @@ All existing operator policies bind the daemon:
 *   **Token expenditure monitoring:** Per-bead token spend is tracked in CXDB as a monitoring metric (sum of coder tokens + reviewer chain tokens across all attempts). The daemon emits a warning to telemetry at 80% of a configurable per-bead token budget. This is a **monitoring-only** metric in Stage 1/2; it does not gate execution, since the 3hr time-box and circuit-breaker already bound runaway cost. The metric exists to inform budget decisions and detect cost anomalies before they become operator surprises.
 *   **Force-push: never.** Re-rolls create fresh branches.
 *   **Branch deletion:** Only refs in the daemon's own creation registry.
-*   **Merge: gated via `auto-merge-guard.sh` (no-red policy).** Merge authority
-    is concentrated in ONE policy engine — the auto-merge-guard — and is never
-    invoked by a coder or reviewer session. Terminal states are
-    `READY_FOR_MERGE` (all gates red-free, merge attempted by the guard) or
-    `HUMAN_HELD` (guard refused; reason recorded). The guard enforces, per
-    pass: (a) every CI check has concluded and none `failed`, (b) the latest
-    `GATE_ASSESSMENT` carries no `red` gate (`unknown` is permitted — it is
-    the honest signal that an infra gate such as CodeRabbit/Bugbot was
-    quota-walled and never blocked on; requiring literal `all_green=true`
-    would deadlock the factory on a quota wall), (c) the per-hour merge
-    budget is not exhausted (cascade blast-radius cap, default 8/hr). The
-    spec's earlier "Merge: never." clause is reconciled with cutover
-    exit-criterion **X4** (`docs/cutover-exit-criteria.md`): the daemon does
-    not perform the merge, but the **factory** does — through the guard —
-    on a no-red, race-bound call. Single-writer guarantee during cutover:
-    `AUTO_MERGE_DISABLED=1` silences the guard so the verifier tier has the
-    daemon.jsonl to itself (cutover X7).
+*   **Merge: blocked on policy.** The factory MUST NOT call `gh pr merge`
+    on any PR until the 7-green pre-merge checks are enforceable
+    end-to-end. Today that is **not the case** — gate 6 (`/er`) has no
+    automated runner (see bead `jleechan-qqq`). What the factory does do,
+    per pass over open `factory/*` PRs, is run
+    `daemon/scripts/ready-scheduler.sh`: it evaluates the latest
+    `GATE_ASSESSMENT`, requires no `red` gate AND every one of the seven
+    required gates to be accounted for (green OR unknown — `unknown` is
+    the honest signal for an infra quota-wall and is not a failure), then
+    transitions the bead overlay to `READY` via
+    `factory-overlay.sh:ready` and stamps the gate-evidence JSON onto a
+    sidecar at `daemon/.ready-evidence/<pr>.json`. The READY transition is
+    a **scheduling** action with **no merge side effect**: it does not
+    call `gh pr merge`, does not close the bead, and does not mutate the
+    PR. The merge is left to a future authority that has the full 7-green
+    evidence (human today; auto-merge-guard re-enabled only after
+    `jleechan-qqq` lands). Single-writer guarantee during cutover:
+    `READY_SCHEDULER_DISABLED=1` silences the scheduler so the verifier
+    tier has `daemon.jsonl` to itself (cutover X7).
 *   **Holdout isolation:** Sanitized environments and holdout-leak screens remain active.
 
 #### 4.2.9 Two-Stage Pilot Deployment
