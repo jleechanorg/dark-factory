@@ -24,6 +24,7 @@ mod common;
 
 use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker, FakeVcs};
 use daemon::config::Config;
+use daemon::er_runner;
 use daemon::errors::DaemonError;
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
@@ -1605,6 +1606,10 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
         summary.beads_recovered_from_held, 0,
         "beads at or above the cap must NOT be recovered"
     );
+    assert_eq!(
+        summary.beads_escalated, 2,
+        "beads at or above the cap must be explicitly escalated"
+    );
 
     let cap = store.load("bead-held-cap").unwrap().unwrap();
     assert_eq!(
@@ -1620,6 +1625,517 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
         !log.contains("RECOVERED_FROM_HELD"),
         "no RECOVERED_FROM_HELD events must be emitted when both beads are at/above the cap; got: {log}"
     );
+    assert_eq!(
+        log.matches("ESCALATION_REQUIRED").count(),
+        2,
+        "both capped HUMAN_HELD beads must emit escalation telemetry; got: {log}"
+    );
+    assert!(
+        log.contains("human_held_recovery_attempt_cap_reached"),
+        "escalation telemetry must name the recovery cap; got: {log}"
+    );
+    let first_comment_count = {
+        let tracker_calls = tracker.calls.borrow();
+        assert!(
+            tracker_calls.iter().any(|call| {
+                call.contains("comment_external(owner/repo#9001,")
+                    && call.contains("Escalation required")
+            }),
+            "at-cap PR must receive an escalation comment; calls: {tracker_calls:?}"
+        );
+        tracker_calls
+            .iter()
+            .filter(|call| call.contains("Escalation required"))
+            .count()
+    };
+    let summary2 = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        2,
+        0,
+    )
+    .expect("second tick should not repeat capped HUMAN_HELD escalation");
+    assert_eq!(
+        summary2.beads_escalated, 0,
+        "already-escalated HUMAN_HELD beads must not emit again"
+    );
+    let second_comment_count = tracker
+        .calls
+        .borrow()
+        .iter()
+        .filter(|call| call.contains("Escalation required"))
+        .count();
+    assert_eq!(
+        second_comment_count, first_comment_count,
+        "second tick must not post duplicate escalation comments"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn capped_human_held_comment_failure_retries_before_recording_escalation() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "bead-held-retry".into(),
+        BeadOverlay {
+            bead_id: "bead-held-retry".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 10,
+            reroll_count: 0,
+            autonomy_secs: 7,
+            spend_usd: 0.0,
+            pr_number: Some(9003),
+            branch: Some("factory/bead-held-retry-r10".into()),
+            session_id: None,
+        },
+    );
+    *tracker.fail_next_comment.borrow_mut() = Some("transient comment failure".into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_recover_human_held_retry_comment.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 0).expect("comment failure should not abort tick");
+    assert_eq!(
+        summary.beads_escalated, 0,
+        "failed notification must not record a completed escalation"
+    );
+    assert!(
+        store
+            .load_rejection("bead-held-retry", u32::MAX)
+            .unwrap()
+            .is_none(),
+        "sentinel must stay absent so the next tick retries notification"
+    );
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("ESCALATION_NOTIFICATION_FAILED"),
+        "notification failure must be visible in telemetry; got: {log}"
+    );
+
+    let summary2 = run_tick(&deps, 2, 0).expect("second tick should retry escalation");
+    assert_eq!(summary2.beads_escalated, 1);
+    assert!(
+        store
+            .load_rejection("bead-held-retry", u32::MAX)
+            .unwrap()
+            .is_some(),
+        "sentinel must be recorded after successful retry"
+    );
+    let comment_count = tracker
+        .calls
+        .borrow()
+        .iter()
+        .filter(|call| call.contains("comment_external(owner/repo#9003,"))
+        .count();
+    assert_eq!(comment_count, 2, "second tick must retry the failed comment");
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalation() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "bead-held-fallback".into(),
+        BeadOverlay {
+            bead_id: "bead-held-fallback".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 10,
+            reroll_count: 0,
+            autonomy_secs: 7,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-held-fallback-r10".into()),
+            session_id: None,
+        },
+    );
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "bead-held-fallback".into(),
+        title: "held fallback".into(),
+        description: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#9004".into()),
+    });
+    *tracker.fail_next_fetch_candidates.borrow_mut() =
+        Some("transient candidate lookup failure".into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_recover_human_held_retry_lookup.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 0).expect("lookup failure should not abort tick");
+    assert_eq!(summary.beads_escalated, 0);
+    assert!(
+        store
+            .load_rejection("bead-held-fallback", u32::MAX)
+            .unwrap()
+            .is_none(),
+        "sentinel must stay absent when the fallback target lookup fails"
+    );
+
+    let summary2 = run_tick(&deps, 2, 0).expect("second tick should retry lookup and comment");
+    assert_eq!(summary2.beads_escalated, 1);
+    assert!(
+        store
+            .load_rejection("bead-held-fallback", u32::MAX)
+            .unwrap()
+            .is_some(),
+        "sentinel must be recorded only after fallback comment succeeds"
+    );
+    let calls = tracker.calls.borrow();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.contains("comment_external(owner/repo#9004,")),
+        "retry must post to the fallback external_ref; calls: {calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn capped_human_held_missing_comment_target_does_not_record_escalation() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "bead-held-missing-target".into(),
+        BeadOverlay {
+            bead_id: "bead-held-missing-target".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 10,
+            reroll_count: 0,
+            autonomy_secs: 7,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-held-missing-target-r10".into()),
+            session_id: None,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_recover_human_held_missing_target.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 0).expect("missing target should not abort tick");
+    assert_eq!(summary.beads_escalated, 0);
+    assert!(
+        store
+            .load_rejection("bead-held-missing-target", u32::MAX)
+            .unwrap()
+            .is_none(),
+        "sentinel must stay absent until an operator-facing target exists"
+    );
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("ESCALATION_NOTIFICATION_FAILED"),
+        "missing notification target must be visible in telemetry; got: {log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass skeptic green".into()));
+    let store = QdwAttemptStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    store.inner.overlays.borrow_mut().insert(
+        "er-capped-unknown".into(),
+        BeadOverlay {
+            bead_id: "er-capped-unknown".into(),
+            state: OverlayState::Attested,
+            attempt: 4,
+            reroll_count: 0,
+            autonomy_secs: 120,
+            spend_usd: 0.0,
+            pr_number: Some(9101),
+            branch: Some("factory/er-capped-unknown-r4".into()),
+            session_id: Some("session-er-capped".into()),
+        },
+    );
+    store
+        .inner
+        .branches
+        .borrow_mut()
+        .push("factory/er-capped-unknown-r4".into());
+    store.inner.branch_beads.borrow_mut().insert(
+        "factory/er-capped-unknown-r4".into(),
+        "er-capped-unknown".into(),
+    );
+    store
+        .er_attempts
+        .borrow_mut()
+        .insert("er-capped-unknown".into(), (er_runner::MAX_ER_RUNNER_ATTEMPTS, Some(1)));
+
+    scm.pr_snapshots.insert(
+        9101,
+        PrSnapshot {
+            pr_number: 9101,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            head_sha: "head9101".into(),
+            body: String::new(),
+            comments: Vec::new(),
+            files: Vec::new(),
+            updated_at_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            ci_status: "green".into(),
+            coderabbit_status: "green".into(),
+            ci_pending: false,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_er_capped_unknown_escalates.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("unknown-only capped /er report should escalate without aborting tick");
+
+    assert_eq!(summary.gates_assessed, 1);
+    assert_eq!(summary.beads_escalated, 1);
+    assert_eq!(summary.beads_parked_human_held, 1);
+    let overlay = store.load("er-capped-unknown").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::HumanHeld,
+        "capped Unknown-only gate report is parked for inspection"
+    );
+    assert_eq!(
+        overlay.attempt, 10,
+        "capped /er escalation must park at the HUMAN_HELD recovery cap so recovery cannot churn it"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("ER_RUNNER_CAPPED"),
+        "runner cap must be recorded; telemetry was:\n{telemetry}"
+    );
+    assert!(
+        telemetry.contains("ESCALATION_REQUIRED")
+            && telemetry.contains("unknown_only_gate_report_with_er_runner_capped"),
+        "Unknown-only capped gate report must emit explicit escalation; telemetry was:\n{telemetry}"
+    );
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls.iter().any(|call| {
+            call.contains("comment_external(owner/repo#9101,")
+                && call.contains("Escalation required")
+        }),
+        "PR must receive an escalation comment; calls: {tracker_calls:?}"
+    );
+    let first_comment_count = tracker_calls
+        .iter()
+        .filter(|call| call.contains("Escalation required"))
+        .count();
+    drop(tracker_calls);
+
+    let summary2 = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("second tick should not recover or repeat capped /er escalation");
+    assert_eq!(summary2.beads_recovered_from_held, 0);
+    assert_eq!(
+        summary2.beads_escalated, 0,
+        "already-escalated capped /er bead must not emit again through HUMAN_HELD recovery"
+    );
+    let second_comment_count = tracker
+        .calls
+        .borrow()
+        .iter()
+        .filter(|call| call.contains("Escalation required"))
+        .count();
+    assert_eq!(
+        second_comment_count, first_comment_count,
+        "second tick must not post duplicate capped /er escalation comments"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass skeptic green".into()));
+    let store = QdwAttemptStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    store.inner.overlays.borrow_mut().insert(
+        "er-capped-retry".into(),
+        BeadOverlay {
+            bead_id: "er-capped-retry".into(),
+            state: OverlayState::Attested,
+            attempt: 4,
+            reroll_count: 0,
+            autonomy_secs: 120,
+            spend_usd: 0.0,
+            pr_number: Some(9102),
+            branch: Some("factory/er-capped-retry-r4".into()),
+            session_id: Some("session-er-capped-retry".into()),
+        },
+    );
+    store
+        .inner
+        .branches
+        .borrow_mut()
+        .push("factory/er-capped-retry-r4".into());
+    store.inner.branch_beads.borrow_mut().insert(
+        "factory/er-capped-retry-r4".into(),
+        "er-capped-retry".into(),
+    );
+    store
+        .er_attempts
+        .borrow_mut()
+        .insert("er-capped-retry".into(), (er_runner::MAX_ER_RUNNER_ATTEMPTS, Some(1)));
+    *tracker.fail_next_comment.borrow_mut() = Some("transient comment failure".into());
+
+    scm.pr_snapshots.insert(9102, qdw_green_snapshot(9102, Vec::new()));
+
+    let telemetry_log = std::env::temp_dir().join("afd_er_capped_unknown_retry_comment.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 0, 0).expect("comment failure should not abort tick");
+    assert_eq!(summary.beads_escalated, 0);
+    assert_eq!(summary.beads_parked_human_held, 0);
+    let overlay = store.load("er-capped-retry").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::Attested);
+    assert_eq!(overlay.attempt, 4);
+    assert!(
+        store
+            .load_rejection("er-capped-retry", u32::MAX)
+            .unwrap()
+            .is_none(),
+        "sentinel must stay absent after failed notification"
+    );
+
+    let summary2 = run_tick(&deps, 1, 0).expect("second tick should retry and park");
+    assert_eq!(summary2.beads_escalated, 1);
+    assert_eq!(summary2.beads_parked_human_held, 1);
+    let overlay = store.load("er-capped-retry").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(overlay.attempt, 10);
+    assert!(
+        store
+            .load_rejection("er-capped-retry", u32::MAX)
+            .unwrap()
+            .is_some(),
+        "sentinel must be recorded after successful retry"
+    );
+    let comment_count = tracker
+        .calls
+        .borrow()
+        .iter()
+        .filter(|call| call.contains("comment_external(owner/repo#9102,"))
+        .count();
+    assert_eq!(comment_count, 2, "second tick must retry the failed comment");
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
@@ -2520,6 +3036,13 @@ impl StateStore for QdwAttemptStore {
 
     fn recover_human_held(&self, max_attempt: u32) -> Result<Vec<BeadOverlay>, DaemonError> {
         self.inner.recover_human_held(max_attempt)
+    }
+
+    fn human_held_at_or_above_attempt(
+        &self,
+        max_attempt: u32,
+    ) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.inner.human_held_at_or_above_attempt(max_attempt)
     }
 
     fn save_rejection(

@@ -58,6 +58,9 @@ pub struct TickSummary {
     /// Beads that the automated HUMAN_HELD exit requeued back to QUEUED
     /// this tick (jleechan-gib: Rust port of shell `recover-held`).
     pub beads_recovered_from_held: usize,
+    /// Beads that reached an automation cap and now require explicit
+    /// operator/escalation attention instead of silent indefinite retry.
+    pub beads_escalated: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -67,6 +70,8 @@ pub struct TickSummary {
 /// above this cap are deliberately left in HUMAN_HELD for a human to
 /// review — the daemon stops blindly retrying past this point.
 const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
+const ESCALATION_REVIEWER: &str = "dark-factory-escalation";
+const ESCALATION_SENTINEL_ATTEMPT: u32 = u32::MAX;
 
 /// Result of looking up CI-pending state for an active overlay (used by the
 /// autonomy/timebox bookkeeping in `run_tick`'s active-overlay loop).
@@ -448,6 +453,7 @@ pub fn run_tick(
             "beadsReady": summary.beads_ready,
             "beadsParkedHumanHeld": summary.beads_parked_human_held,
             "beadsRecoveredFromHeld": summary.beads_recovered_from_held,
+            "beadsEscalated": summary.beads_escalated,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
@@ -477,6 +483,53 @@ fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), D
             serde_json::json!({}),
             serde_json::json!({
                 "prior_state": OverlayState::HumanHeld.as_str(),
+                "pr_number": overlay.pr_number,
+                "branch": overlay.branch,
+            }),
+        )?;
+    }
+    for overlay in deps
+        .store
+        .human_held_at_or_above_attempt(MAX_HUMAN_HELD_RECOVERY_ATTEMPT)?
+    {
+        if escalation_already_recorded(deps, &overlay.bead_id)? {
+            continue;
+        }
+        let comment_body = format!(
+            "🤖 **[dark-factory]** Escalation required: bead `{}` is HUMAN_HELD at attempt {} (max automated recovery attempts: {}). Automation will not silently requeue it again.",
+            overlay.bead_id, overlay.attempt, MAX_HUMAN_HELD_RECOVERY_ATTEMPT
+        );
+        if let Err(err) = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body) {
+            emit(
+                deps.telemetry_log,
+                &overlay.bead_id,
+                overlay.attempt,
+                OverlayState::HumanHeld.as_str(),
+                "ESCALATION_NOTIFICATION_FAILED",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "reason": "human_held_recovery_attempt_cap_reached",
+                    "error": err.to_string(),
+                }),
+            )?;
+            continue;
+        }
+        record_escalation(
+            deps,
+            &overlay.bead_id,
+            "human_held_recovery_attempt_cap_reached",
+        )?;
+        summary.beads_escalated += 1;
+        emit(
+            deps.telemetry_log,
+            &overlay.bead_id,
+            overlay.attempt,
+            OverlayState::HumanHeld.as_str(),
+            "ESCALATION_REQUIRED",
+            serde_json::json!({}),
+            serde_json::json!({
+                "reason": "human_held_recovery_attempt_cap_reached",
+                "max_attempt": MAX_HUMAN_HELD_RECOVERY_ATTEMPT,
                 "pr_number": overlay.pr_number,
                 "branch": overlay.branch,
             }),
@@ -1036,6 +1089,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // runner just emitted. Only fall back to the snapshot when the
         // runner DIDN'T post (cooldown/capped/already-present/no-op).
         let mut posted_verdict: Option<verifier::ErVerdict> = None;
+        let mut er_runner_capped_count: Option<u32> = None;
         match runner_outcome {
             crate::er_runner::Outcome::Posted { verdict, count } => {
                 posted_verdict = Some(verdict);
@@ -1085,6 +1139,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 )?;
             }
             crate::er_runner::Outcome::Capped { count } => {
+                er_runner_capped_count = Some(count);
                 emit(
                     deps.telemetry_log,
                     bead_id,
@@ -1160,6 +1215,56 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 })
                 .collect();
             if red_reasons.is_empty() {
+                if let Some(count) = er_runner_capped_count {
+                    if escalation_already_recorded(deps, bead_id)? {
+                        continue;
+                    }
+                    let comment_body = format!(
+                        "🤖 **[dark-factory]** Escalation required: gate assessment is still Unknown-only after {} automated /er attempts. Automation parked bead `{}` HUMAN_HELD at the recovery cap for inspection rather than silently churning.",
+                        count, bead_id
+                    );
+                    if let Err(err) = post_scm_comment_by_bead_id(deps, bead_id, &comment_body) {
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Attested.as_str(),
+                            "ESCALATION_NOTIFICATION_FAILED",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "unknown_only_gate_report_with_er_runner_capped",
+                                "er_runner_attempts": count,
+                                "pr_number": pr,
+                                "error": err.to_string(),
+                            }),
+                        )?;
+                        continue;
+                    }
+                    overlay.state = OverlayState::HumanHeld;
+                    overlay.attempt = MAX_HUMAN_HELD_RECOVERY_ATTEMPT;
+                    deps.store.save(&overlay)?;
+                    record_escalation(
+                        deps,
+                        bead_id,
+                        "unknown_only_gate_report_with_er_runner_capped",
+                    )?;
+                    summary.beads_escalated += 1;
+                    summary.beads_parked_human_held += 1;
+                    emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_REQUIRED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "unknown_only_gate_report_with_er_runner_capped",
+                            "er_runner_attempts": count,
+                            "pr_number": pr,
+                        }),
+                    )?;
+                    continue;
+                }
                 emit(
                     deps.telemetry_log,
                     bead_id,
@@ -1302,6 +1407,30 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     Ok(())
 }
 
+fn escalation_already_recorded(deps: &TickDeps, bead_id: &str) -> Result<bool, DaemonError> {
+    Ok(matches!(
+        deps.store
+            .load_rejection(bead_id, ESCALATION_SENTINEL_ATTEMPT)?,
+        Some((reviewer, _)) if reviewer == ESCALATION_REVIEWER
+    ))
+}
+
+fn record_escalation(
+    deps: &TickDeps,
+    bead_id: &str,
+    reason: &str,
+) -> Result<(), DaemonError> {
+    deps
+        .store
+        .save_rejection(
+            bead_id,
+            ESCALATION_SENTINEL_ATTEMPT,
+            ESCALATION_REVIEWER,
+            reason,
+            reason,
+        )
+}
+
 fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
     let parts: Vec<&str> = external_ref.split('#').collect();
     if parts.len() == 2 {
@@ -1316,19 +1445,19 @@ fn post_scm_comment_by_bead_id(
     bead_id: &str,
     body: &str,
 ) -> Result<(), DaemonError> {
-    if let Ok(Some(overlay)) = deps.store.load(bead_id) {
+    if let Some(overlay) = deps.store.load(bead_id)? {
         if let Some(pr) = overlay.pr_number {
             let ext_ref = format!("{}#{}", deps.cfg.target_repo, pr);
-            let _ = deps.tracker.comment_external(&ext_ref, body);
-            return Ok(());
+            return deps.tracker.comment_external(&ext_ref, body);
         }
     }
-    if let Ok(candidates) = deps.tracker.fetch_candidates() {
-        if let Some(bead) = candidates.iter().find(|b| b.id == bead_id) {
-            if let Some(ref ext_ref) = bead.external_ref {
-                let _ = deps.tracker.comment_external(ext_ref, body);
-            }
+    let candidates = deps.tracker.fetch_candidates()?;
+    if let Some(bead) = candidates.iter().find(|b| b.id == bead_id) {
+        if let Some(ref ext_ref) = bead.external_ref {
+            return deps.tracker.comment_external(ext_ref, body);
         }
     }
-    Ok(())
+    Err(DaemonError::Config(format!(
+        "no SCM comment target found for bead {bead_id}"
+    )))
 }
