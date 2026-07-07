@@ -58,7 +58,17 @@ if [ -n "$TARGET_PRS" ]; then
   pr_sql_filter="AND pr_number IN ($(echo "$TARGET_PRS" | tr ',' ' ' | awk '{for(i=1;i<=NF;i++) printf "%s%s", (i>1?",":""), $i}'))"
 fi
 
+bead_filter=""
+if [ -n "${AFD_BEAD_FILTER:-}" ]; then
+  bead_filter_sql="$(echo "$AFD_BEAD_FILTER" | tr ' ' ',' | awk 'BEGIN{FS=OFS=","} {for(i=1;i<=NF;i++) printf "%s\047%s\047", (i==1?"":","), $i}')"
+  bead_filter="AND bead_id IN ($bead_filter_sql)"
+else
+  bead_filter="AND bead_id IN ('jleechan-9byt.4','jleechan-93ft','jleechan-7re5')"
+fi
+
 dispatched=0
+ERR_TMP="$(mktemp -t af_dispatch_err.XXXXXX)"
+trap 'rm -f "$ERR_TMP"' EXIT
 while IFS=$'\t' read -r bead_id pr branch; do
   [ -n "$bead_id" ] || continue
   [ "$dispatched" -ge "$MAX_DISPATCH" ] && break
@@ -68,7 +78,34 @@ while IFS=$'\t' read -r bead_id pr branch; do
   fi
   echo "[af] remediate $bead_id PR #$pr"
   if bash "$R" "$bead_id" "$pr" 2>&1; then
-    sqlite3 "$DB" "UPDATE bead_overlay SET state='DISPATCHED', updated_at='$(date -u +%Y-%m-%dT%H:%M:%SZ)' WHERE bead_id='$(printf "%s" "$bead_id" | sed "s/'/''/g")';" 2>/dev/null || true
+    cur_state="$(sqlite3 "$DB" "SELECT state FROM bead_overlay WHERE bead_id='$(printf "%s" "$bead_id" | sed "s/'/''/g")';" 2>/dev/null || true)"
+    if [ "$cur_state" = "QUEUED" ]; then
+      if [ -n "$branch" ]; then
+        "$O" route-record "$bead_id" STANDARD_PATH "drive-existing-pr" 2>/dev/null || true
+      fi
+      if "$O" dispatch-record "$bead_id" "$branch" 2>"$ERR_TMP"; then
+        :
+      else
+        err="$(cat "$ERR_TMP" 2>/dev/null || true)"
+        case "$err" in
+          *over\ capacity*)
+            cur_cap="$("$O" capacity 2>/dev/null || echo 0)"
+            echo "[af] over capacity — skip $bead_id (capacity=$cur_cap)" >&2
+            ;;
+          *already\ registered*)
+            owner="$(printf '%s' "$err" | sed -n 's/.*already registered to //p')"
+            echo "[af] branch conflict $branch owned by $owner — skip $bead_id" >&2
+            ;;
+          *expected\ one\ of:*)
+            echo "[af] dispatch-record refused for $bead_id (state=$cur_state not QUEUED): $err" >&2
+            ;;
+          *)
+            echo "[af] dispatch-record refused for $bead_id: $err" >&2
+            ;;
+        esac
+        continue
+      fi
+    fi
     dispatched=$((dispatched + 1))
   else
     echo "[af] skip $bead_id (ao spawn failed)" >&2
@@ -76,7 +113,7 @@ while IFS=$'\t' read -r bead_id pr branch; do
 done < <(sqlite3 "$DB" -separator $'\t' \
   "SELECT bead_id, pr_number, coalesce(branch,'') FROM bead_overlay
    WHERE state IN ('QUEUED','ATTESTED') AND pr_number IS NOT NULL
-   AND bead_id IN ('jleechan-9byt.4','jleechan-93ft','jleechan-7re5')
+   $bead_filter
    $pr_sql_filter
    ORDER BY CASE bead_id WHEN 'jleechan-7re5' THEN 0 WHEN 'jleechan-93ft' THEN 1 WHEN 'jleechan-9byt.4' THEN 2 ELSE 9 END, updated_at LIMIT 10;")
 
