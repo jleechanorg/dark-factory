@@ -125,6 +125,13 @@ pub trait StateStore {
         let _ = max_attempt;
         Ok(Vec::new())
     }
+    /// Return `HUMAN_HELD` overlays that have reached the automated recovery
+    /// cap and therefore require explicit escalation instead of silent retry
+    /// suppression.
+    fn human_held_at_or_above_attempt(
+        &self,
+        max_attempt: u32,
+    ) -> Result<Vec<BeadOverlay>, DaemonError>;
     fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, feedback_text: &str) -> Result<(), DaemonError>;
     fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError>;
     /// Read the `(attempt_count, last_attempt_epoch_secs)` pair for the
@@ -553,6 +560,52 @@ impl StateStore for SqliteStateStore {
         for r in rows {
             let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id) =
                 r.map_err(|e| tool_err("recover_human_held row", e))?;
+            out.push(BeadOverlay {
+                bead_id,
+                state: OverlayState::from_str(&state_str)?,
+                attempt: attempt as u32,
+                reroll_count: reroll_count as u32,
+                autonomy_secs: autonomy_secs as u64,
+                spend_usd,
+                pr_number: pr_number.map(|v| v as u64),
+                branch,
+                session_id,
+            });
+        }
+        Ok(out)
+    }
+
+    fn human_held_at_or_above_attempt(
+        &self,
+        max_attempt: u32,
+    ) -> Result<Vec<BeadOverlay>, DaemonError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
+                 pr_number, branch, session_id \
+                 FROM bead_overlay WHERE state = 'HUMAN_HELD' AND attempt >= ?1",
+            )
+            .map_err(|e| tool_err("human_held_at_or_above_attempt prepare", e))?;
+        let rows = stmt
+            .query_map(params![max_attempt as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })
+            .map_err(|e| tool_err("human_held_at_or_above_attempt query", e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id) =
+                r.map_err(|e| tool_err("human_held_at_or_above_attempt row", e))?;
             out.push(BeadOverlay {
                 bead_id,
                 state: OverlayState::from_str(&state_str)?,
@@ -1055,6 +1108,12 @@ mod tests {
         let over_cap = store.load("over-cap").unwrap().unwrap();
         assert_eq!(over_cap.state, OverlayState::HumanHeld);
         assert_eq!(over_cap.attempt, 12);
+        let capped = store.human_held_at_or_above_attempt(10).unwrap();
+        let capped_ids: std::collections::HashSet<_> =
+            capped.iter().map(|overlay| overlay.bead_id.as_str()).collect();
+        assert_eq!(capped_ids.len(), 2);
+        assert!(capped_ids.contains("at-cap"));
+        assert!(capped_ids.contains("over-cap"));
 
         // Non-HUMAN_HELD rows are untouched
         let dispatched = store.load("dispatched").unwrap().unwrap();

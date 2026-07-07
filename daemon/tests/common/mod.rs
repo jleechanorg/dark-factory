@@ -476,6 +476,24 @@ impl StateStore for FakeStateStore {
         Ok(recovered)
     }
 
+    fn human_held_at_or_above_attempt(
+        &self,
+        max_attempt: u32,
+    ) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("human_held_at_or_above_attempt({max_attempt})"));
+        Ok(self
+            .overlays
+            .borrow()
+            .values()
+            .filter(|overlay| {
+                overlay.state == OverlayState::HumanHeld && overlay.attempt >= max_attempt
+            })
+            .cloned()
+            .collect())
+    }
+
     fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, _feedback_text: &str) -> Result<(), DaemonError> {
         self.calls.borrow_mut().push(format!("save_rejection({bead_id},{attempt},{reviewer},{feedback_hash})"));
         self.rejections.borrow_mut().insert((bead_id.to_string(), attempt), (reviewer.to_string(), feedback_hash.to_string()));

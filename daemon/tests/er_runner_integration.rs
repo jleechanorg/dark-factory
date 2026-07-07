@@ -237,6 +237,12 @@ impl StateStore for StoreMock {
     fn bump_autonomy_secs(&self, _bead_id: &str, _delta_secs: u64) -> Result<(), daemon::errors::DaemonError> {
         Ok(())
     }
+    fn human_held_at_or_above_attempt(
+        &self,
+        _max_attempt: u32,
+    ) -> Result<Vec<BeadOverlay>, daemon::errors::DaemonError> {
+        Ok(Vec::new())
+    }
     fn save_rejection(
         &self,
         _b: &str,

@@ -432,6 +432,21 @@ mod tests {
             Ok(recovered)
         }
 
+        fn human_held_at_or_above_attempt(
+            &self,
+            max_attempt: u32,
+        ) -> Result<Vec<BeadOverlay>, DaemonError> {
+            Ok(self
+                .overlays
+                .borrow()
+                .values()
+                .filter(|overlay| {
+                    overlay.state == OverlayState::HumanHeld && overlay.attempt >= max_attempt
+                })
+                .cloned()
+                .collect())
+        }
+
         fn save_rejection(
             &self,
             bead_id: &str,
