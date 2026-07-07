@@ -101,6 +101,7 @@ standards we apply to the factory onto the review's own outputs.
 ## Pointers
 
 - Gap review: `docs/factory-goal-gap-review-2026-07-06.md`
+- Reconciled roadmap: `roadmap/nextsteps-2026-07-06-gap-review.md`
 - Ratchet bead: `jleechan-niq` (sequence above supersedes its embedded ordering)
 - Review bead: `jleechan-ron` (closed — subagent review, no files edited)
 - Related memory: gate-self-certification anti-pattern; roadmap overclaim pattern

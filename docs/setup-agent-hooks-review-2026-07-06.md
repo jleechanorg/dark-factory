@@ -1,5 +1,10 @@
 # setup-agent-hooks.sh — Parallel Adversarial Review — 2026-07-06
 
+> Resolution note: this review describes the pre-fix script. The follow-up implementation in
+> `scripts/setup-agent-hooks.sh` re-rotates the Cursor/Gemini/OpenCode templates, JSON/shell-quotes
+> `HOOK_PATH`, hardens `--check` with `jq` schema assertions, rejects malformed args, and verifies a
+> quoted/space hook path in a throwaway git repo.
+
 > Three independent review agents ran in parallel against `scripts/setup-agent-hooks.sh` (298 lines)
 > and the accompanying `.gitignore` change (`.codex/`, `.cursor/`, `.gemini/`, `.opencode.json`):
 > a static shell-correctness reviewer, a sandbox claim-verifier (re-ran every claimed behavior in a
