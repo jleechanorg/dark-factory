@@ -1044,19 +1044,30 @@ fn skeptic_evidence(
         let dual_verdict = combine_dual_verdict(v1, v2, bead_id, pr)?
             .expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)");
 
-        // PR#163 finding 1: `gha` (a target-repo CI workflow posting a
-        // skeptic verdict comment) and `sign-off` (a human reviewer
-        // comment) are both OPTIONAL enrichment signals, never hard
-        // requirements — a human sign-off will never exist in this
-        // Level-5 autonomous system, and not every target repo runs an
-        // equivalent GHA skeptic workflow. Requiring either would
-        // permanently deadlock gate 7 exactly like the pre-fix bug did.
-        // When neither is present, gate 7 is satisfied by the dual-LLM
-        // verdict alone. When either IS present, fold it in through
-        // `parse_skeptic_verdict`'s subsystem grammar so real evidence can
-        // still escalate (Fail beats Warn beats Pass); `sign-off`'s
-        // absence there is separately optional (verifier.rs), so this can
-        // only ever escalate, never re-introduce the deadlock.
+        // PR#163 finding 1 (round 1) + finding (round 3, residual): `gha`
+        // (a target-repo CI workflow posting a skeptic verdict comment) and
+        // `sign-off` (a human reviewer comment) are both OPTIONAL
+        // enrichment signals, never hard requirements — a human sign-off
+        // will never exist in this Level-5 autonomous system, and not
+        // every target repo runs an equivalent GHA skeptic workflow.
+        // Requiring either would permanently deadlock gate 7 exactly like
+        // the pre-fix bug did. `verifier::parse_skeptic_verdict` now treats
+        // BOTH `gha` and `sign-off` as optional (only `gate-7`, the
+        // dual-LLM verdict, is a hard requirement there), so this function
+        // no longer needs to special-case "both absent" — but it still
+        // avoids synthesizing a `subsystem: gha` / `subsystem: sign-off`
+        // block with the literal placeholder `"verdict: absent"` for
+        // whichever subsystem has no real evidence: only a subsystem block
+        // with REAL evidence is emitted. (Round 3 root cause: emitting a
+        // placeholder block for an evidence-less subsystem was harmless by
+        // itself once verifier.rs's `gha`/`sign-off` are optional, but
+        // omitting it entirely here is simpler, avoids ever depending on
+        // `parse_skeptic_verdict` correctly ignoring "verdict: absent" as
+        // defense in depth, and keeps the combined string minimal.) When
+        // real evidence exists it is folded in through
+        // `parse_skeptic_verdict`'s subsystem grammar so it can still
+        // escalate (Fail beats Warn beats Pass); when neither has real
+        // evidence, gate 7 is satisfied by the dual-LLM verdict alone.
         let has_gha_evidence = gha_verdict != "verdict: absent";
         let has_signoff_evidence = signoff_verdict != "verdict: absent";
 
@@ -1068,13 +1079,17 @@ fn skeptic_evidence(
             combined.push_str(&skeptic_verdict_to_line(&dual_verdict));
             combined.push('\n');
 
-            combined.push_str("subsystem: gha\n");
-            combined.push_str(gha_verdict);
-            combined.push('\n');
+            if has_gha_evidence {
+                combined.push_str("subsystem: gha\n");
+                combined.push_str(gha_verdict);
+                combined.push('\n');
+            }
 
-            combined.push_str("subsystem: sign-off\n");
-            combined.push_str(signoff_verdict);
-            combined.push('\n');
+            if has_signoff_evidence {
+                combined.push_str("subsystem: sign-off\n");
+                combined.push_str(signoff_verdict);
+                combined.push('\n');
+            }
 
             verifier::parse_skeptic_verdict(&combined)
         }

@@ -4677,3 +4677,181 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
     let _ = std::fs::remove_file(&telemetry_log);
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
+
+// --- PR#163 finding (round 3): residual asymmetric deadlock -------------
+//
+// The test above proves gate 7 resolves when NEITHER gha nor sign-off has
+// evidence. It structurally cannot catch the round-3 residual: `tick.rs`'s
+// `!has_gha_evidence && !has_signoff_evidence` bypass only fires when BOTH
+// are absent. The moment a PR comment trips the (deliberately loose)
+// sign-off heuristic — any non-bot comment containing "sign-off",
+// "signoff", "verdict: pass", or "/skeptic pass" — `skeptic_evidence`
+// unconditionally wraps the dual-LLM verdict in the full 3-subsystem
+// grammar, padding the still-absent `gha` subsystem with the literal
+// `"verdict: absent"` placeholder. Before the round-3 fix,
+// `verifier::parse_skeptic_verdict` still hard-required `gha`
+// (`gha_verdict?`), so this asymmetric case — gha absent, sign-off
+// present, dual-LLM real evidence — silently re-deadlocked gate 7 to
+// `Unknown` even though both independent LLM reviewers passed. This test
+// drives that exact scenario end-to-end through `run_tick` against a real
+// (non-`owner/repo`) target repo and asserts the bead reaches READY.
+#[test]
+#[cfg(unix)]
+fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha() {
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_fake_reviewers_asym_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    write_fake_reviewer(&fake_bin_dir, "codex", "pass");
+    write_fake_reviewer(&fake_bin_dir, "claude", "pass");
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+
+    // Fix the coder vendor so the reviewer priority list (and therefore
+    // which two fake binaries get dispatched) is deterministic regardless
+    // of the ambient environment.
+    let _env_guard = EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "minimax")]);
+
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+
+    let mut cfg = test_cfg();
+    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" -> is_test_repo == false
+
+    store.overlays.borrow_mut().insert(
+        "real-repo-bead-asym".into(),
+        BeadOverlay {
+            bead_id: "real-repo-bead-asym".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(556),
+            branch: Some("factory/real-repo-bead-asym-r1".into()),
+            session_id: None,
+        },
+    );
+    store
+        .branches
+        .borrow_mut()
+        .push("factory/real-repo-bead-asym-r1".into());
+    store
+        .branch_beads
+        .borrow_mut()
+        .insert("factory/real-repo-bead-asym-r1".into(), "real-repo-bead-asym".into());
+
+    scm.pr_snapshots.insert(
+        556,
+        PrSnapshot {
+            pr_number: 556,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            head_sha: "deadbeef556".into(),
+            body: String::new(),
+            // No gha/skeptic-workflow comment at all (this target repo has
+            // no equivalent CI workflow), but ONE human-looking comment
+            // trips the loose sign-off heuristic ("sign-off" substring,
+            // non-bot author) — the exact asymmetric scenario round 3
+            // proved was still deadlocked. An `/er PASS` comment is present
+            // purely so gate 6 resolves; this test only exercises gate 7.
+            comments: vec![
+                PrComment {
+                    author: "some-reviewer".into(),
+                    body: "/er PASS".into(),
+                },
+                PrComment {
+                    author: "jleechan".into(),
+                    body: "Looks good, sign-off from me.".into(),
+                },
+            ],
+            files: vec![],
+            updated_at_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            ci_status: "green".into(),
+            coderabbit_status: "green".into(),
+            ci_pending: false,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_real_target_repo_skeptic_asym_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
+
+    // Mutation-test sanity (manually verified 2026-07-07): reverting ONLY
+    // `verifier::parse_skeptic_verdict`'s `gha` optionality (restoring
+    // `gha_verdict?` as a hard requirement) makes this test fail —
+    // `beads_ready` drops to 0, `all_green` is false, and telemetry emits
+    // `GATE_ASSESSMENT_TRANSIENT_UNKNOWN`, reproducing the round-3
+    // deadlock exactly. Restoring the fix makes it pass again. Unlike the
+    // "without_gha_or_signoff" test above, `tick.rs`'s bypass branch does
+    // NOT fire here (sign-off evidence IS present), so this test exercises
+    // the full 3-subsystem grammar combine path in `parse_skeptic_verdict`,
+    // not just the early-return bypass.
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert_eq!(
+        summary.beads_ready, 1,
+        "PR#163 finding (round 3) regression: with two independent \
+         reviewer subprocesses both returning 'pass', NO gha comment, and \
+         a comment that trips the loose sign-off heuristic, gate 7 must \
+         still resolve to Green and the bead must reach READY (not \
+         deadlock on the absent gha subsystem). summary={summary:?}\n\
+         telemetry:\n{telemetry}"
+    );
+    assert!(
+        telemetry.contains("\"all_green\":true"),
+        "GATE_ASSESSMENT must report all_green:true; telemetry:\n{telemetry}"
+    );
+    assert!(
+        !telemetry.contains("GATE_ASSESSMENT_TRANSIENT_UNKNOWN"),
+        "must not fall into the Unknown-only branch when gate 7 correctly \
+         resolves from gate-7 + sign-off evidence (gha absent); \
+         telemetry:\n{telemetry}"
+    );
+
+    let overlay = store
+        .load("real-repo-bead-asym")
+        .unwrap()
+        .expect("overlay must still exist");
+    assert_eq!(overlay.state, OverlayState::Ready);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}

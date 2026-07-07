@@ -190,22 +190,35 @@ pub fn parse_skeptic_verdict(raw: &str) -> Option<SkepticVerdict> {
     }
 
     let v_g7 = gate7_verdict?;
-    let v_gha = gha_verdict?;
-    // PR#163 finding 1: `sign-off` is a HUMAN reviewer comment
-    // ("sign-off"/"signoff"/"/skeptic pass"). This daemon is a Level-5
-    // autonomous system with no human in the loop by design (see repo
-    // CLAUDE.md "Dark Factory operating mode") — nothing ever posts a
-    // sign-off comment for a real (non-test) target repo, so requiring it
-    // here would make gate 7 permanently `Unknown` for every real PR. Treat
-    // sign-off as best-effort/optional: when present it can still escalate
-    // the verdict (Fail/Warn), but its absence must never block gate 7 the
-    // way a missing gate-7 or gha verdict does.
+    // PR#163 finding 1 (round 1) + finding (round 3, residual): both `gha`
+    // (a target-repo CI workflow posting a skeptic verdict comment) and
+    // `sign-off` (a human reviewer comment — "sign-off"/"signoff"/
+    // "/skeptic pass") are OPTIONAL enrichment signals, never hard
+    // requirements. This daemon is a Level-5 autonomous system with no
+    // human in the loop by design (see repo CLAUDE.md "Dark Factory
+    // operating mode") — nothing ever posts a sign-off comment for a real
+    // (non-test) target repo, and not every target repo runs an equivalent
+    // GHA skeptic workflow. Requiring EITHER would make gate 7 permanently
+    // `Unknown` for every real PR that happens to trip just one of the two
+    // heuristics (round 1 fixed `sign-off` only; round 3 closed the
+    // asymmetric residual where `gha` alone was still hard-required —
+    // see `parse_skeptic_verdict_gha_absent_is_satisfied_by_gate7_and_signoff`
+    // below). Only `gate-7` (the dual-LLM verdict) is a hard requirement:
+    // that is the one signal `skeptic_evidence` always produces. `gha` and
+    // `sign-off` are both best-effort/optional: when present either can
+    // still escalate the verdict (Fail/Warn), but the absence of either
+    // (or a literal `"verdict: absent"` placeholder that fails to parse
+    // into a real token) must never block gate 7.
+    let v_gha = gha_verdict;
     let v_so = signoff_verdict;
 
     let mut fails = Vec::new();
     let mut warns = Vec::new();
 
-    let mut checked = vec![v_g7, v_gha];
+    let mut checked = vec![v_g7];
+    if let Some(gha) = v_gha {
+        checked.push(gha);
+    }
     if let Some(so) = v_so {
         checked.push(so);
     }
@@ -1066,13 +1079,21 @@ mod tests {
             Some(SkepticVerdict::Fail("(compile error)".into()))
         );
 
-        // One missing -> overall None (unknown). This is `gha` missing,
-        // which stays a hard requirement — only `sign-off` is optional
-        // (see `parse_skeptic_verdict_signoff_absent_is_satisfied_by_gate7_and_gha`
-        // below).
+        // `gha` missing (no `subsystem: gha` block at all) with only
+        // gate-7 + sign-off present -> resolves from gate-7 + sign-off.
+        // PR#163 finding (round 3): `gha` is optional exactly like
+        // `sign-off` — only `gate-7` (the dual-LLM verdict) is a hard
+        // requirement. See
+        // `parse_skeptic_verdict_gha_absent_is_satisfied_by_gate7_and_signoff`
+        // below for the full residual-deadlock regression test.
         let msg = "subsystem: gate-7\nverdict: pass\n\
                    subsystem: sign-off\nverdict: pass\n";
-        assert_eq!(parse_skeptic_verdict(msg), None);
+        assert_eq!(parse_skeptic_verdict(msg), Some(SkepticVerdict::Pass));
+
+        // Only gate-7 present (no gha, no sign-off blocks at all) ->
+        // resolves from gate-7 alone.
+        let msg = "subsystem: gate-7\nverdict: pass\n";
+        assert_eq!(parse_skeptic_verdict(msg), Some(SkepticVerdict::Pass));
     }
 
     // --- PR#163 finding 1 regression: sign-off must never hard-block gate 7 ---
@@ -1108,6 +1129,126 @@ mod tests {
             parse_skeptic_verdict(msg),
             Some(SkepticVerdict::Fail("human rejected".into()))
         );
+    }
+
+    // --- PR#163 finding (round 3): residual asymmetric deadlock ---
+    //
+    // Round 1 (finding 1) made `sign-off` optional but left `gha` hard-
+    // required (`gha_verdict?`). `tick.rs::skeptic_evidence` only skips the
+    // 3-subsystem grammar entirely when BOTH `has_gha_evidence` and
+    // `has_signoff_evidence` are false; the moment EITHER is true (e.g. a
+    // PR comment trips the loose sign-off heuristic — any non-bot comment
+    // containing "sign-off"/"signoff"/"verdict: pass"/"/skeptic pass",
+    // which is very plausible given this project's own convention of
+    // emitting "verdict: pass"-style text) it unconditionally emits all
+    // three `subsystem:` blocks, padding whichever is missing with the
+    // literal placeholder `"verdict: absent"` — which never parses into a
+    // `SkepticVerdict`. Because `gha` was still hard-required, this
+    // silently re-introduced the exact same permanent-`Unknown` deadlock
+    // class for any real target repo that (a) has no `gha` skeptic
+    // workflow (the common case) and (b) got ANY comment that trips the
+    // broad sign-off heuristic. Mutation-test sanity: reverting `v_gha`'s
+    // optionality above (making `gha_verdict?` hard-required again) makes
+    // this test fail with `None` instead of `Some(Pass)` — confirmed by
+    // temporarily reverting the fix and re-running (2026-07-07).
+    #[test]
+    fn parse_skeptic_verdict_signoff_without_gha_is_deadlocked_unknown() {
+        // Renamed intent, kept the exact reviewer-provided PoC message:
+        // this now asserts the FIXED (non-deadlocked) outcome.
+        let msg = "subsystem: gate-7\npass\n\
+                   subsystem: gha\nverdict: absent\n\
+                   subsystem: sign-off\nverdict: pass\n";
+        assert_eq!(parse_skeptic_verdict(msg), Some(SkepticVerdict::Pass));
+    }
+
+    #[test]
+    fn parse_skeptic_verdict_gha_absent_is_satisfied_by_gate7_and_signoff() {
+        // Mirrors `parse_skeptic_verdict_signoff_absent_is_satisfied_by_gate7_and_gha`
+        // but with the roles reversed: `gha` is the placeholder-absent
+        // subsystem, `sign-off` is the one with real evidence. Gate 7 must
+        // still resolve from gate-7 + sign-off alone.
+        let msg = "subsystem: gate-7\nverdict: pass\n\
+                   subsystem: gha\nverdict: absent\n\
+                   subsystem: sign-off\nverdict: pass\n";
+        assert_eq!(parse_skeptic_verdict(msg), Some(SkepticVerdict::Pass));
+    }
+
+    #[test]
+    fn parse_skeptic_verdict_gha_present_can_still_escalate_to_fail() {
+        // Symmetric to `parse_skeptic_verdict_signoff_present_can_still_escalate_to_fail`:
+        // when `gha` DOES report real evidence, it is not ignored — it can
+        // still escalate gate 7 to Fail even with sign-off absent.
+        let msg = "subsystem: gate-7\nverdict: pass\n\
+                   subsystem: gha\nverdict: fail (compile error)\n\
+                   subsystem: sign-off\nverdict: absent\n";
+        assert_eq!(
+            parse_skeptic_verdict(msg),
+            Some(SkepticVerdict::Fail("(compile error)".into()))
+        );
+    }
+
+    #[test]
+    fn parse_skeptic_verdict_both_gha_and_signoff_absent_placeholders_resolves_from_gate7() {
+        // Both optional subsystems present-but-placeholder (the exact
+        // strings `tick.rs` used to always emit pre-fix) -> resolves from
+        // gate-7 alone. Covers the (absent, absent) cell of the combination
+        // matrix via the placeholder-string path rather than the
+        // block-omitted path (see `parse_skeptic_verdict_three_subsystems`'s
+        // "Only gate-7 present" case for the block-omitted equivalent).
+        let msg = "subsystem: gate-7\nverdict: pass\n\
+                   subsystem: gha\nverdict: absent\n\
+                   subsystem: sign-off\nverdict: absent\n";
+        assert_eq!(parse_skeptic_verdict(msg), Some(SkepticVerdict::Pass));
+    }
+
+    #[test]
+    fn parse_skeptic_verdict_gha_warn_and_signoff_absent_escalates_to_warn() {
+        // gha: present-warn, sign-off: absent, dual-LLM: pass -> Warn (not
+        // deadlocked, not silently swallowed).
+        let msg = "subsystem: gate-7\nverdict: pass\n\
+                   subsystem: gha\nverdict: warn flaky retry\n\
+                   subsystem: sign-off\nverdict: absent\n";
+        assert_eq!(
+            parse_skeptic_verdict(msg),
+            Some(SkepticVerdict::Warn("flaky retry".into()))
+        );
+    }
+
+    #[test]
+    fn parse_skeptic_verdict_signoff_fail_and_gha_absent_escalates_to_fail() {
+        // gha: absent, sign-off: present-fail, dual-LLM: pass -> Fail (the
+        // asymmetric mirror of the classic "gha fails" escalation case,
+        // now reachable now that gha is optional too).
+        let msg = "subsystem: gate-7\nverdict: pass\n\
+                   subsystem: gha\nverdict: absent\n\
+                   subsystem: sign-off\nverdict: fail human rejected\n";
+        assert_eq!(
+            parse_skeptic_verdict(msg),
+            Some(SkepticVerdict::Fail("human rejected".into()))
+        );
+    }
+
+    #[test]
+    fn parse_skeptic_verdict_dual_llm_fail_always_wins_regardless_of_gha_signoff() {
+        // gate-7 itself is Fail: no combination of optional gha/sign-off
+        // evidence can downgrade it back to Pass.
+        let msg = "subsystem: gate-7\nfail root cause not addressed\n\
+                   subsystem: gha\nverdict: pass\n\
+                   subsystem: sign-off\nverdict: pass\n";
+        assert_eq!(
+            parse_skeptic_verdict(msg),
+            Some(SkepticVerdict::Fail("root cause not addressed".into()))
+        );
+    }
+
+    #[test]
+    fn parse_skeptic_verdict_no_gate7_evidence_is_still_genuinely_unknown() {
+        // The one case that legitimately stays `None`: no dual-LLM verdict
+        // at all. This is not the deadlock bug — it is the honest "we have
+        // no gate-7 evidence yet" signal gate 7 -> Unknown depends on.
+        let msg = "subsystem: gha\nverdict: pass\n\
+                   subsystem: sign-off\nverdict: pass\n";
+        assert_eq!(parse_skeptic_verdict(msg), None);
     }
 
     #[test]
