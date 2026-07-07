@@ -194,7 +194,8 @@ pub trait Tracker {
     fn comment_external(&self, external_ref: &str, body: &str) -> Result<(), DaemonError>;
 }
 
-/// `gh` CLI (REST + GraphQL). Every fetch goes through the ETag cache (spec §4.2.5).
+/// `gh` CLI (REST + GraphQL). Production adapters use short-lived in-memory
+/// TTL caches for repeated tick reads; a durable ETag cache is not wired yet.
 pub trait Scm {
     fn labeled_issues(&self, label: &str) -> Result<Vec<Issue>, DaemonError>;
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError>;

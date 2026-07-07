@@ -12,15 +12,14 @@
 // tick 1 (fast tier always runs; slow tier is due again since our ratio
 // forces it) promotes DISPATCHED->ATTESTED and assesses the gates.
 //
-// Gate 6 note (bead jleechan-3rf hardening): gate 6 is now "`/er` returns
-// PASS" (spec §4.2.5 item 6), not just the LOC floor. Stage 1's
+// Gate 6 note (beads jleechan-3rf + jleechan-qdw hardening): gate 6 is now
+// "`/er` returns PASS" (spec §4.2.5 item 6), not just the LOC floor. Stage 1's
 // `tick::skeptic_evidence` has no wired `/er` data source yet (only the
 // Skeptic's `pass|warn|fail` judge call is wired) so it honestly reports
 // `ErVerdict::Absent`, which makes gate 6 `Unknown` rather than a guessed
-// `Green`. That means this all-other-gates-green scenario parks
-// HUMAN_HELD instead of reaching READY — an honest reflection of the real
-// gap (wiring a real `/er` invocation into Stage 1 is tracked separately),
-// not a regression in this test's scenario.
+// `Green`. Unknown-only reports are verifier-incomplete, not defect verdicts:
+// the bead stays ATTESTED for retry and must not reach READY, park HUMAN_HELD,
+// or enter the re-roll lane without an actual Red gate.
 mod common;
 
 use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker, FakeVcs};
@@ -50,7 +49,7 @@ fn test_cfg() -> Config {
 }
 
 #[test]
-fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
+fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
     let mut scm = FakeScm::new();
     scm.issues.push(Issue {
         number: 7,
@@ -175,17 +174,16 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
     );
     // Gate 6 (evidence review) is `Unknown` in this scenario: Stage 1's
     // `skeptic_evidence` has no wired `/er` source yet, so `er_verdict`
-    // honestly defaults to `Absent` rather than a guessed `Pass`. An
-    // `Unknown` gate forces `all_green=false` (same as a `Red` gate — see
-    // `verifier::GateReport` doc comment), so the bead parks HUMAN_HELD
-    // under the Stage-1 substitution rule instead of reaching READY.
+    // honestly defaults to `Absent` rather than a guessed `Pass`. An Unknown
+    // gate still prevents READY, but without any Red gate it must remain a
+    // transient/incomplete verifier state, not a Stage-1 HUMAN_HELD park.
     assert_eq!(
         summary2.beads_ready, 0,
         "gate 6 (/er) is Unknown with no wired /er source, so this PR must not reach READY"
     );
     assert_eq!(
-        summary2.beads_parked_human_held, 1,
-        "an Unknown gate 6 must park the bead HUMAN_HELD, not silently pass it"
+        summary2.beads_parked_human_held, 0,
+        "an Unknown-only gate report must not park the bead HUMAN_HELD"
     );
 
     let final_overlay = store
@@ -194,8 +192,8 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
         .expect("overlay should still exist");
     assert_eq!(
         final_overlay.state,
-        OverlayState::HumanHeld,
-        "final overlay state must be HUMAN_HELD while gate 6 (/er) is Unknown"
+        OverlayState::Attested,
+        "final overlay state must stay ATTESTED while gate 6 (/er) is Unknown-only"
     );
 
     // --- Telemetry: >=5 events in schema order, real JSONL on disk ---
@@ -215,17 +213,16 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
         .map(|e| e["eventType"].as_str().unwrap().to_string())
         .collect();
     // Gate 6 (/er) is Unknown in this scenario (no wired /er source — see the
-    // module doc comment above), so the Stage-1 substitution rule fires:
-    // `REROLL_VERDICT_RECORDED` + `PARKED_HUMAN_HELD` instead of
-    // `READY_FOR_MERGE`.
+    // module doc comment above), so the tick records a transient Unknown-only
+    // assessment instead of `READY_FOR_MERGE`, `REROLL_VERDICT_RECORDED`, or
+    // `PARKED_HUMAN_HELD`.
     for required in [
         "INTAKE_BEAD_CREATED",
         "TASK_ROUTED",
         "TASK_DISPATCHED",
         "PR_OPENED",
         "GATE_ASSESSMENT",
-        "REROLL_VERDICT_RECORDED",
-        "PARKED_HUMAN_HELD",
+        "GATE_ASSESSMENT_TRANSIENT_UNKNOWN",
         "TICK",
     ] {
         assert!(
@@ -237,13 +234,21 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
         !event_types.iter().any(|e| e == "READY_FOR_MERGE"),
         "gate 6 (/er) is Unknown, so READY_FOR_MERGE must never be emitted: {event_types:?}"
     );
+    assert!(
+        !event_types.iter().any(|e| e == "REROLL_VERDICT_RECORDED"),
+        "Unknown-only gate reports must not enter the re-roll lane: {event_types:?}"
+    );
+    assert!(
+        !event_types.iter().any(|e| e == "PARKED_HUMAN_HELD"),
+        "Unknown-only gate reports must not park HUMAN_HELD: {event_types:?}"
+    );
 
     // Schema order (plan Task 10 Step 1: ">=5 schema-ordered events"): the
     // lifecycle events must appear in causal order, not merely be present. The
     // first-occurrence index of each stage must strictly increase — a bead is
     // created before it is routed, routed before dispatched, its PR opens
-    // before the gates are assessed, and it is only parked HUMAN_HELD after
-    // assessment. Asserting first-occurrence indices (rather than exact
+    // before the gates are assessed, and the transient Unknown event is emitted
+    // only after assessment. Asserting first-occurrence indices (rather than exact
     // adjacency) keeps the check robust to the interleaved `TICK` summary event
     // while still failing loudly if the pipeline ever emits out of order.
     let first_index = |needle: &str| -> usize {
@@ -258,8 +263,7 @@ fn one_full_tick_cycle_drives_bead_from_intake_to_ready() {
         "TASK_DISPATCHED",
         "PR_OPENED",
         "GATE_ASSESSMENT",
-        "REROLL_VERDICT_RECORDED",
-        "PARKED_HUMAN_HELD",
+        "GATE_ASSESSMENT_TRANSIENT_UNKNOWN",
     ];
     for pair in ordered.windows(2) {
         assert!(
@@ -2345,6 +2349,66 @@ impl Scm for QdwPostErRefetchScm {
     }
 }
 
+struct QdwAssessRefetchScm {
+    pr: u64,
+    snapshot: PrSnapshot,
+    calls: std::cell::RefCell<u32>,
+    close_calls: std::cell::RefCell<Vec<u64>>,
+}
+
+impl QdwAssessRefetchScm {
+    fn new(pr: u64, snapshot: PrSnapshot) -> Self {
+        Self {
+            pr,
+            snapshot,
+            calls: std::cell::RefCell::new(0),
+            close_calls: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl Scm for QdwAssessRefetchScm {
+    fn labeled_issues(&self, _label: &str) -> Result<Vec<Issue>, DaemonError> {
+        Ok(Vec::new())
+    }
+
+    fn collaborator_permission(&self, _login: &str) -> Result<Permission, DaemonError> {
+        Ok(Permission::None)
+    }
+
+    fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError> {
+        if pr != self.pr {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: format!("no scripted snapshot for pr {pr}"),
+            });
+        }
+        let mut calls = self.calls.borrow_mut();
+        *calls += 1;
+        // This scenario must fail inside `verifier::assess`, after fast-tier
+        // checks have already fetched enough SCM state to keep the bead in the
+        // gate path: PR opened, ci_pending, er_runner, and post-/er refetch.
+        if *calls >= 5 {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: "scripted assess refetch outage".into(),
+            });
+        }
+        Ok(self.snapshot.clone())
+    }
+
+    fn close_pr(&self, pr: u64, _comment: &str) -> Result<(), DaemonError> {
+        self.close_calls.borrow_mut().push(pr);
+        Ok(())
+    }
+
+    fn remote_branch_last_commit(&self, _branch: &str) -> Result<Option<u64>, DaemonError> {
+        Ok(None)
+    }
+}
+
 struct QdwAttemptStore {
     inner: FakeStateStore,
     er_attempts: std::cell::RefCell<std::collections::HashMap<String, (u32, Option<u64>)>>,
@@ -2640,6 +2704,114 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
                 && line.contains("\"eventType\":\"PARKED_HUMAN_HELD\"")
         }),
         "affected bead must not emit PARKED_HUMAN_HELD after post_er_refetch outage; telemetry was:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// jleechan-qdw: Unknown gates are verifier outages, not defect verdicts. If
+// `verifier::assess` cannot re-fetch SCM state after earlier fast-tier reads
+// succeeded, the bead must stay ATTESTED for retry. In stage 2 this is
+// especially important: treating Unknown as Red would execute the re-roll
+// engine and close a healthy PR.
+#[test]
+fn qdw_assess_refetch_failure_stays_attested_and_never_closes_pr() {
+    let store = QdwAttemptStore::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let vcs = FakeVcs::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+
+    store
+        .save(&BeadOverlay {
+            bead_id: "qdw-assess-refetch-fails".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(2001),
+            branch: Some("factory/qdw-assess-refetch-fails-r1".into()),
+            session_id: Some("sess-assess".into()),
+        })
+        .unwrap();
+    store
+        .register_branch(
+            "qdw-assess-refetch-fails",
+            "factory/qdw-assess-refetch-fails-r1",
+        )
+        .unwrap();
+
+    let scm = QdwAssessRefetchScm::new(
+        2001,
+        qdw_green_snapshot(
+            2001,
+            vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+            }],
+        ),
+    );
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_qdw_assess_refetch_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("Unknown-only gate assessment must not abort the tick");
+
+    let overlay = store.load("qdw-assess-refetch-fails").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Attested,
+        "assess refetch outage must leave the bead ATTESTED for retry"
+    );
+    assert_eq!(summary.gates_assessed, 1);
+    assert_eq!(summary.beads_ready, 0);
+    assert_eq!(summary.beads_parked_human_held, 0);
+    assert!(
+        scm.close_calls.borrow().is_empty(),
+        "stage 2 Unknown-only gate reports must not execute reroll/close_pr"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.lines().any(|line| {
+            line.contains("\"beadId\":\"qdw-assess-refetch-fails\"")
+                && line.contains("\"eventType\":\"GATE_ASSESSMENT_TRANSIENT_UNKNOWN\"")
+        }),
+        "expected transient Unknown gate telemetry; telemetry was:\n{telemetry}"
+    );
+    assert!(
+        !telemetry.lines().any(|line| {
+            line.contains("\"beadId\":\"qdw-assess-refetch-fails\"")
+                && line.contains("\"eventType\":\"REROLL_VERDICT_RECORDED\"")
+        }),
+        "Unknown-only gate report must not emit reroll verdict; telemetry was:\n{telemetry}"
+    );
+    assert!(
+        !telemetry.lines().any(|line| {
+            line.contains("\"beadId\":\"qdw-assess-refetch-fails\"")
+                && line.contains("\"eventType\":\"PARKED_HUMAN_HELD\"")
+        }),
+        "Unknown-only gate report must not park HUMAN_HELD; telemetry was:\n{telemetry}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

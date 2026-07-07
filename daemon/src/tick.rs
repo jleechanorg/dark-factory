@@ -1149,6 +1149,27 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             );
             let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
         } else {
+            let red_reasons: Vec<String> = report
+                .results
+                .iter()
+                .filter_map(|(gate_name, result)| match result {
+                    verifier::GateResult::Red(reason) => Some(format!("{gate_name:?}: {reason}")),
+                    _ => None,
+                })
+                .collect();
+            if red_reasons.is_empty() {
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "GATE_ASSESSMENT_TRANSIENT_UNKNOWN",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "gate assessment had unknown gates but no red gates"}),
+                )?;
+                continue;
+            }
+
             if deps.cfg.stage == 1 {
                 // Stage-1 substitution rule (CONTRACT.md §1): record the re-roll
                 // verdict, never execute it. Park HUMAN_HELD instead of RE_ROLL.
@@ -1180,10 +1201,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             } else {
                 // Stage 2: execute re-roll engine
                 let mut reviewer = "verifier".to_string();
-                let mut feedback = Vec::new();
                 for (gate_name, result) in &report.results {
-                    if let verifier::GateResult::Red(ref reason) = result {
-                        feedback.push(format!("{gate_name:?}: {reason}"));
+                    if let verifier::GateResult::Red(_) = result {
                         if *gate_name == verifier::GateName::Skeptic {
                             reviewer = "skeptic".to_string();
                         } else if *gate_name == verifier::GateName::CodeRabbitApproved {
@@ -1191,7 +1210,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         }
                     }
                 }
-                let review_text = feedback.join("\n");
+                let review_text = red_reasons.join("\n");
 
                 let reroll_deps = crate::reroll::RerollDeps {
                     scm: deps.scm,
