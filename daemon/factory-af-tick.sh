@@ -49,7 +49,7 @@ while [ "$i" -le "$#" ]; do
     i=$((i + 1))
 done
 
-# ---------- validate --prs (numeric CSV) ----------
+# ---------- validate --prs (numeric CSV; strict regex rejects empty/trailing) ----------
 if [ -n "$TARGET_PRS" ]; then
     case "$TARGET_PRS" in
         ''|*[!0-9,]*)
@@ -57,16 +57,46 @@ if [ -n "$TARGET_PRS" ]; then
             exit 2
             ;;
     esac
+    # Reject empty tokens (",," or leading/trailing ",") — they would produce
+    # invalid SQL like "IN (,1,2)" or "IN (1,2,)".
+    case ",${TARGET_PRS}," in
+        *,,*) echo "factory-af-tick: --prs has empty token (got: $TARGET_PRS)" >&2; exit 2 ;;
+        *,)   echo "factory-af-tick: --prs has trailing comma (got: $TARGET_PRS)" >&2; exit 2 ;;
+        ,,*)  echo "factory-af-tick: --prs has leading comma (got: $TARGET_PRS)" >&2; exit 2 ;;
+    esac
 fi
 
-# ---------- validate AFD_BEAD_FILTER (safe id chars) ----------
+# ---------- validate AFD_BEAD_FILTER (strict allowlist, single bead_id only) ----------
+# AFD_BEAD_FILTER holds ONE bead_id (matches the contract used by the dispatch
+# loop). The allowlist mirrors factory-overlay.sh:valid_bead_id (^[A-Za-z0-9._-]+$).
+# Spaces, commas, and other delimiters are NOT valid — use one filter per tick.
 if [ -n "${AFD_BEAD_FILTER:-}" ]; then
     case "$AFD_BEAD_FILTER" in
-        *'!'*|*'\'*|*'$'*|*'|'*|*'<'*|*'>'*|*';'*|*'`'*|*'('*|*')'*|*'{'*|*'}'*|*'['*|*']'*|*"'"*|*'"'*|*'~'*|*'#'*|*'&'*|*'*'*|*'?'*)
-            echo "factory-af-tick: AFD_BEAD_FILTER must contain only bead_id-safe chars" >&2
+        *' '*|*,*) echo "factory-af-tick: AFD_BEAD_FILTER must be a single bead_id (no spaces/commas): $AFD_BEAD_FILTER" >&2; exit 2 ;;
+    esac
+    case "$AFD_BEAD_FILTER" in
+        *[!A-Za-z0-9._-]*)
+            echo "factory-af-tick: AFD_BEAD_FILTER must match ^[A-Za-z0-9._-]+\$ (got: $AFD_BEAD_FILTER)" >&2
             exit 2
             ;;
     esac
+fi
+
+# ---------- validate AFD_PRIORITY_BEADS (CR-4: SQL injection guard) ----------
+# Each comma-separated token MUST match the strict allowlist. Without this, a
+# crafted bead_id like `x' UNION SELECT ... --` is interpolated unescaped into
+# the CASE WHEN fragment below and executed by sqlite3.
+if [ -n "${AFD_PRIORITY_BEADS:-}" ]; then
+    bad_token="$(printf '%s' "$AFD_PRIORITY_BEADS" | tr ',' '\n' \
+        | awk '{
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+            if ($0 == "") next
+            if ($0 !~ /^[A-Za-z0-9._-]+$/) { print $0; fflush(); exit 0 }
+        }')"
+    if [ -n "$bad_token" ]; then
+        echo "factory-af-tick: AFD_PRIORITY_BEADS has invalid token (must match ^[A-Za-z0-9._-]+\$): $bad_token" >&2
+        exit 2
+    fi
 fi
 
 cd "$ROOT"
@@ -88,8 +118,20 @@ if br --help 2>/dev/null | rg -q 'list.*--label'; then
              | python3 -c 'import json,sys
 try:
     d = json.load(sys.stdin)
-    for b in (d.get("issues") or d if isinstance(d, list) else []):
-        print(b.get("id",""))
+    # CX-1: br list --json may return either {"issues": [...]} (dict shape) or
+    # a top-level list. The old expression `(d.get("issues") or d if isinstance(d, list))`
+    # raised AttributeError on list (no .get) and returned [] on dict — silently
+    # skipping superseded beads and leaving them dispatchable. Normalize: if dict,
+    # extract the issues field; if list, pass through; otherwise empty.
+    if isinstance(d, dict):
+        issues = d.get("issues", [])
+    elif isinstance(d, list):
+        issues = d
+    else:
+        issues = []
+    for b in issues:
+        if isinstance(b, dict):
+            print(b.get("id",""))
 except Exception:
     pass' 2>/dev/null || true)
 fi
@@ -99,12 +141,34 @@ bash "$I"
 # ---------- AO concurrency probe ----------
 AO="$(bash "$ROOT/daemon/factory-ao-bin.sh" 2>/dev/null || true)"
 AO_CAP="${AO_MAX_CONCURRENT_SESSIONS:-30}"
+# Validate AO_PROJECT is non-empty + looks like a project name. Defensive: an
+# empty / malformed project would cause `session ls -p ""` to dump all projects
+# and inflate the active count, falsely tripping AO_MAX_CONCURRENT_SESSIONS.
+if [ -z "${AO_PROJECT:-}" ] || [[ ! "$AO_PROJECT" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "[af] WARN: AFD_AO_PROJECT='${AO_PROJECT:-}' is empty or malformed; defaulting to 'worldarchitect'" >&2
+    AO_PROJECT="worldarchitect"
+fi
 if [ -n "$AO" ]; then
     if "$AO" session ls --json >/dev/null 2>&1; then
-        ao_active="$("$AO" session ls --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(sum(1 for s in d.get("data",[]) if not s.get("isTerminated")))' 2>/dev/null || echo 0)"
+        ao_active="$("$AO" session ls --json 2>/dev/null | python3 -c '
+import json,sys
+try:
+    d = json.load(sys.stdin)
+    if not isinstance(d, dict):
+        print(0); sys.exit(0)
+    sessions = d.get("data") or []
+    if not isinstance(sessions, list):
+        print(0); sys.exit(0)
+    print(sum(1 for s in sessions if isinstance(s, dict) and not s.get("isTerminated")))
+except Exception:
+    print(0)' 2>/dev/null || echo 0)"
     else
         ao_active="$("$AO" session ls -p "$AO_PROJECT" 2>/dev/null | rg -c '\[(spawning|running|active|working|pr_open)\]' || echo 0)"
     fi
+    # Ensure ao_active is a non-negative integer (defensive: rg/race could leave empty)
+    case "${ao_active:-0}" in
+        ''|*[!0-9]*) ao_active=0 ;;
+    esac
     if [ "${ao_active:-0}" -ge "$AO_CAP" ]; then
         echo "[af] AO cap: ${ao_active} active >= ${AO_CAP} — skipping dispatch (intake done)" >&2
         MAX_DISPATCH=0
@@ -119,25 +183,15 @@ fi
 
 bead_filter=""
 if [ -n "${AFD_BEAD_FILTER:-}" ]; then
-    # Build ('id1','id2',...) with each token validated against ^[A-Za-z0-9._-]+$
-    bead_filter_sql="$(printf '%s' "$AFD_BEAD_FILTER" | tr ' ' ',' \
-        | awk -F, '{
-            out=""
-            for (i=1; i<=NF; i++) {
-                tok=$i
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", tok)
-                if (tok == "") continue
-                if (out != "") out = out ","
-                out = out "\x27" tok "\x27"
-            }
-            print out
-        }')"
-    if [ -n "$bead_filter_sql" ]; then
-        bead_filter="AND bead_id IN ($bead_filter_sql)"
-    fi
+    # AFD_BEAD_FILTER holds a SINGLE validated bead_id (allowlist enforced above).
+    # No CSV / whitespace handling — direct interpolation with single-quote escape.
+    bid="$(printf '%s' "$AFD_BEAD_FILTER" | sed "s/'/''/g")"
+    bead_filter="AND bead_id = '${bid}'"
 fi
 
 # ---------- priority ORDER BY (configurable via env, no hardcoded IDs) ----------
+# CR-4 SQL injection guard runs above (line 80ish) — each token has been
+# validated against `^[A-Za-z0-9._-]+$` before reaching here.
 priority_order=""
 if [ -n "${AFD_PRIORITY_BEADS:-}" ]; then
     # Each comma-separated ID becomes "WHEN '<id>' THEN <n>" via awk.
@@ -166,7 +220,9 @@ while IFS=$'\t' read -r bead_id pr branch; do
         continue
     fi
     echo "[af] remediate $bead_id PR #$pr"
-    if bash "$R" "$bead_id" "$pr" 2>&1; then
+    # CX-2: thread AO_PROJECT through to factory-ao-remediate.sh so the spawned
+    # session lives in the same AO project the capacity check measured.
+    if bash "$R" "$bead_id" "$pr" "" "$AO_PROJECT" 2>&1; then
         cur_state="$(sqlite3 "$DB" "SELECT state FROM bead_overlay WHERE bead_id='$(printf "%s" "$bead_id" | sed "s/'/''/g")';" 2>/dev/null || true)"
         if [ "$cur_state" = "QUEUED" ]; then
             if [ -n "$branch" ]; then
@@ -201,6 +257,14 @@ while IFS=$'\t' read -r bead_id pr branch; do
                 7)  # invalid bead_id — input format invalid (will not fix)
                     echo "[af] invalid bead_id for $bead_id: $err" >&2
                     continue
+                    ;;
+                9)  # EX_IO — sqlite / fs failure. CR-5: hard-fail the tick so
+                    # the IO error is not silently swallowed by the generic
+                    # 'continue' branch. The overlay returned a structured code
+                    # specifically because it could not write — continuing would
+                    # mask real disk/db problems and re-dispatch the same bead.
+                    echo "[af] dispatch-record EX_IO for $bead_id (rc=9): $err" >&2
+                    exit 9
                     ;;
                 *)  # unexpected / genuine failure
                     echo "[af] dispatch-record failed for $bead_id (rc=$rc): $err" >&2

@@ -156,23 +156,54 @@ dispatch-record)
   [ $# -eq 3 ] || die_code $EX_USAGE "usage: dispatch-record <bead_id> <branch>"
   valid_bead_id "$2" || die_code $EX_BEAD_ID "invalid bead_id: $2"
   valid_branch "$3"   || die_code $EX_VALID_INPUT "invalid branch: $3"
-  # require_state uses die() (not die_code) to preserve the existing require_state
-  # contract; callers should case on $rc == $EX_REQUIRE_STATE only when they
-  # specifically need to distinguish require_state from other failures.
+  # CR-6: probe row count FIRST so a missing bead returns rc=8 (EX_NOT_FOUND)
+  # instead of the rc=5 (EX_REQUIRE_STATE) it would produce if we let `cur` be
+  # empty and matched the case fallback. get_field returns empty for both
+  # "no row" and "wrong state" — only an existence check distinguishes them.
+  if ! exists="$(sql "SELECT count(*) FROM bead_overlay WHERE bead_id='$(q "$2")';")" 2>/dev/null; then
+    die_code $EX_IO "existence lookup failed for $2"
+  fi
+  if [ "$exists" = "0" ]; then
+    die_code $EX_NOT_FOUND "bead has no overlay row: $2"
+  fi
   if ! cur="$(get_field "$2" state)" 2>/dev/null; then
     die_code $EX_IO "state lookup failed for $2"
   fi
   case " QUEUED " in *" $cur "*) ;; *) die_code $EX_REQUIRE_STATE "bead in state '$cur', expected one of: QUEUED";; esac
   cur_cap="$("$0" capacity)"
   [ "$cur_cap" -gt 0 ] || die_code $EX_OVER_CAP "over capacity — dispatch refused (capacity=$cur_cap)"
+  # CR-7: capture sql exit code so missing tables / corrupt DBs surface as EX_IO
+  # instead of silently passing through. set -e does NOT propagate rc from
+  # command substitutions that are immediately consumed (e.g., `if [ -n ]`),
+  # so the rc must be checked explicitly.
+  set +e
   owner="$(sql "SELECT bead_id FROM branch_registry WHERE branch='$(q "$3")';")"
+  sql_rc=$?
+  set -e
+  if [ "$sql_rc" -ne 0 ]; then
+    die_code $EX_IO "branch_registry read failed (rc=$sql_rc) for $3"
+  fi
   if [ -n "$owner" ] && [ "$owner" != "$2" ]; then
     die_code $EX_BRANCH_CONFLICT "branch $3 already registered to $owner"
   fi
+  # CR-7: capture INSERT/UPDATE errors so missing tables / corrupt DBs surface
+  # as EX_IO instead of silently leaving state inconsistent. The `sql` helper
+  # runs sqlite3 directly; without an explicit error capture, sqlite errors go
+  # to stderr and the script exits 0.
+  sql_err="$(mktemp -t factory_overlay_err.XXXXXX)"
+  set +e
   sql "INSERT INTO branch_registry (branch,bead_id,created_at)
        VALUES ('$(q "$3")','$(q "$2")','$(now)') ON CONFLICT(branch) DO NOTHING;
        UPDATE bead_overlay SET state='DISPATCHED', branch='$(q "$3")', updated_at='$(now)'
-       WHERE bead_id='$(q "$2")';"
+       WHERE bead_id='$(q "$2")';" 2>"$sql_err"
+  sql_rc=$?
+  set -e
+  if [ "$sql_rc" -ne 0 ]; then
+    err_msg="$(cat "$sql_err" 2>/dev/null | tr -d '\n' | head -c 200)"
+    rm -f "$sql_err"
+    die_code $EX_IO "dispatch-record write failed (rc=$sql_rc) for $2: $err_msg"
+  fi
+  rm -f "$sql_err"
   cur_attempt="$(get_field "$2" attempt)"
   emit "$2" "$cur_attempt" DISPATCHED TASK_DISPATCHED "{\"activeModel\":\"minimax\",\"branch\":$(js "$3")}"
   echo "ok"

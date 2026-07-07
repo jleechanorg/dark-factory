@@ -76,6 +76,15 @@ rc=$?
 set -e
 assert "route-record rejects bad verdict" "1" "$rc"
 
+# CR-6: dispatch-record on a non-existent bead must return rc=8 (EX_NOT_FOUND),
+# not rc=5 (EX_REQUIRE_STATE). The current implementation conflates "no row"
+# with "wrong state" — both produce empty `cur` from get_field.
+set +e
+out="$("$OVERLAY" dispatch-record jleechan-doesnot-exist fix/never >/dev/null 2>&1)"
+rc=$?
+set -e
+assert "dispatch-record missing bead returns rc=8 EX_NOT_FOUND" "8" "$rc"
+
 # 7. capacity returns a number
 cap="$("$OVERLAY" capacity)"
 [[ "$cap" =~ ^[0-9]+$ ]] || { echo "FAIL: capacity not numeric: $cap"; FAIL=$((FAIL+1)); }
