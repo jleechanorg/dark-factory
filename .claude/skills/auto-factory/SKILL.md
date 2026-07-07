@@ -104,12 +104,29 @@ gh pr list --repo "$TARGET_REPO" --head "factory/<bead_id>-r<attempt>" --state o
 
 ## 7. Verifier tick (gate assessment)
 
-For every ATTESTED bead (PR opened/updated), run the 7 gates:
+For every ATTESTED bead (PR opened/updated), run the 9 gates (7 original + `/code-standards` + `/zfc`). All nine gates share one verdict space:
+
+| Verdict  | Meaning                                                                | Gate result     |
+|----------|------------------------------------------------------------------------|-----------------|
+| `pass`   | Reviewer returned positive evidence; ready to advance                  | counts toward `all_green` |
+| `warn`   | Reviewer returned mixed evidence; non-blocking, surface in next tick   | counts toward `all_green` |
+| `fail`   | Reviewer returned negative evidence; reroll required                   | forces reroll-verdict |
+| `unknown`| Reviewer could not gather evidence yet; wait for the next tick         | blocks `all_green` |
+
+`all_green=true` iff every gate returned `pass` or `warn`. `fail` routes through
+`reroll-verdict → HUMAN_HELD → recover-held → QUEUED` — the bounded fix loop
+shared with the original 7 gates; **no parallel implementation**. `unknown`
+defers to the next tick rather than racing to READY.
 
 ```bash
 gh pr view <pr> --repo "$TARGET_REPO" --json headRefOid,mergeable,reviewDecision,statusCheckRollup
 gh pr checks <pr> --repo "$TARGET_REPO" --json name,state,conclusion
 ```
+
+Each gate is a model-delegated review (NOT keyword routing); the verifier
+dispatches them as subagents / `claude --print /<slash>` / `codex exec --yolo`
+against the PR diff. The overlay only records verdicts — the pass/warn/fail
+decision is the model's, not ours.
 
 Assess each gate:
 - ci_green: every check `conclusion=success` (or state=SUCCESS)
@@ -119,11 +136,39 @@ Assess each gate:
 - comments_resolved: every reviewThread `isResolved=true`
 - evidence_review: 5-criterion /er rubric pass
 - skeptic: parallel minimax cold review
+- code_standards: dispatch `code-standards` review (overrides `~/.claude/skills/code-standards/SKILL.md` or repo-local `.claude/skills/code-standards/SKILL.md`) — pass/warn only when every claimed pass carries file/line evidence per the lane's Iron Law; fail on bare assertions without file/line proof
+- zfc: dispatch `zfc` review against `.claude/skills/zero-framework-cognition/SKILL.md` + `.claude/skills/root-cause-first/SKILL.md` — pass/warn only when no banned-pattern scan finds a violation; fail otherwise
 
-Record via `$H gate-assessment <bead_id> <pr> '<gates_json>'`.
+Each gate's verdict value in `gates_json` is either a plain string OR a
+structured object so reviewers can audit the verdict without re-running the
+model:
 
-All-green → `$H ready <bead_id> <pr>` (terminal state; verifier stops driving).
-Any-red → `$H reroll-verdict <bead_id> <pr> <in_place_fixable|reroll_worthy> "<rationale>"`.
+```json
+"zfc": "pass"                                              /* shorthand */
+"zfc": {"verdict": "fail",                                  /* structured */
+        "evidence": [{"path": "daemon/factory-overlay.sh",
+                      "line": 201,
+                      "msg": "keyword blacklist enforced in app code"}]}
+```
+
+Record via `$H gate-assessment <bead_id> <pr> '<gates_json>'`. The 9-key JSON
+schema (strict) is enforced by `factory-overlay.sh`:
+
+```json
+{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass",
+ "bugbot":"pass","comments_resolved":"pass","evidence_review":"pass",
+ "skeptic":"pass","code_standards":"pass","zfc":"pass"}
+```
+
+Legacy aliases `"green" → "pass"`, `"red" → "fail"` are still accepted so
+existing test fixtures don't have to migrate in lockstep, but new callers
+should use the pass/warn/fail vocabulary.
+
+All-green (`all_green=true` on stdout line 1) → `$H ready <bead_id> <pr>`
+(terminal state; verifier stops driving). Any-fail → `$H reroll-verdict
+<bead_id> <pr> <in_place_fixable|reroll_worthy> "<rationale>"`. The `cooldown_ready`
+line indicates whether the prior GATE_ASSESSMENT for this PR was a `false`
+result (cooldown handling is unchanged from the original 7-gate design).
 
 ## 8. Autonomy time-box
 
