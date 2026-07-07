@@ -378,6 +378,7 @@ mod tests {
         fn base_head(&self, _b: &str) -> Result<String, DaemonError> { Ok("deadbeef".into()) }
         fn create_branch_at(&self, _n: &str, _s: &str) -> Result<(), DaemonError> { Ok(()) }
         fn head_sha(&self, _b: &str) -> Result<String, DaemonError> { Ok("deadbeef".into()) }
+        fn is_remote_ahead(&self, _b: &str, _r: &str) -> Result<bool, DaemonError> { Ok(false) }
     }
 
     // Local in-memory StateStore that records the er_runner_attempt counter.

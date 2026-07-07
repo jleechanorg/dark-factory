@@ -284,12 +284,12 @@ impl StateStore for SqliteStateStore {
         self.conn
             .execute(
                 "INSERT INTO bead_overlay \
-                 (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
                  ON CONFLICT(bead_id) DO UPDATE SET \
                    state=excluded.state, attempt=excluded.attempt, reroll_count=excluded.reroll_count, \
                    autonomy_secs=excluded.autonomy_secs, spend_usd=excluded.spend_usd, \
-                   pr_number=excluded.pr_number, branch=excluded.branch, updated_at=excluded.updated_at",
+                   pr_number=excluded.pr_number, branch=excluded.branch, session_id=excluded.session_id, updated_at=excluded.updated_at",
                 params![
                     overlay.bead_id,
                     overlay.state.as_str(),
@@ -299,6 +299,7 @@ impl StateStore for SqliteStateStore {
                     overlay.spend_usd,
                     overlay.pr_number.map(|v| v as i64),
                     overlay.branch,
+                    overlay.session_id,
                     now_iso8601(),
                 ],
             )

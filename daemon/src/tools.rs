@@ -217,6 +217,20 @@ pub trait Vcs {
     fn base_head(&self, base_branch: &str) -> Result<String, DaemonError>;
     fn create_branch_at(&self, name: &str, sha: &str) -> Result<(), DaemonError>;
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError>;
+    /// `true` iff `local_head` (the local branch's SHA) is a strict ancestor of
+    /// `remote_sha` — i.e. the remote PR head contains every local commit AND
+    /// has at least one extra commit the local checkout has not seen yet. Returns
+    /// `false` when local and remote match, when remote is behind local, or when
+    /// the two branches have diverged (a stronger condition than `head_sha(branch)
+    /// != remote_sha`, which a divergent local checkout would also satisfy).
+    ///
+    /// This is the predicate the `jleechan-ubas` stall-bypass guard relies on:
+    /// "the worker is still landing commits" must mean "remote has new work
+    /// local hasn't fetched yet", not "the two sides have diverged". A
+    /// divergent or local-only-ahead branch must NOT trigger the bypass —
+    /// otherwise the daemon would mask a real stall behind a green PR and
+    /// ignore local-only work.
+    fn is_remote_ahead(&self, branch: &str, remote_sha: &str) -> Result<bool, DaemonError>;
 }
 
 /// LLM judgment calls (router, in-place-vs-reroll verdict, constraint extraction).
@@ -235,12 +249,46 @@ pub trait Llm {
 /// see bead jleechan-ac1), poll `try_wait` every 100ms, kill the child and
 /// return `DaemonError::Timeout` if the deadline elapses first; non-zero exit
 /// -> `DaemonError::Tool`; otherwise stdout as a `String`.
+/// `run_tool` defaults to the daemon's own cwd (i.e. does NOT set
+/// `current_dir`), matching the discipline the rest of the codebase already
+/// relies on; `run_tool_in_dir` is the explicit-cwd variant used by code that
+/// must run in a different working directory (e.g. the LLM fallback chain in
+/// `adapters.rs::ChainLlm`, where the CWD matters for AGENTS.md / .claude/ to
+/// be picked up — a stray `/tmp` cwd was the root cause of bead
+/// `jleechan-g1k`).
 pub fn run_tool(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<String, DaemonError> {
-    let mut child = Command::new(cmd)
+    run_tool_with_cwd(cmd, args, None, timeout_secs)
+}
+
+/// Explicit-cwd variant of `run_tool`. `cwd = None` leaves the child's cwd
+/// unchanged (matches `run_tool`); `cwd = Some(path)` sets the child's cwd to
+/// `path`. A failed `set_current_dir` on the child returns
+/// `DaemonError::Tool` rather than silently inheriting the parent's cwd.
+pub fn run_tool_in_dir(
+    cmd: &str,
+    args: &[&str],
+    cwd: &str,
+    timeout_secs: u64,
+) -> Result<String, DaemonError> {
+    run_tool_with_cwd(cmd, args, Some(cwd), timeout_secs)
+}
+
+fn run_tool_with_cwd(
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<&str>,
+    timeout_secs: u64,
+) -> Result<String, DaemonError> {
+    let mut command = Command::new(cmd);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| DaemonError::Tool {
             tool: cmd.to_string(),
@@ -432,5 +480,53 @@ mod tests {
     fn summarize_file_tree_zero_max_entries_is_empty() {
         let dir = std::env::temp_dir();
         assert_eq!(summarize_file_tree(&dir, 0), "");
+    }
+
+    /// Regression test for `run_tool_in_dir` (added in beads qdw/g1k land):
+    /// the explicit `cwd` argument MUST actually be the child's cwd, not be
+    /// silently swallowed. Without the assertion below, a future refactor
+    /// that drops the `current_dir` call would be invisible to tests until
+    /// someone observed the LLM fallback chain losing its project context
+    /// (the exact failure mode that produced bead `jleechan-g1k`).
+    #[test]
+    #[cfg(unix)]
+    fn run_tool_in_dir_sets_child_cwd() {
+        let tmp = std::env::temp_dir().join(format!(
+            "afd_run_tool_in_dir_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Run `pwd` in the tmp dir — if `current_dir` is honored, the output
+        // is the canonicalized tmp path; if it is dropped, we get the daemon's
+        // cwd which is something else under `cargo test`.
+        let out = run_tool_in_dir("pwd", &[], tmp.to_str().unwrap(), 5).unwrap();
+        assert!(
+            std::path::Path::new(out.trim())
+                .canonicalize()
+                .unwrap()
+                == std::path::Path::new(tmp.to_str().unwrap())
+                    .canonicalize()
+                    .unwrap(),
+            "run_tool_in_dir must set the child's cwd to the explicit value; \
+             output of `pwd` was {out:?}, expected canonical of {tmp:?}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Regression test for `run_tool` (no-cwd variant): the child MUST inherit
+    /// the parent's cwd. If a future refactor accidentally sets
+    /// `current_dir(".")` or similar on the no-cwd path, the canonical-path
+    /// resolution here would still pass but the no-cwd contract would not be
+    /// tested — keep both tests paired.
+    #[test]
+    #[cfg(unix)]
+    fn run_tool_inherits_parent_cwd() {
+        let parent_cwd = std::env::current_dir().unwrap();
+        let out = run_tool("pwd", &[], 5).unwrap();
+        assert_eq!(
+            std::path::Path::new(out.trim()).canonicalize().unwrap(),
+            parent_cwd.canonicalize().unwrap(),
+            "run_tool must NOT change the child's cwd; got {out:?}, parent cwd {parent_cwd:?}"
+        );
     }
 }
