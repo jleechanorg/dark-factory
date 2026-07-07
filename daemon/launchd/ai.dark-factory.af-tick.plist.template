@@ -3,7 +3,16 @@
 <!--
   Template: ai.dark-factory.af-tick.plist.template
   Purpose: poll-loop launchd agent that fires daemon/factory-af-tick.sh
-           every 240 seconds. Auto-restarts on exit (KeepAlive=true).
+           every @TICK_INTERVAL@ seconds (default 240 = 4 min). Auto-restarts
+           on exit (KeepAlive=true) with a ThrottleInterval of 60s to
+           suppress crash-loop thrash (acceptance: "watchdog for crash-loop
+           detection" from bead jleechan-57h0).
+
+  Invocation:
+    The plist invokes daemon/launchd/launchd-wrapper.sh which sources the
+    user's interactive login env (PATH, git config, SSH agent, homebrew bins)
+    before exec'ing factory-af-tick.sh. launchd's bare PATH would otherwise
+    leave br / gh / sqlite3 / python3 / callpath unresolvable.
 
   Usage (manual install):
     launchctl bootstrap gui/$UID "$HOME/Library/LaunchAgents/ai.dark-factory.af-tick.plist"
@@ -13,9 +22,10 @@
     rm "$HOME/Library/LaunchAgents/ai.dark-factory.af-tick.plist"
 
   Notes:
-    - StartInterval=240 fires the tick script every 4 minutes.
-    - KeepAlive=true ensures the agent is restarted by launchd if killed
-      (acceptance criterion: "After kill, agent auto-restarts").
+    - @TICK_INTERVAL@ is substituted by install-launchagents.sh from the
+      AFD_TICK_INTERVAL_SEC env var (default 240).
+    - ThrottleInterval=60 caps restart rate: launchd will not restart the
+      agent more than once per 60s, so a 1s-exit crash loop won't burn CPU.
     - ProcessType=Background marks this as a long-running background agent
       (lower scheduling priority than Interactive tasks).
     - Replace @HOME@ with $HOME at install time (see install-launchagents.sh).
@@ -28,11 +38,15 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
+        <string>@HOME@/projects/dark-factory/daemon/launchd/launchd-wrapper.sh</string>
         <string>@HOME@/projects/dark-factory/daemon/factory-af-tick.sh</string>
     </array>
 
     <key>StartInterval</key>
-    <integer>240</integer>
+    <integer>@TICK_INTERVAL@</integer>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
 
     <key>RunAtLoad</key>
     <true/>
