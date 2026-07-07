@@ -60,6 +60,12 @@ impl Tracker for CliTracker {
         // refs beyond page one from dedup, so the daemon re-creates a bead for an
         // already-tracked issue and the resulting br rc=7 kills the whole tick
         // (jleechan-v09l: 130 open / 125 closed beads vs 50-row pages).
+        // jleechan-u4gb: this bulk read is a point-in-time snapshot and can
+        // race with a concurrent `br create` (or reflect pagination
+        // skew/staleness in `br list` itself) — see
+        // `DaemonError::duplicate_external_ref_bead_id` and its call sites
+        // in `intake.rs` for the authoritative write-time fallback that
+        // makes create_bead idempotent even when this snapshot is stale.
         let mut refs = parse_external_refs_from_br_list(&run_tool(
             "br",
             &["list", "--status", "open", "--json", "--limit", "0"],
