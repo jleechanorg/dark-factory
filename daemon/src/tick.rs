@@ -145,7 +145,7 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                 serde_json::json!({}),
                 serde_json::json!({"reason": "autonomy_timebox_exceeded"}),
             )?;
-            let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): autonomy time-box limit exceeded.");
+            let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): autonomy time-box limit exceeded.".to_string();
             let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
             summary.beads_parked_human_held += 1;
             continue;
@@ -198,7 +198,7 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                                 serde_json::json!({}),
                                 serde_json::json!({"reason": "coder_silent"}),
                             )?;
-                            let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): coder silent/inactive on branch for 30 minutes.");
+                            let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): coder silent/inactive on branch for 30 minutes.".to_string();
                             let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
                             summary.beads_parked_human_held += 1;
                         }
@@ -233,7 +233,7 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                                 serde_json::json!({}),
                                 serde_json::json!({"reason": "session_stalled"}),
                             )?;
-                            let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): session stalled or quiescent on open PR.");
+                            let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): session stalled or quiescent on open PR.".to_string();
                             let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
                             summary.beads_parked_human_held += 1;
                         }
@@ -645,7 +645,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         };
 
         let mut evidence = skeptic_evidence(deps, bead_id, pr)?;
-        let snapshot = deps.scm.pr_snapshot(pr)?;
+        let mut snapshot = deps.scm.pr_snapshot(pr)?;
         if snapshot.ci_pending {
             emit(
                 deps.telemetry_log,
@@ -659,7 +659,80 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             continue;
         }
 
-        evidence.er_verdict = verifier::parse_er_verdict(&snapshot.comments);
+        // jleechan-qqq: if no `/er` verdict is recorded yet, dispatch an
+        // independent reviewer (claude/codex subprocess) and post the
+        // verdict as a PR comment. Re-fetch the snapshot so the just-
+        // posted comment is visible to `parse_er_verdict` below.
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let runner_outcome = crate::er_runner::maybe_run(deps, bead_id, pr, now_epoch)?;
+        // When the runner just posted a verdict this tick, prefer the
+        // returned verdict over a re-parse of the refreshed snapshot —
+        // `parse_er_verdict` would otherwise pick up any "/er" token
+        // anywhere in the comment body, including in the runner's own
+        // formatted prefix, and could disagree with the verdict the
+        // runner just emitted. Only fall back to the snapshot when the
+        // runner DIDN'T post (cooldown/capped/already-present/no-op).
+        let mut posted_verdict: Option<verifier::ErVerdict> = None;
+        match runner_outcome {
+            crate::er_runner::Outcome::Posted { verdict, count } => {
+                posted_verdict = Some(verdict);
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    crate::er_runner::EVT_POSTED,
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "verdict": format!("{verdict:?}"),
+                        "attempt": count,
+                    }),
+                )?;
+                snapshot = deps.scm.pr_snapshot(pr)?;
+            }
+            crate::er_runner::Outcome::AlreadyPosted(v) => {
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    crate::er_runner::EVT_NOOP,
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "already_posted", "verdict": format!("{v:?}")}),
+                )?;
+            }
+            crate::er_runner::Outcome::Capped { count } => {
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    crate::er_runner::EVT_CAPPED,
+                    serde_json::json!({}),
+                    serde_json::json!({"count": count}),
+                )?;
+            }
+            crate::er_runner::Outcome::Cooldown { elapsed_secs, count } => {
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    crate::er_runner::EVT_NOOP,
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "cooldown", "elapsed_secs": elapsed_secs, "count": count}),
+                )?;
+            }
+            crate::er_runner::Outcome::NotApplicable => {}
+        }
+
+        evidence.er_verdict = match posted_verdict {
+            Some(v) => v,
+            None => verifier::parse_er_verdict(&snapshot.comments),
+        };
         evidence.is_production = verifier::classify_production(&snapshot.files);
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
         evidence.has_integration_evidence_marker = verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
@@ -718,9 +791,9 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({}),
                     serde_json::json!({"reason": "gate assessment not all-green (stage 1: recorded, not executed)"}),
                 )?;
-                let comment_body = format!(
+                let comment_body =
                     "🤖 **[dark-factory]** Coder session parked (human held): gate assessment failed. Stage 1 configuration prevents re-roll."
-                );
+                        .to_string();
                 let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
             } else {
                 // Stage 2: execute re-roll engine
@@ -794,9 +867,9 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 serde_json::json!({}),
                                 serde_json::json!({"reason": "spec file validation failed in recovery"}),
                             )?;
-                            let comment_body = format!(
+                            let comment_body =
                                 "🤖 **[dark-factory]** Coder session parked (human held): spec file validation failed in recovery."
-                            );
+                                    .to_string();
                             let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                         }
                     }

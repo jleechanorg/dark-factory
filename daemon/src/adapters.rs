@@ -247,7 +247,7 @@ impl Scm for CliScm {
             DaemonError::Parse(format!("failed to parse gh pr list: {e}"))
         })?;
         let mut issues: Vec<Issue> = Vec::new();
-        for item in gh_issues.into_iter().chain(gh_prs.into_iter()) {
+        for item in gh_issues.into_iter().chain(gh_prs) {
             if !issues.iter().any(|i| i.number == item.number) {
                 let author_login = item.author.as_ref().or(item.user.as_ref())
                     .map(|a| a.login.clone())
@@ -487,8 +487,7 @@ impl Scm for CliScm {
         let mergeable = view.mergeable == "MERGEABLE";
 
         let last_coderabbit_review = view.reviews.iter()
-            .filter(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED")
-            .last();
+            .rfind(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED");
 
         let coderabbit_status = match last_coderabbit_review {
             Some(r) => {
@@ -562,9 +561,7 @@ impl Scm for CliScm {
                 any_failed = true;
             }
         }
-        let ci_status = if checks.is_empty() {
-            "unknown".to_string()
-        } else if any_pending {
+        let ci_status = if checks.is_empty() || any_pending {
             "unknown".to_string()
         } else if any_failed {
             "red".to_string()
@@ -795,7 +792,7 @@ pub struct CliSessions {
 
 impl CliSessions {
     pub fn new(repo: &str, agent: &str) -> Self {
-        let project = repo.split('/').last().unwrap_or(repo).to_string();
+        let project = repo.split('/').next_back().unwrap_or(repo).to_string();
         Self {
             project,
             agent: agent.to_string(),
