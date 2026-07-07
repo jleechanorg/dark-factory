@@ -231,6 +231,12 @@ impl StateStore for StoreMock {
     fn increment_active_autonomy(&self, _e: u64) -> Result<Vec<BeadOverlay>, daemon::errors::DaemonError> {
         Ok(Vec::new())
     }
+    fn list_active_overlays(&self) -> Result<Vec<BeadOverlay>, daemon::errors::DaemonError> {
+        Ok(Vec::new())
+    }
+    fn bump_autonomy_secs(&self, _bead_id: &str, _delta_secs: u64) -> Result<(), daemon::errors::DaemonError> {
+        Ok(())
+    }
     fn save_rejection(
         &self,
         _b: &str,

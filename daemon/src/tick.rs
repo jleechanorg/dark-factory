@@ -55,6 +55,36 @@ pub struct TickSummary {
     pub gates_assessed: usize,
     pub beads_ready: usize,
     pub beads_parked_human_held: usize,
+    /// Beads that the automated HUMAN_HELD exit requeued back to QUEUED
+    /// this tick (jleechan-gib: Rust port of shell `recover-held`).
+    pub beads_recovered_from_held: usize,
+}
+
+/// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
+/// overlay's `recover-held` (daemon/factory-overlay.sh:319-333) and the
+/// ad-hoc attempt counter cap cited in the gap-review verdict
+/// (`docs/factory-goal-gap-review-2026-07-06.md` Blocker #3). Beads at or
+/// above this cap are deliberately left in HUMAN_HELD for a human to
+/// review — the daemon stops blindly retrying past this point.
+const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
+
+/// Look up whether the PR attached to this `ATTESTED` overlay has CI in
+/// flight (`ci_pending=true`). Returns `false` for non-ATTESTED overlays
+/// and for ATTESTED overlays with no PR yet (treated as "not pending" so
+/// the wedge/timebox logic still runs). SCM errors are logged-and-ignored
+/// at the caller; this helper returns `false` so a transient SCM outage
+/// can't accidentally freeze the autonomy clock for healthy beads.
+fn ci_pending_for_attested(overlay: &BeadOverlay, scm: &dyn crate::tools::Scm) -> bool {
+    if overlay.state != OverlayState::Attested {
+        return false;
+    }
+    match overlay.pr_number {
+        Some(pr) => match scm.pr_snapshot(pr) {
+            Ok(snap) => snap.ci_pending,
+            Err(_) => false,
+        },
+        None => false,
+    }
 }
 
 /// Dependency-free ISO-8601 UTC timestamp, matching `state.rs::now_iso8601`'s
@@ -129,9 +159,33 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
 
     let mut summary = TickSummary::default();
 
-    // Increment autonomy_secs and perform safety envelope & wedge detection checks for active beads
-    let active_overlays = deps.store.increment_active_autonomy(elapsed_secs)?;
+    let slow_tier_due = {
+        let ratio = (deps.cfg.slow_tick_secs / deps.cfg.fast_tick_secs.max(1)).max(1);
+        tick_index.is_multiple_of(ratio)
+    };
+
+    // jleechan-gib: automated HUMAN_HELD exit (Rust port of shell
+    // `recover-held`). Runs at the TOP of the tick, BEFORE the active-overlay
+    // wedge-detection loop, so that a bead recovered this tick cannot also be
+    // parked this same tick (otherwise the wedge check would re-park a
+    // freshly-QUEUED bead before dispatch can make progress). Recovery only
+    // fires when the slow tier is due (matches the shell overlay's cadence
+    // — `recover-held` was never per-fast-tick).
+    if slow_tier_due {
+        run_recovery_step(deps, &mut summary)?;
+    }
+
+    // jleechan-54ky / sub-fix for jleechan-gib: split the SQL-level "increment
+    // every active row" into list + per-row bump so we can pause the autonomy
+    // clock for ATTESTED rows whose PR has ci_pending=true (CI wait time is
+    // operator/CI wall-clock, not coder session time we are budgeting against).
+    let active_overlays = deps.store.list_active_overlays()?;
     for mut overlay in active_overlays {
+        let ci_pending = ci_pending_for_attested(&overlay, deps.scm);
+        if !ci_pending && elapsed_secs > 0 {
+            overlay.autonomy_secs += elapsed_secs;
+            deps.store.bump_autonomy_secs(&overlay.bead_id, elapsed_secs)?;
+        }
         // 1. Time-box envelope check
         if overlay.autonomy_secs >= deps.cfg.autonomy_timebox_secs {
             overlay.state = OverlayState::HumanHeld;
@@ -295,11 +349,6 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
         }
     }
 
-    let slow_tier_due = {
-        let ratio = (deps.cfg.slow_tick_secs / deps.cfg.fast_tick_secs.max(1)).max(1);
-        tick_index.is_multiple_of(ratio)
-    };
-
     if slow_tier_due {
         run_slow_tier(deps, &mut summary)?;
     }
@@ -319,6 +368,7 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
             "gatesAssessed": summary.gates_assessed,
             "beadsReady": summary.beads_ready,
             "beadsParkedHumanHeld": summary.beads_parked_human_held,
+            "beadsRecoveredFromHeld": summary.beads_recovered_from_held,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
@@ -326,9 +376,44 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
     Ok(summary)
 }
 
+/// jleechan-gib: automated HUMAN_HELD exit (Rust port of shell
+/// `recover-held`). Requeues every `HUMAN_HELD` bead whose `attempt` is
+/// below `MAX_HUMAN_HELD_RECOVERY_ATTEMPT` back to `QUEUED`, increments
+/// `attempt`, and zeros `autonomy_secs`. Must run BEFORE the
+/// active-overlay wedge-detection loop in `run_tick` so a freshly-QUEUED
+/// bead is not immediately re-parked by the timebox/wedge checks in the
+/// same tick.
+fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
+    let recovered = deps
+        .store
+        .recover_human_held(MAX_HUMAN_HELD_RECOVERY_ATTEMPT)?;
+    for overlay in recovered {
+        summary.beads_recovered_from_held += 1;
+        emit(
+            deps.telemetry_log,
+            &overlay.bead_id,
+            overlay.attempt,
+            OverlayState::Queued.as_str(),
+            "RECOVERED_FROM_HELD",
+            serde_json::json!({}),
+            serde_json::json!({
+                "prior_state": OverlayState::HumanHeld.as_str(),
+                "pr_number": overlay.pr_number,
+                "branch": overlay.branch,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
 /// Slow tier: intake new beads, route each freshly-queued bead, dispatch as
 /// many QUEUED beads as the safety envelope (30/15) allows.
 fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
+    // jleechan-gib: recovery has already run at the top of this tick via
+    // `run_recovery_step` (it must run BEFORE the active-overlay wedge loop
+    // so freshly-QUEUED beads aren't immediately re-parked by wedge
+    // detection). The freshly-recovered QUEUED beads are picked up by the
+    // routing_candidates loop below, so they get dispatched this same tick.
     let created = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
     let mut routing_candidates: Vec<Bead> = Vec::new();
     for bead_id in &created {

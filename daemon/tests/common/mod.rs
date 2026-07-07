@@ -384,15 +384,59 @@ impl StateStore for FakeStateStore {
 
     fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError> {
         self.calls.borrow_mut().push(format!("increment_active_autonomy({elapsed_secs})"));
-        let mut updated = Vec::new();
-        let mut overlays = self.overlays.borrow_mut();
-        for overlay in overlays.values_mut() {
-            if overlay.state == OverlayState::Dispatched || overlay.state == OverlayState::Attested {
-                overlay.autonomy_secs += elapsed_secs;
-                updated.push(overlay.clone());
+        // Convenience override: mirror the new trait-level behavior of
+        // `list_active_overlays` + per-row `bump_autonomy_secs`. Tests that
+        // need the ci_pending pause (jleechan-54ky) should call
+        // `list_active_overlays` directly and `bump_autonomy_secs` for the
+        // rows they want to advance.
+        let updated = self.list_active_overlays()?;
+        if elapsed_secs > 0 {
+            for overlay in &updated {
+                self.bump_autonomy_secs(&overlay.bead_id, elapsed_secs)?;
             }
         }
-        Ok(updated)
+        // Re-read so callers see the bumped values, matching the original
+        // "increment then return" contract the tick loop's budget-warning
+        // crossing check depends on.
+        self.list_active_overlays()
+    }
+
+    fn list_active_overlays(&self) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.calls.borrow_mut().push("list_active_overlays".into());
+        let mut out = Vec::new();
+        for overlay in self.overlays.borrow().values() {
+            if overlay.state == OverlayState::Dispatched || overlay.state == OverlayState::Attested {
+                out.push(overlay.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    fn bump_autonomy_secs(&self, bead_id: &str, delta_secs: u64) -> Result<(), DaemonError> {
+        self.calls.borrow_mut().push(format!("bump_autonomy_secs({bead_id},{delta_secs})"));
+        if delta_secs == 0 {
+            return Ok(());
+        }
+        if let Some(overlay) = self.overlays.borrow_mut().get_mut(bead_id) {
+            overlay.autonomy_secs += delta_secs;
+        }
+        Ok(())
+    }
+
+    fn recover_human_held(&self, max_attempt: u32) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("recover_human_held({max_attempt})"));
+        let mut recovered = Vec::new();
+        for overlay in self.overlays.borrow_mut().values_mut() {
+            if overlay.state == OverlayState::HumanHeld && overlay.attempt < max_attempt {
+                overlay.state = OverlayState::Queued;
+                overlay.attempt += 1;
+                overlay.autonomy_secs = 0;
+                recovered.push(overlay.clone());
+            }
+        }
+        Ok(recovered)
     }
 
     fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, _feedback_text: &str) -> Result<(), DaemonError> {
