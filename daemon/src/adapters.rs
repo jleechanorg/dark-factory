@@ -11,11 +11,19 @@ pub struct CliTracker;
 
 impl Tracker for CliTracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError> {
-        let out = run_tool("br", &["list", "--status", "open", "--label", "factory", "--json"], 30)?;
+        // `--limit 0` = unlimited: the default page size (50) silently truncates
+        // the queue once open beads exceed one page (jleechan-v09l).
+        let out = run_tool(
+            "br",
+            &["list", "--status", "open", "--label", "factory", "--json", "--limit", "0"],
+            30,
+        )?;
         let json_start = out.find('{').unwrap_or(0);
         #[derive(serde::Deserialize)]
         struct BrListOutput {
             issues: Vec<BrIssue>,
+            #[serde(default)]
+            has_more: bool,
         }
         #[derive(serde::Deserialize)]
         struct BrIssue {
@@ -27,6 +35,13 @@ impl Tracker for CliTracker {
         let data: BrListOutput = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse br list JSON: {e}"))
         })?;
+        // Fail closed on truncated output: a partial candidate queue silently
+        // starves beads beyond page one (jleechan-v09l).
+        if data.has_more {
+            return Err(DaemonError::Parse(
+                "br list output truncated (has_more=true); refusing partial candidate queue — pass --limit 0".to_string(),
+            ));
+        }
         let file_tree_summary = crate::tools::summarize_file_tree(std::path::Path::new("."), 100);
         let beads = data.issues.into_iter().map(|issue| Bead {
             id: issue.id,
@@ -41,14 +56,18 @@ impl Tracker for CliTracker {
     fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
         // `br list --status all` returns zero rows; merge open + closed so closed beads
         // (e.g. jleechan-9byt.5 → worldarchitect.ai#8171) block duplicate create_bead.
+        // `--limit 0` = unlimited. Without it the default page size (50) hides
+        // refs beyond page one from dedup, so the daemon re-creates a bead for an
+        // already-tracked issue and the resulting br rc=7 kills the whole tick
+        // (jleechan-v09l: 130 open / 125 closed beads vs 50-row pages).
         let mut refs = parse_external_refs_from_br_list(&run_tool(
             "br",
-            &["list", "--status", "open", "--json"],
+            &["list", "--status", "open", "--json", "--limit", "0"],
             30,
         )?)?;
         refs.extend(parse_external_refs_from_br_list(&run_tool(
             "br",
-            &["list", "--status", "closed", "--json"],
+            &["list", "--status", "closed", "--json", "--limit", "0"],
             30,
         )?)?);
         Ok(refs)
@@ -99,6 +118,8 @@ pub(crate) fn parse_external_refs_from_br_list(
     #[derive(serde::Deserialize)]
     struct BrListOutput {
         issues: Vec<BrIssue>,
+        #[serde(default)]
+        has_more: bool,
     }
     #[derive(serde::Deserialize)]
     struct BrIssue {
@@ -107,6 +128,13 @@ pub(crate) fn parse_external_refs_from_br_list(
     let data: BrListOutput = serde_json::from_str(&out[json_start..]).map_err(|e| {
         DaemonError::Parse(format!("failed to parse br list JSON: {e}"))
     })?;
+    // Fail closed on truncated output: a partial dedup set means the daemon
+    // re-creates beads for already-tracked issues (jleechan-v09l).
+    if data.has_more {
+        return Err(DaemonError::Parse(
+            "br list output truncated (has_more=true); refusing partial external-ref dedup — pass --limit 0".to_string(),
+        ));
+    }
     Ok(data
         .issues
         .into_iter()
@@ -191,7 +219,12 @@ impl CliScm {
             "gh",
             &[
                 "api",
-                &format!("repos/{}/issues?labels={label}&state=open", self.repo),
+                // REST default per_page is 30; 100 is the API maximum (jleechan-v09l
+                // truncation class).
+                &format!(
+                    "repos/{}/issues?labels={label}&state=open&per_page=100",
+                    self.repo
+                ),
             ],
             30,
         )?;
@@ -324,6 +357,9 @@ impl Scm for CliScm {
                 label,
                 "--state",
                 "open",
+                // gh defaults to 30 rows; same truncation class as jleechan-v09l.
+                "--limit",
+                "1000",
                 "--json",
                 "number,title,body,author",
             ],
@@ -335,7 +371,11 @@ impl Scm for CliScm {
                     "gh",
                     &[
                         "api",
-                        &format!("repos/{}/issues?labels={label}&state=open", self.repo),
+                        // REST default per_page is 30; 100 is the API maximum.
+                        &format!(
+                            "repos/{}/issues?labels={label}&state=open&per_page=100",
+                            self.repo
+                        ),
                     ],
                     30,
                 )?
@@ -391,6 +431,9 @@ impl Scm for CliScm {
                 label,
                 "--state",
                 "open",
+                // gh defaults to 30 rows; same truncation class as jleechan-v09l.
+                "--limit",
+                "1000",
                 "--json",
                 "number,title,body,author,headRefName,isCrossRepository,headRepositoryOwner",
             ],
@@ -1215,6 +1258,42 @@ mod external_ref_tests {
         assert_eq!(refs.len(), 2);
         assert!(refs.contains("owner/repo#1"));
         assert!(refs.contains("jleechanorg/worldarchitect.ai#8171"));
+    }
+
+    #[test]
+    fn truncated_br_list_output_is_rejected() {
+        // jleechan-v09l: br list paginates at 50 rows by default; a truncated
+        // page must fail closed instead of producing a partial dedup set.
+        let json = r#"{
+            "issues": [
+                {"id": "open-1", "external_ref": "owner/repo#1", "status": "open"}
+            ],
+            "total": 130,
+            "limit": 50,
+            "offset": 0,
+            "has_more": true
+        }"#;
+        let err = parse_external_refs_from_br_list(json).unwrap_err();
+        assert!(
+            err.to_string().contains("truncated"),
+            "expected truncation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn complete_br_list_output_with_pagination_fields_is_accepted() {
+        let json = r#"{
+            "issues": [
+                {"id": "open-1", "external_ref": "owner/repo#1", "status": "open"}
+            ],
+            "total": 1,
+            "limit": 0,
+            "offset": 0,
+            "has_more": false
+        }"#;
+        let refs = parse_external_refs_from_br_list(json).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert!(refs.contains("owner/repo#1"));
     }
 
     #[test]
