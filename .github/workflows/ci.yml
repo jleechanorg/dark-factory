@@ -45,8 +45,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Fetch base branch for VCS integration test
-        run: git fetch origin main:main
+      - name: Ensure main ref for VCS integration test
+        run: |
+          git fetch origin main
+          git show-ref --verify --quiet refs/heads/main || git branch main origin/main
 
       - name: cargo test (daemon crate)
         working-directory: daemon
