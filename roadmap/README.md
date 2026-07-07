@@ -11,6 +11,15 @@
 
 ## Recent activity (rolling)
 
+### 2026-07-06 (late night) — Factory merge landed + launchd installed; PATH blocker
+
+- **Landed on `main`:** PR [#168](https://github.com/jleechanorg/dark-factory/pull/168)–[#171](https://github.com/jleechanorg/dark-factory/pull/171) code via local merge (`72b5087c1`): launchd plist, callpath harness, `route-record`/`dispatch-record` tick, smoke evidence; CI `main` ref fetch fix.
+- **Launchd:** `ai.dark-factory.af-tick` installed via `daemon/launchd/install-launchagents.sh`; tick fails with `FileNotFoundError: br` — bare PATH; fix in open [#172](https://github.com/jleechanorg/dark-factory/pull/172) (`launchd-wrapper.sh`).
+- **Open follow-ups:** [#172](https://github.com/jleechanorg/dark-factory/pull/172) + [#173](https://github.com/jleechanorg/dark-factory/pull/173) CONFLICTING — rebase required; branch `fix/zfc-structured-dispatch-codes` not yet on `main`.
+- **Drive targets:** worldai [#7888](https://github.com/jleechanorg/worldarchitect.ai/pull/7888), [#8060](https://github.com/jleechanorg/worldarchitect.ai/pull/8060), [#8189](https://github.com/jleechanorg/worldarchitect.ai/pull/8189) — all OPEN.
+- **Beads:** jleechan-v2wv (#172), jleechan-ebe1 (#173), jleechan-t4m8 (ZFC dispatch); closed jleechan-38w8, jleechan-a5p.
+- **Nextsteps:** `roadmap/nextsteps-2026-07-06-launchd-ci-fixes.md`
+
 ### 2026-07-06 (evening) — /harness: why factory is offline
 
 - **`/harness` analysis:** Factory offline = **no launchd route process** + **`factory-intake-from-gh.sh` missing** + `callpath route=FAIL`; overlay QUEUED/READY can be stale while stack is dead.
