@@ -28,6 +28,8 @@ use std::collections::HashMap;
 pub struct FakeTracker {
     pub candidates: RefCell<Vec<Bead>>,
     pub create_bead_result: RefCell<Option<Result<String, String>>>,
+    pub fail_next_fetch_candidates: RefCell<Option<String>>,
+    pub fail_next_comment: RefCell<Option<String>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -40,6 +42,13 @@ impl FakeTracker {
 impl Tracker for FakeTracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError> {
         self.calls.borrow_mut().push("fetch_candidates".into());
+        if let Some(stderr) = self.fail_next_fetch_candidates.borrow_mut().take() {
+            return Err(DaemonError::Tool {
+                tool: "br".into(),
+                rc: 1,
+                stderr,
+            });
+        }
         Ok(self.candidates.borrow().clone())
     }
 
@@ -87,6 +96,13 @@ impl Tracker for FakeTracker {
         self.calls
             .borrow_mut()
             .push(format!("comment_external({external_ref},{body})"));
+        if let Some(stderr) = self.fail_next_comment.borrow_mut().take() {
+            return Err(DaemonError::Tool {
+                tool: "br".into(),
+                rc: 1,
+                stderr,
+            });
+        }
         Ok(())
     }
 }

@@ -492,13 +492,33 @@ fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), D
         .store
         .human_held_at_or_above_attempt(MAX_HUMAN_HELD_RECOVERY_ATTEMPT)?
     {
-        if !record_escalation_if_new(
+        if escalation_already_recorded(deps, &overlay.bead_id)? {
+            continue;
+        }
+        let comment_body = format!(
+            "🤖 **[dark-factory]** Escalation required: bead `{}` is HUMAN_HELD at attempt {} (max automated recovery attempts: {}). Automation will not silently requeue it again.",
+            overlay.bead_id, overlay.attempt, MAX_HUMAN_HELD_RECOVERY_ATTEMPT
+        );
+        if let Err(err) = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body) {
+            emit(
+                deps.telemetry_log,
+                &overlay.bead_id,
+                overlay.attempt,
+                OverlayState::HumanHeld.as_str(),
+                "ESCALATION_NOTIFICATION_FAILED",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "reason": "human_held_recovery_attempt_cap_reached",
+                    "error": err.to_string(),
+                }),
+            )?;
+            continue;
+        }
+        record_escalation(
             deps,
             &overlay.bead_id,
             "human_held_recovery_attempt_cap_reached",
-        )? {
-            continue;
-        }
+        )?;
         summary.beads_escalated += 1;
         emit(
             deps.telemetry_log,
@@ -514,11 +534,6 @@ fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), D
                 "branch": overlay.branch,
             }),
         )?;
-        let comment_body = format!(
-            "🤖 **[dark-factory]** Escalation required: bead `{}` is HUMAN_HELD at attempt {} (max automated recovery attempts: {}). Automation will not silently requeue it again.",
-            overlay.bead_id, overlay.attempt, MAX_HUMAN_HELD_RECOVERY_ATTEMPT
-        );
-        let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
     }
     Ok(())
 }
@@ -1204,6 +1219,27 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     if escalation_already_recorded(deps, bead_id)? {
                         continue;
                     }
+                    let comment_body = format!(
+                        "🤖 **[dark-factory]** Escalation required: gate assessment is still Unknown-only after {} automated /er attempts. Automation parked bead `{}` HUMAN_HELD at the recovery cap for inspection rather than silently churning.",
+                        count, bead_id
+                    );
+                    if let Err(err) = post_scm_comment_by_bead_id(deps, bead_id, &comment_body) {
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Attested.as_str(),
+                            "ESCALATION_NOTIFICATION_FAILED",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "unknown_only_gate_report_with_er_runner_capped",
+                                "er_runner_attempts": count,
+                                "pr_number": pr,
+                                "error": err.to_string(),
+                            }),
+                        )?;
+                        continue;
+                    }
                     overlay.state = OverlayState::HumanHeld;
                     overlay.attempt = MAX_HUMAN_HELD_RECOVERY_ATTEMPT;
                     deps.store.save(&overlay)?;
@@ -1227,11 +1263,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             "pr_number": pr,
                         }),
                     )?;
-                    let comment_body = format!(
-                        "🤖 **[dark-factory]** Escalation required: gate assessment is still Unknown-only after {} automated /er attempts. Automation parked bead `{}` HUMAN_HELD at the recovery cap for inspection rather than silently churning.",
-                        count, bead_id
-                    );
-                    let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                     continue;
                 }
                 emit(
@@ -1376,18 +1407,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     Ok(())
 }
 
-fn record_escalation_if_new(
-    deps: &TickDeps,
-    bead_id: &str,
-    reason: &str,
-) -> Result<bool, DaemonError> {
-    if escalation_already_recorded(deps, bead_id)? {
-        return Ok(false);
-    }
-    record_escalation(deps, bead_id, reason)?;
-    Ok(true)
-}
-
 fn escalation_already_recorded(deps: &TickDeps, bead_id: &str) -> Result<bool, DaemonError> {
     Ok(matches!(
         deps.store
@@ -1426,19 +1445,19 @@ fn post_scm_comment_by_bead_id(
     bead_id: &str,
     body: &str,
 ) -> Result<(), DaemonError> {
-    if let Ok(Some(overlay)) = deps.store.load(bead_id) {
+    if let Some(overlay) = deps.store.load(bead_id)? {
         if let Some(pr) = overlay.pr_number {
             let ext_ref = format!("{}#{}", deps.cfg.target_repo, pr);
-            let _ = deps.tracker.comment_external(&ext_ref, body);
-            return Ok(());
+            return deps.tracker.comment_external(&ext_ref, body);
         }
     }
-    if let Ok(candidates) = deps.tracker.fetch_candidates() {
-        if let Some(bead) = candidates.iter().find(|b| b.id == bead_id) {
-            if let Some(ref ext_ref) = bead.external_ref {
-                let _ = deps.tracker.comment_external(ext_ref, body);
-            }
+    let candidates = deps.tracker.fetch_candidates()?;
+    if let Some(bead) = candidates.iter().find(|b| b.id == bead_id) {
+        if let Some(ref ext_ref) = bead.external_ref {
+            return deps.tracker.comment_external(ext_ref, body);
         }
     }
-    Ok(())
+    Err(DaemonError::Config(format!(
+        "no SCM comment target found for bead {bead_id}"
+    )))
 }

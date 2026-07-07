@@ -20,6 +20,8 @@ fn fake_tracker_records_calls_and_returns_scripted_response() {
             external_ref: Some("owner/repo#5".into()),
         }]),
         create_bead_result: std::cell::RefCell::new(Some(Ok("bead-42".into()))),
+        fail_next_fetch_candidates: Default::default(),
+        fail_next_comment: Default::default(),
         calls: Default::default(),
     };
 
