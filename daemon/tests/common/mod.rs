@@ -220,6 +220,13 @@ impl Sessions for FakeSessions {
 #[derive(Default)]
 pub struct FakeVcs {
     pub heads: HashMap<String, String>,
+    /// Per-(branch, remote_sha) script for `is_remote_ahead`. When absent the
+    /// default is `false` so tests that don't exercise the stall-bypass guard
+    /// don't have to set it up. Tests that DO exercise the guard
+    /// (`test_wedge_detection_attested_session_not_stalled_if_remote_ahead` and
+    /// its companion `*_local_ahead_or_diverged_still_parks`) insert the
+    /// (branch, remote_sha) key with the desired answer.
+    pub remote_ahead: HashMap<(String, String), bool>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -261,6 +268,35 @@ impl Vcs for FakeVcs {
                 rc: 1,
                 stderr: format!("no scripted head for {branch}"),
             })
+    }
+
+    fn is_remote_ahead(
+        &self,
+        branch: &str,
+        remote_sha: &str,
+    ) -> Result<bool, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("is_remote_ahead({branch},{remote_sha})"));
+        // Empty / equal SHAs are never "ahead" — same contract as the real
+        // CliVcs impl so tests don't have to script a false positive.
+        let local = self
+            .heads
+            .get(branch)
+            .cloned()
+            .ok_or_else(|| DaemonError::Tool {
+                tool: "git".into(),
+                rc: 1,
+                stderr: format!("no scripted head for {branch}"),
+            })?;
+        if local.is_empty() || remote_sha.is_empty() || local == remote_sha {
+            return Ok(false);
+        }
+        Ok(self
+            .remote_ahead
+            .get(&(branch.to_string(), remote_sha.to_string()))
+            .copied()
+            .unwrap_or(false))
     }
 }
 

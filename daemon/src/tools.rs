@@ -217,6 +217,20 @@ pub trait Vcs {
     fn base_head(&self, base_branch: &str) -> Result<String, DaemonError>;
     fn create_branch_at(&self, name: &str, sha: &str) -> Result<(), DaemonError>;
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError>;
+    /// `true` iff `local_head` (the local branch's SHA) is a strict ancestor of
+    /// `remote_sha` — i.e. the remote PR head contains every local commit AND
+    /// has at least one extra commit the local checkout has not seen yet. Returns
+    /// `false` when local and remote match, when remote is behind local, or when
+    /// the two branches have diverged (a stronger condition than `head_sha(branch)
+    /// != remote_sha`, which a divergent local checkout would also satisfy).
+    ///
+    /// This is the predicate the `jleechan-ubas` stall-bypass guard relies on:
+    /// "the worker is still landing commits" must mean "remote has new work
+    /// local hasn't fetched yet", not "the two sides have diverged". A
+    /// divergent or local-only-ahead branch must NOT trigger the bypass —
+    /// otherwise the daemon would mask a real stall behind a green PR and
+    /// ignore local-only work.
+    fn is_remote_ahead(&self, branch: &str, remote_sha: &str) -> Result<bool, DaemonError>;
 }
 
 /// LLM judgment calls (router, in-place-vs-reroll verdict, constraint extraction).

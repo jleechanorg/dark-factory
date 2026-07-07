@@ -188,6 +188,13 @@ impl Vcs for VcsMock {
     fn head_sha(&self, _b: &str) -> Result<String, daemon::errors::DaemonError> {
         Ok("deadbeef".into())
     }
+    fn is_remote_ahead(
+        &self,
+        _b: &str,
+        _r: &str,
+    ) -> Result<bool, daemon::errors::DaemonError> {
+        Ok(false)
+    }
 }
 
 #[derive(Default)]

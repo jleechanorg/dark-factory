@@ -956,6 +956,29 @@ impl Vcs for CliVcs {
         let out = run_tool("git", &["rev-parse", branch], 30)?;
         Ok(out.trim().to_string())
     }
+
+    fn is_remote_ahead(&self, branch: &str, remote_sha: &str) -> Result<bool, DaemonError> {
+        // Two-step check:
+        // 1. local_head == remote_sha ⇒ not ahead (worker hasn't actually
+        //    pushed anything new since the daemon's last view).
+        // 2. `git merge-base --is-ancestor <local> <remote>` returns 0 iff
+        //    local is reachable from remote (i.e. every local commit is in
+        //    remote) — combined with the inequality check this is the
+        //    strict "remote has all of local + more" predicate. A
+        //    divergent branch or a local-only-ahead branch returns rc=1.
+        let local = self.head_sha(branch)?;
+        if local.is_empty() || remote_sha.is_empty() || local == remote_sha {
+            return Ok(false);
+        }
+        // `--is-ancestor` exits 0 on true, 1 on false; we don't care about
+        // commit messages so `--quiet` keeps stderr clean.
+        let r = run_tool(
+            "git",
+            &["merge-base", "--is-ancestor", &local, remote_sha],
+            30,
+        );
+        Ok(r.is_ok())
+    }
 }
 
 pub struct ChainLlm;
@@ -1111,6 +1134,27 @@ mod ci_bucket_tests {
 mod chain_llm_fallback_argv_tests {
     use super::ChainLlm;
     use crate::tools::Llm;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Process-wide mutex that serializes the `PATH` / `HOME` mutations
+    /// performed by the fallback-argv tests below. Without this guard,
+    /// `cargo test` runs unit tests in parallel by default — test A could
+    /// call `set_var("PATH", a)` then yield, then test B could call
+    /// `set_var("PATH", b)` and observe A's environment restored on B's
+    /// failure path (or vice versa), causing one of the two tests to
+    /// invoke the real `codex` binary from the system PATH instead of
+    /// the argv-dump shim (or to fail because ChainLlm::judge fell through
+    /// to a real backend). The mutex holds for the entire mutation +
+    /// `ChainLlm::judge` window, so a single shared binary mutex is
+    /// sufficient even though two tests exist.
+    ///
+    /// `OnceLock` so the allocation happens once per process; `Mutex` (not
+    /// `RwLock`) because every holder mutates `std::env` between lock
+    /// acquisition and `ChainLlm::judge` and the critical section is short.
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    fn env_lock() -> &'static Mutex<()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     /// Write an executable shell script at `path` that prints every element
     /// of its argv, one per line, on stdout. argv[0] (the script path) is
@@ -1152,6 +1196,15 @@ mod chain_llm_fallback_argv_tests {
     #[test]
     #[cfg(unix)]
     fn chain_llm_fallback_uses_explicit_cwd_and_argv_order() {
+        // Hold the process-wide env mutex for the entire mutation +
+        // ChainLlm::judge window so this test cannot interleave with
+        // `codex_argv_preserves_flag_boundary` (see ENV_LOCK rationale).
+        // On mutex poisoning we re-raise as a regular panic so the test
+        // still fails loudly rather than silently skipping.
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         // Key the temp dir on nanos since parallel test invocations need
         // unique paths (process-id is shared across threads in a binary).
         let nanos = std::time::SystemTime::now()
@@ -1171,12 +1224,10 @@ mod chain_llm_fallback_argv_tests {
             new_path.push(":");
             new_path.push(prior);
         }
-        // SAFETY: tests mutate env vars sequentially here — but `cargo test`
-        // runs multiple test binaries in parallel. Use a per-test temp dir
-        // and the unique `nanos` suffix so simultaneous chain_llm_fallback
-        // tests don't trash each other's PATH. Tests within the same crate
-        // run sequentially via `cargo test -- --test-threads=1` if needed;
-        // see the README on isolation.
+        // SAFETY: tests mutate env vars sequentially here. ENV_LOCK above
+        // ensures no parallel test from this module can interleave; the
+        // per-test temp dir + `nanos` suffix is defense-in-depth in case
+        // a future contributor adds a test that does NOT take the lock.
         unsafe { std::env::set_var("PATH", &new_path) };
         let prior_home = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", dir.to_str().unwrap()) };
@@ -1184,7 +1235,10 @@ mod chain_llm_fallback_argv_tests {
         let result = ChainLlm.judge("hello-router-prompt");
 
         // Restore env first so a failed assertion leaves the test run
-        // hygienic for the next case.
+        // hygienic for the next case. Drop the guard explicitly after
+        // restoration so a panic in the assertions does not skip the
+        // env restore (Drop for MutexGuard would not run, but the
+        // restore is the test's responsibility regardless).
         unsafe {
             if let Some(prior) = prior_home {
                 std::env::set_var("HOME", prior);
@@ -1197,6 +1251,7 @@ mod chain_llm_fallback_argv_tests {
                 std::env::remove_var("PATH");
             }
         }
+        drop(_guard);
 
         let captured = result.expect("codex shim should succeed");
 
@@ -1231,6 +1286,13 @@ mod chain_llm_fallback_argv_tests {
     #[test]
     #[cfg(unix)]
     fn codex_argv_preserves_flag_boundary() {
+        // Hold the same process-wide env mutex as the sibling test so
+        // these two cannot interleave their `PATH` / `HOME` mutations
+        // (see ENV_LOCK rationale).
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -1262,6 +1324,7 @@ mod chain_llm_fallback_argv_tests {
                 std::env::remove_var("PATH");
             }
         }
+        drop(_guard);
 
         let captured = result.expect("codex shim should succeed");
         let mut lines = captured.lines();

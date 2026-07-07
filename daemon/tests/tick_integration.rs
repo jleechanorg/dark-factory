@@ -686,9 +686,15 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
     let mut vcs = FakeVcs::new();
     // Local branch SHA is older than the remote head SHA, signalling that
     // the daemon's local checkout hasn't been updated but the PR has new
-    // commits on remote.
+    // commits on remote. `is_remote_ahead` is scripted to return true for
+    // this (branch, remote_sha) pair, matching the post-ubas strict check
+    // (a strict ancestor predicate, not just SHA inequality).
     vcs.heads
         .insert("factory/bead-ubas-r1".into(), "local-head-stale".into());
+    vcs.remote_ahead.insert(
+        ("factory/bead-ubas-r1".into(), "remote-head-advanced".into()),
+        true,
+    );
 
     let telemetry_log = std::env::temp_dir().join("afd_test_ubas_commits_observed.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -808,6 +814,213 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
         summary.beads_parked_human_held, 1,
         "matching-SHA + quiescent session MUST still park — the ubas guard \
          applies only when remote is ahead, not when both sides agree"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Companion regression for bead `jleechan-ubas` review thread
+/// ("Require remote-ahead proof before bypassing the stall"). When the local
+/// branch has unpushed commits — i.e. `local_head` is NOT a strict ancestor
+/// of the remote head SHA — the daemon MUST still park the bead in
+/// `HUMAN_HELD`. The previous "remote != local" inequality check would
+/// also fire here and silently mask a real stall, so this test pins the
+/// stronger `is_remote_ahead`-based predicate.
+#[test]
+fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "bead-local-ahead".into(),
+        BeadOverlay {
+            bead_id: "bead-local-ahead".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 500,
+            spend_usd: 0.0,
+            pr_number: Some(202),
+            branch: Some("factory/bead-local-ahead-r1".into()),
+            session_id: Some("session-local-ahead-1".into()),
+        },
+    );
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Remote PR head SHA differs from the local branch head, but
+    // `is_remote_ahead` is scripted to return false (the daemon's
+    // stall-bypass guard runs that predicate, not raw inequality). The
+    // previous weaker check would have incorrectly bypassed the park here.
+    scm.pr_snapshots.insert(
+        202,
+        PrSnapshot {
+            pr_number: 202,
+            head_sha: "remote-head-stale".into(),
+            updated_at_epoch: now_epoch - 2000,
+            ci_pending: false,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+        },
+    );
+
+    sessions.quiescent = true;
+
+    let mut vcs = FakeVcs::new();
+    vcs.heads
+        .insert("factory/bead-local-ahead-r1".into(), "local-head-ahead".into());
+    // remote_ahead stays at its Default (false) — i.e. local is NOT a strict
+    // ancestor of the remote head, so the bypass guard must NOT fire.
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_ubas_local_ahead.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 10).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "local-ahead bead MUST still park — the ubas guard requires \
+         is_remote_ahead=true (strict ancestor predicate), not just SHA inequality"
+    );
+
+    let o = store.load("bead-local-ahead").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::HumanHeld,
+        "local-ahead bead must end up HUMAN_HELD, not stay ATTESTED behind a bypass"
+    );
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !logs.contains("COMMITS_OBSERVED_AFTER_STALL"),
+        "must NOT emit COMMITS_OBSERVED_AFTER_STALL when local is ahead of remote: {logs}"
+    );
+    assert!(
+        logs.contains("session_stalled"),
+        "must emit session_stalled as the park reason: {logs}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Companion regression for bead `jleechan-ubas` review thread: when the
+/// local branch and the remote PR head have diverged (both advanced from
+/// base, but on different lines) the SHA inequality `remote != local` is
+/// true but `is_remote_ahead` is false. The daemon MUST still park the
+/// bead in `HUMAN_HELD` — the weaker predicate would silently mask a
+/// real stall and let the daemon assess a green-but-diverged PR.
+#[test]
+fn test_wedge_detection_still_parks_when_branches_have_diverged() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "bead-diverged".into(),
+        BeadOverlay {
+            bead_id: "bead-diverged".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 500,
+            spend_usd: 0.0,
+            pr_number: Some(203),
+            branch: Some("factory/bead-diverged-r1".into()),
+            session_id: Some("session-diverged-1".into()),
+        },
+    );
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        203,
+        PrSnapshot {
+            pr_number: 203,
+            head_sha: "remote-head-diverged".into(),
+            updated_at_epoch: now_epoch - 2000,
+            ci_pending: false,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+        },
+    );
+
+    sessions.quiescent = true;
+
+    let mut vcs = FakeVcs::new();
+    vcs.heads
+        .insert("factory/bead-diverged-r1".into(), "local-head-diverged".into());
+    // remote_ahead stays at its Default (false) — diverged branches are
+    // neither remote-ahead nor remote-behind, so the bypass guard must
+    // NOT fire.
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_ubas_diverged.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 10).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "diverged bead MUST still park — SHA inequality is too weak a guard"
+    );
+
+    let o = store.load("bead-diverged").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::HumanHeld,
+        "diverged bead must end up HUMAN_HELD, not stay ATTESTED"
+    );
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !logs.contains("COMMITS_OBSERVED_AFTER_STALL"),
+        "must NOT emit COMMITS_OBSERVED_AFTER_STALL for diverged branches: {logs}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

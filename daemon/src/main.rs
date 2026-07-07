@@ -156,6 +156,13 @@ impl Vcs for NoopAdapters {
     fn head_sha(&self, _branch: &str) -> Result<String, DaemonError> {
         Ok(String::new())
     }
+    fn is_remote_ahead(
+        &self,
+        _branch: &str,
+        _remote_sha: &str,
+    ) -> Result<bool, DaemonError> {
+        Ok(false)
+    }
 }
 
 #[cfg(any(test, debug_assertions))]

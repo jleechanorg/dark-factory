@@ -223,30 +223,31 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
 
                         if is_stalled_or_dead {
                             // Bead `jleechan-ubas`: do NOT park a stalled
-                            // session if the PR head SHA has advanced since
-                            // the daemon's last view — that's evidence the
-                            // worker is still landing commits even though
-                            // `is_quiescent` says otherwise (e.g. an AO
-                            // session was forked, externally terminated,
+                            // session if the remote PR head is genuinely
+                            // ahead of the local branch — that's evidence
+                            // the worker is still landing commits even
+                            // though `is_quiescent` says otherwise (e.g. an
+                            // AO session was forked, externally terminated,
                             // or the AO state lost sync with the actual PR
-                            // progress). We compare the remote head SHA
-                            // (freshly fetched from `pr_snapshot`) to the
-                            // local branch head (Vcs::head_sha) — if they
-                            // differ the remote is ahead. We deliberately
-                            // do NOT run `git fetch` / `git branch -f`
-                            // here: a daemon tick is the wrong place to
-                            // mutate the local branch, and silently
-                            // masking a stuck worker behind a green PR
-                            // would let real stalls recur. The next tick's
-                            // fast tier will re-run gate assessment
-                            // against the live PR state instead.
+                            // progress). The check is `is_remote_ahead`,
+                            // not raw SHA inequality: a divergent or
+                            // local-only-ahead branch (the worker has
+                            // unpushed commits, or local has commits the
+                            // remote has never seen) would also satisfy
+                            // `remote_sha != local_head` and would
+                            // silently mask a real stall behind a green
+                            // PR. We deliberately do NOT run `git fetch`
+                            // / `git branch -f` here: a daemon tick is
+                            // the wrong place to mutate the local branch.
+                            // The next tick's fast tier re-runs gate
+                            // assessment against the live PR state.
                             let mut commits_observed_after_exit = false;
                             if let Some(ref branch) = overlay.branch {
-                                if let Ok(local_head) = deps.vcs.head_sha(branch) {
-                                    if !local_head.is_empty()
-                                        && !pr_snapshot.head_sha.is_empty()
-                                        && pr_snapshot.head_sha != local_head
-                                    {
+                                if let Ok(ahead) = deps
+                                    .vcs
+                                    .is_remote_ahead(branch, &pr_snapshot.head_sha)
+                                {
+                                    if ahead {
                                         commits_observed_after_exit = true;
                                     }
                                 }
