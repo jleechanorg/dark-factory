@@ -28,7 +28,7 @@ use daemon::er_runner;
 use daemon::errors::DaemonError;
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
-use daemon::tools::{Bead, Issue, Llm, Permission, PrComment, PrSnapshot, Scm};
+use daemon::tools::{Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrSnapshot, Scm};
 use daemon::verifier::SkepticVerdict;
 
 fn test_cfg() -> Config {
@@ -1171,6 +1171,507 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
 }
 
 #[test]
+fn factory_labeled_existing_pr_is_adopted_and_verified_without_spawn() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 701,
+        title: "Existing factory PR".into(),
+        body: "already has a branch".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#701".into(),
+        head_ref_name: "feature/already-open-pr".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    scm.pr_snapshots.insert(
+        701,
+        qdw_green_snapshot(
+            701,
+            vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+            }],
+        ),
+    );
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_existing_pr_adoption.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("factory-labeled PR should be adopted and verified");
+
+    assert_eq!(summary.beads_created, 1);
+    assert_eq!(summary.beads_dispatched, 0);
+    assert_eq!(summary.gates_assessed, 1);
+    assert_eq!(summary.beads_ready, 1);
+
+    let overlay = store.load("fake-bead-1").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::Ready);
+    assert_eq!(overlay.pr_number, Some(701));
+    assert_eq!(overlay.branch.as_deref(), Some("feature/already-open-pr"));
+    assert_eq!(
+        store.bead_id_for_branch("feature/already-open-pr").unwrap(),
+        Some("fake-bead-1".into())
+    );
+
+    let session_calls = sessions.calls.borrow();
+    assert!(
+        !session_calls.iter().any(|call| call.starts_with("spawn(")),
+        "existing PR adoption must not spawn a new session; calls: {session_calls:?}"
+    );
+    assert!(
+        !session_calls.iter().any(|call| call.starts_with("attach(")),
+        "existing PR adoption must not attach a remediation session during initial verification; calls: {session_calls:?}"
+    );
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("EXISTING_PR_ADOPTED") && telemetry.contains("READY_FOR_MERGE"),
+        "expected adoption and ready events, got:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn factory_labeled_existing_pr_second_tick_reuses_tracking_bead_without_spawn() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 702,
+        title: "Existing factory PR".into(),
+        body: "already has a branch".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#702".into(),
+        head_ref_name: "feature/already-open-pr-702".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    scm.pr_snapshots.insert(
+        702,
+        qdw_green_snapshot(
+            702,
+            vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+            }],
+        ),
+    );
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_existing_pr_adoption_idempotent.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let first = run_tick(&deps, 0, 0).expect("first tick adopts PR");
+    let second = run_tick(&deps, 1, 0).expect("second tick reuses adoption");
+
+    assert_eq!(first.beads_created, 1);
+    assert_eq!(second.beads_created, 0);
+    assert_eq!(second.beads_dispatched, 0);
+    assert_eq!(
+        store.bead_id_for_branch("feature/already-open-pr-702").unwrap(),
+        Some("fake-bead-1".into())
+    );
+    let create_calls: Vec<_> = tracker
+        .calls
+        .borrow()
+        .iter()
+        .filter(|call| call.starts_with("create_bead("))
+        .cloned()
+        .collect();
+    assert_eq!(
+        create_calls.len(),
+        1,
+        "second tick must not duplicate the tracking bead: {create_calls:?}"
+    );
+    let session_calls = sessions.calls.borrow();
+    assert!(
+        !session_calls.iter().any(|call| call.starts_with("spawn(")),
+        "repeated adoption must not spawn a session; calls: {session_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn factory_labeled_existing_pr_without_session_is_not_parked_as_stalled() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 703,
+        title: "Existing factory PR waiting on review".into(),
+        body: "already has a branch".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#703".into(),
+        head_ref_name: "feature/already-open-pr-703".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    let mut stale_unknown = qdw_green_snapshot(703, Vec::new());
+    stale_unknown.updated_at_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(1900);
+    scm.pr_snapshots.insert(703, stale_unknown);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_existing_pr_no_session_waiting.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    run_tick(&deps, 0, 0).expect("first tick adopts PR");
+    run_tick(&deps, 1, 1).expect("second tick must not false-park no-session PR");
+
+    let overlay = store.load("fake-bead-1").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::Attested);
+    assert_eq!(overlay.session_id, None);
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("EXISTING_PR_WAITING"),
+        "expected no-session waiting telemetry, got:\n{telemetry}"
+    );
+    assert!(
+        !telemetry.contains("\"reason\":\"session_stalled\""),
+        "existing PR without session must not be parked as session_stalled:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 704,
+        title: "Branch collision PR".into(),
+        body: "tries to reuse an owned branch".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#704".into(),
+        head_ref_name: "factory/existing-bead-r1".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    store
+        .save(&BeadOverlay {
+            bead_id: "existing-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(111),
+            branch: Some("factory/existing-bead-r1".into()),
+            session_id: Some("sess-existing".into()),
+        })
+        .unwrap();
+    store
+        .register_branch("existing-bead", "factory/existing-bead-r1")
+        .unwrap();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_existing_pr_collision.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("branch collision should escalate without failing the tick");
+
+    assert_eq!(summary.beads_escalated, 1);
+    assert_eq!(
+        store.bead_id_for_branch("factory/existing-bead-r1").unwrap(),
+        Some("existing-bead".into()),
+        "collision must not steal the branch registry key"
+    );
+    let refused_overlay = store.load("fake-bead-1").unwrap();
+    assert!(
+        refused_overlay.is_none(),
+        "refused adoption must not create an overlay for the colliding PR; overlay={refused_overlay:?}, calls={:?}",
+        store.calls.borrow()
+    );
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls.iter().any(|call| {
+            call.contains("comment_external(owner/repo#704")
+                && call.contains("already registered to bead `existing-bead`")
+        }),
+        "collision must be escalated on the original PR: {tracker_calls:?}"
+    );
+    let store_calls = store.calls.borrow();
+    assert!(
+        !store_calls
+            .iter()
+            .any(|call| call == "register_branch(fake-bead-1,factory/existing-bead-r1)"),
+        "colliding adoption must not register the candidate bead: {store_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-sniw re-review gap #1: `daemon/tests/intake.rs`'s
+/// `fork_factory_pr_is_skipped_with_escalation_comment` only proves
+/// `intake::normalize_labeled_prs` returns an empty `Vec` for a fork PR — it
+/// stops at the intake unit boundary and never proves the *tick-level*
+/// guarantee that `run_tick` (and specifically `run_slow_tier`'s
+/// `deps.store.register_branch` call at the single call site gated by the
+/// `intake::normalize_labeled_prs(...)` loop) never registers a branch for a
+/// fork-origin PR. A fork PR is filtered out one layer earlier inside
+/// `intake::normalize_labeled_prs` (via `same_repo_pr`), so it never even
+/// produces an `ExistingPrIntake` for `run_slow_tier`'s branch-collision loop
+/// to see — this test proves that end-to-end through the real `run_tick`
+/// entry point, not just at the `intake` unit boundary.
+#[test]
+fn fork_labeled_pr_never_registers_branch_at_tick_level() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 811,
+        title: "Fork PR trying to adopt".into(),
+        body: "opened from a fork, must never enter the branch registry".into(),
+        author_login: "mallory".into(),
+        external_ref: "owner/repo#811".into(),
+        head_ref_name: "factory/fork-pr-r1".into(),
+        is_cross_repository: true,
+        head_repo_full_name: Some("mallory-fork/repo".into()),
+        head_repo_owner_login: Some("mallory-fork".into()),
+    });
+    scm.permissions.insert("mallory".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_fork_pr_tick_level.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("fork PR intake must not fail the tick");
+
+    assert_eq!(
+        summary.beads_created, 0,
+        "fork PR must never be adopted as a bead"
+    );
+    assert_eq!(
+        summary.beads_escalated, 0,
+        "fork PR is filtered before run_slow_tier's own branch-collision escalation counter fires; \
+         the escalation comment comes from intake::normalize_labeled_prs directly"
+    );
+    assert_eq!(
+        store.bead_id_for_branch("factory/fork-pr-r1").unwrap(),
+        None,
+        "fork PR's branch must never appear in the branch-ownership registry"
+    );
+    let store_calls = store.calls.borrow();
+    assert!(
+        !store_calls
+            .iter()
+            .any(|call| call.starts_with("register_branch(")),
+        "register_branch must never be called for a fork-origin PR: {store_calls:?}"
+    );
+    assert!(
+        !store_calls.iter().any(|call| call.starts_with("save(")),
+        "no overlay may be created/saved for a fork-origin PR: {store_calls:?}"
+    );
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls.iter().all(|call| !call.starts_with("create_bead(")),
+        "fork PR must not create an adopted bead at the tick level: {tracker_calls:?}"
+    );
+    assert!(
+        tracker_calls.iter().any(|call| {
+            call.contains("comment_external(owner/repo#811")
+                && call.contains("fork/cross-repository PR adoption is not supported")
+                && call.contains("jleechan-tfs1")
+        }),
+        "fork PR must still receive the intake-level escalation comment: {tracker_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn adopted_non_green_pr_parks_human_held_with_v1_escalation() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 705,
+        title: "Adopted red PR".into(),
+        body: "already has a non-green branch".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#705".into(),
+        head_ref_name: "feature/adopted-red-pr".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    let mut snapshot = qdw_green_snapshot(
+        705,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+        }],
+    );
+    snapshot.ci_success = false;
+    snapshot.ci_status = "failure".into();
+    scm.pr_snapshots.insert(705, snapshot);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_existing_pr_adoption_red.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("non-green adopted PR should park with escalation");
+
+    assert_eq!(summary.beads_created, 1);
+    assert_eq!(summary.gates_assessed, 1);
+    assert_eq!(summary.beads_parked_human_held, 1);
+    let overlay = store.load("fake-bead-1").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(overlay.session_id, None);
+    assert_eq!(overlay.pr_number, Some(705));
+    assert_eq!(overlay.branch.as_deref(), Some("feature/adopted-red-pr"));
+    assert_eq!(
+        store.bead_id_for_branch("feature/adopted-red-pr").unwrap(),
+        Some("fake-bead-1".into())
+    );
+    let session_calls = sessions.calls.borrow();
+    assert!(
+        session_calls.iter().all(|call| {
+            !call.starts_with("spawn(") && !call.starts_with("attach(")
+        }),
+        "adopted non-green PR must not fabricate remediation sessions: {session_calls:?}"
+    );
+    let branch_calls = store.calls.borrow();
+    assert!(
+        branch_calls
+            .iter()
+            .all(|call| !call.contains("factory/fake-bead-1-r2")),
+        "adopted non-green PR must not fabricate replacement branches: {branch_calls:?}"
+    );
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls.iter().any(|call| {
+            call.contains("comment_external(owner/repo#705")
+                && call.contains("adopted PR is not green")
+                && call.contains("jleechan-tfs1")
+        }),
+        "adopted red PR must receive the v1 escalation comment: {tracker_calls:?}"
+    );
+    assert!(
+        tracker_calls.iter().all(|call| !call.contains("close")),
+        "original PR must not be closed by adopted non-green handling: {tracker_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
 fn test_manual_bead_input_auto_queued_and_dispatched() {
     let scm = FakeScm::new(); // no issues in SCM
     let tracker = FakeTracker::new();
@@ -1677,6 +2178,196 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
         second_comment_count, first_comment_count,
         "second tick must not post duplicate escalation comments"
     );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-sniw re-review gap #2: the generic HUMAN_HELD cap/escalation
+/// coverage (`recover_human_held_does_not_touch_bead_at_or_above_max_attempt`
+/// above) pre-dates this PR and only proves the cap mechanism in isolation by
+/// directly seeding an overlay at `attempt=10`/`attempt=11`. It never proves
+/// that a bead which arrived via the *adopted-PR intake overlay* (this PR's
+/// `run_slow_tier` PR-adoption path, `daemon/src/tick.rs` ~line 597-636) can
+/// actually walk itself up to the recovery cap and escalate through repeated
+/// real ticks. This test adopts a factory-labeled PR whose PR snapshot is
+/// permanently non-green (CI never turns green), drives `run_tick` for
+/// enough ticks to organically cycle
+/// HUMAN_HELD -> (recovery) QUEUED -> (re-adoption) ATTESTED -> (gate
+/// assessment, still red) HUMAN_HELD until `attempt` reaches
+/// `MAX_HUMAN_HELD_RECOVERY_ATTEMPT`, and asserts: (a) recovery stops at the
+/// cap, (b) a real escalation comment is posted via
+/// `post_scm_comment_by_bead_id`, and (c) `escalation_already_recorded`
+/// dedup logic (the `ESCALATION_SENTINEL_ATTEMPT` rejection-table row)
+/// prevents a duplicate escalation comment on a later tick past the cap.
+#[test]
+fn adopted_pr_that_never_goes_green_escalates_at_recovery_cap_and_dedups() {
+    const PR_NUMBER: u64 = 909;
+    const BRANCH: &str = "factory/never-green-r1";
+    const BEAD_ID: &str = "fake-bead-1";
+
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: PR_NUMBER,
+        title: "Adopted PR that never goes green".into(),
+        body: "CI stays red across every tick".into(),
+        author_login: "alice".into(),
+        external_ref: format!("owner/repo#{PR_NUMBER}"),
+        head_ref_name: BRANCH.into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    let mut snapshot = qdw_green_snapshot(
+        PR_NUMBER,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+        }],
+    );
+    snapshot.ci_success = false;
+    snapshot.ci_status = "failure".into();
+    scm.pr_snapshots.insert(PR_NUMBER, snapshot);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_adopted_pr_never_green_cap.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // Tick 0: adopt the labeled PR (real intake path — creates the bead,
+    // registers the branch) and, in the same tick, run gate assessment
+    // against the permanently-red PR snapshot. Stage-1 substitution rule
+    // parks it HUMAN_HELD immediately at attempt=1 (first-ever overlay
+    // starts at attempt=1, not 0 — matches `adopted_non_green_pr_parks_
+    // human_held_with_v1_escalation`).
+    let summary0 = run_tick(&deps, 0, 0).expect("tick 0 (adoption + park) should succeed");
+    assert_eq!(summary0.beads_created, 1, "PR must be adopted as a new bead");
+    assert_eq!(summary0.gates_assessed, 1);
+    assert_eq!(summary0.beads_parked_human_held, 1);
+    assert_eq!(summary0.beads_escalated, 0);
+    let overlay0 = store.load(BEAD_ID).unwrap().unwrap();
+    assert_eq!(overlay0.state, OverlayState::HumanHeld);
+    assert_eq!(overlay0.attempt, 1);
+    assert_eq!(overlay0.pr_number, Some(PR_NUMBER));
+    assert_eq!(overlay0.branch.as_deref(), Some(BRANCH));
+
+    // Ticks 1..=9: each tick's `run_recovery_step` requeues the still-
+    // HUMAN_HELD bead (attempt < 10), the same tick's re-adoption pass
+    // (`run_slow_tier`) immediately re-attests it against the still-open PR,
+    // and `run_fast_tier`'s gate assessment sees the same permanently-red
+    // snapshot and re-parks it HUMAN_HELD — all organically, no manual state
+    // mutation. After this loop `attempt` must equal 10 (the cap).
+    for tick_index in 1..=9u64 {
+        let summary = run_tick(&deps, tick_index, 0)
+            .unwrap_or_else(|e| panic!("tick {tick_index} should succeed: {e:?}"));
+        assert_eq!(
+            summary.beads_recovered_from_held, 1,
+            "tick {tick_index}: bead below the cap must be recovered from HUMAN_HELD"
+        );
+        assert_eq!(
+            summary.beads_escalated, 0,
+            "tick {tick_index}: bead below the cap must not escalate yet"
+        );
+        let overlay = store.load(BEAD_ID).unwrap().unwrap();
+        assert_eq!(
+            overlay.state,
+            OverlayState::HumanHeld,
+            "tick {tick_index}: bead must re-park HUMAN_HELD after re-adoption + failed gate assessment"
+        );
+        assert_eq!(
+            overlay.attempt,
+            (tick_index as u32) + 1,
+            "tick {tick_index}: attempt must advance by exactly one recovery cycle"
+        );
+    }
+    let at_cap = store.load(BEAD_ID).unwrap().unwrap();
+    assert_eq!(at_cap.attempt, 10, "bead must have reached the recovery cap");
+    assert_eq!(at_cap.state, OverlayState::HumanHeld);
+
+    // Tick 10: attempt (10) is no longer `< MAX_HUMAN_HELD_RECOVERY_ATTEMPT`
+    // (10), so recovery MUST stop retrying and instead escalate: a real
+    // escalation comment is posted through `post_scm_comment_by_bead_id`,
+    // and the escalation sentinel row is recorded.
+    let summary_cap = run_tick(&deps, 10, 0).expect("cap tick should succeed");
+    assert_eq!(
+        summary_cap.beads_recovered_from_held, 0,
+        "bead at the cap must NOT be recovered again"
+    );
+    assert_eq!(
+        summary_cap.beads_escalated, 1,
+        "bead at the cap must be escalated exactly once"
+    );
+    let capped_overlay = store.load(BEAD_ID).unwrap().unwrap();
+    assert_eq!(
+        capped_overlay.state,
+        OverlayState::HumanHeld,
+        "escalation must leave the bead parked HUMAN_HELD for human review"
+    );
+    assert_eq!(capped_overlay.attempt, 10);
+
+    let escalation_comment_count = |tracker: &FakeTracker| {
+        tracker
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| {
+                call.contains(&format!("comment_external(owner/repo#{PR_NUMBER}"))
+                    && call.contains("Escalation required")
+                    && call.contains(&format!("bead `{BEAD_ID}` is HUMAN_HELD at attempt 10"))
+                    && call.contains("max automated recovery attempts: 10")
+            })
+            .count()
+    };
+    assert_eq!(
+        escalation_comment_count(&tracker),
+        1,
+        "a real escalation comment must be posted via post_scm_comment_by_bead_id: {:?}",
+        tracker.calls.borrow()
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("ESCALATION_REQUIRED")
+            && log.contains("human_held_recovery_attempt_cap_reached"),
+        "cap escalation telemetry must be emitted; got: {log}"
+    );
+
+    // Tick 11: dedup check. The bead is still HUMAN_HELD at attempt 10, so
+    // `run_recovery_step` finds it again via `human_held_at_or_above_attempt`,
+    // but `escalation_already_recorded` (the `ESCALATION_SENTINEL_ATTEMPT`
+    // rejection-table row written by tick 10's `record_escalation`) must
+    // suppress a second escalation comment.
+    let summary_dedup = run_tick(&deps, 11, 0).expect("dedup tick should succeed");
+    assert_eq!(
+        summary_dedup.beads_escalated, 0,
+        "an already-escalated capped bead must not escalate again"
+    );
+    assert_eq!(summary_dedup.beads_recovered_from_held, 0);
+    assert_eq!(
+        escalation_comment_count(&tracker),
+        1,
+        "dedup must prevent a second escalation comment on a later tick past the cap: {:?}",
+        tracker.calls.borrow()
+    );
+    let final_overlay = store.load(BEAD_ID).unwrap().unwrap();
+    assert_eq!(final_overlay.state, OverlayState::HumanHeld);
+    assert_eq!(final_overlay.attempt, 10);
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
@@ -2888,6 +3579,10 @@ impl Scm for QdwPostErRefetchScm {
         Ok(Vec::new())
     }
 
+    fn labeled_prs(&self, _label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
+        Ok(Vec::new())
+    }
+
     fn collaborator_permission(&self, _login: &str) -> Result<Permission, DaemonError> {
         Ok(Permission::None)
     }
@@ -2944,6 +3639,10 @@ impl QdwAssessRefetchScm {
 
 impl Scm for QdwAssessRefetchScm {
     fn labeled_issues(&self, _label: &str) -> Result<Vec<Issue>, DaemonError> {
+        Ok(Vec::new())
+    }
+
+    fn labeled_prs(&self, _label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
         Ok(Vec::new())
     }
 

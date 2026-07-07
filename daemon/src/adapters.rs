@@ -1,5 +1,5 @@
 use crate::errors::DaemonError;
-use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
+use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
@@ -185,6 +185,99 @@ impl CliScm {
             branch_commit_cache: Mutex::new(HashMap::new()),
         }
     }
+
+    fn labeled_prs_via_rest(&self, label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
+        let out = run_tool(
+            "gh",
+            &[
+                "api",
+                &format!("repos/{}/issues?labels={label}&state=open", self.repo),
+            ],
+            30,
+        )?;
+        #[derive(serde::Deserialize)]
+        struct RestIssue {
+            number: u64,
+            title: String,
+            body: Option<String>,
+            user: Option<RestUser>,
+            pull_request: Option<serde_json::Value>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RestUser {
+            login: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct RestPull {
+            head: RestHead,
+        }
+        #[derive(serde::Deserialize)]
+        struct RestHead {
+            #[serde(rename = "ref")]
+            ref_name: String,
+            repo: Option<RestRepo>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RestRepo {
+            full_name: Option<String>,
+            owner: Option<RestUser>,
+        }
+
+        let json_start = out.find('[').unwrap_or(0);
+        let issues: Vec<RestIssue> = serde_json::from_str(&out[json_start..]).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse gh labeled PR REST list: {e}"))
+        })?;
+        let mut prs = Vec::new();
+        let target_owner = self.repo.split('/').next().unwrap_or_default();
+        for issue in issues.into_iter().filter(|issue| issue.pull_request.is_some()) {
+            let pull_out = run_tool(
+                "gh",
+                &[
+                    "api",
+                    &format!("repos/{}/pulls/{}", self.repo, issue.number),
+                ],
+                30,
+            )?;
+            let json_start = pull_out.find('{').unwrap_or(0);
+            let pull: RestPull = serde_json::from_str(&pull_out[json_start..]).map_err(|e| {
+                DaemonError::Parse(format!(
+                    "failed to parse gh pull REST response for PR #{}: {e}",
+                    issue.number
+                ))
+            })?;
+            let head_repo_full_name = pull
+                .head
+                .repo
+                .as_ref()
+                .and_then(|repo| repo.full_name.clone());
+            let head_repo_owner_login = pull
+                .head
+                .repo
+                .as_ref()
+                .and_then(|repo| repo.owner.as_ref().map(|owner| owner.login.clone()));
+            let is_cross_repository = head_repo_full_name
+                .as_ref()
+                .map(|repo| !repo.eq_ignore_ascii_case(&self.repo))
+                .or_else(|| {
+                    head_repo_owner_login
+                        .as_ref()
+                        .map(|owner| !owner.eq_ignore_ascii_case(target_owner))
+                })
+                .unwrap_or(false);
+            prs.push(LabeledPr {
+                number: issue.number,
+                title: issue.title,
+                body: issue.body.unwrap_or_default(),
+                author_login: issue.user.map(|u| u.login).unwrap_or_default(),
+                external_ref: format!("{}#{}", self.repo, issue.number),
+                head_ref_name: pull.head.ref_name,
+                is_cross_repository,
+                head_repo_full_name,
+                head_repo_owner_login,
+            });
+        }
+        Ok(prs)
+    }
 }
 
 
@@ -220,7 +313,6 @@ impl Scm for CliScm {
                 }
             }
         }
-        let mut fallback_active = false;
         let out_issues = match run_tool(
             "gh",
             &[
@@ -239,7 +331,6 @@ impl Scm for CliScm {
         ) {
             Ok(out) => out,
             Err(_) => {
-                fallback_active = true;
                 run_tool(
                     "gh",
                     &[
@@ -249,26 +340,6 @@ impl Scm for CliScm {
                     30,
                 )?
             }
-        };
-        let out_prs = if fallback_active {
-            "[]".to_string()
-        } else {
-            run_tool(
-                "gh",
-                &[
-                    "pr",
-                    "list",
-                    "--repo",
-                    &self.repo,
-                    "--label",
-                    label,
-                    "--state",
-                    "open",
-                    "--json",
-                    "number,title,body,author",
-                ],
-                30,
-            )?
         };
         #[derive(serde::Deserialize)]
         struct GhIssue {
@@ -286,12 +357,8 @@ impl Scm for CliScm {
         let gh_issues: Vec<GhIssue> = serde_json::from_str(&out_issues[json_start_issues..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse gh issue list: {e}"))
         })?;
-        let json_start_prs = out_prs.find('[').unwrap_or(0);
-        let gh_prs: Vec<GhIssue> = serde_json::from_str(&out_prs[json_start_prs..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse gh pr list: {e}"))
-        })?;
         let mut issues: Vec<Issue> = Vec::new();
-        for item in gh_issues.into_iter().chain(gh_prs) {
+        for item in gh_issues {
             if !issues.iter().any(|i| i.number == item.number) {
                 let author_login = item.author.as_ref().or(item.user.as_ref())
                     .map(|a| a.login.clone())
@@ -310,6 +377,63 @@ impl Scm for CliScm {
             cache.insert(label.to_string(), (issues.clone(), Instant::now()));
         }
         Ok(issues)
+    }
+
+    fn labeled_prs(&self, label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
+        let out = match run_tool(
+            "gh",
+            &[
+                "pr",
+                "list",
+                "--repo",
+                &self.repo,
+                "--label",
+                label,
+                "--state",
+                "open",
+                "--json",
+                "number,title,body,author,headRefName,isCrossRepository,headRepositoryOwner",
+            ],
+            30,
+        ) {
+            Ok(out) => out,
+            Err(_) => return self.labeled_prs_via_rest(label),
+        };
+        #[derive(serde::Deserialize)]
+        struct GhPr {
+            number: u64,
+            title: String,
+            body: Option<String>,
+            author: Option<GhAuthor>,
+            #[serde(rename = "headRefName")]
+            head_ref_name: String,
+            #[serde(rename = "isCrossRepository")]
+            is_cross_repository: bool,
+            #[serde(rename = "headRepositoryOwner")]
+            head_repository_owner: Option<GhAuthor>,
+        }
+        #[derive(serde::Deserialize)]
+        struct GhAuthor {
+            login: String,
+        }
+        let json_start = out.find('[').unwrap_or(0);
+        let prs: Vec<GhPr> = serde_json::from_str(&out[json_start..]).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse gh pr list: {e}"))
+        })?;
+        Ok(prs
+            .into_iter()
+            .map(|pr| LabeledPr {
+                number: pr.number,
+                title: pr.title,
+                body: pr.body.unwrap_or_default(),
+                author_login: pr.author.map(|a| a.login).unwrap_or_default(),
+                external_ref: format!("{}#{}", self.repo, pr.number),
+                head_ref_name: pr.head_ref_name,
+                is_cross_repository: pr.is_cross_repository,
+                head_repo_full_name: None,
+                head_repo_owner_login: pr.head_repository_owner.map(|owner| owner.login),
+            })
+            .collect())
     }
 
 

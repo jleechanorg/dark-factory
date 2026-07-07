@@ -6,7 +6,7 @@ mod common;
 use common::{FakeScm, FakeTracker};
 use daemon::config::Config;
 use daemon::intake;
-use daemon::tools::{Bead, Issue, Permission};
+use daemon::tools::{Bead, Issue, LabeledPr, Permission};
 
 fn test_cfg() -> Config {
     Config {
@@ -31,6 +31,20 @@ fn issue(number: u64, author_login: &str) -> Issue {
         body: "body text".into(),
         author_login: author_login.into(),
         external_ref: format!("owner/repo#{number}"),
+    }
+}
+
+fn labeled_pr(number: u64, author_login: &str, head_ref_name: &str) -> LabeledPr {
+    LabeledPr {
+        number,
+        title: format!("pr {number}"),
+        body: "pr body".into(),
+        author_login: author_login.into(),
+        external_ref: format!("owner/repo#{number}"),
+        head_ref_name: head_ref_name.into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
     }
 }
 
@@ -163,4 +177,118 @@ fn mixed_batch_only_creates_bead_for_new_write_tier_issue() {
         .collect();
     assert_eq!(create_calls.len(), 1);
     assert!(create_calls[0].contains("owner/repo#1"));
+}
+
+#[test]
+fn new_factory_pr_from_write_tier_collaborator_creates_existing_pr_intake() {
+    let mut scm = FakeScm::new();
+    scm.prs
+        .push(labeled_pr(51, "alice", "feature/existing-pr-51"));
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+
+    let adopted = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+
+    assert_eq!(adopted.len(), 1);
+    assert_eq!(adopted[0].bead_id, "fake-bead-1");
+    assert_eq!(adopted[0].pr_number, 51);
+    assert_eq!(adopted[0].head_ref_name, "feature/existing-pr-51");
+    assert_eq!(adopted[0].external_ref, "owner/repo#51");
+    assert!(adopted[0].newly_created);
+
+    let calls = tracker.calls.borrow();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.contains("create_bead(pr 51 (owner/repo),pr body,owner/repo#51)")),
+        "expected PR bead creation call, got: {calls:?}"
+    );
+}
+
+#[test]
+fn factory_pr_with_existing_external_ref_reuses_bead() {
+    let mut scm = FakeScm::new();
+    scm.prs
+        .push(labeled_pr(52, "alice", "feature/existing-pr-52"));
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "existing-pr-bead".into(),
+        title: "pr 52".into(),
+        description: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#52".into()),
+    });
+    let cfg = test_cfg();
+
+    let adopted = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+
+    assert_eq!(adopted.len(), 1);
+    assert_eq!(adopted[0].bead_id, "existing-pr-bead");
+    assert!(!adopted[0].newly_created);
+    let create_calls: Vec<_> = tracker
+        .calls
+        .borrow()
+        .iter()
+        .filter(|call| call.starts_with("create_bead("))
+        .cloned()
+        .collect();
+    assert!(create_calls.is_empty(), "got duplicate creates: {create_calls:?}");
+}
+
+#[test]
+fn factory_pr_from_read_tier_creator_is_skipped() {
+    let mut scm = FakeScm::new();
+    scm.prs
+        .push(labeled_pr(53, "mallory", "feature/existing-pr-53"));
+    scm.permissions.insert("mallory".into(), Permission::Read);
+
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+
+    let adopted = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+
+    assert!(adopted.is_empty());
+    let create_calls: Vec<_> = tracker
+        .calls
+        .borrow()
+        .iter()
+        .filter(|call| call.starts_with("create_bead("))
+        .cloned()
+        .collect();
+    assert!(create_calls.is_empty(), "read-tier PR created bead: {create_calls:?}");
+}
+
+#[test]
+fn fork_factory_pr_is_skipped_with_escalation_comment() {
+    let mut scm = FakeScm::new();
+    let mut pr = labeled_pr(54, "alice", "factory/existing-bead-r1");
+    pr.is_cross_repository = true;
+    pr.head_repo_full_name = Some("fork/repo".into());
+    pr.head_repo_owner_login = Some("fork".into());
+    scm.prs.push(pr);
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+
+    let adopted = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+
+    assert!(adopted.is_empty());
+    let calls = tracker.calls.borrow();
+    assert!(
+        calls.iter().all(|call| !call.starts_with("create_bead(")),
+        "fork PR must not create an adopted bead: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|call| {
+            call.contains("comment_external(owner/repo#54")
+                && call.contains("fork/cross-repository PR adoption is not supported")
+                && call.contains("jleechan-tfs1")
+        }),
+        "fork PR must receive an escalation comment: {calls:?}"
+    );
 }

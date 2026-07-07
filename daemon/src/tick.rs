@@ -27,6 +27,7 @@ use crate::state::{BeadOverlay, OverlayState, StateStore};
 use crate::telemetry::{self, TelemetryEvent};
 use crate::tools::{Bead, Llm, Scm, SessionId, Sessions, Tracker, Vcs};
 use crate::verifier::{self, PrEvidence};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Everything one `run_tick` call needs: the five tool-boundary trait objects,
@@ -356,7 +357,19 @@ pub fn run_tick(
                                 let session_id = SessionId(session_id_str.clone());
                                 deps.sessions.is_quiescent(&session_id)?
                             } else {
-                                true
+                                emit(
+                                    deps.telemetry_log,
+                                    &overlay.bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Attested.as_str(),
+                                    "EXISTING_PR_WAITING",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "reason": "no_worker_session",
+                                        "pr_number": pr_number,
+                                    }),
+                                )?;
+                                false
                             };
 
                         if is_stalled_or_dead {
@@ -546,6 +559,83 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // so freshly-QUEUED beads aren't immediately re-parked by wedge
     // detection). The freshly-recovered QUEUED beads are picked up by the
     // routing_candidates loop below, so they get dispatched this same tick.
+    let mut pr_intake_bead_ids = HashSet::new();
+    for adopted in intake::normalize_labeled_prs(deps.scm, deps.tracker, deps.cfg)? {
+        pr_intake_bead_ids.insert(adopted.bead_id.clone());
+        if adopted.newly_created {
+            summary.beads_created += 1;
+        }
+        if let Some(owner) = deps.store.bead_id_for_branch(&adopted.head_ref_name)? {
+            if owner != adopted.bead_id {
+                let owner_live = deps.store.load(&owner)?.is_some();
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: refusing factory PR adoption for branch `{}` because it is already registered to bead `{}`. Branch-key stealing is not allowed; please use a unique same-repo branch.",
+                    adopted.head_ref_name, owner
+                );
+                let _ = deps
+                    .tracker
+                    .comment_external(&adopted.external_ref, &comment_body);
+                summary.beads_escalated += 1;
+                emit(
+                    deps.telemetry_log,
+                    &adopted.bead_id,
+                    1,
+                    OverlayState::HumanHeld.as_str(),
+                    "ESCALATION_REQUIRED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "adoption_branch_collision",
+                        "branch": adopted.head_ref_name,
+                        "registered_bead": owner,
+                        "registered_bead_live": owner_live,
+                        "external_ref": adopted.external_ref,
+                    }),
+                )?;
+                continue;
+            }
+        }
+        deps.store
+            .register_branch(&adopted.bead_id, &adopted.head_ref_name)?;
+
+        let existing = deps.store.load(&adopted.bead_id)?;
+        let attempt = existing.as_ref().map(|o| o.attempt).unwrap_or(1);
+        let should_adopt = !matches!(
+            existing.as_ref().map(|o| o.state),
+            Some(OverlayState::Ready) | Some(OverlayState::HumanHeld)
+        );
+        if should_adopt {
+            let mut overlay = existing.unwrap_or(BeadOverlay {
+                bead_id: adopted.bead_id.clone(),
+                state: OverlayState::Attested,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: Some(adopted.pr_number),
+                branch: Some(adopted.head_ref_name.clone()),
+                session_id: None,
+            });
+            overlay.state = OverlayState::Attested;
+            overlay.pr_number = Some(adopted.pr_number);
+            overlay.branch = Some(adopted.head_ref_name.clone());
+            deps.store.save(&overlay)?;
+        }
+        emit(
+            deps.telemetry_log,
+            &adopted.bead_id,
+            attempt,
+            OverlayState::Attested.as_str(),
+            "EXISTING_PR_ADOPTED",
+            serde_json::json!({}),
+            serde_json::json!({
+                "pr_number": adopted.pr_number,
+                "branch": adopted.head_ref_name,
+                "external_ref": adopted.external_ref,
+                "newly_created": adopted.newly_created,
+            }),
+        )?;
+    }
+
     let created = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
     let tracker_candidates = deps.tracker.fetch_candidates()?;
     let mut routing_candidates: Vec<Bead> = Vec::new();
@@ -623,6 +713,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // `Tracker::fetch_candidates` reflects prior `create_bead` calls, so this
     // covers that path in production even though the static test fake can't.
     for bead in tracker_candidates {
+        if pr_intake_bead_ids.contains(&bead.id) {
+            continue;
+        }
         if !routing_candidates.iter().any(|b| b.id == bead.id) {
             routing_candidates.push(bead);
         }
@@ -1301,9 +1394,12 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({}),
                     serde_json::json!({"reason": "gate assessment not all-green (stage 1: recorded, not executed)"}),
                 )?;
-                let comment_body =
+                let comment_body = if overlay.session_id.is_none() {
+                    "🤖 **[dark-factory]** Escalation required: this adopted PR is not green, so automation parked it HUMAN_HELD. Remediation for adopted PRs lands with bead `jleechan-tfs1`; no replacement branch was fabricated.".to_string()
+                } else {
                     "🤖 **[dark-factory]** Coder session parked (human held): gate assessment failed. Stage 1 configuration prevents re-roll."
-                        .to_string();
+                        .to_string()
+                };
                 let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
             } else {
                 // Stage 2: execute re-roll engine
