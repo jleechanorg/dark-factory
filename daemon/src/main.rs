@@ -2,7 +2,6 @@
 // Modules live in `lib.rs` (see that file) so `daemon/tests/*` integration
 // tests can `use daemon::{...}`; this binary just drives the poll loop.
 #[allow(dead_code, unused_imports)]
-
 use daemon::config::{self, Config};
 use daemon::errors::DaemonError;
 use daemon::state::{SqliteStateStore, StateStore};
@@ -197,6 +196,14 @@ fn load_config(path: &Path) -> Result<Config, DaemonError> {
     config::load(path)
 }
 
+type DaemonAdapters = (
+    Box<dyn Scm>,
+    Box<dyn Tracker>,
+    Box<dyn Sessions>,
+    Box<dyn Llm>,
+    Box<dyn Vcs>,
+);
+
 fn run(args: Args) -> Result<(), DaemonError> {
     let cfg_path = default_config_path();
     let cfg = load_config(&cfg_path)?;
@@ -213,13 +220,7 @@ fn run(args: Args) -> Result<(), DaemonError> {
 
     store.reconcile_dispatching()?;
 
-    let (scm, tracker, sessions, llm, vcs): (
-        Box<dyn Scm>,
-        Box<dyn Tracker>,
-        Box<dyn Sessions>,
-        Box<dyn Llm>,
-        Box<dyn Vcs>,
-    ) = if args.dry_run {
+    let (scm, tracker, sessions, llm, vcs): DaemonAdapters = if args.dry_run {
         #[cfg(any(test, debug_assertions))]
         {
             (

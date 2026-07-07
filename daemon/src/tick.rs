@@ -145,7 +145,7 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                 serde_json::json!({}),
                 serde_json::json!({"reason": "autonomy_timebox_exceeded"}),
             )?;
-            let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): autonomy time-box limit exceeded.");
+            let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): autonomy time-box limit exceeded.".to_string();
             let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
             summary.beads_parked_human_held += 1;
             continue;
@@ -198,7 +198,7 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                                 serde_json::json!({}),
                                 serde_json::json!({"reason": "coder_silent"}),
                             )?;
-                            let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): coder silent/inactive on branch for 30 minutes.");
+                            let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): coder silent/inactive on branch for 30 minutes.".to_string();
                             let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
                             summary.beads_parked_human_held += 1;
                         }
@@ -233,7 +233,7 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                                 serde_json::json!({}),
                                 serde_json::json!({"reason": "session_stalled"}),
                             )?;
-                            let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): session stalled or quiescent on open PR.");
+                            let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): session stalled or quiescent on open PR.".to_string();
                             let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
                             summary.beads_parked_human_held += 1;
                         }
