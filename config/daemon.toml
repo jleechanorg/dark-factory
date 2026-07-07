@@ -1,4 +1,5 @@
 target_repo = "jleechanorg/worldarchitect.ai"
+ao_project = "worldarchitect"
 base_branch = "main"
 stage = 1
 max_workers = 30

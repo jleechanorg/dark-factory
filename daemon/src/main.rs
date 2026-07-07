@@ -11,6 +11,51 @@ use std::path::{Path, PathBuf};
 
 const MAX_TICK_BACKOFF_SECS: u64 = 300;
 
+#[cfg(unix)]
+fn systemd_notify(message: &str) -> Result<(), DaemonError> {
+    use std::os::unix::net::UnixDatagram;
+
+    let Some(socket) = std::env::var_os("NOTIFY_SOCKET") else {
+        return Ok(());
+    };
+    let datagram = UnixDatagram::unbound()
+        .map_err(|e| DaemonError::Config(format!("systemd notify socket open failed: {e}")))?;
+    #[cfg(target_os = "linux")]
+    if let Some(name) = systemd_abstract_notify_name(socket.as_os_str()) {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::SocketAddr;
+
+        let address = SocketAddr::from_abstract_name(name).map_err(|e| {
+            DaemonError::Config(format!("systemd notify abstract socket invalid: {e}"))
+        })?;
+        datagram
+            .send_to_addr(message.as_bytes(), &address)
+            .map_err(|e| DaemonError::Config(format!("systemd notify send failed: {e}")))?;
+        return Ok(());
+    }
+    datagram
+        .send_to(message.as_bytes(), PathBuf::from(socket))
+        .map_err(|e| DaemonError::Config(format!("systemd notify send failed: {e}")))?;
+    Ok(())
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn systemd_abstract_notify_name(socket: &std::ffi::OsStr) -> Option<&[u8]> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = socket.as_bytes();
+    if bytes.first() == Some(&b'@') {
+        Some(&bytes[1..])
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn systemd_notify(_message: &str) -> Result<(), DaemonError> {
+    Ok(())
+}
+
 /// Parsed CLI flags (manual `std::env::args` parsing per Task 10 — no `clap`,
 /// staying inside the five-dependency budget from design doc §2).
 #[derive(Debug, Clone, Copy, Default)]
@@ -360,10 +405,17 @@ fn run(args: Args) -> Result<(), DaemonError> {
         }
     } else {
         use daemon::adapters::{CliScm, CliSessions, CliTracker, ChainLlm, CliVcs};
+        let ao_project = cfg.ao_project.clone().unwrap_or_else(|| {
+            cfg.target_repo
+                .split('/')
+                .next_back()
+                .unwrap_or(&cfg.target_repo)
+                .to_string()
+        });
         (
             Box::new(CliScm::new(cfg.target_repo.clone())),
             Box::new(CliTracker),
-            Box::new(CliSessions::new(&cfg.target_repo, "claude-code")),
+            Box::new(CliSessions::new(&ao_project, "claude-code")),
             Box::new(ChainLlm),
             Box::new(CliVcs),
         )
@@ -381,9 +433,13 @@ fn run(args: Args) -> Result<(), DaemonError> {
     };
 
     if args.once {
+        let _ = systemd_notify("READY=1\nSTATUS=auto-factory daemon running one tick");
         run_tick(&deps, 0, 0)?;
+        let _ = systemd_notify("STOPPING=1\nSTATUS=auto-factory daemon one-shot complete");
         return Ok(());
     }
+
+    let _ = systemd_notify("READY=1\nSTATUS=auto-factory daemon started");
 
     let mut tick_loop = TickLoopState::new(std::time::Instant::now());
     loop {
@@ -397,7 +453,24 @@ fn run(args: Args) -> Result<(), DaemonError> {
             cfg.fast_tick_secs,
             tick_loop.consecutive_failures,
         )?;
+        let watchdog_status = match &action {
+            TickLoopAction::Success {
+                consecutive_failures,
+            } => format!(
+                "WATCHDOG=1\nSTATUS=auto-factory daemon tick={} ok consecutive_failures={}",
+                attempt.tick_index, consecutive_failures
+            ),
+            TickLoopAction::TransientBackoff {
+                consecutive_failures,
+                sleep_secs,
+                ..
+            } => format!(
+                "WATCHDOG=1\nSTATUS=auto-factory daemon tick={} transient_failure consecutive_failures={} backoff={}s",
+                attempt.tick_index, consecutive_failures, sleep_secs
+            ),
+        };
         apply_tick_action(&mut tick_loop, &action, || store.reconcile_dispatching())?;
+        let _ = systemd_notify(&watchdog_status);
 
         match action {
             TickLoopAction::Success {
@@ -727,5 +800,65 @@ mod tests {
         assert_eq!(reconcile_count, 0);
         assert_eq!(state.tick_index, 1);
         assert_eq!(state.consecutive_failures, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_notify_sends_to_notify_socket() {
+        use std::os::unix::net::UnixDatagram;
+        use std::time::Duration;
+
+        let socket_path = std::env::temp_dir().join(format!(
+            "dark-factory-notify-{}-{}.sock",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixDatagram::bind(&socket_path).unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        std::env::set_var("NOTIFY_SOCKET", &socket_path);
+        systemd_notify("READY=1\nSTATUS=test-ready").unwrap();
+        std::env::remove_var("NOTIFY_SOCKET");
+
+        let mut buf = [0_u8; 256];
+        let n = listener.recv(&mut buf).unwrap();
+        let received = std::str::from_utf8(&buf[..n]).unwrap();
+
+        assert!(received.contains("READY=1"));
+        assert!(received.contains("STATUS=test-ready"));
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_notify_sends_to_abstract_notify_socket() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+        use std::time::Duration;
+
+        let socket_name = format!(
+            "dark-factory-notify-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        );
+        let address = SocketAddr::from_abstract_name(socket_name.as_bytes()).unwrap();
+        let listener = UnixDatagram::bind_addr(&address).unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        std::env::set_var("NOTIFY_SOCKET", format!("@{socket_name}"));
+        systemd_notify("READY=1\nSTATUS=test-ready-abstract").unwrap();
+        std::env::remove_var("NOTIFY_SOCKET");
+
+        let mut buf = [0_u8; 256];
+        let n = listener.recv(&mut buf).unwrap();
+        let received = std::str::from_utf8(&buf[..n]).unwrap();
+
+        assert!(received.contains("READY=1"));
+        assert!(received.contains("STATUS=test-ready-abstract"));
     }
 }

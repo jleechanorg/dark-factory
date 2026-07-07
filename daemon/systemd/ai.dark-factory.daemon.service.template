@@ -1,0 +1,23 @@
+[Unit]
+Description=Dark Factory Rust auto-factory daemon
+Documentation=https://github.com/jleechanorg/dark-factory
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+WorkingDirectory=@REPO@
+ExecStart=@REPO@/daemon/target/release/daemon
+Restart=on-failure
+RestartSec=10s
+WatchdogSec=7200s
+KillSignal=SIGINT
+TimeoutStopSec=30s
+Environment=HOME=@HOME@
+Environment=PATH=@HOME@/.local/bin:@HOME@/.npm-global/bin:@HOME@/.nvm/versions/node/v22.22.0/bin:@HOME@/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=append:@HOME@/Library/Logs/dark-factory/rust-daemon.out.log
+StandardError=append:@HOME@/Library/Logs/dark-factory/rust-daemon.err.log
+
+[Install]
+WantedBy=default.target

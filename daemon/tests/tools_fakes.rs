@@ -92,6 +92,7 @@ fn fake_sessions_spawn_attach_stop_quiescent_roundtrip() {
         next_session_id: "sess-9".into(),
         quiescent: true,
         fail_spawn_for: Default::default(),
+        spawn_prompts: Default::default(),
         calls: Default::default(),
     };
 
@@ -104,6 +105,10 @@ fn fake_sessions_spawn_attach_stop_quiescent_roundtrip() {
     };
     let id = fake.spawn(&spec).unwrap();
     assert_eq!(id, SessionId("sess-9".into()));
+    assert_eq!(
+        fake.spawn_prompts.borrow().as_slice(),
+        &[("b1".to_string(), "do the thing".to_string())]
+    );
 
     let attached = fake.attach("factory/b1-r1", "b1").unwrap();
     assert_eq!(attached, SessionId("sess-9".into()));

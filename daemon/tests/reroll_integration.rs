@@ -13,6 +13,7 @@ use daemon::tools::{Issue, Permission, PrSnapshot, Llm};
 fn test_cfg() -> Config {
     Config {
         target_repo: "owner/repo".into(),
+        ao_project: None,
         base_branch: "main".into(),
         stage: 2, // stage 2 enabled!
         max_workers: 30,

@@ -795,10 +795,9 @@ pub struct CliSessions {
 }
 
 impl CliSessions {
-    pub fn new(repo: &str, agent: &str) -> Self {
-        let project = repo.split('/').next_back().unwrap_or(repo).to_string();
+    pub fn new(project: &str, agent: &str) -> Self {
         Self {
-            project,
+            project: project.to_string(),
             agent: agent.to_string(),
         }
     }

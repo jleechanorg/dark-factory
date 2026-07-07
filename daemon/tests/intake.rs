@@ -11,6 +11,7 @@ use daemon::tools::{Bead, Issue, Permission};
 fn test_cfg() -> Config {
     Config {
         target_repo: "owner/repo".into(),
+        ao_project: None,
         base_branch: "main".into(),
         stage: 1,
         max_workers: 30,

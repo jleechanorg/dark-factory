@@ -33,6 +33,7 @@ use daemon::verifier::SkepticVerdict;
 fn test_cfg() -> Config {
     Config {
         target_repo: "owner/repo".into(),
+        ao_project: None,
         base_branch: "main".into(),
         stage: 1,
         max_workers: 30,
@@ -294,7 +295,7 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
 
 #[test]
 fn run_tick_rejects_non_stage_1_or_2_config() {
-    let mut scm = FakeScm::new();
+    let scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
@@ -568,7 +569,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
 
 #[test]
 fn test_autonomy_budget_warning_crossing() {
-    let mut scm = FakeScm::new();
+    let scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
@@ -1229,6 +1230,64 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
 }
 
 #[test]
+fn newly_intaken_bead_dispatch_uses_real_tracker_title() {
+    let mut scm = FakeScm::new();
+    scm.issues.push(Issue {
+        number: 8123,
+        title: "Wire a durable Linux trigger".into(),
+        body: "systemd user unit acceptance criteria".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#8123".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_new_intake_prompt_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("newly-intaken bead should route and dispatch");
+
+    assert_eq!(summary.beads_created, 1);
+    assert_eq!(summary.beads_dispatched, 1);
+    let prompts = sessions.spawn_prompts.borrow();
+    assert_eq!(
+        prompts.as_slice(),
+        &[(
+            "fake-bead-1".to_string(),
+            "Wire a durable Linux trigger (owner/repo)".to_string()
+        )],
+        "new intake must dispatch the real tracker title, not an empty stub prompt"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
 fn drive_existing_pr_pending_ci_does_not_reach_ready() {
     // Regression: pending CI buckets must not yield READY (callpath 2026-07-06).
     let mut scm = FakeScm::new();
@@ -1406,7 +1465,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
 // zeros autonomy_secs, and emits a RECOVERED_FROM_HELD telemetry event.
 #[test]
 fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
-    let mut scm = FakeScm::new();
+    let scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
@@ -1484,7 +1543,7 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
 
 #[test]
 fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
-    let mut scm = FakeScm::new();
+    let scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
@@ -1773,7 +1832,7 @@ fn attested_ci_pending_does_not_timebox_park() {
 // does it for them.
 #[test]
 fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
-    let mut scm = FakeScm::new();
+    let scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();

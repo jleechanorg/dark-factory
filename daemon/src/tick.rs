@@ -494,32 +494,35 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // detection). The freshly-recovered QUEUED beads are picked up by the
     // routing_candidates loop below, so they get dispatched this same tick.
     let created = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
+    let tracker_candidates = deps.tracker.fetch_candidates()?;
     let mut routing_candidates: Vec<Bead> = Vec::new();
     for bead_id in &created {
         let mut pr_number = None;
+        let tracker_bead = tracker_candidates
+            .iter()
+            .find(|bead| bead.id == *bead_id)
+            .cloned();
         if deps.llm.is_real() {
-            if let Ok(candidates) = deps.tracker.fetch_candidates() {
-                if let Some(bead) = candidates.iter().find(|b| b.id == *bead_id) {
-                    if let Some(ref ext_ref) = bead.external_ref {
-                        if let Some((_, num_str)) = parse_external_ref(ext_ref) {
-                            if let Ok(num) = num_str.parse::<u64>() {
-                                if crate::tools::run_tool(
-                                    "gh",
-                                    &[
-                                        "pr",
-                                        "view",
-                                        &num.to_string(),
-                                        "--repo",
-                                        &deps.cfg.target_repo,
-                                        "--json",
-                                        "number",
-                                    ],
-                                    10,
-                                )
-                                .is_ok()
-                                {
-                                    pr_number = Some(num);
-                                }
+            if let Some(bead) = tracker_bead.as_ref() {
+                if let Some(ref ext_ref) = bead.external_ref {
+                    if let Some((_, num_str)) = parse_external_ref(ext_ref) {
+                        if let Ok(num) = num_str.parse::<u64>() {
+                            if crate::tools::run_tool(
+                                "gh",
+                                &[
+                                    "pr",
+                                    "view",
+                                    &num.to_string(),
+                                    "--repo",
+                                    &deps.cfg.target_repo,
+                                    "--json",
+                                    "number",
+                                ],
+                                10,
+                            )
+                            .is_ok()
+                            {
+                                pr_number = Some(num);
                             }
                         }
                     }
@@ -549,25 +552,24 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             serde_json::json!({}),
             serde_json::json!({}),
         )?;
-        // `Tracker::fetch_candidates` == `br list ...`; a real `br` would show
-        // this bead on the very next call since `br` is a durable store. Test
-        // fakes are static/pre-seeded, so route/dispatch this tick against the
-        // bead we just created directly rather than depending on the fake
-        // reflecting it back through `fetch_candidates`.
-        routing_candidates.push(Bead {
+        // `Tracker::fetch_candidates` == `br list ...`; a real `br` shows this
+        // bead on the very next call since `br` is durable. Prefer that real
+        // bead payload so the worker prompt carries the tracker title rather than
+        // an empty just-created stub; keep a non-empty fallback for static fakes.
+        routing_candidates.push(tracker_bead.unwrap_or(Bead {
             id: bead_id.clone(),
-            title: String::new(),
+            title: bead_id.clone(),
             description: String::new(),
             file_tree_summary: String::new(),
             external_ref: None,
-        });
+        }));
     }
 
     // Also pick up any bead left over from a prior tick that reached QUEUED
     // but was never routed/dispatched (process restart resilience) — real
     // `Tracker::fetch_candidates` reflects prior `create_bead` calls, so this
     // covers that path in production even though the static test fake can't.
-    for bead in deps.tracker.fetch_candidates()? {
+    for bead in tracker_candidates {
         if !routing_candidates.iter().any(|b| b.id == bead.id) {
             routing_candidates.push(bead);
         }
