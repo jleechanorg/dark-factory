@@ -170,7 +170,19 @@ dispatch-record)
     die_code $EX_IO "state lookup failed for $2"
   fi
   case " QUEUED " in *" $cur "*) ;; *) die_code $EX_REQUIRE_STATE "bead in state '$cur', expected one of: QUEUED";; esac
+  # CR-7 (capacity leg): "$0 capacity" recurses into a fresh invocation of this
+  # same script, which also runs under `set -euo pipefail`. If ITS internal
+  # `sql` call fails (missing table, corrupt DB), that subprocess exits with
+  # sqlite3's raw error code — and a bare assignment here would let that raw
+  # code propagate straight out of THIS process too, bypassing the structured
+  # EX_IO=9 contract. Capture explicitly, same pattern as the owner lookup below.
+  set +e
   cur_cap="$("$0" capacity)"
+  cap_rc=$?
+  set -e
+  if [ "$cap_rc" -ne 0 ]; then
+    die_code $EX_IO "capacity lookup failed (rc=$cap_rc)"
+  fi
   [ "$cur_cap" -gt 0 ] || die_code $EX_OVER_CAP "over capacity — dispatch refused (capacity=$cur_cap)"
   # CR-7: capture sql exit code so missing tables / corrupt DBs surface as EX_IO
   # instead of silently passing through. set -e does NOT propagate rc from

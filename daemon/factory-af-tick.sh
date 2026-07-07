@@ -149,8 +149,13 @@ if [ -z "${AO_PROJECT:-}" ] || [[ ! "$AO_PROJECT" =~ ^[A-Za-z0-9._-]+$ ]]; then
     AO_PROJECT="worldarchitect"
 fi
 if [ -n "$AO" ]; then
-    if "$AO" session ls --json >/dev/null 2>&1; then
-        ao_active="$("$AO" session ls --json 2>/dev/null | python3 -c '
+    # CR: scope the --json probe to $AO_PROJECT the same way the non-JSON
+    # fallback below does (`-p "$AO_PROJECT"`). Without -p here, a successful
+    # --json call would count sessions across ALL AO projects, inflating
+    # ao_active and falsely tripping AO_MAX_CONCURRENT_SESSIONS for
+    # deployments using a non-default AFD_AO_PROJECT.
+    if "$AO" session ls -p "$AO_PROJECT" --json >/dev/null 2>&1; then
+        ao_active="$("$AO" session ls -p "$AO_PROJECT" --json 2>/dev/null | python3 -c '
 import json,sys
 try:
     d = json.load(sys.stdin)
