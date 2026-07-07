@@ -85,6 +85,19 @@ pub trait StateStore {
     fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError>;
     fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, feedback_text: &str) -> Result<(), DaemonError>;
     fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError>;
+    /// Read the `(attempt_count, last_attempt_epoch_secs)` pair for the
+    /// `/er` runner (bead jleechan-qqq). Default impl returns `(0, None)`
+    /// so test fakes that don't override it get the "never spawned" state.
+    fn er_runner_attempt(&self, _bead_id: &str) -> Result<(u32, Option<u64>), DaemonError> {
+        Ok((0, None))
+    }
+    /// Atomically increment the `/er` runner attempt counter for `bead_id`
+    /// and stamp `last_attempt_epoch_secs` to `now_epoch`. Returns the
+    /// new count. Default impl just returns `1` so fakes that don't
+    /// override it still satisfy the call (they aren't used in production).
+    fn incr_er_runner_attempt(&self, _bead_id: &str, _now_epoch: u64) -> Result<u32, DaemonError> {
+        Ok(1)
+    }
     fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
         Ok(())
     }
@@ -372,6 +385,55 @@ impl StateStore for SqliteStateStore {
             .optional()
             .map_err(|e| tool_err("load_rejection", e))
     }
+
+    fn er_runner_attempt(&self, bead_id: &str) -> Result<(u32, Option<u64>), DaemonError> {
+        // Schema migration: the columns were added after the initial release;
+        // older DB files won't have them. Detect that by attempting the
+        // SELECT and falling back to (0, None) if the column is missing
+        // (sqlite returns "no such column" rather than an empty result).
+        let row: Result<(i64, Option<i64>), rusqlite::Error> = self.conn.query_row(
+            "SELECT attempt_er_runner_count, last_er_runner_attempt_at \
+             FROM bead_overlay WHERE bead_id = ?1",
+            params![bead_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        match row {
+            Ok((count, last_at)) => Ok((count.max(0) as u32, last_at.map(|v| v.max(0) as u64))),
+            Err(e) if no_such_column(&e) => Ok((0, None)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok((0, None)),
+            Err(e) => Err(tool_err("er_runner_attempt", e)),
+        }
+    }
+
+    fn incr_er_runner_attempt(&self, bead_id: &str, now_epoch: u64) -> Result<u32, DaemonError> {
+        // Try the UPDATE first (modern schema). If the column is missing
+        // (legacy DB), fall back to no-op + return 1 so the runner's
+        // attempt cap still fires on the in-memory counter.
+        let res = self.conn.execute(
+            "UPDATE bead_overlay SET \
+                attempt_er_runner_count = COALESCE(attempt_er_runner_count, 0) + 1, \
+                last_er_runner_attempt_at = ?2, \
+                updated_at = ?2 \
+             WHERE bead_id = ?1",
+            params![bead_id, now_epoch as i64],
+        );
+        match res {
+            Ok(_) => {
+                let (count, _) = self.er_runner_attempt(bead_id)?;
+                Ok(count)
+            }
+            Err(e) if no_such_column(&e) => Ok(1),
+            Err(e) => Err(tool_err("incr_er_runner_attempt", e)),
+        }
+    }
+}
+
+/// True when `err` is the SQLite "no such column" schema-mismatch signal.
+/// `rusqlite::Error` does not expose a typed `message` field on every
+/// feature combo, so we stringify + match — this is the same trick
+/// the JSON parsers in tools.rs use for `find('{')` fallback.
+fn no_such_column(err: &rusqlite::Error) -> bool {
+    err.to_string().to_lowercase().contains("no such column")
 }
 
 #[cfg(test)]

@@ -645,7 +645,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         };
 
         let mut evidence = skeptic_evidence(deps, bead_id, pr)?;
-        let snapshot = deps.scm.pr_snapshot(pr)?;
+        let mut snapshot = deps.scm.pr_snapshot(pr)?;
         if snapshot.ci_pending {
             emit(
                 deps.telemetry_log,
@@ -657,6 +657,67 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 serde_json::json!({"message": "CI checks are still running (in progress), waiting for completion"}),
             )?;
             continue;
+        }
+
+        // jleechan-qqq: if no `/er` verdict is recorded yet, dispatch an
+        // independent reviewer (claude/codex subprocess) and post the
+        // verdict as a PR comment. Re-fetch the snapshot so the just-
+        // posted comment is visible to `parse_er_verdict` below.
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let runner_outcome = crate::er_runner::maybe_run(deps, bead_id, pr, now_epoch)?;
+        match runner_outcome {
+            crate::er_runner::Outcome::Posted { verdict, count } => {
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    crate::er_runner::EVT_POSTED,
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "verdict": format!("{verdict:?}"),
+                        "attempt": count,
+                    }),
+                )?;
+                snapshot = deps.scm.pr_snapshot(pr)?;
+            }
+            crate::er_runner::Outcome::AlreadyPosted(v) => {
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    crate::er_runner::EVT_NOOP,
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "already_posted", "verdict": format!("{v:?}")}),
+                )?;
+            }
+            crate::er_runner::Outcome::Capped { count } => {
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    crate::er_runner::EVT_CAPPED,
+                    serde_json::json!({}),
+                    serde_json::json!({"count": count}),
+                )?;
+            }
+            crate::er_runner::Outcome::Cooldown { elapsed_secs, count } => {
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    crate::er_runner::EVT_NOOP,
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "cooldown", "elapsed_secs": elapsed_secs, "count": count}),
+                )?;
+            }
+            crate::er_runner::Outcome::NotApplicable => {}
         }
 
         evidence.er_verdict = verifier::parse_er_verdict(&snapshot.comments);

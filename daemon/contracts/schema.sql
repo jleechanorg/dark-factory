@@ -40,3 +40,13 @@ CREATE TABLE IF NOT EXISTS review_rejection (
   created_at    TEXT NOT NULL,
   PRIMARY KEY (bead_id, attempt)
 );
+
+-- /er runner state (bead jleechan-qqq): per-bead attempt counter + last
+-- attempt timestamp (unix epoch seconds). Used by `er_runner::maybe_run`
+-- to enforce a per-bead attempt cap (default MAX_ER_RUNNER_ATTEMPTS=3)
+-- and a cooldown window (default ER_RUNNER_COOLDOWN_SECS=300).
+-- `ALTER TABLE ... ADD COLUMN` is idempotent on modern SQLite when guarded
+-- with `IF NOT EXISTS`-style logic; for older DBs, the Rust side detects
+-- "no such column" and falls back to (0, None) so the runner still works.
+ALTER TABLE bead_overlay ADD COLUMN attempt_er_runner_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE bead_overlay ADD COLUMN last_er_runner_attempt_at INTEGER;
