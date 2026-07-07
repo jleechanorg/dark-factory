@@ -190,11 +190,62 @@ gate-assessment)
   python3 - "$4" <<'PYGA' || die "invalid gates json"
 import json, sys
 g = json.loads(sys.argv[1])
-keys = {"ci_green","no_conflicts","coderabbit","bugbot","comments_resolved","evidence_review","skeptic"}
+# 9 gates since 2026-07 auto-factory expansion: the original 7 plus
+# code_standards (/.codex/skills/code-standards) and zfc
+# (.claude/skills/zero-framework-cognition). The verifier tick in
+# .claude/skills/auto-factory/SKILL.md step 7 dispatches these two extra
+# reviews; the overlay only stores the verdicts + structured evidence,
+# it does not invoke the skills itself.
+#
+# Verdict value shape (jleechan-240 additive expansion):
+#   * String:  "pass" | "warn" | "fail" | "unknown"
+#   * Object:  {"verdict": "...", "evidence": <path:line:msg list>}
+# Legacy aliases "green"/"red"/"unknown" map to "pass"/"fail"/"unknown".
+# Unknown verdict tokens are rejected (no keyword routing — only the
+# invoking model decides pass|warn|fail).
+keys = {"ci_green","no_conflicts","coderabbit","bugbot","comments_resolved","evidence_review","skeptic","code_standards","zfc"}
+ALIAS = {"green":"pass","red":"fail","warn":"warn","unknown":"unknown","pass":"pass","fail":"fail"}
+VALID = {"pass","warn","fail","unknown"}
+
+def normalize(v, key):
+    if isinstance(v, str):
+        if v not in ALIAS:
+            raise AssertionError(f"gate[{key}] verdict must be pass|warn|fail|unknown (or alias green|red|unknown); got {v!r}")
+        return ALIAS[v]
+    if isinstance(v, dict):
+        unknown_keys = set(v.keys()) - {"verdict","evidence"}
+        if unknown_keys:
+            raise AssertionError(f"gate[{key}] object may only have 'verdict'+'evidence'; got {sorted(v.keys())}")
+        if "verdict" not in v:
+            raise AssertionError(f"gate[{key}] object must contain 'verdict'")
+        verdict = v["verdict"]
+        if not isinstance(verdict, str) or verdict not in ALIAS:
+            raise AssertionError(f"gate[{key}].verdict must be pass|warn|fail|unknown; got {verdict!r}")
+        return ALIAS[verdict]
+    raise AssertionError(f"gate[{key}] value must be string or object; got {type(v).__name__}")
+
 assert set(g) == keys, f"gate keys must be exactly {sorted(keys)}, got {sorted(g)}"
-assert all(v in ("green","red","unknown") for v in g.values()), "gate values must be green|red|unknown"
+verdicts = {k: normalize(v, k) for k, v in g.items()}
 PYGA
-  all_green="$(python3 -c 'import json,sys; g=json.loads(sys.argv[1]); print("true" if all(v=="green" for v in g.values()) else "false")' "$4")"
+  all_green="$(python3 - "$4" <<'PYGB'
+import json, sys
+g = json.loads(sys.argv[1])
+ALIAS = {"green":"pass","red":"fail","warn":"warn","unknown":"unknown","pass":"pass","fail":"fail"}
+def verdict(v):
+    if isinstance(v, str):
+        return ALIAS.get(v, v)
+    if isinstance(v, dict):
+        return ALIAS.get(v.get("verdict",""), v.get("verdict",""))
+    return v
+# all_green=true iff every gate returned a positive verdict ("pass" or
+# "warn"). "fail" routes through reroll-verdict -> HUMAN_HELD ->
+# recover-held -> QUEUED (the bounded fix loop). "unknown" means the
+# verifier hasn't gathered evidence yet and must wait for the next tick;
+# treating unknown as green would let stale beads race to READY without
+# independent review.
+print("true" if all(verdict(v) in ("pass","warn") for v in g.values()) else "false")
+PYGB
+)"
   prior_last="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$3[,}]" | tail -1 || true)"
   cooldown="false"
   if [ -n "$prior_last" ] && printf '%s' "$prior_last" | grep -q '"all_green": false'; then cooldown="true"; fi
@@ -286,7 +337,18 @@ print((d[0] if isinstance(d, list) else d).get("status","unknown"))' 2>/dev/null
       if [ -n "$last_ga" ] && printf '%s' "$last_ga" | python3 -c 'import json,sys
 try: g=json.loads(sys.stdin.read())["context"]["gates"]
 except Exception: sys.exit(1)
-sys.exit(0 if not any(v=="red" for v in g.values()) else 1)'; then
+# jleechan-240 align guard with the verdict vocabulary accepted by
+# gate-assessment: block on fail (or the legacy "red" alias), including
+# the structured {"verdict":"fail", "evidence":[...]} shape. Warn and
+# unknown stay non-blocking per the documented no-red merge policy.
+ALIAS={"green":"pass","red":"fail","yellow":"warn","warn":"warn","unknown":"unknown","pass":"pass","fail":"fail"}
+def verdict(v):
+    if isinstance(v, str):
+        return ALIAS.get(v, v)
+    if isinstance(v, dict):
+        return ALIAS.get(v.get("verdict",""), v.get("verdict",""))
+    return v
+sys.exit(0 if not any(verdict(v) == "fail" for v in g.values()) else 1)'; then
         merged_ok="yes"
       fi
     fi
