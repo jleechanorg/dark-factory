@@ -295,7 +295,7 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
 
 #[test]
 fn run_tick_rejects_non_stage_1_or_2_config() {
-    let mut scm = FakeScm::new();
+    let scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
@@ -569,7 +569,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
 
 #[test]
 fn test_autonomy_budget_warning_crossing() {
-    let mut scm = FakeScm::new();
+    let scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
@@ -1465,7 +1465,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
 // zeros autonomy_secs, and emits a RECOVERED_FROM_HELD telemetry event.
 #[test]
 fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
-    let mut scm = FakeScm::new();
+    let scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
@@ -1543,7 +1543,7 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
 
 #[test]
 fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
-    let mut scm = FakeScm::new();
+    let scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
@@ -1832,7 +1832,7 @@ fn attested_ci_pending_does_not_timebox_park() {
 // does it for them.
 #[test]
 fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
-    let mut scm = FakeScm::new();
+    let scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
     let llm = FakeLlm::new();

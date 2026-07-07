@@ -73,7 +73,7 @@ impl Scm for ScmMock {
         self.calls
             .borrow_mut()
             .push(format!("collaborator_permission({login})"));
-        Ok(self.perms.get(&login.to_string()).copied().unwrap_or(Permission::None))
+        Ok(self.perms.get(login).copied().unwrap_or(Permission::None))
     }
     fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, daemon::errors::DaemonError> {
         self.calls.borrow_mut().push(format!("pr_snapshot({pr})"));

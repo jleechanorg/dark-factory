@@ -308,7 +308,7 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("collaborator_permission({login})"));
-            Ok(self.perms.get(&login.to_string()).copied().unwrap_or(Permission::None))
+            Ok(self.perms.get(login).copied().unwrap_or(Permission::None))
         }
         fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError> {
             self.calls.borrow_mut().push(format!("pr_snapshot({pr})"));
@@ -515,7 +515,7 @@ mod tests {
         telemetry_cleanup();
         let scm = S::default();
         let tracker = T::default();
-        let sessions = Ss::default();
+        let sessions = Ss;
         let llm = L::default(); // mock
         let store = St::default();
         let cfg = test_cfg();
@@ -542,7 +542,7 @@ mod tests {
         telemetry_cleanup();
         let scm = S::default();
         let tracker = T::default();
-        let sessions = Ss::default();
+        let sessions = Ss;
         let llm = L::default();
         let store = St::default();
         let cfg = test_cfg();
@@ -569,7 +569,7 @@ mod tests {
         telemetry_cleanup();
         let scm = S::default();
         let tracker = T::default();
-        let sessions = Ss::default();
+        let sessions = Ss;
         let llm = L::default();
         *llm.response.borrow_mut() = Some(Ok("/er PASS — saw integration test output".into()));
         let store = St::default();
@@ -607,7 +607,7 @@ mod tests {
         telemetry_cleanup();
         let scm = S::default();
         let tracker = T::default();
-        let sessions = Ss::default();
+        let sessions = Ss;
         let llm = L::default();
         *llm.response.borrow_mut() = Some(Ok("/er PASS".into()));
         let store = St::default();
@@ -649,7 +649,7 @@ mod tests {
         telemetry_cleanup();
         let scm = S::default();
         let tracker = T::default();
-        let sessions = Ss::default();
+        let sessions = Ss;
         let llm = L::default();
         *llm.response.borrow_mut() = Some(Ok("/er FAIL broken tests".into()));
         let store = St::default();
@@ -682,7 +682,7 @@ mod tests {
         telemetry_cleanup();
         let scm = S::default();
         let tracker = T::default();
-        let sessions = Ss::default();
+        let sessions = Ss;
         let llm = L::default();
         *llm.response.borrow_mut() = Some(Ok("/er FAIL x".into()));
         let store = St::default();
@@ -730,7 +730,7 @@ mod tests {
         telemetry_cleanup();
         let scm = S::default();
         let tracker = T::default();
-        let sessions = Ss::default();
+        let sessions = Ss;
         let llm = L::default();
         let store = St::default();
         let cfg = test_cfg();
@@ -755,7 +755,7 @@ mod tests {
         telemetry_cleanup();
         let scm = S::default();
         let tracker = T::default();
-        let sessions = Ss::default();
+        let sessions = Ss;
         let llm = L::default();
         let store = St::default();
         let cfg = test_cfg();
@@ -798,7 +798,7 @@ mod tests {
         telemetry_cleanup();
         let scm = S::default();
         let tracker = T::default();
-        let sessions = Ss::default();
+        let sessions = Ss;
         let llm = L::default();
         *llm.response.borrow_mut() = Some(Ok("/er PASS".into()));
         let store = St::default();
