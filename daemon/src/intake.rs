@@ -10,7 +10,7 @@
 //! the AO session's credentials").
 use crate::config::Config;
 use crate::errors::DaemonError;
-use crate::tools::{Scm, Tracker};
+use crate::tools::{LabeledPr, Scm, Tracker};
 
 const FACTORY_LABEL: &str = "factory";
 
@@ -21,6 +21,20 @@ pub struct ExistingPrIntake {
     pub head_ref_name: String,
     pub external_ref: String,
     pub newly_created: bool,
+}
+
+fn same_repo_pr(pr: &LabeledPr, cfg: &Config) -> bool {
+    if pr.is_cross_repository {
+        return false;
+    }
+    if let Some(head_repo) = pr.head_repo_full_name.as_deref() {
+        return head_repo.eq_ignore_ascii_case(&cfg.target_repo);
+    }
+    if let Some(head_owner) = pr.head_repo_owner_login.as_deref() {
+        let target_owner = cfg.target_repo.split('/').next().unwrap_or_default();
+        return head_owner.eq_ignore_ascii_case(target_owner);
+    }
+    true
 }
 
 /// Normalize labeled issues into beads.
@@ -101,6 +115,12 @@ pub fn normalize_labeled_prs(
 
     for pr in prs {
         if pr.head_ref_name.trim().is_empty() {
+            continue;
+        }
+
+        if !same_repo_pr(&pr, cfg) {
+            let comment_body = "🤖 **[dark-factory]** Escalation required: fork/cross-repository PR adoption is not supported in v1. Same-repo factory PRs can be verified automatically; fork remediation lands with bead `jleechan-tfs1`.";
+            let _ = tracker.comment_external(&pr.external_ref, comment_body);
             continue;
         }
 

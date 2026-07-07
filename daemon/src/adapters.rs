@@ -215,6 +215,12 @@ impl CliScm {
         struct RestHead {
             #[serde(rename = "ref")]
             ref_name: String,
+            repo: Option<RestRepo>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RestRepo {
+            full_name: Option<String>,
+            owner: Option<RestUser>,
         }
 
         let json_start = out.find('[').unwrap_or(0);
@@ -222,6 +228,7 @@ impl CliScm {
             DaemonError::Parse(format!("failed to parse gh labeled PR REST list: {e}"))
         })?;
         let mut prs = Vec::new();
+        let target_owner = self.repo.split('/').next().unwrap_or_default();
         for issue in issues.into_iter().filter(|issue| issue.pull_request.is_some()) {
             let pull_out = run_tool(
                 "gh",
@@ -238,6 +245,25 @@ impl CliScm {
                     issue.number
                 ))
             })?;
+            let head_repo_full_name = pull
+                .head
+                .repo
+                .as_ref()
+                .and_then(|repo| repo.full_name.clone());
+            let head_repo_owner_login = pull
+                .head
+                .repo
+                .as_ref()
+                .and_then(|repo| repo.owner.as_ref().map(|owner| owner.login.clone()));
+            let is_cross_repository = head_repo_full_name
+                .as_ref()
+                .map(|repo| !repo.eq_ignore_ascii_case(&self.repo))
+                .or_else(|| {
+                    head_repo_owner_login
+                        .as_ref()
+                        .map(|owner| !owner.eq_ignore_ascii_case(target_owner))
+                })
+                .unwrap_or(false);
             prs.push(LabeledPr {
                 number: issue.number,
                 title: issue.title,
@@ -245,6 +271,9 @@ impl CliScm {
                 author_login: issue.user.map(|u| u.login).unwrap_or_default(),
                 external_ref: format!("{}#{}", self.repo, issue.number),
                 head_ref_name: pull.head.ref_name,
+                is_cross_repository,
+                head_repo_full_name,
+                head_repo_owner_login,
             });
         }
         Ok(prs)
@@ -363,7 +392,7 @@ impl Scm for CliScm {
                 "--state",
                 "open",
                 "--json",
-                "number,title,body,author,headRefName",
+                "number,title,body,author,headRefName,isCrossRepository,headRepositoryOwner",
             ],
             30,
         ) {
@@ -378,6 +407,10 @@ impl Scm for CliScm {
             author: Option<GhAuthor>,
             #[serde(rename = "headRefName")]
             head_ref_name: String,
+            #[serde(rename = "isCrossRepository")]
+            is_cross_repository: bool,
+            #[serde(rename = "headRepositoryOwner")]
+            head_repository_owner: Option<GhAuthor>,
         }
         #[derive(serde::Deserialize)]
         struct GhAuthor {
@@ -396,6 +429,9 @@ impl Scm for CliScm {
                 author_login: pr.author.map(|a| a.login).unwrap_or_default(),
                 external_ref: format!("{}#{}", self.repo, pr.number),
                 head_ref_name: pr.head_ref_name,
+                is_cross_repository: pr.is_cross_repository,
+                head_repo_full_name: None,
+                head_repo_owner_login: pr.head_repository_owner.map(|owner| owner.login),
             })
             .collect())
     }

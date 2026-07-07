@@ -99,6 +99,9 @@ pub struct LabeledPr {
     pub author_login: String,
     pub external_ref: String, // "<owner>/<repo>#<pr_number>"
     pub head_ref_name: String,
+    pub is_cross_repository: bool,
+    pub head_repo_full_name: Option<String>,
+    pub head_repo_owner_login: Option<String>,
 }
 
 /// Collaborator permission tier, coarsened to the write-tier gate (spec §4.2.3).

@@ -42,6 +42,9 @@ fn labeled_pr(number: u64, author_login: &str, head_ref_name: &str) -> LabeledPr
         author_login: author_login.into(),
         external_ref: format!("owner/repo#{number}"),
         head_ref_name: head_ref_name.into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
     }
 }
 
@@ -257,4 +260,35 @@ fn factory_pr_from_read_tier_creator_is_skipped() {
         .cloned()
         .collect();
     assert!(create_calls.is_empty(), "read-tier PR created bead: {create_calls:?}");
+}
+
+#[test]
+fn fork_factory_pr_is_skipped_with_escalation_comment() {
+    let mut scm = FakeScm::new();
+    let mut pr = labeled_pr(54, "alice", "factory/existing-bead-r1");
+    pr.is_cross_repository = true;
+    pr.head_repo_full_name = Some("fork/repo".into());
+    pr.head_repo_owner_login = Some("fork".into());
+    scm.prs.push(pr);
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+
+    let adopted = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+
+    assert!(adopted.is_empty());
+    let calls = tracker.calls.borrow();
+    assert!(
+        calls.iter().all(|call| !call.starts_with("create_bead(")),
+        "fork PR must not create an adopted bead: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|call| {
+            call.contains("comment_external(owner/repo#54")
+                && call.contains("fork/cross-repository PR adoption is not supported")
+                && call.contains("jleechan-tfs1")
+        }),
+        "fork PR must receive an escalation comment: {calls:?}"
+    );
 }

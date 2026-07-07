@@ -1180,6 +1180,9 @@ fn factory_labeled_existing_pr_is_adopted_and_verified_without_spawn() {
         author_login: "alice".into(),
         external_ref: "owner/repo#701".into(),
         head_ref_name: "feature/already-open-pr".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
     });
     scm.permissions.insert("alice".into(), Permission::Write);
     scm.pr_snapshots.insert(
@@ -1261,6 +1264,9 @@ fn factory_labeled_existing_pr_second_tick_reuses_tracking_bead_without_spawn() 
         author_login: "alice".into(),
         external_ref: "owner/repo#702".into(),
         head_ref_name: "feature/already-open-pr-702".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
     });
     scm.permissions.insert("alice".into(), Permission::Write);
     scm.pr_snapshots.insert(
@@ -1335,6 +1341,9 @@ fn factory_labeled_existing_pr_without_session_is_not_parked_as_stalled() {
         author_login: "alice".into(),
         external_ref: "owner/repo#703".into(),
         head_ref_name: "feature/already-open-pr-703".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
     });
     scm.permissions.insert("alice".into(), Permission::Write);
     let mut stale_unknown = qdw_green_snapshot(703, Vec::new());
@@ -1379,6 +1388,189 @@ fn factory_labeled_existing_pr_without_session_is_not_parked_as_stalled() {
     assert!(
         !telemetry.contains("\"reason\":\"session_stalled\""),
         "existing PR without session must not be parked as session_stalled:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 704,
+        title: "Branch collision PR".into(),
+        body: "tries to reuse an owned branch".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#704".into(),
+        head_ref_name: "factory/existing-bead-r1".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    store
+        .save(&BeadOverlay {
+            bead_id: "existing-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(111),
+            branch: Some("factory/existing-bead-r1".into()),
+            session_id: Some("sess-existing".into()),
+        })
+        .unwrap();
+    store
+        .register_branch("existing-bead", "factory/existing-bead-r1")
+        .unwrap();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_existing_pr_collision.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("branch collision should escalate without failing the tick");
+
+    assert_eq!(summary.beads_escalated, 1);
+    assert_eq!(
+        store.bead_id_for_branch("factory/existing-bead-r1").unwrap(),
+        Some("existing-bead".into()),
+        "collision must not steal the branch registry key"
+    );
+    let refused_overlay = store.load("fake-bead-1").unwrap();
+    assert!(
+        refused_overlay.is_none(),
+        "refused adoption must not create an overlay for the colliding PR; overlay={refused_overlay:?}, calls={:?}",
+        store.calls.borrow()
+    );
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls.iter().any(|call| {
+            call.contains("comment_external(owner/repo#704")
+                && call.contains("already registered to bead `existing-bead`")
+        }),
+        "collision must be escalated on the original PR: {tracker_calls:?}"
+    );
+    let store_calls = store.calls.borrow();
+    assert!(
+        !store_calls
+            .iter()
+            .any(|call| call == "register_branch(fake-bead-1,factory/existing-bead-r1)"),
+        "colliding adoption must not register the candidate bead: {store_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn adopted_non_green_pr_parks_human_held_with_v1_escalation() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 705,
+        title: "Adopted red PR".into(),
+        body: "already has a non-green branch".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#705".into(),
+        head_ref_name: "feature/adopted-red-pr".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    let mut snapshot = qdw_green_snapshot(
+        705,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+        }],
+    );
+    snapshot.ci_success = false;
+    snapshot.ci_status = "failure".into();
+    scm.pr_snapshots.insert(705, snapshot);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_existing_pr_adoption_red.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("non-green adopted PR should park with escalation");
+
+    assert_eq!(summary.beads_created, 1);
+    assert_eq!(summary.gates_assessed, 1);
+    assert_eq!(summary.beads_parked_human_held, 1);
+    let overlay = store.load("fake-bead-1").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(overlay.session_id, None);
+    assert_eq!(overlay.pr_number, Some(705));
+    assert_eq!(overlay.branch.as_deref(), Some("feature/adopted-red-pr"));
+    assert_eq!(
+        store.bead_id_for_branch("feature/adopted-red-pr").unwrap(),
+        Some("fake-bead-1".into())
+    );
+    let session_calls = sessions.calls.borrow();
+    assert!(
+        session_calls.iter().all(|call| {
+            !call.starts_with("spawn(") && !call.starts_with("attach(")
+        }),
+        "adopted non-green PR must not fabricate remediation sessions: {session_calls:?}"
+    );
+    let branch_calls = store.calls.borrow();
+    assert!(
+        branch_calls
+            .iter()
+            .all(|call| !call.contains("factory/fake-bead-1-r2")),
+        "adopted non-green PR must not fabricate replacement branches: {branch_calls:?}"
+    );
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls.iter().any(|call| {
+            call.contains("comment_external(owner/repo#705")
+                && call.contains("adopted PR is not green")
+                && call.contains("jleechan-tfs1")
+        }),
+        "adopted red PR must receive the v1 escalation comment: {tracker_calls:?}"
+    );
+    assert!(
+        tracker_calls.iter().all(|call| !call.contains("close")),
+        "original PR must not be closed by adopted non-green handling: {tracker_calls:?}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

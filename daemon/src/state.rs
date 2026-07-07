@@ -404,10 +404,17 @@ impl StateStore for SqliteStateStore {
     }
 
     fn register_branch(&self, bead_id: &str, branch: &str) -> Result<(), DaemonError> {
+        if let Some(existing) = self.bead_id_for_branch(branch)? {
+            if existing == bead_id {
+                return Ok(());
+            }
+            return Err(DaemonError::Config(format!(
+                "branch {branch} is already registered to bead {existing}; refusing to reassign to {bead_id}"
+            )));
+        }
         self.conn
             .execute(
-                "INSERT INTO branch_registry (branch, bead_id, created_at) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(branch) DO UPDATE SET bead_id=excluded.bead_id, created_at=excluded.created_at",
+                "INSERT INTO branch_registry (branch, bead_id, created_at) VALUES (?1, ?2, ?3)",
                 params![branch, bead_id, now_iso8601()],
             )
             .map_err(|e| tool_err("register_branch", e))?;
@@ -865,12 +872,21 @@ mod tests {
     }
 
     #[test]
-    fn register_branch_upserts_on_conflict() {
+    fn register_branch_rejects_conflicting_owner() {
         let s = store();
         s.register_branch("b1", "factory/b1-r1").unwrap();
-        s.register_branch("b2", "factory/b1-r1").unwrap(); // re-register same branch, different bead
+        s.register_branch("b1", "factory/b1-r1").unwrap(); // idempotent for same bead
+        let err = s.register_branch("b2", "factory/b1-r1").unwrap_err();
+        assert!(
+            err.to_string().contains("already registered to bead b1"),
+            "unexpected conflict error: {err}"
+        );
         let branches = s.owned_branches().unwrap();
         assert_eq!(branches, vec!["factory/b1-r1".to_string()]);
+        assert_eq!(
+            s.bead_id_for_branch("factory/b1-r1").unwrap(),
+            Some("b1".to_string())
+        );
     }
 
     /// jleechan-8in: file-backed `open()` must not silently swallow a failed
