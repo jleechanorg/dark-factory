@@ -55,16 +55,27 @@ cd dark-factory
 git checkout 77494977caa4bf7809415dd3dfb0eaca807cbeb3
 git lfs pull
 mkdir -p /tmp/df-repro
-tar --use-compress-program=zstd \
-  -xf artifacts/repro-developer/claude-fable-adversarial-review-codex-plan-miss/claude-fable-adversarial-review-codex-plan-miss-sanitized.tar.zst \
-  -C /tmp/df-repro
+
+# Portable extraction pipeline (works on both macOS/BSD and Linux/GNU tar)
+zstd -dc artifacts/repro-developer/claude-fable-adversarial-review-codex-plan-miss/claude-fable-adversarial-review-codex-plan-miss-sanitized.tar.zst | tar -xf - -C /tmp/df-repro
+
 sed -n '1,220p' /tmp/df-repro/repro-developer-*/REPLAY.md
 ```
 
-For exact raw replay, get the GPG passphrase out of band and decrypt:
+For exact raw replay, get the GPG passphrase out of band.
+
+To decrypt interactively (prompts for passphrase):
 
 ```bash
-gpg --batch --yes --decrypt \
+gpg --decrypt \
+  --output /tmp/claude-fable-adversarial-review-codex-plan-miss.tar.zst \
+  artifacts/repro-developer/claude-fable-adversarial-review-codex-plan-miss/claude-fable-adversarial-review-codex-plan-miss.tar.zst.gpg
+```
+
+To decrypt non-interactively (scripted/command line):
+
+```bash
+gpg --batch --yes --passphrase "YOUR_PASSPHRASE" --decrypt \
   --output /tmp/claude-fable-adversarial-review-codex-plan-miss.tar.zst \
   artifacts/repro-developer/claude-fable-adversarial-review-codex-plan-miss/claude-fable-adversarial-review-codex-plan-miss.tar.zst.gpg
 ```
