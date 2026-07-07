@@ -309,6 +309,44 @@ assert "reroll-verdict ok" "ok" "$out"
 state="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='test-reroll';")"
 assert "reroll_worthy → HUMAN_HELD" "HUMAN_HELD" "$state"
 
+# 22. dispatch-record capacity IO failure → EX_IO (CR-7, capacity leg).
+# Simulate a broken `capacity` lookup (corrupt/missing schema) via a fake
+# `sqlite3` on PATH that fails ONLY the capacity subcommand's
+# `state IN ('DISPATCHED','ATTESTED')` query, and passes every other query
+# (existence check, state lookup, branch_registry, INSERT) through to the
+# real sqlite3 unchanged. This isolates the capacity leg specifically, the
+# same way the BR_BIN shim above isolates `br show` for bead-closed-check.
+FAKE_SQLITE_DIR="/tmp/test-overlay-$$-fakebin"
+mkdir -p "$FAKE_SQLITE_DIR"
+REAL_SQLITE3="$(command -v sqlite3)"
+cat > "$FAKE_SQLITE_DIR/sqlite3" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  case "\$arg" in
+    *"state IN ('DISPATCHED','ATTESTED')"*)
+      echo "fake-sqlite3: simulated disk I/O error" >&2
+      exit 10
+      ;;
+  esac
+done
+exec "$REAL_SQLITE3" "\$@"
+EOF
+chmod +x "$FAKE_SQLITE_DIR/sqlite3"
+
+"$OVERLAY" intake-upsert test-cap-iofail 'capacity IO failure test' >/dev/null
+"$OVERLAY" route-record test-cap-iofail STANDARD_PATH >/dev/null
+set +e
+out_capio="$(PATH="$FAKE_SQLITE_DIR:$PATH" "$OVERLAY" dispatch-record test-cap-iofail fix/cap-iofail-branch 2>&1)"
+rc_capio=$?
+set -e
+assert "dispatch-record capacity IO failure -> rc=9 EX_IO" "9" "$rc_capio"
+[[ "$out_capio" == *"capacity lookup failed"* ]] && echo "PASS: capacity IO failure message mentions capacity lookup" && PASS=$((PASS+1)) \
+  || { echo "FAIL: capacity IO failure message did not mention capacity lookup (got: $out_capio)"; FAIL=$((FAIL+1)); }
+# bead must remain QUEUED (no partial state mutation from the aborted dispatch)
+state_capio="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='test-cap-iofail';")"
+assert "capacity IO failure leaves bead in QUEUED (no partial mutation)" "QUEUED" "$state_capio"
+rm -rf "$FAKE_SQLITE_DIR"
+
 echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ] || exit 1
