@@ -28,6 +28,8 @@ use std::collections::HashMap;
 pub struct FakeTracker {
     pub candidates: RefCell<Vec<Bead>>,
     pub create_bead_result: RefCell<Option<Result<String, String>>>,
+    pub fail_next_fetch_candidates: RefCell<Option<String>>,
+    pub fail_next_comment: RefCell<Option<String>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -40,6 +42,13 @@ impl FakeTracker {
 impl Tracker for FakeTracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError> {
         self.calls.borrow_mut().push("fetch_candidates".into());
+        if let Some(stderr) = self.fail_next_fetch_candidates.borrow_mut().take() {
+            return Err(DaemonError::Tool {
+                tool: "br".into(),
+                rc: 1,
+                stderr,
+            });
+        }
         Ok(self.candidates.borrow().clone())
     }
 
@@ -87,6 +96,13 @@ impl Tracker for FakeTracker {
         self.calls
             .borrow_mut()
             .push(format!("comment_external({external_ref},{body})"));
+        if let Some(stderr) = self.fail_next_comment.borrow_mut().take() {
+            return Err(DaemonError::Tool {
+                tool: "br".into(),
+                rc: 1,
+                stderr,
+            });
+        }
         Ok(())
     }
 }
@@ -163,6 +179,8 @@ pub struct FakeSessions {
     pub active_count: usize,
     pub next_session_id: String,
     pub quiescent: bool,
+    pub fail_spawn_for: RefCell<Vec<String>>,
+    pub spawn_prompts: RefCell<Vec<(String, String)>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -172,6 +190,8 @@ impl Default for FakeSessions {
             active_count: 0,
             next_session_id: "fake-session-1".into(),
             quiescent: true,
+            fail_spawn_for: RefCell::new(Vec::new()),
+            spawn_prompts: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -180,6 +200,10 @@ impl Default for FakeSessions {
 impl FakeSessions {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn fail_spawn_for(&self, bead_id: &str) {
+        self.fail_spawn_for.borrow_mut().push(bead_id.to_string());
     }
 }
 
@@ -190,9 +214,19 @@ impl Sessions for FakeSessions {
     }
 
     fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+        self.spawn_prompts
+            .borrow_mut()
+            .push((spec.bead_id.clone(), spec.prompt.clone()));
         self.calls
             .borrow_mut()
             .push(format!("spawn({})", spec.bead_id));
+        if self.fail_spawn_for.borrow().contains(&spec.bead_id) {
+            return Err(DaemonError::Tool {
+                tool: "ao".into(),
+                rc: 1,
+                stderr: format!("scripted spawn failure for {}", spec.bead_id),
+            });
+        }
         Ok(SessionId(self.next_session_id.clone()))
     }
 
@@ -220,6 +254,13 @@ impl Sessions for FakeSessions {
 #[derive(Default)]
 pub struct FakeVcs {
     pub heads: HashMap<String, String>,
+    /// Per-(branch, remote_sha) script for `is_remote_ahead`. When absent the
+    /// default is `false` so tests that don't exercise the stall-bypass guard
+    /// don't have to set it up. Tests that DO exercise the guard
+    /// (`test_wedge_detection_attested_session_not_stalled_if_remote_ahead` and
+    /// its companion `*_local_ahead_or_diverged_still_parks`) insert the
+    /// (branch, remote_sha) key with the desired answer.
+    pub remote_ahead: HashMap<(String, String), bool>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -262,6 +303,35 @@ impl Vcs for FakeVcs {
                 stderr: format!("no scripted head for {branch}"),
             })
     }
+
+    fn is_remote_ahead(
+        &self,
+        branch: &str,
+        remote_sha: &str,
+    ) -> Result<bool, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("is_remote_ahead({branch},{remote_sha})"));
+        // Empty / equal SHAs are never "ahead" — same contract as the real
+        // CliVcs impl so tests don't have to script a false positive.
+        let local = self
+            .heads
+            .get(branch)
+            .cloned()
+            .ok_or_else(|| DaemonError::Tool {
+                tool: "git".into(),
+                rc: 1,
+                stderr: format!("no scripted head for {branch}"),
+            })?;
+        if local.is_empty() || remote_sha.is_empty() || local == remote_sha {
+            return Ok(false);
+        }
+        Ok(self
+            .remote_ahead
+            .get(&(branch.to_string(), remote_sha.to_string()))
+            .copied()
+            .unwrap_or(false))
+    }
 }
 
 /// Scripted `Llm` fake: returns the scripted response regardless of prompt
@@ -298,12 +368,19 @@ pub struct FakeStateStore {
     pub branches: RefCell<Vec<String>>,
     pub branch_beads: RefCell<HashMap<String, String>>,
     pub rejections: RefCell<HashMap<(String, u32), (String, String)>>,
+    pub fail_save_for_state: RefCell<Vec<(String, OverlayState)>>,
     pub calls: RefCell<Vec<String>>,
 }
 
 impl FakeStateStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn fail_save_for(&self, bead_id: &str, state: OverlayState) {
+        self.fail_save_for_state
+            .borrow_mut()
+            .push((bead_id.to_string(), state));
     }
 }
 
@@ -317,6 +394,18 @@ impl StateStore for FakeStateStore {
         self.calls
             .borrow_mut()
             .push(format!("save({})", overlay.bead_id));
+        if self
+            .fail_save_for_state
+            .borrow()
+            .iter()
+            .any(|(bead_id, state)| bead_id == &overlay.bead_id && *state == overlay.state)
+        {
+            return Err(DaemonError::Tool {
+                tool: "sqlite".into(),
+                rc: -1,
+                stderr: format!("scripted save failure for {}", overlay.state.as_str()),
+            });
+        }
         self.overlays
             .borrow_mut()
             .insert(overlay.bead_id.clone(), overlay.clone());
@@ -348,15 +437,77 @@ impl StateStore for FakeStateStore {
 
     fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError> {
         self.calls.borrow_mut().push(format!("increment_active_autonomy({elapsed_secs})"));
-        let mut updated = Vec::new();
-        let mut overlays = self.overlays.borrow_mut();
-        for overlay in overlays.values_mut() {
-            if overlay.state == OverlayState::Dispatched || overlay.state == OverlayState::Attested {
-                overlay.autonomy_secs += elapsed_secs;
-                updated.push(overlay.clone());
+        // Convenience override: mirror the new trait-level behavior of
+        // `list_active_overlays` + per-row `bump_autonomy_secs`. Tests that
+        // need the ci_pending pause (jleechan-54ky) should call
+        // `list_active_overlays` directly and `bump_autonomy_secs` for the
+        // rows they want to advance.
+        let updated = self.list_active_overlays()?;
+        if elapsed_secs > 0 {
+            for overlay in &updated {
+                self.bump_autonomy_secs(&overlay.bead_id, elapsed_secs)?;
             }
         }
-        Ok(updated)
+        // Re-read so callers see the bumped values, matching the original
+        // "increment then return" contract the tick loop's budget-warning
+        // crossing check depends on.
+        self.list_active_overlays()
+    }
+
+    fn list_active_overlays(&self) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.calls.borrow_mut().push("list_active_overlays".into());
+        let mut out = Vec::new();
+        for overlay in self.overlays.borrow().values() {
+            if overlay.state == OverlayState::Dispatched || overlay.state == OverlayState::Attested {
+                out.push(overlay.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    fn bump_autonomy_secs(&self, bead_id: &str, delta_secs: u64) -> Result<(), DaemonError> {
+        self.calls.borrow_mut().push(format!("bump_autonomy_secs({bead_id},{delta_secs})"));
+        if delta_secs == 0 {
+            return Ok(());
+        }
+        if let Some(overlay) = self.overlays.borrow_mut().get_mut(bead_id) {
+            overlay.autonomy_secs += delta_secs;
+        }
+        Ok(())
+    }
+
+    fn recover_human_held(&self, max_attempt: u32) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("recover_human_held({max_attempt})"));
+        let mut recovered = Vec::new();
+        for overlay in self.overlays.borrow_mut().values_mut() {
+            if overlay.state == OverlayState::HumanHeld && overlay.attempt < max_attempt {
+                overlay.state = OverlayState::Queued;
+                overlay.attempt += 1;
+                overlay.autonomy_secs = 0;
+                recovered.push(overlay.clone());
+            }
+        }
+        Ok(recovered)
+    }
+
+    fn human_held_at_or_above_attempt(
+        &self,
+        max_attempt: u32,
+    ) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("human_held_at_or_above_attempt({max_attempt})"));
+        Ok(self
+            .overlays
+            .borrow()
+            .values()
+            .filter(|overlay| {
+                overlay.state == OverlayState::HumanHeld && overlay.attempt >= max_attempt
+            })
+            .cloned()
+            .collect())
     }
 
     fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, _feedback_text: &str) -> Result<(), DaemonError> {

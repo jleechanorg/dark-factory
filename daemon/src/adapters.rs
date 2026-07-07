@@ -1,5 +1,5 @@
 use crate::errors::DaemonError;
-use crate::tools::{Bead, Issue, Llm, Permission, PrSnapshot, run_tool, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
+use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
@@ -121,6 +121,50 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
     } else {
         None
     }
+}
+
+fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
+    #[derive(serde::Deserialize)]
+    struct GhGqlResponse {
+        data: GhGqlData,
+    }
+    #[derive(serde::Deserialize)]
+    struct GhGqlData {
+        repository: GhGqlRepository,
+    }
+    #[derive(serde::Deserialize)]
+    struct GhGqlRepository {
+        #[serde(rename = "pullRequest")]
+        pull_request: Option<GhGqlPullRequest>,
+    }
+    #[derive(serde::Deserialize)]
+    struct GhGqlPullRequest {
+        #[serde(rename = "reviewThreads")]
+        review_threads: GhGqlReviewThreads,
+    }
+    #[derive(serde::Deserialize)]
+    struct GhGqlReviewThreads {
+        nodes: Vec<GhGqlNode>,
+    }
+    #[derive(serde::Deserialize)]
+    struct GhGqlNode {
+        #[serde(rename = "isResolved")]
+        is_resolved: bool,
+    }
+
+    let json_start = gql_out.find('{').unwrap_or(0);
+    let gql: GhGqlResponse = serde_json::from_str(&gql_out[json_start..]).map_err(|e| {
+        DaemonError::Parse(format!("failed to parse gh graphql JSON: {e}"))
+    })?;
+    let pr_data = gql.data.repository.pull_request.ok_or_else(|| {
+        DaemonError::Parse("gh graphql response omitted pullRequest".into())
+    })?;
+    Ok(pr_data
+        .review_threads
+        .nodes
+        .iter()
+        .filter(|n| !n.is_resolved)
+        .count() as u32)
 }
 
 pub struct CliScm {
@@ -247,7 +291,7 @@ impl Scm for CliScm {
             DaemonError::Parse(format!("failed to parse gh pr list: {e}"))
         })?;
         let mut issues: Vec<Issue> = Vec::new();
-        for item in gh_issues.into_iter().chain(gh_prs.into_iter()) {
+        for item in gh_issues.into_iter().chain(gh_prs) {
             if !issues.iter().any(|i| i.number == item.number) {
                 let author_login = item.author.as_ref().or(item.user.as_ref())
                     .map(|a| a.login.clone())
@@ -487,8 +531,7 @@ impl Scm for CliScm {
         let mergeable = view.mergeable == "MERGEABLE";
 
         let last_coderabbit_review = view.reviews.iter()
-            .filter(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED")
-            .last();
+            .rfind(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED");
 
         let coderabbit_status = match last_coderabbit_review {
             Some(r) => {
@@ -562,9 +605,7 @@ impl Scm for CliScm {
                 any_failed = true;
             }
         }
-        let ci_status = if checks.is_empty() {
-            "unknown".to_string()
-        } else if any_pending {
+        let ci_status = if checks.is_empty() || any_pending {
             "unknown".to_string()
         } else if any_failed {
             "red".to_string()
@@ -603,7 +644,7 @@ impl Scm for CliScm {
               }
             }
         }";
-        let gql_out = match run_tool(
+        let gql_out = run_tool(
             "gh",
             &[
                 "api",
@@ -618,48 +659,8 @@ impl Scm for CliScm {
                 &format!("query={query}"),
             ],
             30,
-        ) {
-            Ok(out) => out,
-            Err(_) => {
-                // REST Fallback: return dummy JSON representing 0 unresolved threads!
-                r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}"#.to_string()
-            }
-        };
-        #[derive(serde::Deserialize)]
-        struct GhGqlResponse {
-            data: GhGqlData,
-        }
-        #[derive(serde::Deserialize)]
-        struct GhGqlData {
-            repository: GhGqlRepository,
-        }
-        #[derive(serde::Deserialize)]
-        struct GhGqlRepository {
-            #[serde(rename = "pullRequest")]
-            pull_request: Option<GhGqlPullRequest>,
-        }
-        #[derive(serde::Deserialize)]
-        struct GhGqlPullRequest {
-            #[serde(rename = "reviewThreads")]
-            review_threads: GhGqlReviewThreads,
-        }
-        #[derive(serde::Deserialize)]
-        struct GhGqlReviewThreads {
-            nodes: Vec<GhGqlNode>,
-        }
-        #[derive(serde::Deserialize)]
-        struct GhGqlNode {
-            #[serde(rename = "isResolved")]
-            is_resolved: bool,
-        }
-        let json_start_g = gql_out.find('{').unwrap_or(0);
-        let gql: GhGqlResponse = serde_json::from_str(&gql_out[json_start_g..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse gh graphql JSON: {e}"))
-        })?;
-        let mut unresolved_thread_count = 0;
-        if let Some(pr_data) = gql.data.repository.pull_request {
-            unresolved_thread_count = pr_data.review_threads.nodes.iter().filter(|n| !n.is_resolved).count() as u32;
-        }
+        )?;
+        let unresolved_thread_count = unresolved_thread_count_from_gql(&gql_out)?;
 
         let pr_comments = view.comments.into_iter().map(|c| crate::tools::PrComment {
             author: c.author.login,
@@ -794,10 +795,9 @@ pub struct CliSessions {
 }
 
 impl CliSessions {
-    pub fn new(repo: &str, agent: &str) -> Self {
-        let project = repo.split('/').last().unwrap_or(repo).to_string();
+    pub fn new(project: &str, agent: &str) -> Self {
         Self {
-            project,
+            project: project.to_string(),
             agent: agent.to_string(),
         }
     }
@@ -959,9 +959,42 @@ impl Vcs for CliVcs {
         let out = run_tool("git", &["rev-parse", branch], 30)?;
         Ok(out.trim().to_string())
     }
+
+    fn is_remote_ahead(&self, branch: &str, remote_sha: &str) -> Result<bool, DaemonError> {
+        // Two-step check:
+        // 1. local_head == remote_sha ⇒ not ahead (worker hasn't actually
+        //    pushed anything new since the daemon's last view).
+        // 2. `git merge-base --is-ancestor <local> <remote>` returns 0 iff
+        //    local is reachable from remote (i.e. every local commit is in
+        //    remote) — combined with the inequality check this is the
+        //    strict "remote has all of local + more" predicate. A
+        //    divergent branch or a local-only-ahead branch returns rc=1.
+        let local = self.head_sha(branch)?;
+        if local.is_empty() || remote_sha.is_empty() || local == remote_sha {
+            return Ok(false);
+        }
+        // `--is-ancestor` exits 0 on true, 1 on false; we don't care about
+        // commit messages so `--quiet` keeps stderr clean.
+        let r = run_tool(
+            "git",
+            &["merge-base", "--is-ancestor", &local, remote_sha],
+            30,
+        );
+        Ok(r.is_ok())
+    }
 }
 
 pub struct ChainLlm;
+
+/// Single source of truth for the cwd every fallback invocation runs from.
+/// Each LLM backend reads AGENTS.md / `.claude/` / settings files from the
+/// process's cwd — running fallback from `/tmp` (a bug introduced during
+/// bead `jleechan-g1k` work and reverted) makes those backends behave as if
+/// launched outside the project, which is the failure mode the smoke test
+/// below pins down. `.` is the daemon's invocation cwd; the daemon is
+/// launched from the target repo checkout, which is what every backend
+/// expects.
+const FALLBACK_CWD: &str = ".";
 
 impl Llm for ChainLlm {
     fn is_real(&self) -> bool {
@@ -969,7 +1002,20 @@ impl Llm for ChainLlm {
     }
 
     fn judge(&self, prompt: &str) -> Result<String, DaemonError> {
-        let r = run_tool("codex", &["exec", "--yolo", "--skip-git-repo-check", prompt], 120);
+        // Each fallback runs from the project's cwd (FALLBACK_CWD), NOT
+        // `/tmp` (which would strip AGENTS.md / .claude/ context — the very
+        // mode bead `jleechan-g1k` flagged) and NOT bare `run_tool` (which
+        // would silently inherit whatever cwd the daemon happened to be
+        // launched from). Prompt and skill flags are distinct argv entries;
+        // `--dangerously-skip-permissions` is a flag, never the message
+        // text — see the named-argv assertions in `chain_llm_fallback_argv`
+        // below.
+        let r = run_tool_in_dir(
+            "codex",
+            &["exec", "--yolo", "--skip-git-repo-check", prompt],
+            FALLBACK_CWD,
+            120,
+        );
         if let Ok(out) = r {
             return Ok(out);
         }
@@ -980,11 +1026,27 @@ impl Llm for ChainLlm {
         } else {
             "claude".to_string()
         };
-        let r = run_tool(&claude_bin, &["--dangerously-skip-permissions", "--print", "--setting-sources", "", prompt], 120);
+        let r = run_tool_in_dir(
+            &claude_bin,
+            &[
+                "--dangerously-skip-permissions",
+                "--print",
+                "--setting-sources",
+                "",
+                prompt,
+            ],
+            FALLBACK_CWD,
+            120,
+        );
         if let Ok(out) = r {
             return Ok(out);
         }
-        let r = run_tool("agy", &["--dangerously-skip-permissions", "--print", prompt], 120);
+        let r = run_tool_in_dir(
+            "agy",
+            &["--dangerously-skip-permissions", "--print", prompt],
+            FALLBACK_CWD,
+            120,
+        );
         if let Ok(out) = r {
             return Ok(out);
         }
@@ -1014,7 +1076,7 @@ pub fn ci_success_from_check_buckets(buckets: &[&str], iteration_stub: bool) -> 
 
 #[cfg(test)]
 mod external_ref_tests {
-    use super::parse_external_refs_from_br_list;
+    use super::{parse_external_refs_from_br_list, unresolved_thread_count_from_gql};
 
     #[test]
     fn fetch_all_external_refs_includes_closed_beads() {
@@ -1029,6 +1091,59 @@ mod external_ref_tests {
         assert_eq!(refs.len(), 2);
         assert!(refs.contains("owner/repo#1"));
         assert!(refs.contains("jleechanorg/worldarchitect.ai#8171"));
+    }
+
+    #[test]
+    fn graphql_thread_count_counts_unresolved_threads() {
+        let json = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {"isResolved": true},
+                                {"isResolved": false},
+                                {"isResolved": false}
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let count = unresolved_thread_count_from_gql(json).unwrap();
+
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn graphql_thread_count_parse_error_is_not_faked_as_zero() {
+        let err = unresolved_thread_count_from_gql("gh: GraphQL API rate limit exceeded")
+            .expect_err("invalid GraphQL output must fail closed");
+
+        assert!(
+            matches!(err, crate::errors::DaemonError::Parse(_)),
+            "expected parse error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn graphql_thread_count_missing_pull_request_is_not_faked_as_zero() {
+        let json = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": null
+                }
+            }
+        }"#;
+
+        let err = unresolved_thread_count_from_gql(json)
+            .expect_err("missing pullRequest must fail closed");
+
+        assert!(
+            matches!(err, crate::errors::DaemonError::Parse(_)),
+            "expected parse error, got {err:?}"
+        );
     }
 }
 
@@ -1058,3 +1173,232 @@ mod ci_bucket_tests {
     }
 }
 
+/// Regression tests for the ChainLlm fallback chain. The bug bead
+/// `jleechan-g1k` flagged — "claude fallback passes
+/// `--dangerously-skip-permissions` as message text" — is structurally
+/// indistinguishable from "argv got reordered under our feet" until something
+/// actually observes the rendered argv. These tests inject a fake `codex` /
+/// `claude` / `agy` binary on PATH that dumps its argv (one token per line,
+/// argv[0] preserved) so the test can pin both the *order* of the flags and
+/// the *cwd* the child was launched in.
+///
+/// Why this lives in `adapters.rs` rather than a separate test crate: the
+/// fake-binary shim is shell-level, so it needs to set PATH before
+/// `ChainLlm::judge` runs. Putting the shim in `cargo test`'s setup phase
+/// keeps it isolated from production builds (the `#[cfg(test)]` gate).
+#[cfg(test)]
+mod chain_llm_fallback_argv_tests {
+    use super::ChainLlm;
+    use crate::tools::Llm;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Process-wide mutex that serializes the `PATH` / `HOME` mutations
+    /// performed by the fallback-argv tests below. Without this guard,
+    /// `cargo test` runs unit tests in parallel by default — test A could
+    /// call `set_var("PATH", a)` then yield, then test B could call
+    /// `set_var("PATH", b)` and observe A's environment restored on B's
+    /// failure path (or vice versa), causing one of the two tests to
+    /// invoke the real `codex` binary from the system PATH instead of
+    /// the argv-dump shim (or to fail because ChainLlm::judge fell through
+    /// to a real backend). The mutex holds for the entire mutation +
+    /// `ChainLlm::judge` window, so a single shared binary mutex is
+    /// sufficient even though two tests exist.
+    ///
+    /// `OnceLock` so the allocation happens once per process; `Mutex` (not
+    /// `RwLock`) because every holder mutates `std::env` between lock
+    /// acquisition and `ChainLlm::judge` and the critical section is short.
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    fn env_lock() -> &'static Mutex<()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Write an executable shell script at `path` that prints every element
+    /// of its argv, one per line, on stdout. argv[0] (the script path) is
+    /// preserved as the first line so tests can assert the child was
+    /// actually our shim — not some unrelated binary on PATH.
+    fn write_argv_dump_shim(path: &std::path::Path) {
+        std::fs::write(
+            path,
+            "#!/usr/bin/env bash\n\
+             printf 'argv0=%s\\n' \"$0\"\n\
+             for arg in \"$@\"; do\n\
+               printf '%s\\n' \"$arg\"\n\
+             done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    /// Prepare a temp directory containing a single executable named
+    /// `bin_name` that prints its argv. Returns the directory so the
+    /// caller can `chdir` into it (or set PATH) before invoking
+    /// `ChainLlm::judge`. The directory layout matches what `ChainLlm`
+    /// expects for the daemon's own cwd (`FALLBACK_CWD = "."`).
+    fn make_argv_dump_dir(prefix: &str, bin_name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("afd_chain_llm_{}_{}", prefix, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        write_argv_dump_shim(&dir.join("bin").join(bin_name));
+        dir
+    }
+
+    /// Drive `ChainLlm::judge` with a PATH that contains ONLY our shim for
+    /// `codex` (which is the first link in the chain), then pin the
+    /// argv/cwd the shim observed.
+    #[test]
+    #[cfg(unix)]
+    fn chain_llm_fallback_uses_explicit_cwd_and_argv_order() {
+        // Hold the process-wide env mutex for the entire mutation +
+        // ChainLlm::judge window so this test cannot interleave with
+        // `codex_argv_preserves_flag_boundary` (see ENV_LOCK rationale).
+        // On mutex poisoning we re-raise as a regular panic so the test
+        // still fails loudly rather than silently skipping.
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Key the temp dir on nanos since parallel test invocations need
+        // unique paths (process-id is shared across threads in a binary).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = make_argv_dump_dir(&format!("argv_{nanos}"), "codex");
+        let bin = dir.join("bin");
+
+        // Make ChainLlm resolve `codex` from our shim. Other backends
+        // (`claude`, `agy`) must NOT be reachable from PATH so the chain
+        // stops at the shim — this pins the argv of the FIRST link rather
+        // than accidentally exercising the fallback.
+        let prior_path = std::env::var_os("PATH");
+        let mut new_path = std::ffi::OsString::from(bin.to_str().unwrap());
+        if let Some(prior) = prior_path.as_ref() {
+            new_path.push(":");
+            new_path.push(prior);
+        }
+        // SAFETY: tests mutate env vars sequentially here. ENV_LOCK above
+        // ensures no parallel test from this module can interleave; the
+        // per-test temp dir + `nanos` suffix is defense-in-depth in case
+        // a future contributor adds a test that does NOT take the lock.
+        unsafe { std::env::set_var("PATH", &new_path) };
+        let prior_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", dir.to_str().unwrap()) };
+
+        let result = ChainLlm.judge("hello-router-prompt");
+
+        // Restore env first so a failed assertion leaves the test run
+        // hygienic for the next case. Drop the guard explicitly after
+        // restoration so a panic in the assertions does not skip the
+        // env restore (Drop for MutexGuard would not run, but the
+        // restore is the test's responsibility regardless).
+        unsafe {
+            if let Some(prior) = prior_home {
+                std::env::set_var("HOME", prior);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(prior) = prior_path {
+                std::env::set_var("PATH", prior);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+        drop(_guard);
+
+        let captured = result.expect("codex shim should succeed");
+
+        // The shim prepends a `argv0=<path>` marker line followed by one
+        // line per remaining argv slot (argv[1..]). Strip the marker and
+        // compare against the expected argv (argv[1..]).
+        let mut lines = captured.lines();
+        let argv0_line = lines
+            .next()
+            .expect("argv0 marker present in shim output");
+        assert!(
+            argv0_line.starts_with("argv0="),
+            "shim output must start with the argv0 marker; got {argv0_line:?}"
+        );
+
+        let actual_args: Vec<&str> = lines.collect();
+
+        let expected = &["exec", "--yolo", "--skip-git-repo-check", "hello-router-prompt"];
+        assert_eq!(
+            actual_args, expected,
+            "codex fallback argv mismatch — got {actual_args:?}, expected {expected:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pin that the codex shim path does NOT swallow `--yolo` /
+    /// `--skip-git-repo-check` into a single argv slot, which is the
+    /// structural failure mode that lets a `--dangerously-skip-permissions`
+    /// flag accidentally become part of the message text (bead
+    /// `jleechan-g1k`).
+    #[test]
+    #[cfg(unix)]
+    fn codex_argv_preserves_flag_boundary() {
+        // Hold the same process-wide env mutex as the sibling test so
+        // these two cannot interleave their `PATH` / `HOME` mutations
+        // (see ENV_LOCK rationale).
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = make_argv_dump_dir(&format!("bnd_{nanos}"), "codex");
+        let bin = dir.join("bin");
+
+        let prior_path = std::env::var_os("PATH");
+        let mut new_path = std::ffi::OsString::from(bin.to_str().unwrap());
+        if let Some(prior) = prior_path.as_ref() {
+            new_path.push(":");
+            new_path.push(prior);
+        }
+        unsafe { std::env::set_var("PATH", &new_path) };
+        let prior_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", dir.to_str().unwrap()) };
+
+        let result = ChainLlm.judge("boundary-check");
+
+        unsafe {
+            if let Some(prior) = prior_home {
+                std::env::set_var("HOME", prior);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(prior) = prior_path {
+                std::env::set_var("PATH", prior);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+        drop(_guard);
+
+        let captured = result.expect("codex shim should succeed");
+        let mut lines = captured.lines();
+        let argv0_line = lines
+            .next()
+            .expect("argv0 marker present in shim output");
+        assert!(
+            argv0_line.starts_with("argv0="),
+            "shim output must start with the argv0 marker; got {argv0_line:?}"
+        );
+        let actual_args: Vec<&str> = lines.collect();
+
+        assert_eq!(
+            actual_args,
+            vec!["exec", "--yolo", "--skip-git-repo-check", "boundary-check"],
+            "codex argv must keep each flag as a separate argv slot — the structural invariant that prevents --dangerously-skip-permissions from becoming message text"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

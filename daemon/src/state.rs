@@ -82,9 +82,71 @@ pub trait StateStore {
     fn owned_branches(&self) -> Result<Vec<String>, DaemonError>;
     /// Reverse-lookup: branch → bead_id (used by fast_tier to find drive-existing-pr beads).
     fn bead_id_for_branch(&self, branch: &str) -> Result<Option<String>, DaemonError>;
-    fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError>;
+    /// Return the overlay rows currently in `DISPATCHED` or `ATTESTED`. The
+    /// caller decides whether (and when) to bump `autonomy_secs` per row via
+    /// [`bump_autonomy_secs`] — splitting these two ops is what lets the
+    /// `ci_pending` pause (jleechan-54ky / sub-fix for jleechan-gib) freeze
+    /// the autonomy clock for healthy PRs that are waiting on slow CI,
+    /// instead of silently burning the 3h timebox against operator/CI
+    /// wall-clock time and parking the bead `HUMAN_HELD`.
+    fn list_active_overlays(&self) -> Result<Vec<BeadOverlay>, DaemonError>;
+    /// Increment a single overlay's `autonomy_secs` by `delta_secs` and
+    /// refresh `updated_at`. Pair with [`list_active_overlays`] when the
+    /// caller needs to skip the bump for specific rows (e.g.
+    /// `ci_pending=true`); the SQL-level "increment everything" form that
+    /// [`increment_active_autonomy`] used to provide is preserved below as
+    /// a default-method convenience for callers that don't need the skip.
+    fn bump_autonomy_secs(&self, bead_id: &str, delta_secs: u64) -> Result<(), DaemonError>;
+    /// Convenience for callers that don't need the ci_pending pause:
+    /// list all active overlays AND bump their autonomy_secs by
+    /// `elapsed_secs` in one call. Equivalent to `list_active_overlays`
+    /// followed by `bump_autonomy_secs` for every returned row.
+    fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError> {
+        let overlays = self.list_active_overlays()?;
+        for overlay in &overlays {
+            if elapsed_secs > 0 {
+                self.bump_autonomy_secs(&overlay.bead_id, elapsed_secs)?;
+            }
+        }
+        // Re-read so the returned rows reflect the just-applied bump; this
+        // matches the original "increment then return" semantics the tick
+        // loop depended on for the budget-warning crossing check.
+        self.list_active_overlays()
+    }
+    /// Requeue every `HUMAN_HELD` bead whose attempt is below `max_attempt`
+    /// back to `QUEUED`, incrementing `attempt` and zeroing `autonomy_secs`.
+    /// Returns the recovered overlays so the caller can emit telemetry.
+    /// This is the Rust port of the shell overlay's `recover-held`
+    /// (daemon/factory-overlay.sh:319), and the fix for jleechan-gib's
+    /// "100% of intake dead-ends terminally" blocker: without an automated
+    /// exit from `HUMAN_HELD`, every non-green gate assessment parks a
+    /// bead forever.
+    fn recover_human_held(&self, max_attempt: u32) -> Result<Vec<BeadOverlay>, DaemonError> {
+        let _ = max_attempt;
+        Ok(Vec::new())
+    }
+    /// Return `HUMAN_HELD` overlays that have reached the automated recovery
+    /// cap and therefore require explicit escalation instead of silent retry
+    /// suppression.
+    fn human_held_at_or_above_attempt(
+        &self,
+        max_attempt: u32,
+    ) -> Result<Vec<BeadOverlay>, DaemonError>;
     fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, feedback_text: &str) -> Result<(), DaemonError>;
     fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError>;
+    /// Read the `(attempt_count, last_attempt_epoch_secs)` pair for the
+    /// `/er` runner (bead jleechan-qqq). Default impl returns `(0, None)`
+    /// so test fakes that don't override it get the "never spawned" state.
+    fn er_runner_attempt(&self, _bead_id: &str) -> Result<(u32, Option<u64>), DaemonError> {
+        Ok((0, None))
+    }
+    /// Atomically increment the `/er` runner attempt counter for `bead_id`
+    /// and stamp `last_attempt_epoch_secs` to `now_epoch`. Returns the
+    /// new count. Default impl just returns `1` so fakes that don't
+    /// override it still satisfy the call (they aren't used in production).
+    fn incr_er_runner_attempt(&self, _bead_id: &str, _now_epoch: u64) -> Result<u32, DaemonError> {
+        Ok(1)
+    }
     fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
         Ok(())
     }
@@ -141,6 +203,7 @@ impl SqliteStateStore {
         Self::configure(&conn, false)?;
         conn.execute_batch(include_str!("../contracts/schema.sql"))
             .map_err(|e| tool_err("apply schema", e))?;
+        Self::ensure_er_runner_columns(&conn)?;
         Ok(Self { conn })
     }
 
@@ -151,7 +214,49 @@ impl SqliteStateStore {
         Self::configure(&conn, true)?;
         conn.execute_batch(schema_sql)
             .map_err(|e| tool_err("apply schema", e))?;
+        Self::ensure_er_runner_columns(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Idempotent migration for the `/er` runner columns (bead jleechan-qqq).
+    /// Older on-disk DBs predate the columns declared in the CREATE TABLE
+    /// block; SQLite has no `ADD COLUMN IF NOT EXISTS`, so we probe
+    /// `pragma_table_info` first and only ALTER when a column is missing.
+    /// Safe to call repeatedly — a no-op when both columns are already
+    /// present.
+    fn ensure_er_runner_columns(conn: &Connection) -> Result<(), DaemonError> {
+        let has_count: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'attempt_er_runner_count'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_er_runner_columns: pragma count", e))?;
+        if !has_count {
+            conn.execute(
+                "ALTER TABLE bead_overlay \
+                 ADD COLUMN attempt_er_runner_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_er_runner_columns: add count", e))?;
+        }
+        let has_last: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'last_er_runner_attempt_at'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_er_runner_columns: pragma last", e))?;
+        if !has_last {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN last_er_runner_attempt_at INTEGER",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_er_runner_columns: add last", e))?;
+        }
+        Ok(())
     }
 
     /// `is_memory` distinguishes the two `configure` call sites: `open()` (file-backed,
@@ -177,6 +282,53 @@ impl SqliteStateStore {
                 "PRAGMA journal_mode=WAL failed on file-backed DB: {e}"
             ))),
         }
+    }
+
+    /// Shared SELECT for `list_active_overlays` and `increment_active_autonomy`'s
+    /// "read after bump" return value. Filters to `DISPATCHED` + `ATTESTED`
+    /// (the only states where autonomy_secs is allowed to accumulate per
+    /// spec §4.2.8).
+    fn query_active_overlays(&self, op: &str) -> Result<Vec<BeadOverlay>, DaemonError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
+                 pr_number, branch, session_id \
+                 FROM bead_overlay WHERE state IN ('DISPATCHED', 'ATTESTED')",
+            )
+            .map_err(|e| tool_err(&format!("{op} prepare"), e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })
+            .map_err(|e| tool_err(&format!("{op} query"), e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id) =
+                r.map_err(|e| tool_err(&format!("{op} row"), e))?;
+            out.push(BeadOverlay {
+                bead_id,
+                state: OverlayState::from_str(&state_str)?,
+                attempt: attempt as u32,
+                reroll_count: reroll_count as u32,
+                autonomy_secs: autonomy_secs as u64,
+                spend_usd,
+                pr_number: pr_number.map(|v| v as u64),
+                branch,
+                session_id,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -228,12 +380,12 @@ impl StateStore for SqliteStateStore {
         self.conn
             .execute(
                 "INSERT INTO bead_overlay \
-                 (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
                  ON CONFLICT(bead_id) DO UPDATE SET \
                    state=excluded.state, attempt=excluded.attempt, reroll_count=excluded.reroll_count, \
                    autonomy_secs=excluded.autonomy_secs, spend_usd=excluded.spend_usd, \
-                   pr_number=excluded.pr_number, branch=excluded.branch, updated_at=excluded.updated_at",
+                   pr_number=excluded.pr_number, branch=excluded.branch, session_id=excluded.session_id, updated_at=excluded.updated_at",
                 params![
                     overlay.bead_id,
                     overlay.state.as_str(),
@@ -243,6 +395,7 @@ impl StateStore for SqliteStateStore {
                     overlay.spend_usd,
                     overlay.pr_number.map(|v| v as i64),
                     overlay.branch,
+                    overlay.session_id,
                     now_iso8601(),
                 ],
             )
@@ -292,6 +445,10 @@ impl StateStore for SqliteStateStore {
     }
 
     fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError> {
+        // Default-method wiring in the trait calls list_active_overlays +
+        // bump_autonomy_secs; we still need to override here so the bump
+        // happens via the existing single-UPDATE path (cheaper than
+        // per-row updates when no caller asks for the ci_pending skip).
         if elapsed_secs > 0 {
             self.conn.execute(
                 "UPDATE bead_overlay SET autonomy_secs = autonomy_secs + ?1, updated_at = ?2 \
@@ -299,32 +456,159 @@ impl StateStore for SqliteStateStore {
                 params![elapsed_secs, now_iso8601()],
             ).map_err(|e| tool_err("increment_active_autonomy update", e))?;
         }
+        self.list_active_overlays()
+    }
 
-        let mut stmt = self.conn.prepare(
-            "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id \
-             FROM bead_overlay WHERE state IN ('DISPATCHED', 'ATTESTED')"
-        ).map_err(|e| tool_err("increment_active_autonomy prepare", e))?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, f64>(5)?,
-                row.get::<_, Option<i64>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-            ))
-        }).map_err(|e| tool_err("increment_active_autonomy query", e))?;
+    fn list_active_overlays(&self) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.query_active_overlays("list_active_overlays")
+    }
 
+    fn bump_autonomy_secs(&self, bead_id: &str, delta_secs: u64) -> Result<(), DaemonError> {
+        if delta_secs == 0 {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "UPDATE bead_overlay SET autonomy_secs = autonomy_secs + ?1, updated_at = ?2 \
+                 WHERE bead_id = ?3",
+                params![delta_secs, now_iso8601(), bead_id],
+            )
+            .map_err(|e| tool_err("bump_autonomy_secs", e))?;
+        Ok(())
+    }
+
+    fn recover_human_held(&self, max_attempt: u32) -> Result<Vec<BeadOverlay>, DaemonError> {
+        // P2 fix (Codex review): the post-UPDATE SELECT must return ONLY the
+        // rows we just flipped — earlier versions matched every QUEUED bead
+        // with autonomy_secs=0 in the DB, polluting recovery telemetry with
+        // beads that were never HUMAN_HELD. Capture the bead_ids first, then
+        // SELECT WHERE bead_id IN (...). rusqlite has no clean RETURNING
+        // support, so two statements + an in-memory id list is the simplest
+        // fix.
+        let mut id_stmt = self
+            .conn
+            .prepare(
+                "SELECT bead_id FROM bead_overlay \
+                 WHERE state = 'HUMAN_HELD' AND attempt < ?1",
+            )
+            .map_err(|e| tool_err("recover_human_held id select prepare", e))?;
+        let recovered_ids: Vec<String> = id_stmt
+            .query_map(params![max_attempt as i64], |row| row.get::<_, String>(0))
+            .map_err(|e| tool_err("recover_human_held id select query", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if recovered_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // P2 fix (Codex review): clear stale PR metadata on requeue.
+        // `pr_number` and `session_id` belong to the prior (failed) attempt
+        // and would otherwise be carried into the new dispatch — `dispatch_ready`
+        // overwrites `branch` but leaves the other fields, so the fast tier
+        // would treat the freshly-DISPATCHED row as already ATTESTED against
+        // the dead PR and re-park on the same gate. `branch` is kept so the
+        // recovered-from telemetry still records what was being worked on;
+        // dispatch will rewrite it on the next attempt.
+        let placeholders = std::iter::repeat_n("?", recovered_ids.len()).collect::<Vec<_>>().join(",");
+        let update_sql = format!(
+            "UPDATE bead_overlay \
+             SET state = 'QUEUED', attempt = attempt + 1, autonomy_secs = 0, \
+                 pr_number = NULL, session_id = NULL, updated_at = ?1 \
+             WHERE bead_id IN ({})",
+            placeholders
+        );
+        let now = now_iso8601();
+        let mut update_params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(recovered_ids.len() + 1);
+        update_params.push(&now);
+        for id in &recovered_ids {
+            update_params.push(id as &dyn rusqlite::ToSql);
+        }
+        self.conn
+            .execute(&update_sql, &update_params[..])
+            .map_err(|e| tool_err("recover_human_held update", e))?;
+        // SELECT the exact rows we just flipped — bounded by the captured
+        // id list, not by state+autonomy heuristics that could match other rows.
+        let select_sql = format!(
+            "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
+             pr_number, branch, session_id \
+             FROM bead_overlay WHERE bead_id IN ({})",
+            placeholders
+        );
+        let mut select_params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(recovered_ids.len());
+        for id in &recovered_ids {
+            select_params.push(id as &dyn rusqlite::ToSql);
+        }
+        let mut stmt = self
+            .conn
+            .prepare(&select_sql)
+            .map_err(|e| tool_err("recover_human_held prepare", e))?;
+        let rows = stmt
+            .query_map(&select_params[..], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })
+            .map_err(|e| tool_err("recover_human_held query", e))?;
         let mut out = Vec::new();
         for r in rows {
-            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id) = r.map_err(|e| tool_err("increment_active_autonomy row", e))?;
-            let state = OverlayState::from_str(&state_str)?;
+            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id) =
+                r.map_err(|e| tool_err("recover_human_held row", e))?;
             out.push(BeadOverlay {
                 bead_id,
-                state,
+                state: OverlayState::from_str(&state_str)?,
+                attempt: attempt as u32,
+                reroll_count: reroll_count as u32,
+                autonomy_secs: autonomy_secs as u64,
+                spend_usd,
+                pr_number: pr_number.map(|v| v as u64),
+                branch,
+                session_id,
+            });
+        }
+        Ok(out)
+    }
+
+    fn human_held_at_or_above_attempt(
+        &self,
+        max_attempt: u32,
+    ) -> Result<Vec<BeadOverlay>, DaemonError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
+                 pr_number, branch, session_id \
+                 FROM bead_overlay WHERE state = 'HUMAN_HELD' AND attempt >= ?1",
+            )
+            .map_err(|e| tool_err("human_held_at_or_above_attempt prepare", e))?;
+        let rows = stmt
+            .query_map(params![max_attempt as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })
+            .map_err(|e| tool_err("human_held_at_or_above_attempt query", e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id) =
+                r.map_err(|e| tool_err("human_held_at_or_above_attempt row", e))?;
+            out.push(BeadOverlay {
+                bead_id,
+                state: OverlayState::from_str(&state_str)?,
                 attempt: attempt as u32,
                 reroll_count: reroll_count as u32,
                 autonomy_secs: autonomy_secs as u64,
@@ -372,11 +656,61 @@ impl StateStore for SqliteStateStore {
             .optional()
             .map_err(|e| tool_err("load_rejection", e))
     }
+
+    fn er_runner_attempt(&self, bead_id: &str) -> Result<(u32, Option<u64>), DaemonError> {
+        // Schema migration: the columns were added after the initial release;
+        // older DB files won't have them. Detect that by attempting the
+        // SELECT and falling back to (0, None) if the column is missing
+        // (sqlite returns "no such column" rather than an empty result).
+        let row: Result<(i64, Option<i64>), rusqlite::Error> = self.conn.query_row(
+            "SELECT attempt_er_runner_count, last_er_runner_attempt_at \
+             FROM bead_overlay WHERE bead_id = ?1",
+            params![bead_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        match row {
+            Ok((count, last_at)) => Ok((count.max(0) as u32, last_at.map(|v| v.max(0) as u64))),
+            Err(e) if no_such_column(&e) => Ok((0, None)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok((0, None)),
+            Err(e) => Err(tool_err("er_runner_attempt", e)),
+        }
+    }
+
+    fn incr_er_runner_attempt(&self, bead_id: &str, now_epoch: u64) -> Result<u32, DaemonError> {
+        // Try the UPDATE first (modern schema). If the column is missing
+        // (legacy DB), fall back to no-op + return 1 so the runner's
+        // attempt cap still fires on the in-memory counter.
+        let res = self.conn.execute(
+            "UPDATE bead_overlay SET \
+                attempt_er_runner_count = COALESCE(attempt_er_runner_count, 0) + 1, \
+                last_er_runner_attempt_at = ?2, \
+                updated_at = ?3 \
+             WHERE bead_id = ?1",
+            params![bead_id, now_epoch as i64, now_iso8601()],
+        );
+        match res {
+            Ok(_) => {
+                let (count, _) = self.er_runner_attempt(bead_id)?;
+                Ok(count)
+            }
+            Err(e) if no_such_column(&e) => Ok(1),
+            Err(e) => Err(tool_err("incr_er_runner_attempt", e)),
+        }
+    }
+}
+
+/// True when `err` is the SQLite "no such column" schema-mismatch signal.
+/// `rusqlite::Error` does not expose a typed `message` field on every
+/// feature combo, so we stringify + match — this is the same trick
+/// the JSON parsers in tools.rs use for `find('{')` fallback.
+fn no_such_column(err: &rusqlite::Error) -> bool {
+    err.to_string().to_lowercase().contains("no such column")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn store() -> SqliteStateStore {
         SqliteStateStore::open_in_memory_with_schema(include_str!("../contracts/schema.sql"))
@@ -590,5 +924,342 @@ mod tests {
                 let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
             }
         }
+    }
+
+    /// jleechan-qqq: an on-disk DB that lacks the `/er` runner columns must
+    /// be auto-migrated by `open()` and `open_in_memory_with_schema()`, so
+    /// the runner's first `incr_er_runner_attempt` doesn't fail with
+    /// "no such column". This pins the idempotency of the migration: a
+    /// second `open()` against the same file must NOT error on the
+    /// re-applied `ALTER TABLE` (a hard crash here would also block every
+    /// daemon restart, since `execute_batch(schema.sql)` re-runs).
+    #[test]
+    fn open_migrates_legacy_db_missing_er_runner_columns() {
+        use rusqlite::Connection;
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "dark-factory-er-migrate-{}-{}.sqlite",
+            std::process::id(),
+            now_iso8601().replace([':', '-', 'T', 'Z'], "")
+        ));
+        let _cleanup = TempFileGuard(path.clone());
+
+        // Build a "legacy" DB: just `bead_overlay` and `branch_registry`,
+        // no `/er` runner columns.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE bead_overlay (bead_id TEXT PRIMARY KEY, state TEXT NOT NULL, \
+                 attempt INTEGER NOT NULL DEFAULT 1, reroll_count INTEGER NOT NULL DEFAULT 0, \
+                 autonomy_secs INTEGER NOT NULL DEFAULT 0, spend_usd REAL NOT NULL DEFAULT 0, \
+                 pr_number INTEGER, branch TEXT, session_id TEXT, updated_at TEXT NOT NULL); \
+                 CREATE TABLE branch_registry (branch TEXT PRIMARY KEY, bead_id TEXT NOT NULL, \
+                 created_at TEXT NOT NULL);",
+            )
+            .unwrap();
+        }
+
+        // First open: must apply the migration without error.
+        let _store = SqliteStateStore::open(&path).expect("legacy DB should auto-migrate");
+
+        // Re-open: must NOT fail on the second ALTER (idempotency).
+        let _store2 = SqliteStateStore::open(&path).expect("second open must be idempotent");
+
+        // Both columns are present, with the expected defaults.
+        let conn = Connection::open(&path).unwrap();
+        let count_col: i64 = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'attempt_er_runner_count'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("attempt_er_runner_count column should exist after migration");
+        let last_col: i64 = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'last_er_runner_attempt_at'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("last_er_runner_attempt_at column should exist after migration");
+        assert_eq!(count_col, 1);
+        assert_eq!(last_col, 1);
+    }
+
+    /// jleechan-gib: the real-SQLite `recover_human_held` requeues every
+    /// HUMAN_HELD row under the cap and leaves HUMAN_HELD rows at/above the
+    /// cap alone. Mirrors the shell overlay's
+    /// `recover-held` (daemon/factory-overlay.sh:319-333) exactly so the
+    /// Rust tick can replace the shell caller.
+    #[test]
+    fn recover_human_held_requeues_below_cap_leaves_at_or_above_alone() {
+        let schema = include_str!("../contracts/schema.sql");
+        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
+
+        let mut overlays = HashMap::new();
+        overlays.insert(
+            "below".to_string(),
+            BeadOverlay {
+                bead_id: "below".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 2,
+                reroll_count: 0,
+                autonomy_secs: 9999,
+                spend_usd: 0.0,
+                pr_number: Some(11),
+                branch: Some("factory/below-r2".into()),
+                session_id: None,
+            },
+        );
+        overlays.insert(
+            "at-cap".to_string(),
+            BeadOverlay {
+                bead_id: "at-cap".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 10,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: Some(22),
+                branch: Some("factory/at-cap-r10".into()),
+                session_id: None,
+            },
+        );
+        overlays.insert(
+            "over-cap".to_string(),
+            BeadOverlay {
+                bead_id: "over-cap".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 12,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: Some(33),
+                branch: Some("factory/over-cap-r12".into()),
+                session_id: None,
+            },
+        );
+        // Non-HUMAN_HELD rows must never be touched.
+        overlays.insert(
+            "dispatched".to_string(),
+            BeadOverlay {
+                bead_id: "dispatched".into(),
+                state: OverlayState::Dispatched,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 100,
+                spend_usd: 0.0,
+                pr_number: Some(44),
+                branch: Some("factory/dispatched-r1".into()),
+                session_id: None,
+            },
+        );
+        overlays.insert(
+            "ready".to_string(),
+            BeadOverlay {
+                bead_id: "ready".into(),
+                state: OverlayState::Ready,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: Some(55),
+                branch: Some("factory/ready-r1".into()),
+                session_id: None,
+            },
+        );
+        for overlay in overlays.values() {
+            store.save(overlay).unwrap();
+        }
+
+        let recovered = store.recover_human_held(10).unwrap();
+        assert_eq!(recovered.len(), 1, "only `below` should be recovered");
+        assert_eq!(recovered[0].bead_id, "below");
+
+        // `below` was requeued and reset
+        let below = store.load("below").unwrap().unwrap();
+        assert_eq!(below.state, OverlayState::Queued);
+        assert_eq!(below.attempt, 3);
+        assert_eq!(below.autonomy_secs, 0);
+        // P2 (Codex): stale PR metadata must be cleared on requeue so the
+        // next dispatch doesn't conflate the fresh attempt with the dead PR.
+        assert_eq!(
+            below.pr_number, None,
+            "recover_human_held must clear pr_number to prevent stale-PR churn"
+        );
+        assert_eq!(
+            below.session_id, None,
+            "recover_human_held must clear session_id (belonged to the prior attempt)"
+        );
+        // branch is intentionally preserved so the recovered_from telemetry
+        // can still record what was being worked on; dispatch will rewrite
+        // it on the next attempt.
+        assert_eq!(
+            below.branch.as_deref(),
+            Some("factory/below-r2"),
+            "recover_human_held keeps branch as a stale-attempt breadcrumb"
+        );
+
+        // `at-cap` and `over-cap` are still HUMAN_HELD
+        let at_cap = store.load("at-cap").unwrap().unwrap();
+        assert_eq!(at_cap.state, OverlayState::HumanHeld);
+        assert_eq!(at_cap.attempt, 10);
+        let over_cap = store.load("over-cap").unwrap().unwrap();
+        assert_eq!(over_cap.state, OverlayState::HumanHeld);
+        assert_eq!(over_cap.attempt, 12);
+        let capped = store.human_held_at_or_above_attempt(10).unwrap();
+        let capped_ids: std::collections::HashSet<_> =
+            capped.iter().map(|overlay| overlay.bead_id.as_str()).collect();
+        assert_eq!(capped_ids.len(), 2);
+        assert!(capped_ids.contains("at-cap"));
+        assert!(capped_ids.contains("over-cap"));
+
+        // Non-HUMAN_HELD rows are untouched
+        let dispatched = store.load("dispatched").unwrap().unwrap();
+        assert_eq!(dispatched.state, OverlayState::Dispatched);
+        assert_eq!(dispatched.autonomy_secs, 100);
+        let ready = store.load("ready").unwrap().unwrap();
+        assert_eq!(ready.state, OverlayState::Ready);
+    }
+
+    /// P2 (Codex review): `recover_human_held` must return ONLY the rows
+    /// that were actually requeued — not every QUEUED bead with
+    /// `autonomy_secs = 0` (which is what the original heuristic-query did).
+    /// Pre-existing QUEUED beads with `autonomy_secs = 0` would otherwise
+    /// be reported as RECOVERED_FROM_HELD and pollute telemetry + the
+    /// tick summary. Run with a populated QUEUED backlog + a single
+    /// recoverable HUMAN_HELD bead, and assert the returned vec contains
+    /// only the bead we just recovered.
+    #[test]
+    fn recover_human_held_returns_only_rows_actually_recovered() {
+        let schema = include_str!("../contracts/schema.sql");
+        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
+
+        // Pre-existing QUEUED backlog with autonomy_secs=0 (these are
+        // exactly the rows that would have been incorrectly reported as
+        // RECOVERED_FROM_HELD before the fix).
+        for (id, attempt) in [("queued-a", 1), ("queued-b", 2), ("queued-c", 3)] {
+            store
+                .save(&BeadOverlay {
+                    bead_id: id.into(),
+                    state: OverlayState::Queued,
+                    attempt,
+                    reroll_count: 0,
+                    autonomy_secs: 0,
+                    spend_usd: 0.0,
+                    pr_number: None,
+                    branch: None,
+                    session_id: None,
+                })
+                .unwrap();
+        }
+
+        // One recoverable HUMAN_HELD bead.
+        store
+            .save(&BeadOverlay {
+                bead_id: "held-only".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 4321,
+                spend_usd: 0.0,
+                pr_number: Some(7777),
+                branch: Some("factory/held-only-r1".into()),
+                session_id: Some("session-xyz".into()),
+            })
+            .unwrap();
+
+        let recovered = store.recover_human_held(10).unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "only the HUMAN_HELD row should be reported as recovered"
+        );
+        assert_eq!(recovered[0].bead_id, "held-only");
+
+        // Pre-existing QUEUED rows are untouched.
+        for id in ["queued-a", "queued-b", "queued-c"] {
+            let o = store.load(id).unwrap().unwrap();
+            assert_eq!(o.state, OverlayState::Queued, "{id} must stay QUEUED");
+            assert_eq!(o.autonomy_secs, 0, "{id} autonomy_secs unchanged");
+        }
+    }
+
+    /// jleechan-54ky: `list_active_overlays` returns the active set
+    /// unchanged (no implicit increment). `bump_autonomy_secs` advances a
+    /// single row. Together they replace the old
+    /// `increment_active_autonomy` SQL update + select in a way that lets
+    /// the caller skip rows whose PR has `ci_pending=true` (the
+    /// sub-fix-for-gib autonomy pause).
+    #[test]
+    fn list_active_overlays_does_not_bump_and_bump_autonomy_secs_targets_one_row() {
+        let schema = include_str!("../contracts/schema.sql");
+        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
+
+        store
+            .save(&BeadOverlay {
+                bead_id: "d".into(),
+                state: OverlayState::Dispatched,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 100,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: Some("factory/d-r1".into()),
+                session_id: None,
+            })
+            .unwrap();
+        store
+            .save(&BeadOverlay {
+                bead_id: "a".into(),
+                state: OverlayState::Attested,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 200,
+                spend_usd: 0.0,
+                pr_number: Some(7),
+                branch: Some("factory/a-r1".into()),
+                session_id: None,
+            })
+            .unwrap();
+        store
+            .save(&BeadOverlay {
+                bead_id: "h".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 300,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: Some("factory/h-r1".into()),
+                session_id: None,
+            })
+            .unwrap();
+
+        let active = store.list_active_overlays().unwrap();
+        assert_eq!(active.len(), 2, "DISPATCHED + ATTESTED only");
+        let names: Vec<&str> = active.iter().map(|o| o.bead_id.as_str()).collect();
+        assert!(names.contains(&"d"));
+        assert!(names.contains(&"a"));
+
+        // list_active_overlays must NOT have bumped autonomy_secs
+        let d_before = store.load("d").unwrap().unwrap();
+        assert_eq!(
+            d_before.autonomy_secs, 100,
+            "list_active_overlays must not bump autonomy_secs"
+        );
+
+        // bump_autonomy_secs targets exactly the row named
+        store.bump_autonomy_secs("d", 50).unwrap();
+        store.bump_autonomy_secs("a", 75).unwrap();
+        store.bump_autonomy_secs("h", 9999).unwrap(); // HUMAN_HELD row still bumps
+
+        let d_after = store.load("d").unwrap().unwrap();
+        assert_eq!(d_after.autonomy_secs, 150);
+        let a_after = store.load("a").unwrap().unwrap();
+        assert_eq!(a_after.autonomy_secs, 275);
+        let h_after = store.load("h").unwrap().unwrap();
+        assert_eq!(h_after.autonomy_secs, 10299);
     }
 }

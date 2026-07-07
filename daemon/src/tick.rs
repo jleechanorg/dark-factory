@@ -55,6 +55,62 @@ pub struct TickSummary {
     pub gates_assessed: usize,
     pub beads_ready: usize,
     pub beads_parked_human_held: usize,
+    /// Beads that the automated HUMAN_HELD exit requeued back to QUEUED
+    /// this tick (jleechan-gib: Rust port of shell `recover-held`).
+    pub beads_recovered_from_held: usize,
+    /// Beads that reached an automation cap and now require explicit
+    /// operator/escalation attention instead of silent indefinite retry.
+    pub beads_escalated: usize,
+}
+
+/// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
+/// overlay's `recover-held` (daemon/factory-overlay.sh:319-333) and the
+/// ad-hoc attempt counter cap cited in the gap-review verdict
+/// (`docs/factory-goal-gap-review-2026-07-06.md` Blocker #3). Beads at or
+/// above this cap are deliberately left in HUMAN_HELD for a human to
+/// review — the daemon stops blindly retrying past this point.
+const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
+const ESCALATION_REVIEWER: &str = "dark-factory-escalation";
+const ESCALATION_SENTINEL_ATTEMPT: u32 = u32::MAX;
+
+/// Result of looking up CI-pending state for an active overlay (used by the
+/// autonomy/timebox bookkeeping in `run_tick`'s active-overlay loop).
+///
+/// `NotApplicable` covers non-`Attested` overlays and `Attested` overlays
+/// without a PR yet — the caller proceeds with normal timebox + wedge work
+/// for those (the autonomy clock must keep ticking regardless of which
+/// state the bead is in, except for `Attested + PR exists + ci_pending=true`
+/// where CI wall-clock would falsely count against the coder's budget).
+///
+/// `Known(ci_pending)` is the normal path: snapshot fetched, value known.
+///
+/// `SnapshotUnavailable` (jleechan-qdw) is the new third state — a
+/// transient `gh`/GraphQL/network hiccup on `pr_snapshot`. The caller MUST
+/// skip this overlay's timebox bump, timebox-park, and wedge-check for
+/// this tick (continue to the next overlay) and emit
+/// `BEAD_SNAPSHOT_TRANSIENT_ERROR` with `phase: "ci_pending"` /
+/// `"active_overlay"`. Leaving the bead `Attested` is deliberate: the
+/// next tick retries the snapshot fetch. The previous implementation
+/// collapsed `Err` to `false` here, which let the timebox-park branch
+/// false-park an `Attested` bead on a single transient snapshot error
+/// (bead 901 regression the audit caught).
+enum CiPendingStatus {
+    NotApplicable,
+    Known(bool),
+    SnapshotUnavailable,
+}
+
+fn ci_pending_for_attested(overlay: &BeadOverlay, scm: &dyn crate::tools::Scm) -> CiPendingStatus {
+    if overlay.state != OverlayState::Attested {
+        return CiPendingStatus::NotApplicable;
+    }
+    match overlay.pr_number {
+        None => CiPendingStatus::NotApplicable,
+        Some(pr) => match scm.pr_snapshot(pr) {
+            Ok(snap) => CiPendingStatus::Known(snap.ci_pending),
+            Err(_) => CiPendingStatus::SnapshotUnavailable,
+        },
+    }
 }
 
 /// Dependency-free ISO-8601 UTC timestamp, matching `state.rs::now_iso8601`'s
@@ -119,7 +175,11 @@ fn emit(
 ///
 /// Stage gate: `deps.cfg.stage` must be `1` — this function only implements
 /// the Stage-1 substitution rule (re-roll verdicts recorded, never executed).
-pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<TickSummary, DaemonError> {
+pub fn run_tick(
+    deps: &TickDeps,
+    tick_index: u64,
+    elapsed_secs: u64,
+) -> Result<TickSummary, DaemonError> {
     if deps.cfg.stage != 1 && deps.cfg.stage != 2 {
         return Err(DaemonError::Config(format!(
             "run_tick only implements stage 1 or 2; got stage={}",
@@ -129,9 +189,62 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
 
     let mut summary = TickSummary::default();
 
-    // Increment autonomy_secs and perform safety envelope & wedge detection checks for active beads
-    let active_overlays = deps.store.increment_active_autonomy(elapsed_secs)?;
+    let slow_tier_due = {
+        let ratio = (deps.cfg.slow_tick_secs / deps.cfg.fast_tick_secs.max(1)).max(1);
+        tick_index.is_multiple_of(ratio)
+    };
+
+    // jleechan-gib: automated HUMAN_HELD exit (Rust port of shell
+    // `recover-held`). Runs at the TOP of the tick, BEFORE the active-overlay
+    // wedge-detection loop, so that a bead recovered this tick cannot also be
+    // parked this same tick (otherwise the wedge check would re-park a
+    // freshly-QUEUED bead before dispatch can make progress). Recovery only
+    // fires when the slow tier is due (matches the shell overlay's cadence
+    // — `recover-held` was never per-fast-tick).
+    if slow_tier_due {
+        run_recovery_step(deps, &mut summary)?;
+    }
+
+    // jleechan-54ky / sub-fix for jleechan-gib: split the SQL-level "increment
+    // every active row" into list + per-row bump so we can pause the autonomy
+    // clock for ATTESTED rows whose PR has ci_pending=true (CI wait time is
+    // operator/CI wall-clock, not coder session time we are budgeting against).
+    let active_overlays = deps.store.list_active_overlays()?;
     for mut overlay in active_overlays {
+        // jleechan-qdw: per-overlay isolation. A snapshot fetch error in the
+        // ci_pending lookup must not bump the autonomy clock AND must not
+        // run the timebox-park / wedge-check branches for this overlay —
+        // any of those would risk false-parking a near-timebox bead on a
+        // single transient `gh`/GraphQL/network hiccup. Skip this overlay
+        // for the rest of the active-overlay loop and continue to the next.
+        match ci_pending_for_attested(&overlay, deps.scm) {
+            CiPendingStatus::SnapshotUnavailable => {
+                let _ = emit(
+                    deps.telemetry_log,
+                    &overlay.bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "BEAD_SNAPSHOT_TRANSIENT_ERROR",
+                    serde_json::json!({}),
+                    serde_json::json!({"phase": "ci_pending", "skip": "active_overlay"}),
+                );
+                continue;
+            }
+            CiPendingStatus::NotApplicable => {
+                if elapsed_secs > 0 {
+                    overlay.autonomy_secs += elapsed_secs;
+                    deps.store
+                        .bump_autonomy_secs(&overlay.bead_id, elapsed_secs)?;
+                }
+            }
+            CiPendingStatus::Known(ci_pending) => {
+                if !ci_pending && elapsed_secs > 0 {
+                    overlay.autonomy_secs += elapsed_secs;
+                    deps.store
+                        .bump_autonomy_secs(&overlay.bead_id, elapsed_secs)?;
+                }
+            }
+        }
         // 1. Time-box envelope check
         if overlay.autonomy_secs >= deps.cfg.autonomy_timebox_secs {
             overlay.state = OverlayState::HumanHeld;
@@ -145,7 +258,7 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                 serde_json::json!({}),
                 serde_json::json!({"reason": "autonomy_timebox_exceeded"}),
             )?;
-            let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): autonomy time-box limit exceeded.");
+            let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): autonomy time-box limit exceeded.".to_string();
             let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
             summary.beads_parked_human_held += 1;
             continue;
@@ -198,8 +311,9 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                                 serde_json::json!({}),
                                 serde_json::json!({"reason": "coder_silent"}),
                             )?;
-                            let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): coder silent/inactive on branch for 30 minutes.");
-                            let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
+                            let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): coder silent/inactive on branch for 30 minutes.".to_string();
+                            let _ =
+                                post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
                             summary.beads_parked_human_held += 1;
                         }
                     }
@@ -207,21 +321,95 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
             }
             OverlayState::Attested => {
                 if let Some(pr_number) = overlay.pr_number {
-                    let pr_snapshot = deps.scm.pr_snapshot(pr_number)?;
+                    // jleechan-qdw: per-bead isolation. A transient
+                    // `gh`/GraphQL/network hiccup fetching THIS overlay's
+                    // PR snapshot must not abort the entire tick — one
+                    // bead's tool failure cannot wedge the wedge-detection
+                    // loop and freeze every other active overlay. Log the
+                    // error and skip to the next overlay; the wedge check
+                    // re-runs on the next tick when the snapshot succeeds.
+                    let pr_snapshot = match deps.scm.pr_snapshot(pr_number) {
+                        Ok(snap) => snap,
+                        Err(e) => {
+                            let _ = emit(
+                                deps.telemetry_log,
+                                &overlay.bead_id,
+                                overlay.attempt,
+                                OverlayState::Attested.as_str(),
+                                "BEAD_SNAPSHOT_TRANSIENT_ERROR",
+                                serde_json::json!({}),
+                                serde_json::json!({"error": format!("{e:?}"), "phase": "wedge_detection"}),
+                            );
+                            continue;
+                        }
+                    };
                     let now_epoch = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
 
-                    if now_epoch.saturating_sub(pr_snapshot.updated_at_epoch) >= 1800 && !pr_snapshot.ci_pending {
-                        let is_stalled_or_dead = if let Some(ref session_id_str) = overlay.session_id {
-                            let session_id = SessionId(session_id_str.clone());
-                            deps.sessions.is_quiescent(&session_id)?
-                        } else {
-                            true
-                        };
+                    if now_epoch.saturating_sub(pr_snapshot.updated_at_epoch) >= 1800
+                        && !pr_snapshot.ci_pending
+                    {
+                        let is_stalled_or_dead =
+                            if let Some(ref session_id_str) = overlay.session_id {
+                                let session_id = SessionId(session_id_str.clone());
+                                deps.sessions.is_quiescent(&session_id)?
+                            } else {
+                                true
+                            };
 
                         if is_stalled_or_dead {
+                            // Bead `jleechan-ubas`: do NOT park a stalled
+                            // session if the remote PR head is genuinely
+                            // ahead of the local branch — that's evidence
+                            // the worker is still landing commits even
+                            // though `is_quiescent` says otherwise (e.g. an
+                            // AO session was forked, externally terminated,
+                            // or the AO state lost sync with the actual PR
+                            // progress). The check is `is_remote_ahead`,
+                            // not raw SHA inequality: a divergent or
+                            // local-only-ahead branch (the worker has
+                            // unpushed commits, or local has commits the
+                            // remote has never seen) would also satisfy
+                            // `remote_sha != local_head` and would
+                            // silently mask a real stall behind a green
+                            // PR. We deliberately do NOT run `git fetch`
+                            // / `git branch -f` here: a daemon tick is
+                            // the wrong place to mutate the local branch.
+                            // The next tick's fast tier re-runs gate
+                            // assessment against the live PR state.
+                            let mut commits_observed_after_exit = false;
+                            if let Some(ref branch) = overlay.branch {
+                                if let Ok(ahead) =
+                                    deps.vcs.is_remote_ahead(branch, &pr_snapshot.head_sha)
+                                {
+                                    if ahead {
+                                        commits_observed_after_exit = true;
+                                    }
+                                }
+                            }
+
+                            if commits_observed_after_exit {
+                                emit(
+                                    deps.telemetry_log,
+                                    &overlay.bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Attested.as_str(),
+                                    "COMMITS_OBSERVED_AFTER_STALL",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "reason": "commits observed after session_exit",
+                                        "remote_head_sha": pr_snapshot.head_sha,
+                                    }),
+                                )?;
+                                // Stay in ATTESTED; the next tick's fast
+                                // tier re-runs gate assessment against
+                                // the live PR state. No state mutation,
+                                // no destructive git ops.
+                                continue;
+                            }
+
                             overlay.state = OverlayState::HumanHeld;
                             deps.store.save(&overlay)?;
                             emit(
@@ -233,8 +421,9 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
                                 serde_json::json!({}),
                                 serde_json::json!({"reason": "session_stalled"}),
                             )?;
-                            let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): session stalled or quiescent on open PR.");
-                            let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
+                            let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): session stalled or quiescent on open PR.".to_string();
+                            let _ =
+                                post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
                             summary.beads_parked_human_held += 1;
                         }
                     }
@@ -243,11 +432,6 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
             _ => {}
         }
     }
-
-    let slow_tier_due = {
-        let ratio = (deps.cfg.slow_tick_secs / deps.cfg.fast_tick_secs.max(1)).max(1);
-        tick_index.is_multiple_of(ratio)
-    };
 
     if slow_tier_due {
         run_slow_tier(deps, &mut summary)?;
@@ -268,6 +452,8 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
             "gatesAssessed": summary.gates_assessed,
             "beadsReady": summary.beads_ready,
             "beadsParkedHumanHeld": summary.beads_parked_human_held,
+            "beadsRecoveredFromHeld": summary.beads_recovered_from_held,
+            "beadsEscalated": summary.beads_escalated,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
@@ -275,34 +461,121 @@ pub fn run_tick(deps: &TickDeps, tick_index: u64, elapsed_secs: u64) -> Result<T
     Ok(summary)
 }
 
+/// jleechan-gib: automated HUMAN_HELD exit (Rust port of shell
+/// `recover-held`). Requeues every `HUMAN_HELD` bead whose `attempt` is
+/// below `MAX_HUMAN_HELD_RECOVERY_ATTEMPT` back to `QUEUED`, increments
+/// `attempt`, and zeros `autonomy_secs`. Must run BEFORE the
+/// active-overlay wedge-detection loop in `run_tick` so a freshly-QUEUED
+/// bead is not immediately re-parked by the timebox/wedge checks in the
+/// same tick.
+fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
+    let recovered = deps
+        .store
+        .recover_human_held(MAX_HUMAN_HELD_RECOVERY_ATTEMPT)?;
+    for overlay in recovered {
+        summary.beads_recovered_from_held += 1;
+        emit(
+            deps.telemetry_log,
+            &overlay.bead_id,
+            overlay.attempt,
+            OverlayState::Queued.as_str(),
+            "RECOVERED_FROM_HELD",
+            serde_json::json!({}),
+            serde_json::json!({
+                "prior_state": OverlayState::HumanHeld.as_str(),
+                "pr_number": overlay.pr_number,
+                "branch": overlay.branch,
+            }),
+        )?;
+    }
+    for overlay in deps
+        .store
+        .human_held_at_or_above_attempt(MAX_HUMAN_HELD_RECOVERY_ATTEMPT)?
+    {
+        if escalation_already_recorded(deps, &overlay.bead_id)? {
+            continue;
+        }
+        let comment_body = format!(
+            "🤖 **[dark-factory]** Escalation required: bead `{}` is HUMAN_HELD at attempt {} (max automated recovery attempts: {}). Automation will not silently requeue it again.",
+            overlay.bead_id, overlay.attempt, MAX_HUMAN_HELD_RECOVERY_ATTEMPT
+        );
+        if let Err(err) = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body) {
+            emit(
+                deps.telemetry_log,
+                &overlay.bead_id,
+                overlay.attempt,
+                OverlayState::HumanHeld.as_str(),
+                "ESCALATION_NOTIFICATION_FAILED",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "reason": "human_held_recovery_attempt_cap_reached",
+                    "error": err.to_string(),
+                }),
+            )?;
+            continue;
+        }
+        record_escalation(
+            deps,
+            &overlay.bead_id,
+            "human_held_recovery_attempt_cap_reached",
+        )?;
+        summary.beads_escalated += 1;
+        emit(
+            deps.telemetry_log,
+            &overlay.bead_id,
+            overlay.attempt,
+            OverlayState::HumanHeld.as_str(),
+            "ESCALATION_REQUIRED",
+            serde_json::json!({}),
+            serde_json::json!({
+                "reason": "human_held_recovery_attempt_cap_reached",
+                "max_attempt": MAX_HUMAN_HELD_RECOVERY_ATTEMPT,
+                "pr_number": overlay.pr_number,
+                "branch": overlay.branch,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
 /// Slow tier: intake new beads, route each freshly-queued bead, dispatch as
 /// many QUEUED beads as the safety envelope (30/15) allows.
 fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
+    // jleechan-gib: recovery has already run at the top of this tick via
+    // `run_recovery_step` (it must run BEFORE the active-overlay wedge loop
+    // so freshly-QUEUED beads aren't immediately re-parked by wedge
+    // detection). The freshly-recovered QUEUED beads are picked up by the
+    // routing_candidates loop below, so they get dispatched this same tick.
     let created = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
+    let tracker_candidates = deps.tracker.fetch_candidates()?;
     let mut routing_candidates: Vec<Bead> = Vec::new();
     for bead_id in &created {
         let mut pr_number = None;
+        let tracker_bead = tracker_candidates
+            .iter()
+            .find(|bead| bead.id == *bead_id)
+            .cloned();
         if deps.llm.is_real() {
-            if let Ok(candidates) = deps.tracker.fetch_candidates() {
-                if let Some(bead) = candidates.iter().find(|b| b.id == *bead_id) {
-                    if let Some(ref ext_ref) = bead.external_ref {
-                        if let Some((_, num_str)) = parse_external_ref(ext_ref) {
-                            if let Ok(num) = num_str.parse::<u64>() {
-                                if crate::tools::run_tool(
-                                    "gh",
-                                    &[
-                                        "pr",
-                                        "view",
-                                        &num.to_string(),
-                                        "--repo",
-                                        &deps.cfg.target_repo,
-                                        "--json",
-                                        "number",
-                                    ],
-                                    10,
-                                ).is_ok() {
-                                    pr_number = Some(num);
-                                }
+            if let Some(bead) = tracker_bead.as_ref() {
+                if let Some(ref ext_ref) = bead.external_ref {
+                    if let Some((_, num_str)) = parse_external_ref(ext_ref) {
+                        if let Ok(num) = num_str.parse::<u64>() {
+                            if crate::tools::run_tool(
+                                "gh",
+                                &[
+                                    "pr",
+                                    "view",
+                                    &num.to_string(),
+                                    "--repo",
+                                    &deps.cfg.target_repo,
+                                    "--json",
+                                    "number",
+                                ],
+                                10,
+                            )
+                            .is_ok()
+                            {
+                                pr_number = Some(num);
                             }
                         }
                     }
@@ -332,25 +605,24 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             serde_json::json!({}),
             serde_json::json!({}),
         )?;
-        // `Tracker::fetch_candidates` == `br list ...`; a real `br` would show
-        // this bead on the very next call since `br` is a durable store. Test
-        // fakes are static/pre-seeded, so route/dispatch this tick against the
-        // bead we just created directly rather than depending on the fake
-        // reflecting it back through `fetch_candidates`.
-        routing_candidates.push(Bead {
+        // `Tracker::fetch_candidates` == `br list ...`; a real `br` shows this
+        // bead on the very next call since `br` is durable. Prefer that real
+        // bead payload so the worker prompt carries the tracker title rather than
+        // an empty just-created stub; keep a non-empty fallback for static fakes.
+        routing_candidates.push(tracker_bead.unwrap_or(Bead {
             id: bead_id.clone(),
-            title: String::new(),
+            title: bead_id.clone(),
             description: String::new(),
             file_tree_summary: String::new(),
             external_ref: None,
-        });
+        }));
     }
 
     // Also pick up any bead left over from a prior tick that reached QUEUED
     // but was never routed/dispatched (process restart resilience) — real
     // `Tracker::fetch_candidates` reflects prior `create_bead` calls, so this
     // covers that path in production even though the static test fake can't.
-    for bead in deps.tracker.fetch_candidates()? {
+    for bead in tracker_candidates {
         if !routing_candidates.iter().any(|b| b.id == bead.id) {
             routing_candidates.push(bead);
         }
@@ -430,7 +702,10 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({}),
                     serde_json::json!({"reason": reason}),
                 )?;
-                let comment_body = format!("🤖 **[dark-factory]** Router parse error (human held): {}", reason);
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Router parse error (human held): {}",
+                    reason
+                );
                 if let Some(ref ext_ref) = bead.external_ref {
                     let _ = deps.tracker.comment_external(ext_ref, &comment_body);
                 }
@@ -440,28 +715,54 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     }
 
     if !ready.is_empty() {
-        let dispatched = dispatch::dispatch_ready(deps.sessions, deps.store, deps.cfg, &ready)?;
-        summary.beads_dispatched += dispatched;
-        for (bead, _) in ready.iter().take(dispatched) {
+        let dispatch_report =
+            dispatch::dispatch_ready(deps.sessions, deps.store, deps.cfg, &ready)?;
+        summary.beads_dispatched += dispatch_report.success_count();
+
+        for failure in &dispatch_report.failures {
+            let lifecycle_state = if failure.branch.is_some() {
+                OverlayState::Dispatching.as_str()
+            } else {
+                OverlayState::Queued.as_str()
+            };
             emit(
                 deps.telemetry_log,
-                &bead.id,
-                1,
+                &failure.bead_id,
+                failure.attempt,
+                lifecycle_state,
+                "BEAD_DISPATCH_TRANSIENT_ERROR",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "phase": failure.phase,
+                    "branch": failure.branch.as_deref(),
+                    "error": failure.error.as_str(),
+                    "transient": failure.transient,
+                }),
+            )?;
+        }
+
+        for success in &dispatch_report.successes {
+            emit(
+                deps.telemetry_log,
+                &success.bead_id,
+                success.attempt,
                 OverlayState::Dispatched.as_str(),
                 "TASK_DISPATCHED",
                 serde_json::json!({}),
-                serde_json::json!({}),
+                serde_json::json!({
+                    "branch": success.branch.as_str(),
+                    "sessionId": success.session_id.as_str()
+                }),
             )?;
-            let attempt = if let Ok(Some(o)) = deps.store.load(&bead.id) {
-                o.attempt
-            } else {
-                1
-            };
             let comment_body = format!(
-                "🤖 **[dark-factory]** Spawned worker session in slot for bead `{}` (attempt {}). Branch: `factory/{}-r{}`.",
-                bead.id, attempt, bead.id, attempt
+                "🤖 **[dark-factory]** Spawned worker session in slot for bead `{}` (attempt {}). Branch: `{}`.",
+                success.bead_id, success.attempt, success.branch
             );
-            if let Some(ref ext_ref) = bead.external_ref {
+            if let Some(ext_ref) = ready
+                .iter()
+                .find(|(bead, _)| bead.id == success.bead_id)
+                .and_then(|(bead, _)| bead.external_ref.as_ref())
+            {
                 let _ = deps.tracker.comment_external(ext_ref, &comment_body);
             }
         }
@@ -510,7 +811,11 @@ fn skeptic_evidence(deps: &TickDeps, bead_id: &str, pr: u64) -> Result<PrEvidenc
 
     let prompt_clone1 = prompt.clone();
     let handle1 = std::thread::spawn(move || {
-        crate::tools::run_tool("codex", &["exec", "--yolo", "--skip-git-repo-check", &prompt_clone1], 120)
+        crate::tools::run_tool(
+            "codex",
+            &["exec", "--yolo", "--skip-git-repo-check", &prompt_clone1],
+            120,
+        )
     });
 
     let prompt_clone2 = prompt.clone();
@@ -522,11 +827,29 @@ fn skeptic_evidence(deps: &TickDeps, bead_id: &str, pr: u64) -> Result<PrEvidenc
         } else {
             "claude".to_string()
         };
-        crate::tools::run_tool(&claude_bin, &["--print", "--dangerously-skip-permissions", "--setting-sources", "", &prompt_clone2], 120)
+        crate::tools::run_tool(
+            &claude_bin,
+            &[
+                "--print",
+                "--dangerously-skip-permissions",
+                "--setting-sources",
+                "",
+                &prompt_clone2,
+            ],
+            120,
+        )
     });
 
-    let res1 = handle1.join().unwrap_or(Err(DaemonError::Tool { tool: "thread".into(), rc: -1, stderr: "join failed".into() }));
-    let res2 = handle2.join().unwrap_or(Err(DaemonError::Tool { tool: "thread".into(), rc: -1, stderr: "join failed".into() }));
+    let res1 = handle1.join().unwrap_or(Err(DaemonError::Tool {
+        tool: "thread".into(),
+        rc: -1,
+        stderr: "join failed".into(),
+    }));
+    let res2 = handle2.join().unwrap_or(Err(DaemonError::Tool {
+        tool: "thread".into(),
+        rc: -1,
+        stderr: "join failed".into(),
+    }));
 
     let v1 = match &res1 {
         Ok(reply) => verifier::parse_skeptic_verdict(reply),
@@ -538,18 +861,7 @@ fn skeptic_evidence(deps: &TickDeps, bead_id: &str, pr: u64) -> Result<PrEvidenc
         Err(_) => None,
     };
 
-    let skeptic_verdict = match (v1, v2) {
-        (Some(verifier::SkepticVerdict::Fail(r1)), Some(verifier::SkepticVerdict::Fail(r2))) => Some(verifier::SkepticVerdict::Fail(format!("{r1} && {r2}"))),
-        (Some(verifier::SkepticVerdict::Fail(r)), _) => Some(verifier::SkepticVerdict::Fail(r)),
-        (_, Some(verifier::SkepticVerdict::Fail(r))) => Some(verifier::SkepticVerdict::Fail(r)),
-        (Some(verifier::SkepticVerdict::Warn(w1)), Some(verifier::SkepticVerdict::Warn(w2))) => Some(verifier::SkepticVerdict::Warn(format!("{w1} && {w2}"))),
-        (Some(verifier::SkepticVerdict::Warn(w)), _) => Some(verifier::SkepticVerdict::Warn(w)),
-        (_, Some(verifier::SkepticVerdict::Warn(w))) => Some(verifier::SkepticVerdict::Warn(w)),
-        (Some(verifier::SkepticVerdict::Pass), Some(verifier::SkepticVerdict::Pass)) => Some(verifier::SkepticVerdict::Pass),
-        (Some(verifier::SkepticVerdict::Pass), None) => Some(verifier::SkepticVerdict::Pass),
-        (None, Some(verifier::SkepticVerdict::Pass)) => Some(verifier::SkepticVerdict::Pass),
-        _ => None,
-    };
+    let skeptic_verdict = combine_dual_verdict(v1, v2, bead_id, pr)?;
 
     Ok(PrEvidence {
         is_production: false,
@@ -558,6 +870,58 @@ fn skeptic_evidence(deps: &TickDeps, bead_id: &str, pr: u64) -> Result<PrEvidenc
         er_verdict: verifier::ErVerdict::Absent,
         skeptic_verdict,
     })
+}
+
+/// Combine two reviewer verdicts (one per subprocess) into a single
+/// `SkepticVerdict` for gate 7.
+///
+/// Single-pass success is preserved: if EITHER reviewer returns a usable
+/// verdict (`Fail`/`Warn`/`Pass`), that verdict wins (Fail beats Warn
+/// beats Pass in priority, and either side overrides `None`).
+///
+/// jleechan-qdw: when BOTH reviewers failed (tool errored OR reply was
+/// unparseable, i.e. `v1 == None && v2 == None`) the previous code
+/// returned `Ok(None)` — gate 7 became `Unknown`, `all_green` became
+/// `false`, and Stage-1's substitution rule parked the bead
+/// `HUMAN_HELD`. That is a false-park on a reviewer-tool outage (the
+/// bead is not known-bad; it is unjudged). Return `Err` instead so
+/// `run_fast_tier`'s per-bead catch-and-continue fires (phase =
+/// `skeptic_evidence`), the bead stays ATTESTED, and the next tick
+/// retries the reviewer call.
+pub fn combine_dual_verdict(
+    v1: Option<verifier::SkepticVerdict>,
+    v2: Option<verifier::SkepticVerdict>,
+    bead_id: &str,
+    pr: u64,
+) -> Result<Option<verifier::SkepticVerdict>, DaemonError> {
+    let combined = match (v1, v2) {
+        (Some(verifier::SkepticVerdict::Fail(r1)), Some(verifier::SkepticVerdict::Fail(r2))) => {
+            Some(verifier::SkepticVerdict::Fail(format!("{r1} && {r2}")))
+        }
+        (Some(verifier::SkepticVerdict::Fail(r)), _) => Some(verifier::SkepticVerdict::Fail(r)),
+        (_, Some(verifier::SkepticVerdict::Fail(r))) => Some(verifier::SkepticVerdict::Fail(r)),
+        (Some(verifier::SkepticVerdict::Warn(w1)), Some(verifier::SkepticVerdict::Warn(w2))) => {
+            Some(verifier::SkepticVerdict::Warn(format!("{w1} && {w2}")))
+        }
+        (Some(verifier::SkepticVerdict::Warn(w)), _) => Some(verifier::SkepticVerdict::Warn(w)),
+        (_, Some(verifier::SkepticVerdict::Warn(w))) => Some(verifier::SkepticVerdict::Warn(w)),
+        (Some(verifier::SkepticVerdict::Pass), Some(verifier::SkepticVerdict::Pass)) => {
+            Some(verifier::SkepticVerdict::Pass)
+        }
+        (Some(verifier::SkepticVerdict::Pass), None) => Some(verifier::SkepticVerdict::Pass),
+        (None, Some(verifier::SkepticVerdict::Pass)) => Some(verifier::SkepticVerdict::Pass),
+        _ => None,
+    };
+    if combined.is_none() {
+        return Err(DaemonError::Tool {
+            tool: "skeptic_evidence".into(),
+            rc: 1,
+            stderr: format!(
+                "both reviewers failed to produce a parseable verdict for bead {bead_id} PR #{pr}"
+            ),
+        });
+    }
+    Ok(combined)
 }
 
 /// Fast tier: for every bead whose overlay is `ATTESTED` (or freshly promoted
@@ -644,8 +1008,43 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             None => continue,
         };
 
-        let mut evidence = skeptic_evidence(deps, bead_id, pr)?;
-        let snapshot = deps.scm.pr_snapshot(pr)?;
+        let mut evidence = match skeptic_evidence(deps, bead_id, pr) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "BEAD_PROCESSING_TRANSIENT_ERROR",
+                    serde_json::json!({}),
+                    serde_json::json!({"phase": "skeptic_evidence", "error": format!("{e:?}")}),
+                );
+                continue;
+            }
+        };
+        // jleechan-qdw: per-bead isolation. A transient `gh`/GraphQL/network
+        // hiccup fetching THIS bead's PR snapshot must not abort the fast
+        // tier for the rest of the in-flight beads — one bead's failure
+        // cannot stop another bead in the same tick from advancing. Log the
+        // failure via telemetry and skip to the next bead; the bead stays
+        // ATTESTED so the next tick retries the snapshot fetch (no false-
+        // green, no false-park on a single transient error).
+        let mut snapshot = match deps.scm.pr_snapshot(pr) {
+            Ok(snap) => snap,
+            Err(e) => {
+                let _ = emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "BEAD_SNAPSHOT_TRANSIENT_ERROR",
+                    serde_json::json!({}),
+                    serde_json::json!({"phase": "fast_tier", "error": format!("{e:?}")}),
+                );
+                continue;
+            }
+        };
         if snapshot.ci_pending {
             emit(
                 deps.telemetry_log,
@@ -659,10 +1058,123 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             continue;
         }
 
-        evidence.er_verdict = verifier::parse_er_verdict(&snapshot.comments);
+        // jleechan-qqq: if no `/er` verdict is recorded yet, dispatch an
+        // independent reviewer (claude/codex subprocess) and post the
+        // verdict as a PR comment. Re-fetch the snapshot so the just-
+        // posted comment is visible to `parse_er_verdict` below.
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let runner_outcome = match crate::er_runner::maybe_run(deps, bead_id, pr, now_epoch) {
+            Ok(out) => out,
+            Err(e) => {
+                let _ = emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "BEAD_PROCESSING_TRANSIENT_ERROR",
+                    serde_json::json!({}),
+                    serde_json::json!({"phase": "er_runner", "error": format!("{e:?}")}),
+                );
+                continue;
+            }
+        };
+        // When the runner just posted a verdict this tick, prefer the
+        // returned verdict over a re-parse of the refreshed snapshot —
+        // `parse_er_verdict` would otherwise pick up any "/er" token
+        // anywhere in the comment body, including in the runner's own
+        // formatted prefix, and could disagree with the verdict the
+        // runner just emitted. Only fall back to the snapshot when the
+        // runner DIDN'T post (cooldown/capped/already-present/no-op).
+        let mut posted_verdict: Option<verifier::ErVerdict> = None;
+        let mut er_runner_capped_count: Option<u32> = None;
+        match runner_outcome {
+            crate::er_runner::Outcome::Posted { verdict, count } => {
+                posted_verdict = Some(verdict);
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    crate::er_runner::EVT_POSTED,
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "verdict": format!("{verdict:?}"),
+                        "attempt": count,
+                    }),
+                )?;
+                // jleechan-qdw: per-bead isolation for the post-/er refetch.
+                // If the refresh fails after posting, this bead's SCM view
+                // is transiently unavailable. Emit the outage and retry on a
+                // later tick rather than falling through into `assess()`,
+                // which performs another `pr_snapshot` and would turn the
+                // outage into Unknown/all_green=false -> HUMAN_HELD.
+                match deps.scm.pr_snapshot(pr) {
+                    Ok(snap) => snapshot = snap,
+                    Err(e) => {
+                        let _ = emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Attested.as_str(),
+                            "BEAD_SNAPSHOT_TRANSIENT_ERROR",
+                            serde_json::json!({}),
+                            serde_json::json!({"phase": "post_er_refetch", "error": format!("{e:?}")}),
+                        );
+                        continue;
+                    }
+                }
+            }
+            crate::er_runner::Outcome::AlreadyPosted(v) => {
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    crate::er_runner::EVT_NOOP,
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "already_posted", "verdict": format!("{v:?}")}),
+                )?;
+            }
+            crate::er_runner::Outcome::Capped { count } => {
+                er_runner_capped_count = Some(count);
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    crate::er_runner::EVT_CAPPED,
+                    serde_json::json!({}),
+                    serde_json::json!({"count": count}),
+                )?;
+            }
+            crate::er_runner::Outcome::Cooldown {
+                elapsed_secs,
+                count,
+            } => {
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    crate::er_runner::EVT_NOOP,
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "cooldown", "elapsed_secs": elapsed_secs, "count": count}),
+                )?;
+            }
+            crate::er_runner::Outcome::NotApplicable => {}
+        }
+
+        evidence.er_verdict = match posted_verdict {
+            Some(v) => v,
+            None => verifier::parse_er_verdict(&snapshot.comments),
+        };
         evidence.is_production = verifier::classify_production(&snapshot.files);
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
-        evidence.has_integration_evidence_marker = verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
+        evidence.has_integration_evidence_marker =
+            verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
         let report = verifier::assess(deps.scm, pr, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
         emit(
@@ -694,6 +1206,77 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             );
             let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
         } else {
+            let red_reasons: Vec<String> = report
+                .results
+                .iter()
+                .filter_map(|(gate_name, result)| match result {
+                    verifier::GateResult::Red(reason) => Some(format!("{gate_name:?}: {reason}")),
+                    _ => None,
+                })
+                .collect();
+            if red_reasons.is_empty() {
+                if let Some(count) = er_runner_capped_count {
+                    if escalation_already_recorded(deps, bead_id)? {
+                        continue;
+                    }
+                    let comment_body = format!(
+                        "🤖 **[dark-factory]** Escalation required: gate assessment is still Unknown-only after {} automated /er attempts. Automation parked bead `{}` HUMAN_HELD at the recovery cap for inspection rather than silently churning.",
+                        count, bead_id
+                    );
+                    if let Err(err) = post_scm_comment_by_bead_id(deps, bead_id, &comment_body) {
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Attested.as_str(),
+                            "ESCALATION_NOTIFICATION_FAILED",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "unknown_only_gate_report_with_er_runner_capped",
+                                "er_runner_attempts": count,
+                                "pr_number": pr,
+                                "error": err.to_string(),
+                            }),
+                        )?;
+                        continue;
+                    }
+                    overlay.state = OverlayState::HumanHeld;
+                    overlay.attempt = MAX_HUMAN_HELD_RECOVERY_ATTEMPT;
+                    deps.store.save(&overlay)?;
+                    record_escalation(
+                        deps,
+                        bead_id,
+                        "unknown_only_gate_report_with_er_runner_capped",
+                    )?;
+                    summary.beads_escalated += 1;
+                    summary.beads_parked_human_held += 1;
+                    emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_REQUIRED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "unknown_only_gate_report_with_er_runner_capped",
+                            "er_runner_attempts": count,
+                            "pr_number": pr,
+                        }),
+                    )?;
+                    continue;
+                }
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "GATE_ASSESSMENT_TRANSIENT_UNKNOWN",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "gate assessment had unknown gates but no red gates"}),
+                )?;
+                continue;
+            }
+
             if deps.cfg.stage == 1 {
                 // Stage-1 substitution rule (CONTRACT.md §1): record the re-roll
                 // verdict, never execute it. Park HUMAN_HELD instead of RE_ROLL.
@@ -718,17 +1301,15 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({}),
                     serde_json::json!({"reason": "gate assessment not all-green (stage 1: recorded, not executed)"}),
                 )?;
-                let comment_body = format!(
+                let comment_body =
                     "🤖 **[dark-factory]** Coder session parked (human held): gate assessment failed. Stage 1 configuration prevents re-roll."
-                );
+                        .to_string();
                 let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
             } else {
                 // Stage 2: execute re-roll engine
                 let mut reviewer = "verifier".to_string();
-                let mut feedback = Vec::new();
                 for (gate_name, result) in &report.results {
-                    if let verifier::GateResult::Red(ref reason) = result {
-                        feedback.push(format!("{gate_name:?}: {reason}"));
+                    if let verifier::GateResult::Red(_) = result {
                         if *gate_name == verifier::GateName::Skeptic {
                             reviewer = "skeptic".to_string();
                         } else if *gate_name == verifier::GateName::CodeRabbitApproved {
@@ -736,7 +1317,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         }
                     }
                 }
-                let review_text = feedback.join("\n");
+                let review_text = red_reasons.join("\n");
 
                 let reroll_deps = crate::reroll::RerollDeps {
                     scm: deps.scm,
@@ -753,7 +1334,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 match crate::reroll::execute(&reroll_deps, &mut overlay) {
                     Ok(crate::reroll::RerollOutcome::Rerolled { new_branch: _ }) => {
                         // Perform recovery validation: check if spec is valid TOML
-                        let spec_path = std::path::Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", overlay.bead_id));
+                        let spec_path = std::path::Path::new(&deps.cfg.spec_dir)
+                            .join(format!("{}.toml", overlay.bead_id));
                         let validation_pass = if spec_path.exists() {
                             if let Ok(c) = std::fs::read_to_string(&spec_path) {
                                 toml::from_str::<serde_json::Value>(&c).is_ok()
@@ -794,9 +1376,9 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 serde_json::json!({}),
                                 serde_json::json!({"reason": "spec file validation failed in recovery"}),
                             )?;
-                            let comment_body = format!(
+                            let comment_body =
                                 "🤖 **[dark-factory]** Coder session parked (human held): spec file validation failed in recovery."
-                            );
+                                    .to_string();
                             let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                         }
                     }
@@ -825,6 +1407,30 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     Ok(())
 }
 
+fn escalation_already_recorded(deps: &TickDeps, bead_id: &str) -> Result<bool, DaemonError> {
+    Ok(matches!(
+        deps.store
+            .load_rejection(bead_id, ESCALATION_SENTINEL_ATTEMPT)?,
+        Some((reviewer, _)) if reviewer == ESCALATION_REVIEWER
+    ))
+}
+
+fn record_escalation(
+    deps: &TickDeps,
+    bead_id: &str,
+    reason: &str,
+) -> Result<(), DaemonError> {
+    deps
+        .store
+        .save_rejection(
+            bead_id,
+            ESCALATION_SENTINEL_ATTEMPT,
+            ESCALATION_REVIEWER,
+            reason,
+            reason,
+        )
+}
+
 fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
     let parts: Vec<&str> = external_ref.split('#').collect();
     if parts.len() == 2 {
@@ -834,21 +1440,24 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
     }
 }
 
-fn post_scm_comment_by_bead_id(deps: &TickDeps, bead_id: &str, body: &str) -> Result<(), DaemonError> {
-    if let Ok(Some(overlay)) = deps.store.load(bead_id) {
+fn post_scm_comment_by_bead_id(
+    deps: &TickDeps,
+    bead_id: &str,
+    body: &str,
+) -> Result<(), DaemonError> {
+    if let Some(overlay) = deps.store.load(bead_id)? {
         if let Some(pr) = overlay.pr_number {
             let ext_ref = format!("{}#{}", deps.cfg.target_repo, pr);
-            let _ = deps.tracker.comment_external(&ext_ref, body);
-            return Ok(());
+            return deps.tracker.comment_external(&ext_ref, body);
         }
     }
-    if let Ok(candidates) = deps.tracker.fetch_candidates() {
-        if let Some(bead) = candidates.iter().find(|b| b.id == bead_id) {
-            if let Some(ref ext_ref) = bead.external_ref {
-                let _ = deps.tracker.comment_external(ext_ref, body);
-            }
+    let candidates = deps.tracker.fetch_candidates()?;
+    if let Some(bead) = candidates.iter().find(|b| b.id == bead_id) {
+        if let Some(ref ext_ref) = bead.external_ref {
+            return deps.tracker.comment_external(ext_ref, body);
         }
     }
-    Ok(())
+    Err(DaemonError::Config(format!(
+        "no SCM comment target found for bead {bead_id}"
+    )))
 }
-

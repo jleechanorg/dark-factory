@@ -3,4 +3,12 @@
 # Real logic lives in pre-push-graph-audit.sh (and any future pre-push siblings).
 
 set -euo pipefail
-exec "$(git rev-parse --show-toplevel)/.githooks/pre-push-graph-audit.sh" "$@"
+
+command -v git-lfs >/dev/null 2>&1 || {
+  echo >&2 "This repository is configured for Git LFS but git-lfs was not found on PATH."
+  exit 2
+}
+
+git lfs pre-push "$@"
+"$(git rev-parse --show-toplevel)/.githooks/pre-push-repro-artifact-guard.sh"
+"$(git rev-parse --show-toplevel)/.githooks/pre-push-graph-audit.sh" "$@"

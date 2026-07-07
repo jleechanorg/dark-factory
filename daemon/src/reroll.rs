@@ -271,11 +271,11 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     // Format spec block append-only
     let mut inhibition_lines = String::new();
     for spec in &extracted.inhibition_specs {
-        inhibition_lines.push_str(&format!("    \"{}\",\n", spec.replace('"', "\"")));
+        inhibition_lines.push_str(&format!("    \"{}\",\n", spec.replace('"', "\\\"")));
     }
     let mut positive_lines = String::new();
     for spec in &extracted.positive_assertions {
-        positive_lines.push_str(&format!("    \"{}\",\n", spec.replace('"', "\"")));
+        positive_lines.push_str(&format!("    \"{}\",\n", spec.replace('"', "\\\"")));
     }
 
     let block = format!(

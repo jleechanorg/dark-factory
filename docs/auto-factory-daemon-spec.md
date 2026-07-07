@@ -251,7 +251,7 @@ Additional floors and optimizations are enforced:
 *   **Spec mutation grammar:** The spec file for the bead is append-only. Each re-roll appends one block containing the source event, attesting reviewer, superseded attempt, extracted constraints, and raw feedback snapshot. Atomicity is guaranteed via write-temp -> fsync -> rename.
 *   **Overlay States:**
     *   Pre-PR lifecycle (previously implicit, named in r3): *QUEUED* (bead accepted by intake, awaiting dispatch) -> *DISPATCHED* (worker or pipeline running, no PR yet) -> *ATTESTED* (PR open).
-    *   *ATTESTED* (all 7 gates green; readiness posted) -> *READY* — terminal on the automated path; the daemon stops driving (added r3.1 so "stops driving" is a mechanized state, not a behavior note).
+    *   *ATTESTED* (all 9 gates green — 7 originals + `/code-standards` + `/zfc`; readiness posted) -> *READY* — terminal on the automated path; the daemon stops driving (added r3.1 so "stops driving" is a mechanized state, not a behavior note).
     *   *ATTESTED* (on PR rejection + cooldown) -> *RE_ROLL*
     *   *RE_ROLL* (on abort) -> *ATTESTED*
     *   *RE_ROLL* (on success) -> *RECOVERY*

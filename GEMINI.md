@@ -101,7 +101,7 @@ Before marking Gate 6 as PASS, you must answer explicitly what the evidence prov
 
 ### Human Merge Approval Requirement
 > [!CAUTION]
-> **NEVER** execute `gh pr merge` or merge any PR unprompted, even if all 7 gates are green. You **MUST** wait for the human user to explicitly type `MERGE APPROVED` in the chat before carrying out the merge.
+> **NEVER** execute `gh pr merge` or merge any PR unprompted, even if all 9 gates are green (the 7 originals + `/code-standards` + `/zfc`). You **MUST** wait for the human user to explicitly type `MERGE APPROVED` in the chat before carrying out the merge.
 
 ---
 

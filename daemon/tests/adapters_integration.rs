@@ -12,7 +12,7 @@ fn test_cli_vcs_real_git() {
 
     let temp_branch = format!("temp-test-branch-{}", std::process::id());
     let _ = std::process::Command::new("git")
-        .args(&["branch", "-D", &temp_branch])
+        .args(["branch", "-D", &temp_branch])
         .status();
 
     vcs.create_branch_at(&temp_branch, &sha).expect("create_branch_at failed");
@@ -21,7 +21,7 @@ fn test_cli_vcs_real_git() {
     assert_eq!(sha, check_sha);
 
     let status = std::process::Command::new("git")
-        .args(&["branch", "-D", &temp_branch])
+        .args(["branch", "-D", &temp_branch])
         .status()
         .unwrap();
     assert!(status.success());
@@ -46,7 +46,7 @@ fn test_cli_scm_real_gh() {
 #[test]
 #[ignore] // Requires real `ao` CLI — run locally with `cargo test -- --ignored`
 fn test_cli_sessions_real_ao() {
-    let sessions = CliSessions::new("jleechanorg/dark-factory", "claude-code");
+    let sessions = CliSessions::new("dark-factory", "claude-code");
     let count = sessions.active_count();
     assert!(count.is_ok(), "active_count failed: {:?}", count);
 }
@@ -65,8 +65,8 @@ fn test_chain_llm_real_fallback() {
 fn test_cli_scm_offline_fallback() {
     let scm = CliScm::new("jleechanorg/dark-factory".to_string());
     let offline_dir = std::path::Path::new(".beads/offline");
-    std::fs::create_dir_all(&offline_dir).unwrap();
-    
+    std::fs::create_dir_all(offline_dir).unwrap();
+
     let pr_file = offline_dir.join("pr_9999.json");
     std::fs::write(&pr_file, r#"{
         "ci_success": true,
@@ -88,4 +88,3 @@ fn test_cli_scm_offline_fallback() {
     
     let _ = std::fs::remove_file(pr_file);
 }
-
