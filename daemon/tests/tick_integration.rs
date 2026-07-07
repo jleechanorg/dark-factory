@@ -28,7 +28,7 @@ use daemon::config::Config;
 use daemon::errors::DaemonError;
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
-use daemon::tools::{Issue, Llm, Permission, PrComment, PrSnapshot, Scm};
+use daemon::tools::{Bead, Issue, Llm, Permission, PrComment, PrSnapshot, Scm};
 use daemon::verifier::SkepticVerdict;
 
 fn test_cfg() -> Config {
@@ -379,6 +379,118 @@ fn run_tick_never_calls_dispatch_when_router_parses_no_verdict() {
 
     let overlay = store.load("fake-bead-1").unwrap().unwrap();
     assert_eq!(overlay.state, OverlayState::HumanHeld);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().extend([
+        Bead {
+            id: "bead-0".into(),
+            title: "first bead".into(),
+            description: String::new(),
+            file_tree_summary: String::new(),
+            external_ref: None,
+        },
+        Bead {
+            id: "bead-1".into(),
+            title: "second bead".into(),
+            description: String::new(),
+            file_tree_summary: String::new(),
+            external_ref: None,
+        },
+    ]);
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"STANDARD_PATH","justification":"scripted"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    for bead_id in ["bead-0", "bead-1"] {
+        store
+            .save(&BeadOverlay {
+                bead_id: bead_id.into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+            })
+            .unwrap();
+    }
+    store.fail_save_for("bead-0", OverlayState::Dispatching);
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_tick_dispatch_isolation.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("tick should isolate one dispatch failure and continue");
+
+    assert_eq!(summary.beads_dispatched, 1);
+    assert_eq!(
+        store.load("bead-0").unwrap().unwrap().state,
+        OverlayState::Queued
+    );
+    assert_eq!(
+        store.load("bead-1").unwrap().unwrap().state,
+        OverlayState::Dispatched
+    );
+
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let dispatched_beads: Vec<_> = events
+        .iter()
+        .filter(|e| e["eventType"] == "TASK_DISPATCHED")
+        .map(|e| e["beadId"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        dispatched_beads,
+        vec!["bead-1".to_string()],
+        "TASK_DISPATCHED must describe actual successes, not ready-list prefix count"
+    );
+
+    let failure = events
+        .iter()
+        .find(|e| e["eventType"] == "BEAD_DISPATCH_TRANSIENT_ERROR")
+        .expect("dispatch failure telemetry should be emitted");
+    assert_eq!(failure["beadId"], "bead-0");
+    assert_eq!(failure["context"]["phase"], "save_dispatching");
+
+    let spawn_calls: Vec<_> = sessions
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| c.starts_with("spawn("))
+        .cloned()
+        .collect();
+    assert_eq!(
+        spawn_calls,
+        vec!["spawn(bead-1)".to_string()],
+        "pre-spawn failure for bead-0 must not call spawn, but bead-1 should still dispatch"
+    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }

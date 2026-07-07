@@ -163,6 +163,7 @@ pub struct FakeSessions {
     pub active_count: usize,
     pub next_session_id: String,
     pub quiescent: bool,
+    pub fail_spawn_for: RefCell<Vec<String>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -172,6 +173,7 @@ impl Default for FakeSessions {
             active_count: 0,
             next_session_id: "fake-session-1".into(),
             quiescent: true,
+            fail_spawn_for: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -180,6 +182,10 @@ impl Default for FakeSessions {
 impl FakeSessions {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn fail_spawn_for(&self, bead_id: &str) {
+        self.fail_spawn_for.borrow_mut().push(bead_id.to_string());
     }
 }
 
@@ -193,6 +199,13 @@ impl Sessions for FakeSessions {
         self.calls
             .borrow_mut()
             .push(format!("spawn({})", spec.bead_id));
+        if self.fail_spawn_for.borrow().contains(&spec.bead_id) {
+            return Err(DaemonError::Tool {
+                tool: "ao".into(),
+                rc: 1,
+                stderr: format!("scripted spawn failure for {}", spec.bead_id),
+            });
+        }
         Ok(SessionId(self.next_session_id.clone()))
     }
 
@@ -334,12 +347,19 @@ pub struct FakeStateStore {
     pub branches: RefCell<Vec<String>>,
     pub branch_beads: RefCell<HashMap<String, String>>,
     pub rejections: RefCell<HashMap<(String, u32), (String, String)>>,
+    pub fail_save_for_state: RefCell<Vec<(String, OverlayState)>>,
     pub calls: RefCell<Vec<String>>,
 }
 
 impl FakeStateStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn fail_save_for(&self, bead_id: &str, state: OverlayState) {
+        self.fail_save_for_state
+            .borrow_mut()
+            .push((bead_id.to_string(), state));
     }
 }
 
@@ -353,6 +373,18 @@ impl StateStore for FakeStateStore {
         self.calls
             .borrow_mut()
             .push(format!("save({})", overlay.bead_id));
+        if self
+            .fail_save_for_state
+            .borrow()
+            .iter()
+            .any(|(bead_id, state)| bead_id == &overlay.bead_id && *state == overlay.state)
+        {
+            return Err(DaemonError::Tool {
+                tool: "sqlite".into(),
+                rc: -1,
+                stderr: format!("scripted save failure for {}", overlay.state.as_str()),
+            });
+        }
         self.overlays
             .borrow_mut()
             .insert(overlay.bead_id.clone(), overlay.clone());
