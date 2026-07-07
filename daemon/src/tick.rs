@@ -660,28 +660,54 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     }
 
     if !ready.is_empty() {
-        let dispatched = dispatch::dispatch_ready(deps.sessions, deps.store, deps.cfg, &ready)?;
-        summary.beads_dispatched += dispatched;
-        for (bead, _) in ready.iter().take(dispatched) {
+        let dispatch_report =
+            dispatch::dispatch_ready(deps.sessions, deps.store, deps.cfg, &ready)?;
+        summary.beads_dispatched += dispatch_report.success_count();
+
+        for failure in &dispatch_report.failures {
+            let lifecycle_state = if failure.branch.is_some() {
+                OverlayState::Dispatching.as_str()
+            } else {
+                OverlayState::Queued.as_str()
+            };
             emit(
                 deps.telemetry_log,
-                &bead.id,
-                1,
+                &failure.bead_id,
+                failure.attempt,
+                lifecycle_state,
+                "BEAD_DISPATCH_TRANSIENT_ERROR",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "phase": failure.phase,
+                    "branch": failure.branch.as_deref(),
+                    "error": failure.error.as_str(),
+                    "transient": failure.transient,
+                }),
+            )?;
+        }
+
+        for success in &dispatch_report.successes {
+            emit(
+                deps.telemetry_log,
+                &success.bead_id,
+                success.attempt,
                 OverlayState::Dispatched.as_str(),
                 "TASK_DISPATCHED",
                 serde_json::json!({}),
-                serde_json::json!({}),
+                serde_json::json!({
+                    "branch": success.branch.as_str(),
+                    "sessionId": success.session_id.as_str()
+                }),
             )?;
-            let attempt = if let Ok(Some(o)) = deps.store.load(&bead.id) {
-                o.attempt
-            } else {
-                1
-            };
             let comment_body = format!(
-                "🤖 **[dark-factory]** Spawned worker session in slot for bead `{}` (attempt {}). Branch: `factory/{}-r{}`.",
-                bead.id, attempt, bead.id, attempt
+                "🤖 **[dark-factory]** Spawned worker session in slot for bead `{}` (attempt {}). Branch: `{}`.",
+                success.bead_id, success.attempt, success.branch
             );
-            if let Some(ref ext_ref) = bead.external_ref {
+            if let Some(ext_ref) = ready
+                .iter()
+                .find(|(bead, _)| bead.id == success.bead_id)
+                .and_then(|(bead, _)| bead.external_ref.as_ref())
+            {
                 let _ = deps.tracker.comment_external(ext_ref, &comment_body);
             }
         }

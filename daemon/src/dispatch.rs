@@ -6,9 +6,56 @@
 // spawns whatever `ready` already contains, in order).
 use crate::config::Config;
 use crate::errors::DaemonError;
+use crate::router::RoutingVerdict;
 use crate::state::{BeadOverlay, OverlayState, StateStore};
 use crate::tools::{Bead, Sessions, SpawnSpec};
-use crate::router::RoutingVerdict;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchSuccess {
+    pub bead_id: String,
+    pub attempt: u32,
+    pub branch: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchFailure {
+    pub bead_id: String,
+    pub attempt: u32,
+    pub branch: Option<String>,
+    pub phase: &'static str,
+    pub error: String,
+    pub transient: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DispatchReport {
+    pub successes: Vec<DispatchSuccess>,
+    pub failures: Vec<DispatchFailure>,
+}
+
+impl DispatchReport {
+    pub fn success_count(&self) -> usize {
+        self.successes.len()
+    }
+}
+
+fn failure(
+    bead: &Bead,
+    attempt: u32,
+    branch: Option<String>,
+    phase: &'static str,
+    err: DaemonError,
+) -> DispatchFailure {
+    DispatchFailure {
+        bead_id: bead.id.clone(),
+        attempt,
+        branch,
+        phase,
+        transient: err.is_transient(),
+        error: err.to_string(),
+    }
+}
 
 /// Dispatch as many `ready` beads as the safety envelope allows.
 ///
@@ -23,53 +70,96 @@ use crate::router::RoutingVerdict;
 ///   3. Registers the branch in the store's branch registry.
 ///   4. Persists the overlay with `state = Dispatching` and `branch` set —
 ///      the durable "about to spawn" record. Nothing has been spawned yet,
-///      so a failure here needs no rollback; the error just propagates and
-///      the bead is left at its prior on-disk state.
+///      so a transient failure here needs no rollback and can be reported
+///      without stopping later beads.
 ///   5. Calls `sessions.spawn(&SpawnSpec { .. })`.
 ///   6. Saves the overlay with `state = Dispatched` to confirm the spawn.
 ///      If THIS save fails, the spawn already succeeded and would otherwise
 ///      be exactly the "spawn succeeds, store error leaves an untracked live
 ///      session" bug this closes: roll back by calling
-///      `sessions.stop(&session_id)` on the just-spawned worker, then
-///      propagate the original save error.
+///      `sessions.stop(&session_id)` on the just-spawned worker. If that stop
+///      succeeds, requeue the bead durably, then report the original
+///      transient save failure and continue. If stop or requeue persistence
+///      fails, stop the batch because a live untracked worker or stranded
+///      DISPATCHING row may remain. A `sessions.spawn` error is also fatal
+///      because the real spawn path may have created a process before failing
+///      to return a session id.
 ///
-/// Returns the number of beads actually spawned. Never spawns past the cap;
-/// if zero slots are free, returns `Ok(0)` without calling `sessions.spawn`
-/// (verified by the fake's call log in tests — spec §4.2.8's caps are absolute).
+/// Returns a per-bead report. Never spawns past the cap; if zero slots are
+/// free, returns an empty report without calling `sessions.spawn` (verified by
+/// the fake's call log in tests — spec §4.2.8's caps are absolute).
 pub fn dispatch_ready(
     sessions: &dyn Sessions,
     store: &dyn StateStore,
     cfg: &Config,
     ready: &[(Bead, RoutingVerdict)],
-) -> Result<usize, DaemonError> {
+) -> Result<DispatchReport, DaemonError> {
     let active = sessions.active_count()?;
     let free_slots = cfg.max_workers.saturating_sub(active);
     let batch = free_slots.min(cfg.max_batch);
 
-    let mut dispatched = 0usize;
-    for (bead, verdict) in ready.iter().take(batch) {
-        let mut overlay = store.load(&bead.id)?.unwrap_or_else(|| BeadOverlay {
-            bead_id: bead.id.clone(),
-            state: OverlayState::Queued,
-            attempt: 1,
-            reroll_count: 0,
-            autonomy_secs: 0,
-            spend_usd: 0.0,
-            pr_number: None,
-            branch: None,
-            session_id: None,
-        });
+    let mut report = DispatchReport::default();
+    for (bead, verdict) in ready {
+        if report.success_count() >= batch {
+            break;
+        }
+
+        let mut overlay = match store.load(&bead.id) {
+            Ok(Some(overlay)) => overlay,
+            Ok(None) => BeadOverlay {
+                bead_id: bead.id.clone(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+            },
+            Err(err) if err.is_transient() => {
+                report
+                    .failures
+                    .push(failure(bead, 1, None, "load_overlay", err));
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
 
         let branch = format!("factory/{}-r{}", bead.id, overlay.attempt);
 
         // Register the branch + persist the DISPATCHING intent BEFORE
         // spawning a worker. Neither creates a live process, so a failure
         // here needs no rollback.
-        store.register_branch(&bead.id, &branch)?;
+        if let Err(err) = store.register_branch(&bead.id, &branch) {
+            if err.is_transient() {
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    Some(branch),
+                    "register_branch",
+                    err,
+                ));
+                continue;
+            }
+            return Err(err);
+        }
 
         overlay.state = OverlayState::Dispatching;
         overlay.branch = Some(branch.clone());
-        store.save(&overlay)?;
+        if let Err(err) = store.save(&overlay) {
+            if err.is_transient() {
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    Some(branch),
+                    "save_dispatching",
+                    err,
+                ));
+                continue;
+            }
+            return Err(err);
+        }
 
         let prompt = match verdict {
             RoutingVerdict::ResearchPath => {
@@ -105,13 +195,31 @@ pub fn dispatch_ready(
             // that's a more urgent operator-facing failure than the original
             // save error, so it takes priority and is returned instead.
             sessions.stop(&session_id)?;
+            if save_err.is_transient() {
+                overlay.state = OverlayState::Queued;
+                overlay.session_id = None;
+                store.save(&overlay)?;
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    Some(branch),
+                    "save_dispatched",
+                    save_err,
+                ));
+                continue;
+            }
             return Err(save_err);
         }
 
-        dispatched += 1;
+        report.successes.push(DispatchSuccess {
+            bead_id: bead.id.clone(),
+            attempt: overlay.attempt,
+            branch,
+            session_id: session_id.0,
+        });
     }
 
-    Ok(dispatched)
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -130,6 +238,8 @@ mod tests {
     struct FakeSessions {
         active_count: usize,
         calls: RefCell<Vec<String>>,
+        fail_spawn_for: RefCell<Vec<String>>,
+        fail_stop_for: RefCell<Vec<String>>,
     }
 
     impl FakeSessions {
@@ -137,7 +247,17 @@ mod tests {
             Self {
                 active_count,
                 calls: RefCell::new(Vec::new()),
+                fail_spawn_for: RefCell::new(Vec::new()),
+                fail_stop_for: RefCell::new(Vec::new()),
             }
+        }
+
+        fn fail_spawn_for(&self, bead_id: &str) {
+            self.fail_spawn_for.borrow_mut().push(bead_id.to_string());
+        }
+
+        fn fail_stop_for(&self, session_id: &str) {
+            self.fail_stop_for.borrow_mut().push(session_id.to_string());
         }
     }
 
@@ -151,6 +271,13 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("spawn({})", spec.bead_id));
+            if self.fail_spawn_for.borrow().contains(&spec.bead_id) {
+                return Err(DaemonError::Tool {
+                    tool: "ao".into(),
+                    rc: 1,
+                    stderr: format!("scripted spawn failure for {}", spec.bead_id),
+                });
+            }
             Ok(SessionId("fake-session-1".into()))
         }
 
@@ -163,6 +290,13 @@ mod tests {
 
         fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
             self.calls.borrow_mut().push(format!("stop({})", id.0));
+            if self.fail_stop_for.borrow().contains(&id.0) {
+                return Err(DaemonError::Tool {
+                    tool: "ao".into(),
+                    rc: 1,
+                    stderr: format!("scripted stop failure for {}", id.0),
+                });
+            }
             Ok(())
         }
 
@@ -184,7 +318,7 @@ mod tests {
         branches: RefCell<Vec<String>>,
         branch_beads: RefCell<HashMap<String, String>>,
         rejections: RefCell<HashMap<(String, u32), (String, String)>>,
-        fail_save_for_state: Option<OverlayState>,
+        fail_save_for_state: RefCell<Vec<(String, OverlayState)>>,
     }
 
     impl FakeStateStore {
@@ -193,10 +327,18 @@ mod tests {
         }
 
         fn failing_on(state: OverlayState) -> Self {
-            Self {
-                fail_save_for_state: Some(state),
-                ..Self::default()
-            }
+            let store = Self::default();
+            store
+                .fail_save_for_state
+                .borrow_mut()
+                .push(("*".into(), state));
+            store
+        }
+
+        fn fail_save_for(&self, bead_id: &str, state: OverlayState) {
+            self.fail_save_for_state
+                .borrow_mut()
+                .push((bead_id.to_string(), state));
         }
     }
 
@@ -206,7 +348,14 @@ mod tests {
         }
 
         fn save(&self, overlay: &BeadOverlay) -> Result<(), DaemonError> {
-            if self.fail_save_for_state == Some(overlay.state) {
+            if self
+                .fail_save_for_state
+                .borrow()
+                .iter()
+                .any(|(bead_id, state)| {
+                    (bead_id == "*" || bead_id == &overlay.bead_id) && *state == overlay.state
+                })
+            {
                 return Err(DaemonError::Tool {
                     tool: "sqlite".into(),
                     rc: -1,
@@ -235,7 +384,10 @@ mod tests {
             Ok(self.branches.borrow().clone())
         }
 
-        fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError> {
+        fn increment_active_autonomy(
+            &self,
+            elapsed_secs: u64,
+        ) -> Result<Vec<BeadOverlay>, DaemonError> {
             let updated = self.list_active_overlays()?;
             if elapsed_secs > 0 {
                 for overlay in &updated {
@@ -248,7 +400,9 @@ mod tests {
         fn list_active_overlays(&self) -> Result<Vec<BeadOverlay>, DaemonError> {
             let mut out = Vec::new();
             for overlay in self.overlays.borrow().values() {
-                if overlay.state == OverlayState::Dispatched || overlay.state == OverlayState::Attested {
+                if overlay.state == OverlayState::Dispatched
+                    || overlay.state == OverlayState::Attested
+                {
                     out.push(overlay.clone());
                 }
             }
@@ -278,13 +432,31 @@ mod tests {
             Ok(recovered)
         }
 
-        fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, _feedback_text: &str) -> Result<(), DaemonError> {
-            self.rejections.borrow_mut().insert((bead_id.to_string(), attempt), (reviewer.to_string(), feedback_hash.to_string()));
+        fn save_rejection(
+            &self,
+            bead_id: &str,
+            attempt: u32,
+            reviewer: &str,
+            feedback_hash: &str,
+            _feedback_text: &str,
+        ) -> Result<(), DaemonError> {
+            self.rejections.borrow_mut().insert(
+                (bead_id.to_string(), attempt),
+                (reviewer.to_string(), feedback_hash.to_string()),
+            );
             Ok(())
         }
 
-        fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError> {
-            Ok(self.rejections.borrow().get(&(bead_id.to_string(), attempt)).cloned())
+        fn load_rejection(
+            &self,
+            bead_id: &str,
+            attempt: u32,
+        ) -> Result<Option<(String, String)>, DaemonError> {
+            Ok(self
+                .rejections
+                .borrow()
+                .get(&(bead_id.to_string(), attempt))
+                .cloned())
         }
     }
 
@@ -305,13 +477,18 @@ mod tests {
 
     fn beads(n: usize) -> Vec<(Bead, RoutingVerdict)> {
         (0..n)
-            .map(|i| (Bead {
-                id: format!("bead-{i}"),
-                title: format!("title {i}"),
-                description: String::new(),
-                file_tree_summary: String::new(),
-                external_ref: None,
-            }, RoutingVerdict::StandardPath))
+            .map(|i| {
+                (
+                    Bead {
+                        id: format!("bead-{i}"),
+                        title: format!("title {i}"),
+                        description: String::new(),
+                        file_tree_summary: String::new(),
+                        external_ref: None,
+                    },
+                    RoutingVerdict::StandardPath,
+                )
+            })
             .collect()
     }
 
@@ -322,9 +499,13 @@ mod tests {
         let cfg = cfg();
         let ready = beads(40);
 
-        let n = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
-        assert_eq!(n, 15, "must cap at max_batch even with 30 free slots");
+        assert_eq!(
+            report.success_count(),
+            15,
+            "must cap at max_batch even with 30 free slots"
+        );
         let spawn_calls = sessions
             .calls
             .borrow()
@@ -341,9 +522,13 @@ mod tests {
         let cfg = cfg();
         let ready = beads(40);
 
-        let n = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
-        assert_eq!(n, 2, "only 2 free slots remain under the 30-worker cap");
+        assert_eq!(
+            report.success_count(),
+            2,
+            "only 2 free slots remain under the 30-worker cap"
+        );
         let spawn_calls = sessions
             .calls
             .borrow()
@@ -360,9 +545,9 @@ mod tests {
         let cfg = cfg();
         let ready = beads(40);
 
-        let n = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
-        assert_eq!(n, 0);
+        assert_eq!(report.success_count(), 0);
         let spawn_calls = sessions
             .calls
             .borrow()
@@ -396,8 +581,8 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let n = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
-        assert_eq!(n, 1);
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(report.success_count(), 1);
 
         assert_eq!(store.branches.borrow().as_slice(), ["factory/bead-0-r1"]);
 
@@ -413,8 +598,12 @@ mod tests {
         let cfg = cfg();
         let ready = beads(5);
 
-        let n = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
-        assert_eq!(n, 1, "only 1 free slot under the 30-worker cap");
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report.success_count(),
+            1,
+            "only 1 free slot under the 30-worker cap"
+        );
 
         let spawn_calls: Vec<String> = sessions
             .calls
@@ -437,8 +626,8 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let n = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
-        assert_eq!(n, 1);
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(report.success_count(), 1);
 
         // Final state is DISPATCHED (spawn + confirmation both succeeded),
         // but the branch registry write happened unconditionally up front.
@@ -459,11 +648,11 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
-        assert!(
-            matches!(err, DaemonError::Tool { .. }),
-            "expected the scripted save error to propagate, got {err:?}"
-        );
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(report.success_count(), 0);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-0");
+        assert_eq!(report.failures[0].phase, "save_dispatched");
 
         let calls = sessions.calls.borrow();
         assert!(
@@ -475,13 +664,166 @@ mod tests {
             "the just-spawned session must be stopped on save failure: {calls:?}"
         );
 
-        // The DISPATCHING intent (persisted before spawn) is still on disk —
-        // rollback kills the process but deliberately does not erase the
-        // record that a dispatch was attempted, so the Healer/operator can
-        // see it rather than the bead silently reverting to QUEUED.
+        // Rollback kills the process and durably requeues the bead. Leaving
+        // the earlier DISPATCHING intent on disk would strand this bead
+        // because the successful tick would not run top-level reconciliation.
         let overlay = store.load("bead-0").unwrap().unwrap();
-        assert_eq!(overlay.state, OverlayState::Dispatching);
+        assert_eq!(overlay.state, OverlayState::Queued);
         assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
         assert_eq!(store.branches.borrow().as_slice(), ["factory/bead-0-r1"]);
+    }
+
+    #[test]
+    fn dispatching_save_failure_for_first_bead_does_not_prevent_later_dispatch() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store.fail_save_for("bead-0", OverlayState::Dispatching);
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        assert_eq!(report.successes[0].bead_id, "bead-1");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-0");
+        assert_eq!(report.failures[0].phase, "save_dispatching");
+
+        assert!(
+            store.load("bead-0").unwrap().is_none(),
+            "DISPATCHING save failed before spawn, so no overlay mutation is durable"
+        );
+        let bead_1 = store.load("bead-1").unwrap().unwrap();
+        assert_eq!(bead_1.state, OverlayState::Dispatched);
+
+        let calls = sessions.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c == "spawn(bead-0)"),
+            "pre-spawn save failure must not spawn the failed bead"
+        );
+        assert!(calls.iter().any(|c| c == "spawn(bead-1)"));
+    }
+
+    #[test]
+    fn pre_spawn_failures_do_not_consume_worker_capacity() {
+        let sessions = FakeSessions::new(29);
+        let store = FakeStateStore::new();
+        store.fail_save_for("bead-0", OverlayState::Dispatching);
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            1,
+            "one free worker slot should still dispatch a later bead when the first failure happened before spawn"
+        );
+        assert_eq!(report.successes[0].bead_id, "bead-1");
+        assert_eq!(report.failures[0].bead_id, "bead-0");
+    }
+
+    #[test]
+    fn spawn_failure_after_dispatching_intent_is_fatal() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_for("bead-0");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        assert!(
+            matches!(err, DaemonError::Tool { .. }),
+            "spawn failure must stop the batch because a worker may exist without a session id: {err:?}"
+        );
+
+        let bead_0 = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(bead_0.state, OverlayState::Dispatching);
+        assert!(
+            store.load("bead-1").unwrap().is_none(),
+            "later beads must not dispatch after an ambiguous spawn failure"
+        );
+        let calls = sessions.calls.borrow();
+        assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
+        assert!(!calls.iter().any(|c| c == "spawn(bead-1)"));
+    }
+
+    #[test]
+    fn save_failure_after_spawn_stops_session_and_continues_later_dispatch() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store.fail_save_for("bead-0", OverlayState::Dispatched);
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        assert_eq!(report.successes[0].bead_id, "bead-1");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-0");
+        assert_eq!(report.failures[0].phase, "save_dispatched");
+
+        let calls = sessions.calls.borrow();
+        assert!(
+            calls.iter().any(|c| c == "stop(fake-session-1)"),
+            "the just-spawned session must be stopped on save failure: {calls:?}"
+        );
+
+        let bead_0 = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(bead_0.state, OverlayState::Queued);
+        let bead_1 = store.load("bead-1").unwrap().unwrap();
+        assert_eq!(bead_1.state, OverlayState::Dispatched);
+    }
+
+    #[test]
+    fn requeue_save_failure_after_rollback_is_fatal() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store.fail_save_for("bead-0", OverlayState::Dispatched);
+        store.fail_save_for("bead-0", OverlayState::Queued);
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        assert!(
+            matches!(err, DaemonError::Tool { .. }),
+            "failed rollback requeue must be fatal so top-level reconciliation can recover: {err:?}"
+        );
+
+        let calls = sessions.calls.borrow();
+        assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
+        assert!(calls.iter().any(|c| c == "stop(fake-session-1)"));
+        assert!(
+            !calls.iter().any(|c| c == "spawn(bead-1)"),
+            "later beads must not dispatch after rollback requeue persistence fails"
+        );
+
+        let bead_0 = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(bead_0.state, OverlayState::Dispatching);
+    }
+
+    #[test]
+    fn stop_failure_after_spawn_save_failure_is_fatal() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_stop_for("fake-session-1");
+        let store = FakeStateStore::new();
+        store.fail_save_for("bead-0", OverlayState::Dispatched);
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        assert!(
+            matches!(err, DaemonError::Tool { .. }),
+            "stop failure must remain fatal because a live untracked worker may remain: {err:?}"
+        );
+
+        let calls = sessions.calls.borrow();
+        assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
+        assert!(calls.iter().any(|c| c == "stop(fake-session-1)"));
+        assert!(
+            !calls.iter().any(|c| c == "spawn(bead-1)"),
+            "later beads must not dispatch after failed rollback stop"
+        );
     }
 }
