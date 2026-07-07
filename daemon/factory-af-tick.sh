@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # Deterministic /af one tick: intake + recover + AO dispatch for drive-existing-pr beads.
+# The tick ends with a single, idempotent merge/ready step (auto-merge-guard.sh)
+# so the zero-touch label→green→merge path has an automatic caller for the
+# cutover X4 merge authority. AUTO_MERGE_DISABLED=1 silences the guard for the
+# single-writer guarantee during cutover (docs/cutover-exit-criteria.md X7).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export BR_DB="${BR_DB:-$ROOT/.beads/beads.db}"
@@ -7,8 +11,11 @@ br() { command br --db "$BR_DB" "$@"; }
 O="$ROOT/daemon/factory-overlay.sh"
 I="$ROOT/daemon/factory-intake-from-gh.sh"
 R="$ROOT/daemon/factory-ao-remediate.sh"
+G="$ROOT/daemon/scripts/auto-merge-guard.sh"
 DB="${AFD_DB:-$HOME/.dark-factory/daemon-cxdb.sqlite}"
+LOG="${AFD_LOG:-$HOME/Library/Logs/dark-factory/daemon.jsonl}"
 MAX_DISPATCH="${MAX_DISPATCH:-2}"
+AUTO_MERGE_DISABLED="${AUTO_MERGE_DISABLED:-0}"
 
 TARGET_PRS=""
 args=("$@")
@@ -119,3 +126,16 @@ done < <(sqlite3 "$DB" -separator $'\t' \
 
 echo "af_dispatched=$dispatched"
 callpath run dark-factory ${1+"$@"} 2>/dev/null || true
+
+# --- Merge/Ready step -----------------------------------------------------
+# Single automatic caller for the merge authority. The guard is the only
+# entity permitted to issue `gh pr merge` on a factory/* branch; coder and
+# reviewer sessions never invoke it. AUTO_MERGE_DISABLED=1 silences it for
+# cutover X7's single-writer guarantee.
+# ---------------------------------------------------------------------------
+if [ -x "$G" ] && [ "$AUTO_MERGE_DISABLED" != "1" ]; then
+  echo "[af] merge/ready step: auto-merge-guard.sh (AFD_LOG=$LOG)"
+  AFD_LOG="$LOG" bash "$G" 2>&1 || echo "[af] auto-merge-guard.sh exited non-zero (continuing)"
+else
+  echo "[af] merge/ready step: SKIPPED (AUTO_MERGE_DISABLED=$AUTO_MERGE_DISABLED guard_present=$([ -x "$G" ] && echo 1 || echo 0))"
+fi
