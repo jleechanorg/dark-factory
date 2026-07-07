@@ -19,7 +19,17 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   pr_number     INTEGER,
   branch        TEXT,
   session_id    TEXT,
-  updated_at    TEXT    NOT NULL              -- ISO-8601 UTC
+  updated_at    TEXT    NOT NULL,             -- ISO-8601 UTC
+  -- /er runner state (bead jleechan-qqq): per-bead attempt counter + last
+  -- attempt timestamp (unix epoch seconds). Used by `er_runner::maybe_run`
+  -- to enforce a per-bead attempt cap (default MAX_ER_RUNNER_ATTEMPTS=3)
+  -- and a cooldown window (default ER_RUNNER_COOLDOWN_SECS=300).
+  -- Older DBs that pre-date this column pair get them via the
+  -- idempotent `ensure_er_runner_columns` migration in
+  -- `SqliteStateStore::open` (which checks `pragma_table_info` first
+  -- because SQLite has no `ADD COLUMN IF NOT EXISTS`).
+  attempt_er_runner_count INTEGER NOT NULL DEFAULT 0,
+  last_er_runner_attempt_at INTEGER
 );
 
 -- Deletion guard: the daemon/skills may delete ONLY refs recorded here (spec §4.2.8).
@@ -45,8 +55,11 @@ CREATE TABLE IF NOT EXISTS review_rejection (
 -- attempt timestamp (unix epoch seconds). Used by `er_runner::maybe_run`
 -- to enforce a per-bead attempt cap (default MAX_ER_RUNNER_ATTEMPTS=3)
 -- and a cooldown window (default ER_RUNNER_COOLDOWN_SECS=300).
--- `ALTER TABLE ... ADD COLUMN` is idempotent on modern SQLite when guarded
--- with `IF NOT EXISTS`-style logic; for older DBs, the Rust side detects
--- "no such column" and falls back to (0, None) so the runner still works.
-ALTER TABLE bead_overlay ADD COLUMN attempt_er_runner_count INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE bead_overlay ADD COLUMN last_er_runner_attempt_at INTEGER;
+--
+-- The columns are declared in the CREATE TABLE block above for fresh
+-- DBs. Older DBs that pre-date this column pair get them via the
+-- idempotent `ensure_er_runner_columns` step in
+-- `SqliteStateStore::open`, which checks `pragma_table_info` before
+-- issuing an `ALTER TABLE ... ADD COLUMN` (SQLite has no
+-- `ADD COLUMN IF NOT EXISTS`). Without that guard, re-running
+-- `execute_batch` against an already-migrated DB would fail.

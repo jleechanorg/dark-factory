@@ -154,6 +154,7 @@ impl SqliteStateStore {
         Self::configure(&conn, false)?;
         conn.execute_batch(include_str!("../contracts/schema.sql"))
             .map_err(|e| tool_err("apply schema", e))?;
+        Self::ensure_er_runner_columns(&conn)?;
         Ok(Self { conn })
     }
 
@@ -164,7 +165,49 @@ impl SqliteStateStore {
         Self::configure(&conn, true)?;
         conn.execute_batch(schema_sql)
             .map_err(|e| tool_err("apply schema", e))?;
+        Self::ensure_er_runner_columns(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Idempotent migration for the `/er` runner columns (bead jleechan-qqq).
+    /// Older on-disk DBs predate the columns declared in the CREATE TABLE
+    /// block; SQLite has no `ADD COLUMN IF NOT EXISTS`, so we probe
+    /// `pragma_table_info` first and only ALTER when a column is missing.
+    /// Safe to call repeatedly — a no-op when both columns are already
+    /// present.
+    fn ensure_er_runner_columns(conn: &Connection) -> Result<(), DaemonError> {
+        let has_count: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'attempt_er_runner_count'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_er_runner_columns: pragma count", e))?;
+        if !has_count {
+            conn.execute(
+                "ALTER TABLE bead_overlay \
+                 ADD COLUMN attempt_er_runner_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_er_runner_columns: add count", e))?;
+        }
+        let has_last: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'last_er_runner_attempt_at'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_er_runner_columns: pragma last", e))?;
+        if !has_last {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN last_er_runner_attempt_at INTEGER",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_er_runner_columns: add last", e))?;
+        }
+        Ok(())
     }
 
     /// `is_memory` distinguishes the two `configure` call sites: `open()` (file-backed,
@@ -413,9 +456,9 @@ impl StateStore for SqliteStateStore {
             "UPDATE bead_overlay SET \
                 attempt_er_runner_count = COALESCE(attempt_er_runner_count, 0) + 1, \
                 last_er_runner_attempt_at = ?2, \
-                updated_at = ?2 \
+                updated_at = ?3 \
              WHERE bead_id = ?1",
-            params![bead_id, now_epoch as i64],
+            params![bead_id, now_epoch as i64, now_iso8601()],
         );
         match res {
             Ok(_) => {
@@ -652,5 +695,66 @@ mod tests {
                 let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
             }
         }
+    }
+
+    /// jleechan-qqq: an on-disk DB that lacks the `/er` runner columns must
+    /// be auto-migrated by `open()` and `open_in_memory_with_schema()`, so
+    /// the runner's first `incr_er_runner_attempt` doesn't fail with
+    /// "no such column". This pins the idempotency of the migration: a
+    /// second `open()` against the same file must NOT error on the
+    /// re-applied `ALTER TABLE` (a hard crash here would also block every
+    /// daemon restart, since `execute_batch(schema.sql)` re-runs).
+    #[test]
+    fn open_migrates_legacy_db_missing_er_runner_columns() {
+        use rusqlite::Connection;
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "dark-factory-er-migrate-{}-{}.sqlite",
+            std::process::id(),
+            now_iso8601().replace([':', '-', 'T', 'Z'], "")
+        ));
+        let _cleanup = TempFileGuard(path.clone());
+
+        // Build a "legacy" DB: just `bead_overlay` and `branch_registry`,
+        // no `/er` runner columns.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE bead_overlay (bead_id TEXT PRIMARY KEY, state TEXT NOT NULL, \
+                 attempt INTEGER NOT NULL DEFAULT 1, reroll_count INTEGER NOT NULL DEFAULT 0, \
+                 autonomy_secs INTEGER NOT NULL DEFAULT 0, spend_usd REAL NOT NULL DEFAULT 0, \
+                 pr_number INTEGER, branch TEXT, session_id TEXT, updated_at TEXT NOT NULL); \
+                 CREATE TABLE branch_registry (branch TEXT PRIMARY KEY, bead_id TEXT NOT NULL, \
+                 created_at TEXT NOT NULL);",
+            )
+            .unwrap();
+        }
+
+        // First open: must apply the migration without error.
+        let _store = SqliteStateStore::open(&path).expect("legacy DB should auto-migrate");
+
+        // Re-open: must NOT fail on the second ALTER (idempotency).
+        let _store2 = SqliteStateStore::open(&path).expect("second open must be idempotent");
+
+        // Both columns are present, with the expected defaults.
+        let conn = Connection::open(&path).unwrap();
+        let count_col: i64 = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'attempt_er_runner_count'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("attempt_er_runner_count column should exist after migration");
+        let last_col: i64 = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'last_er_runner_attempt_at'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("last_er_runner_attempt_at column should exist after migration");
+        assert_eq!(count_col, 1);
+        assert_eq!(last_col, 1);
     }
 }

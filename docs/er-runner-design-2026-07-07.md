@@ -134,7 +134,7 @@ pub fn maybe_run(deps: &TickDeps, bead_id: &str, pr: u64) -> Result<Option<ErVer
     if existing != ErVerdict::Absent { return Ok(Some(existing)); }
 
     let overlay = match deps.store.load(bead_id)? { Some(o) => o, None => return Ok(None) };
-    let (count, last_at) = deps.store.er_runner_attempt(bead_id).unwrap_or((0, None));
+    let (count, last_at) = deps.store.er_runner_attempt(bead_id)?;
     let now = now_epoch();
     if count >= MAX_ER_RUNNER_ATTEMPTS { return Ok(None); } // capped
     if let Some(last) = last_at { if now.saturating_sub(last) < ER_RUNNER_COOLDOWN_SECS {
@@ -148,7 +148,8 @@ pub fn maybe_run(deps: &TickDeps, bead_id: &str, pr: u64) -> Result<Option<ErVer
         spawn_claude_reviewer(&prompt, ER_RUNNER_TIMEOUT_SECS)?
     };
 
-    // post the verbatim reply as a PR comment
+    // post the verbatim reply as a PR comment — propagate any failure so a
+    // transient `gh`/API error doesn't burn one of the 3 retry slots.
     let body = format!("🤖 **[dark-factory /er]** Evidence review verdict:\n\n```\n{reply}\n```");
     let ext_ref = format!("{}#{}", deps.cfg.target_repo, pr);
     let _ = deps.tracker.comment_external(&ext_ref, &body);

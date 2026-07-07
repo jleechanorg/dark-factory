@@ -668,8 +668,17 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let runner_outcome = crate::er_runner::maybe_run(deps, bead_id, pr, now_epoch)?;
+        // When the runner just posted a verdict this tick, prefer the
+        // returned verdict over a re-parse of the refreshed snapshot —
+        // `parse_er_verdict` would otherwise pick up any "/er" token
+        // anywhere in the comment body, including in the runner's own
+        // formatted prefix, and could disagree with the verdict the
+        // runner just emitted. Only fall back to the snapshot when the
+        // runner DIDN'T post (cooldown/capped/already-present/no-op).
+        let mut posted_verdict: Option<verifier::ErVerdict> = None;
         match runner_outcome {
             crate::er_runner::Outcome::Posted { verdict, count } => {
+                posted_verdict = Some(verdict);
                 emit(
                     deps.telemetry_log,
                     bead_id,
@@ -720,7 +729,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             crate::er_runner::Outcome::NotApplicable => {}
         }
 
-        evidence.er_verdict = verifier::parse_er_verdict(&snapshot.comments);
+        evidence.er_verdict = match posted_verdict {
+            Some(v) => v,
+            None => verifier::parse_er_verdict(&snapshot.comments),
+        };
         evidence.is_production = verifier::classify_production(&snapshot.files);
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
         evidence.has_integration_evidence_marker = verifier::check_integration_marker(&snapshot.body, &snapshot.comments);

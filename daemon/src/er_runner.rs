@@ -142,14 +142,17 @@ pub fn maybe_run(
         spawn_reviewer(&prompt)?
     };
 
-    // 6. Post verbatim reply as a PR comment
+    // 6. Post verbatim reply as a PR comment. If the post fails (network
+    //    blip, 403, etc.), do NOT consume an attempt — propagate the error
+    //    so the next tick can retry without burning one of the 3 slots.
     let body = format!(
         "🤖 **[dark-factory /er]** Evidence review verdict:\n\n```\n{reply}\n```"
     );
     let ext_ref = format!("{}#{}", deps.cfg.target_repo, pr);
-    let _ = deps.tracker.comment_external(&ext_ref, &body);
+    deps.tracker.comment_external(&ext_ref, &body)?;
 
-    // 7. Increment attempt counter
+    // 7. Increment attempt counter — only AFTER the comment landed, so a
+    //    transient `comment_external` failure doesn't burn a retry slot.
     let new_count = deps.store.incr_er_runner_attempt(bead_id, now_epoch)?;
 
     // 8. Parse verdict from the reply (NOT just from the now-posted comment —
