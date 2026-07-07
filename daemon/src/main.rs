@@ -213,6 +213,9 @@ impl Vcs for NoopAdapters {
     ) -> Result<bool, DaemonError> {
         Ok(false)
     }
+    fn push_fix_commit(&self, _branch: &str, _message: &str) -> Result<(), DaemonError> {
+        Ok(())
+    }
 }
 
 #[cfg(any(test, debug_assertions))]

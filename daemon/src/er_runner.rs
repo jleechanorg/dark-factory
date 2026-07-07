@@ -383,6 +383,7 @@ mod tests {
         fn create_branch_at(&self, _n: &str, _s: &str) -> Result<(), DaemonError> { Ok(()) }
         fn head_sha(&self, _b: &str) -> Result<String, DaemonError> { Ok("deadbeef".into()) }
         fn is_remote_ahead(&self, _b: &str, _r: &str) -> Result<bool, DaemonError> { Ok(false) }
+        fn push_fix_commit(&self, _branch: &str, _message: &str) -> Result<(), DaemonError> { Ok(()) }
     }
 
     // Local in-memory StateStore that records the er_runner_attempt counter.
@@ -488,6 +489,7 @@ mod tests {
             pr_number: Some(pr),
             branch: Some(format!("factory/{bead_id}-r1")),
             session_id: Some("s1".into()),
+            is_adopted: false,
         }
     }
 

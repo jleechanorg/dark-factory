@@ -285,12 +285,23 @@ pub struct FakeVcs {
     /// its companion `*_local_ahead_or_diverged_still_parks`) insert the
     /// (branch, remote_sha) key with the desired answer.
     pub remote_ahead: HashMap<(String, String), bool>,
+    /// Scripts `push_fix_commit` to fail for a given branch, simulating a
+    /// non-fast-forward rejection (remote diverged / genuine conflict) —
+    /// exercises the adopted-branch "needs a human" path (bead jleechan-tfs1)
+    /// without ever touching a real `git` subprocess.
+    pub fail_push_fix_commit_for: RefCell<Vec<String>>,
     pub calls: RefCell<Vec<String>>,
 }
 
 impl FakeVcs {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn fail_push_fix_commit_for(&self, branch: &str) {
+        self.fail_push_fix_commit_for
+            .borrow_mut()
+            .push(branch.to_string());
     }
 }
 
@@ -355,6 +366,26 @@ impl Vcs for FakeVcs {
             .get(&(branch.to_string(), remote_sha.to_string()))
             .copied()
             .unwrap_or(false))
+    }
+
+    fn push_fix_commit(&self, branch: &str, message: &str) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("push_fix_commit({branch},{message})"));
+        if self
+            .fail_push_fix_commit_for
+            .borrow()
+            .contains(&branch.to_string())
+        {
+            return Err(DaemonError::Tool {
+                tool: "git".into(),
+                rc: 1,
+                stderr: format!(
+                    "! [rejected] {branch} -> {branch} (non-fast-forward): scripted append-only push failure"
+                ),
+            });
+        }
+        Ok(())
     }
 }
 

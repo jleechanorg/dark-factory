@@ -614,10 +614,20 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 pr_number: Some(adopted.pr_number),
                 branch: Some(adopted.head_ref_name.clone()),
                 session_id: None,
+                is_adopted: true,
             });
             overlay.state = OverlayState::Attested;
             overlay.pr_number = Some(adopted.pr_number);
             overlay.branch = Some(adopted.head_ref_name.clone());
+            // Explicit stored provenance flag (bead jleechan-tfs1), NOT a
+            // branch-name pattern match: every bead that reaches this block
+            // arrived via `intake::normalize_labeled_prs` adopting an
+            // external contributor's own head_ref_name, so it is always
+            // adopted — including on a re-adopt of a pre-migration row that
+            // predates this field. `reroll()` reads this flag to choose
+            // append-only remediation instead of fabricating a replacement
+            // branch and closing the contributor's PR.
+            overlay.is_adopted = true;
             deps.store.save(&overlay)?;
         }
         emit(
@@ -683,6 +693,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             pr_number,
             branch: None,
             session_id: None,
+            is_adopted: false,
         };
         deps.store.save(&overlay)?;
         summary.beads_created += 1;
@@ -742,6 +753,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     pr_number: None,
                     branch: None,
                     session_id: None,
+                    is_adopted: false,
                 };
                 deps.store.save(&o)?;
                 summary.beads_created += 1;
@@ -1394,7 +1406,13 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({}),
                     serde_json::json!({"reason": "gate assessment not all-green (stage 1: recorded, not executed)"}),
                 )?;
-                let comment_body = if overlay.session_id.is_none() {
+                // bead jleechan-tfs1: use the explicit stored provenance
+                // flag, not the `session_id.is_none()` proxy this used to
+                // rely on (every adopted bead happens to have no session_id
+                // since the factory never spawns one for an externally
+                // authored branch, but that was an inference, not a fact —
+                // `is_adopted` is the real fact).
+                let comment_body = if overlay.is_adopted {
                     "🤖 **[dark-factory]** Escalation required: this adopted PR is not green, so automation parked it HUMAN_HELD. Remediation for adopted PRs lands with bead `jleechan-tfs1`; no replacement branch was fabricated.".to_string()
                 } else {
                     "🤖 **[dark-factory]** Coder session parked (human held): gate assessment failed. Stage 1 configuration prevents re-roll."
@@ -1428,7 +1446,34 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 };
 
                 match crate::reroll::execute(&reroll_deps, &mut overlay) {
-                    Ok(crate::reroll::RerollOutcome::Rerolled { new_branch: _ }) => {
+                    Ok(crate::reroll::RerollOutcome::Rerolled { new_branch }) => {
+                        if overlay.is_adopted {
+                            // Adopted-branch remediation (bead jleechan-tfs1):
+                            // `reroll::execute` already pushed an append-only
+                            // fix commit to the EXISTING contributor branch
+                            // and left the overlay ATTESTED with
+                            // pr_number/branch unchanged. There is no
+                            // factory-spawned session to redispatch to for
+                            // an externally authored branch, so the
+                            // spec-file-validation / REDISPATCHED-or-
+                            // HumanHeld dance below (factory-fabricated path
+                            // only) does not apply here.
+                            emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                overlay.state.as_str(),
+                                "REROLL_ADOPTED_REDISPATCH_SKIPPED",
+                                serde_json::json!({}),
+                                serde_json::json!({"branch": new_branch}),
+                            )?;
+                            let comment_body = format!(
+                                "🤖 **[dark-factory]** Pushed a remediation commit to `{}` (attempt {}) addressing review feedback. This pull request remains open under your ownership; no replacement branch was created.",
+                                new_branch, overlay.attempt
+                            );
+                            let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+                            continue;
+                        }
                         // Perform recovery validation: check if spec is valid TOML
                         let spec_path = std::path::Path::new(&deps.cfg.spec_dir)
                             .join(format!("{}.toml", overlay.bead_id));

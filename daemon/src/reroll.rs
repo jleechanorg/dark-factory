@@ -142,6 +142,19 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     // Save current rejection for future circuit-breaker checks
     deps.store.save_rejection(&bead.bead_id, bead.attempt, &deps.reviewer, &feedback_hash, &deps.review_text)?;
 
+    // Adopted-PR remediation (bead jleechan-tfs1, Option A + hard safety
+    // amendment): `bead.branch` for an adopted bead is the external
+    // contributor's OWN branch (set at intake time in
+    // `tick::run_slow_tier`), not a factory-fabricated one. Steps 3-8 below
+    // are the factory-fabricated path — they stop/attach an AO session that
+    // was never spawned for an adopted bead, fabricate a brand-new branch,
+    // and close the contributor's PR. None of that is safe or applicable
+    // here: diverge into the append-only remediation path instead and
+    // return without touching steps 3-8.
+    if bead.is_adopted {
+        return execute_adopted(deps, bead);
+    }
+
     // 3. Stop AO session and wait for quiescence (60s timeout)
     if let Some(ref branch) = bead.branch {
         emit_telemetry(
@@ -316,4 +329,106 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     )?;
 
     Ok(RerollOutcome::Rerolled { new_branch })
+}
+
+/// Adopted-PR remediation (bead jleechan-tfs1, Option A + hard safety
+/// amendment): append-only fix commit on the EXISTING contributor branch.
+/// Never fabricates a replacement branch, never closes the original PR,
+/// never force-pushes or rewrites history. `deps.vcs.push_fix_commit`
+/// enforces the append-only/non-force contract at the git layer (fetch +
+/// checkout onto `origin/<branch>` + `--allow-empty` commit + a *non*-force
+/// push); a non-fast-forward rejection there (remote diverged, or a genuine
+/// conflict with base that would require a rebase) is surfaced here as a
+/// `Held` outcome — this function does NOT retry with a force-push or a
+/// rebase under any circumstance. The caller (`tick::run_fast_tier`) posts
+/// the escalation comment on the PR for a `Held` outcome via the same
+/// generic path it already uses for every other `Held` reason.
+fn execute_adopted(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcome, DaemonError> {
+    let branch = match bead.branch.clone() {
+        Some(b) => b,
+        None => {
+            // Should not happen: adoption always sets `branch` to the
+            // contributor's head_ref_name. Park rather than guess.
+            bead.state = OverlayState::HumanHeld;
+            deps.store.save(bead)?;
+            emit_telemetry(
+                deps.telemetry_log,
+                &bead.bead_id,
+                bead.attempt,
+                bead.state.as_str(),
+                "REROLL_ADOPTED_MISSING_BRANCH",
+                serde_json::json!({}),
+                serde_json::json!({}),
+            )?;
+            return Ok(RerollOutcome::Held(
+                "adopted bead has no branch on record; refusing to fabricate one".into(),
+            ));
+        }
+    };
+
+    emit_telemetry(
+        deps.telemetry_log,
+        &bead.bead_id,
+        bead.attempt,
+        bead.state.as_str(),
+        "REROLL_ADOPTED_APPEND_ONLY_START",
+        serde_json::json!({}),
+        serde_json::json!({"branch": branch}),
+    )?;
+
+    let next_attempt = bead.attempt + 1;
+    let commit_message = format!(
+        "fix: address {} review feedback (attempt {})\n\n{}",
+        deps.reviewer, next_attempt, deps.review_text
+    );
+
+    match deps.vcs.push_fix_commit(&branch, &commit_message) {
+        Ok(()) => {
+            bead.attempt = next_attempt;
+            bead.reroll_count += 1;
+            // Branch and pr_number are deliberately left unchanged: same
+            // branch, same PR, still open. There is no factory session to
+            // redispatch to, so the bead goes straight back to ATTESTED —
+            // the next tick's verifier pass re-assesses the PR once CI
+            // catches up to the new commit, exactly like any other push a
+            // contributor makes to their own open PR.
+            bead.state = OverlayState::Attested;
+            deps.store.save(bead)?;
+            emit_telemetry(
+                deps.telemetry_log,
+                &bead.bead_id,
+                bead.attempt,
+                bead.state.as_str(),
+                "REROLL_ADOPTED_FIX_PUSHED",
+                serde_json::json!({
+                    "elapsedAutonomySeconds": bead.autonomy_secs,
+                }),
+                serde_json::json!({"branch": branch}),
+            )?;
+            Ok(RerollOutcome::Rerolled { new_branch: branch })
+        }
+        Err(e) => {
+            // Append-only push failed — most likely a non-fast-forward
+            // rejection, meaning genuine remediation would require a rebase
+            // or force-push. The daemon has no authority to rewrite a
+            // contributor's history, so this parks HUMAN_HELD rather than
+            // ever falling back to `--force`.
+            bead.state = OverlayState::HumanHeld;
+            deps.store.save(bead)?;
+            emit_telemetry(
+                deps.telemetry_log,
+                &bead.bead_id,
+                bead.attempt,
+                bead.state.as_str(),
+                "REROLL_ADOPTED_APPEND_ONLY_FAILED",
+                serde_json::json!({}),
+                serde_json::json!({"branch": branch, "error": e.to_string()}),
+            )?;
+            Ok(RerollOutcome::Held(format!(
+                "append-only fix push to adopted branch {branch} failed and needs a human \
+                 (possible remote divergence or a base conflict requiring a rebase/force-push, \
+                 which automation will not perform on a contributor-owned branch): {e}"
+            )))
+        }
+    }
 }

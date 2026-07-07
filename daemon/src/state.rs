@@ -72,6 +72,14 @@ pub struct BeadOverlay {
     pub pr_number: Option<u64>,
     pub branch: Option<String>,
     pub session_id: Option<String>,
+    /// Adopted-PR provenance (bead jleechan-tfs1): `true` iff `branch` is an
+    /// external contributor's own head_ref_name (adopted via
+    /// `intake::normalize_labeled_prs`, set in `tick::run_slow_tier` at
+    /// adoption time), `false` for factory-fabricated branches. `reroll()`
+    /// reads this to pick append-only remediation (adopted) vs. the
+    /// fabricate-new-branch + close-old-PR path (factory-fabricated).
+    /// Explicit stored flag, NOT inferred from branch name.
+    pub is_adopted: bool,
 }
 
 pub trait StateStore {
@@ -204,6 +212,7 @@ impl SqliteStateStore {
         conn.execute_batch(include_str!("../contracts/schema.sql"))
             .map_err(|e| tool_err("apply schema", e))?;
         Self::ensure_er_runner_columns(&conn)?;
+        Self::ensure_is_adopted_column(&conn)?;
         Ok(Self { conn })
     }
 
@@ -215,6 +224,7 @@ impl SqliteStateStore {
         conn.execute_batch(schema_sql)
             .map_err(|e| tool_err("apply schema", e))?;
         Self::ensure_er_runner_columns(&conn)?;
+        Self::ensure_is_adopted_column(&conn)?;
         Ok(Self { conn })
     }
 
@@ -259,6 +269,32 @@ impl SqliteStateStore {
         Ok(())
     }
 
+    /// Idempotent migration for the `is_adopted` column (bead jleechan-tfs1).
+    /// Same `pragma_table_info` probe-then-`ALTER` pattern as
+    /// `ensure_er_runner_columns` — older on-disk DBs predate the column
+    /// declared in the CREATE TABLE block, and SQLite has no
+    /// `ADD COLUMN IF NOT EXISTS`. Safe to call repeatedly; defaults every
+    /// pre-existing row to `0` (factory-fabricated), which is the correct
+    /// conservative default since only adopted-PR intake ever sets it `1`.
+    fn ensure_is_adopted_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_is_adopted: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'is_adopted'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_is_adopted_column: pragma", e))?;
+        if !has_is_adopted {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN is_adopted INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_is_adopted_column: add column", e))?;
+        }
+        Ok(())
+    }
+
     /// `is_memory` distinguishes the two `configure` call sites: `open()` (file-backed,
     /// `is_memory=false`) and `open_in_memory_with_schema()` (`is_memory=true`). WAL is a
     /// documented no-op against `:memory:` connections, so failures/non-"wal" readbacks are
@@ -293,7 +329,7 @@ impl SqliteStateStore {
             .conn
             .prepare(
                 "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
-                 pr_number, branch, session_id \
+                 pr_number, branch, session_id, is_adopted \
                  FROM bead_overlay WHERE state IN ('DISPATCHED', 'ATTESTED')",
             )
             .map_err(|e| tool_err(&format!("{op} prepare"), e))?;
@@ -309,12 +345,13 @@ impl SqliteStateStore {
                     row.get::<_, Option<i64>>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<String>>(8)?,
+                    row.get::<_, i64>(9)?,
                 ))
             })
             .map_err(|e| tool_err(&format!("{op} query"), e))?;
         let mut out = Vec::new();
         for r in rows {
-            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id) =
+            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, is_adopted) =
                 r.map_err(|e| tool_err(&format!("{op} row"), e))?;
             out.push(BeadOverlay {
                 bead_id,
@@ -326,6 +363,7 @@ impl SqliteStateStore {
                 pr_number: pr_number.map(|v| v as u64),
                 branch,
                 session_id,
+                is_adopted: is_adopted != 0,
             });
         }
         Ok(out)
@@ -347,10 +385,11 @@ impl StateStore for SqliteStateStore {
         self.conn
             .query_row(
                 "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
-                 pr_number, branch, session_id FROM bead_overlay WHERE bead_id = ?1",
+                 pr_number, branch, session_id, is_adopted FROM bead_overlay WHERE bead_id = ?1",
                 params![bead_id],
                 |row| {
                     let state_str: String = row.get(1)?;
+                    let is_adopted: i64 = row.get(9)?;
                     Ok((
                         state_str,
                         BeadOverlay {
@@ -363,6 +402,7 @@ impl StateStore for SqliteStateStore {
                             pr_number: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
                             branch: row.get(7)?,
                             session_id: row.get(8)?,
+                            is_adopted: is_adopted != 0,
                         },
                     ))
                 },
@@ -380,12 +420,13 @@ impl StateStore for SqliteStateStore {
         self.conn
             .execute(
                 "INSERT INTO bead_overlay \
-                 (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, updated_at, is_adopted) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                  ON CONFLICT(bead_id) DO UPDATE SET \
                    state=excluded.state, attempt=excluded.attempt, reroll_count=excluded.reroll_count, \
                    autonomy_secs=excluded.autonomy_secs, spend_usd=excluded.spend_usd, \
-                   pr_number=excluded.pr_number, branch=excluded.branch, session_id=excluded.session_id, updated_at=excluded.updated_at",
+                   pr_number=excluded.pr_number, branch=excluded.branch, session_id=excluded.session_id, updated_at=excluded.updated_at, \
+                   is_adopted=excluded.is_adopted",
                 params![
                     overlay.bead_id,
                     overlay.state.as_str(),
@@ -397,6 +438,7 @@ impl StateStore for SqliteStateStore {
                     overlay.branch,
                     overlay.session_id,
                     now_iso8601(),
+                    overlay.is_adopted as i64,
                 ],
             )
             .map_err(|e| tool_err("save", e))?;
@@ -536,7 +578,7 @@ impl StateStore for SqliteStateStore {
         // id list, not by state+autonomy heuristics that could match other rows.
         let select_sql = format!(
             "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
-             pr_number, branch, session_id \
+             pr_number, branch, session_id, is_adopted \
              FROM bead_overlay WHERE bead_id IN ({})",
             placeholders
         );
@@ -560,12 +602,13 @@ impl StateStore for SqliteStateStore {
                     row.get::<_, Option<i64>>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<String>>(8)?,
+                    row.get::<_, i64>(9)?,
                 ))
             })
             .map_err(|e| tool_err("recover_human_held query", e))?;
         let mut out = Vec::new();
         for r in rows {
-            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id) =
+            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, is_adopted) =
                 r.map_err(|e| tool_err("recover_human_held row", e))?;
             out.push(BeadOverlay {
                 bead_id,
@@ -577,6 +620,7 @@ impl StateStore for SqliteStateStore {
                 pr_number: pr_number.map(|v| v as u64),
                 branch,
                 session_id,
+                is_adopted: is_adopted != 0,
             });
         }
         Ok(out)
@@ -590,7 +634,7 @@ impl StateStore for SqliteStateStore {
             .conn
             .prepare(
                 "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
-                 pr_number, branch, session_id \
+                 pr_number, branch, session_id, is_adopted \
                  FROM bead_overlay WHERE state = 'HUMAN_HELD' AND attempt >= ?1",
             )
             .map_err(|e| tool_err("human_held_at_or_above_attempt prepare", e))?;
@@ -606,12 +650,13 @@ impl StateStore for SqliteStateStore {
                     row.get::<_, Option<i64>>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<String>>(8)?,
+                    row.get::<_, i64>(9)?,
                 ))
             })
             .map_err(|e| tool_err("human_held_at_or_above_attempt query", e))?;
         let mut out = Vec::new();
         for r in rows {
-            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id) =
+            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, is_adopted) =
                 r.map_err(|e| tool_err("human_held_at_or_above_attempt row", e))?;
             out.push(BeadOverlay {
                 bead_id,
@@ -623,6 +668,7 @@ impl StateStore for SqliteStateStore {
                 pr_number: pr_number.map(|v| v as u64),
                 branch,
                 session_id,
+                is_adopted: is_adopted != 0,
             });
         }
         Ok(out)
@@ -737,6 +783,7 @@ mod tests {
             pr_number: None,
             branch: None,
             session_id: None,
+            is_adopted: false,
         };
         s.save(&o).unwrap();
         let got = s.load("b1").unwrap().unwrap();
@@ -760,6 +807,7 @@ mod tests {
             pr_number: None,
             branch: None,
             session_id: None,
+            is_adopted: false,
         };
         s.save(&o).unwrap();
         o.state = OverlayState::Attested;
@@ -818,6 +866,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+                is_adopted: false,
             };
             s.save(&o).unwrap();
             let got = s.load(&o.bead_id).unwrap().unwrap();
@@ -850,6 +899,7 @@ mod tests {
             pr_number: Some(7),
             branch: Some("factory/b1-r1".into()),
             session_id: None,
+            is_adopted: false,
         };
         s.save(&o).unwrap();
         s.register_branch("b1", "factory/b1-r1").unwrap();
@@ -1026,6 +1076,7 @@ mod tests {
                 pr_number: Some(11),
                 branch: Some("factory/below-r2".into()),
                 session_id: None,
+                is_adopted: false,
             },
         );
         overlays.insert(
@@ -1040,6 +1091,7 @@ mod tests {
                 pr_number: Some(22),
                 branch: Some("factory/at-cap-r10".into()),
                 session_id: None,
+                is_adopted: false,
             },
         );
         overlays.insert(
@@ -1054,6 +1106,7 @@ mod tests {
                 pr_number: Some(33),
                 branch: Some("factory/over-cap-r12".into()),
                 session_id: None,
+                is_adopted: false,
             },
         );
         // Non-HUMAN_HELD rows must never be touched.
@@ -1069,6 +1122,7 @@ mod tests {
                 pr_number: Some(44),
                 branch: Some("factory/dispatched-r1".into()),
                 session_id: None,
+                is_adopted: false,
             },
         );
         overlays.insert(
@@ -1083,6 +1137,7 @@ mod tests {
                 pr_number: Some(55),
                 branch: Some("factory/ready-r1".into()),
                 session_id: None,
+                is_adopted: false,
             },
         );
         for overlay in overlays.values() {
@@ -1167,6 +1222,7 @@ mod tests {
                     pr_number: None,
                     branch: None,
                     session_id: None,
+                    is_adopted: false,
                 })
                 .unwrap();
         }
@@ -1183,6 +1239,7 @@ mod tests {
                 pr_number: Some(7777),
                 branch: Some("factory/held-only-r1".into()),
                 session_id: Some("session-xyz".into()),
+                is_adopted: false,
             })
             .unwrap();
 
@@ -1224,6 +1281,7 @@ mod tests {
                 pr_number: None,
                 branch: Some("factory/d-r1".into()),
                 session_id: None,
+                is_adopted: false,
             })
             .unwrap();
         store
@@ -1237,6 +1295,7 @@ mod tests {
                 pr_number: Some(7),
                 branch: Some("factory/a-r1".into()),
                 session_id: None,
+                is_adopted: false,
             })
             .unwrap();
         store
@@ -1250,6 +1309,7 @@ mod tests {
                 pr_number: None,
                 branch: Some("factory/h-r1".into()),
                 session_id: None,
+                is_adopted: false,
             })
             .unwrap();
 

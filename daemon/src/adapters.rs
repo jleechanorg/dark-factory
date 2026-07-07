@@ -1155,6 +1155,36 @@ impl Vcs for CliVcs {
         );
         Ok(r.is_ok())
     }
+
+    fn push_fix_commit(&self, branch: &str, message: &str) -> Result<(), DaemonError> {
+        // Fetch the branch fresh, then check out a local ref pinned exactly
+        // to `origin/<branch>` — this is the append-only starting point: the
+        // daemon never bases the fix commit on any local/stale ref, only on
+        // what the contributor's remote actually has right now.
+        run_tool("git", &["fetch", "origin", branch], 30)?;
+        run_tool(
+            "git",
+            &["checkout", "-B", branch, &format!("origin/{branch}")],
+            30,
+        )?;
+        // `--allow-empty`: the daemon's job here is the push mechanism, not
+        // generating the code diff itself (that's out of scope for the
+        // adopted-branch path per bead jleechan-tfs1 — there is no factory
+        // AO session to attach to for an externally authored branch); the
+        // commit is a remediation marker carrying the review feedback as its
+        // message. A real code-bearing commit would replace this call's
+        // caller-supplied `message` with an actual diff, but the append-only
+        // contract (one new commit on top, never rewrite) is identical either way.
+        run_tool("git", &["commit", "--allow-empty", "-m", message], 30)?;
+        // Deliberately NOT --force / --force-with-lease: a non-fast-forward
+        // rejection here means the remote diverged from what the daemon just
+        // fetched (e.g. the contributor pushed more commits concurrently, or
+        // there's a genuine conflict with base). That is exactly the signal
+        // the caller (`reroll::execute`) must treat as "needs a human", never
+        // silently retried with a history-rewrite.
+        run_tool("git", &["push", "origin", branch], 30)?;
+        Ok(())
+    }
 }
 
 pub struct ChainLlm;

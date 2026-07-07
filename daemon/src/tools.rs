@@ -247,6 +247,19 @@ pub trait Vcs {
     /// otherwise the daemon would mask a real stall behind a green PR and
     /// ignore local-only work.
     fn is_remote_ahead(&self, branch: &str, remote_sha: &str) -> Result<bool, DaemonError>;
+
+    /// Append-only remediation push for an ADOPTED branch (bead jleechan-tfs1):
+    /// add exactly one new commit on top of `branch`'s current tip (fetched
+    /// fresh from `origin`) and push it non-force to `origin/<branch>`.
+    ///
+    /// MUST NEVER rewrite history: no `git rebase`, no `--force`/`--force-with-lease`.
+    /// An adopted branch belongs to an external contributor; the daemon has no
+    /// authority to touch commits it didn't author. A non-fast-forward push
+    /// rejection (the remote diverged since the daemon last looked — e.g. the
+    /// contributor pushed more commits, or a genuine merge conflict with base
+    /// exists) is a real error the caller MUST surface as "needs a human", and
+    /// MUST NOT silently retry with `--force` or fall back to a rebase.
+    fn push_fix_commit(&self, branch: &str, message: &str) -> Result<(), DaemonError>;
 }
 
 /// LLM judgment calls (router, in-place-vs-reroll verdict, constraint extraction).

@@ -202,6 +202,9 @@ impl Vcs for VcsMock {
     ) -> Result<bool, daemon::errors::DaemonError> {
         Ok(false)
     }
+    fn push_fix_commit(&self, _branch: &str, _message: &str) -> Result<(), daemon::errors::DaemonError> {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -340,6 +343,7 @@ fn attested_overlay(bead_id: &str, pr: u64) -> BeadOverlay {
         pr_number: Some(pr),
         branch: Some(format!("factory/{bead_id}-r1")),
         session_id: Some("s1".into()),
+        is_adopted: false,
     }
 }
 
