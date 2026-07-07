@@ -501,7 +501,7 @@ impl StateStore for SqliteStateStore {
         // the dead PR and re-park on the same gate. `branch` is kept so the
         // recovered-from telemetry still records what was being worked on;
         // dispatch will rewrite it on the next attempt.
-        let placeholders = std::iter::repeat("?").take(recovered_ids.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat_n("?", recovered_ids.len()).collect::<Vec<_>>().join(",");
         let update_sql = format!(
             "UPDATE bead_overlay \
              SET state = 'QUEUED', attempt = attempt + 1, autonomy_secs = 0, \
