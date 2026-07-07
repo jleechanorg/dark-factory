@@ -46,7 +46,7 @@ fn test_cli_scm_real_gh() {
 #[test]
 #[ignore] // Requires real `ao` CLI — run locally with `cargo test -- --ignored`
 fn test_cli_sessions_real_ao() {
-    let sessions = CliSessions::new("jleechanorg/dark-factory", "claude-code");
+    let sessions = CliSessions::new("dark-factory", "claude-code");
     let count = sessions.active_count();
     assert!(count.is_ok(), "active_count failed: {:?}", count);
 }
@@ -88,4 +88,3 @@ fn test_cli_scm_offline_fallback() {
     
     let _ = std::fs::remove_file(pr_file);
 }
-

@@ -75,6 +75,26 @@ The 10 canonical `event_type` values (`TICK`, `INTAKE_BEAD_CREATED`,
 `READY_FOR_MERGE`, `REROLL_VERDICT_RECORDED`, `PARKED_HUMAN_HELD`,
 `BUDGET_WARNING`) are enumerated in `CONTRACT.md` §2; none may be invented.
 
+## Linux user service
+
+The durable Linux trigger for the Rust daemon is the systemd user unit in
+`daemon/systemd/`. It runs the release binary directly, not the legacy shell
+tick lane:
+
+```bash
+daemon/systemd/install-systemd-user.sh
+systemctl --user status ai.dark-factory.daemon.service --no-pager
+journalctl --user -u ai.dark-factory.daemon.service -n 100 --no-pager
+```
+
+The installer builds `daemon/target/release/daemon`, renders
+`ai.dark-factory.daemon.service`, verifies user lingering for boot persistence,
+then runs `systemctl --user enable --now`. The unit uses `Type=notify`,
+`Restart=on-failure`, and `WatchdogSec=7200s`; the daemon sends `READY=1`
+after startup and `WATCHDOG=1` after each classified tick. Use `--dry-run` to
+inspect commands without mutating the host, `--render-only` to print the
+rendered unit, and `--uninstall` to disable and remove it.
+
 ## Planned Rust Stage-1 crate layout
 
 Per design doc §2: single-threaded poll loop, no async runtime

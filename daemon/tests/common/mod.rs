@@ -164,6 +164,7 @@ pub struct FakeSessions {
     pub next_session_id: String,
     pub quiescent: bool,
     pub fail_spawn_for: RefCell<Vec<String>>,
+    pub spawn_prompts: RefCell<Vec<(String, String)>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -174,6 +175,7 @@ impl Default for FakeSessions {
             next_session_id: "fake-session-1".into(),
             quiescent: true,
             fail_spawn_for: RefCell::new(Vec::new()),
+            spawn_prompts: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -196,6 +198,9 @@ impl Sessions for FakeSessions {
     }
 
     fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+        self.spawn_prompts
+            .borrow_mut()
+            .push((spec.bead_id.clone(), spec.prompt.clone()));
         self.calls
             .borrow_mut()
             .push(format!("spawn({})", spec.bead_id));

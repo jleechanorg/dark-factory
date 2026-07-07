@@ -33,6 +33,7 @@ use daemon::verifier::SkepticVerdict;
 fn test_cfg() -> Config {
     Config {
         target_repo: "owner/repo".into(),
+        ao_project: None,
         base_branch: "main".into(),
         stage: 1,
         max_workers: 30,
@@ -1223,6 +1224,64 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
     assert_eq!(
         final_overlay.branch.as_deref(),
         Some("factory/manual-bead-123-r1")
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn newly_intaken_bead_dispatch_uses_real_tracker_title() {
+    let mut scm = FakeScm::new();
+    scm.issues.push(Issue {
+        number: 8123,
+        title: "Wire a durable Linux trigger".into(),
+        body: "systemd user unit acceptance criteria".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#8123".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_new_intake_prompt_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("newly-intaken bead should route and dispatch");
+
+    assert_eq!(summary.beads_created, 1);
+    assert_eq!(summary.beads_dispatched, 1);
+    let prompts = sessions.spawn_prompts.borrow();
+    assert_eq!(
+        prompts.as_slice(),
+        &[(
+            "fake-bead-1".to_string(),
+            "Wire a durable Linux trigger (owner/repo)".to_string()
+        )],
+        "new intake must dispatch the real tracker title, not an empty stub prompt"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
