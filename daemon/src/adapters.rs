@@ -1217,6 +1217,13 @@ impl Sessions for CliSessions {
                 } else {
                     Command::new("ao")
                 };
+                // jleechan-pqip follow-up (PR#163 finding 3): mirror
+                // `run_spawn_process`'s argv exactly — omitting `--name`/
+                // `--branch` here previously meant every batch-spawned
+                // session landed on whatever branch `ao spawn` defaults to
+                // instead of `spec.branch`, and `spec.bead_id` was never
+                // read at all.
+                let display_name = spec.branch.strip_prefix("factory/").unwrap_or(&spec.branch);
                 cmd.arg("spawn")
                     .arg("--prompt")
                     .arg(&spec.prompt)
@@ -1224,6 +1231,10 @@ impl Sessions for CliSessions {
                     .arg(&self.project)
                     .arg("--agent")
                     .arg(agent)
+                    .arg("--name")
+                    .arg(display_name)
+                    .arg("--branch")
+                    .arg(&spec.branch)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
 

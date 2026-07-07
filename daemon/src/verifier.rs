@@ -191,12 +191,26 @@ pub fn parse_skeptic_verdict(raw: &str) -> Option<SkepticVerdict> {
 
     let v_g7 = gate7_verdict?;
     let v_gha = gha_verdict?;
-    let v_so = signoff_verdict?;
+    // PR#163 finding 1: `sign-off` is a HUMAN reviewer comment
+    // ("sign-off"/"signoff"/"/skeptic pass"). This daemon is a Level-5
+    // autonomous system with no human in the loop by design (see repo
+    // CLAUDE.md "Dark Factory operating mode") — nothing ever posts a
+    // sign-off comment for a real (non-test) target repo, so requiring it
+    // here would make gate 7 permanently `Unknown` for every real PR. Treat
+    // sign-off as best-effort/optional: when present it can still escalate
+    // the verdict (Fail/Warn), but its absence must never block gate 7 the
+    // way a missing gate-7 or gha verdict does.
+    let v_so = signoff_verdict;
 
     let mut fails = Vec::new();
     let mut warns = Vec::new();
 
-    for v in &[v_g7, v_gha, v_so] {
+    let mut checked = vec![v_g7, v_gha];
+    if let Some(so) = v_so {
+        checked.push(so);
+    }
+
+    for v in &checked {
         match v {
             SkepticVerdict::Fail(reason) => fails.push(reason.clone()),
             SkepticVerdict::Warn(note) => warns.push(note.clone()),
@@ -1052,10 +1066,48 @@ mod tests {
             Some(SkepticVerdict::Fail("(compile error)".into()))
         );
 
-        // One missing -> overall None (unknown)
+        // One missing -> overall None (unknown). This is `gha` missing,
+        // which stays a hard requirement — only `sign-off` is optional
+        // (see `parse_skeptic_verdict_signoff_absent_is_satisfied_by_gate7_and_gha`
+        // below).
         let msg = "subsystem: gate-7\nverdict: pass\n\
                    subsystem: sign-off\nverdict: pass\n";
         assert_eq!(parse_skeptic_verdict(msg), None);
+    }
+
+    // --- PR#163 finding 1 regression: sign-off must never hard-block gate 7 ---
+    //
+    // The daemon has no human-in-the-loop by design (repo CLAUDE.md "Dark
+    // Factory operating mode" — Level 5, no human code review gate). Before
+    // this fix, `tick.rs::skeptic_evidence` always wrapped the reviewer
+    // reply in a `subsystem: gate-7 / gha / sign-off` combined string with
+    // sign-off defaulting to the literal `"verdict: absent"` (which never
+    // parses to a `SkepticVerdict`), and this function required ALL THREE
+    // subsystems to parse. Since no human ever posts a sign-off comment on
+    // a real target repo, gate 7 (`skeptic_gate`) was permanently `Unknown`
+    // and `all_green` permanently `false` for every real PR — a total
+    // deadlock. Mutation-test sanity: reverting the `v_so` optionality
+    // above (making `signoff_verdict?` hard-required again) makes this
+    // test fail with `None` instead of `Some(Pass)`.
+    #[test]
+    fn parse_skeptic_verdict_signoff_absent_is_satisfied_by_gate7_and_gha() {
+        let msg = "subsystem: gate-7\nverdict: pass\n\
+                   subsystem: gha\nverdict: pass\n\
+                   subsystem: sign-off\nverdict: absent\n";
+        assert_eq!(parse_skeptic_verdict(msg), Some(SkepticVerdict::Pass));
+    }
+
+    #[test]
+    fn parse_skeptic_verdict_signoff_present_can_still_escalate_to_fail() {
+        // When a human DOES leave a sign-off comment, it is not ignored —
+        // it can still escalate gate 7 to Fail, same as gate-7/gha.
+        let msg = "subsystem: gate-7\nverdict: pass\n\
+                   subsystem: gha\nverdict: pass\n\
+                   subsystem: sign-off\nverdict: fail human rejected\n";
+        assert_eq!(
+            parse_skeptic_verdict(msg),
+            Some(SkepticVerdict::Fail("human rejected".into()))
+        );
     }
 
     #[test]

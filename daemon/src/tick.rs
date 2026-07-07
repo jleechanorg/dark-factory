@@ -893,6 +893,45 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 /// has no wired `/er` runner yet, so `er_verdict` is honestly `Absent` (gate 6
 /// -> `Unknown`, never a guessed `Pass`) until a real `/er` invocation is
 /// wired in (bead jleechan-3rf, verifier.rs `evidence_floor_gate`).
+/// Dispatch one independent reviewer subprocess by vendor name. Extracted
+/// from `skeptic_evidence` so two vendors can be dispatched in parallel
+/// threads (PR#163 finding 2) without duplicating the per-vendor argv
+/// construction.
+fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> {
+    use crate::tools::run_tool;
+    match vendor {
+        "codex" => run_tool("codex", &["exec", "--yolo", "--skip-git-repo-check", prompt], 120),
+        "claude" => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let nvm_claude = format!("{}/.nvm/versions/node/v22.22.0/bin/claude", home);
+            let claude_bin = if std::path::Path::new(&nvm_claude).exists() {
+                nvm_claude
+            } else {
+                "claude".to_string()
+            };
+            run_tool(&claude_bin, &["--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt], 120)
+        }
+        "agy" => run_tool("agy", &["--print", "--dangerously-skip-permissions", prompt], 120),
+        other => Err(DaemonError::Tool {
+            tool: other.to_string(),
+            rc: -1,
+            stderr: "unknown reviewer vendor".to_string(),
+        }),
+    }
+}
+
+/// Render a `SkepticVerdict` back into the bare `pass|warn <note>|fail
+/// <reason>` grammar `parse_skeptic_verdict` accepts, so the dual-reviewer
+/// combined verdict can be folded into the `subsystem: gate-7` line
+/// alongside the (optional) `gha`/`sign-off` subsystems.
+fn skeptic_verdict_to_line(v: &verifier::SkepticVerdict) -> String {
+    match v {
+        verifier::SkepticVerdict::Pass => "pass".to_string(),
+        verifier::SkepticVerdict::Warn(note) => format!("warn {note}"),
+        verifier::SkepticVerdict::Fail(reason) => format!("fail {reason}"),
+    }
+}
+
 fn skeptic_evidence(
     deps: &TickDeps,
     bead_id: &str,
@@ -924,42 +963,9 @@ fn skeptic_evidence(
         priority.retain(|&v| v != coder_vendor);
     }
 
-    let mut reply = String::new();
-    let mut resolved = false;
-
     let is_test_repo = deps.cfg.target_repo.contains("fake-")
         || deps.cfg.target_repo.contains("test-")
         || deps.cfg.target_repo == "owner/repo";
-
-    use crate::tools::run_tool;
-    if !is_test_repo {
-        for vendor in &priority {
-        let r = match *vendor {
-            "codex" => run_tool("codex", &["exec", "--yolo", "--skip-git-repo-check", &prompt], 120),
-            "claude" => {
-                let home = std::env::var("HOME").unwrap_or_default();
-                let nvm_claude = format!("{}/.nvm/versions/node/v22.22.0/bin/claude", home);
-                let claude_bin = if std::path::Path::new(&nvm_claude).exists() {
-                    nvm_claude
-                } else {
-                    "claude".to_string()
-                };
-                run_tool(&claude_bin, &["--print", "--dangerously-skip-permissions", "--setting-sources", "", &prompt], 120)
-            }
-            "agy" => run_tool("agy", &["--print", "--dangerously-skip-permissions", &prompt], 120),
-            _ => continue,
-        };
-        if let Ok(out) = r {
-            reply = out;
-            resolved = true;
-            break;
-        }
-        }
-    }
-
-    if !resolved {
-        reply = deps.llm.judge(&prompt)?;
-    }
 
     let mut gha_verdict = "verdict: absent";
     let mut signoff_verdict = "verdict: absent";
@@ -996,22 +1002,82 @@ fn skeptic_evidence(
     }
 
     let skeptic_verdict = if is_test_repo {
+        let reply = deps.llm.judge(&prompt)?;
         verifier::parse_skeptic_verdict(&reply)
     } else {
-        let mut combined = String::new();
-        combined.push_str("subsystem: gate-7\n");
-        combined.push_str(&reply);
-        combined.push('\n');
+        // PR#163 finding 2: dispatch the first TWO vendors in the
+        // coder-exclusion-filtered priority list as INDEPENDENT parallel
+        // reviewers — never the vendor that authored the code under review
+        // (self-review would defeat the adversarial guarantee) — and
+        // combine via `combine_dual_verdict`. This restores main's
+        // pre-rebase dual-reviewer safety net: a single reviewer-tool
+        // outage can never false-park a bead. Only a TOTAL outage of both
+        // reviewers (both unparseable/errored) returns `Err`, which
+        // propagates out of this function to `run_fast_tier`'s per-bead
+        // catch-and-continue (phase = "skeptic_evidence"); the bead stays
+        // ATTESTED and the next tick retries, instead of guessing a
+        // verdict or silently falling back to a third, non-adversarial LLM
+        // call.
+        let vendor1 = priority.first().copied().unwrap_or("codex").to_string();
+        let vendor2 = priority.get(1).copied().unwrap_or("claude").to_string();
 
-        combined.push_str("subsystem: gha\n");
-        combined.push_str(gha_verdict);
-        combined.push('\n');
+        let prompt1 = prompt.clone();
+        let handle1 = std::thread::spawn(move || dispatch_reviewer(&vendor1, &prompt1));
+        let prompt2 = prompt.clone();
+        let handle2 = std::thread::spawn(move || dispatch_reviewer(&vendor2, &prompt2));
 
-        combined.push_str("subsystem: sign-off\n");
-        combined.push_str(signoff_verdict);
-        combined.push('\n');
+        let res1 = handle1.join().unwrap_or(Err(DaemonError::Tool {
+            tool: "thread".into(),
+            rc: -1,
+            stderr: "join failed".into(),
+        }));
+        let res2 = handle2.join().unwrap_or(Err(DaemonError::Tool {
+            tool: "thread".into(),
+            rc: -1,
+            stderr: "join failed".into(),
+        }));
 
-        verifier::parse_skeptic_verdict(&combined)
+        let v1 = res1.ok().and_then(|r| verifier::parse_skeptic_verdict(&r));
+        let v2 = res2.ok().and_then(|r| verifier::parse_skeptic_verdict(&r));
+
+        // Err propagates via `?` on total outage (jleechan-qdw safety net).
+        let dual_verdict = combine_dual_verdict(v1, v2, bead_id, pr)?
+            .expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)");
+
+        // PR#163 finding 1: `gha` (a target-repo CI workflow posting a
+        // skeptic verdict comment) and `sign-off` (a human reviewer
+        // comment) are both OPTIONAL enrichment signals, never hard
+        // requirements — a human sign-off will never exist in this
+        // Level-5 autonomous system, and not every target repo runs an
+        // equivalent GHA skeptic workflow. Requiring either would
+        // permanently deadlock gate 7 exactly like the pre-fix bug did.
+        // When neither is present, gate 7 is satisfied by the dual-LLM
+        // verdict alone. When either IS present, fold it in through
+        // `parse_skeptic_verdict`'s subsystem grammar so real evidence can
+        // still escalate (Fail beats Warn beats Pass); `sign-off`'s
+        // absence there is separately optional (verifier.rs), so this can
+        // only ever escalate, never re-introduce the deadlock.
+        let has_gha_evidence = gha_verdict != "verdict: absent";
+        let has_signoff_evidence = signoff_verdict != "verdict: absent";
+
+        if !has_gha_evidence && !has_signoff_evidence {
+            Some(dual_verdict)
+        } else {
+            let mut combined = String::new();
+            combined.push_str("subsystem: gate-7\n");
+            combined.push_str(&skeptic_verdict_to_line(&dual_verdict));
+            combined.push('\n');
+
+            combined.push_str("subsystem: gha\n");
+            combined.push_str(gha_verdict);
+            combined.push('\n');
+
+            combined.push_str("subsystem: sign-off\n");
+            combined.push_str(signoff_verdict);
+            combined.push('\n');
+
+            verifier::parse_skeptic_verdict(&combined)
+        }
     };
 
     Ok(PrEvidence {
