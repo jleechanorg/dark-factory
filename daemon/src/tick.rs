@@ -779,9 +779,9 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({}),
                     serde_json::json!({"reason": "gate assessment not all-green (stage 1: recorded, not executed)"}),
                 )?;
-                let comment_body = format!(
+                let comment_body =
                     "🤖 **[dark-factory]** Coder session parked (human held): gate assessment failed. Stage 1 configuration prevents re-roll."
-                );
+                        .to_string();
                 let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
             } else {
                 // Stage 2: execute re-roll engine
@@ -855,9 +855,9 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 serde_json::json!({}),
                                 serde_json::json!({"reason": "spec file validation failed in recovery"}),
                             )?;
-                            let comment_body = format!(
+                            let comment_body =
                                 "🤖 **[dark-factory]** Coder session parked (human held): spec file validation failed in recovery."
-                            );
+                                    .to_string();
                             let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                         }
                     }

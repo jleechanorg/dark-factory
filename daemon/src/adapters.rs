@@ -247,7 +247,7 @@ impl Scm for CliScm {
             DaemonError::Parse(format!("failed to parse gh pr list: {e}"))
         })?;
         let mut issues: Vec<Issue> = Vec::new();
-        for item in gh_issues.into_iter().chain(gh_prs.into_iter()) {
+        for item in gh_issues.into_iter().chain(gh_prs) {
             if !issues.iter().any(|i| i.number == item.number) {
                 let author_login = item.author.as_ref().or(item.user.as_ref())
                     .map(|a| a.login.clone())
@@ -488,7 +488,7 @@ impl Scm for CliScm {
 
         let last_coderabbit_review = view.reviews.iter()
             .filter(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED")
-            .last();
+            .next_back();
 
         let coderabbit_status = match last_coderabbit_review {
             Some(r) => {
@@ -562,9 +562,7 @@ impl Scm for CliScm {
                 any_failed = true;
             }
         }
-        let ci_status = if checks.is_empty() {
-            "unknown".to_string()
-        } else if any_pending {
+        let ci_status = if checks.is_empty() || any_pending {
             "unknown".to_string()
         } else if any_failed {
             "red".to_string()
