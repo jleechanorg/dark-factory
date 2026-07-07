@@ -58,15 +58,14 @@ if [ -n "$TARGET_PRS" ]; then
   pr_sql_filter="AND pr_number IN ($(echo "$TARGET_PRS" | tr ',' ' ' | awk '{for(i=1;i<=NF;i++) printf "%s%s", (i>1?",":""), $i}'))"
 fi
 
-<<<<<<< HEAD
-=======
 bead_filter=""
 if [ -n "${AFD_BEAD_FILTER:-}" ]; then
   bead_filter_sql="$(echo "$AFD_BEAD_FILTER" | tr ' ' ',' | awk 'BEGIN{FS=OFS=","} {for(i=1;i<=NF;i++) printf "%s\047%s\047", (i==1?"":","), $i}')"
   bead_filter="AND bead_id IN ($bead_filter_sql)"
+else
+  bead_filter="AND bead_id IN ('jleechan-9byt.4','jleechan-93ft','jleechan-7re5')"
 fi
 
->>>>>>> a265fd103 (feat(daemon/tick): route-record + dispatch-record for QUEUED beads (jleechan-xzsh))
 dispatched=0
 ERR_TMP="$(mktemp -t af_dispatch_err.XXXXXX)"
 trap 'rm -f "$ERR_TMP"' EXIT
@@ -79,27 +78,11 @@ while IFS=$'\t' read -r bead_id pr branch; do
   fi
   echo "[af] remediate $bead_id PR #$pr"
   if bash "$R" "$bead_id" "$pr" 2>&1; then
-<<<<<<< HEAD
-    sqlite3 "$DB" "UPDATE bead_overlay SET state='DISPATCHED', updated_at='$(date -u +%Y-%m-%dT%H:%M:%SZ)' WHERE bead_id='$(printf "%s" "$bead_id" | sed "s/'/''/g")';" 2>/dev/null || true
-=======
-    # After AO spawn, transition QUEUED → DISPATCHED via the overlay harness
-    # (NOT direct sqlite UPDATE). The overlay subcommands enforce:
-    #   - valid_branch regex (factory-overlay.sh:dispatch-record)
-    #   - require_state=QUEUED guard
-    #   - branch_registry owner check (surfaces conflicts that the prior
-    #     direct UPDATE silently swallowed)
-    #   - capacity() gate from config max_workers/max_batch (auto-skip when 0)
-    #   - TASK_DISPATCHED telemetry event emission
-    # ATTESTED beads are already past DISPATCHED (set by pr-opened) — no
-    # transition needed; the remediate call re-drives the existing PR.
     cur_state="$(sqlite3 "$DB" "SELECT state FROM bead_overlay WHERE bead_id='$(printf "%s" "$bead_id" | sed "s/'/''/g")';" 2>/dev/null || true)"
     if [ "$cur_state" = "QUEUED" ]; then
-      # route-record has its own require_state=QUEUED guard; safe to re-call.
-      # Idempotent: emits TASK_ROUTED telemetry each time but never mutates state.
       if [ -n "$branch" ]; then
         "$O" route-record "$bead_id" STANDARD_PATH "drive-existing-pr" 2>/dev/null || true
       fi
-      # dispatch-record is the single source of truth for QUEUED → DISPATCHED.
       if "$O" dispatch-record "$bead_id" "$branch" 2>"$ERR_TMP"; then
         :
       else
@@ -123,7 +106,6 @@ while IFS=$'\t' read -r bead_id pr branch; do
         continue
       fi
     fi
->>>>>>> a265fd103 (feat(daemon/tick): route-record + dispatch-record for QUEUED beads (jleechan-xzsh))
     dispatched=$((dispatched + 1))
   else
     echo "[af] skip $bead_id (ao spawn failed)" >&2
@@ -131,11 +113,7 @@ while IFS=$'\t' read -r bead_id pr branch; do
 done < <(sqlite3 "$DB" -separator $'\t' \
   "SELECT bead_id, pr_number, coalesce(branch,'') FROM bead_overlay
    WHERE state IN ('QUEUED','ATTESTED') AND pr_number IS NOT NULL
-<<<<<<< HEAD
-   AND bead_id IN ('jleechan-9byt.4','jleechan-93ft','jleechan-7re5')
-=======
    $bead_filter
->>>>>>> a265fd103 (feat(daemon/tick): route-record + dispatch-record for QUEUED beads (jleechan-xzsh))
    $pr_sql_filter
    ORDER BY CASE bead_id WHEN 'jleechan-7re5' THEN 0 WHEN 'jleechan-93ft' THEN 1 WHEN 'jleechan-9byt.4' THEN 2 ELSE 9 END, updated_at LIMIT 10;")
 
