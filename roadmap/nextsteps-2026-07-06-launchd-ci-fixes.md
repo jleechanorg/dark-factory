@@ -15,7 +15,7 @@
 - **Outcomes:** Landed factory stack on `origin/main` (`72b5087c1`): PRs #168–#171 code via local merge commits (launchd plist, callpath harness, route-record/dispatch-record tick, smoke evidence); CI `main` ref fetch fix; launchd agent **`ai.dark-factory.af-tick`** installed locally; script tests green (21/21 af-tick, callpath harness PASS, cargo test ok).
 - **Risks / blockers:** Launchd tick **exit code 1** — `FileNotFoundError: 'br'` in `af-tick.err.log` (bare launchd PATH; fix is in open [PR #172](https://github.com/jleechanorg/dark-factory/pull/172)). [PR #172](https://github.com/jleechanorg/dark-factory/pull/172) and [PR #173](https://github.com/jleechanorg/dark-factory/pull/173) are **CONFLICTING** and need rebase onto current `main`. ZFC structured dispatch fix lives on branch `fix/zfc-structured-dispatch-codes` (`a7ce4b0f0`) — **not on `main` yet**. Linux CI clippy still red (12 warnings).
 - **Next (sequencing):** (1) Rebase + merge [PR #172](https://github.com/jleechanorg/dark-factory/pull/172) → relaunch launchd with wrapper; (2) rebase + merge [PR #173](https://github.com/jleechanorg/dark-factory/pull/173); (3) land `fix/zfc-structured-dispatch-codes`; (4) drive worldai PRs [#7888](https://github.com/jleechanorg/worldarchitect.ai/pull/7888), [#8060](https://github.com/jleechanorg/worldarchitect.ai/pull/8060), [#8189](https://github.com/jleechanorg/worldarchitect.ai/pull/8189) via `/af` tick.
-- **Beads:** jleechan-v2wv (#172 rebase), jleechan-ebe1 (#173 rebase), jleechan-t4m8 (structured dispatch); drive beads jleechan-93ft, jleechan-9byt.4, jleechan-7re5.
+- **Beads:** [jleechan-v2wv](https://github.com/jleechanorg/dark-factory/issues/175) (#172 rebase), [jleechan-ebe1](https://github.com/jleechanorg/dark-factory/issues/176) (#173 rebase), [jleechan-t4m8](https://github.com/jleechanorg/dark-factory/issues/177) (structured dispatch); drive beads jleechan-93ft, jleechan-9byt.4, jleechan-7re5.
 
 ## Context
 
@@ -29,9 +29,9 @@ Repo: `jleechanorg/dark-factory`, branch `main`, HEAD `72b5087c1`.
 
 | Bead | Title | Priority | Status |
 |------|-------|----------|--------|
-| jleechan-v2wv | Rebase and merge PR #172 (launchd wrapper fixes af-tick PATH) | P1 | OPEN |
-| jleechan-ebe1 | Rebase and merge PR #173 (CI bash-tests + daemon main ref fetch) | P1 | OPEN |
-| jleechan-t4m8 | Land fix/zfc-structured-dispatch-codes on main | P1 | OPEN |
+| [jleechan-v2wv](https://github.com/jleechanorg/dark-factory/issues/175) | Rebase and merge PR #172 (launchd wrapper fixes af-tick PATH) | P1 | OPEN |
+| [jleechan-ebe1](https://github.com/jleechanorg/dark-factory/issues/176) | Rebase and merge PR #173 (CI bash-tests + daemon main ref fetch) | P1 | OPEN |
+| [jleechan-t4m8](https://github.com/jleechanorg/dark-factory/issues/177) | Land fix/zfc-structured-dispatch-codes on main | P1 | OPEN |
 | jleechan-7wud | ZFC: replace verdict enum with LLM-classified tier | P1 | OPEN |
 | jleechan-8dyu | Post-merge smoke + first real dispatch on PR #7888 | P1 | OPEN |
 | jleechan-93ft | Drive PR #7888 to /green | P1 | OPEN |
@@ -45,11 +45,11 @@ Repo: `jleechanorg/dark-factory`, branch `main`, HEAD `72b5087c1`.
 
 ## Work queue
 
-1. **Rebase and merge [PR #172](https://github.com/jleechanorg/dark-factory/pull/172)** — tracks jleechan-v2wv. Goal: `launchd-wrapper.sh` sources `~/.bash_profile` so `br`, `gh`, `sqlite3` resolve under launchd. Acceptance: `launchctl kickstart -k gui/$(id -u)/ai.dark-factory.af-tick`; no `FileNotFoundError: br` in `af-tick.err.log`. Blocker: CONFLICTING with `main`.
+1. **Rebase and merge [PR #172](https://github.com/jleechanorg/dark-factory/pull/172)** — tracks [jleechan-v2wv](https://github.com/jleechanorg/dark-factory/issues/175). Goal: `launchd-wrapper.sh` sources `~/.bash_profile` so `br`, `gh`, `sqlite3` resolve under launchd. Acceptance: `launchctl kickstart -k gui/$(id -u)/ai.dark-factory.af-tick`; no `FileNotFoundError: br` in `af-tick.err.log`. Blocker: CONFLICTING with `main`.
 
-2. **Rebase and merge [PR #173](https://github.com/jleechanorg/dark-factory/pull/173)** — tracks jleechan-ebe1. Goal: wire `tests/scripts/test_*.sh` into CI; vendored callpath probe; daemon-tests main ref fetch. Depends on conflict resolution with #172.
+2. **Rebase and merge [PR #173](https://github.com/jleechanorg/dark-factory/pull/173)** — tracks [jleechan-ebe1](https://github.com/jleechanorg/dark-factory/issues/176). Goal: wire `tests/scripts/test_*.sh` into CI; vendored callpath probe; daemon-tests main ref fetch. Depends on conflict resolution with #172.
 
-3. **Land `fix/zfc-structured-dispatch-codes` on `main`** — tracks jleechan-t4m8. Structured exit codes on dispatch-record; resolves jleechan-2r1k/q47c/81wa on main.
+3. **Land `fix/zfc-structured-dispatch-codes` on `main`** — tracks [jleechan-t4m8](https://github.com/jleechanorg/dark-factory/issues/177). Structured exit codes on dispatch-record; resolves jleechan-2r1k/q47c/81wa on main.
 
 4. **Drive canonical PRs via `/af` tick** — tracks jleechan-8dyu, jleechan-93ft, jleechan-9byt.4, jleechan-7re5. After #172: `MAX_DISPATCH=1 bash daemon/factory-af-tick.sh --prs 7888` then 8060, 8189. Avoid `daemon --once`.
 
