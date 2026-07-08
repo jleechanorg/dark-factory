@@ -374,7 +374,8 @@ impl StateStore for SqliteStateStore {
     fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
         self.conn
             .execute(
-                "UPDATE bead_overlay SET state = 'QUEUED' WHERE state = 'DISPATCHING'",
+                "UPDATE bead_overlay SET state = 'QUEUED', session_id = NULL, branch = NULL \
+                 WHERE state = 'DISPATCHING'",
                 [],
             )
             .map_err(|e| tool_err("reconcile_dispatching", e))?;
@@ -826,6 +827,31 @@ mod tests {
     fn load_missing_bead_returns_none() {
         let s = store();
         assert!(s.load("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn reconcile_dispatching_requeues_and_clears_stale_session_and_branch() {
+        let s = store();
+        let o = BeadOverlay {
+            bead_id: "b-stale".into(),
+            state: OverlayState::Dispatching,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("stale-branch".into()),
+            session_id: Some("stale-session-id".into()),
+            is_adopted: false,
+        };
+
+        s.save(&o).unwrap();
+        s.reconcile_dispatching().unwrap();
+
+        let got = s.load("b-stale").unwrap().unwrap();
+        assert_eq!(got.state, OverlayState::Queued);
+        assert_eq!(got.session_id, None);
+        assert_eq!(got.branch, None);
     }
 
     #[test]
