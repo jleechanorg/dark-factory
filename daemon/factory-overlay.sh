@@ -27,6 +27,7 @@
 #   tick-summary <role>           — emit TICK telemetry line
 #   recover-held                  — HUMAN_HELD → QUEUED (max_attempt guard)
 #   unstick-dispatching           — DISPATCHING → QUEUED
+#   rollback-dispatched           — DISPATCHED → QUEUED for orphaned async-spawns
 #   redrive-pr <id> <pr> <branch> — re-QUEUE existing PR for re-attempt
 #   list <STATE>                  — print bead_overlay rows for state
 set -euo pipefail
@@ -479,6 +480,37 @@ unstick-dispatching)
   echo "unstuck=$n"
   ;;
 
+rollback-dispatched)
+  # Codex P1 finding on PR #193: factory-ao-remediate.sh (async mode) returns
+  # success optimistically when the spawn is still pending. If the spawn then
+  # fails AFTER the fast-fail window (slow internal error, daemon dies
+  # mid-spawn), the bead is stranded as DISPATCHED with no AO session. This
+  # subcommand reads each DISPATCHED bead's spawn-state file (written by the
+  # detached background process in factory-ao-remediate.sh) and rolls the bead
+  # back to QUEUED when the state file shows "fail:rc=N".
+  #
+  # State file path: $AFD_SPAWN_STATE_DIR/${bead_id}-${pr_number}.state
+  # State values: "pending" (spawn still running), "ok" (success),
+  #               "fail:rc=N" (failure with rc)
+  SPAWN_STATE_DIR_ROLL="${AFD_SPAWN_STATE_DIR:-$HOME/Library/Application Support/dark-factory/spawns}"
+  rolled=0
+  while IFS='|' read -r rb_id rb_pr; do
+    [ -n "$rb_id" ] || continue
+    state_file="$SPAWN_STATE_DIR_ROLL/${rb_id}-${rb_pr}.state"
+    [ -f "$state_file" ] || continue
+    cur="$(cat "$state_file" 2>/dev/null || true)"
+    case "$cur" in
+      fail:*)
+        sql "UPDATE bead_overlay SET state='QUEUED', updated_at='$(now)' WHERE bead_id='$(q "$rb_id")' AND state='DISPATCHED';"
+        ctx="$(python3 -c 'import json,sys; v=sys.argv[1]; print(json.dumps({"pr_number":(int(v) if v not in ("","NULL") else None), "reason":"async_spawn_failed","state_file_value":v}))' "$rb_pr" "$cur")"
+        emit "$rb_id" 0 QUEUED ROLLBACK_DISPATCHED "$ctx"
+        rolled=$((rolled + 1))
+        ;;
+    esac
+  done < <(sql -separator '|' "SELECT bead_id, coalesce(cast(pr_number as text),'') FROM bead_overlay WHERE state='DISPATCHED' AND pr_number IS NOT NULL;")
+  echo "rolled=$rolled"
+  ;;
+
 redrive-pr)
   [ $# -eq 4 ] || die "usage: redrive-pr <bead_id> <pr_number> <branch>"
   valid_bead_id "$2"
@@ -502,6 +534,6 @@ list)
   ;;
 
 *)
-  die "unknown: ${1:-}. Valid: init intake-upsert route-record capacity dispatch-record pr-opened autonomy-tick gate-assessment prev-gate-assessment ready reroll-verdict park park-duplicate bead-closed-check tick-summary recover-held unstick-dispatching redrive-pr list"
+  die "unknown: ${1:-}. Valid: init intake-upsert route-record capacity dispatch-record pr-opened autonomy-tick gate-assessment prev-gate-assessment ready reroll-verdict park park-duplicate bead-closed-check tick-summary recover-held unstick-dispatching rollback-dispatched redrive-pr list"
   ;;
 esac
