@@ -185,6 +185,40 @@ pub fn dispatch_ready(
         };
         let session_id = sessions.spawn(&spec)?;
 
+        // jleechan-5ia2: a `bead_overlay` row was found with
+        // `state=DISPATCHED` and a real, live `session_id` belonging to a
+        // completely unrelated, pre-existing task (different branch,
+        // different prompt) — this defensively verifies AO's own live view
+        // of the just-returned session before ever trusting/persisting it.
+        // `Ok(None)` means "cannot verify" (adapter/fake doesn't implement
+        // the check, or `ao status` failed/raced) and is intentionally
+        // treated as trust-it, matching `Sessions::session_branch`'s
+        // documented contract — this check only ever *rejects* on a
+        // positively confirmed mismatch, never on absence of information.
+        // We deliberately do NOT call `sessions.stop(&session_id)` here: on
+        // a mismatch this session_id is not provably ours to kill (it may
+        // be someone else's live, legitimate work, exactly like the
+        // wa-3004 case that motivated this check) — we only refuse to
+        // adopt it.
+        if let Ok(Some(actual_branch)) = sessions.session_branch(&session_id) {
+            if actual_branch != branch {
+                overlay.state = OverlayState::Queued;
+                overlay.session_id = None;
+                store.save(&overlay)?;
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    Some(branch.clone()),
+                    "spawn_branch_mismatch",
+                    DaemonError::Parse(format!(
+                        "ao spawn returned session {} but its live branch is {actual_branch:?}, expected {branch:?} — refusing to record as DISPATCHED",
+                        session_id.0
+                    )),
+                ));
+                continue;
+            }
+        }
+
         overlay.state = OverlayState::Dispatched;
         overlay.session_id = Some(session_id.0.clone());
         if let Err(save_err) = store.save(&overlay) {
@@ -241,6 +275,14 @@ mod tests {
         calls: RefCell<Vec<String>>,
         fail_spawn_for: RefCell<Vec<String>>,
         fail_stop_for: RefCell<Vec<String>>,
+        // jleechan-5ia2: scripted `session_branch` override, keyed by
+        // session id. Empty by default (matches the trait's `Ok(None)`
+        // default — "cannot verify") so every pre-existing test keeps
+        // trusting `spawn()`'s returned session unconditionally; only the
+        // regression test for this bead populates it, to simulate AO
+        // returning a session whose live branch does NOT match what was
+        // requested (the wa-3004 contamination scenario).
+        scripted_branch: RefCell<HashMap<String, String>>,
     }
 
     impl FakeSessions {
@@ -250,6 +292,7 @@ mod tests {
                 calls: RefCell::new(Vec::new()),
                 fail_spawn_for: RefCell::new(Vec::new()),
                 fail_stop_for: RefCell::new(Vec::new()),
+                scripted_branch: RefCell::new(HashMap::new()),
             }
         }
 
@@ -259,6 +302,14 @@ mod tests {
 
         fn fail_stop_for(&self, session_id: &str) {
             self.fail_stop_for.borrow_mut().push(session_id.to_string());
+        }
+
+        /// Script `session_branch(session_id)` to report `branch` instead of
+        /// the default "cannot verify" (`Ok(None)`).
+        fn set_session_branch(&self, session_id: &str, branch: &str) {
+            self.scripted_branch
+                .borrow_mut()
+                .insert(session_id.to_string(), branch.to_string());
         }
     }
 
@@ -306,6 +357,13 @@ mod tests {
                 .borrow_mut()
                 .push(format!("is_quiescent({})", id.0));
             Ok(true)
+        }
+
+        fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("session_branch({})", id.0));
+            Ok(self.scripted_branch.borrow().get(&id.0).cloned())
         }
     }
 
@@ -652,6 +710,57 @@ mod tests {
         assert_eq!(store.branches.borrow().as_slice(), ["factory/bead-0-r1"]);
         let overlay = store.load("bead-0").unwrap().unwrap();
         assert_eq!(overlay.state, OverlayState::Dispatched);
+    }
+
+    /// jleechan-5ia2 regression test: reproduces (in miniature) the exact
+    /// integrity bug this bead tracks — a `bead_overlay` row observed live
+    /// with `state=DISPATCHED` and a real, alive `session_id` that actually
+    /// belonged to a completely unrelated, pre-existing task/branch
+    /// (`wa-3004` on `feat/wa-3004-hook-refactor` instead of
+    /// `factory/jleechan-vj89-r1`). `Sessions::spawn` here returns a session
+    /// id whose live branch (per the scripted `session_branch`) does NOT
+    /// match the branch this dispatch actually requested — the daemon must
+    /// refuse to record this as a successful dispatch, must NOT persist
+    /// state=Dispatched/session_id, and must requeue the bead for a real
+    /// retry instead of silently trusting a mismatched session forever.
+    #[test]
+    fn spawn_returning_session_with_mismatched_live_branch_is_never_recorded_as_dispatched() {
+        let sessions = FakeSessions::new(0);
+        // FakeSessions::spawn always returns SessionId("fake-session-1")
+        // regardless of the requested branch — script its live branch to
+        // something else entirely, simulating AO returning a session that
+        // belongs to a different, already-running task.
+        sessions.set_session_branch("fake-session-1", "feat/wa-3004-hook-refactor");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            0,
+            "a branch-mismatched session must never count as a successful dispatch"
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-0");
+        assert_eq!(report.failures[0].phase, "spawn_branch_mismatch");
+
+        // The session must NOT be killed — it may be someone else's live,
+        // legitimate work (exactly the wa-3004 case). We only refuse to
+        // adopt it.
+        let calls = sessions.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("stop(")),
+            "a foreign/mismatched session must never be stopped by dispatch: {calls:?}"
+        );
+
+        // The overlay must be back at QUEUED with no session_id — never
+        // left claiming DISPATCHED with a session that isn't actually
+        // working on this bead's branch.
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Queued);
+        assert_eq!(overlay.session_id, None);
     }
 
     #[test]

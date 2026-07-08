@@ -226,6 +226,33 @@ pub trait Sessions {
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError>;
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError>;
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError>;
+    /// Returns the live branch AO reports for a given session, if known.
+    ///
+    /// jleechan-5ia2: a `bead_overlay` row was found with
+    /// `state=DISPATCHED` and a real, live `session_id` — but that session
+    /// belonged to a completely unrelated, pre-existing task/branch. No code
+    /// path in this crate can produce that pairing through a genuine
+    /// `spawn()` return value (AO's session-id reservation is atomic —
+    /// `O_EXCL` — so a fresh spawn can never return an already-taken id, and
+    /// the id in question predated this bead's dispatch attempt by ~1h).
+    /// The row was almost certainly written by a stray out-of-band `sqlite3
+    /// UPDATE` bypassing both this crate and `factory-overlay.sh`'s own
+    /// "no direct sqlite3 mutations" contract. This check, combined with the
+    /// `dispatch_ready` post-spawn verification and the `tick.rs`
+    /// wedge-detection sweep, makes such a row impossible to *create* going
+    /// forward and impossible to keep silently *trusting* if one somehow
+    /// appears.
+    ///
+    /// `Ok(None)` covers both "session not found" and "adapter cannot
+    /// verify" — callers must NOT distinguish. The default impl (for fakes
+    /// that predate this check) always returns `Ok(None)`, which callers
+    /// treat as "cannot verify, do not block" — this method only ever
+    /// *rejects* a dispatch on a positively confirmed mismatch, never on
+    /// absence of information.
+    fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
+        let _ = id;
+        Ok(None)
+    }
     fn spawn_batch(&self, specs: &[SpawnSpec]) -> Result<Vec<SessionId>, DaemonError> {
         let mut ids = Vec::new();
         for spec in specs {

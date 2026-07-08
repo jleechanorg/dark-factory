@@ -8,11 +8,30 @@ pub enum DaemonError {
     Timeout(String),
     #[error("config: {0}")]
     Config(String),
+    /// `ao spawn` declined to synchronously create a session and instead
+    /// enqueued a deferred `SpawnRequest` (its own internal admission-control
+    /// queue, hit when a project's active-session count is at/above AO's
+    /// configured cap). AO prints `REQUEST=<id>` instead of `SESSION=<id>`
+    /// and exits 0 — no worktree, branch, or process was ever created for
+    /// this call. jleechan-5ia2: the daemon used to fall through to
+    /// `DaemonError::Parse` ("ao spawn produced no session name"), which is
+    /// fatal and crashes the whole daemon process (`main.rs` calls
+    /// `std::process::exit(1)` on any non-transient tick error) — confirmed
+    /// live via `rust-daemon.err.log` showing 18 systemd restarts in ~15
+    /// minutes while `worldarchitect` sat at its 20-session cap. Unlike a
+    /// genuine parse failure, this case is provably safe to retry: AO
+    /// guarantees no live process exists yet, so there is nothing to leak or
+    /// double-spawn by requeuing the bead and trying again next tick.
+    #[error("ao spawn deferred to internal queue: {0}")]
+    Deferred(String),
 }
 
 impl DaemonError {
     pub fn is_transient(&self) -> bool {
-        matches!(self, DaemonError::Tool { .. } | DaemonError::Timeout(_))
+        matches!(
+            self,
+            DaemonError::Tool { .. } | DaemonError::Timeout(_) | DaemonError::Deferred(_)
+        )
     }
 
     /// Detects `br create --external-ref ...` failing because the ref is
@@ -71,6 +90,15 @@ mod tests {
     fn classifies_config_and_parse_as_fatal() {
         assert!(!DaemonError::Config("missing config".to_string()).is_transient());
         assert!(!DaemonError::Parse("bad json".to_string()).is_transient());
+    }
+
+    /// jleechan-5ia2: AO's own internal spawn queue (hit at its active-session
+    /// cap) is a retry-safe condition, not a crash-the-daemon condition — see
+    /// the `Deferred` variant doc comment for the live-reproduced crash loop
+    /// this fixes.
+    #[test]
+    fn classifies_deferred_as_transient() {
+        assert!(DaemonError::Deferred("REQUEST=sq-abc123".to_string()).is_transient());
     }
 
     #[test]

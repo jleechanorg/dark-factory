@@ -684,6 +684,131 @@ fn test_wedge_detection_dispatched_coder_silent() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// jleechan-5ia2 regression test: reproduces the LIVE bug this bead tracks.
+/// Bead `jleechan-vj89`'s overlay was observed with `state=DISPATCHED`,
+/// `branch=factory/jleechan-vj89-r1`, and a real, alive `session_id`
+/// (`wa-3004`) whose ACTUAL live branch was `feat/wa-3004-hook-refactor` —
+/// a completely unrelated, pre-existing task. This must be caught and
+/// self-healed by the dispatch-integrity sweep on the very next tick,
+/// independent of the 30-minute "coder silent" autonomy threshold (this
+/// overlay's `autonomy_secs` is deliberately tiny — 5 — to prove the sweep
+/// is NOT gated on that timer).
+#[test]
+fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    sessions.set_session_branch("wa-3004", "feat/wa-3004-hook-refactor");
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "jleechan-vj89".into(),
+        BeadOverlay {
+            bead_id: "jleechan-vj89".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(8227),
+            branch: Some("factory/jleechan-vj89-r1".into()),
+            session_id: Some("wa-3004".into()),
+            is_adopted: false,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_dispatch_integrity_sweep.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = FakeVcs::new();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 1).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "a branch-mismatched DISPATCHED row must be parked on the very next tick"
+    );
+
+    let o = store.load("jleechan-vj89").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::HumanHeld,
+        "a corrupted DISPATCHED row must never be left silently trusted"
+    );
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(logs.contains("PARKED_HUMAN_HELD"), "logs: {}", logs);
+    assert!(logs.contains("session_branch_mismatch"), "logs: {}", logs);
+    assert!(logs.contains("wa-3004"), "logs: {}", logs);
+    assert!(logs.contains("feat/wa-3004-hook-refactor"), "logs: {}", logs);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Companion test: a DISPATCHED row whose session_id's live branch DOES
+/// match must be left completely untouched by the integrity sweep (no
+/// false positives on legitimate in-flight dispatches).
+#[test]
+fn test_dispatch_integrity_sweep_leaves_matching_branch_alone() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    sessions.set_session_branch("wa-4001", "factory/bead-ok-r1");
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "bead-ok".into(),
+        BeadOverlay {
+            bead_id: "bead-ok".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-ok-r1".into()),
+            session_id: Some("wa-4001".into()),
+            is_adopted: false,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_dispatch_integrity_ok.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = FakeVcs::new();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 1).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-ok").unwrap().unwrap();
+    assert_eq!(o.state, OverlayState::Dispatched);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 #[test]
 fn test_wedge_detection_attested_session_stalled() {
     let mut scm = FakeScm::new();
