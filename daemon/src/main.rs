@@ -75,6 +75,12 @@ enum CommandMode {
         pr: u64,
         repo: Option<String>,
     },
+    ChildRunEr {
+        bead_id: String,
+        pr: u64,
+        now_epoch: u64,
+        target_repo: String,
+    },
 }
 
 fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CommandMode, String> {
@@ -108,6 +114,54 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CommandMode, Str
             }
             let pr = pr.ok_or_else(|| "Missing required argument --pr".to_string())?;
             Ok(CommandMode::GatesCompute { pr, repo })
+        }
+        Some("--child-run-er") => {
+            let mut bead_id = None;
+            let mut pr = None;
+            let mut now_epoch = None;
+            let mut target_repo = None;
+            while let Some(arg) = argv.next() {
+                match arg.as_str() {
+                    "--bead-id" => {
+                        if let Some(val) = argv.next() {
+                            bead_id = Some(val);
+                        } else {
+                            return Err("Missing value for --bead-id".to_string());
+                        }
+                    }
+                    "--pr" => {
+                        if let Some(val) = argv.next() {
+                            let parsed_pr = val.parse::<u64>().map_err(|_| format!("Invalid PR number: {}", val))?;
+                            pr = Some(parsed_pr);
+                        } else {
+                            return Err("Missing value for --pr".to_string());
+                        }
+                    }
+                    "--now-epoch" => {
+                        if let Some(val) = argv.next() {
+                            let parsed_epoch = val.parse::<u64>().map_err(|_| format!("Invalid epoch: {}", val))?;
+                            now_epoch = Some(parsed_epoch);
+                        } else {
+                            return Err("Missing value for --now-epoch".to_string());
+                        }
+                    }
+                    "--target-repo" => {
+                        if let Some(val) = argv.next() {
+                            target_repo = Some(val);
+                        } else {
+                            return Err("Missing value for --target-repo".to_string());
+                        }
+                    }
+                    other => {
+                        return Err(format!("Unknown argument for --child-run-er: {}", other));
+                    }
+                }
+            }
+            let bead_id = bead_id.ok_or_else(|| "Missing required argument --bead-id".to_string())?;
+            let pr = pr.ok_or_else(|| "Missing required argument --pr".to_string())?;
+            let now_epoch = now_epoch.ok_or_else(|| "Missing required argument --now-epoch".to_string())?;
+            let target_repo = target_repo.ok_or_else(|| "Missing required argument --target-repo".to_string())?;
+            Ok(CommandMode::ChildRunEr { bead_id, pr, now_epoch, target_repo })
         }
         Some(first_flag) => {
             let mut args = Args::default();
@@ -529,6 +583,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        CommandMode::ChildRunEr { bead_id, pr, now_epoch, target_repo } => {
+            if let Err(e) = daemon::er_runner::run_child_main(&bead_id, pr, now_epoch, &target_repo) {
+                eprintln!("auto-factory daemon: child-run-er error: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -613,6 +673,74 @@ mod tests {
                 assert_eq!(repo, None);
             }
             _ => panic!("Expected GatesCompute mode"),
+        }
+    }
+
+    #[test]
+    fn parse_args_recognizes_child_run_er() {
+        let argv = vec![
+            "daemon".to_string(),
+            "--child-run-er".to_string(),
+            "--bead-id".to_string(),
+            "test-bead-1".to_string(),
+            "--pr".to_string(),
+            "123".to_string(),
+            "--now-epoch".to_string(),
+            "1000000".to_string(),
+            "--target-repo".to_string(),
+            "owner/test-repo".to_string(),
+        ];
+        let mode = parse_args(argv.into_iter()).unwrap();
+        match mode {
+            CommandMode::ChildRunEr { bead_id, pr, now_epoch, target_repo } => {
+                assert_eq!(bead_id, "test-bead-1");
+                assert_eq!(pr, 123);
+                assert_eq!(now_epoch, 1_000_000);
+                assert_eq!(target_repo, "owner/test-repo");
+            }
+            _ => panic!("Expected ChildRunEr mode"),
+        }
+    }
+
+    #[test]
+    fn parse_args_child_run_er_missing_bead_id_is_error() {
+        let argv = vec![
+            "daemon".to_string(),
+            "--child-run-er".to_string(),
+            "--pr".to_string(),
+            "1".to_string(),
+            "--now-epoch".to_string(),
+            "1".to_string(),
+            "--target-repo".to_string(),
+            "o/r".to_string(),
+        ];
+        let result = parse_args(argv.into_iter());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--bead-id"));
+    }
+
+    #[test]
+    fn parse_args_child_run_er_does_not_fall_through_to_daemon_mode() {
+        // This is the critical regression test for jleechan-2xlo:
+        // without the --child-run-er handler, this would fall through to
+        // CommandMode::Daemon which runs an infinite tick loop (fork bomb).
+        let argv = vec![
+            "daemon".to_string(),
+            "--child-run-er".to_string(),
+            "--bead-id".to_string(),
+            "b1".to_string(),
+            "--pr".to_string(),
+            "1".to_string(),
+            "--now-epoch".to_string(),
+            "1".to_string(),
+            "--target-repo".to_string(),
+            "o/r".to_string(),
+        ];
+        let mode = parse_args(argv.into_iter()).unwrap();
+        match mode {
+            CommandMode::ChildRunEr { .. } => {}
+            CommandMode::Daemon(_) => panic!("BUG REGRESSION: --child-run-er fell through to Daemon mode!"),
+            _ => panic!("Unexpected mode"),
         }
     }
 

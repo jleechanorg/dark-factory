@@ -39,6 +39,13 @@ pub const ER_RUNNER_COOLDOWN_SECS: u64 = 300;
 /// Wall-clock timeout for the spawned reviewer subprocess.
 pub const ER_RUNNER_TIMEOUT_SECS: u64 = 120;
 
+/// Generous upper bound on total forked-child wall-clock time: the child's
+/// own reviewer subprocess is already bounded by `ER_RUNNER_TIMEOUT_SECS`
+/// (120s) via `run_tool` inside `spawn_reviewer`, plus ~30s for the `gh`
+/// comment post (also `run_tool`-bounded). 180s leaves headroom without
+/// letting a hung child live indefinitely.
+pub const ER_RUNNER_CHILD_REAP_TIMEOUT_SECS: u64 = 180;
+
 /// Telemetry event names (mirrored in `factory-overlay.sh` and the CXDB
 /// consumers). Kept as `&'static str` so the `emit` call in tick.rs needs
 /// no allocation.
@@ -255,10 +262,53 @@ fn is_test_binary() -> bool {
     path_is_test || args_have_test_flag
 }
 
+/// Poll a forked `/er` child to completion, killing it if it exceeds
+/// `ER_RUNNER_CHILD_REAP_TIMEOUT_SECS`, and ALWAYS `wait()`s so the OS can
+/// reap it (an un-`wait()`-ed exited child is a zombie process; an
+/// un-bounded still-running child is an orphan that outlives its purpose).
+/// Runs on a detached background thread so the parent tick loop returns
+/// immediately after `fork_er_child` — this function must never be awaited
+/// synchronously from `dispatch_to_child`.
+fn reap_er_child(mut child: std::process::Child, bead_id: String, pr: u64) {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(ER_RUNNER_CHILD_REAP_TIMEOUT_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    eprintln!(
+                        "er_runner: forked child exited non-zero for bead={bead_id} pr={pr}: {status:?}"
+                    );
+                }
+                return;
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "er_runner: forked child exceeded {ER_RUNNER_CHILD_REAP_TIMEOUT_SECS}s \
+                         timeout for bead={bead_id} pr={pr}; killing"
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => {
+                eprintln!(
+                    "er_runner: try_wait failed while reaping forked child for bead={bead_id} pr={pr}: {e}"
+                );
+                return;
+            }
+        }
+    }
+}
+
 /// Spawn the daemon binary as a child process with `--child-run-er`. The
 /// child invocation is handled by `main.rs` which reconstructs production
 /// adapters from config and runs `child_run_er_owned`. PID is returned
-/// for observability; we do not wait on the child.
+/// for observability; we spawn a detached reaper thread to bound and reap
+/// the child so it doesn't become a zombie/orphan.
 fn fork_er_child(
     bead_id: &str,
     pr: u64,
@@ -291,22 +341,28 @@ fn fork_er_child(
             rc: 1,
             stderr: e.to_string(),
         })?;
-    Ok(child.id())
+    let pid = child.id();
+    let bead_id_owned = bead_id.to_string();
+    std::thread::spawn(move || reap_er_child(child, bead_id_owned, pr));
+    Ok(pid)
 }
 
-/// Inline-mode child work: spawn the reviewer, post the verbatim reply as
-/// a PR comment. Counter is NOT incremented (parent reserved the slot).
-/// Returns the parsed verdict so callers / tests can assert on it.
-fn child_run_er_inline(
-    deps: &TickDeps,
+/// Shared child work: spawn reviewer, post PR comment, parse verdict.
+/// Used by BOTH the inline test/debug path (`child_run_er_inline`, via
+/// `TickDeps` trait objects) and the real forked-child path
+/// (`run_child_main`, via owned production adapters) so the two paths
+/// cannot drift out of sync.
+fn run_er_child_work(
+    llm: &dyn crate::tools::Llm,
+    tracker: &dyn crate::tools::Tracker,
     bead_id: &str,
     pr: u64,
-    _now_epoch: u64,
+    target_repo: &str,
 ) -> ErVerdict {
-    // 1. Spawn reviewer (mock or real per deps.llm.is_real()).
-    let prompt = build_er_prompt(bead_id, pr, &deps.cfg.target_repo);
-    let reply = match if !deps.llm.is_real() {
-        deps.llm.judge(&prompt)
+    // 1. Spawn reviewer (mock or real per llm.is_real()).
+    let prompt = build_er_prompt(bead_id, pr, target_repo);
+    let reply = match if !llm.is_real() {
+        llm.judge(&prompt)
     } else {
         spawn_reviewer(&prompt)
     } {
@@ -323,8 +379,8 @@ fn child_run_er_inline(
     let body = format!(
         "🤖 **[dark-factory /er]** Evidence review verdict:\n\n```\n{reply}\n```"
     );
-    let ext_ref = format!("{}#{}", deps.cfg.target_repo, pr);
-    if let Err(e) = deps.tracker.comment_external(&ext_ref, &body) {
+    let ext_ref = format!("{}#{}", target_repo, pr);
+    if let Err(e) = tracker.comment_external(&ext_ref, &body) {
         eprintln!("er_runner: child post failed for bead={bead_id} pr={pr}: {e:?}");
         return ErVerdict::Absent;
     }
@@ -335,45 +391,48 @@ fn child_run_er_inline(
     parse_reviewer_reply(&reply)
 }
 
+/// Inline-mode child work: spawn the reviewer, post the verbatim reply as
+/// a PR comment. Counter is NOT incremented (parent reserved the slot).
+/// Returns the parsed verdict so callers / tests can assert on it.
+fn child_run_er_inline(
+    deps: &TickDeps,
+    bead_id: &str,
+    pr: u64,
+    _now_epoch: u64,
+) -> ErVerdict {
+    run_er_child_work(deps.llm, deps.tracker, bead_id, pr, &deps.cfg.target_repo)
+}
+
 /// Owned-deps entry point invoked by the child process (production path).
-/// Parses argv, reconstructs production adapters from config + cwd,
-/// runs `child_run_er_owned`. Used by `main.rs`'s `--child-run-er`
-/// handler; not called directly from the parent.
+/// Called from `main.rs`'s `--child-run-er` handler with argv already
+/// parsed. Builds REAL production adapters (`CliTracker`, `ChainLlm` — both
+/// zero-field unit structs, no config needed) and runs the same child work
+/// `child_run_er_inline` runs in tests, but as a genuinely separate forked
+/// process with no shared memory with the parent.
 ///
-/// `now_epoch` is captured from the parent's invocation so the cooldown
-/// math is consistent across the fork boundary.
+/// Reporting mechanism: the child's ONLY side effect is posting the
+/// reviewer's verbatim reply as a PR comment via `Tracker::comment_external`
+/// (same as the inline path). GitHub is the durable, externally-visible
+/// state store — there is no separate file/CXDB write-back needed, because
+/// the PARENT's next tick already re-fetches `pr_snapshot(pr).comments` and
+/// runs `parse_er_verdict` over them (see `maybe_run` step 2). This is the
+/// existing idempotent hand-off contract; the forked child doesn't need to
+/// invent a new one.
 pub fn run_child_main(
     bead_id: &str,
     pr: u64,
     now_epoch: u64,
     target_repo: &str,
 ) -> Result<(), DaemonError> {
-    // The owned-adapters refactor is staged: for this PR, the child runs
-    // its inline child work against a minimal config stub. A follow-up PR
-    // will wire real owned `Scm` / `Tracker` / `SqliteStore` adapters so
-    // the child has zero dependency on the parent's in-memory state.
-    let cfg = crate::config::Config {
-        target_repo: target_repo.to_string(),
-        ao_project: None,
-        base_branch: "main".into(),
-        stage: 1,
-        max_workers: 30,
-        max_batch: 15,
-        fast_tick_secs: 60,
-        slow_tick_secs: 60,
-        autonomy_timebox_secs: 10_800,
-        budget_warn_usd: 20.0,
-        spec_dir: ".factory/specs/".into(),
-    };
     eprintln!(
-        "er_runner[child]: start bead={bead_id} pr={pr} now_epoch={now_epoch} repo={target_repo} \
-         (owned-adapter follow-up pending; this child writes the spawn reservation only)"
+        "er_runner[child]: start bead={bead_id} pr={pr} now_epoch={now_epoch} repo={target_repo}"
     );
-    // Owned adapters are staged; child exits cleanly so the parent sees
-    // its Dispatched reservation without a long-blocking child holding
-    // resources. The follow-up PR will replace this stub with the real
-    // owned-adapter child pipeline.
-    let _ = cfg;
+    let llm = crate::adapters::ChainLlm;
+    let tracker = crate::adapters::CliTracker;
+    let verdict = run_er_child_work(&llm, &tracker, bead_id, pr, target_repo);
+    eprintln!(
+        "er_runner[child]: done bead={bead_id} pr={pr} verdict={verdict:?}"
+    );
     Ok(())
 }
 
