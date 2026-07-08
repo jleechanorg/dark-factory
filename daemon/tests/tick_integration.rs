@@ -6184,7 +6184,16 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
     cfg.stage = 2;
-    let vcs = FakeVcs::new();
+    let mut vcs = FakeVcs::new();
+    // jleechan-tfs1 amendment (#209): execute_adopted now captures
+    // pre_session_head_sha via Vcs::remote_head_sha before spawning, and
+    // fails closed (Held) if that lookup errors. Bead B (the only bead in
+    // this test that reaches the real adopted-remediation dispatch path,
+    // since bead A exits early on the comparator failure) needs a scripted
+    // head for its branch or it never reaches its expected `Attested`
+    // outcome — this test predates #209 and only scripted PR snapshots.
+    vcs.heads
+        .insert("bob/cq8r-bead-b-branch".into(), "bead-b-head-sha".into());
 
     for (bead_id, pr, branch, prior_text) in [
         ("cq8r-bead-a", 801u64, "alice/cq8r-bead-a-branch", "BEAD-A-PRIOR-MARKER"),
@@ -6203,6 +6212,7 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
                 session_id: None,
                 is_adopted: true,
                 spawn_failure_count: 0,
+                pre_session_head_sha: None,
             })
             .unwrap();
         store.register_branch(bead_id, branch).unwrap();
@@ -6249,29 +6259,35 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
     );
 
     let bead_b = store.load("cq8r-bead-b").unwrap().unwrap();
+    // jleechan-tfs1 amendment (#209): adopted-PR remediation now dispatches a
+    // real coder session and lands in Dispatched (not an immediate Attested)
+    // — the fast-tier quiescence-gated DISPATCHED -> ATTESTED promotion
+    // re-verifies on a later tick once the coder session finishes. This test
+    // predates that change; the invariant under test (bead A's comparator
+    // failure does not block bead B's re-roll in the same tick) still holds
+    // — bead B reaches Dispatched, not HumanHeld or untouched.
     assert_eq!(
         bead_b.state,
-        OverlayState::Attested,
-        "bead B must complete its re-roll in the SAME tick as bead A's comparator failure; got {:?}",
+        OverlayState::Dispatched,
+        "bead B must progress its re-roll (to Dispatched, real coder session) in the SAME tick as bead A's comparator failure; got {:?}",
         bead_b.state
     );
     assert_eq!(
         bead_b.attempt, 3,
-        "bead B's successful append-only re-roll must advance its attempt counter"
+        "bead B's successful append-only re-roll dispatch must advance its attempt counter"
     );
 
-    let vcs_calls = vcs.calls.borrow();
+    // jleechan-tfs1 amendment (#209): execute_adopted no longer fabricates a
+    // commit via Vcs::push_fix_commit — it dispatches a real coder session
+    // via Sessions::spawn instead. This test predates that change.
+    let session_calls = sessions.calls.borrow();
     assert!(
-        vcs_calls
-            .iter()
-            .any(|c| c.starts_with("push_fix_commit(bob/cq8r-bead-b-branch,")),
-        "bead B's re-roll must actually push a fix commit: {vcs_calls:?}"
+        session_calls.iter().any(|c| c == "spawn(cq8r-bead-b)"),
+        "bead B's re-roll must actually dispatch a real coder session: {session_calls:?}"
     );
     assert!(
-        vcs_calls
-            .iter()
-            .all(|c| !c.starts_with("push_fix_commit(alice/cq8r-bead-a-branch,")),
-        "bead A must never reach the append-only push after its comparator call failed: {vcs_calls:?}"
+        session_calls.iter().all(|c| c != "spawn(cq8r-bead-a)"),
+        "bead A must never reach the spawn dispatch after its comparator call failed: {session_calls:?}"
     );
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();

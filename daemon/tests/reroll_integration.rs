@@ -1086,6 +1086,7 @@ fn same_underlying_issue_malformed_reply_is_transient_not_fatal() {
         session_id: None,
         is_adopted: false,
         spawn_failure_count: 0,
+        pre_session_head_sha: None,
     };
     store.save(&bead).unwrap();
     store
