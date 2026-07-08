@@ -72,7 +72,11 @@ fn new_issue_from_write_tier_collaborator_creates_one_bead() {
         .iter()
         .filter(|c| c.starts_with("create_bead("))
         .collect();
-    assert_eq!(create_calls.len(), 1, "expected exactly one create_bead call");
+    assert_eq!(
+        create_calls.len(),
+        1,
+        "expected exactly one create_bead call"
+    );
     assert!(
         create_calls[0].contains("owner/repo#42"),
         "create_bead call should carry external_ref owner/repo#42, got: {}",
@@ -107,7 +111,11 @@ fn already_known_external_ref_is_not_duplicated() {
     );
     // jleechan-eazj: the skip must still be reported so telemetry can prove
     // the daemon saw and evaluated the candidate.
-    assert_eq!(outcomes.len(), 1, "expected exactly one verdict: {outcomes:?}");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "expected exactly one verdict: {outcomes:?}"
+    );
     assert_eq!(outcomes[0].external_ref, "owner/repo#42");
     assert_eq!(outcomes[0].verdict, IntakeVerdict::SkippedDuplicate);
 
@@ -143,7 +151,11 @@ fn read_tier_creator_is_skipped_without_create_bead() {
     );
     // jleechan-eazj: "ineligible" verdict names the actual precondition that
     // failed, not a generic message.
-    assert_eq!(outcomes.len(), 1, "expected exactly one verdict: {outcomes:?}");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "expected exactly one verdict: {outcomes:?}"
+    );
     assert_eq!(outcomes[0].external_ref, "owner/repo#7");
     assert_eq!(
         outcomes[0].verdict,
@@ -193,7 +205,11 @@ fn mixed_batch_only_creates_bead_for_new_write_tier_issue() {
     // produce exactly one verdict — a mixed batch is exactly the shape
     // where a per-candidate abort used to silently swallow candidates after
     // the first hiccup.
-    assert_eq!(outcomes.len(), 2, "expected 2 non-adopted verdicts: {outcomes:?}");
+    assert_eq!(
+        outcomes.len(),
+        2,
+        "expected 2 non-adopted verdicts: {outcomes:?}"
+    );
     let by_ref = |r: &str| outcomes.iter().find(|o| o.external_ref == r);
     assert_eq!(
         by_ref("owner/repo#2").map(|o| &o.verdict),
@@ -245,13 +261,20 @@ fn create_bead_duplicate_error_is_recovered_as_already_known() {
     );
     // jleechan-eazj: a write-time-race recovery is still a SkippedDuplicate
     // verdict, not silence.
-    assert_eq!(outcomes.len(), 1, "expected exactly one verdict: {outcomes:?}");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "expected exactly one verdict: {outcomes:?}"
+    );
     assert_eq!(outcomes[0].external_ref, "owner/repo#8227");
     assert_eq!(outcomes[0].verdict, IntakeVerdict::SkippedDuplicate);
 
     let calls = tracker.calls.borrow();
     assert_eq!(
-        calls.iter().filter(|c| c.starts_with("create_bead(")).count(),
+        calls
+            .iter()
+            .filter(|c| c.starts_with("create_bead("))
+            .count(),
         1,
         "expected exactly one create_bead attempt (which raced and was recovered)"
     );
@@ -280,12 +303,19 @@ fn pr_create_bead_duplicate_error_is_recovered_as_already_adopted() {
         adopted.is_empty(),
         "duplicate create_bead race must not produce a fresh adoption: {adopted:?}"
     );
-    assert_eq!(outcomes.len(), 1, "expected exactly one verdict: {outcomes:?}");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "expected exactly one verdict: {outcomes:?}"
+    );
     assert_eq!(outcomes[0].external_ref, "owner/repo#8227");
     assert_eq!(outcomes[0].verdict, IntakeVerdict::SkippedDuplicate);
     let calls = tracker.calls.borrow();
     assert_eq!(
-        calls.iter().filter(|c| c.starts_with("create_bead(")).count(),
+        calls
+            .iter()
+            .filter(|c| c.starts_with("create_bead("))
+            .count(),
         1
     );
     assert!(
@@ -359,7 +389,10 @@ fn factory_pr_with_existing_external_ref_reuses_bead() {
         .filter(|call| call.starts_with("create_bead("))
         .cloned()
         .collect();
-    assert!(create_calls.is_empty(), "got duplicate creates: {create_calls:?}");
+    assert!(
+        create_calls.is_empty(),
+        "got duplicate creates: {create_calls:?}"
+    );
 }
 
 #[test]
@@ -375,7 +408,11 @@ fn factory_pr_from_read_tier_creator_is_skipped() {
     let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
 
     assert!(adopted.is_empty());
-    assert_eq!(outcomes.len(), 1, "expected exactly one verdict: {outcomes:?}");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "expected exactly one verdict: {outcomes:?}"
+    );
     assert_eq!(outcomes[0].external_ref, "owner/repo#53");
     assert_eq!(
         outcomes[0].verdict,
@@ -390,7 +427,10 @@ fn factory_pr_from_read_tier_creator_is_skipped() {
         .filter(|call| call.starts_with("create_bead("))
         .cloned()
         .collect();
-    assert!(create_calls.is_empty(), "read-tier PR created bead: {create_calls:?}");
+    assert!(
+        create_calls.is_empty(),
+        "read-tier PR created bead: {create_calls:?}"
+    );
 }
 
 #[test]
@@ -409,7 +449,11 @@ fn fork_factory_pr_is_skipped_with_escalation_comment() {
     let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
 
     assert!(adopted.is_empty());
-    assert_eq!(outcomes.len(), 1, "expected exactly one verdict: {outcomes:?}");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "expected exactly one verdict: {outcomes:?}"
+    );
     assert_eq!(outcomes[0].external_ref, "owner/repo#54");
     assert_eq!(outcomes[0].verdict, IntakeVerdict::SkippedFork);
     let calls = tracker.calls.borrow();

@@ -156,9 +156,7 @@ pub fn normalize(
             outcomes.push(IntakeOutcome {
                 external_ref: issue.external_ref.clone(),
                 verdict: IntakeVerdict::SkippedIneligible {
-                    precondition: format!(
-                        "author_permission_below_write_tier:{permission:?}"
-                    ),
+                    precondition: format!("author_permission_below_write_tier:{permission:?}"),
                 },
             });
             continue;
@@ -281,9 +279,7 @@ pub fn normalize_labeled_prs(
             outcomes.push(IntakeOutcome {
                 external_ref: pr.external_ref.clone(),
                 verdict: IntakeVerdict::SkippedIneligible {
-                    precondition: format!(
-                        "author_permission_below_write_tier:{permission:?}"
-                    ),
+                    precondition: format!("author_permission_below_write_tier:{permission:?}"),
                 },
             });
             continue;

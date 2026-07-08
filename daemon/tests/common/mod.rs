@@ -35,6 +35,12 @@ pub struct FakeTracker {
     /// snapshot missed a ref that `br create`'s own uniqueness check
     /// correctly rejects. Value is the existing bead id to report.
     pub create_bead_duplicate_of: RefCell<Option<String>>,
+    /// jleechan-eazj: scripts a NON-duplicate `create_bead` failure for one
+    /// specific `external_ref` only (consumed once), so a multi-candidate
+    /// batch can exercise "candidate A's create_bead errors, candidate B's
+    /// does not" — the exact shape needed to prove one candidate's error no
+    /// longer starves the rest of the batch of telemetry.
+    pub create_bead_fail_for_ref: RefCell<Option<(String, String)>>,
     pub fail_next_fetch_candidates: RefCell<Option<String>>,
     pub fail_next_comment: RefCell<Option<String>>,
     pub calls: RefCell<Vec<String>>,
@@ -60,8 +66,11 @@ impl Tracker for FakeTracker {
     }
 
     fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
-        self.calls.borrow_mut().push("fetch_all_external_refs".into());
-        let refs = self.candidates
+        self.calls
+            .borrow_mut()
+            .push("fetch_all_external_refs".into());
+        let refs = self
+            .candidates
             .borrow()
             .iter()
             .filter_map(|bead| bead.external_ref.clone())
@@ -86,6 +95,25 @@ impl Tracker for FakeTracker {
                     "Error: Configuration error: External reference '{external_ref}' already exists on issue {existing_bead_id}\n"
                 ),
             });
+        }
+        // NB: clone into an owned local first — using the `.borrow()` call
+        // directly as the `if let` scrutinee extends the `Ref` guard's
+        // lifetime across the whole block (temporary lifetime extension),
+        // which panics on the `.borrow_mut()` below with "already borrowed".
+        let fail_for_ref = self.create_bead_fail_for_ref.borrow().clone();
+        if let Some((fail_ref, msg)) = fail_for_ref {
+            if fail_ref == external_ref {
+                self.create_bead_fail_for_ref.borrow_mut().take();
+                // `DaemonError::Tool` matches the real shape a generic
+                // (non-duplicate) `br create` subprocess failure takes —
+                // e.g. a malformed body/title `br` rejects for reasons
+                // unrelated to the uniqueness constraint above.
+                return Err(DaemonError::Tool {
+                    tool: "br".into(),
+                    rc: 1,
+                    stderr: msg,
+                });
+            }
         }
         let result = match self.create_bead_result.borrow().as_ref() {
             Some(Ok(id)) => Ok(id.clone()),
@@ -385,11 +413,7 @@ impl Vcs for FakeVcs {
             })
     }
 
-    fn is_remote_ahead(
-        &self,
-        branch: &str,
-        remote_sha: &str,
-    ) -> Result<bool, DaemonError> {
+    fn is_remote_ahead(&self, branch: &str, remote_sha: &str) -> Result<bool, DaemonError> {
         self.calls
             .borrow_mut()
             .push(format!("is_remote_ahead({branch},{remote_sha})"));
@@ -536,8 +560,13 @@ impl StateStore for FakeStateStore {
         Ok(self.branches.borrow().clone())
     }
 
-    fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError> {
-        self.calls.borrow_mut().push(format!("increment_active_autonomy({elapsed_secs})"));
+    fn increment_active_autonomy(
+        &self,
+        elapsed_secs: u64,
+    ) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("increment_active_autonomy({elapsed_secs})"));
         // Convenience override: mirror the new trait-level behavior of
         // `list_active_overlays` + per-row `bump_autonomy_secs`. Tests that
         // need the ci_pending pause (jleechan-54ky) should call
@@ -559,7 +588,8 @@ impl StateStore for FakeStateStore {
         self.calls.borrow_mut().push("list_active_overlays".into());
         let mut out = Vec::new();
         for overlay in self.overlays.borrow().values() {
-            if overlay.state == OverlayState::Dispatched || overlay.state == OverlayState::Attested {
+            if overlay.state == OverlayState::Dispatched || overlay.state == OverlayState::Attested
+            {
                 out.push(overlay.clone());
             }
         }
@@ -567,7 +597,9 @@ impl StateStore for FakeStateStore {
     }
 
     fn bump_autonomy_secs(&self, bead_id: &str, delta_secs: u64) -> Result<(), DaemonError> {
-        self.calls.borrow_mut().push(format!("bump_autonomy_secs({bead_id},{delta_secs})"));
+        self.calls
+            .borrow_mut()
+            .push(format!("bump_autonomy_secs({bead_id},{delta_secs})"));
         if delta_secs == 0 {
             return Ok(());
         }
@@ -611,14 +643,36 @@ impl StateStore for FakeStateStore {
             .collect())
     }
 
-    fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, _feedback_text: &str) -> Result<(), DaemonError> {
-        self.calls.borrow_mut().push(format!("save_rejection({bead_id},{attempt},{reviewer},{feedback_hash})"));
-        self.rejections.borrow_mut().insert((bead_id.to_string(), attempt), (reviewer.to_string(), feedback_hash.to_string()));
+    fn save_rejection(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+        reviewer: &str,
+        feedback_hash: &str,
+        _feedback_text: &str,
+    ) -> Result<(), DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "save_rejection({bead_id},{attempt},{reviewer},{feedback_hash})"
+        ));
+        self.rejections.borrow_mut().insert(
+            (bead_id.to_string(), attempt),
+            (reviewer.to_string(), feedback_hash.to_string()),
+        );
         Ok(())
     }
 
-    fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError> {
-        self.calls.borrow_mut().push(format!("load_rejection({bead_id},{attempt})"));
-        Ok(self.rejections.borrow().get(&(bead_id.to_string(), attempt)).cloned())
+    fn load_rejection(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+    ) -> Result<Option<(String, String)>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("load_rejection({bead_id},{attempt})"));
+        Ok(self
+            .rejections
+            .borrow()
+            .get(&(bead_id.to_string(), attempt))
+            .cloned())
     }
 }
