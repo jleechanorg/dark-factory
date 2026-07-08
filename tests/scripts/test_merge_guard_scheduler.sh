@@ -48,7 +48,7 @@ assert_not_grep() {
 # -- 1. Unit files exist ----------------------------------------------------
 SVC="$ROOT/daemon/scripts/systemd-user/dark-factory-merge-guard.service"
 TMR="$ROOT/daemon/scripts/systemd-user/dark-factory-merge-guard.timer"
-PLIST_TPL="$ROOT/daemon/launchd/ai.dark-factory.auto-merge-guard.plist.template"
+PLIST_TPL="$ROOT/daemon/launchd/opt-in/ai.dark-factory.auto-merge-guard.plist.template"
 GUARD="$ROOT/daemon/scripts/auto-merge-guard.sh"
 
 assert_file_exists "systemd service file present" "$SVC"
@@ -151,6 +151,22 @@ if [ -n "$INSTALLER" ] && [ -f "$INSTALLER" ]; then
   assert_grep "installer enables timer"               'systemctl --user enable --now' "$INSTALLER"
   assert_grep "installer references timer unit name"  'dark-factory-merge-guard\.timer' "$INSTALLER"
   assert_grep "installer handles macOS branch"        'darwin|Darwin|macos|macOS' "$INSTALLER"
+fi
+
+# -- 7. install-launchagents.sh --dry-run must NOT bootstrap merge-guard ------
+INSTALL_LAUNCHAGENTS="$ROOT/install-launchagents.sh"
+if [ -f "$INSTALL_LAUNCHAGENTS" ]; then
+  DRYRUN_OUT="$(cd "$ROOT" && "$INSTALL_LAUNCHAGENTS" --dry-run 2>&1 || true)"
+  if echo "$DRYRUN_OUT" | grep -q "auto-merge-guard"; then
+    echo "FAIL: install-launchagents.sh --dry-run references auto-merge-guard (opt-in bypass regression)"
+    echo "$DRYRUN_OUT" | grep "auto-merge-guard" | sed 's/^/    /'
+    FAIL=$((FAIL + 1))
+  else
+    echo "PASS: install-launchagents.sh --dry-run does not reference auto-merge-guard"
+    PASS=$((PASS + 1))
+  fi
+else
+  echo "SKIP: install-launchagents.sh not found at $INSTALL_LAUNCHAGENTS"
 fi
 
 # -- Summary ----------------------------------------------------------------

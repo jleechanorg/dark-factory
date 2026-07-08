@@ -29,7 +29,7 @@ fi
 SYSTEMD_USER_DIR="${SYSTEMD_USER_DIR:-$HOME/.config/systemd/user}"
 SERVICE_SRC="$REPO_ROOT/daemon/scripts/systemd-user/dark-factory-merge-guard.service"
 TIMER_SRC="$REPO_ROOT/daemon/scripts/systemd-user/dark-factory-merge-guard.timer"
-PLIST_TPL_SRC="$REPO_ROOT/daemon/launchd/ai.dark-factory.auto-merge-guard.plist.template"
+PLIST_TPL_SRC="$REPO_ROOT/daemon/launchd/opt-in/ai.dark-factory.auto-merge-guard.plist.template"
 PLIST_TARGET="$HOME/Library/LaunchAgents/ai.dark-factory.auto-merge-guard.plist"
 LOG_DIR="$HOME/Library/Logs/dark-factory"
 TIMER_NAME="dark-factory-merge-guard.timer"
