@@ -72,26 +72,42 @@ fi
 if [ -f "$SVC" ]; then
   assert_grep "service is Type=oneshot"            '^Type=oneshot$'             "$SVC"
   assert_grep "service ExecStart targets auto-merge-guard.sh" 'auto-merge-guard\.sh' "$SVC"
+  assert_grep "service defines PATH for gh/br/git" '^Environment=PATH='         "$SVC"
+  assert_grep "service unsets GITHUB_TOKEN"        '^UnsetEnvironment=GITHUB_TOKEN' "$SVC"
 fi
 if [ -f "$TMR" ]; then
   assert_grep "timer has OnUnitActiveSec"           '^OnUnitActiveSec='          "$TMR"
   assert_grep "timer Persistent=true"               '^Persistent=true$'          "$TMR"
   assert_grep "timer Unit references the service"   '^Unit=dark-factory-merge-guard\.service$' "$TMR"
   assert_grep "timer Install [Install] WantedBy=timers.target" '^WantedBy=timers\.target$' "$TMR"
+  assert_not_grep "timer has no redundant OnCalendar" '^OnCalendar=' "$TMR"
 fi
 
 # -- 4. systemd-analyze verify on both unit files (best-effort) --------------
 if command -v systemd-analyze >/dev/null 2>&1; then
   TMP="$(mktemp -d -t dark-factory-scheduler-test.XXXXXX)"
-  cp "$SVC" "$TMP/s.service" 2>/dev/null || true
-  cp "$TMR" "$TMP/s.timer"   2>/dev/null || true
-  if [ -f "$TMP/s.timer" ]; then
-    if systemd-analyze verify "$TMP/s.timer" >/dev/null 2>&1; then
+  # systemd's WorkingDirectory= requires an absolute path, so the test must
+  # render @REPO@ to the repo root the same way install_systemd_user does,
+  # otherwise verify would fail on a template-only artifact.
+  sed -e "s%@REPO@%${ROOT}%g" "$SVC" > "$TMP/dark-factory-merge-guard.service"
+  sed -e "s%@REPO@%${ROOT}%g" "$TMR" > "$TMP/dark-factory-merge-guard.timer"
+  if [ -f "$TMP/dark-factory-merge-guard.service" ]; then
+    if systemd-analyze verify "$TMP/dark-factory-merge-guard.service" >/dev/null 2>&1; then
+      echo "PASS: systemd-analyze verify passes for service"
+      PASS=$((PASS + 1))
+    else
+      echo "FAIL: systemd-analyze verify failed for service"
+      systemd-analyze verify "$TMP/dark-factory-merge-guard.service" 2>&1 | sed 's/^/    /'
+      FAIL=$((FAIL + 1))
+    fi
+  fi
+  if [ -f "$TMP/dark-factory-merge-guard.timer" ]; then
+    if systemd-analyze verify "$TMP/dark-factory-merge-guard.timer" >/dev/null 2>&1; then
       echo "PASS: systemd-analyze verify passes for timer"
       PASS=$((PASS + 1))
     else
       echo "FAIL: systemd-analyze verify failed for timer"
-      systemd-analyze verify "$TMP/s.timer" 2>&1 | sed 's/^/    /'
+      systemd-analyze verify "$TMP/dark-factory-merge-guard.timer" 2>&1 | sed 's/^/    /'
       FAIL=$((FAIL + 1))
     fi
   fi
@@ -103,8 +119,11 @@ fi
 # -- 5. launchd plist template parses (plutil or python plistlib fallback) ---
 if [ -f "$PLIST_TPL" ]; then
   RENDERED="$(mktemp -t dark-factory-plist-rendered.XXXXXX.plist)"
-  # Render @HOME@ -> a fake path so plutil sees a well-formed plist.
-  sed -e "s%@HOME@%/tmp/fake-home-for-lint%g" "$PLIST_TPL" > "$RENDERED"
+  # Render @HOME@ and @REPO@ -> fake paths so plutil sees a well-formed plist
+  # (working-directory + program-arguments both need absolute paths to lint).
+  sed -e "s%@HOME@%/tmp/fake-home-for-lint%g" \
+      -e "s%@REPO@%/tmp/fake-repo-for-lint%g" \
+      "$PLIST_TPL" > "$RENDERED"
   if command -v plutil >/dev/null 2>&1; then
     if plutil -lint "$RENDERED" >/dev/null 2>&1; then
       echo "PASS: plutil -lint passes for rendered plist"
@@ -126,6 +145,9 @@ if [ -f "$PLIST_TPL" ]; then
   assert_grep     "plist StartInterval=60"         '^[[:space:]]*<integer>60</integer>[[:space:]]*$' "$PLIST_TPL"
   assert_grep     "plist RunAtLoad present"        '^[[:space:]]*<key>RunAtLoad</key>' "$PLIST_TPL"
   assert_grep     "plist @HOME@ is template"       '@HOME@' "$PLIST_TPL"
+  assert_grep     "plist @REPO@ is template"       '@REPO@' "$PLIST_TPL"
+  assert_grep     "plist WorkingDirectory key"     '<key>WorkingDirectory</key>' "$PLIST_TPL"
+  assert_not_grep "plist no hardcoded projects/dark-factory" 'projects/dark-factory' "$PLIST_TPL"
   assert_grep     "plist points at auto-merge-guard.sh" 'auto-merge-guard\.sh' "$PLIST_TPL"
   assert_not_grep "plist no leftover @TICK_INTERVAL@" '@TICK_INTERVAL@' "$PLIST_TPL"
 fi
@@ -151,6 +173,10 @@ if [ -n "$INSTALLER" ] && [ -f "$INSTALLER" ]; then
   assert_grep "installer enables timer"               'systemctl --user enable --now' "$INSTALLER"
   assert_grep "installer references timer unit name"  'dark-factory-merge-guard\.timer' "$INSTALLER"
   assert_grep "installer handles macOS branch"        'darwin|Darwin|macos|macOS' "$INSTALLER"
+  assert_grep "installer dry-run routes mkdir via run()" 'run mkdir -p "\$\(dirname "\$PLIST_TARGET"\)"' "$INSTALLER"
+  assert_grep "installer renders @REPO@ in plist"     's%@REPO@%' "$INSTALLER"
+  assert_grep "installer calls ensure_log_dir for macOS" 'ensure_log_dir' "$INSTALLER"
+  assert_not_grep "installer header does not claim exit 4" '4  systemd --user install failed' "$INSTALLER"
 fi
 
 # -- 7. install-launchagents.sh --dry-run must NOT bootstrap merge-guard ------
@@ -167,6 +193,22 @@ if [ -f "$INSTALL_LAUNCHAGENTS" ]; then
   fi
 else
   echo "SKIP: install-launchagents.sh not found at $INSTALL_LAUNCHAGENTS"
+fi
+
+# -- 8. install-merge-guard.sh --dry-run must not perform real filesystem ops --
+# We only smoke-test on Linux (systemd path) and skip on macOS so the
+# parse-test stays platform-neutral. The plist render is verified separately
+# by the `installer dry-run routes mkdir via run()` grep above.
+if [ -n "$INSTALLER" ] && [ -f "$INSTALLER" ] && [ "$(uname -s)" = "Linux" ]; then
+  DRYRUN_INSTALLER_OUT="$("$INSTALLER" --dry-run 2>&1 || true)"
+  if echo "$DRYRUN_INSTALLER_OUT" | grep -q "\[dry-run\]"; then
+    echo "PASS: installer --dry-run reports actions instead of running them"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL: installer --dry-run did not emit [dry-run] markers"
+    echo "$DRYRUN_INSTALLER_OUT" | sed 's/^/    /'
+    FAIL=$((FAIL + 1))
+  fi
 fi
 
 # -- Summary ----------------------------------------------------------------

@@ -24,7 +24,9 @@
   Notes:
     - StartInterval=60s: 1-min cadence; the guard's per-hour budget (default 8)
       caps actual merges regardless of timer frequency.
-    - @HOME@ is substituted by install-launchagents.sh from $HOME at install.
+    - @HOME@ is substituted from $HOME and @REPO@ is substituted from the
+      script's REPO_ROOT by scripts/install-merge-guard.sh at render time, so
+      the rendered plist always points at the current checkout.
     - Operator opt-in: install-merge-guard.sh renders the plist on macOS but
       does NOT bootstrap it automatically.
 -->
@@ -33,11 +35,14 @@
     <key>Label</key>
     <string>ai.dark-factory.auto-merge-guard</string>
 
+    <key>WorkingDirectory</key>
+    <string>@REPO@</string>
+
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>@HOME@/projects/dark-factory/daemon/launchd/launchd-wrapper.sh</string>
-        <string>@HOME@/projects/dark-factory/daemon/scripts/auto-merge-guard.sh</string>
+        <string>@REPO@/daemon/launchd/launchd-wrapper.sh</string>
+        <string>@REPO@/daemon/scripts/auto-merge-guard.sh</string>
     </array>
 
     <key>StartInterval</key>

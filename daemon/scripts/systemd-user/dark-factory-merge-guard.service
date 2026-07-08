@@ -9,6 +9,12 @@ WorkingDirectory=@REPO@
 ExecStart=/bin/bash @REPO@/daemon/scripts/auto-merge-guard.sh
 Environment=HOME=%h
 Environment=AFD_LOG=%h/Library/Logs/dark-factory/daemon.jsonl
+# systemd's minimal user-unit environment does not define PATH, so gh / br /
+# git / python3 (the guard's only external dependencies) would be unresolvable
+# on every tick. Set the same default the systemd user manager inherits from
+# /etc/environment on this host; auto-merge-guard.sh itself relies on absolute
+# paths via its own PATH augmentation (see daemon/scripts/auto-merge-guard.sh).
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Strip any shell-exported GITHUB_TOKEN/GH_TOKEN before the service runs so the
 # user's keyring auth (gh CLI's default credential source on this host) takes
 # effect for gh pr list / gh pr view / gh pr merge calls inside the guard.

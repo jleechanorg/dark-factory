@@ -15,7 +15,6 @@
 #   0  success
 #   2  invalid argument
 #   3  systemd user session not available (only on Linux install path)
-#   4  systemd --user install failed (only on Linux install path)
 
 set -euo pipefail
 
@@ -41,7 +40,7 @@ while [ "$#" -gt 0 ]; do
         --dry-run)   DRY_RUN=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
         -h|--help)
-            sed -n '2,16p' "$0"
+            sed -n '2,15p' "$0"
             exit 0
             ;;
         *)
@@ -112,14 +111,15 @@ uninstall_systemd_user() {
 }
 
 render_macos_plist() {
-    if ! mkdir -p "$(dirname "$PLIST_TARGET")" 2>/dev/null; then
-        run mkdir -p "$(dirname "$PLIST_TARGET")"
-    fi
+    # All filesystem mutations route through run() so --dry-run is safe.
+    run mkdir -p "$(dirname "$PLIST_TARGET")"
+    ensure_log_dir
     if [ "$DRY_RUN" -eq 1 ]; then
-        printf '[dry-run] sed -e s%%@HOME@%%%s%%g %s > %s\n' \
-            "$HOME" "$PLIST_TPL_SRC" "$PLIST_TARGET"
+        printf '[dry-run] sed -e s%%@HOME@%%%s%%g -e s%%@REPO@%%%s%%g %s > %s\n' \
+            "$HOME" "$REPO_ROOT" "$PLIST_TPL_SRC" "$PLIST_TARGET"
     else
-        sed -e "s%@HOME@%${HOME}%g" "$PLIST_TPL_SRC" > "$PLIST_TARGET"
+        sed -e "s%@HOME@%${HOME}%g" -e "s%@REPO@%${REPO_ROOT}%g" \
+            "$PLIST_TPL_SRC" > "$PLIST_TARGET"
         chmod 0644 "$PLIST_TARGET"
     fi
     echo "Rendered macOS plist (NOT bootstrapped — operator opt-in): $PLIST_TARGET"
