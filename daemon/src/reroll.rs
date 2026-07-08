@@ -182,26 +182,68 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
             return Ok(RerollOutcome::Held(format!("failed to stop session: {e}")));
         }
 
+        // Spec §4.2.6: quiescence requires BOTH a terminal process state AND a
+        // stable branch HEAD SHA before the daemon proceeds — this is the
+        // guard against the race where an AO worker pushes a final commit
+        // during the confirmation window, leaving a half-pushed branch. A
+        // process-only check (the old implementation here) cannot detect
+        // that race at all: `is_quiescent()` can report a terminal AO
+        // process while a `git push` from that same worker is still landing
+        // on the remote, or lands moments later. HEAD SHA stability is
+        // therefore tracked independently: on each poll where the process IS
+        // terminal, read `head_sha(branch)` and require it to match the
+        // previous terminal-poll's reading (two consecutive terminal+matching
+        // reads) before declaring quiescence confirmed. Any non-terminal poll
+        // OR any HEAD SHA change resets the stability streak — a mid-window
+        // push is treated as "still not settled", never as a false success.
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(60);
-        let mut quiescent = false;
+        let poll_interval = std::time::Duration::from_millis(500);
+        let mut confirmed = false;
+        let mut last_stable_head: Option<String> = None;
         while start.elapsed() < timeout {
-            match deps.sessions.is_quiescent(&session_id) {
-                Ok(true) => {
-                    quiescent = true;
-                    break;
-                }
-                Ok(false) => {}
+            let is_terminal = match deps.sessions.is_quiescent(&session_id) {
+                Ok(v) => v,
                 Err(e) => {
                     bead.state = OverlayState::HumanHeld;
                     deps.store.save(bead)?;
                     return Ok(RerollOutcome::Held(format!("quiescence check failed: {e}")));
                 }
+            };
+
+            if is_terminal {
+                let head = match deps.vcs.head_sha(branch) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        bead.state = OverlayState::HumanHeld;
+                        deps.store.save(bead)?;
+                        return Ok(RerollOutcome::Held(format!("quiescence check failed: {e}")));
+                    }
+                };
+                match &last_stable_head {
+                    Some(prev) if *prev == head => {
+                        confirmed = true;
+                        break;
+                    }
+                    _ => {
+                        // First terminal+readable observation, or the HEAD
+                        // SHA moved since the last terminal observation (a
+                        // push landed mid-window) — (re)start the stability
+                        // streak rather than trusting a single sample.
+                        last_stable_head = Some(head);
+                    }
+                }
+            } else {
+                // Process left/never reached terminal state — any HEAD SHA
+                // stability streak observed while it looked terminal is no
+                // longer trustworthy (e.g. it resumed and could push again).
+                last_stable_head = None;
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            std::thread::sleep(poll_interval);
         }
 
-        if !quiescent {
+        if !confirmed {
             bead.state = OverlayState::HumanHeld;
             deps.store.save(bead)?;
             return Ok(RerollOutcome::Held("quiescence timeout exceeded (60s)".into()));

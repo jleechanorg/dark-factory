@@ -248,6 +248,17 @@ pub struct FakeSessions {
     /// daemon believes it dispatched (the `wa-3004` contamination
     /// scenario).
     pub branch_for: RefCell<HashMap<String, String>>,
+    /// Real-wall-clock quiescence scripting for the reroll quiescence-timeout
+    /// race tests (jleechan quiescence-timeout validation): when set,
+    /// `is_quiescent` ignores the static `quiescent` flag and instead returns
+    /// `Ok(Instant::now() >= terminal_at)` — i.e. the fake AO process reports
+    /// "not terminal" before this real instant and "terminal" from then on.
+    /// `None` preserves the original static-flag behavior so every
+    /// pre-existing test is unaffected.
+    pub terminal_at: RefCell<Option<std::time::Instant>>,
+    /// Optional error to return from `is_quiescent` (models the "quiescence
+    /// check failed" error path independent of the timeout path).
+    pub quiescence_check_error: RefCell<Option<String>>,
 }
 
 impl Default for FakeSessions {
@@ -261,6 +272,8 @@ impl Default for FakeSessions {
             spawn_prompts: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
             branch_for: RefCell::new(HashMap::new()),
+            terminal_at: RefCell::new(None),
+            quiescence_check_error: RefCell::new(None),
         }
     }
 }
@@ -285,6 +298,22 @@ impl FakeSessions {
         self.branch_for
             .borrow_mut()
             .insert(session_id.to_string(), branch.to_string());
+    }
+
+    /// Script the fake AO process to report "not terminal" (`is_quiescent`
+    /// returns `Ok(false)`) until real wall-clock instant `at`, and
+    /// "terminal" (`Ok(true)`) from `at` onward. Passing an instant in the
+    /// past means "terminal immediately". Passing an instant far in the
+    /// future (beyond the quiescence timeout under test) simulates a session
+    /// that never settles — the genuine mid-push-race case.
+    pub fn set_terminal_at(&self, at: std::time::Instant) {
+        *self.terminal_at.borrow_mut() = Some(at);
+    }
+
+    /// Script `is_quiescent` to return this error on every call, modeling an
+    /// AO status-query failure independent of the timeout path.
+    pub fn fail_quiescence_check(&self, message: &str) {
+        *self.quiescence_check_error.borrow_mut() = Some(message.to_string());
     }
 }
 
@@ -337,6 +366,16 @@ impl Sessions for FakeSessions {
         self.calls
             .borrow_mut()
             .push(format!("is_quiescent({})", id.0));
+        if let Some(msg) = self.quiescence_check_error.borrow().as_ref() {
+            return Err(DaemonError::Tool {
+                tool: "ao".into(),
+                rc: 1,
+                stderr: msg.clone(),
+            });
+        }
+        if let Some(at) = *self.terminal_at.borrow() {
+            return Ok(std::time::Instant::now() >= at);
+        }
         Ok(self.quiescent)
     }
 
@@ -365,6 +404,19 @@ pub struct FakeVcs {
     /// without ever touching a real `git` subprocess.
     pub fail_push_fix_commit_for: RefCell<Vec<String>>,
     pub calls: RefCell<Vec<String>>,
+    /// Real-wall-clock HEAD SHA scripting for the reroll quiescence-timeout
+    /// race tests: `(branch, [(instant, sha), ...])` sorted ascending by
+    /// instant. `head_sha(branch)` returns the SHA of the last entry whose
+    /// instant is `<= Instant::now()`; if no entry has elapsed yet, or the
+    /// branch has no schedule, falls back to the static `heads` map. This
+    /// lets a test simulate "the worker pushes a final commit at t=Xs",
+    /// changing what `head_sha` reports mid-quiescence-poll without any
+    /// fake/injected clock in the code under test — `reroll::execute` reads
+    /// real `Instant::now()` throughout.
+    pub head_sha_schedule: RefCell<HashMap<String, Vec<(std::time::Instant, String)>>>,
+    /// Optional error to return from `head_sha` on every call for a given
+    /// branch, modeling a `git rev-parse` failure mid-quiescence-check.
+    pub fail_head_sha_for: RefCell<HashMap<String, String>>,
 }
 
 impl FakeVcs {
@@ -376,6 +428,24 @@ impl FakeVcs {
         self.fail_push_fix_commit_for
             .borrow_mut()
             .push(branch.to_string());
+    }
+
+    /// Script `head_sha(branch)` to return `sha_before` until real instant
+    /// `at`, then `sha_after` from `at` onward — i.e. a single simulated
+    /// push landing at wall-clock instant `at`. Call multiple times with
+    /// ascending instants to script more than one push.
+    pub fn schedule_head_sha(&self, branch: &str, at: std::time::Instant, sha: &str) {
+        self.head_sha_schedule
+            .borrow_mut()
+            .entry(branch.to_string())
+            .or_default()
+            .push((at, sha.to_string()));
+    }
+
+    pub fn fail_head_sha_for(&self, branch: &str, message: &str) {
+        self.fail_head_sha_for
+            .borrow_mut()
+            .insert(branch.to_string(), message.to_string());
     }
 }
 
@@ -403,6 +473,22 @@ impl Vcs for FakeVcs {
 
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError> {
         self.calls.borrow_mut().push(format!("head_sha({branch})"));
+        if let Some(msg) = self.fail_head_sha_for.borrow().get(branch) {
+            return Err(DaemonError::Tool {
+                tool: "git".into(),
+                rc: 1,
+                stderr: msg.clone(),
+            });
+        }
+        if let Some(schedule) = self.head_sha_schedule.borrow().get(branch) {
+            let now = std::time::Instant::now();
+            if let Some((_, sha)) = schedule.iter().rfind(|(at, _)| *at <= now) {
+                return Ok(sha.clone());
+            }
+            // Schedule exists but nothing has elapsed yet — fall through to
+            // the static map only if present, otherwise this is a genuine
+            // "no head yet" scripting error (test forgot a baseline entry).
+        }
         self.heads
             .get(branch)
             .cloned()

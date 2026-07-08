@@ -1,4 +1,5 @@
 use std::hash::Hasher;
+use std::time::{Duration, Instant};
 mod common;
 
 use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker, FakeVcs};
@@ -560,4 +561,352 @@ fn test_reroll_adopted_push_failure_parks_human_held() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Stage-2 prerequisite #3 (quiescence timeout validated): four adversarial
+/// race-condition tests against `reroll::execute`'s quiescence-confirmation
+/// loop (reroll.rs, "Stop AO session and wait for quiescence" section), run
+/// with REAL wall-clock timing against the actual production
+/// `Duration::from_secs(60)` timeout and `500ms` poll interval hardcoded in
+/// `reroll::execute` — not an injected/fake clock — so a wrong constant,
+/// unit, or off-by-one in that wiring would actually fail these tests, not
+/// just a logic-level unit test with a mocked clock. Each test takes real
+/// wall-clock seconds to run by design; see individual doc comments for
+/// expected duration.
+mod quiescence_timeout_races {
+    use super::*;
+
+    fn race_test_bead(bead_id: &str, branch: &str) -> BeadOverlay {
+        BeadOverlay {
+            bead_id: bead_id.into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(900),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+        }
+    }
+
+    /// Case A — genuine mid-push race that NEVER settles: the fake AO
+    /// session reports "not terminal" for the entire 60s window (models a
+    /// worker that is actively pushing / retrying throughout). Expect: the
+    /// hard 60s timeout fires, `RerollOutcome::Held("quiescence timeout
+    /// exceeded (60s)")`, bead parks HUMAN_HELD, and — critically — the
+    /// daemon must NOT proceed to fabricate a fresh branch or close the old
+    /// PR on top of an unconfirmed base. Real wall-clock duration: ~60s.
+    #[test]
+    fn case_a_never_settles_timeout_fires_and_blocks_branch_creation() {
+        let scm = FakeScm::new();
+        let sessions = FakeSessions::new();
+        let mut vcs = FakeVcs::new();
+        vcs.heads.insert("main".into(), "base-sha-a".into());
+        vcs.heads
+            .insert("factory/bead-race-a-r1".into(), "head-sha-a".into());
+        let store = FakeStateStore::new();
+        let llm = FakeLlm::new();
+        let cfg = test_cfg();
+        let telemetry_log = std::env::temp_dir().join("afd_quiescence_case_a_telemetry.jsonl");
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let mut bead = race_test_bead("bead-race-a", "factory/bead-race-a-r1");
+        store.save(&bead).unwrap();
+
+        // Never terminal within any realistic test window.
+        sessions.set_terminal_at(Instant::now() + Duration::from_secs(3600));
+
+        let deps = RerollDeps {
+            scm: &scm,
+            sessions: &sessions,
+            vcs: &vcs,
+            store: &store,
+            llm: &llm,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            reviewer: "skeptic".into(),
+            review_text: "mid-push race case A".into(),
+        };
+
+        let start = Instant::now();
+        let outcome = reroll::execute(&deps, &mut bead).unwrap();
+        let elapsed = start.elapsed();
+
+        match outcome {
+            RerollOutcome::Held(reason) => {
+                assert!(
+                    reason.contains("quiescence timeout exceeded"),
+                    "expected timeout Held reason, got: {reason}"
+                );
+            }
+            other => panic!("expected Held(timeout), got {:?}", other),
+        }
+
+        // Proves the REAL 60s constant is wired (not e.g. 60ms or 6000ms):
+        // an aborted attempt must take roughly 60 real seconds, not near-zero.
+        assert!(
+            elapsed >= Duration::from_secs(58) && elapsed <= Duration::from_secs(65),
+            "expected ~60s real elapsed time for the hard timeout, got {elapsed:?}"
+        );
+
+        let updated = store.load("bead-race-a").unwrap().unwrap();
+        assert_eq!(updated.state, OverlayState::HumanHeld);
+        // Never proceeded past quiescence: no fresh branch, old PR untouched.
+        let vcs_calls = vcs.calls.borrow();
+        assert!(
+            vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")),
+            "must not fabricate a branch when quiescence never confirmed: {vcs_calls:?}"
+        );
+        let scm_calls = scm.calls.borrow();
+        assert!(
+            scm_calls.iter().all(|c| !c.starts_with("close_pr(")),
+            "must not close the old PR when quiescence never confirmed: {scm_calls:?}"
+        );
+
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+
+    /// Case B — session settles well under the timeout (~50s in). Expect a
+    /// normal successful re-roll, not a false-positive abort. Real
+    /// wall-clock duration: ~50-51s.
+    #[test]
+    fn case_b_settles_under_timeout_succeeds() {
+        let scm = FakeScm::new();
+        let sessions = FakeSessions::new();
+        let mut vcs = FakeVcs::new();
+        vcs.heads.insert("main".into(), "base-sha-b".into());
+        vcs.heads
+            .insert("factory/bead-race-b-r1".into(), "head-sha-b".into());
+        let store = FakeStateStore::new();
+        let llm = FakeLlm::new();
+        *llm.response.borrow_mut() = Some(Ok(
+            r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into(),
+        ));
+        let mut cfg = test_cfg();
+        cfg.spec_dir = std::env::temp_dir()
+            .join("afd_quiescence_case_b_spec")
+            .to_string_lossy()
+            .to_string();
+        let spec_dir = std::path::Path::new(&cfg.spec_dir);
+        let _ = std::fs::remove_dir_all(spec_dir);
+        std::fs::create_dir_all(spec_dir).unwrap();
+        let telemetry_log = std::env::temp_dir().join("afd_quiescence_case_b_telemetry.jsonl");
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let mut bead = race_test_bead("bead-race-b", "factory/bead-race-b-r1");
+        store.save(&bead).unwrap();
+
+        // Terminal at t=50s — squarely in the "45-55s" boundary band, still
+        // well inside the 60s window. HEAD SHA is static (no schedule), so
+        // once terminal, the very next two polls read the same value and
+        // confirm.
+        sessions.set_terminal_at(Instant::now() + Duration::from_secs(50));
+
+        let deps = RerollDeps {
+            scm: &scm,
+            sessions: &sessions,
+            vcs: &vcs,
+            store: &store,
+            llm: &llm,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            reviewer: "skeptic".into(),
+            review_text: "settles under timeout case B".into(),
+        };
+
+        let start = Instant::now();
+        let outcome = reroll::execute(&deps, &mut bead).unwrap();
+        let elapsed = start.elapsed();
+
+        match outcome {
+            RerollOutcome::Rerolled { new_branch } => {
+                assert_eq!(new_branch, "factory/bead-race-b-r2");
+            }
+            other => panic!(
+                "expected Rerolled (not a false-positive abort), got {:?}",
+                other
+            ),
+        }
+        assert!(
+            elapsed >= Duration::from_secs(50) && elapsed < Duration::from_secs(58),
+            "expected confirmation shortly after the t=50s settle point and well under the \
+             60s timeout, got {elapsed:?}"
+        );
+
+        let updated = store.load("bead-race-b").unwrap().unwrap();
+        assert_eq!(updated.state, OverlayState::Recovery);
+
+        std::fs::remove_dir_all(spec_dir).ok();
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+
+    /// Case C — session settles just OVER the timeout (~61s in, i.e. AFTER
+    /// the 60s deadline has already elapsed). Expect the abort — boundary
+    /// correctness, not just "eventually true". Real wall-clock duration:
+    /// ~60s (the loop exits at the 60s deadline, never observing the
+    /// terminal state that only arrives at 61s).
+    #[test]
+    fn case_c_settles_just_over_timeout_aborts() {
+        let scm = FakeScm::new();
+        let sessions = FakeSessions::new();
+        let mut vcs = FakeVcs::new();
+        vcs.heads.insert("main".into(), "base-sha-c".into());
+        vcs.heads
+            .insert("factory/bead-race-c-r1".into(), "head-sha-c".into());
+        let store = FakeStateStore::new();
+        let llm = FakeLlm::new();
+        let cfg = test_cfg();
+        let telemetry_log = std::env::temp_dir().join("afd_quiescence_case_c_telemetry.jsonl");
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let mut bead = race_test_bead("bead-race-c", "factory/bead-race-c-r1");
+        store.save(&bead).unwrap();
+
+        // Terminal only at t=61s — one second past the hard deadline.
+        sessions.set_terminal_at(Instant::now() + Duration::from_secs(61));
+
+        let deps = RerollDeps {
+            scm: &scm,
+            sessions: &sessions,
+            vcs: &vcs,
+            store: &store,
+            llm: &llm,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            reviewer: "skeptic".into(),
+            review_text: "settles just over timeout case C".into(),
+        };
+
+        let start = Instant::now();
+        let outcome = reroll::execute(&deps, &mut bead).unwrap();
+        let elapsed = start.elapsed();
+
+        match outcome {
+            RerollOutcome::Held(reason) => {
+                assert!(
+                    reason.contains("quiescence timeout exceeded"),
+                    "expected timeout Held reason, got: {reason}"
+                );
+            }
+            other => panic!(
+                "expected Held(timeout) for a settle-just-past-deadline session, got {:?}",
+                other
+            ),
+        }
+        assert!(
+            elapsed >= Duration::from_secs(58) && elapsed < Duration::from_secs(61),
+            "the loop must exit at the ~60s deadline itself, before ever observing the t=61s \
+             terminal state, got {elapsed:?}"
+        );
+
+        let updated = store.load("bead-race-c").unwrap().unwrap();
+        assert_eq!(updated.state, OverlayState::HumanHeld);
+
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+
+    /// Case D — the actual race from the spec's own rationale: the AO
+    /// process is ALREADY terminal from t=0 (it exited quickly), but the
+    /// worker's `git push` for its final commit is still landing — the
+    /// branch's HEAD SHA changes partway through the confirmation window
+    /// (at ~250ms, between the 1st poll at ~0ms and the 2nd poll at
+    /// ~500ms). Expect: the daemon must NOT declare success off the stale
+    /// pre-push SHA; it must detect the SHA change as non-stability, keep
+    /// polling, and only confirm once the POST-push SHA has itself been
+    /// observed unchanged across two consecutive polls. This is exactly the
+    /// class of bug the missing HEAD-SHA check (fixed alongside these
+    /// tests) would produce a false positive on. Real wall-clock duration:
+    /// ~1-1.5s — the race resolves quickly; only the boundary cases A-C
+    /// need the full 60s window.
+    #[test]
+    fn case_d_push_lands_mid_poll_is_detected_not_falsely_confirmed() {
+        let scm = FakeScm::new();
+        let sessions = FakeSessions::new();
+        let mut vcs = FakeVcs::new();
+        vcs.heads.insert("main".into(), "base-sha-d".into());
+        let branch = "factory/bead-race-d-r1";
+        let store = FakeStateStore::new();
+        let llm = FakeLlm::new();
+        *llm.response.borrow_mut() = Some(Ok(
+            r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into(),
+        ));
+        let mut cfg = test_cfg();
+        cfg.spec_dir = std::env::temp_dir()
+            .join("afd_quiescence_case_d_spec")
+            .to_string_lossy()
+            .to_string();
+        let spec_dir = std::path::Path::new(&cfg.spec_dir);
+        let _ = std::fs::remove_dir_all(spec_dir);
+        std::fs::create_dir_all(spec_dir).unwrap();
+        let telemetry_log = std::env::temp_dir().join("afd_quiescence_case_d_telemetry.jsonl");
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let mut bead = race_test_bead("bead-race-d", branch);
+        store.save(&bead).unwrap();
+
+        // AO process already exited — terminal immediately.
+        sessions.set_terminal_at(Instant::now() - Duration::from_millis(1));
+
+        // But the branch HEAD SHA is still "sha-mid-push" until t=250ms
+        // (between the 1st poll at ~0ms and the 2nd poll at ~500ms), then
+        // becomes the final "sha-final" for good — models the worker's push
+        // landing exactly inside the confirmation window.
+        let t0 = Instant::now();
+        vcs.schedule_head_sha(branch, t0, "sha-mid-push");
+        vcs.schedule_head_sha(branch, t0 + Duration::from_millis(250), "sha-final");
+
+        let deps = RerollDeps {
+            scm: &scm,
+            sessions: &sessions,
+            vcs: &vcs,
+            store: &store,
+            llm: &llm,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            reviewer: "skeptic".into(),
+            review_text: "push lands mid-poll case D".into(),
+        };
+
+        let outcome = reroll::execute(&deps, &mut bead).unwrap();
+
+        match outcome {
+            RerollOutcome::Rerolled { new_branch } => {
+                assert_eq!(new_branch, "factory/bead-race-d-r2");
+            }
+            other => panic!(
+                "expected eventual Rerolled success once the post-push SHA settled, got {:?}",
+                other
+            ),
+        }
+
+        // The crux of the proof: the quiescence loop must have actually
+        // polled `head_sha(branch)` more than once (>= 3: t=0 reads
+        // "sha-mid-push", t=0.5s reads "sha-final" — a MISMATCH resetting
+        // the streak, t=1.0s reads "sha-final" again — confirms). A
+        // process-only check (the pre-fix behavior) would never call
+        // `head_sha` in this loop at all, and would have confirmed instantly
+        // at t=0 on the stale pre-push value.
+        let head_sha_polls = vcs
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| c.as_str() == format!("head_sha({branch})"))
+            .count();
+        assert!(
+            head_sha_polls >= 3,
+            "expected the mismatch at t=0.5s to force at least a 3rd poll before confirming \
+             (saw a stale value, a changed value, then a re-confirmed value), got \
+             {head_sha_polls} head_sha({branch}) calls: {:?}",
+            vcs.calls.borrow()
+        );
+
+        let updated = store.load("bead-race-d").unwrap().unwrap();
+        assert_eq!(updated.state, OverlayState::Recovery);
+
+        std::fs::remove_dir_all(spec_dir).ok();
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
 }
