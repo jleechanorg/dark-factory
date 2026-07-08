@@ -427,6 +427,7 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+                is_adopted: false,
             })
             .unwrap();
     }
@@ -532,6 +533,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
             pr_number: None,
             branch: Some("factory/bead-1-r1".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
 
@@ -591,6 +593,7 @@ fn test_autonomy_budget_warning_crossing() {
             pr_number: None,
             branch: Some("factory/bead-2-r1".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
 
@@ -644,6 +647,7 @@ fn test_wedge_detection_dispatched_coder_silent() {
             pr_number: None,
             branch: Some("factory/bead-silent-r1".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
 
@@ -702,6 +706,7 @@ fn test_wedge_detection_attested_session_stalled() {
             pr_number: Some(42),
             branch: Some("factory/bead-stalled-r1".into()),
             session_id: Some("session-abc123yz".into()),
+            is_adopted: false,
         },
     );
 
@@ -791,6 +796,7 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             pr_number: Some(99),
             branch: Some("factory/bead-ubas-r1".into()),
             session_id: Some("session-ubas-1".into()),
+            is_adopted: false,
         },
     );
 
@@ -901,6 +907,7 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             pr_number: Some(101),
             branch: Some("factory/bead-genuinely-stalled-r1".into()),
             session_id: Some("session-stuck-1".into()),
+            is_adopted: false,
         },
     );
 
@@ -987,6 +994,7 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             pr_number: Some(202),
             branch: Some("factory/bead-local-ahead-r1".into()),
             session_id: Some("session-local-ahead-1".into()),
+            is_adopted: false,
         },
     );
 
@@ -1096,6 +1104,7 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             pr_number: Some(203),
             branch: Some("factory/bead-diverged-r1".into()),
             session_id: Some("session-diverged-1".into()),
+            is_adopted: false,
         },
     );
 
@@ -1424,6 +1433,7 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
             pr_number: Some(111),
             branch: Some("factory/existing-bead-r1".into()),
             session_id: Some("sess-existing".into()),
+            is_adopted: false,
         })
         .unwrap();
     store
@@ -1671,6 +1681,235 @@ fn adopted_non_green_pr_parks_human_held_with_v1_escalation() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// bead jleechan-tfs1, requirement (a) + (c), full pipeline (Stage 2): a
+/// red-gate reroll on an adopted PR pushes an append-only fix commit to the
+/// EXISTING contributor branch via `run_tick`'s real intake -> verifier ->
+/// reroll wiring (not a direct `reroll::execute` call — this proves the
+/// `is_adopted` flag actually survives the round trip through
+/// `tick::run_slow_tier`'s adoption block, `StateStore::save`/`load`, and
+/// back into `tick::run_fast_tier`'s reroll dispatch). The PR stays open,
+/// branch registry is unchanged, and no force-push/rebase/close_pr ever
+/// happens.
+#[test]
+fn adopted_red_pr_stage2_reroll_pushes_fix_commit_leaves_pr_open() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 706,
+        title: "Adopted red PR (stage 2)".into(),
+        body: "already has a non-green branch".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#706".into(),
+        head_ref_name: "alice/my-cool-feature".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    let mut snapshot = qdw_green_snapshot(
+        706,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+        }],
+    );
+    snapshot.ci_success = false;
+    snapshot.ci_status = "failure".into();
+    scm.pr_snapshots.insert(706, snapshot);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2; // Stage 2: actually execute reroll() rather than just recording the verdict
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_adopted_stage2_success.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("adopted red PR stage2 reroll should succeed");
+
+    assert_eq!(summary.beads_created, 1);
+    assert_eq!(summary.gates_assessed, 1);
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "a successful append-only push must not park the bead"
+    );
+
+    let overlay = store.load("fake-bead-1").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::Attested);
+    assert_eq!(overlay.attempt, 2);
+    assert_eq!(
+        overlay.pr_number,
+        Some(706),
+        "PR must stay open under the same number"
+    );
+    assert_eq!(overlay.branch.as_deref(), Some("alice/my-cool-feature"));
+    assert!(overlay.is_adopted);
+
+    assert_eq!(
+        store.bead_id_for_branch("alice/my-cool-feature").unwrap(),
+        Some("fake-bead-1".into())
+    );
+    assert_eq!(
+        store.branches.borrow().as_slice(),
+        &["alice/my-cool-feature"],
+        "no fabricated replacement branch should be registered"
+    );
+
+    let vcs_calls = vcs.calls.borrow();
+    assert!(
+        vcs_calls
+            .iter()
+            .any(|c| c.starts_with("push_fix_commit(alice/my-cool-feature,")),
+        "adopted stage-2 reroll must push a fix commit to the existing branch: {vcs_calls:?}"
+    );
+    assert!(
+        vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")),
+        "adopted stage-2 reroll must never fabricate a replacement branch: {vcs_calls:?}"
+    );
+    assert!(
+        vcs_calls
+            .iter()
+            .all(|c| !c.contains("force") && !c.contains("rebase")),
+        "adopted stage-2 reroll must never force-push or rebase: {vcs_calls:?}"
+    );
+
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls.iter().all(|c| !c.contains("close")),
+        "original PR must never be closed by adopted stage-2 remediation: {tracker_calls:?}"
+    );
+    assert!(
+        tracker_calls.iter().any(|c| {
+            c.contains("comment_external(owner/repo#706") && c.contains("remediation commit")
+        }),
+        "adopted stage-2 success should post a status comment: {tracker_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// bead jleechan-tfs1, requirement (d), full pipeline (Stage 2): when the
+/// append-only push genuinely can't land (scripted as a non-fast-forward
+/// rejection — the real-world case is a remote that diverged or a base
+/// conflict needing a rebase), the bead must be parked `HUMAN_HELD` with an
+/// escalation comment actually posted on the PR (via
+/// `tick::post_scm_comment_by_bead_id` -> `Tracker::comment_external`) —
+/// not a silent failure, and never a force-push/rebase fallback.
+#[test]
+fn adopted_red_pr_stage2_reroll_append_only_conflict_parks_human_held_with_escalation() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 707,
+        title: "Adopted red PR (stage 2 conflict)".into(),
+        body: "already has a non-green branch".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#707".into(),
+        head_ref_name: "alice/my-conflicted-feature".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    let mut snapshot = qdw_green_snapshot(
+        707,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+        }],
+    );
+    snapshot.ci_success = false;
+    snapshot.ci_status = "failure".into();
+    scm.pr_snapshots.insert(707, snapshot);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    let vcs = FakeVcs::new();
+    vcs.fail_push_fix_commit_for("alice/my-conflicted-feature");
+    let telemetry_log = std::env::temp_dir().join("afd_adopted_stage2_conflict.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("adopted red PR stage2 append-only failure should park, not error");
+
+    assert_eq!(summary.beads_parked_human_held, 1);
+
+    let overlay = store.load("fake-bead-1").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        overlay.pr_number,
+        Some(707),
+        "PR number must be left in place even on a failed remediation attempt"
+    );
+    assert_eq!(overlay.branch.as_deref(), Some("alice/my-conflicted-feature"));
+
+    let vcs_calls = vcs.calls.borrow();
+    assert!(
+        vcs_calls
+            .iter()
+            .any(|c| c.starts_with("push_fix_commit(alice/my-conflicted-feature,")),
+        "must have attempted the append-only push before parking: {vcs_calls:?}"
+    );
+    assert!(
+        vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")),
+        "a failed append-only push must never fall back to fabricating a branch: {vcs_calls:?}"
+    );
+    assert!(
+        vcs_calls
+            .iter()
+            .all(|c| !c.contains("force") && !c.contains("rebase")),
+        "a failed append-only push must never force-push or rebase as a fallback: {vcs_calls:?}"
+    );
+
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls.iter().all(|c| !c.contains("close")),
+        "original PR must never be closed even when remediation fails: {tracker_calls:?}"
+    );
+    assert!(
+        tracker_calls.iter().any(|c| {
+            c.contains("comment_external(owner/repo#707")
+                && (c.contains("human held") || c.contains("re-roll held"))
+        }),
+        "a failed append-only push must post an escalation comment on the PR, not fail silently: {tracker_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 #[test]
 fn test_manual_bead_input_auto_queued_and_dispatched() {
     let scm = FakeScm::new(); // no issues in SCM
@@ -1813,6 +2052,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             pr_number: Some(8060),
             branch: Some("fix/rewards-box-not-showing-8020-v2".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
     store
@@ -1899,6 +2139,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             pr_number: Some(8060),
             branch: Some("fix/rewards-box-not-showing-8020-v2".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
     store
@@ -1988,6 +2229,7 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
             pr_number: Some(4242),
             branch: Some("factory/bead-held-r2".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
 
@@ -2066,6 +2308,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             pr_number: Some(9001),
             branch: Some("factory/bead-held-cap-r10".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
     // Also seed one above the cap (defensive — matches the shell overlay)
@@ -2081,6 +2324,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             pr_number: Some(9002),
             branch: Some("factory/bead-held-over-r11".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
 
@@ -2394,6 +2638,7 @@ fn capped_human_held_comment_failure_retries_before_recording_escalation() {
             pr_number: Some(9003),
             branch: Some("factory/bead-held-retry-r10".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
     *tracker.fail_next_comment.borrow_mut() = Some("transient comment failure".into());
@@ -2472,6 +2717,7 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
             pr_number: None,
             branch: Some("factory/bead-held-fallback-r10".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
     tracker.candidates.borrow_mut().push(Bead {
@@ -2550,6 +2796,7 @@ fn capped_human_held_missing_comment_target_does_not_record_escalation() {
             pr_number: None,
             branch: Some("factory/bead-held-missing-target-r10".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
 
@@ -2608,6 +2855,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             pr_number: Some(9101),
             branch: Some("factory/er-capped-unknown-r4".into()),
             session_id: Some("session-er-capped".into()),
+            is_adopted: false,
         },
     );
     store
@@ -2761,6 +3009,7 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
             pr_number: Some(9102),
             branch: Some("factory/er-capped-retry-r4".into()),
             session_id: Some("session-er-capped-retry".into()),
+            is_adopted: false,
         },
     );
     store
@@ -2866,6 +3115,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             pr_number: Some(7000),
             branch: Some("factory/att-bead-r1".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
     scm.pr_snapshots.insert(
@@ -2962,6 +3212,7 @@ fn attested_ci_pending_does_not_timebox_park() {
             pr_number: Some(7100),
             branch: Some("factory/slow-ci-r1".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
     scm.pr_snapshots.insert(
@@ -3064,6 +3315,7 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
             pr_number: Some(5050),
             branch: Some("factory/non-green-r1".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
 
@@ -3152,6 +3404,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             pr_number: Some(7001),
             branch: Some("factory/att-active-r1".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
     scm.pr_snapshots.insert(
@@ -3247,6 +3500,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
                 pr_number: Some(pr),
                 branch: Some(format!("factory/{bead}-r1")),
                 session_id: Some("sess-1".into()),
+                is_adopted: false,
             })
             .unwrap();
         store
@@ -3396,6 +3650,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             pr_number: Some(901),
             branch: Some("factory/qdw-near-timebox-r1".into()),
             session_id: Some("sess-1".into()),
+            is_adopted: false,
         })
         .unwrap();
     store
@@ -3414,6 +3669,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             pr_number: Some(902),
             branch: Some("factory/qdw-healthy-r1".into()),
             session_id: Some("sess-1".into()),
+            is_adopted: false,
         })
         .unwrap();
     store
@@ -3846,6 +4102,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             pr_number: Some(1901),
             branch: Some("factory/qdw-post-refetch-fails-r1".into()),
             session_id: Some("sess-1".into()),
+            is_adopted: false,
         })
         .unwrap();
     store
@@ -3865,6 +4122,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             pr_number: Some(1902),
             branch: Some("factory/qdw-post-refetch-healthy-r1".into()),
             session_id: Some("sess-2".into()),
+            is_adopted: false,
         })
         .unwrap();
     store
@@ -4017,6 +4275,7 @@ fn qdw_assess_refetch_failure_stays_attested_and_never_closes_pr() {
             pr_number: Some(2001),
             branch: Some("factory/qdw-assess-refetch-fails-r1".into()),
             session_id: Some("sess-assess".into()),
+            is_adopted: false,
         })
         .unwrap();
     store

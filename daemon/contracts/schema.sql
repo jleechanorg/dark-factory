@@ -29,7 +29,22 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- `SqliteStateStore::open` (which checks `pragma_table_info` first
   -- because SQLite has no `ADD COLUMN IF NOT EXISTS`).
   attempt_er_runner_count INTEGER NOT NULL DEFAULT 0,
-  last_er_runner_attempt_at INTEGER
+  last_er_runner_attempt_at INTEGER,
+  -- Adopted-PR provenance (bead jleechan-tfs1): 1 iff this bead's `branch`
+  -- is an external contributor's own head_ref_name (adopted via
+  -- `intake::normalize_labeled_prs`), 0 for factory-fabricated branches.
+  -- `reroll()` (daemon/src/reroll.rs) reads this to pick its remediation
+  -- strategy: adopted -> append-only fix commit on the existing branch,
+  -- PR stays open; factory-fabricated -> today's fabricate-new-branch +
+  -- close-old-PR path (no regression). Detection is an explicit stored
+  -- flag set at adoption time in `tick::run_slow_tier`, NOT a branch-name
+  -- pattern match (a contributor could legitimately name a branch
+  -- `factory/...`). Older DBs pre-date this column and get it via the
+  -- idempotent `ensure_is_adopted_column` migration in
+  -- `SqliteStateStore::open` (same `pragma_table_info` guard pattern as
+  -- `ensure_er_runner_columns`, since SQLite has no
+  -- `ADD COLUMN IF NOT EXISTS`).
+  is_adopted INTEGER NOT NULL DEFAULT 0
 );
 
 -- Deletion guard: the daemon/skills may delete ONLY refs recorded here (spec §4.2.8).

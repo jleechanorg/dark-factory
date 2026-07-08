@@ -116,6 +116,7 @@ pub fn dispatch_ready(
                 pr_number: None,
                 branch: None,
                 session_id: None,
+                is_adopted: false,
             },
             Err(err) if err.is_transient() => {
                 report
@@ -592,6 +593,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+                is_adopted: false,
             })
             .unwrap();
         let cfg = cfg();
