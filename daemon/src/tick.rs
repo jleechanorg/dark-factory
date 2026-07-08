@@ -1910,7 +1910,31 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                     }
                     Ok(crate::reroll::RerollOutcome::Aborted(_)) => {}
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        // jleechan-cq8r: per-bead isolation, matching the
+                        // jleechan-qdw pattern used elsewhere in this same
+                        // loop (BEAD_SNAPSHOT_TRANSIENT_ERROR /
+                        // BEAD_PROCESSING_TRANSIENT_ERROR above). A single
+                        // bead's re-roll engine failure -- e.g. the
+                        // circuit-breaker comparator's LLM call hitting a
+                        // rate limit or returning a malformed reply -- must
+                        // not abort processing for every OTHER in-flight
+                        // bead in this tick. `reroll::execute` already
+                        // persisted this bead as `ReRoll` before the
+                        // failure; emit telemetry and move on to the next
+                        // bead rather than propagating with `return Err`,
+                        // which used to abort the entire fast tier.
+                        let _ = emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            overlay.state.as_str(),
+                            "BEAD_PROCESSING_TRANSIENT_ERROR",
+                            serde_json::json!({}),
+                            serde_json::json!({"phase": "reroll_execute", "error": format!("{e:?}")}),
+                        );
+                        continue;
+                    }
                 }
             }
         }

@@ -97,12 +97,19 @@ fn same_underlying_issue(llm: &dyn Llm, prior_text: &str, new_text: &str) -> Res
 
     let reply = llm.judge(&prompt)?;
 
+    // jleechan-cq8r: a malformed/unparseable reply here must NOT construct
+    // `DaemonError::Parse` -- that variant is fatal (`is_transient()` only
+    // covers Tool|Timeout|Deferred) and crashes the whole daemon process
+    // (main.rs calls `std::process::exit(1)` on any non-transient tick
+    // error), reproducing the jleechan-5ia2 crash-loop pattern (PR #197)
+    // through this call site. `ComparatorUnparseable` is transient by
+    // design -- see its doc comment in errors.rs.
     let last_close = reply.rfind('}').ok_or_else(|| {
-        DaemonError::Parse(format!("no JSON object found in circuit-breaker comparator reply: {reply:?}"))
+        DaemonError::ComparatorUnparseable(format!("no JSON object found in circuit-breaker comparator reply: {reply:?}"))
     })?;
     let prefix = &reply[..=last_close];
     let last_open = prefix.rfind('{').ok_or_else(|| {
-        DaemonError::Parse(format!("no JSON object found in circuit-breaker comparator reply: {reply:?}"))
+        DaemonError::ComparatorUnparseable(format!("no JSON object found in circuit-breaker comparator reply: {reply:?}"))
     })?;
     let candidate = &prefix[last_open..=last_close];
 
@@ -113,7 +120,7 @@ fn same_underlying_issue(llm: &dyn Llm, prior_text: &str, new_text: &str) -> Res
     }
 
     let parsed: CmpResponse = serde_json::from_str(candidate).map_err(|e| {
-        DaemonError::Parse(format!(
+        DaemonError::ComparatorUnparseable(format!(
             "circuit-breaker comparator reply did not contain a valid response object: {e} (reply: {reply:?})"
         ))
     })?;

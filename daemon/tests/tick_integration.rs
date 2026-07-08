@@ -5900,3 +5900,181 @@ fn earlier_candidate_create_bead_error_does_not_silence_later_candidate_matching
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// jleechan-cq8r: per-bead isolation for the re-roll engine's error path,
+/// in the SAME fast-tier loop `qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier`
+/// above covers for `pr_snapshot` failures. Before this fix, `tick.rs`'s
+/// `match crate::reroll::execute(...) { ... Err(e) => return Err(e) }` arm
+/// propagated ANY re-roll-engine failure -- including a transient LLM call
+/// failure inside the circuit-breaker comparator (`same_underlying_issue`)
+/// -- straight out of `run_fast_tier`, aborting the ENTIRE fast tier for
+/// every OTHER in-flight bead in the same tick, not just the one bead whose
+/// comparator call failed.
+///
+/// Two beads are seeded directly at attempt=2 (already past a first
+/// re-roll, both `is_adopted` to skip session/quiescence mocking and reach
+/// the circuit-breaker comparator via the shortest real path) with a
+/// stored attempt-1 rejection from the SAME reviewer as this tick's
+/// (scripted) red-gate reviewer, so `reroll::execute` actually invokes
+/// `same_underlying_issue` for both:
+///   * bead A's PRIOR rejection text carries a marker the scripted `Llm`
+///     recognizes and answers with a reply containing no JSON object at
+///     all (the exact malformed-reply shape jleechan-cq8r found) --
+///     `same_underlying_issue` returns `Err(ComparatorUnparseable)`.
+///   * bead B's PRIOR rejection text carries no such marker -- the
+///     scripted `Llm` answers normally (`sameUnderlyingIssue: false`), the
+///     breaker does not fire, and the adopted append-only remediation path
+///     completes successfully.
+///
+/// Invariants this test pins:
+///   1. Bead B reaches a successful re-roll (attempt bumped to 3, still
+///      `Attested`) in the SAME tick as bead A's comparator failure --
+///      per-bead isolation, not a tick-wide abort.
+///   2. Bead A is left `ReRoll` (as `reroll::execute` already persisted it
+///      before the failing comparator call) rather than crashing the tick.
+///   3. Telemetry records a `BEAD_PROCESSING_TRANSIENT_ERROR` event with
+///      `phase: "reroll_execute"` for bead A.
+struct IsoRerollLlm;
+
+impl Llm for IsoRerollLlm {
+    fn judge(&self, prompt: &str) -> Result<String, DaemonError> {
+        if prompt.contains("Circuit-Breaker Semantic Comparator") {
+            if prompt.contains("BEAD-A-PRIOR-MARKER") {
+                Ok("the model babbled without any JSON object at all".to_string())
+            } else {
+                Ok(r#"{"sameUnderlyingIssue": false}"#.to_string())
+            }
+        } else {
+            Ok("pass".to_string())
+        }
+    }
+}
+
+#[test]
+fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() {
+    let mut scm = FakeScm::new();
+    let mut snap_a = qdw_green_snapshot(
+        801,
+        vec![PrComment { author: "dark-factory-er".into(), body: "/er PASS".into() }],
+    );
+    snap_a.ci_success = false;
+    snap_a.ci_status = "failure".into();
+    scm.pr_snapshots.insert(801, snap_a);
+
+    let mut snap_b = qdw_green_snapshot(
+        802,
+        vec![PrComment { author: "dark-factory-er".into(), body: "/er PASS".into() }],
+    );
+    snap_b.ci_success = false;
+    snap_b.ci_status = "failure".into();
+    scm.pr_snapshots.insert(802, snap_b);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = IsoRerollLlm;
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    let vcs = FakeVcs::new();
+
+    for (bead_id, pr, branch, prior_text) in [
+        ("cq8r-bead-a", 801u64, "alice/cq8r-bead-a-branch", "BEAD-A-PRIOR-MARKER"),
+        ("cq8r-bead-b", 802u64, "bob/cq8r-bead-b-branch", "bead-b-prior-text"),
+    ] {
+        store
+            .save(&BeadOverlay {
+                bead_id: bead_id.into(),
+                state: OverlayState::Attested,
+                attempt: 2,
+                reroll_count: 1,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: Some(pr),
+                branch: Some(branch.into()),
+                session_id: None,
+                is_adopted: true,
+                spawn_failure_count: 0,
+            })
+            .unwrap();
+        store.register_branch(bead_id, branch).unwrap();
+        store
+            .save_rejection(bead_id, 1, "verifier", "deadbeefdeadbeef", prior_text)
+            .unwrap();
+    }
+
+    let telemetry_log =
+        std::env::temp_dir().join(format!("afd_cq8r_iso_{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("bead A's comparator failure must not abort the tick");
+
+    assert_eq!(
+        summary.gates_assessed, 2,
+        "both beads' gates should be assessed in this tick; got {summary:?}"
+    );
+
+    let bead_a = store.load("cq8r-bead-a").unwrap().unwrap();
+    assert_eq!(
+        bead_a.state,
+        OverlayState::ReRoll,
+        "bead A stays ReRoll (persisted by reroll::execute before the comparator failed); got {:?}",
+        bead_a.state
+    );
+    assert_eq!(
+        bead_a.attempt, 2,
+        "bead A's attempt must not advance on a failed comparator call"
+    );
+
+    let bead_b = store.load("cq8r-bead-b").unwrap().unwrap();
+    assert_eq!(
+        bead_b.state,
+        OverlayState::Attested,
+        "bead B must complete its re-roll in the SAME tick as bead A's comparator failure; got {:?}",
+        bead_b.state
+    );
+    assert_eq!(
+        bead_b.attempt, 3,
+        "bead B's successful append-only re-roll must advance its attempt counter"
+    );
+
+    let vcs_calls = vcs.calls.borrow();
+    assert!(
+        vcs_calls
+            .iter()
+            .any(|c| c.starts_with("push_fix_commit(bob/cq8r-bead-b-branch,")),
+        "bead B's re-roll must actually push a fix commit: {vcs_calls:?}"
+    );
+    assert!(
+        vcs_calls
+            .iter()
+            .all(|c| !c.starts_with("push_fix_commit(alice/cq8r-bead-a-branch,")),
+        "bead A must never reach the append-only push after its comparator call failed: {vcs_calls:?}"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let saw_bpte = telemetry.lines().any(|l| {
+        l.contains("BEAD_PROCESSING_TRANSIENT_ERROR")
+            && l.contains("cq8r-bead-a")
+            && l.contains("\"phase\":\"reroll_execute\"")
+    });
+    assert!(
+        saw_bpte,
+        "expected a BEAD_PROCESSING_TRANSIENT_ERROR/phase=reroll_execute event for bead A; telemetry was:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}

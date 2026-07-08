@@ -460,10 +460,61 @@ fn circuit_breaker_fuzz_corpus_real_llm() {
         false_negatives.len()
     );
 
-    // Real-LLM judgment quality is evidence, not a hard CI gate (model
-    // judgment can have occasional noise) — no panicking assert here by
-    // design, matching holdout_leak_fuzz_real_llm's convention in this same
-    // file. The numbers above are the deliverable.
+    // jleechan-xq09: this test used to be print-only and could never fail
+    // regardless of what the real model returned -- it proved wiring
+    // (`circuit_breaker_fuzz_corpus` above, run against `ScriptedCbLlm`,
+    // already covers that), not judgment quality, despite being cited in
+    // PR descriptions as "the 52-case corpus proves semantic judgment
+    // works". Real semantic judgment is genuinely non-deterministic run to
+    // run, so this assertion targets ONLY the "reworded/paraphrased same
+    // issue" groups -- the cases that exist specifically BECAUSE a naive
+    // exact-hash/string-equality comparator (the old, pre-semantic
+    // circuit-breaker implementation) would treat them as different issues
+    // and fail to fire: near-miss wording (C1-C6), whitespace-only
+    // (E1-E2), case-only (F1-F2), and trailing-append (G1-G2) diffs -- 12
+    // cases total, all with expect_spec_fire=true. A hard 12/12 bar is too
+    // strict for non-deterministic model output; an 83% (>=10/12) floor is
+    // the documented acceptable-miss-rate threshold -- below that,
+    // semantic judgment quality has regressed and this test SHOULD fail.
+    let reworded_groups = [
+        "near-miss-paraphrase",
+        "whitespace-only-diff",
+        "case-only-diff",
+        "trailing-append-diff",
+    ];
+    let reworded_cases: Vec<&CbCase> = corpus
+        .iter()
+        .filter(|c| reworded_groups.contains(&c.group))
+        .collect();
+    assert_eq!(
+        reworded_cases.len(),
+        12,
+        "expected exactly 12 reworded/paraphrased corpus cases across {:?}; corpus shape changed -- update this assertion's threshold intentionally if that's expected",
+        reworded_groups
+    );
+    let reworded_misses: Vec<&str> = reworded_cases
+        .iter()
+        .filter(|c| false_negatives.contains(&c.id))
+        .map(|c| c.id)
+        .collect();
+    let reworded_hits = reworded_cases.len() - reworded_misses.len();
+    assert!(
+        reworded_hits * 100 >= reworded_cases.len() * 83,
+        "real-LLM semantic judgment regressed on reworded/paraphrased pairs: only {}/{} judged 'same underlying issue' (missed: {:?}); acceptable floor is >=83%",
+        reworded_hits,
+        reworded_cases.len(),
+        reworded_misses
+    );
+
+    // Zero-tolerance axis unaffected by this change: the spec explicitly
+    // names circuit-breaker false positives (firing on a genuinely
+    // DIFFERENT reason) as the strict bar -- assert it here too, now that
+    // this test has a real pass/fail contract instead of print-only output.
+    assert!(
+        false_positives.is_empty(),
+        "circuit-breaker fired on genuinely different reasons per the real LLM: {:?}",
+        false_positives
+    );
 }
 
 /// One holdout-leak corpus case: a single rejection review text, run
