@@ -570,6 +570,8 @@ impl Llm for FakeLlm {
     }
 }
 
+type RejectionRecord = (String, String, String);
+
 /// Scripted `StateStore` fake: in-memory overlay map + branch registry, plus a
 /// call log. No SQLite involved — downstream tasks (dispatch, verifier) unit-test
 /// against this instead of `SqliteStateStore` (design doc §3).
@@ -578,7 +580,7 @@ pub struct FakeStateStore {
     pub overlays: RefCell<HashMap<String, BeadOverlay>>,
     pub branches: RefCell<Vec<String>>,
     pub branch_beads: RefCell<HashMap<String, String>>,
-    pub rejections: RefCell<HashMap<(String, u32), (String, String)>>,
+    pub rejections: RefCell<HashMap<(String, u32), RejectionRecord>>,
     pub fail_save_for_state: RefCell<Vec<(String, OverlayState)>>,
     pub calls: RefCell<Vec<String>>,
 }
@@ -735,14 +737,18 @@ impl StateStore for FakeStateStore {
         attempt: u32,
         reviewer: &str,
         feedback_hash: &str,
-        _feedback_text: &str,
+        feedback_text: &str,
     ) -> Result<(), DaemonError> {
         self.calls.borrow_mut().push(format!(
             "save_rejection({bead_id},{attempt},{reviewer},{feedback_hash})"
         ));
         self.rejections.borrow_mut().insert(
             (bead_id.to_string(), attempt),
-            (reviewer.to_string(), feedback_hash.to_string()),
+            (
+                reviewer.to_string(),
+                feedback_hash.to_string(),
+                feedback_text.to_string(),
+            ),
         );
         Ok(())
     }
@@ -759,6 +765,23 @@ impl StateStore for FakeStateStore {
             .rejections
             .borrow()
             .get(&(bead_id.to_string(), attempt))
-            .cloned())
+            .map(|(reviewer, feedback_hash, _feedback_text)| {
+                (reviewer.clone(), feedback_hash.clone())
+            }))
+    }
+
+    fn load_rejection_text(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+    ) -> Result<Option<String>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("load_rejection_text({bead_id},{attempt})"));
+        Ok(self
+            .rejections
+            .borrow()
+            .get(&(bead_id.to_string(), attempt))
+            .map(|(_, _, feedback_text)| feedback_text.clone()))
     }
 }
