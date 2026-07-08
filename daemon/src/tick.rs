@@ -287,6 +287,60 @@ pub fn run_tick(
         // 3. Wedge detection
         match overlay.state {
             OverlayState::Dispatched => {
+                // jleechan-5ia2: dispatch-integrity sweep. Runs every tick
+                // (independent of the 30-minute autonomy threshold below) so
+                // a corrupted DISPATCHED row can never sit trusted
+                // indefinitely, however it was written. Live-reproduced:
+                // bead `jleechan-vj89`'s overlay had `state=DISPATCHED` and
+                // a real, alive `session_id` — but that session belonged to
+                // a completely unrelated task on a different branch
+                // (`wa-3004` / `feat/wa-3004-hook-refactor`, not
+                // `factory/jleechan-vj89-r1`), and zero `TASK_DISPATCHED`
+                // telemetry exists for the bead — no code path in this
+                // crate's dispatch/reroll modules can produce that pairing
+                // through a genuine `Sessions::spawn`/`attach` return value,
+                // so the row was almost certainly written out-of-band
+                // (bypassing both this daemon and `factory-overlay.sh`'s own
+                // "no direct sqlite3 mutations" contract). `dispatch_ready`
+                // now refuses to *create* such a row going forward; this
+                // sweep additionally refuses to keep *trusting* one if it
+                // somehow appears — parking it HUMAN_HELD rather than
+                // silently treating it as a legitimate in-flight worker.
+                // `Ok(None)` ("cannot verify") is intentionally NOT
+                // treated as a violation — only a positively confirmed
+                // mismatch (or a confirmed-dead session) parks the bead.
+                if let Some(ref session_id_str) = overlay.session_id {
+                    let session_id = SessionId(session_id_str.clone());
+                    if let Ok(Some(actual_branch)) = deps.sessions.session_branch(&session_id) {
+                        let expected_branch = overlay.branch.clone().unwrap_or_default();
+                        if actual_branch != expected_branch {
+                            overlay.state = OverlayState::HumanHeld;
+                            deps.store.save(&overlay)?;
+                            emit(
+                                deps.telemetry_log,
+                                &overlay.bead_id,
+                                overlay.attempt,
+                                OverlayState::HumanHeld.as_str(),
+                                "PARKED_HUMAN_HELD",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "reason": "session_branch_mismatch",
+                                    "session_id": session_id_str,
+                                    "expected_branch": expected_branch,
+                                    "actual_branch": actual_branch,
+                                }),
+                            )?;
+                            let comment_body = format!(
+                                "🤖 **[dark-factory]** Escalation required: bead `{}` was recorded DISPATCHED with session `{}`, but that session's live branch (`{}`) does not match the bead's registered branch (`{}`). This record cannot be trusted and has been parked HUMAN_HELD for manual review (see jleechan-5ia2).",
+                                overlay.bead_id, session_id_str, actual_branch, expected_branch
+                            );
+                            let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
+                            summary.beads_parked_human_held += 1;
+                            continue;
+                        }
+                    }
+                }
+
                 if let Some(ref branch) = overlay.branch {
                     if overlay.autonomy_secs >= 1800 {
                         let last_commit_epoch = deps.scm.remote_branch_last_commit(branch)?;

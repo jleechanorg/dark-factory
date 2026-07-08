@@ -206,6 +206,14 @@ pub struct FakeSessions {
     pub fail_spawn_for: RefCell<Vec<String>>,
     pub spawn_prompts: RefCell<Vec<(String, String)>>,
     pub calls: RefCell<Vec<String>>,
+    /// jleechan-5ia2: scripted `session_branch` override, keyed by session
+    /// id. Empty by default (matches the trait's `Ok(None)` default —
+    /// "cannot verify") so pre-existing tests are unaffected; tests that
+    /// exercise the dispatch-integrity sweep populate this to simulate AO
+    /// reporting a session whose live branch does NOT match what the
+    /// daemon believes it dispatched (the `wa-3004` contamination
+    /// scenario).
+    pub branch_for: RefCell<HashMap<String, String>>,
 }
 
 impl Default for FakeSessions {
@@ -217,6 +225,7 @@ impl Default for FakeSessions {
             fail_spawn_for: RefCell::new(Vec::new()),
             spawn_prompts: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
+            branch_for: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -228,6 +237,13 @@ impl FakeSessions {
 
     pub fn fail_spawn_for(&self, bead_id: &str) {
         self.fail_spawn_for.borrow_mut().push(bead_id.to_string());
+    }
+
+    /// Script `session_branch(session_id)` to report `branch`.
+    pub fn set_session_branch(&self, session_id: &str, branch: &str) {
+        self.branch_for
+            .borrow_mut()
+            .insert(session_id.to_string(), branch.to_string());
     }
 }
 
@@ -271,6 +287,13 @@ impl Sessions for FakeSessions {
             .borrow_mut()
             .push(format!("is_quiescent({})", id.0));
         Ok(self.quiescent)
+    }
+
+    fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("session_branch({})", id.0));
+        Ok(self.branch_for.borrow().get(&id.0).cloned())
     }
 }
 

@@ -1106,12 +1106,34 @@ impl CliSessions {
         }
 
         if let Some(name) = sess_name {
-            Ok(SessionId(name))
-        } else {
-            Err(DaemonError::Parse(format!(
-                "ao spawn --agent {agent} produced no SESSION= line: {out}"
-            )))
+            return Ok(SessionId(name));
         }
+
+        // jleechan-5ia2: `ao spawn` has its own internal admission-control
+        // queue (packages/cli/src/commands/spawn.ts in agent-orchestrator) —
+        // when a project's active-session count is at/above AO's configured
+        // cap, `ao spawn` does NOT create a session at all. It enqueues a
+        // deferred `SpawnRequest` and prints `REQUEST=<id>` instead of
+        // `SESSION=<id>`, exiting 0 (success). No worktree, branch, or
+        // process was ever created for this call, so unlike a genuine parse
+        // failure it is always safe to retry. Before this fix that case fell
+        // through to `DaemonError::Parse` below, which `is_transient()`
+        // classifies as fatal — `dispatch_ready`'s `?` on `sessions.spawn`
+        // then propagated it all the way to `main.rs`, which calls
+        // `std::process::exit(1)` on any non-transient tick error. Live
+        // evidence: `rust-daemon.err.log` showed the exact string "ao spawn
+        // produced no session name: Reason: N active sessions >= cap N" and
+        // 18 systemd restarts in ~15 minutes while `worldarchitect` sat at
+        // its cap.
+        if let Some(request_line) = out.lines().find(|l| l.starts_with("REQUEST=")) {
+            return Err(DaemonError::Deferred(format!(
+                "ao spawn --agent {agent} queued instead of spawning ({request_line})"
+            )));
+        }
+
+        Err(DaemonError::Parse(format!(
+            "ao spawn --agent {agent} produced no SESSION= line: {out}"
+        )))
     }
 
     fn spawn_with_fallback(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
@@ -1329,6 +1351,36 @@ impl Sessions for CliSessions {
             }
         }
         Ok(true)
+    }
+
+    /// jleechan-5ia2: `ao status --json` already reports each session's
+    /// `branch` field (verified live: `ao status --json | jq '.[].branch'`).
+    /// Reuse the same parsing shape as `is_quiescent` above. Any failure to
+    /// reach/parse `ao status` is folded into `Ok(None)` — "cannot verify" —
+    /// rather than propagated as an `Err`, matching the trait contract that
+    /// callers only ever reject a dispatch on a *positive* mismatch, never
+    /// on an inability to check.
+    fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
+        let out = match run_tool("ao", &["status", "--json"], 30) {
+            Ok(o) => o,
+            Err(_) => return Ok(None),
+        };
+        let json_start = out.find('[').unwrap_or(0);
+        let data: serde_json::Value = match serde_json::from_str(&out[json_start..]) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        if let Some(arr) = data.as_array() {
+            for entry in arr {
+                if entry.get("name").and_then(|v| v.as_str()) == Some(&id.0) {
+                    return Ok(entry
+                        .get("branch")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()));
+                }
+            }
+        }
+        Ok(None)
     }
 }
 
