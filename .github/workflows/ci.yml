@@ -32,6 +32,21 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
 
+      - name: Run bash integration tests
+        # The tests/scripts/*.sh suite exercises factory-overlay.sh, factory-af-tick.sh,
+        # and the callpath overlay-harness probe. Without this step, regressions in
+        # those scripts only surface when an operator runs them locally.
+        # See bead jleechan-50jf.
+        run: |
+          set +e
+          fail=0
+          for t in tests/scripts/test_*.sh; do
+            echo "::group::$t"
+            bash "$t" || { echo "::error file=$t::test failed"; fail=$((fail + 1)); }
+            echo "::endgroup::"
+          done
+          exit $fail
+
       - name: Graph structural audit (G1/G2 dogfooding)
         run: python -m runner.graph_audit pipelines
 
@@ -46,6 +61,11 @@ jobs:
           persist-credentials: false
 
       - name: Ensure main ref for VCS integration test
+        # daemon/tests/adapters_integration.rs:7 calls `git base_head main` which
+        # requires a local `main` ref. actions/checkout by default does NOT create
+        # a local `main` ref (only the PR ref + origin/main). This explicit fetch
+        # populates the local `main` ref so the Rust test passes.
+        # See bead jleechan-q2wu.
         run: |
           git fetch origin main
           git show-ref --verify --quiet refs/heads/main || git branch main origin/main
