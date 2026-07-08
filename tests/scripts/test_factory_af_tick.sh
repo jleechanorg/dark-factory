@@ -103,7 +103,7 @@ set +e
 "$OVERLAY" dispatch-record test-guard fix/test-guard-2 >"$SCRATCH_DIR/err.log" 2>&1
 rc=$?
 set -e
-assert "dispatch-record refuses non-QUEUED bead (rc=1)" "1" "$rc"
+assert "dispatch-record refuses non-QUEUED bead (rc=5 EX_REQUIRE_STATE)" "5" "$rc"
 err="$(cat "$SCRATCH_DIR/err.log")"
 case "$err" in
   *expected\ one\ of*QUEUED*) echo "PASS: require_state message mentions QUEUED"; PASS=$((PASS + 1)) ;;
@@ -123,7 +123,7 @@ set +e
 "$OVERLAY" dispatch-record test-cap fix/test-cap >"$SCRATCH_DIR/cap-err.log" 2>&1
 rc=$?
 set -e
-assert "dispatch-record refuses over capacity (rc=1)" "1" "$rc"
+assert "dispatch-record refuses over capacity (rc=3 EX_OVER_CAP)" "3" "$rc"
 err="$(cat "$SCRATCH_DIR/cap-err.log")"
 case "$err" in
   *over\ capacity*) echo "PASS: capacity gate error mentions over capacity"; PASS=$((PASS + 1)) ;;
@@ -149,7 +149,7 @@ set +e
 "$OVERLAY" dispatch-record test-rival fix/shared-branch >"$SCRATCH_DIR/conflict.log" 2>&1
 rc=$?
 set -e
-assert "dispatch-record refuses branch conflict (rc=1)" "1" "$rc"
+assert "dispatch-record refuses branch conflict (rc=4 EX_BRANCH_CONFLICT)" "4" "$rc"
 err="$(cat "$SCRATCH_DIR/conflict.log")"
 case "$err" in
   *registered\ to\ test-owner*)
