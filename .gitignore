@@ -66,3 +66,4 @@ test.db
 # AO runtime state (machine-local, written by activity-updater hook)
 .ao/
 .claude/activity-updater.sh
+.beads/.local_version
