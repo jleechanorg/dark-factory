@@ -217,6 +217,12 @@ impl Vcs for NoopAdapters {
     fn push_fix_commit(&self, _branch: &str, _message: &str) -> Result<(), DaemonError> {
         Ok(())
     }
+    fn remote_head_sha(&self, _branch: &str) -> Result<String, DaemonError> {
+        Ok(String::new())
+    }
+    fn is_ancestor(&self, _ancestor_sha: &str, _descendant_sha: &str) -> Result<bool, DaemonError> {
+        Ok(true)
+    }
 }
 
 #[cfg(any(test, debug_assertions))]

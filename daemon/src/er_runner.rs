@@ -384,6 +384,8 @@ mod tests {
         fn head_sha(&self, _b: &str) -> Result<String, DaemonError> { Ok("deadbeef".into()) }
         fn is_remote_ahead(&self, _b: &str, _r: &str) -> Result<bool, DaemonError> { Ok(false) }
         fn push_fix_commit(&self, _branch: &str, _message: &str) -> Result<(), DaemonError> { Ok(()) }
+        fn remote_head_sha(&self, _branch: &str) -> Result<String, DaemonError> { Ok("deadbeef".into()) }
+        fn is_ancestor(&self, _ancestor_sha: &str, _descendant_sha: &str) -> Result<bool, DaemonError> { Ok(true) }
     }
 
     // Local in-memory StateStore that records the er_runner_attempt counter.
@@ -491,6 +493,7 @@ mod tests {
             session_id: Some("s1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         }
     }
 

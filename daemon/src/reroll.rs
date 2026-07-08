@@ -375,10 +375,28 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
 
 /// Adopted-PR remediation dispatches a real coder session onto the EXISTING
 /// contributor branch, briefed with the reviewer feedback that caused the red
-/// gate. This function never fabricates commits itself, never creates a
-/// replacement branch, never closes the original PR, and never invokes a
-/// history-rewrite primitive; those invariants are structural because this
-/// code path only attaches/checks an existing session or spawns a new one.
+/// gate. This function itself never fabricates commits, never creates a
+/// replacement branch, and never closes the original PR — those three
+/// invariants ARE structural: this code path contains no
+/// `create_branch_at`, `close_pr`, or commit-authoring call at all, only
+/// `Sessions::attach`/`Sessions::spawn`.
+///
+/// The "no force-push / no history-rewrite" constraint is DIFFERENT and is
+/// NOT structural in that same sense. It is enforced at the PROMPT level
+/// only (the coder session is instructed not to force-push, in the spawn
+/// prompt built below) PLUS a post-hoc detection backstop added as a
+/// required amendment (bead jleechan-tfs1): this function captures the
+/// branch's pre-session HEAD SHA immediately before dispatch, and every
+/// tick the resulting bead sits `DISPATCHED`, `tick::run_tick`'s
+/// wedge-detection sweep verifies that SHA is still an ancestor of the
+/// branch's current tip (`Vcs::is_ancestor`), parking the bead `HUMAN_HELD`
+/// with an escalation comment naming both SHAs if not. This is detection,
+/// not prevention — the coder session is an independent subprocess running
+/// its own `git push` that the daemon does not control at the git layer,
+/// so the daemon cannot structurally block a force-push at the moment it
+/// happens the way it structurally blocks itself from calling
+/// `create_branch_at`/`close_pr` here. Do not describe the force-push
+/// constraint as "structural" — it is not.
 fn execute_adopted(
     deps: &RerollDeps,
     bead: &mut BeadOverlay,
@@ -473,6 +491,30 @@ fn execute_adopted(
         branch = branch,
         review_text = deps.review_text,
     );
+    // Capture the pre-session HEAD SHA for post-hoc force-push detection
+    // (bead jleechan-tfs1 amendment).
+    let pre_session_sha = match deps.vcs.remote_head_sha(&branch) {
+        Ok(sha) => sha,
+        Err(e) => {
+            bead.state = OverlayState::HumanHeld;
+            deps.store.save(bead)?;
+            emit_telemetry(
+                deps.telemetry_log,
+                &bead.bead_id,
+                bead.attempt,
+                bead.state.as_str(),
+                "REROLL_ADOPTED_PRE_SESSION_SHA_CAPTURE_FAILED",
+                serde_json::json!({}),
+                serde_json::json!({"branch": branch, "error": e.to_string()}),
+            )?;
+            return Ok(RerollOutcome::Held(format!(
+                "failed to capture the pre-session HEAD SHA for adopted branch {branch} \
+                 before dispatching a remediation session (required for post-hoc \
+                 force-push detection): {e}"
+            )));
+        }
+    };
+
     let spec = SpawnSpec {
         bead_id: bead.bead_id.clone(),
         branch: branch.clone(),
@@ -489,6 +531,7 @@ fn execute_adopted(
             // quiescence-gated DISPATCHED -> ATTESTED promotion moves this
             // back to verification after the coder session finishes.
             bead.state = OverlayState::Dispatched;
+            bead.pre_session_head_sha = Some(pre_session_sha);
             deps.store.save(bead)?;
             emit_telemetry(
                 deps.telemetry_log,

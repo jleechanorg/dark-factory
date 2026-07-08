@@ -93,6 +93,7 @@ fn test_circuit_breaker() {
         session_id: None,
         is_adopted: false,
         spawn_failure_count: 0,
+            pre_session_head_sha: None,
     };
     store.save(&bead).unwrap();
 
@@ -177,6 +178,7 @@ fn test_reroll_success() {
         session_id: None,
         is_adopted: false,
         spawn_failure_count: 0,
+            pre_session_head_sha: None,
     };
     store.save(&bead).unwrap();
 
@@ -396,7 +398,8 @@ fn test_tick_stage2_integration() {
 fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
     let scm = FakeScm::new();
     let sessions = FakeSessions::new();
-    let vcs = FakeVcs::new();
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("alice/my-cool-feature".into(), "pre-session-sha-abc123".into());
     let store = FakeStateStore::new();
     let llm = FakeLlm::new();
     let cfg = test_cfg();
@@ -418,6 +421,7 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
         session_id: None,
         is_adopted: true,
         spawn_failure_count: 0,
+        pre_session_head_sha: None,
     };
     store.save(&bead).unwrap();
     store
@@ -489,6 +493,11 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
         updated.session_id.is_some(),
         "adopted remediation must track the spawned coder session"
     );
+    assert_eq!(
+        updated.pre_session_head_sha.as_deref(),
+        Some("pre-session-sha-abc123"),
+        "adopted remediation must capture the pre-session HEAD SHA for later force-push detection"
+    );
 
     // (c) Never force-pushes/rewrites history, never fabricates a branch or
     // daemon-side placeholder commit:
@@ -531,7 +540,8 @@ fn test_reroll_adopted_spawn_failure_parks_human_held() {
     let scm = FakeScm::new();
     let sessions = FakeSessions::new();
     sessions.fail_spawn_for("bead-adopted-conflict");
-    let vcs = FakeVcs::new();
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("alice/my-cool-feature".into(), "pre-session-sha-abc123".into());
     let store = FakeStateStore::new();
     let llm = FakeLlm::new();
     let cfg = test_cfg();
@@ -550,6 +560,7 @@ fn test_reroll_adopted_spawn_failure_parks_human_held() {
         session_id: None,
         is_adopted: true,
         spawn_failure_count: 0,
+        pre_session_head_sha: None,
     };
     store.save(&bead).unwrap();
     store
@@ -636,6 +647,7 @@ fn test_reroll_adopted_skips_duplicate_spawn_when_session_already_active() {
         session_id: None,
         is_adopted: true,
         spawn_failure_count: 0,
+            pre_session_head_sha: None,
     };
     store.save(&bead).unwrap();
     store
@@ -710,6 +722,7 @@ mod quiescence_timeout_races {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         }
     }
 
