@@ -4571,6 +4571,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             pr_number: Some(555),
             branch: Some("factory/real-repo-bead-r1".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
     store
@@ -4744,6 +4745,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             pr_number: Some(556),
             branch: Some("factory/real-repo-bead-asym-r1".into()),
             session_id: None,
+            is_adopted: false,
         },
     );
     store
