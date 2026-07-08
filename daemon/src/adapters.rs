@@ -1180,6 +1180,11 @@ impl Sessions for CliSessions {
         let mut count = 0;
         if let Some(arr) = data.as_array() {
             for entry in arr {
+                if let Some(project) = entry.get("project").and_then(|v| v.as_str()) {
+                    if project != self.project {
+                        continue;
+                    }
+                }
                 if let Some(activity) = entry.get("activity").and_then(|v| v.as_str()) {
                     if activity != "exited" && activity != "missing" {
                         count += 1;
