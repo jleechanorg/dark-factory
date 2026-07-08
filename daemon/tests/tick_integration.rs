@@ -756,7 +756,11 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
     assert!(logs.contains("PARKED_HUMAN_HELD"), "logs: {}", logs);
     assert!(logs.contains("session_branch_mismatch"), "logs: {}", logs);
     assert!(logs.contains("wa-3004"), "logs: {}", logs);
-    assert!(logs.contains("feat/wa-3004-hook-refactor"), "logs: {}", logs);
+    assert!(
+        logs.contains("feat/wa-3004-hook-refactor"),
+        "logs: {}",
+        logs
+    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
@@ -1452,7 +1456,9 @@ fn factory_labeled_existing_pr_second_tick_reuses_tracking_bead_without_spawn() 
     assert_eq!(second.beads_created, 0);
     assert_eq!(second.beads_dispatched, 0);
     assert_eq!(
-        store.bead_id_for_branch("feature/already-open-pr-702").unwrap(),
+        store
+            .bead_id_for_branch("feature/already-open-pr-702")
+            .unwrap(),
         Some("fake-bead-1".into())
     );
     let create_calls: Vec<_> = tracker
@@ -1599,7 +1605,9 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
 
     assert_eq!(summary.beads_escalated, 1);
     assert_eq!(
-        store.bead_id_for_branch("factory/existing-bead-r1").unwrap(),
+        store
+            .bead_id_for_branch("factory/existing-bead-r1")
+            .unwrap(),
         Some("existing-bead".into()),
         "collision must not steal the branch registry key"
     );
@@ -1708,7 +1716,9 @@ fn fork_labeled_pr_never_registers_branch_at_tick_level() {
     );
     let tracker_calls = tracker.calls.borrow();
     assert!(
-        tracker_calls.iter().all(|call| !call.starts_with("create_bead(")),
+        tracker_calls
+            .iter()
+            .all(|call| !call.starts_with("create_bead(")),
         "fork PR must not create an adopted bead at the tick level: {tracker_calls:?}"
     );
     assert!(
@@ -1789,9 +1799,9 @@ fn adopted_non_green_pr_parks_human_held_with_v1_escalation() {
     );
     let session_calls = sessions.calls.borrow();
     assert!(
-        session_calls.iter().all(|call| {
-            !call.starts_with("spawn(") && !call.starts_with("attach(")
-        }),
+        session_calls
+            .iter()
+            .all(|call| { !call.starts_with("spawn(") && !call.starts_with("attach(") }),
         "adopted non-green PR must not fabricate remediation sessions: {session_calls:?}"
     );
     let branch_calls = store.calls.borrow();
@@ -1916,7 +1926,9 @@ fn adopted_red_pr_stage2_reroll_pushes_fix_commit_leaves_pr_open() {
         "adopted stage-2 reroll must push a fix commit to the existing branch: {vcs_calls:?}"
     );
     assert!(
-        vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")),
+        vcs_calls
+            .iter()
+            .all(|c| !c.starts_with("create_branch_at(")),
         "adopted stage-2 reroll must never fabricate a replacement branch: {vcs_calls:?}"
     );
     assert!(
@@ -2011,7 +2023,10 @@ fn adopted_red_pr_stage2_reroll_append_only_conflict_parks_human_held_with_escal
         Some(707),
         "PR number must be left in place even on a failed remediation attempt"
     );
-    assert_eq!(overlay.branch.as_deref(), Some("alice/my-conflicted-feature"));
+    assert_eq!(
+        overlay.branch.as_deref(),
+        Some("alice/my-conflicted-feature")
+    );
 
     let vcs_calls = vcs.calls.borrow();
     assert!(
@@ -2021,7 +2036,9 @@ fn adopted_red_pr_stage2_reroll_append_only_conflict_parks_human_held_with_escal
         "must have attempted the append-only push before parking: {vcs_calls:?}"
     );
     assert!(
-        vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")),
+        vcs_calls
+            .iter()
+            .all(|c| !c.starts_with("create_branch_at(")),
         "a failed append-only push must never fall back to fabricating a branch: {vcs_calls:?}"
     );
     assert!(
@@ -2643,7 +2660,10 @@ fn adopted_pr_that_never_goes_green_escalates_at_recovery_cap_and_dedups() {
     // starts at attempt=1, not 0 — matches `adopted_non_green_pr_parks_
     // human_held_with_v1_escalation`).
     let summary0 = run_tick(&deps, 0, 0).expect("tick 0 (adoption + park) should succeed");
-    assert_eq!(summary0.beads_created, 1, "PR must be adopted as a new bead");
+    assert_eq!(
+        summary0.beads_created, 1,
+        "PR must be adopted as a new bead"
+    );
     assert_eq!(summary0.gates_assessed, 1);
     assert_eq!(summary0.beads_parked_human_held, 1);
     assert_eq!(summary0.beads_escalated, 0);
@@ -2683,7 +2703,10 @@ fn adopted_pr_that_never_goes_green_escalates_at_recovery_cap_and_dedups() {
         );
     }
     let at_cap = store.load(BEAD_ID).unwrap().unwrap();
-    assert_eq!(at_cap.attempt, 10, "bead must have reached the recovery cap");
+    assert_eq!(
+        at_cap.attempt, 10,
+        "bead must have reached the recovery cap"
+    );
     assert_eq!(at_cap.state, OverlayState::HumanHeld);
 
     // Tick 10: attempt (10) is no longer `< MAX_HUMAN_HELD_RECOVERY_ATTEMPT`
@@ -2833,7 +2856,10 @@ fn capped_human_held_comment_failure_retries_before_recording_escalation() {
         .iter()
         .filter(|call| call.contains("comment_external(owner/repo#9003,"))
         .count();
-    assert_eq!(comment_count, 2, "second tick must retry the failed comment");
+    assert_eq!(
+        comment_count, 2,
+        "second tick must retry the failed comment"
+    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
@@ -3013,10 +3039,10 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
         "factory/er-capped-unknown-r4".into(),
         "er-capped-unknown".into(),
     );
-    store
-        .er_attempts
-        .borrow_mut()
-        .insert("er-capped-unknown".into(), (er_runner::MAX_ER_RUNNER_ATTEMPTS, Some(1)));
+    store.er_attempts.borrow_mut().insert(
+        "er-capped-unknown".into(),
+        (er_runner::MAX_ER_RUNNER_ATTEMPTS, Some(1)),
+    );
 
     scm.pr_snapshots.insert(
         9101,
@@ -3168,13 +3194,14 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
         "factory/er-capped-retry-r4".into(),
         "er-capped-retry".into(),
     );
-    store
-        .er_attempts
-        .borrow_mut()
-        .insert("er-capped-retry".into(), (er_runner::MAX_ER_RUNNER_ATTEMPTS, Some(1)));
+    store.er_attempts.borrow_mut().insert(
+        "er-capped-retry".into(),
+        (er_runner::MAX_ER_RUNNER_ATTEMPTS, Some(1)),
+    );
     *tracker.fail_next_comment.borrow_mut() = Some("transient comment failure".into());
 
-    scm.pr_snapshots.insert(9102, qdw_green_snapshot(9102, Vec::new()));
+    scm.pr_snapshots
+        .insert(9102, qdw_green_snapshot(9102, Vec::new()));
 
     let telemetry_log = std::env::temp_dir().join("afd_er_capped_unknown_retry_comment.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -3222,7 +3249,10 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
         .iter()
         .filter(|call| call.contains("comment_external(owner/repo#9102,"))
         .count();
-    assert_eq!(comment_count, 2, "second tick must retry the failed comment");
+    assert_eq!(
+        comment_count, 2,
+        "second tick must retry the failed comment"
+    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
@@ -4704,7 +4734,10 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
     // Fix the coder vendor so the reviewer priority list (and therefore
     // which two fake binaries get dispatched) is deterministic regardless
     // of the ambient environment.
-    let _env_guard = EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "minimax")]);
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
+    ]);
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -4879,7 +4912,10 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
     // Fix the coder vendor so the reviewer priority list (and therefore
     // which two fake binaries get dispatched) is deterministic regardless
     // of the ambient environment.
-    let _env_guard = EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "minimax")]);
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
+    ]);
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -4911,10 +4947,10 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
         .branches
         .borrow_mut()
         .push("factory/real-repo-bead-asym-r1".into());
-    store
-        .branch_beads
-        .borrow_mut()
-        .insert("factory/real-repo-bead-asym-r1".into(), "real-repo-bead-asym".into());
+    store.branch_beads.borrow_mut().insert(
+        "factory/real-repo-bead-asym-r1".into(),
+        "real-repo-bead-asym".into(),
+    );
 
     scm.pr_snapshots.insert(
         556,
@@ -5454,7 +5490,10 @@ fn deferred_spawn_backpressure_never_increments_counter_or_parks_across_repeated
 
     let deferred_phase_count = log
         .lines()
-        .filter(|line| line.contains("BEAD_DISPATCH_TRANSIENT_ERROR") && line.contains("\"phase\":\"spawn_deferred\""))
+        .filter(|line| {
+            line.contains("BEAD_DISPATCH_TRANSIENT_ERROR")
+                && line.contains("\"phase\":\"spawn_deferred\"")
+        })
         .count();
     assert_eq!(
         deferred_phase_count, N as usize,
@@ -5595,18 +5634,19 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
     assert_eq!(b_final.state, OverlayState::HumanHeld);
     assert_eq!(b_final.spawn_failure_count, MAX_TRANSIENT_SPAWN_RETRY + 1);
 
-    let escalation_comment_count_for = |tracker: &FakeTracker, external_ref: &str, bead_id: &str| {
-        tracker
-            .calls
-            .borrow()
-            .iter()
-            .filter(|call| {
-                call.contains(&format!("comment_external({external_ref}"))
-                    && call.contains("Escalation required")
-                    && call.contains(&format!("bead `{bead_id}`"))
-            })
-            .count()
-    };
+    let escalation_comment_count_for =
+        |tracker: &FakeTracker, external_ref: &str, bead_id: &str| {
+            tracker
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| {
+                    call.contains(&format!("comment_external({external_ref}"))
+                        && call.contains("Escalation required")
+                        && call.contains(&format!("bead `{bead_id}`"))
+                })
+                .count()
+        };
     assert_eq!(
         escalation_comment_count_for(&tracker, EXTERNAL_REF_B, BEAD_B),
         1,
@@ -5629,6 +5669,146 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
     assert!(
         log.contains("PARKED_HUMAN_HELD") && log.contains("transient_spawn_retry_cap_exceeded"),
         "bead B's cap-exceeded park telemetry must be present; got: {log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-eazj: reproduces the exact mechanism that made GitHub issue
+/// jleechanorg/worldarchitect.ai#8171 vanish with zero telemetry, ever, even
+/// though it carried the `factory` label and was OPEN.
+///
+/// #8171's shape: factory-labeled, no existing bead, no existing branch.
+/// That shape alone always worked fine in isolation — the actual gap was
+/// upstream in the *batch*: `intake::normalize`'s per-candidate loop used to
+/// `return Err(e)` the instant ANY earlier candidate in the same
+/// `scm.labeled_issues` fetch hit a non-duplicate `create_bead` error (e.g. a
+/// malformed body/title `br create` rejects for unrelated reasons). That
+/// early return aborted the whole `normalize()` call before later candidates
+/// in the batch — including one shaped exactly like #8171 — were ever even
+/// looked at, so NOTHING was ever logged for them: not ADOPTED, not
+/// SKIPPED_*, not even ERRORED. Depending on `DaemonError` variant this also
+/// either crash-loops the whole daemon process (non-transient -> `main()`
+/// calls `std::process::exit(1)`) or silently retries forever hitting the
+/// exact same wall every tick (transient `DaemonError::Tool` -> backoff and
+/// retry, re-fetching the same ordered candidate list and getting stuck on
+/// the same earlier failing candidate again).
+///
+/// This test seeds two factory-labeled issues in one fetch batch: issue #1
+/// (`owner/repo#1`) is scripted to fail `create_bead` with a generic,
+/// non-duplicate `br` tool error — standing in for "whatever other candidate
+/// was ahead of #8171 in the batch and broke". Issue #2 (`owner/repo#8171`)
+/// matches #8171's real shape (factory label, no bead, no branch, write-tier
+/// author) and would have adopted cleanly on its own. The fix under test:
+/// BOTH issues must resolve to exactly one of the five jleechan-eazj verdict
+/// events (ADOPTED/SKIPPED_DUPLICATE/SKIPPED_FORK/SKIPPED_INELIGIBLE/ERRORED)
+/// in the SAME tick, and the tick itself must succeed rather than aborting.
+#[test]
+fn earlier_candidate_create_bead_error_does_not_silence_later_candidate_matching_issue_8171() {
+    let mut scm = FakeScm::new();
+    scm.issues.push(Issue {
+        number: 1,
+        title: "some other malformed candidate".into(),
+        body: "triggers a create_bead failure unrelated to #8171".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#1".into(),
+    });
+    scm.issues.push(Issue {
+        number: 8171,
+        title: "[autor] Drive PR #8061 (Nocturna docs) to 4-green NON_PRODUCTION".into(),
+        body: "matches issue #8171's real shape".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#8171".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    // Only owner/repo#1's create_bead call fails; owner/repo#8171's succeeds
+    // via the default `create_bead_result` (`Ok("fake-bead-1")`).
+    *tracker.create_bead_fail_for_ref.borrow_mut() = Some((
+        "owner/repo#1".to_string(),
+        "br: create failed: malformed candidate".to_string(),
+    ));
+
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_tick_integration_test");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-8171-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 0, 0).expect(
+        "the tick must SUCCEED despite issue #1's create_bead error -- one candidate's failure \
+         must never abort the batch (this is exactly the mechanism that silenced #8171)",
+    );
+    assert_eq!(
+        summary.beads_created, 1,
+        "only owner/repo#8171 should produce a bead; owner/repo#1 errored"
+    );
+
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    // owner/repo#1: exactly one ERRORED verdict, naming the real reason.
+    let issue1_events: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["beadId"] == "owner/repo#1")
+        .collect();
+    assert_eq!(
+        issue1_events.len(),
+        1,
+        "owner/repo#1 must get exactly one verdict event, got: {issue1_events:#?}"
+    );
+    assert_eq!(issue1_events[0]["eventType"], "ERRORED");
+    let reason = issue1_events[0]["context"]["reason"]
+        .as_str()
+        .expect("ERRORED context must carry a real reason string");
+    assert!(
+        reason.contains("malformed candidate"),
+        "ERRORED reason must be the actual error, not a generic message: {reason}"
+    );
+
+    // owner/repo#8171: exactly one ADOPTED verdict (INTAKE_BEAD_CREATED),
+    // proving issue #1's earlier failure did not silence it.
+    let issue_8171_events: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| {
+            e["context"]["external_ref"] == "owner/repo#8171" || e["beadId"] == "fake-bead-1"
+        })
+        .filter(|e| e["eventType"] == "INTAKE_BEAD_CREATED")
+        .collect();
+    assert_eq!(
+        issue_8171_events.len(),
+        1,
+        "owner/repo#8171 (matching the real issue's shape) must get exactly one ADOPTED \
+         verdict in the same tick as the errored candidate ahead of it, got full event stream: \
+         {events:#?}"
+    );
+
+    // grep-ability: the operator's actual diagnostic step was `grep 8171
+    // daemon.jsonl`. Assert the raw JSONL text contains "8171" somewhere,
+    // matching both the ERRORED external_ref format and this assertion's
+    // intent.
+    assert!(
+        body.contains("8171"),
+        "raw telemetry JSONL must be grep-able for the issue number, got: {body}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

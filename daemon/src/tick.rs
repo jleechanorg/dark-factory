@@ -21,7 +21,7 @@
 use crate::config::Config;
 use crate::dispatch::{self, MAX_TRANSIENT_SPAWN_RETRY};
 use crate::errors::DaemonError;
-use crate::intake;
+use crate::intake::{self, IntakeOutcome, IntakeVerdict};
 use crate::router::{self, RoutingVerdict};
 use crate::state::{BeadOverlay, OverlayState, StateStore};
 use crate::telemetry::{self, TelemetryEvent};
@@ -165,6 +165,50 @@ fn emit(
             metrics,
             context,
         },
+    )
+}
+
+/// jleechan-eazj: emit exactly one structured verdict event for a
+/// non-adopted `intake::IntakeOutcome`. No bead exists yet for these
+/// candidates, so `bead_id` is the `external_ref` (e.g.
+/// `"owner/repo#8171"`) — the same identifier the operator greps for, so
+/// `grep 8171 daemon.jsonl` finds this line even though no bead was ever
+/// created. `ADOPTED` verdicts are NOT handled here: they already carry a
+/// real bead id and are reported by the caller via INTAKE_BEAD_CREATED /
+/// EXISTING_PR_ADOPTED, which predate this helper.
+fn emit_intake_outcome(telemetry_log: &Path, outcome: &IntakeOutcome) -> Result<(), DaemonError> {
+    let (event_type, context) = match &outcome.verdict {
+        IntakeVerdict::SkippedDuplicate => (
+            "SKIPPED_DUPLICATE",
+            serde_json::json!({"external_ref": outcome.external_ref}),
+        ),
+        IntakeVerdict::SkippedFork => (
+            "SKIPPED_FORK",
+            serde_json::json!({"external_ref": outcome.external_ref}),
+        ),
+        IntakeVerdict::SkippedIneligible { precondition } => (
+            "SKIPPED_INELIGIBLE",
+            serde_json::json!({
+                "external_ref": outcome.external_ref,
+                "precondition": precondition,
+            }),
+        ),
+        IntakeVerdict::Errored { reason } => (
+            "ERRORED",
+            serde_json::json!({
+                "external_ref": outcome.external_ref,
+                "reason": reason,
+            }),
+        ),
+    };
+    emit(
+        telemetry_log,
+        &outcome.external_ref,
+        1,
+        "INTAKE",
+        event_type,
+        serde_json::json!({}),
+        context,
     )
 }
 
@@ -334,7 +378,8 @@ pub fn run_tick(
                                 "🤖 **[dark-factory]** Escalation required: bead `{}` was recorded DISPATCHED with session `{}`, but that session's live branch (`{}`) does not match the bead's registered branch (`{}`). This record cannot be trusted and has been parked HUMAN_HELD for manual review (see jleechan-5ia2).",
                                 overlay.bead_id, session_id_str, actual_branch, expected_branch
                             );
-                            let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
+                            let _ =
+                                post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
                             summary.beads_parked_human_held += 1;
                             continue;
                         }
@@ -614,7 +659,15 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // detection). The freshly-recovered QUEUED beads are picked up by the
     // routing_candidates loop below, so they get dispatched this same tick.
     let mut pr_intake_bead_ids = HashSet::new();
-    for adopted in intake::normalize_labeled_prs(deps.scm, deps.tracker, deps.cfg)? {
+    let (pr_adoptions, pr_skip_outcomes) =
+        intake::normalize_labeled_prs(deps.scm, deps.tracker, deps.cfg)?;
+    // jleechan-eazj: every factory-labeled PR that did NOT result in an
+    // adoption still gets exactly one verdict event here, unconditionally —
+    // before the adoption loop below runs any I/O of its own.
+    for outcome in &pr_skip_outcomes {
+        emit_intake_outcome(deps.telemetry_log, outcome)?;
+    }
+    for adopted in pr_adoptions {
         pr_intake_bead_ids.insert(adopted.bead_id.clone());
         if adopted.newly_created {
             summary.beads_created += 1;
@@ -701,7 +754,13 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         )?;
     }
 
-    let created = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
+    let (created, issue_skip_outcomes) = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
+    // jleechan-eazj: same unconditional per-candidate guarantee as the PR
+    // path above — every factory-labeled issue that did NOT result in a
+    // newly-created bead still gets exactly one verdict event.
+    for outcome in &issue_skip_outcomes {
+        emit_intake_outcome(deps.telemetry_log, outcome)?;
+    }
     let tracker_candidates = deps.tracker.fetch_candidates()?;
     let mut routing_candidates: Vec<Bead> = Vec::new();
     for bead_id in &created {
@@ -760,7 +819,13 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             OverlayState::Queued.as_str(),
             "INTAKE_BEAD_CREATED",
             serde_json::json!({}),
-            serde_json::json!({}),
+            // jleechan-eazj: carry external_ref so `grep <issue-number>
+            // daemon.jsonl` finds the ADOPTED event too, not just the four
+            // SKIPPED_*/ERRORED verdicts (which are keyed on external_ref
+            // via bead_id since no bead exists yet for those).
+            serde_json::json!({
+                "external_ref": tracker_bead.as_ref().and_then(|b| b.external_ref.clone()),
+            }),
         )?;
         // `Tracker::fetch_candidates` == `br list ...`; a real `br` shows this
         // bead on the very next call since `br` is durable. Prefer that real
@@ -821,7 +886,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     OverlayState::Queued.as_str(),
                     "INTAKE_BEAD_CREATED",
                     serde_json::json!({}),
-                    serde_json::json!({"manual": true}),
+                    serde_json::json!({"manual": true, "external_ref": bead.external_ref}),
                 )?;
                 o
             }
@@ -911,7 +976,8 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     "🤖 **[dark-factory]** Escalation required: bead `{}` failed to spawn a worker session more than {} consecutive times (transient errors only — e.g. AO session-cap pressure). Automation parked it HUMAN_HELD instead of retrying indefinitely; please check target-repo session capacity before requeuing.",
                     failure.bead_id, MAX_TRANSIENT_SPAWN_RETRY
                 );
-                if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body) {
+                if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
+                {
                     emit(
                         deps.telemetry_log,
                         &failure.bead_id,
@@ -1019,7 +1085,11 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> {
     use crate::tools::run_tool;
     match vendor {
-        "codex" => run_tool("codex", &["exec", "--yolo", "--skip-git-repo-check", prompt], 120),
+        "codex" => run_tool(
+            "codex",
+            &["exec", "--yolo", "--skip-git-repo-check", prompt],
+            120,
+        ),
         "claude" => {
             let home = std::env::var("HOME").unwrap_or_default();
             let nvm_claude = format!("{}/.nvm/versions/node/v22.22.0/bin/claude", home);
@@ -1028,9 +1098,23 @@ fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> 
             } else {
                 "claude".to_string()
             };
-            run_tool(&claude_bin, &["--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt], 120)
+            run_tool(
+                &claude_bin,
+                &[
+                    "--print",
+                    "--dangerously-skip-permissions",
+                    "--setting-sources",
+                    "",
+                    prompt,
+                ],
+                120,
+            )
         }
-        "agy" => run_tool("agy", &["--print", "--dangerously-skip-permissions", prompt], 120),
+        "agy" => run_tool(
+            "agy",
+            &["--print", "--dangerously-skip-permissions", prompt],
+            120,
+        ),
         other => Err(DaemonError::Tool {
             tool: other.to_string(),
             rc: -1,
@@ -1098,7 +1182,9 @@ fn skeptic_evidence(
         {
             if body_lower.contains("verdict: pass") || body_lower.contains("verdict: success") {
                 gha_verdict = "verdict: pass";
-            } else if body_lower.contains("verdict: fail") || body_lower.contains("verdict: failure") {
+            } else if body_lower.contains("verdict: fail")
+                || body_lower.contains("verdict: failure")
+            {
                 gha_verdict = "verdict: fail";
             }
         }
@@ -1298,7 +1384,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     bead_ids.sort();
     bead_ids.dedup();
 
-
     for bead_id in &bead_ids {
         let mut overlay = match deps.store.load(bead_id)? {
             Some(o) => o,
@@ -1318,19 +1403,20 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         project = "worldarchitect".to_string();
                     }
 
-                    let r = crate::tools::run_tool(
-                        "ao",
-                        &["status", "-p", &project, "--json"],
-                        30,
-                    );
+                    let r = crate::tools::run_tool("ao", &["status", "-p", &project, "--json"], 30);
                     if let Ok(out) = r {
                         let json_start = out.find('[').unwrap_or(0);
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&out[json_start..]) {
+                        if let Ok(val) =
+                            serde_json::from_str::<serde_json::Value>(&out[json_start..])
+                        {
                             if let Some(arr) = val.as_array() {
                                 if let Some(entry) = arr.iter().find(|e| {
-                                    e.get("name").and_then(|v| v.as_str()) == Some(session_id.as_str())
+                                    e.get("name").and_then(|v| v.as_str())
+                                        == Some(session_id.as_str())
                                 }) {
-                                    if let Some(pr_num) = entry.get("prNumber").and_then(|v| v.as_u64()) {
+                                    if let Some(pr_num) =
+                                        entry.get("prNumber").and_then(|v| v.as_u64())
+                                    {
                                         overlay.pr_number = Some(pr_num);
                                         deps.store.save(&overlay)?;
                                     }
@@ -1841,20 +1927,14 @@ fn escalation_already_recorded(deps: &TickDeps, bead_id: &str) -> Result<bool, D
     ))
 }
 
-fn record_escalation(
-    deps: &TickDeps,
-    bead_id: &str,
-    reason: &str,
-) -> Result<(), DaemonError> {
-    deps
-        .store
-        .save_rejection(
-            bead_id,
-            ESCALATION_SENTINEL_ATTEMPT,
-            ESCALATION_REVIEWER,
-            reason,
-            reason,
-        )
+fn record_escalation(deps: &TickDeps, bead_id: &str, reason: &str) -> Result<(), DaemonError> {
+    deps.store.save_rejection(
+        bead_id,
+        ESCALATION_SENTINEL_ATTEMPT,
+        ESCALATION_REVIEWER,
+        reason,
+        reason,
+    )
 }
 
 fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {

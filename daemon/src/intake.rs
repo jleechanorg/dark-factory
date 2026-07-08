@@ -23,6 +23,46 @@ pub struct ExistingPrIntake {
     pub newly_created: bool,
 }
 
+/// jleechan-eazj: the five verdicts every factory-labeled candidate must
+/// resolve to, exactly once, per slow tick. `Adopted` is reported separately
+/// by the caller (it already carries a bead id via `created`/`ExistingPrIntake`
+/// and an INTAKE_BEAD_CREATED/EXISTING_PR_ADOPTED telemetry event); the four
+/// variants here cover every path that does NOT result in a bead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntakeVerdict {
+    /// `external_ref` already tracked by the bead store (idempotency skip,
+    /// either via the pre-check or a `create_bead` uniqueness-constraint
+    /// race recovered at write time).
+    SkippedDuplicate,
+    /// Fork/cross-repository PR — branch-stealing guard rejected it.
+    SkippedFork,
+    /// Label present but some other precondition failed. `precondition`
+    /// names exactly which one (e.g. "author_permission_below_write_tier",
+    /// "empty_head_ref_name") so the telemetry line is self-explanatory
+    /// without cross-referencing source.
+    SkippedIneligible { precondition: String },
+    /// An operation on this specific candidate failed (e.g. `create_bead` or
+    /// `collaborator_permission` errored). `reason` is the real error
+    /// string, not a generic message. Recorded and the loop *continues* —
+    /// one candidate's error must never abort processing of the rest of the
+    /// batch (jleechan-eazj: this was the actual root cause of issue #8171
+    /// vanishing with zero telemetry — an earlier candidate's non-transient
+    /// `create_bead` error used to `return Err(..)`, which propagates all
+    /// the way to `main()` and calls `std::process::exit(1)`, killing the
+    /// whole daemon process before later candidates in the same fetch batch
+    /// were ever visited).
+    Errored { reason: String },
+}
+
+/// One verdict for one candidate, keyed on the same `external_ref` used
+/// everywhere else in the daemon (`"<owner>/<repo>#<number>"`) so telemetry
+/// consumers can `grep` a specific issue/PR number and always find it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntakeOutcome {
+    pub external_ref: String,
+    pub verdict: IntakeVerdict,
+}
+
 fn same_repo_pr(pr: &LabeledPr, cfg: &Config) -> bool {
     if pr.is_cross_repository {
         return false;
@@ -50,35 +90,75 @@ fn same_repo_pr(pr: &LabeledPr, cfg: &Config) -> bool {
 /// * For each newly-authorized issue, calls `create_bead` and collects the
 ///   returned bead id.
 ///
-/// Returns the ids of beads newly created during this pass (empty if nothing
-/// new). Idempotent: running twice against an unchanged SCM/tracker produces
-/// no new beads on the second run.
+/// Returns `(created, outcomes)`: `created` is the ids of beads newly
+/// created during this pass (empty if nothing new, preserved for existing
+/// callers). `outcomes` carries exactly one `IntakeOutcome` for every
+/// candidate that did NOT result in a newly-created bead (skips + errors) —
+/// combined with one `INTAKE_BEAD_CREATED` telemetry event per `created`
+/// entry, every candidate `scm.labeled_issues` returned resolves to exactly
+/// one verdict (jleechan-eazj). Idempotent: running twice against an
+/// unchanged SCM/tracker produces no new beads on the second run.
+///
+/// No single candidate's failure can prevent the rest of the batch from
+/// being processed: every per-candidate operation that can fail
+/// (`collaborator_permission`, `create_bead`) is caught and converted into
+/// an `Errored` outcome rather than propagated with `?` — jleechan-eazj
+/// traced issue #8171's total telemetry silence to exactly this pattern: an
+/// earlier candidate's non-transient error used to abort this whole
+/// function via `return Err(..)`, which propagates through `run_slow_tier`
+/// to `main()` and calls `std::process::exit(1)`, so no candidate after the
+/// failing one in the same fetch batch was ever visited, let alone logged.
 pub fn normalize(
     scm: &dyn Scm,
     tracker: &dyn Tracker,
     cfg: &Config,
-) -> Result<Vec<String>, DaemonError> {
+) -> Result<(Vec<String>, Vec<IntakeOutcome>), DaemonError> {
     let issues = scm.labeled_issues(FACTORY_LABEL)?;
     if issues.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let known_refs = tracker.fetch_all_external_refs()?;
 
     let mut created = Vec::new();
+    let mut outcomes = Vec::new();
 
     for issue in issues {
         // Idempotency: already-known external_ref -> skip silently, no create_bead call.
         if known_refs.contains(&issue.external_ref) {
+            outcomes.push(IntakeOutcome {
+                external_ref: issue.external_ref.clone(),
+                verdict: IntakeVerdict::SkippedDuplicate,
+            });
             continue;
         }
 
         // Write-tier authorization gate (spec §4.2.3): only Write/Admin may
         // trigger dispatch. Lower tiers are skipped, not errored — the skip
         // itself is the audit trail the caller records via telemetry, keyed
-        // on issue.external_ref + issue.author_login.
-        let permission = scm.collaborator_permission(&issue.author_login)?;
+        // on issue.external_ref + issue.author_login. A failure to even
+        // *determine* the permission tier (e.g. a transient GitHub API
+        // error) is recorded as Errored for this candidate only — it must
+        // not abort the rest of the batch.
+        let permission = match scm.collaborator_permission(&issue.author_login) {
+            Ok(p) => p,
+            Err(e) => {
+                outcomes.push(IntakeOutcome {
+                    external_ref: issue.external_ref.clone(),
+                    verdict: IntakeVerdict::Errored {
+                        reason: e.to_string(),
+                    },
+                });
+                continue;
+            }
+        };
         if !permission.is_write_tier() {
+            outcomes.push(IntakeOutcome {
+                external_ref: issue.external_ref.clone(),
+                verdict: IntakeVerdict::SkippedIneligible {
+                    precondition: format!("author_permission_below_write_tier:{permission:?}"),
+                },
+            });
             continue;
         }
 
@@ -103,9 +183,27 @@ pub fn normalize(
                         "auto-factory daemon: intake race recovered — external_ref {:?} already tracked by {existing_bead_id} (known_refs pre-check missed it); skipping create_bead",
                         issue.external_ref
                     );
+                    outcomes.push(IntakeOutcome {
+                        external_ref: issue.external_ref.clone(),
+                        verdict: IntakeVerdict::SkippedDuplicate,
+                    });
                     continue;
                 }
-                return Err(e);
+                // jleechan-eazj: do NOT `return Err(e)` here — that used to
+                // abort the whole `normalize` call (and, via `?` upstream,
+                // the whole daemon process) on the first non-duplicate
+                // `create_bead` failure, silently starving every subsequent
+                // candidate in this fetch batch of any telemetry at all.
+                // Record the real error and move on to the next candidate;
+                // an unresolved issue is retried again next slow tick since
+                // it never gets added to `known_refs`.
+                outcomes.push(IntakeOutcome {
+                    external_ref: issue.external_ref.clone(),
+                    verdict: IntakeVerdict::Errored {
+                        reason: e.to_string(),
+                    },
+                });
+                continue;
             }
         };
 
@@ -118,38 +216,72 @@ pub fn normalize(
         created.push(bead_id);
     }
 
-    Ok(created)
+    Ok((created, outcomes))
 }
 
 /// Normalize open PRs labeled `factory` into beads that should attach to the
 /// existing PR/head branch rather than dispatching a fresh factory branch.
+///
+/// Returns `(intakes, outcomes)` with the same jleechan-eazj guarantee as
+/// `normalize`: every PR `scm.labeled_prs` returns resolves to exactly one
+/// verdict this tick — either an `ExistingPrIntake` entry (ADOPTED, reported
+/// by the caller via EXISTING_PR_ADOPTED) or one `IntakeOutcome` here. No
+/// single PR's error aborts the rest of the batch.
 pub fn normalize_labeled_prs(
     scm: &dyn Scm,
     tracker: &dyn Tracker,
     cfg: &Config,
-) -> Result<Vec<ExistingPrIntake>, DaemonError> {
+) -> Result<(Vec<ExistingPrIntake>, Vec<IntakeOutcome>), DaemonError> {
     let prs = scm.labeled_prs(FACTORY_LABEL)?;
     if prs.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let tracker_candidates = tracker.fetch_candidates()?;
     let known_refs = tracker.fetch_all_external_refs()?;
     let mut intakes = Vec::new();
+    let mut outcomes = Vec::new();
 
     for pr in prs {
         if pr.head_ref_name.trim().is_empty() {
+            outcomes.push(IntakeOutcome {
+                external_ref: pr.external_ref.clone(),
+                verdict: IntakeVerdict::SkippedIneligible {
+                    precondition: "empty_head_ref_name".to_string(),
+                },
+            });
             continue;
         }
 
         if !same_repo_pr(&pr, cfg) {
             let comment_body = "🤖 **[dark-factory]** Escalation required: fork/cross-repository PR adoption is not supported in v1. Same-repo factory PRs can be verified automatically; fork remediation lands with bead `jleechan-tfs1`.";
             let _ = tracker.comment_external(&pr.external_ref, comment_body);
+            outcomes.push(IntakeOutcome {
+                external_ref: pr.external_ref.clone(),
+                verdict: IntakeVerdict::SkippedFork,
+            });
             continue;
         }
 
-        let permission = scm.collaborator_permission(&pr.author_login)?;
+        let permission = match scm.collaborator_permission(&pr.author_login) {
+            Ok(p) => p,
+            Err(e) => {
+                outcomes.push(IntakeOutcome {
+                    external_ref: pr.external_ref.clone(),
+                    verdict: IntakeVerdict::Errored {
+                        reason: e.to_string(),
+                    },
+                });
+                continue;
+            }
+        };
         if !permission.is_write_tier() {
+            outcomes.push(IntakeOutcome {
+                external_ref: pr.external_ref.clone(),
+                verdict: IntakeVerdict::SkippedIneligible {
+                    precondition: format!("author_permission_below_write_tier:{permission:?}"),
+                },
+            });
             continue;
         }
 
@@ -168,6 +300,10 @@ pub fn normalize_labeled_prs(
         }
 
         if known_refs.contains(&pr.external_ref) {
+            outcomes.push(IntakeOutcome {
+                external_ref: pr.external_ref.clone(),
+                verdict: IntakeVerdict::SkippedDuplicate,
+            });
             continue;
         }
 
@@ -184,9 +320,24 @@ pub fn normalize_labeled_prs(
                         "auto-factory daemon: PR intake race recovered — external_ref {:?} already tracked by {existing_bead_id} (known_refs pre-check missed it); skipping create_bead",
                         pr.external_ref
                     );
+                    outcomes.push(IntakeOutcome {
+                        external_ref: pr.external_ref.clone(),
+                        verdict: IntakeVerdict::SkippedDuplicate,
+                    });
                     continue;
                 }
-                return Err(e);
+                // jleechan-eazj: do NOT `return Err(e)` here — see the
+                // matching comment in `normalize` above. One PR's
+                // non-duplicate `create_bead` failure must not starve every
+                // other candidate in this fetch batch of telemetry (or crash
+                // the daemon process via the `?` upstream in `run_slow_tier`).
+                outcomes.push(IntakeOutcome {
+                    external_ref: pr.external_ref.clone(),
+                    verdict: IntakeVerdict::Errored {
+                        reason: e.to_string(),
+                    },
+                });
+                continue;
             }
         };
         let comment_body = format!(
@@ -203,7 +354,7 @@ pub fn normalize_labeled_prs(
         });
     }
 
-    Ok(intakes)
+    Ok((intakes, outcomes))
 }
 
 #[cfg(test)]
