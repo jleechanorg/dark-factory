@@ -5355,3 +5355,281 @@ fn spawn_failure_count_resets_after_a_successful_dispatch() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+// jleechan-w28n: follow-up to the three `MAX_TRANSIENT_SPAWN_RETRY` tests
+// above. `DaemonError::Deferred` (AO's own admission-control queue, hit when
+// the target project is pinned at its active-session cap) was classified as
+// `is_transient() == true` by `errors.rs` from the start, which meant it fell
+// into the SAME counter-incrementing `Err(err) if err.is_transient()` arm as
+// genuine `Tool`/`Timeout` spawn failures. Sustained cap saturation is the
+// live, expected steady state (not a bug) — worldarchitect.ai routinely sits
+// at its session cap — so every dispatch cycle for every queued bead would
+// increment `spawn_failure_count`, and after `MAX_TRANSIENT_SPAWN_RETRY`
+// cycles the entire backlog would spuriously park HUMAN_HELD with escalation
+// comments. These two tests prove the fix: `Deferred` now has its own
+// `"spawn_deferred"` phase and NEVER touches the counter.
+
+/// N=20 consecutive `Deferred` spawn "failures" (backpressure, not failure)
+/// for the same bead, driven across 20 separate simulated dispatch cycles via
+/// the real `run_tick` call stack. N is intentionally chosen above
+/// `MAX_TRANSIENT_SPAWN_RETRY` (15) to prove the cap simply does not apply to
+/// this path — if the fix regressed and `Deferred` fell back into the
+/// general transient arm, this bead would park HUMAN_HELD partway through
+/// the loop and the test would fail loudly.
+#[test]
+fn deferred_spawn_backpressure_never_increments_counter_or_parks_across_repeated_cycles() {
+    const BEAD_ID: &str = "fake-bead-1";
+    const N: u64 = 20;
+
+    let mut scm = FakeScm::new();
+    scm.issues.push(Issue {
+        number: 9001,
+        title: "Bead whose target project sits at its AO session cap".into(),
+        body: "sustained admission-control backpressure, not a failure".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#9001".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    sessions.fail_spawn_deferred_for(BEAD_ID);
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_spawn_deferred_below_cap_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    for tick_index in 0..N {
+        let summary = run_tick(&deps, tick_index, 0)
+            .unwrap_or_else(|e| panic!("tick {tick_index} should succeed: {e:?}"));
+        assert_eq!(summary.beads_dispatched, 0, "tick {tick_index}");
+        assert_eq!(
+            summary.beads_parked_human_held, 0,
+            "tick {tick_index}: Deferred backpressure must never park a bead, no matter how \
+             many consecutive cycles it persists for"
+        );
+        assert_eq!(summary.beads_escalated, 0, "tick {tick_index}");
+
+        let overlay = store.load(BEAD_ID).unwrap().unwrap();
+        assert_eq!(
+            overlay.state,
+            OverlayState::Queued,
+            "tick {tick_index}: a Deferred bead must stay QUEUED and retriable"
+        );
+        assert_eq!(
+            overlay.spawn_failure_count, 0,
+            "tick {tick_index}: Deferred must NEVER increment spawn_failure_count, even after \
+             {tick_index} consecutive cycles well past MAX_TRANSIENT_SPAWN_RETRY (15)"
+        );
+    }
+
+    let final_overlay = store.load(BEAD_ID).unwrap().unwrap();
+    assert_eq!(final_overlay.state, OverlayState::Queued);
+    assert_eq!(final_overlay.spawn_failure_count, 0);
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !log.contains("PARKED_HUMAN_HELD"),
+        "no park should ever happen for sustained Deferred backpressure; got: {log}"
+    );
+
+    let deferred_phase_count = log
+        .lines()
+        .filter(|line| line.contains("BEAD_DISPATCH_TRANSIENT_ERROR") && line.contains("\"phase\":\"spawn_deferred\""))
+        .count();
+    assert_eq!(
+        deferred_phase_count, N as usize,
+        "exactly {N} \"spawn_deferred\"-phase telemetry events must reach daemon.jsonl (one per \
+         tick) — a Deferred spawn outcome that never reaches telemetry reproduces the \
+         zero-telemetry-signal gap this fix closes; got log: {log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Mixed-batch independence: in the SAME dispatch batch, bead A hits
+/// sustained `Deferred` backpressure (must never park, counter stays 0)
+/// while bead B hits genuine `Tool` transient failures and DOES eventually
+/// park HUMAN_HELD once `spawn_failure_count` exceeds
+/// `MAX_TRANSIENT_SPAWN_RETRY`. Proves the two paths are independent: A's
+/// backpressure must never contaminate B's counter (or vice versa), and B
+/// parking must never affect A.
+#[test]
+fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independent() {
+    const MAX_TRANSIENT_SPAWN_RETRY: u32 = 15;
+    const BEAD_A: &str = "fake-bead-a";
+    const BEAD_B: &str = "fake-bead-b";
+    const EXTERNAL_REF_A: &str = "owner/repo#9101";
+    const EXTERNAL_REF_B: &str = "owner/repo#9102";
+
+    // `FakeTracker::create_bead` always returns the single hardcoded id
+    // "fake-bead-1" (see tests/common/mod.rs), so two `scm.issues` entries
+    // cannot be used to mint two DISTINCT bead ids in one test. Instead,
+    // pre-seed both beads directly as already-tracked (mirrors
+    // `capped_human_held_candidate_lookup_failure_retries_before_recording_escalation`'s
+    // pattern below): `run_slow_tier`'s "leftover from a prior tick" loop
+    // (tick.rs, `for bead in tracker_candidates { ... }`) picks up every
+    // `tracker.candidates` entry each tick and routes/dispatches it if its
+    // overlay is QUEUED, exactly like a real `br list` would on tick N+1.
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: BEAD_A.into(),
+        title: "Bead A: sustained Deferred backpressure".into(),
+        description: "target project pinned at its AO session cap".into(),
+        file_tree_summary: String::new(),
+        external_ref: Some(EXTERNAL_REF_A.into()),
+    });
+    tracker.candidates.borrow_mut().push(Bead {
+        id: BEAD_B.into(),
+        title: "Bead B: genuine deterministic tool spawn failure".into(),
+        description: "distinct from bead A's backpressure — a real transient error".into(),
+        file_tree_summary: String::new(),
+        external_ref: Some(EXTERNAL_REF_B.into()),
+    });
+
+    let sessions = FakeSessions::new();
+    sessions.fail_spawn_deferred_for(BEAD_A);
+    sessions.fail_spawn_for(BEAD_B);
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_spawn_mixed_batch_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // Ticks 0..=14: fifteen consecutive cycles. Bead A must stay QUEUED with
+    // a permanently-zero counter; bead B accumulates spawn_failure_count but
+    // must stay under the cap (>15 required to trip it).
+    for tick_index in 0..=14u64 {
+        let summary = run_tick(&deps, tick_index, 0)
+            .unwrap_or_else(|e| panic!("tick {tick_index} should succeed: {e:?}"));
+        assert_eq!(
+            summary.beads_parked_human_held, 0,
+            "tick {tick_index}: bead B must not be parked before the cap is exceeded, and bead \
+             A must never be parked at all"
+        );
+
+        let overlay_a = store.load(BEAD_A).unwrap().unwrap();
+        assert_eq!(
+            overlay_a.state,
+            OverlayState::Queued,
+            "tick {tick_index}: bead A (Deferred) must stay QUEUED"
+        );
+        assert_eq!(
+            overlay_a.spawn_failure_count, 0,
+            "tick {tick_index}: bead A's counter must stay at 0 regardless of bead B's failures \
+             in the same batch"
+        );
+
+        let overlay_b = store.load(BEAD_B).unwrap().unwrap();
+        assert_eq!(
+            overlay_b.state,
+            OverlayState::Queued,
+            "tick {tick_index}: bead B (genuine transient) must stay QUEUED below the cap"
+        );
+        assert_eq!(overlay_b.spawn_failure_count, (tick_index as u32) + 1);
+    }
+
+    let a_at_fifteen = store.load(BEAD_A).unwrap().unwrap();
+    assert_eq!(a_at_fifteen.spawn_failure_count, 0);
+    let b_at_cap = store.load(BEAD_B).unwrap().unwrap();
+    assert_eq!(b_at_cap.spawn_failure_count, MAX_TRANSIENT_SPAWN_RETRY);
+    assert_eq!(b_at_cap.state, OverlayState::Queued);
+
+    // Tick 15: bead B's 16th consecutive genuine transient failure exceeds
+    // the cap and must park HUMAN_HELD + escalate. Bead A, in the very same
+    // batch, must remain completely unaffected.
+    let summary_cap = run_tick(&deps, 15, 0).expect("cap tick should succeed");
+    assert_eq!(
+        summary_cap.beads_parked_human_held, 1,
+        "exactly one bead (B) should park on this tick"
+    );
+    assert_eq!(summary_cap.beads_escalated, 1);
+
+    let a_final = store.load(BEAD_A).unwrap().unwrap();
+    assert_eq!(
+        a_final.state,
+        OverlayState::Queued,
+        "bead A must remain QUEUED even after bead B parks HUMAN_HELD in the same batch"
+    );
+    assert_eq!(a_final.spawn_failure_count, 0);
+
+    let b_final = store.load(BEAD_B).unwrap().unwrap();
+    assert_eq!(b_final.state, OverlayState::HumanHeld);
+    assert_eq!(b_final.spawn_failure_count, MAX_TRANSIENT_SPAWN_RETRY + 1);
+
+    let escalation_comment_count_for = |tracker: &FakeTracker, external_ref: &str, bead_id: &str| {
+        tracker
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| {
+                call.contains(&format!("comment_external({external_ref}"))
+                    && call.contains("Escalation required")
+                    && call.contains(&format!("bead `{bead_id}`"))
+            })
+            .count()
+    };
+    assert_eq!(
+        escalation_comment_count_for(&tracker, EXTERNAL_REF_B, BEAD_B),
+        1,
+        "bead B must get exactly one real escalation comment: {:?}",
+        tracker.calls.borrow()
+    );
+    assert_eq!(
+        escalation_comment_count_for(&tracker, EXTERNAL_REF_A, BEAD_A),
+        0,
+        "bead A (Deferred backpressure) must NEVER be escalated: {:?}",
+        tracker.calls.borrow()
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("\"phase\":\"spawn_deferred\""),
+        "bead A's Deferred outcomes must still reach telemetry via BEAD_DISPATCH_TRANSIENT_ERROR; \
+         got: {log}"
+    );
+    assert!(
+        log.contains("PARKED_HUMAN_HELD") && log.contains("transient_spawn_retry_cap_exceeded"),
+        "bead B's cap-exceeded park telemetry must be present; got: {log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}

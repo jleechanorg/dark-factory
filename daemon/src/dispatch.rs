@@ -200,6 +200,34 @@ pub fn dispatch_ready(
         };
         let session_id = match sessions.spawn(&spec) {
             Ok(session_id) => session_id,
+            // jleechan-w28n: AO's own admission-control queue (session-cap
+            // backpressure — see `DaemonError::Deferred`'s doc comment) is
+            // NOT a failure and must never share `spawn_failure_count` with
+            // genuine transient errors (`Tool`/`Timeout`). Sustained cap
+            // saturation would otherwise increment the counter on EVERY
+            // dispatch cycle for EVERY queued bead and, after
+            // `MAX_TRANSIENT_SPAWN_RETRY` cycles, spuriously park the entire
+            // backlog HUMAN_HELD with escalation comments — converting
+            // normal capacity backpressure into a mass false-escalation
+            // incident. This arm MUST precede the general
+            // `err.is_transient()` guard below (Deferred also satisfies that
+            // guard, but Rust match arms are order-sensitive and the more
+            // specific pattern must win). Simply requeue and report under a
+            // distinct `"spawn_deferred"` phase so it's visually
+            // distinguishable downstream from genuine spawn failures.
+            Err(err @ DaemonError::Deferred(_)) => {
+                overlay.state = OverlayState::Queued;
+                overlay.session_id = None;
+                store.save(&overlay)?;
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    Some(branch.clone()),
+                    "spawn_deferred",
+                    err,
+                ));
+                continue;
+            }
             Err(err) if err.is_transient() => {
                 overlay.spawn_failure_count += 1;
                 overlay.session_id = None;
@@ -331,6 +359,11 @@ mod tests {
         calls: RefCell<Vec<String>>,
         fail_spawn_for: RefCell<Vec<String>>,
         fail_spawn_fatal_for: RefCell<Vec<String>>,
+        // jleechan-w28n: scripted `DaemonError::Deferred` spawn outcome,
+        // distinct from `fail_spawn_for`'s `DaemonError::Tool` — exercises
+        // the AO admission-control-queue path (session-cap backpressure)
+        // separately from a genuine transient tool failure.
+        fail_spawn_deferred_for: RefCell<Vec<String>>,
         fail_stop_for: RefCell<Vec<String>>,
         // jleechan-5ia2: scripted `session_branch` override, keyed by
         // session id. Empty by default (matches the trait's `Ok(None)`
@@ -349,6 +382,7 @@ mod tests {
                 calls: RefCell::new(Vec::new()),
                 fail_spawn_for: RefCell::new(Vec::new()),
                 fail_spawn_fatal_for: RefCell::new(Vec::new()),
+                fail_spawn_deferred_for: RefCell::new(Vec::new()),
                 fail_stop_for: RefCell::new(Vec::new()),
                 scripted_branch: RefCell::new(HashMap::new()),
             }
@@ -360,6 +394,12 @@ mod tests {
 
         fn fail_spawn_fatal_for(&self, bead_id: &str) {
             self.fail_spawn_fatal_for
+                .borrow_mut()
+                .push(bead_id.to_string());
+        }
+
+        fn fail_spawn_deferred_for(&self, bead_id: &str) {
+            self.fail_spawn_deferred_for
                 .borrow_mut()
                 .push(bead_id.to_string());
         }
@@ -399,6 +439,16 @@ mod tests {
                     rc: 1,
                     stderr: format!("scripted spawn failure for {}", spec.bead_id),
                 });
+            }
+            if self
+                .fail_spawn_deferred_for
+                .borrow()
+                .contains(&spec.bead_id)
+            {
+                return Err(DaemonError::Deferred(format!(
+                    "REQUEST=sq-scripted-{}",
+                    spec.bead_id
+                )));
             }
             Ok(SessionId("fake-session-1".into()))
         }
@@ -952,6 +1002,60 @@ mod tests {
         assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
         assert!(calls.iter().any(|c| c == "spawn(bead-1)"));
         assert!(calls.iter().any(|c| c == "spawn(bead-2)"));
+    }
+
+    /// jleechan-w28n: `DaemonError::Deferred` (AO's own admission-control
+    /// queue at the target project's session cap) must be requeued WITHOUT
+    /// touching `spawn_failure_count`, and reported under a distinct
+    /// `"spawn_deferred"` phase — never the `"spawn"` phase genuine transient
+    /// tool/timeout failures use. This is the arm-ordering guarantee: the
+    /// `Err(err @ DaemonError::Deferred(_))` match arm must intercept before
+    /// the general `err.is_transient()` guard (Deferred also satisfies that
+    /// guard, so a regression here would silently fall through to the
+    /// counter-incrementing path).
+    #[test]
+    fn deferred_spawn_failure_requeues_without_incrementing_counter_or_aborting_batch() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_deferred_for("bead-1");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(3);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        let success_ids: Vec<&str> = report
+            .successes
+            .iter()
+            .map(|success| success.bead_id.as_str())
+            .collect();
+        assert_eq!(
+            success_ids,
+            ["bead-0", "bead-2"],
+            "a Deferred spawn for one bead must not abort the rest of the batch"
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-1");
+        assert_eq!(
+            report.failures[0].phase, "spawn_deferred",
+            "Deferred backpressure must be reported under its own phase, distinct from \"spawn\""
+        );
+        assert!(
+            report.failures[0].transient,
+            "Deferred is retry-safe and must be reported as transient"
+        );
+
+        let bead_1 = store.load("bead-1").unwrap().unwrap();
+        assert_eq!(
+            bead_1.state,
+            OverlayState::Queued,
+            "a Deferred bead must be requeued, never parked"
+        );
+        assert_eq!(bead_1.session_id, None);
+        assert_eq!(
+            bead_1.spawn_failure_count, 0,
+            "Deferred backpressure must NEVER increment spawn_failure_count — it shares no \
+             budget with genuine transient tool/timeout failures"
+        );
     }
 
     #[test]
