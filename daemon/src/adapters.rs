@@ -1326,8 +1326,44 @@ impl Sessions for CliSessions {
         Ok(final_ids)
     }
 
-    fn attach(&self, _branch: &str, _bead_id: &str) -> Result<SessionId, DaemonError> {
-        Err(DaemonError::Config("attach is disabled/unimplemented".into()))
+    /// jleechan-hna3: reverse lookup of the AO session CURRENTLY associated
+    /// with `branch`, so the re-roll handover flow (`reroll.rs`) can `stop()`
+    /// it cleanly before creating a fresh attempt branch. This is NOT the
+    /// interactive `ao session attach <name>` terminal-reconnect command
+    /// (that would hang/misbehave from a non-interactive daemon subprocess)
+    /// and it does NOT steer the old session with new instructions —
+    /// remediation happens later via a fresh branch + `sessions.spawn()`.
+    ///
+    /// Same `ao status --json` parsing shape as `is_quiescent` /
+    /// `session_branch` above (ground-truth field names verified live:
+    /// `name`, `branch`, `activity`), just searched in the opposite
+    /// direction: given a branch, find the entry whose `branch` field
+    /// matches and return its `name` as the `SessionId`.
+    ///
+    /// "No matching entry" is a legitimate, expected failure (e.g. the bead
+    /// has no currently-tracked session) — the caller in `reroll.rs` already
+    /// handles it by parking `HumanHeld` and surfacing the error string
+    /// verbatim in telemetry a human reads, so the message names the branch
+    /// and bead explicitly instead of a generic "not found".
+    fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
+        let out = run_tool("ao", &["status", "--json"], 30)?;
+        let json_start = out.find('[').unwrap_or(0);
+        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse ao status: {e}"))
+        })?;
+        if let Some(arr) = data.as_array() {
+            for entry in arr {
+                if entry.get("branch").and_then(|v| v.as_str()) == Some(branch) {
+                    if let Some(name) = entry.get("name").and_then(|v| v.as_str()) {
+                        return Ok(SessionId(name.to_string()));
+                    }
+                }
+            }
+        }
+        Err(DaemonError::Config(format!(
+            "attach: no ao session currently tracks branch '{branch}' (bead {bead_id}); \
+             it may have already exited, been reaped, or never been spawned"
+        )))
     }
 
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
