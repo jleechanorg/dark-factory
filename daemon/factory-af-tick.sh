@@ -103,6 +103,12 @@ cd "$ROOT"
 "$O" init
 "$O" unstick-dispatching
 "$O" recover-held
+# Roll back DISPATCHED beads whose async spawn failed (state file "fail:rc=N").
+# Closes the Codex P1 loop on PR #193: async-spawn can succeed at the wrapper
+# level (fast-fail window passed) but fail later; the state file records the
+# final outcome and the next tick's `rollback-dispatched` rolls those beads
+# back to QUEUED for retry.
+"$O" rollback-dispatched
 
 # Park superseded duplicates. Generic query — no hardcoded bead IDs.
 # Picks up beads marked with the "superseded" label via the br CLI; if that

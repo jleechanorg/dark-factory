@@ -31,6 +31,11 @@
 #                             $HOME/Library/Logs/dark-factory)
 #   AFD_SPAWN_STATE_DIR       directory for state files (default
 #                             $HOME/Library/Application Support/dark-factory/spawns)
+#   AFD_ASYNC_WAIT_SEC        how long the async wrapper polls the state
+#                             file for fast-fail detection before returning
+#                             optimistically (default 5). Most auth/project
+#                             errors fail within 1-2s; cold-start slow spawns
+#                             exceed this bound and proceed optimistically.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export AO_MAX_CONCURRENT_SESSIONS="${AO_MAX_CONCURRENT_SESSIONS:-30}"
@@ -171,8 +176,43 @@ echo "pending" > "$STATE_FILE"
 SPAWN_PID=$!
 disown "$SPAWN_PID" 2>/dev/null || true
 
-echo "[remediate] async-spawned PR #$PR bead=${BEAD_ID} pid=${SPAWN_PID} log=${SPAWN_LOG}"
-# Caller (factory-af-tick.sh) treats rc=0 as "dispatch accepted". The
-# `ao session ls` check on subsequent ticks will skip this PR if the spawn
-# never produced a session — same retry semantics as before.
-exit 0
+# Fast-fail detection: poll the state file for up to AFD_ASYNC_WAIT_SEC
+# before returning. Auth/project errors and broken-daemon errors typically
+# fail within 1-2s of `ao spawn`; cold-start slow spawns exceed this bound
+# and we proceed optimistically (the state file still records the final
+# outcome for downstream observability). This prevents the dispatch-record
+# step in factory-af-tick.sh from stranding a bead in DISPATCHED when the
+# spawn already failed — see Codex P1 finding on PR #193.
+ASYNC_WAIT_SEC="${AFD_ASYNC_WAIT_SEC:-5}"
+start_ts=$(date +%s)
+final_state=""
+while [ $(( $(date +%s) - start_ts )) -lt "$ASYNC_WAIT_SEC" ]; do
+  cur="$(cat "$STATE_FILE" 2>/dev/null || true)"
+  case "$cur" in
+    ok)
+      final_state="ok"
+      break
+      ;;
+    fail:*)
+      final_state="$cur"
+      break
+      ;;
+  esac
+  sleep 0.2
+done
+
+echo "[remediate] async-spawned PR #$PR bead=${BEAD_ID} pid=${SPAWN_PID} log=${SPAWN_LOG} state=${final_state:-pending}"
+case "$final_state" in
+  fail:*)
+    # Fast-fail detected within wait window. Refuse so dispatch-record is
+    # skipped — the bead stays QUEUED and the next tick can retry.
+    echo "[remediate] fast-fail detected for PR #$PR: $final_state — refusing to acknowledge dispatch" >&2
+    exit 1
+    ;;
+  *)
+    # Either the spawn succeeded within the wait window OR it's still
+    # pending (cold-start slow spawn). Caller treats rc=0 as "dispatch
+    # accepted"; the state file records the eventual outcome.
+    exit 0
+    ;;
+esac

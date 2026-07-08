@@ -135,20 +135,22 @@ export FAKE_AO_HANG_SECS=30
 unset AO_MAX_CONCURRENT_SESSIONS
 
 # ---------------------------------------------------------------------------
-# Test 1: async-mode (default) returns <5s even when AO hangs for 30s.
+# Test 1: async-mode (default) returns quickly on cold-start even when AO
+# hangs for 30s. Bounded by AFD_ASYNC_WAIT_SEC (default 5s) for fast-fail
+# detection; after that window, returns 0 optimistically.
 # ---------------------------------------------------------------------------
 rm -f /tmp/test-remediate-fake-ao.log
 start=$(date +%s)
 # IMPORTANT: do NOT `|| true` inside the subshell — that swallows the wrapper's
 # exit code. Capture it via `rc=$?` after the command substitution.
-out="$(AO_SPAWN_TIMEOUT_SEC=60 timeout 15 bash "$REMEDIATE" bead-async-1 8181 jleechanorg/worldarchitect.ai worldarchitect 2>&1)"
+out="$(AO_SPAWN_TIMEOUT_SEC=60 AFD_ASYNC_WAIT_SEC=5 timeout 15 bash "$REMEDIATE" bead-async-1 8181 jleechanorg/worldarchitect.ai worldarchitect 2>&1)"
 rc=$?
 elapsed=$(( $(date +%s) - start ))
 echo "[test 1 output]"
 echo "$out" | sed 's/^/    /'
 echo
 assert "async-mode exit=0 (immediate queue ack)" "0" "$rc"
-assert_lt "async-mode wallclock <5s on cold-start" 5 "$elapsed"
+assert_lt "async-mode wallclock <10s on cold-start (fast-fail poll)" 10 "$elapsed"
 case "$out" in
   *async-spawned*)
     echo "PASS: async-mode emits 'async-spawned' message"; PASS=$((PASS + 1)) ;;
@@ -256,7 +258,84 @@ fi
 # Wall-clock bound: even the failure path must be fast (<15s).
 assert_lt "async-mode unreachable-AO wallclock <15s" 15 "$elapsed"
 
+# ---------------------------------------------------------------------------
+# Test 6: async-mode fast-fail detection (Codex P1 finding on PR #193).
+# When the spawned `ao spawn` exits non-zero within the AFD_ASYNC_WAIT_SEC
+# window (e.g. auth/project error), the wrapper must return non-zero so
+# dispatch-record is skipped and the bead stays QUEUED for retry.
+# ---------------------------------------------------------------------------
+FAST_FAIL_AO="$SCRATCH_DIR/fast-fail-ao"
+cat > "$FAST_FAIL_AO" <<'EOF_FF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  spawn)
+    # Auth/project error: fail quickly with a recognizable message.
+    echo "ERROR: invalid AO_PROJECT 'worldarchitect' — not registered" >&2
+    exit 3
+    ;;
+  session)
+    echo "[]"
+    exit 0
+    ;;
+  status)
+    echo '{"state":"ready"}'
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF_FF
+chmod +x "$FAST_FAIL_AO"
+rm -f /tmp/test-remediate-fake-ao.log
+start=$(date +%s)
+out="$(AO_BIN="$FAST_FAIL_AO" AO_SPAWN_TIMEOUT_SEC=60 AFD_ASYNC_WAIT_SEC=5 timeout 15 bash "$REMEDIATE" test-bead-fastfail 9997 jleechanorg/worldarchitect.ai worldarchitect 2>&1)"
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+echo "[test 6 output]"
+echo "$out" | sed 's/^/    /'
+echo
+# Fast-fail path: wrapper returns non-zero (so dispatch-record is skipped).
+# The message should mention "fast-fail detected".
+assert "fast-fail: exit non-zero on auth/project error" "1" "$rc"
+case "$out" in
+  *fast-fail*)
+    echo "PASS: fast-fail message emitted"; PASS=$((PASS + 1)) ;;
+  *)
+    echo "FAIL: fast-fail message not emitted"; FAIL=$((FAIL + 1)) ;;
+esac
+# Wall-clock: should be ≤ AFD_ASYNC_WAIT_SEC + small overhead.
+assert_lt "fast-fail wallclock <8s (within wait window)" 8 "$elapsed"
+
+# ---------------------------------------------------------------------------
+# Test 7: async-mode slow-spawn optimistic path (cold-start sim).
+# When the spawned `ao spawn` does NOT complete within AFD_ASYNC_WAIT_SEC,
+# the wrapper returns 0 optimistically — the state file records the
+# eventual outcome for downstream observability.
+# ---------------------------------------------------------------------------
+rm -f /tmp/test-remediate-fake-ao.log
+# Reuse $FAKE_AO which hangs for FAKE_AO_HANG_SECS=30s. After 5s wait, the
+# state file is still "pending" → wrapper returns 0 optimistically.
+start=$(date +%s)
+out="$(AO_BIN="$FAKE_AO" AO_SPAWN_TIMEOUT_SEC=60 AFD_ASYNC_WAIT_SEC=5 timeout 15 bash "$REMEDIATE" test-bead-slow 9996 jleechanorg/worldarchitect.ai worldarchitect 2>&1)"
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+echo "[test 7 output]"
+echo "$out" | sed 's/^/    /'
+echo
+assert "slow-spawn: exit 0 (optimistic)" "0" "$rc"
+# State field should appear as "pending" in the message (slow path).
+case "$out" in
+  *state=pending*)
+    echo "PASS: slow-spawn message shows state=pending"; PASS=$((PASS + 1)) ;;
+  *)
+    echo "FAIL: slow-spawn message did not show state=pending"; FAIL=$((FAIL + 1)) ;;
+esac
+# Wall-clock bound: ~ AFD_ASYNC_WAIT_SEC + small overhead.
+assert_lt "slow-spawn wallclock <10s (wait window respected)" 10 "$elapsed"
+
 echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
+#
