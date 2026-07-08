@@ -1,7 +1,8 @@
 // Task 10: tick loop wiring + CLI flags (design doc §5, spec §4.2.2/§4.2.9).
 // Modules live in `lib.rs` (see that file) so `daemon/tests/*` integration
 // tests can `use daemon::{...}`; this binary just drives the poll loop.
-#[allow(dead_code, unused_imports)]
+#![allow(dead_code, unused_imports, clippy::type_complexity)]
+
 use daemon::config::{self, Config};
 use daemon::errors::DaemonError;
 use daemon::state::{SqliteStateStore, StateStore};
@@ -418,10 +419,12 @@ fn run(args: Args) -> Result<(), DaemonError> {
                 .unwrap_or(&cfg.target_repo)
                 .to_string()
         });
+        let default_agent = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT")
+            .unwrap_or_else(|_| "minimax".to_string());
         (
             Box::new(CliScm::new(cfg.target_repo.clone())),
             Box::new(CliTracker),
-            Box::new(CliSessions::new(&ao_project, "claude-code")),
+            Box::new(CliSessions::new(&ao_project, &default_agent)),
             Box::new(ChainLlm),
             Box::new(CliVcs),
         )
