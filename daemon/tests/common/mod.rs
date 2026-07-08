@@ -204,6 +204,12 @@ pub struct FakeSessions {
     pub next_session_id: String,
     pub quiescent: bool,
     pub fail_spawn_for: RefCell<Vec<String>>,
+    // jleechan-w28n: scripted `DaemonError::Deferred` spawn outcome — AO's
+    // own admission-control queue at the target project's session cap, NOT a
+    // failure. Distinct from `fail_spawn_for` (`DaemonError::Tool`) so
+    // end-to-end tests can exercise the two paths independently and prove
+    // they never share `overlay.spawn_failure_count`.
+    pub fail_spawn_deferred_for: RefCell<Vec<String>>,
     pub spawn_prompts: RefCell<Vec<(String, String)>>,
     pub calls: RefCell<Vec<String>>,
     /// jleechan-5ia2: scripted `session_branch` override, keyed by session
@@ -223,6 +229,7 @@ impl Default for FakeSessions {
             next_session_id: "fake-session-1".into(),
             quiescent: true,
             fail_spawn_for: RefCell::new(Vec::new()),
+            fail_spawn_deferred_for: RefCell::new(Vec::new()),
             spawn_prompts: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
             branch_for: RefCell::new(HashMap::new()),
@@ -237,6 +244,12 @@ impl FakeSessions {
 
     pub fn fail_spawn_for(&self, bead_id: &str) {
         self.fail_spawn_for.borrow_mut().push(bead_id.to_string());
+    }
+
+    pub fn fail_spawn_deferred_for(&self, bead_id: &str) {
+        self.fail_spawn_deferred_for
+            .borrow_mut()
+            .push(bead_id.to_string());
     }
 
     /// Script `session_branch(session_id)` to report `branch`.
@@ -266,6 +279,16 @@ impl Sessions for FakeSessions {
                 rc: 1,
                 stderr: format!("scripted spawn failure for {}", spec.bead_id),
             });
+        }
+        if self
+            .fail_spawn_deferred_for
+            .borrow()
+            .contains(&spec.bead_id)
+        {
+            return Err(DaemonError::Deferred(format!(
+                "REQUEST=sq-scripted-{}",
+                spec.bead_id
+            )));
         }
         Ok(SessionId(self.next_session_id.clone()))
     }

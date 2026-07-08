@@ -85,6 +85,7 @@ fn test_circuit_breaker() {
         branch: Some("factory/bead-breaker-r2".into()),
         session_id: None,
         is_adopted: false,
+        spawn_failure_count: 0,
     };
     store.save(&bead).unwrap();
 
@@ -162,6 +163,7 @@ fn test_reroll_success() {
         branch: Some("factory/bead-success-r1".into()),
         session_id: None,
         is_adopted: false,
+        spawn_failure_count: 0,
     };
     store.save(&bead).unwrap();
 
@@ -396,6 +398,7 @@ fn test_reroll_adopted_success_pushes_fix_commit_leaves_pr_open() {
         branch: Some("alice/my-cool-feature".into()),
         session_id: None,
         is_adopted: true,
+        spawn_failure_count: 0,
     };
     store.save(&bead).unwrap();
     store.register_branch("bead-adopted", "alice/my-cool-feature").unwrap();
@@ -504,6 +507,7 @@ fn test_reroll_adopted_push_failure_parks_human_held() {
         branch: Some("alice/my-cool-feature".into()),
         session_id: None,
         is_adopted: true,
+        spawn_failure_count: 0,
     };
     store.save(&bead).unwrap();
     store.register_branch("bead-adopted-conflict", "alice/my-cool-feature").unwrap();
