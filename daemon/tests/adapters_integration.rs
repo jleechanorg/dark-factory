@@ -77,6 +77,36 @@ fn test_chain_llm_real_fallback() {
 }
 
 #[test]
+#[ignore] // Requires real `ao` CLI — run locally with `cargo test -- --ignored`
+// Stage-2 prereq #1 smoke test (jleechan-hna3): prove/disprove that
+// CliSessions::attach — the entry point the spec's "attach, remediate,
+// quiesce" lifecycle depends on — actually attaches to a real AO session
+// in production, as opposed to the fakes used everywhere else in the test
+// suite (tools_fakes.rs, tick_integration.rs FakeSessions). This is a
+// mutation-style check: if attach() ever becomes a working implementation,
+// this assertion must be flipped, which is the point — a passing test here
+// today would be gate self-certification (the expected value would just be
+// "no error", true of literally any Err(..) variant).
+fn test_cli_sessions_real_attach_always_errors() {
+    if std::env::var("GITHUB_ACTIONS").is_ok() {
+        return;
+    }
+    let sessions = CliSessions::new("dark-factory", "minimax");
+    let result = sessions.attach("main", "smoke-test-bead");
+    assert!(
+        result.is_err(),
+        "CliSessions::attach unexpectedly succeeded ({result:?}) — if this ever \
+         starts happening, the Stage-2 attach/remediate/quiesce prerequisite \
+         needs to be re-run for real, not just re-asserted",
+    );
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("disabled") || msg.contains("unimplemented"),
+        "expected the known stub error, got: {msg}"
+    );
+}
+
+#[test]
 fn test_cli_scm_offline_fallback() {
     let scm = CliScm::new("jleechanorg/dark-factory".to_string());
     let offline_dir = std::path::Path::new(".beads/offline");
