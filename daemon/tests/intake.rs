@@ -508,8 +508,9 @@ fn every_create_bead_call_across_both_intake_paths_carries_nonempty_external_ref
     let tracker = FakeTracker::new();
     let cfg = test_cfg();
 
-    let created_issues = intake::normalize(&scm, &tracker, &cfg).unwrap();
-    let adopted_prs = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+    let (created_issues, _issue_outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
+    let (adopted_prs, _pr_outcomes) =
+        intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
 
     assert_eq!(created_issues.len(), 2, "expected both new issues to create beads");
     assert_eq!(adopted_prs.len(), 2, "expected both new PRs to be adopted");
