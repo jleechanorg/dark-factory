@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template: ai.dark-factory.auto-merge-guard.plist.template
+  Purpose: poll-loop launchd agent that fires daemon/scripts/auto-merge-guard.sh
+           every 60 seconds (jleechan-s3c). The auto-merge-guard.sh script
+           already implements the X4 controls (no-red gate, head-SHA check via
+           gh pr view, per-hour budget). This template only adds the caller;
+           it does NOT modify the guard script.
+
+  Invocation:
+    The plist invokes the hardened auto-merge-guard.sh directly under bash.
+    launchd's bare PATH would otherwise leave gh / br / sqlite3 / python3
+    unresolvable, so daemon/launchd/launchd-wrapper.sh sources the user's
+    interactive login env (PATH, git config, SSH agent) before exec.
+
+  Usage (manual install):
+    launchctl bootstrap gui/$UID "$HOME/Library/LaunchAgents/ai.dark-factory.auto-merge-guard.plist"
+
+  Disarm:
+    launchctl bootout gui/$UID "$HOME/Library/LaunchAgents/ai.dark-factory.auto-merge-guard.plist"
+    rm "$HOME/Library/LaunchAgents/ai.dark-factory.auto-merge-guard.plist"
+
+  Notes:
+    - StartInterval=60s: 1-min cadence; the guard's per-hour budget (default 8)
+      caps actual merges regardless of timer frequency.
+    - @HOME@ is substituted by install-launchagents.sh from $HOME at install.
+    - Operator opt-in: install-merge-guard.sh renders the plist on macOS but
+      does NOT bootstrap it automatically.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.dark-factory.auto-merge-guard</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>@HOME@/projects/dark-factory/daemon/launchd/launchd-wrapper.sh</string>
+        <string>@HOME@/projects/dark-factory/daemon/scripts/auto-merge-guard.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>@HOME@/Library/Logs/dark-factory/auto-merge-guard.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>@HOME@/Library/Logs/dark-factory/auto-merge-guard.err.log</string>
+</dict>
+</plist>

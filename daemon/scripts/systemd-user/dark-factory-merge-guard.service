@@ -1,0 +1,13 @@
+[Unit]
+Description=Dark Factory auto-merge-guard.sh merge-authority sweep (jleechan-s3c)
+Documentation=https://github.com/jleechanorg/dark-factory
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO@
+ExecStart=/bin/bash @REPO@/daemon/scripts/auto-merge-guard.sh
+Environment=HOME=%h
+Environment=AFD_LOG=%h/Library/Logs/dark-factory/daemon.jsonl
+StandardOutput=append:%h/Library/Logs/dark-factory/merge-guard.out.log
+StandardError=append:%h/Library/Logs/dark-factory/merge-guard.err.log

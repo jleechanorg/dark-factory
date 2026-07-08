@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule dark-factory-merge-guard.service every 60s (jleechan-s3c)
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+OnUnitActiveSec=60s
+Persistent=true
+Unit=dark-factory-merge-guard.service
+
+[Install]
+WantedBy=timers.target
