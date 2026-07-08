@@ -1046,3 +1046,75 @@ mod quiescence_timeout_races {
         let _ = std::fs::remove_file(&telemetry_log);
     }
 }
+
+/// jleechan-cq8r: a malformed/unparseable reply from the circuit-breaker's
+/// semantic comparator LLM call must NOT crash the daemon. Before this fix,
+/// `same_underlying_issue` (reroll.rs) constructed `DaemonError::Parse` for
+/// this case, which `is_transient()` does not cover -- the exact
+/// jleechan-5ia2 crash-loop pattern (PR #197), reintroduced via this
+/// brand-new subprocess-LLM call site. This test drives the REAL
+/// `reroll::execute` through a second-attempt circuit-breaker comparison
+/// (attempt=2, same reviewer as the stored attempt-1 rejection) with a
+/// scripted LLM reply that contains no JSON object at all, and asserts the
+/// resulting error is transient.
+#[test]
+fn same_underlying_issue_malformed_reply_is_transient_not_fatal() {
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    let vcs = FakeVcs::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let llm = FakeLlm::new();
+    // No JSON object anywhere in this reply -- `reply.rfind('}')` returns
+    // None, exercising exactly the failure mode jleechan-cq8r found.
+    *llm.response.borrow_mut() = Some(Ok(
+        "the model babbled without any JSON object at all".to_string()
+    ));
+
+    let telemetry_log = std::env::temp_dir().join("afd_cq8r_malformed_comparator.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "cq8r-bead".into(),
+        state: OverlayState::Attested,
+        attempt: 2,
+        reroll_count: 1,
+        autonomy_secs: 0,
+        spend_usd: 0.0,
+        pr_number: Some(900),
+        branch: Some("factory/cq8r-bead-r2".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+    };
+    store.save(&bead).unwrap();
+    store
+        .save_rejection("cq8r-bead", 1, "verifier", "deadbeefdeadbeef", "prior rejection text")
+        .unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "verifier".to_string(),
+        review_text: "new rejection text, different from prior".to_string(),
+    };
+
+    let err = reroll::execute(&deps, &mut bead)
+        .expect_err("malformed comparator reply must surface as an Err, not silently succeed");
+
+    assert!(
+        matches!(err, DaemonError::ComparatorUnparseable(_)),
+        "expected DaemonError::ComparatorUnparseable, got {err:?}"
+    );
+    assert!(
+        err.is_transient(),
+        "a malformed circuit-breaker comparator reply must be classified transient (jleechan-cq8r / jleechan-5ia2 pattern), got non-transient: {err:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}

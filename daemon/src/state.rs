@@ -170,6 +170,17 @@ pub trait StateStore {
     ) -> Result<Vec<BeadOverlay>, DaemonError>;
     fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, feedback_text: &str) -> Result<(), DaemonError>;
     fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError>;
+    /// Read back the raw feedback text for a stored rejection (companion to
+    /// `load_rejection`, which only returns `(reviewer, feedback_hash)`). The
+    /// reroll circuit-breaker's semantic comparison (spec §4.2.6) needs the
+    /// actual text, not just the hash, to ask the model whether two rejections
+    /// describe the same underlying issue. Default `Ok(None)` so stores that
+    /// predate this feature (or fakes that don't need reroll's circuit-breaker
+    /// exercised) don't need to implement it; `None` means the circuit-breaker
+    /// safely no-ops (never fires) rather than erroring or guessing.
+    fn load_rejection_text(&self, _bead_id: &str, _attempt: u32) -> Result<Option<String>, DaemonError> {
+        Ok(None)
+    }
     /// Read the `(attempt_count, last_attempt_epoch_secs)` pair for the
     /// `/er` runner (bead jleechan-qqq). Default impl returns `(0, None)`
     /// so test fakes that don't override it get the "never spawned" state.
@@ -808,6 +819,17 @@ impl StateStore for SqliteStateStore {
             )
             .optional()
             .map_err(|e| tool_err("load_rejection", e))
+    }
+
+    fn load_rejection_text(&self, bead_id: &str, attempt: u32) -> Result<Option<String>, DaemonError> {
+        self.conn
+            .query_row(
+                "SELECT feedback_text FROM review_rejection WHERE bead_id = ?1 AND attempt = ?2",
+                params![bead_id, attempt],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| tool_err("load_rejection_text", e))
     }
 
     fn er_runner_attempt(&self, bead_id: &str) -> Result<(u32, Option<u64>), DaemonError> {

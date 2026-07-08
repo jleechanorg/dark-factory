@@ -74,6 +74,60 @@ fn emit_telemetry(
     )
 }
 
+/// Circuit-Breaker Semantic Comparator (spec §4.2.6): judges whether two
+/// consecutive same-reviewer rejection texts describe the SAME underlying
+/// issue / root cause, even when reworded, paraphrased, reformatted, or
+/// extended — as opposed to two genuinely different issues. This is a real
+/// model judgment call (ZFC: semantic-similarity judgments must not be
+/// hand-rolled as a scoring function) — mirrors the trailing-JSON-object
+/// parsing contract `constraints::extract` already uses against the same
+/// `Llm` trait.
+fn same_underlying_issue(llm: &dyn Llm, prior_text: &str, new_text: &str) -> Result<bool, DaemonError> {
+    let prompt = format!(
+        "You are the Circuit-Breaker Semantic Comparator for an autonomous coding factory (spec §4.2.6).\n\
+          Two consecutive rejection review comments were left by the SAME reviewer on re-roll attempts of \
+          the same bead. Judge whether they describe the SAME underlying issue / root cause, even if \
+          reworded, paraphrased, reformatted, or extended with extra commentary — as opposed to two \
+          genuinely DIFFERENT issues.\n\n\
+          PRIOR REJECTION:\n\"\"\"\n{prior_text}\n\"\"\"\n\n\
+          NEW REJECTION:\n\"\"\"\n{new_text}\n\"\"\"\n\n\
+          Respond with exactly one JSON object as the last thing in your reply, in this format:\n\
+          {{\"sameUnderlyingIssue\": true|false}}"
+    );
+
+    let reply = llm.judge(&prompt)?;
+
+    // jleechan-cq8r: a malformed/unparseable reply here must NOT construct
+    // `DaemonError::Parse` -- that variant is fatal (`is_transient()` only
+    // covers Tool|Timeout|Deferred) and crashes the whole daemon process
+    // (main.rs calls `std::process::exit(1)` on any non-transient tick
+    // error), reproducing the jleechan-5ia2 crash-loop pattern (PR #197)
+    // through this call site. `ComparatorUnparseable` is transient by
+    // design -- see its doc comment in errors.rs.
+    let last_close = reply.rfind('}').ok_or_else(|| {
+        DaemonError::ComparatorUnparseable(format!("no JSON object found in circuit-breaker comparator reply: {reply:?}"))
+    })?;
+    let prefix = &reply[..=last_close];
+    let last_open = prefix.rfind('{').ok_or_else(|| {
+        DaemonError::ComparatorUnparseable(format!("no JSON object found in circuit-breaker comparator reply: {reply:?}"))
+    })?;
+    let candidate = &prefix[last_open..=last_close];
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CmpResponse {
+        same_underlying_issue: bool,
+    }
+
+    let parsed: CmpResponse = serde_json::from_str(candidate).map_err(|e| {
+        DaemonError::ComparatorUnparseable(format!(
+            "circuit-breaker comparator reply did not contain a valid response object: {e} (reply: {reply:?})"
+        ))
+    })?;
+
+    Ok(parsed.same_underlying_issue)
+}
+
 pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcome, DaemonError> {
     // 1. Lock & Freshness Guard
     let latest = deps.store.load(&bead.bead_id)?;
@@ -106,35 +160,43 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     };
 
     if bead.attempt > 1 {
-        if let Some((prev_reviewer, prev_hash)) = deps.store.load_rejection(&bead.bead_id, bead.attempt - 1)? {
-            if prev_reviewer == deps.reviewer && prev_hash == feedback_hash {
-                bead.state = OverlayState::HumanHeld;
-                deps.store.save(bead)?;
+        if let Some((prev_reviewer, _prev_hash)) = deps.store.load_rejection(&bead.bead_id, bead.attempt - 1)? {
+            if prev_reviewer == deps.reviewer {
+                let prev_text = deps.store.load_rejection_text(&bead.bead_id, bead.attempt - 1)?;
+                let same_issue = match prev_text {
+                    Some(ref prev) if *prev == deps.review_text => true,
+                    Some(ref prev) => same_underlying_issue(deps.llm, prev, &deps.review_text)?,
+                    None => false,
+                };
+                if same_issue {
+                    bead.state = OverlayState::HumanHeld;
+                    deps.store.save(bead)?;
 
-                let (owner, repo) = deps.cfg.target_repo.split_once('/').unwrap_or(("unknown_owner", "unknown_repo"));
-                let healer_scope = format!("{}:{}:{}", owner, repo, &bead.bead_id);
+                    let (owner, repo) = deps.cfg.target_repo.split_once('/').unwrap_or(("unknown_owner", "unknown_repo"));
+                    let healer_scope = format!("{}:{}:{}", owner, repo, &bead.bead_id);
 
-                let healer_report = format!(
-                    "# Healer Report\n\n                     Circuit-breaker triggered for bead {} (scope: {}).\n                     Consecutive re-roll rejections by the same reviewer ({}) citing the same semantic reason:\n\n                     \"\"\"\n                     {}\n                     \"\"\"\n",
-                    bead.bead_id, healer_scope, deps.reviewer, deps.review_text
-                );
+                    let healer_report = format!(
+                        "# Healer Report\n\n                     Circuit-breaker triggered for bead {} (scope: {}).\n                     Consecutive re-roll rejections by the same reviewer ({}) citing the same semantic reason:\n\n                     \"\"\"\n                     {}\n                     \"\"\"\n",
+                        bead.bead_id, healer_scope, deps.reviewer, deps.review_text
+                    );
 
-                emit_telemetry(
-                    deps.telemetry_log,
-                    &bead.bead_id,
-                    bead.attempt,
-                    bead.state.as_str(),
-                    "CIRCUIT_BREAKER_TRIGGERED",
-                    serde_json::json!({}),
-                    serde_json::json!({
-                        "healerScope": healer_scope,
-                        "healerReport": healer_report,
-                        "reviewer": deps.reviewer,
-                        "feedbackHash": feedback_hash,
-                    }),
-                )?;
+                    emit_telemetry(
+                        deps.telemetry_log,
+                        &bead.bead_id,
+                        bead.attempt,
+                        bead.state.as_str(),
+                        "CIRCUIT_BREAKER_TRIGGERED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "healerScope": healer_scope,
+                            "healerReport": healer_report,
+                            "reviewer": deps.reviewer,
+                            "feedbackHash": feedback_hash,
+                        }),
+                    )?;
 
-                return Ok(RerollOutcome::Held("circuit-breaker triggered: same reviewer and feedback hash as prior attempt".into()));
+                    return Ok(RerollOutcome::Held("circuit-breaker triggered: same reviewer and feedback hash as prior attempt".into()));
+                }
             }
         }
     }
