@@ -204,6 +204,17 @@ Each node emits `ENTER` on visit and `EXIT` with classified outcome (`success`, 
 3. Reference from a `.dot` file with `mynode [type="my_handler", ...]`.
 4. Echo-backend tests should drive paths via `ctx.state["<node>.outcome"]` — see `tests/test_gates.py`.
 
+## Dispatch-health triage (when beads queue but nothing dispatches)
+
+Check in THIS order — each layer can silently starve the ones below (2026-07-08 incident, bead jleechan-la67):
+
+1. **Telemetry error tail**: `grep DISPATCH ~/Library/Logs/dark-factory/daemon.jsonl | tail` — read the FULL error string (config warnings are noise; the real error is at the end).
+2. **AO session cap**: `ao session ls -p <project> | wc -l` vs config `max_workers`. Idle-but-alive coder sessions hold slots (jleechan-tnri/d0wn) — revive via `ao send <session> "<continuation nudge>"` before killing; kill only wedged/superseded sessions via `ao session kill`.
+3. **AO spawn admission queue**: `~/.agent-orchestrator/<instance>/sessions/spawn-queue-<project>.json` — `MAX_PENDING_REQUESTS=100`, fork-local code (NOT upstream AgentWrapper), no dedup/TTL: the daemon re-enqueues every retry cycle, so a stalled consumer fills it in hours. `/callpath run dark-factory` now probes depth (`ao_spawn_queue` hop). Flush = backup the file, then atomically write `{"pending":[]}` — AO treats reset state as start-fresh and the daemon re-requests on demand.
+4. **Error classification trap**: "Spawn queue is full" arrives as rc=1 Tool error (counter-incrementing), NOT the `REQUEST=` Deferred shape — until jleechan-la67 lands, sustained queue-full burns `spawn_failure_count` toward mass HumanHeld park.
+
+Design rule: any queue between the daemon and AO must have dedup (one pending request per bead+attempt), TTL, depth telemetry, and a flush command. A queue with an unbounded producer and a stallable consumer is an outage timer.
+
 ## Pipeline authoring rules
 
 1. `.dot` files are first-class — version them, review them in PRs.
