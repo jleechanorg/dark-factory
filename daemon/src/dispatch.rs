@@ -81,9 +81,9 @@ fn failure(
 ///      succeeds, requeue the bead durably, then report the original
 ///      transient save failure and continue. If stop or requeue persistence
 ///      fails, stop the batch because a live untracked worker or stranded
-///      DISPATCHING row may remain. A `sessions.spawn` error is also fatal
-///      because the real spawn path may have created a process before failing
-///      to return a session id.
+///      DISPATCHING row may remain. A transient `sessions.spawn` error is
+///      requeued and reported per bead; a non-transient spawn error remains
+///      fatal.
 ///
 /// Returns a per-bead report. Never spawns past the cap; if zero slots are
 /// free, returns an empty report without calling `sessions.spawn` (verified by
@@ -183,7 +183,23 @@ pub fn dispatch_ready(
             branch: branch.clone(),
             prompt,
         };
-        let session_id = sessions.spawn(&spec)?;
+        let session_id = match sessions.spawn(&spec) {
+            Ok(session_id) => session_id,
+            Err(err) if err.is_transient() => {
+                overlay.state = OverlayState::Queued;
+                overlay.session_id = None;
+                store.save(&overlay)?;
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    Some(branch.clone()),
+                    "spawn",
+                    err,
+                ));
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
 
         // jleechan-5ia2: a `bead_overlay` row was found with
         // `state=DISPATCHED` and a real, live `session_id` belonging to a
@@ -274,6 +290,7 @@ mod tests {
         active_count: usize,
         calls: RefCell<Vec<String>>,
         fail_spawn_for: RefCell<Vec<String>>,
+        fail_spawn_fatal_for: RefCell<Vec<String>>,
         fail_stop_for: RefCell<Vec<String>>,
         // jleechan-5ia2: scripted `session_branch` override, keyed by
         // session id. Empty by default (matches the trait's `Ok(None)`
@@ -291,6 +308,7 @@ mod tests {
                 active_count,
                 calls: RefCell::new(Vec::new()),
                 fail_spawn_for: RefCell::new(Vec::new()),
+                fail_spawn_fatal_for: RefCell::new(Vec::new()),
                 fail_stop_for: RefCell::new(Vec::new()),
                 scripted_branch: RefCell::new(HashMap::new()),
             }
@@ -298,6 +316,12 @@ mod tests {
 
         fn fail_spawn_for(&self, bead_id: &str) {
             self.fail_spawn_for.borrow_mut().push(bead_id.to_string());
+        }
+
+        fn fail_spawn_fatal_for(&self, bead_id: &str) {
+            self.fail_spawn_fatal_for
+                .borrow_mut()
+                .push(bead_id.to_string());
         }
 
         fn fail_stop_for(&self, session_id: &str) {
@@ -323,6 +347,12 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("spawn({})", spec.bead_id));
+            if self.fail_spawn_fatal_for.borrow().contains(&spec.bead_id) {
+                return Err(DaemonError::Parse(format!(
+                    "scripted fatal spawn failure for {}",
+                    spec.bead_id
+                )));
+            }
             if self.fail_spawn_for.borrow().contains(&spec.bead_id) {
                 return Err(DaemonError::Tool {
                     tool: "ao".into(),
@@ -851,24 +881,57 @@ mod tests {
     }
 
     #[test]
-    fn spawn_failure_after_dispatching_intent_is_fatal() {
+    fn spawn_failure_is_transient_and_does_not_abort_batch() {
         let sessions = FakeSessions::new(0);
-        sessions.fail_spawn_for("bead-0");
+        sessions.fail_spawn_for("bead-1");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(3);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        let success_ids: Vec<&str> = report
+            .successes
+            .iter()
+            .map(|success| success.bead_id.as_str())
+            .collect();
+        assert_eq!(success_ids, ["bead-0", "bead-2"]);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-1");
+        assert_eq!(report.failures[0].phase, "spawn");
+        assert!(
+            report.failures[0].transient,
+            "Tool spawn failures are retryable and must be reported as transient"
+        );
+
+        let bead_1 = store.load("bead-1").unwrap().unwrap();
+        assert_eq!(bead_1.state, OverlayState::Queued);
+        assert_eq!(bead_1.session_id, None);
+        let calls = sessions.calls.borrow();
+        assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
+        assert!(calls.iter().any(|c| c == "spawn(bead-1)"));
+        assert!(calls.iter().any(|c| c == "spawn(bead-2)"));
+    }
+
+    #[test]
+    fn non_transient_spawn_failure_after_dispatching_intent_is_fatal() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_fatal_for("bead-0");
         let store = FakeStateStore::new();
         let cfg = cfg();
         let ready = beads(2);
 
         let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
         assert!(
-            matches!(err, DaemonError::Tool { .. }),
-            "spawn failure must stop the batch because a worker may exist without a session id: {err:?}"
+            matches!(err, DaemonError::Parse(_)),
+            "non-transient spawn failure must stop the batch: {err:?}"
         );
 
         let bead_0 = store.load("bead-0").unwrap().unwrap();
         assert_eq!(bead_0.state, OverlayState::Dispatching);
         assert!(
             store.load("bead-1").unwrap().is_none(),
-            "later beads must not dispatch after an ambiguous spawn failure"
+            "later beads must not dispatch after a fatal spawn failure"
         );
         let calls = sessions.calls.borrow();
         assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
