@@ -1636,7 +1636,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // failure via telemetry and skip to the next bead; the bead stays
         // ATTESTED so the next tick retries the snapshot fetch (no false-
         // green, no false-park on a single transient error).
-        let mut snapshot = match deps.scm.pr_snapshot(pr) {
+        let snapshot = match deps.scm.pr_snapshot(pr) {
             Ok(snap) => snap,
             Err(e) => {
                 let _ = emit(
@@ -1710,45 +1710,14 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // formatted prefix, and could disagree with the verdict the
         // runner just emitted. Only fall back to the snapshot when the
         // runner DIDN'T post (cooldown/capped/already-present/no-op).
-        let mut posted_verdict: Option<verifier::ErVerdict> = None;
+        let posted_verdict: Option<verifier::ErVerdict> = None;
         let mut er_runner_capped_count: Option<u32> = None;
         match runner_outcome {
-            crate::er_runner::Outcome::Posted { verdict, count } => {
-                posted_verdict = Some(verdict);
-                emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::Attested.as_str(),
-                    crate::er_runner::EVT_POSTED,
-                    serde_json::json!({}),
-                    serde_json::json!({
-                        "verdict": format!("{verdict:?}"),
-                        "attempt": count,
-                    }),
-                )?;
-                // jleechan-qdw: per-bead isolation for the post-/er refetch.
-                // If the refresh fails after posting, this bead's SCM view
-                // is transiently unavailable. Emit the outage and retry on a
-                // later tick rather than falling through into `assess()`,
-                // which performs another `pr_snapshot` and would turn the
-                // outage into Unknown/all_green=false -> HUMAN_HELD.
-                match deps.scm.pr_snapshot(pr) {
-                    Ok(snap) => snapshot = snap,
-                    Err(e) => {
-                        let _ = emit(
-                            deps.telemetry_log,
-                            bead_id,
-                            overlay.attempt,
-                            OverlayState::Attested.as_str(),
-                            "BEAD_SNAPSHOT_TRANSIENT_ERROR",
-                            serde_json::json!({}),
-                            serde_json::json!({"phase": "post_er_refetch", "error": format!("{e:?}")}),
-                        );
-                        continue;
-                    }
-                }
-            }
+            // jleechan-bpb6: the parent (this tick) only sees AlreadyPosted /
+            // Cooldown / Capped / Dispatched / NotApplicable. The Posted
+            // variant was removed — the child owns the spawn + post + parse
+            // path; the verdict arrives on a future tick via the just-
+            // posted PR comment that `parse_er_verdict` picks up.
             crate::er_runner::Outcome::AlreadyPosted(v) => {
                 emit(
                     deps.telemetry_log,
@@ -1787,6 +1756,27 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 )?;
             }
             crate::er_runner::Outcome::NotApplicable => {}
+            // jleechan-bpb6: parent does NOT try to use a verdict this
+            // tick — the child is still running and may take 60–120s
+            // (claude --print). `posted_verdict` stays None, so the
+            // gate assessment falls through to `parse_er_verdict` on
+            // the (pre-child-write) snapshot. Gate 6 stays Unknown
+            // until a future tick re-fetches the snapshot and sees the
+            // comment the child posted.
+            crate::er_runner::Outcome::Dispatched { count } => {
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    crate::er_runner::EVT_DISPATCHED,
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "count": count,
+                        "note": "child is async; parent treats this tick as no-op for verdict",
+                    }),
+                )?;
+            }
         }
 
         evidence.er_verdict = match posted_verdict {

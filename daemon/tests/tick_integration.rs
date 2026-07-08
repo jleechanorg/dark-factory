@@ -24,7 +24,7 @@ mod common;
 
 use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker, FakeVcs};
 use daemon::config::Config;
-use daemon::er_runner;
+use daemon::er_runner::{self, ER_RUNNER_FORCE_INLINE};
 use daemon::errors::DaemonError;
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
@@ -4555,6 +4555,16 @@ fn qdw_green_snapshot(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
 //   * a later healthy bead still reaches READY in the same tick.
 #[test]
 fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
+    // jleechan-bpb6: this test was written for the synchronous /er
+    // runner; it relies on `maybe_run` consuming a response from the
+    // queue-style Llm to post the verdict synchronously. In production
+    // mode the parent no longer touches Llm (child does it async), so
+    // we force inline mode for this test to preserve the original
+    // queue-ordering assumption.
+    let _lock = ER_RUNNER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    ER_RUNNER_FORCE_INLINE.store(true, std::sync::atomic::Ordering::SeqCst);
     let store = QdwAttemptStore::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
@@ -4655,11 +4665,17 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
     assert_eq!(
         healthy.state,
         OverlayState::Ready,
-        "later healthy bead must still reach READY after the affected bead is skipped"
+        "later healthy bead must still reach READY after the affected bead is assessed"
     );
+    // jleechan-bpb6: pre-bpb6 the parent re-fetched the snapshot after
+    // posting the verdict and `continue`d on a transient outage, so
+    // gates_assessed was 1 (only healthy bead). Post-bpb6 the post is
+    // owned by the child; the parent assesses both beads and lets the
+    // gate logic drive state — affected stays Attested (gate 6
+    // Unknown → not all_green), healthy reaches Ready (all-green).
     assert_eq!(
-        summary.gates_assessed, 1,
-        "only the healthy bead should be assessed after post_er_refetch fails; got {summary:?}"
+        summary.gates_assessed, 2,
+        "both beads should be assessed; affected stays Attested via gate 6 Unknown, healthy reaches Ready; got {summary:?}"
     );
     assert_eq!(
         summary.beads_parked_human_held, 0,
@@ -4683,38 +4699,45 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
         tracker_calls.iter().any(|call| {
             call.contains("comment_external(owner/repo#1901,") && call.contains("/er PASS")
         }),
-        "affected PR should receive the posted /er PASS comment before post_er_refetch fails; calls were: {tracker_calls:?}"
+        "affected PR should receive the posted /er PASS comment (inline child path); calls were: {tracker_calls:?}"
     );
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    // jleechan-bpb6: post_er_refetch no longer happens — the parent
+    // (this tick) does NOT re-fetch after the inline child posts the
+    // comment. The bead stays Attested for a different reason: gate 6
+    // is Unknown (snapshot at assessment time didn't yet contain the
+    // child's just-posted verdict), so all_green=false → no false-
+    // park, no false-reroll, just stay Attested for the next tick.
     assert!(
-        telemetry.lines().any(|line| {
+        !telemetry.lines().any(|line| {
             line.contains("BEAD_SNAPSHOT_TRANSIENT_ERROR")
                 && line.contains("\"beadId\":\"qdw-post-refetch-fails\"")
                 && line.contains("\"phase\":\"post_er_refetch\"")
         }),
-        "expected post_er_refetch transient telemetry for affected bead; telemetry was:\n{telemetry}"
+        "post_er_refetch no longer exists in the parent (jleechan-bpb6); telemetry was:\n{telemetry}"
     );
     assert!(
         telemetry.lines().any(|line| {
             line.contains("\"beadId\":\"qdw-post-refetch-fails\"")
-                && line.contains("\"eventType\":\"ER_RUNNER_POSTED\"")
+                && line.contains("\"eventType\":\"ER_RUNNER_DISPATCHED\"")
         }),
-        "affected bead must emit ER_RUNNER_POSTED before post_er_refetch fails; telemetry was:\n{telemetry}"
+        "affected bead must emit ER_RUNNER_DISPATCHED (parent handed work to child); telemetry was:\n{telemetry}"
     );
     assert!(
-        !telemetry.lines().any(|line| {
+        telemetry.lines().any(|line| {
             line.contains("\"beadId\":\"qdw-post-refetch-fails\"")
                 && line.contains("\"eventType\":\"GATE_ASSESSMENT\"")
+                && line.contains("\"all_green\":false")
         }),
-        "affected bead must not enter gate assessment after post_er_refetch outage; telemetry was:\n{telemetry}"
+        "affected bead must hit gate assessment with all_green=false (gate 6 Unknown); telemetry was:\n{telemetry}"
     );
     assert!(
         !telemetry.lines().any(|line| {
             line.contains("\"beadId\":\"qdw-post-refetch-fails\"")
                 && line.contains("\"eventType\":\"REROLL_VERDICT_RECORDED\"")
         }),
-        "affected bead must not record a reroll verdict after post_er_refetch outage; telemetry was:\n{telemetry}"
+        "affected bead must not record a reroll verdict; telemetry was:\n{telemetry}"
     );
     assert!(
         !telemetry.lines().any(|line| {
@@ -4987,6 +5010,13 @@ impl Drop for EnvVarGuard {
 /// (`PATH`, `DARK_FACTORY_CODER_DEFAULT`) so a future second such test can't
 /// race this one.
 static REAL_TARGET_REPO_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// jleechan-bpb6: serializes tests that flip `ER_RUNNER_FORCE_INLINE` so
+/// two parallel tests can't disagree on inline-vs-production mode for the
+/// same process. `unwrap_or_else(|e| e.into_inner())` recovers from a
+/// poisoned mutex (a test panic while holding the lock shouldn't deadlock
+/// the suite).
+static ER_RUNNER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Write a fake reviewer script named `name` into `dir` that ignores its
 /// arguments, prints `reply` to stdout, and exits 0 — a fast, deterministic

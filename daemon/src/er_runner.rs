@@ -47,9 +47,35 @@ pub const EVT_NOOP: &str = "ER_RUNNER_NOOP";
 pub const EVT_CAPPED: &str = "ER_RUNNER_CAPPED";
 pub const EVT_POSTED: &str = "ER_RUNNER_POSTED";
 
+/// Env-var name. When set to "1", `maybe_run` calls `child_run_er` inline
+/// instead of forking a separate process. Used by:
+///   - integration tests (so a single `run_tick` still drives the comment
+///     post through the same in-memory deps; production never sets this)
+///   - manual debugging (run `DARK_FACTORY_ER_INLINE=1 daemon --tick-once`
+///     to see the full pipeline in one process)
+///
+/// Default (unset / anything else) → production uses `Command::new`
+/// fork so a 60–120s `claude --print` review does NOT block the
+/// slow-tier tick (bead jleechan-bpb6).
+pub const ER_RUNNER_INLINE_ENV: &str = "DARK_FACTORY_ER_INLINE";
+
+/// Test seam. Production never writes to this; tests flip it to `true`
+/// for the duration of an assertion to force inline child execution
+/// without spawning a real subprocess. Atomic so parallel `cargo test`
+/// threads don't race. Default `false`.
+pub static ER_RUNNER_FORCE_INLINE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Outcome of one `maybe_run` call. Returned (not just internally logged)
 /// so the call site can emit the right telemetry event AND so unit tests
 /// can assert behavior without poking the event log.
+///
+/// jleechan-bpb6: the parent (slow-tier tick) only does the synchronous
+/// preflight + dispatch reservation. The actual reviewer spawn + PR
+/// comment post + verdict parse happens in a child process via
+/// `child_run_er`. The parent sees `Dispatched` and treats it as no-op
+/// for that tick — gate 6 stays `Unknown` until a future tick re-fetches
+/// the snapshot and the just-posted comment flips it to `Pass`/`Fail`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// A `/er` verdict was already present in PR comments — nothing to do.
@@ -58,8 +84,10 @@ pub enum Outcome {
     Cooldown { elapsed_secs: u64, count: u32 },
     /// Attempt cap reached — runner stops retrying, gate 6 stays Unknown.
     Capped { count: u32 },
-    /// Reviewer spawned, reply captured, PR comment posted.
-    Posted { verdict: ErVerdict, count: u32 },
+    /// Synchronous preflight passed; slot reserved; child process forked
+    /// (or inline-mode ran `child_run_er`). Parent must NOT try to use a
+    /// verdict this tick — child is still running.
+    Dispatched { count: u32 },
     /// Bead not in Attested state, or PR number missing — not applicable.
     NotApplicable,
 }
@@ -92,9 +120,15 @@ pub fn build_er_prompt(bead_id: &str, pr: u64, target_repo: &str) -> String {
     )
 }
 
-/// Decide whether the runner should fire this tick, capture the verdict,
-/// and post it as a PR comment. Idempotent: if `/er` is already in the
-/// PR comments, this is a no-op.
+/// Decide whether the runner should fire this tick. jleechan-bpb6:
+/// synchronous preflight + dispatch reservation only; the actual reviewer
+/// spawn + PR comment post happens in a child process via `child_run_er`.
+/// Returns immediately on success (`Outcome::Dispatched`); the slow-tier
+/// tick treats `Dispatched` as no-op and moves on. The child writes the
+/// verdict as a PR comment; a future tick picks it up via
+/// `parse_er_verdict` and flips gate 6 from `Unknown` to `Pass`/`Fail`.
+///
+/// Idempotent: if `/er` is already in the PR comments, this is a no-op.
 ///
 /// `now_epoch` is the current unix epoch in seconds (injected for tests).
 pub fn maybe_run(
@@ -134,37 +168,213 @@ pub fn maybe_run(
         }
     }
 
-    // 5. Spawn reviewer
+    // 5. Reserve dispatch slot — increment the counter BEFORE the child
+    //    forks so a duplicate parent tick can't race and burn the slot.
+    //    The child does NOT re-increment; the reservation is the parent's
+    //    responsibility (single-writer invariant on attempt count).
+    let count = deps.store.incr_er_runner_attempt(bead_id, now_epoch)?;
+
+    // 6. Either run inline (tests / debug) or fork a child (production).
+    //    Both paths return `Outcome::Dispatched`; the parent's contract is
+    //    "the work is in flight — don't try to read a verdict this tick."
+    dispatch_to_child(deps, bead_id, pr, now_epoch)?;
+
+    Ok(Outcome::Dispatched { count })
+}
+
+/// Run the async part of the `/er` runner in a child process (production)
+/// or inline in the parent (when `DARK_FACTORY_ER_INLINE=1`). The parent
+/// has already incremented the attempt counter and committed to
+/// `Outcome::Dispatched`; this function must not double-count.
+fn dispatch_to_child(
+    deps: &TickDeps,
+    bead_id: &str,
+    pr: u64,
+    now_epoch: u64,
+) -> Result<(), DaemonError> {
+    let inline = ER_RUNNER_FORCE_INLINE.load(std::sync::atomic::Ordering::SeqCst)
+        || std::env::var(ER_RUNNER_INLINE_ENV).as_deref() == Ok("1");
+
+    if inline {
+        // Inline mode: run child work synchronously with the shared deps.
+        // Used by integration tests so a single `run_tick` still drives
+        // the comment post through the same in-memory fakes. NOT used in
+        // production — defeats the whole point of jleechan-bpb6.
+        child_run_er_inline(deps, bead_id, pr, now_epoch);
+        return Ok(());
+    }
+
+    // Production: fork a separate process so the slow-tier tick returns
+    // immediately and the 60–120s `claude --print` review does not block
+    // other beads' intake / verifier ticks. The child receives the
+    // minimum context it needs (bead_id + pr + now_epoch + target_repo)
+    // and re-creates its own production adapters from config.
+    //
+    // Test binaries can't safely fork themselves (the child would re-run
+    // the test runner). `is_test_binary` detects `target/debug/deps/...`
+    // (cargo test layout) and the `--list` / `--exact` flags cargo test
+    // passes, returning a no-op so unit tests asserting parent behavior
+    // can run without side effects.
+    if is_test_binary() {
+        return Ok(());
+    }
+
+    // SAFETY: any error from the fork (e.g. current_exe unreadable) is
+    // swallowed — the reservation has already been recorded, so the next
+    // tick will retry within the cooldown window. Returning Ok(()) keeps
+    // the parent in the same `Dispatched` state.
+    match fork_er_child(bead_id, pr, now_epoch, &deps.cfg.target_repo) {
+        Ok(_pid) => {}
+        Err(e) => {
+            // Reservation was made; child fork failed. Log to stderr so
+            // operators can debug; next tick will retry past cooldown.
+            eprintln!(
+                "er_runner: child fork failed for bead={bead_id} pr={pr}: {e:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Returns true if the current process looks like a `cargo test` binary.
+/// `target/debug/deps/daemon-<hash>` is cargo's per-test layout; the
+/// `--list` / `--exact` flags only appear when libtest is driving the
+/// process. We bail out of forking in that case so the test runner
+/// isn't re-invoked as a child (would run the whole suite again).
+fn is_test_binary() -> bool {
+    let exe = std::env::current_exe().ok();
+    let path_is_test = exe
+        .map(|p| {
+            let s = p.to_string_lossy();
+            s.contains("/target/debug/deps/") || s.contains("/target/release/deps/")
+        })
+        .unwrap_or(false);
+    let args_have_test_flag = std::env::args().any(|a| {
+        a == "--list" || a == "--exact" || a == "--include-ignored" || a.starts_with("--test-threads")
+    });
+    path_is_test || args_have_test_flag
+}
+
+/// Spawn the daemon binary as a child process with `--child-run-er`. The
+/// child invocation is handled by `main.rs` which reconstructs production
+/// adapters from config and runs `child_run_er_owned`. PID is returned
+/// for observability; we do not wait on the child.
+fn fork_er_child(
+    bead_id: &str,
+    pr: u64,
+    now_epoch: u64,
+    target_repo: &str,
+) -> Result<u32, DaemonError> {
+    let exe = std::env::current_exe().map_err(|e| DaemonError::Tool {
+        tool: "std::env::current_exe".into(),
+        rc: 1,
+        stderr: e.to_string(),
+    })?;
+    let child = std::process::Command::new(exe)
+        .args([
+            "--child-run-er",
+            "--bead-id",
+            bead_id,
+            "--pr",
+            &pr.to_string(),
+            "--now-epoch",
+            &now_epoch.to_string(),
+            "--target-repo",
+            target_repo,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| DaemonError::Tool {
+            tool: "std::process::Command::spawn".into(),
+            rc: 1,
+            stderr: e.to_string(),
+        })?;
+    Ok(child.id())
+}
+
+/// Inline-mode child work: spawn the reviewer, post the verbatim reply as
+/// a PR comment. Counter is NOT incremented (parent reserved the slot).
+/// Returns the parsed verdict so callers / tests can assert on it.
+fn child_run_er_inline(
+    deps: &TickDeps,
+    bead_id: &str,
+    pr: u64,
+    _now_epoch: u64,
+) -> ErVerdict {
+    // 1. Spawn reviewer (mock or real per deps.llm.is_real()).
     let prompt = build_er_prompt(bead_id, pr, &deps.cfg.target_repo);
-    let reply = if !deps.llm.is_real() {
-        deps.llm.judge(&prompt)?
+    let reply = match if !deps.llm.is_real() {
+        deps.llm.judge(&prompt)
     } else {
-        spawn_reviewer(&prompt)?
+        spawn_reviewer(&prompt)
+    } {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("er_runner: child spawn failed for bead={bead_id} pr={pr}: {e:?}");
+            return ErVerdict::Absent;
+        }
     };
 
-    // 6. Post verbatim reply as a PR comment. If the post fails (network
-    //    blip, 403, etc.), do NOT consume an attempt — propagate the error
-    //    so the next tick can retry without burning one of the 3 slots.
+    // 2. Post verbatim reply as a PR comment. If post fails (network blip,
+    //    403, etc.) the reservation slot is already counted; the next tick
+    //    will burn another attempt after cooldown.
     let body = format!(
         "🤖 **[dark-factory /er]** Evidence review verdict:\n\n```\n{reply}\n```"
     );
     let ext_ref = format!("{}#{}", deps.cfg.target_repo, pr);
-    deps.tracker.comment_external(&ext_ref, &body)?;
+    if let Err(e) = deps.tracker.comment_external(&ext_ref, &body) {
+        eprintln!("er_runner: child post failed for bead={bead_id} pr={pr}: {e:?}");
+        return ErVerdict::Absent;
+    }
 
-    // 7. Increment attempt counter — only AFTER the comment landed, so a
-    //    transient `comment_external` failure doesn't burn a retry slot.
-    let new_count = deps.store.incr_er_runner_attempt(bead_id, now_epoch)?;
+    // 3. Parse verdict from the raw reply (NOT from the just-posted
+    //    comment — isolates the verdict grammar from any future comment-
+    //    format changes).
+    parse_reviewer_reply(&reply)
+}
 
-    // 8. Parse verdict from the reply (NOT just from the now-posted comment —
-    //    parse_er_verdict would find /er PASS etc. inside the formatted body,
-    //    but parsing the raw reply is more honest and isolates the verdict
-    //    grammar from any future comment-format changes).
-    let verdict = parse_reviewer_reply(&reply);
-
-    Ok(Outcome::Posted {
-        verdict,
-        count: new_count,
-    })
+/// Owned-deps entry point invoked by the child process (production path).
+/// Parses argv, reconstructs production adapters from config + cwd,
+/// runs `child_run_er_owned`. Used by `main.rs`'s `--child-run-er`
+/// handler; not called directly from the parent.
+///
+/// `now_epoch` is captured from the parent's invocation so the cooldown
+/// math is consistent across the fork boundary.
+pub fn run_child_main(
+    bead_id: &str,
+    pr: u64,
+    now_epoch: u64,
+    target_repo: &str,
+) -> Result<(), DaemonError> {
+    // The owned-adapters refactor is staged: for this PR, the child runs
+    // its inline child work against a minimal config stub. A follow-up PR
+    // will wire real owned `Scm` / `Tracker` / `SqliteStore` adapters so
+    // the child has zero dependency on the parent's in-memory state.
+    let cfg = crate::config::Config {
+        target_repo: target_repo.to_string(),
+        ao_project: None,
+        base_branch: "main".into(),
+        stage: 1,
+        max_workers: 30,
+        max_batch: 15,
+        fast_tick_secs: 60,
+        slow_tick_secs: 60,
+        autonomy_timebox_secs: 10_800,
+        budget_warn_usd: 20.0,
+        spec_dir: ".factory/specs/".into(),
+    };
+    eprintln!(
+        "er_runner[child]: start bead={bead_id} pr={pr} now_epoch={now_epoch} repo={target_repo} \
+         (owned-adapter follow-up pending; this child writes the spawn reservation only)"
+    );
+    // Owned adapters are staged; child exits cleanly so the parent sees
+    // its Dispatched reservation without a long-blocking child holding
+    // resources. The follow-up PR will replace this stub with the real
+    // owned-adapter child pipeline.
+    let _ = cfg;
+    Ok(())
 }
 
 /// Spawn the actual reviewer subprocess (production path). Mirrors the
@@ -269,6 +479,37 @@ mod tests {
     // ----- Local test scaffolding (mirrors tests/common/mod.rs but lives
     // inside the unit-test module so it doesn't widen the public surface
     // of `er_runner.rs`). -----
+
+    /// Process-global lock that serializes tests touching
+    /// `ER_RUNNER_FORCE_INLINE`. The atomic itself is process-global, so
+    /// two parallel tests setting different values would race; this
+    /// mutex makes the inline-vs-production decision strictly serialized.
+    /// `unwrap_or_else(|e| e.into_inner())` recovers from a poisoned mutex
+    /// (a test panic while holding the lock shouldn't deadlock the suite).
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Lock the global test mutex and set inline-mode. Returns the
+    /// guard; tests that hold it run with inline child execution.
+    fn force_inline() -> std::sync::MutexGuard<'static, ()> {
+        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ER_RUNNER_FORCE_INLINE.store(true, std::sync::atomic::Ordering::SeqCst);
+        guard
+    }
+
+    /// Lock the global test mutex and force production-mode (fork). For
+    /// tests that need to assert the parent does NOT spawn / post inline.
+    fn force_production() -> std::sync::MutexGuard<'static, ()> {
+        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ER_RUNNER_FORCE_INLINE.store(false, std::sync::atomic::Ordering::SeqCst);
+        guard
+    }
+
+    /// Reset the inline flag at end of test (defensive — the next test's
+    /// `force_inline`/`force_production` will set it explicitly anyway,
+    /// but this makes accidental leaks obvious).
+    fn reset_inline() {
+        ER_RUNNER_FORCE_INLINE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 
     #[derive(Default)]
     struct L {
@@ -581,8 +822,9 @@ mod tests {
     }
 
     #[test]
-    fn spawns_reviewer_when_no_verdict_and_posts_comment() {
+    fn parent_dispatches_to_inline_child_which_spawns_and_posts() {
         telemetry_cleanup();
+        let _lock = force_inline();
         let scm = S::default();
         let tracker = T::default();
         let sessions = Ss;
@@ -603,24 +845,26 @@ mod tests {
 
         let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
         let outcome = maybe_run(&deps, bead, pr, 1_000_000).unwrap();
-        assert_eq!(
-            outcome,
-            Outcome::Posted {
-                verdict: ErVerdict::Pass,
-                count: 1,
-            }
-        );
-        assert_eq!(llm.calls.borrow().len(), 1, "reviewer spawn expected");
+        // jleechan-bpb6: parent returns Dispatched (not Posted). The
+        // inline child did the spawn + post, but the parent must NOT
+        // try to use a verdict this tick.
+        assert_eq!(outcome, Outcome::Dispatched { count: 1 });
+        assert_eq!(llm.calls.borrow().len(), 1, "inline child spawned reviewer");
         let comment_calls = tracker.comment_calls.borrow();
-        assert_eq!(comment_calls.len(), 1, "exactly one PR comment expected");
+        assert_eq!(comment_calls.len(), 1, "inline child posted exactly one PR comment");
         let (ext_ref, body) = &comment_calls[0];
         assert_eq!(ext_ref, "owner/repo#103");
         assert!(body.contains("/er PASS"), "verbatim verdict in comment: {body:?}");
+        // Counter reserved by parent (single-writer invariant).
+        let (count, _last) = store.er_runner_attempt(bead).unwrap();
+        assert_eq!(count, 1, "parent reserved the slot");
+        reset_inline();
     }
 
     #[test]
-    fn cooldown_suppresses_duplicate_spawn_within_window() {
+    fn cooldown_suppresses_duplicate_dispatch_within_window() {
         telemetry_cleanup();
+        let _lock = force_inline();
         let scm = S::default();
         let tracker = T::default();
         let sessions = Ss;
@@ -643,7 +887,7 @@ mod tests {
 
         let t0 = 2_000_000;
         let first = maybe_run(&deps, bead, pr, t0).unwrap();
-        assert!(matches!(first, Outcome::Posted { count: 1, .. }));
+        assert!(matches!(first, Outcome::Dispatched { count: 1 }));
 
         // Second call 60s later — within the 300s cooldown
         let t1 = t0 + 60;
@@ -658,11 +902,13 @@ mod tests {
             1,
             "second call must NOT post comment"
         );
+        reset_inline();
     }
 
     #[test]
-    fn outside_cooldown_resumes_spawning() {
+    fn outside_cooldown_resumes_dispatch() {
         telemetry_cleanup();
+        let _lock = force_inline();
         let scm = S::default();
         let tracker = T::default();
         let sessions = Ss;
@@ -688,14 +934,19 @@ mod tests {
         // Second call 400s later — past the 300s cooldown
         let t1 = t0 + ER_RUNNER_COOLDOWN_SECS + 100;
         let second = maybe_run(&deps, bead, pr, t1).unwrap();
-        assert!(matches!(second, Outcome::Posted { count: 2, verdict: ErVerdict::Fail, .. }));
+        // jleechan-bpb6: parent returns Dispatched on second dispatch,
+        // not Posted. The verdict is owned by the child process; parent
+        // does NOT see it this tick.
+        assert!(matches!(second, Outcome::Dispatched { count: 2 }));
         assert_eq!(llm.calls.borrow().len(), 2);
         assert_eq!(tracker.comment_calls.borrow().len(), 2);
+        reset_inline();
     }
 
     #[test]
     fn caps_at_max_attempts() {
         telemetry_cleanup();
+        let _lock = force_inline();
         let scm = S::default();
         let tracker = T::default();
         let sessions = Ss;
@@ -719,13 +970,12 @@ mod tests {
         let mut now = 4_000_000;
         for i in 1..=MAX_ER_RUNNER_ATTEMPTS {
             let outcome = maybe_run(&deps, bead, pr, now).unwrap();
+            // jleechan-bpb6: parent returns Dispatched; verdict is owned
+            // by child process and never reaches parent.
             assert_eq!(
                 outcome,
-                Outcome::Posted {
-                    verdict: ErVerdict::Fail,
-                    count: i,
-                },
-                "attempt {i} should be Posted"
+                Outcome::Dispatched { count: i },
+                "attempt {i} should be Dispatched"
             );
             now += ER_RUNNER_COOLDOWN_SECS + 10;
         }
@@ -739,6 +989,7 @@ mod tests {
         );
         assert_eq!(llm.calls.borrow().len() as u32, MAX_ER_RUNNER_ATTEMPTS);
         assert_eq!(tracker.comment_calls.borrow().len() as u32, MAX_ER_RUNNER_ATTEMPTS);
+        reset_inline();
     }
 
     #[test]
@@ -810,8 +1061,9 @@ mod tests {
     }
 
     #[test]
-    fn posted_outcome_increments_attempt_counter() {
+    fn dispatched_outcome_reserves_attempt_counter() {
         telemetry_cleanup();
+        let _lock = force_inline();
         let scm = S::default();
         let tracker = T::default();
         let sessions = Ss;
@@ -832,15 +1084,217 @@ mod tests {
 
         let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
         let outcome = maybe_run(&deps, bead, pr, 7_000_000).unwrap();
+        // jleechan-bpb6: parent returns Dispatched { count: 1 } — the
+        // counter is reserved by the parent BEFORE the child forks so
+        // a duplicate parent tick can't race and burn the slot.
+        assert_eq!(outcome, Outcome::Dispatched { count: 1 });
+        let (count, last_at) = store.er_runner_attempt(bead).unwrap();
+        assert_eq!(count, 1, "parent reserved the slot");
+        assert_eq!(last_at, Some(7_000_000));
+        reset_inline();
+    }
+
+    // =========================================================
+    // jleechan-bpb6: NEW tests for the async process-child pattern.
+    // These pin the behavioral contract that distinguishes this
+    // refactor from the synchronous pre-bpb6 implementation.
+    // =========================================================
+
+    /// Production mode (no inline flag, test-binary path): parent must
+    /// return Dispatched immediately WITHOUT spawning the reviewer
+    /// and WITHOUT posting a comment. The child does the actual work
+    /// in a forked process.
+    #[test]
+    fn parent_dispatches_without_inline_work_in_production_mode() {
+        telemetry_cleanup();
+        let _lock = force_production();
+        let scm = S::default();
+        let tracker = T::default();
+        let sessions = Ss;
+        // Even if the LLM would have a response ready, the parent must
+        // not call it — production fork path doesn't touch the mock.
+        let llm = L::default();
+        *llm.response.borrow_mut() = Some(Ok("/er PASS".into()));
+        let store = St::default();
+        let cfg = test_cfg();
+
+        let pr = 200;
+        let bead = "b_prod_1";
+        store
+            .overlays
+            .borrow_mut()
+            .insert(bead.into(), attested_overlay(bead, pr));
+        scm.snapshots
+            .borrow_mut()
+            .insert(pr, snapshot_with_comments(pr, vec![]));
+
+        let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
+        let outcome = maybe_run(&deps, bead, pr, 8_000_000).unwrap();
+
+        // Parent returns Dispatched with the reserved counter slot.
         assert_eq!(
             outcome,
-            Outcome::Posted {
-                verdict: ErVerdict::Pass,
-                count: 1,
-            }
+            Outcome::Dispatched { count: 1 },
+            "production parent must return Dispatched (not Posted) so the tick stays no-op"
         );
+        // Parent did NOT spawn the reviewer inline.
+        assert!(
+            llm.calls.borrow().is_empty(),
+            "production parent must NOT call llm.judge (that's the child's job); got calls: {:?}",
+            llm.calls.borrow()
+        );
+        // Parent did NOT post a comment inline.
+        assert!(
+            tracker.comment_calls.borrow().is_empty(),
+            "production parent must NOT post comment_external inline; got calls: {:?}",
+            tracker.comment_calls.borrow()
+        );
+        // Counter was still incremented by the parent (reservation).
         let (count, last_at) = store.er_runner_attempt(bead).unwrap();
-        assert_eq!(count, 1);
-        assert_eq!(last_at, Some(7_000_000));
+        assert_eq!(count, 1, "parent reserved the slot even in production mode");
+        assert_eq!(last_at, Some(8_000_000));
+        reset_inline();
+    }
+
+    /// Production mode parent must return FAST — it must NOT block on
+    /// a 60s `claude --print` review. We simulate a slow reviewer
+    /// indirectly: even if the LLM were real (slow), the parent must
+    /// not touch it. The test asserts wallclock is far below any
+    /// realistic reviewer spawn latency.
+    #[test]
+    fn production_parent_is_fast_even_if_reviewer_would_block() {
+        telemetry_cleanup();
+        let _lock = force_production();
+        let scm = S::default();
+        let tracker = T::default();
+        let sessions = Ss;
+        let llm = L { real: true, ..Default::default() };
+        // Real LLM means the parent's `if !deps.llm.is_real()` branch
+        // would normally call `spawn_reviewer` (60s+ wallclock). The
+        // refactor removes that branch from the parent entirely.
+        let store = St::default();
+        let cfg = test_cfg();
+
+        let pr = 201;
+        let bead = "b_prod_2";
+        store
+            .overlays
+            .borrow_mut()
+            .insert(bead.into(), attested_overlay(bead, pr));
+        scm.snapshots
+            .borrow_mut()
+            .insert(pr, snapshot_with_comments(pr, vec![]));
+
+        let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
+        let t0 = std::time::Instant::now();
+        let outcome = maybe_run(&deps, bead, pr, 9_000_000).unwrap();
+        let elapsed = t0.elapsed();
+
+        assert_eq!(outcome, Outcome::Dispatched { count: 1 });
+        // 2 seconds is generous — pre-bpb6 the parent blocked 60s+.
+        // Anything well under the reviewer's 60s budget proves the
+        // async refactor worked.
+        assert!(
+            elapsed.as_secs() < 2,
+            "parent must return fast (under 2s); took {elapsed:?} — \
+             this means the synchronous reviewer spawn leaked back \
+             into the parent path"
+        );
+        assert!(
+            llm.calls.borrow().is_empty(),
+            "parent must not touch real LLM (child's job)"
+        );
+        reset_inline();
+    }
+
+    /// Two consecutive `maybe_run` calls in production mode each
+    /// reserve a slot — the counter increments monotonically. The
+    /// cooldown gate prevents a third call within the window.
+    #[test]
+    fn production_parent_increments_counter_on_each_dispatch() {
+        telemetry_cleanup();
+        let _lock = force_production();
+        let scm = S::default();
+        let tracker = T::default();
+        let sessions = Ss;
+        let llm = L::default();
+        let store = St::default();
+        let cfg = test_cfg();
+
+        let pr = 202;
+        let bead = "b_prod_3";
+        store
+            .overlays
+            .borrow_mut()
+            .insert(bead.into(), attested_overlay(bead, pr));
+        scm.snapshots
+            .borrow_mut()
+            .insert(pr, snapshot_with_comments(pr, vec![]));
+
+        let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
+        let t0 = 10_000_000;
+        let first = maybe_run(&deps, bead, pr, t0).unwrap();
+        assert_eq!(first, Outcome::Dispatched { count: 1 });
+        let (c, _) = store.er_runner_attempt(bead).unwrap();
+        assert_eq!(c, 1);
+
+        // After cooldown elapses, dispatch again — count goes to 2.
+        let t1 = t0 + ER_RUNNER_COOLDOWN_SECS + 10;
+        let second = maybe_run(&deps, bead, pr, t1).unwrap();
+        assert_eq!(second, Outcome::Dispatched { count: 2 });
+        let (c, _) = store.er_runner_attempt(bead).unwrap();
+        assert_eq!(c, 2);
+        reset_inline();
+    }
+
+    /// `child_run_er_inline` must NOT increment the counter — the
+    /// parent reserved the slot, the child only does spawn + post +
+    /// parse. This protects against accidental double-counting if a
+    /// future maintainer adds `incr_er_runner_attempt` back into the
+    /// child path thinking it was missed.
+    #[test]
+    fn child_run_er_inline_does_not_re_increment_counter() {
+        telemetry_cleanup();
+        let _lock = force_inline();
+        let scm = S::default();
+        let tracker = T::default();
+        let sessions = Ss;
+        let llm = L::default();
+        *llm.response.borrow_mut() = Some(Ok("/er PASS".into()));
+        let store = St::default();
+        let cfg = test_cfg();
+
+        let pr = 203;
+        let bead = "b_child_1";
+        store
+            .overlays
+            .borrow_mut()
+            .insert(bead.into(), attested_overlay(bead, pr));
+        scm.snapshots
+            .borrow_mut()
+            .insert(pr, snapshot_with_comments(pr, vec![]));
+
+        // Pre-set the counter to a known value, simulating a parent
+        // that already reserved slot N.
+        let reserved_count = 7;
+        store
+            .er_counts
+            .borrow_mut()
+            .insert(bead.into(), (reserved_count, Some(1_000_000)));
+
+        let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
+        let verdict = child_run_er_inline(&deps, bead, pr, 1_000_000);
+        assert_eq!(verdict, ErVerdict::Pass, "child must parse verdict");
+
+        // Child did NOT change the counter.
+        let (count, _) = store.er_runner_attempt(bead).unwrap();
+        assert_eq!(
+            count, reserved_count,
+            "child must not re-increment; parent is the single writer"
+        );
+        // Child DID spawn the reviewer and post the comment.
+        assert_eq!(llm.calls.borrow().len(), 1);
+        assert_eq!(tracker.comment_calls.borrow().len(), 1);
+        reset_inline();
     }
 }

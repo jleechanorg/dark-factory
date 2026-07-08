@@ -13,6 +13,7 @@
 // --json comments` seeing a freshly-posted comment on the next fetch.
 
 use daemon::config::Config;
+use daemon::er_runner::ER_RUNNER_FORCE_INLINE;
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{run_tick, TickDeps};
 use daemon::tools::{
@@ -21,6 +22,25 @@ use daemon::tools::{
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::Ordering;
+use std::sync::Mutex;
+
+/// Process-global lock that serializes tests touching
+/// `ER_RUNNER_FORCE_INLINE`. The atomic itself is process-global, so
+/// two parallel tests setting different values would race; this mutex
+/// keeps the inline-vs-production decision strictly serialized.
+/// `unwrap_or_else(|e| e.into_inner())` recovers from a poisoned mutex
+/// (a test panic while holding the lock shouldn't deadlock the suite).
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Lock the global test mutex and set inline-mode. The returned guard
+/// holds the lock for the rest of the test; hold it via `let _lock = …`
+/// so it drops at the end of the test scope.
+fn force_inline() -> std::sync::MutexGuard<'static, ()> {
+    let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ER_RUNNER_FORCE_INLINE.store(true, Ordering::SeqCst);
+    guard
+}
 
 #[derive(Default)]
 struct LlmMock {
@@ -384,6 +404,7 @@ fn drive_one_tick(
 
 #[test]
 fn er_runner_already_posted_short_circuits_no_llm_call() {
+    let _lock = force_inline();
     let _ = std::fs::remove_file("/tmp/afd_er_runner_int_test_already.jsonl");
 
     let scm_rc = Rc::new(RefCell::new(ScmMock::default()));
@@ -441,6 +462,7 @@ fn er_runner_already_posted_short_circuits_no_llm_call() {
 
 #[test]
 fn er_runner_spawns_reviewer_and_posted_comment_flips_gate_to_pass() {
+    let _lock = force_inline();
     let _ = std::fs::remove_file("/tmp/afd_er_runner_int_test_posted.jsonl");
 
     let scm_rc = Rc::new(RefCell::new(ScmMock::default()));
@@ -519,6 +541,7 @@ fn er_runner_spawns_reviewer_and_posted_comment_flips_gate_to_pass() {
 
 #[test]
 fn er_runner_fail_comment_flips_gate_to_red() {
+    let _lock = force_inline();
     let _ = std::fs::remove_file("/tmp/afd_er_runner_int_test_fail.jsonl");
 
     let scm_rc = Rc::new(RefCell::new(ScmMock::default()));
@@ -567,7 +590,8 @@ fn er_runner_fail_comment_flips_gate_to_red() {
 }
 
 #[test]
-fn er_runner_emits_posted_telemetry_event() {
+fn er_runner_emits_dispatched_telemetry_event() {
+    let _lock = force_inline();
     let _ = std::fs::remove_file("/tmp/afd_er_runner_int_test_telemetry.jsonl");
 
     let scm_rc = Rc::new(RefCell::new(ScmMock::default()));
@@ -607,9 +631,13 @@ fn er_runner_emits_posted_telemetry_event() {
         .iter()
         .map(|e| e["eventType"].as_str().unwrap_or("").to_string())
         .collect();
+    // jleechan-bpb6: the parent emits ER_RUNNER_DISPATCHED (not POSTED);
+    // the child's POSTED event arrives on a future tick after the
+    // child process completes. Inline mode collapses both phases into
+    // one tick but the parent-side event is still DISPATCHED.
     assert!(
-        event_types.iter().any(|e| e == "ER_RUNNER_POSTED"),
-        "expected an ER_RUNNER_POSTED telemetry event, got: {event_types:?}"
+        event_types.iter().any(|e| e == "ER_RUNNER_DISPATCHED"),
+        "expected an ER_RUNNER_DISPATCHED telemetry event, got: {event_types:?}"
     );
 
     let _ = std::fs::remove_file("/tmp/afd_er_runner_int_test_telemetry.jsonl");
