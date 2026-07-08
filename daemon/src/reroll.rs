@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::state::{BeadOverlay, OverlayState, StateStore};
-use crate::tools::{Llm, Scm, Sessions, Vcs};
+use crate::tools::{Llm, Scm, Sessions, SpawnSpec, Vcs};
 use crate::telemetry::{self, TelemetryEvent};
 use crate::constraints;
 use std::path::Path;
@@ -373,19 +373,16 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     Ok(RerollOutcome::Rerolled { new_branch })
 }
 
-/// Adopted-PR remediation (bead jleechan-tfs1, Option A + hard safety
-/// amendment): append-only fix commit on the EXISTING contributor branch.
-/// Never fabricates a replacement branch, never closes the original PR,
-/// never force-pushes or rewrites history. `deps.vcs.push_fix_commit`
-/// enforces the append-only/non-force contract at the git layer (fetch +
-/// checkout onto `origin/<branch>` + `--allow-empty` commit + a *non*-force
-/// push); a non-fast-forward rejection there (remote diverged, or a genuine
-/// conflict with base that would require a rebase) is surfaced here as a
-/// `Held` outcome — this function does NOT retry with a force-push or a
-/// rebase under any circumstance. The caller (`tick::run_fast_tier`) posts
-/// the escalation comment on the PR for a `Held` outcome via the same
-/// generic path it already uses for every other `Held` reason.
-fn execute_adopted(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcome, DaemonError> {
+/// Adopted-PR remediation dispatches a real coder session onto the EXISTING
+/// contributor branch, briefed with the reviewer feedback that caused the red
+/// gate. This function never fabricates commits itself, never creates a
+/// replacement branch, never closes the original PR, and never invokes a
+/// history-rewrite primitive; those invariants are structural because this
+/// code path only attaches/checks an existing session or spawns a new one.
+fn execute_adopted(
+    deps: &RerollDeps,
+    bead: &mut BeadOverlay,
+) -> Result<RerollOutcome, DaemonError> {
     let branch = match bead.branch.clone() {
         Some(b) => b,
         None => {
@@ -413,48 +410,100 @@ fn execute_adopted(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOu
         &bead.bead_id,
         bead.attempt,
         bead.state.as_str(),
-        "REROLL_ADOPTED_APPEND_ONLY_START",
+        "REROLL_ADOPTED_REMEDIATION_START",
         serde_json::json!({}),
         serde_json::json!({"branch": branch}),
     )?;
 
-    let next_attempt = bead.attempt + 1;
-    let commit_message = format!(
-        "fix: address {} review feedback (attempt {})\n\n{}",
-        deps.reviewer, next_attempt, deps.review_text
-    );
+    // Duplicate-spawn guard: `execute_adopted` is normally only reachable
+    // when the bead's freshest stored state is ATTESTED or RE_ROLL. This is
+    // a second line of defense against two coder sessions racing commits
+    // onto the same contributor-owned branch.
+    if let Ok(existing_session) = deps.sessions.attach(&branch, &bead.bead_id) {
+        match deps.sessions.is_quiescent(&existing_session) {
+            Ok(false) => {
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_ADOPTED_SESSION_ALREADY_ACTIVE",
+                    serde_json::json!({}),
+                    serde_json::json!({"branch": branch, "sessionId": existing_session.0}),
+                )?;
+                return Ok(RerollOutcome::Rerolled { new_branch: branch });
+            }
+            Ok(true) => {}
+            Err(e) => {
+                bead.state = OverlayState::HumanHeld;
+                deps.store.save(bead)?;
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_ADOPTED_QUIESCENCE_CHECK_FAILED",
+                    serde_json::json!({}),
+                    serde_json::json!({"branch": branch, "error": e.to_string()}),
+                )?;
+                return Ok(RerollOutcome::Held(format!(
+                    "failed to check whether an existing remediation session on adopted branch {branch} is still active: {e}"
+                )));
+            }
+        }
+    }
 
-    match deps.vcs.push_fix_commit(&branch, &commit_message) {
-        Ok(()) => {
+    let next_attempt = bead.attempt + 1;
+    let prompt = format!(
+        "Address the following code review feedback from {reviewer} on this pull \
+         request (attempt {attempt}). Work ONLY on the existing branch `{branch}` - \
+         make real code changes that resolve the issues described below, then commit \
+         and push your changes to that same branch.\n\n\
+         HARD CONSTRAINTS (do not violate under any circumstance):\n\
+         - This is a branch owned by an external contributor. You MUST NOT force-push, \
+         rewrite commits, or otherwise rewrite this branch's history.\n\
+         - You MUST NOT close the existing pull request or open a new one.\n\
+         - You MUST NOT create or push to any other branch.\n\
+         - If resolving the feedback genuinely requires rewriting branch history (e.g. a \
+         base conflict), STOP and leave the branch exactly as-is rather than doing \
+         either - a human will handle it.\n\n\
+         Review feedback:\n{review_text}",
+        reviewer = deps.reviewer,
+        attempt = next_attempt,
+        branch = branch,
+        review_text = deps.review_text,
+    );
+    let spec = SpawnSpec {
+        bead_id: bead.bead_id.clone(),
+        branch: branch.clone(),
+        prompt,
+    };
+
+    match deps.sessions.spawn(&spec) {
+        Ok(session_id) => {
             bead.attempt = next_attempt;
             bead.reroll_count += 1;
-            // Branch and pr_number are deliberately left unchanged: same
-            // branch, same PR, still open. There is no factory session to
-            // redispatch to, so the bead goes straight back to ATTESTED —
-            // the next tick's verifier pass re-assesses the PR once CI
-            // catches up to the new commit, exactly like any other push a
-            // contributor makes to their own open PR.
-            bead.state = OverlayState::Attested;
+            bead.session_id = Some(session_id.0.clone());
+            // Reuse DISPATCHED: branch and pr_number are deliberately left
+            // unchanged (same branch, same still-open PR). The fast-tier
+            // quiescence-gated DISPATCHED -> ATTESTED promotion moves this
+            // back to verification after the coder session finishes.
+            bead.state = OverlayState::Dispatched;
             deps.store.save(bead)?;
             emit_telemetry(
                 deps.telemetry_log,
                 &bead.bead_id,
                 bead.attempt,
                 bead.state.as_str(),
-                "REROLL_ADOPTED_FIX_PUSHED",
+                "REROLL_ADOPTED_SESSION_SPAWNED",
                 serde_json::json!({
                     "elapsedAutonomySeconds": bead.autonomy_secs,
                 }),
-                serde_json::json!({"branch": branch}),
+                serde_json::json!({"branch": branch, "sessionId": session_id.0}),
             )?;
             Ok(RerollOutcome::Rerolled { new_branch: branch })
         }
         Err(e) => {
-            // Append-only push failed — most likely a non-fast-forward
-            // rejection, meaning genuine remediation would require a rebase
-            // or force-push. The daemon has no authority to rewrite a
-            // contributor's history, so this parks HUMAN_HELD rather than
-            // ever falling back to `--force`.
             bead.state = OverlayState::HumanHeld;
             deps.store.save(bead)?;
             emit_telemetry(
@@ -462,14 +511,12 @@ fn execute_adopted(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOu
                 &bead.bead_id,
                 bead.attempt,
                 bead.state.as_str(),
-                "REROLL_ADOPTED_APPEND_ONLY_FAILED",
+                "REROLL_ADOPTED_SPAWN_FAILED",
                 serde_json::json!({}),
                 serde_json::json!({"branch": branch, "error": e.to_string()}),
             )?;
             Ok(RerollOutcome::Held(format!(
-                "append-only fix push to adopted branch {branch} failed and needs a human \
-                 (possible remote divergence or a base conflict requiring a rebase/force-push, \
-                 which automation will not perform on a contributor-owned branch): {e}"
+                "failed to spawn a remediation coder session on adopted branch {branch}: {e}"
             )))
         }
     }

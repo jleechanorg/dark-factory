@@ -1829,16 +1829,15 @@ fn adopted_non_green_pr_parks_human_held_with_v1_escalation() {
 }
 
 /// bead jleechan-tfs1, requirement (a) + (c), full pipeline (Stage 2): a
-/// red-gate reroll on an adopted PR pushes an append-only fix commit to the
+/// red-gate reroll on an adopted PR spawns a remediation coder session on the
 /// EXISTING contributor branch via `run_tick`'s real intake -> verifier ->
 /// reroll wiring (not a direct `reroll::execute` call — this proves the
 /// `is_adopted` flag actually survives the round trip through
 /// `tick::run_slow_tier`'s adoption block, `StateStore::save`/`load`, and
-/// back into `tick::run_fast_tier`'s reroll dispatch). The PR stays open,
-/// branch registry is unchanged, and no force-push/rebase/close_pr ever
-/// happens.
+/// back into `tick::run_fast_tier`'s reroll dispatch). The PR stays open and
+/// branch registry is unchanged.
 #[test]
-fn adopted_red_pr_stage2_reroll_pushes_fix_commit_leaves_pr_open() {
+fn adopted_red_pr_stage2_reroll_spawns_remediation_session_leaves_pr_open() {
     let mut scm = FakeScm::new();
     scm.prs.push(LabeledPr {
         number: 706,
@@ -1894,11 +1893,13 @@ fn adopted_red_pr_stage2_reroll_pushes_fix_commit_leaves_pr_open() {
     assert_eq!(summary.gates_assessed, 1);
     assert_eq!(
         summary.beads_parked_human_held, 0,
-        "a successful append-only push must not park the bead"
+        "a successful remediation-session spawn must not park the bead"
     );
 
     let overlay = store.load("fake-bead-1").unwrap().unwrap();
-    assert_eq!(overlay.state, OverlayState::Attested);
+    // run_fast_tier does not revisit a bead after the reroll branch in the
+    // same tick, so quiescence-gated promotion happens on a later tick.
+    assert_eq!(overlay.state, OverlayState::Dispatched);
     assert_eq!(overlay.attempt, 2);
     assert_eq!(
         overlay.pr_number,
@@ -1918,13 +1919,24 @@ fn adopted_red_pr_stage2_reroll_pushes_fix_commit_leaves_pr_open() {
         "no fabricated replacement branch should be registered"
     );
 
-    let vcs_calls = vcs.calls.borrow();
-    assert!(
-        vcs_calls
-            .iter()
-            .any(|c| c.starts_with("push_fix_commit(alice/my-cool-feature,")),
-        "adopted stage-2 reroll must push a fix commit to the existing branch: {vcs_calls:?}"
+    let session_prompts = sessions.spawn_prompts.borrow();
+    assert_eq!(
+        session_prompts.len(),
+        1,
+        "adopted stage-2 reroll must spawn exactly one remediation session: {session_prompts:?}"
     );
+    let (spawned_bead_id, prompt) = &session_prompts[0];
+    assert_eq!(spawned_bead_id, "fake-bead-1");
+    assert!(
+        prompt.contains("CI check-run(s) not all success"),
+        "spawn prompt must include the red-gate feedback: {prompt}"
+    );
+    assert!(
+        prompt.contains("alice/my-cool-feature"),
+        "spawn prompt must target the adopted branch: {prompt}"
+    );
+
+    let vcs_calls = vcs.calls.borrow();
     assert!(
         vcs_calls
             .iter()
@@ -1945,7 +1957,7 @@ fn adopted_red_pr_stage2_reroll_pushes_fix_commit_leaves_pr_open() {
     );
     assert!(
         tracker_calls.iter().any(|c| {
-            c.contains("comment_external(owner/repo#706") && c.contains("remediation commit")
+            c.contains("comment_external(owner/repo#706") && c.contains("remediation coder session")
         }),
         "adopted stage-2 success should post a status comment: {tracker_calls:?}"
     );
@@ -1954,14 +1966,12 @@ fn adopted_red_pr_stage2_reroll_pushes_fix_commit_leaves_pr_open() {
 }
 
 /// bead jleechan-tfs1, requirement (d), full pipeline (Stage 2): when the
-/// append-only push genuinely can't land (scripted as a non-fast-forward
-/// rejection — the real-world case is a remote that diverged or a base
-/// conflict needing a rebase), the bead must be parked `HUMAN_HELD` with an
-/// escalation comment actually posted on the PR (via
+/// remediation coder session cannot be spawned, the bead must be parked
+/// `HUMAN_HELD` with an escalation comment actually posted on the PR (via
 /// `tick::post_scm_comment_by_bead_id` -> `Tracker::comment_external`) —
-/// not a silent failure, and never a force-push/rebase fallback.
+/// not a silent failure.
 #[test]
-fn adopted_red_pr_stage2_reroll_append_only_conflict_parks_human_held_with_escalation() {
+fn adopted_red_pr_stage2_reroll_spawn_failure_parks_human_held_with_escalation() {
     let mut scm = FakeScm::new();
     scm.prs.push(LabeledPr {
         number: 707,
@@ -1994,7 +2004,7 @@ fn adopted_red_pr_stage2_reroll_append_only_conflict_parks_human_held_with_escal
     let mut cfg = test_cfg();
     cfg.stage = 2;
     let vcs = FakeVcs::new();
-    vcs.fail_push_fix_commit_for("alice/my-conflicted-feature");
+    sessions.fail_spawn_for("fake-bead-1");
     let telemetry_log = std::env::temp_dir().join("afd_adopted_stage2_conflict.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -2012,7 +2022,7 @@ fn adopted_red_pr_stage2_reroll_append_only_conflict_parks_human_held_with_escal
         0,
         0,
     )
-    .expect("adopted red PR stage2 append-only failure should park, not error");
+    .expect("adopted red PR stage2 spawn failure should park, not error");
 
     assert_eq!(summary.beads_parked_human_held, 1);
 
@@ -2028,13 +2038,13 @@ fn adopted_red_pr_stage2_reroll_append_only_conflict_parks_human_held_with_escal
         Some("alice/my-conflicted-feature")
     );
 
-    let vcs_calls = vcs.calls.borrow();
+    let session_calls = sessions.calls.borrow();
     assert!(
-        vcs_calls
-            .iter()
-            .any(|c| c.starts_with("push_fix_commit(alice/my-conflicted-feature,")),
-        "must have attempted the append-only push before parking: {vcs_calls:?}"
+        session_calls.iter().any(|c| c == "spawn(fake-bead-1)"),
+        "must have attempted the remediation-session spawn before parking: {session_calls:?}"
     );
+
+    let vcs_calls = vcs.calls.borrow();
     assert!(
         vcs_calls
             .iter()
@@ -2181,7 +2191,10 @@ fn manual_bead_adoption_never_calls_create_bead_or_fabricates_external_ref() {
     };
 
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
-    assert_eq!(summary.beads_created, 1, "manual bead should get a local overlay row");
+    assert_eq!(
+        summary.beads_created, 1,
+        "manual bead should get a local overlay row"
+    );
 
     let calls = tracker.calls.borrow();
     assert!(
