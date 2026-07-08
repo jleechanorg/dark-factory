@@ -9,5 +9,12 @@ WorkingDirectory=@REPO@
 ExecStart=/bin/bash @REPO@/daemon/scripts/auto-merge-guard.sh
 Environment=HOME=%h
 Environment=AFD_LOG=%h/Library/Logs/dark-factory/daemon.jsonl
+# Strip any shell-exported GITHUB_TOKEN/GH_TOKEN before the service runs so the
+# user's keyring auth (gh CLI's default credential source on this host) takes
+# effect for gh pr list / gh pr view / gh pr merge calls inside the guard.
+# Without this, a stale or invalid GITHUB_TOKEN shadows the working keyring
+# auth and every gh CLI call fails the same way (every timer tick rc=1).
+# See bead jleechan-s3c and jleechan-p944.
+UnsetEnvironment=GITHUB_TOKEN GH_TOKEN
 StandardOutput=append:%h/Library/Logs/dark-factory/merge-guard.out.log
 StandardError=append:%h/Library/Logs/dark-factory/merge-guard.err.log
