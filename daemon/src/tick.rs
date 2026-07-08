@@ -331,6 +331,109 @@ pub fn run_tick(
         // 3. Wedge detection
         match overlay.state {
             OverlayState::Dispatched => {
+                // bead jleechan-tfs1 amendment: post-hoc append-only
+                // verification for adopted-branch remediation. The coder
+                // session dispatched by `reroll::execute_adopted` is only
+                // constrained not to force-push at the PROMPT level (it's
+                // an independent subprocess the daemon doesn't control at
+                // the git layer) — this is the code-level backstop. Runs
+                // every tick the bead sits DISPATCHED on an adopted branch
+                // (not gated on the 30-minute autonomy threshold, same as
+                // the session_branch_mismatch sweep below it), so a
+                // history-rewrite is caught on the very next tick rather
+                // than silently surviving until promotion.
+                //
+                // Fail-closed by design (opposite bias from the
+                // session_branch_mismatch check below, which intentionally
+                // treats "cannot verify" as NOT a violation): both a
+                // confirmed non-ancestor (`Ok(false)`) and an inconclusive
+                // check (`Err`, e.g. a fetch failure) escalate. A missed
+                // stall retries next tick for free; a missed force-push is
+                // silent, permanent history loss on a branch the daemon
+                // does not own.
+                if overlay.is_adopted {
+                    if let (Some(branch), Some(pre_sha)) =
+                        (overlay.branch.clone(), overlay.pre_session_head_sha.clone())
+                    {
+                        let verdict = deps.vcs.remote_head_sha(&branch).and_then(|post_sha| {
+                            deps.vcs
+                                .is_ancestor(&pre_sha, &post_sha)
+                                .map(|ok| (ok, post_sha))
+                        });
+                        match verdict {
+                            Ok((true, _)) => {}
+                            Ok((false, post_sha)) => {
+                                overlay.state = OverlayState::HumanHeld;
+                                deps.store.save(&overlay)?;
+                                emit(
+                                    deps.telemetry_log,
+                                    &overlay.bead_id,
+                                    overlay.attempt,
+                                    OverlayState::HumanHeld.as_str(),
+                                    "PARKED_HUMAN_HELD",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "reason": "adopted_branch_history_rewrite_detected",
+                                        "branch": branch,
+                                        "pre_session_sha": pre_sha,
+                                        "post_session_sha": post_sha,
+                                    }),
+                                )?;
+                                let comment_body = format!(
+                                    "🤖 **[dark-factory]** Escalation required: history-rewrite \
+                                     detected on adopted branch `{}`. The pre-remediation \
+                                     HEAD `{}` is no longer an ancestor of the branch's \
+                                     current tip (`{}`) — this means the branch was \
+                                     force-pushed or rebased, which violates the append-only \
+                                     guarantee for adopted PRs (bead jleechan-tfs1). Parked \
+                                     HUMAN_HELD for manual review; the daemon will not touch \
+                                     this branch further.",
+                                    branch, pre_sha, post_sha
+                                );
+                                let _ = post_scm_comment_by_bead_id(
+                                    deps,
+                                    &overlay.bead_id,
+                                    &comment_body,
+                                );
+                                summary.beads_parked_human_held += 1;
+                                continue;
+                            }
+                            Err(e) => {
+                                overlay.state = OverlayState::HumanHeld;
+                                deps.store.save(&overlay)?;
+                                emit(
+                                    deps.telemetry_log,
+                                    &overlay.bead_id,
+                                    overlay.attempt,
+                                    OverlayState::HumanHeld.as_str(),
+                                    "PARKED_HUMAN_HELD",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "reason": "adopted_branch_append_only_check_failed",
+                                        "branch": branch,
+                                        "pre_session_sha": pre_sha,
+                                        "error": e.to_string(),
+                                    }),
+                                )?;
+                                let comment_body = format!(
+                                    "🤖 **[dark-factory]** Escalation required: could not verify \
+                                     the append-only guarantee on adopted branch `{}` \
+                                     (pre-remediation HEAD `{}`): {}. Parked HUMAN_HELD \
+                                     for manual review rather than assuming the branch is safe.",
+                                    branch, pre_sha, e
+                                );
+                                let _ = post_scm_comment_by_bead_id(
+                                    deps,
+                                    &overlay.bead_id,
+                                    &comment_body,
+                                );
+                                summary.beads_parked_human_held += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 // jleechan-5ia2: dispatch-integrity sweep. Runs every tick
                 // (independent of the 30-minute autonomy threshold below) so
                 // a corrupted DISPATCHED row can never sit trusted
@@ -386,35 +489,43 @@ pub fn run_tick(
                     }
                 }
 
-                if let Some(ref branch) = overlay.branch {
-                    if overlay.autonomy_secs >= 1800 {
-                        let last_commit_epoch = deps.scm.remote_branch_last_commit(branch)?;
-                        let now_epoch = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
+                // Adopted remediation reuses cumulative autonomy_secs from
+                // adoption, which can false-positive-park a fresh session;
+                // a dedicated staleness check for that path is follow-up.
+                if !overlay.is_adopted {
+                    if let Some(ref branch) = overlay.branch {
+                        if overlay.autonomy_secs >= 1800 {
+                            let last_commit_epoch = deps.scm.remote_branch_last_commit(branch)?;
+                            let now_epoch = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
 
-                        let is_silent = match last_commit_epoch {
-                            None => true,
-                            Some(commit_time) => now_epoch.saturating_sub(commit_time) >= 1800,
-                        };
+                            let is_silent = match last_commit_epoch {
+                                None => true,
+                                Some(commit_time) => now_epoch.saturating_sub(commit_time) >= 1800,
+                            };
 
-                        if is_silent {
-                            overlay.state = OverlayState::HumanHeld;
-                            deps.store.save(&overlay)?;
-                            emit(
-                                deps.telemetry_log,
-                                &overlay.bead_id,
-                                overlay.attempt,
-                                OverlayState::HumanHeld.as_str(),
-                                "PARKED_HUMAN_HELD",
-                                serde_json::json!({}),
-                                serde_json::json!({"reason": "coder_silent"}),
-                            )?;
-                            let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): coder silent/inactive on branch for 30 minutes.".to_string();
-                            let _ =
-                                post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
-                            summary.beads_parked_human_held += 1;
+                            if is_silent {
+                                overlay.state = OverlayState::HumanHeld;
+                                deps.store.save(&overlay)?;
+                                emit(
+                                    deps.telemetry_log,
+                                    &overlay.bead_id,
+                                    overlay.attempt,
+                                    OverlayState::HumanHeld.as_str(),
+                                    "PARKED_HUMAN_HELD",
+                                    serde_json::json!({}),
+                                    serde_json::json!({"reason": "coder_silent"}),
+                                )?;
+                                let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): coder silent/inactive on branch for 30 minutes.".to_string();
+                                let _ = post_scm_comment_by_bead_id(
+                                    deps,
+                                    &overlay.bead_id,
+                                    &comment_body,
+                                );
+                                summary.beads_parked_human_held += 1;
+                            }
                         }
                     }
                 }
@@ -723,6 +834,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 session_id: None,
                 is_adopted: true,
                 spawn_failure_count: 0,
+            pre_session_head_sha: None,
             });
             overlay.state = OverlayState::Attested;
             overlay.pr_number = Some(adopted.pr_number);
@@ -809,6 +921,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         };
         deps.store.save(&overlay)?;
         summary.beads_created += 1;
@@ -876,6 +989,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     session_id: None,
                     is_adopted: false,
                     spawn_failure_count: 0,
+            pre_session_head_sha: None,
                 };
                 deps.store.save(&o)?;
                 summary.beads_created += 1;
@@ -1456,22 +1570,54 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
 
             if let Some(pr) = overlay.pr_number {
-                overlay.state = OverlayState::Attested;
-                deps.store.save(&overlay)?;
-                emit(
-                    deps.telemetry_log,
-                    bead_id,
-                    overlay.attempt,
-                    OverlayState::Attested.as_str(),
-                    "PR_OPENED",
-                    serde_json::json!({}),
-                    serde_json::json!({"pr_number": pr}),
-                )?;
-                let comment_body = format!(
-                    "🤖 **[dark-factory]** Worker session opened this pull request for bead `{}`. Beginning gate-by-gate safety verification...",
-                    bead_id
-                );
-                let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+                // Adopted-branch remediation reuses DISPATCHED with
+                // `pr_number` already set from adoption time. Gate promotion
+                // on the remediation coder session having quiesced so the
+                // verifier checks real landed work, not the stale pre-fix
+                // commit.
+                let ready_to_promote = if overlay.is_adopted {
+                    match &overlay.session_id {
+                        Some(session_id_str) => deps
+                            .sessions
+                            .is_quiescent(&SessionId(session_id_str.clone()))
+                            .unwrap_or(false),
+                        None => false,
+                    }
+                } else {
+                    true
+                };
+
+                if ready_to_promote {
+                    overlay.state = OverlayState::Attested;
+                    deps.store.save(&overlay)?;
+                    let event_type = if overlay.is_adopted {
+                        "REROLL_ADOPTED_SESSION_QUIESCED"
+                    } else {
+                        "PR_OPENED"
+                    };
+                    emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Attested.as_str(),
+                        event_type,
+                        serde_json::json!({}),
+                        serde_json::json!({"pr_number": pr}),
+                    )?;
+                    let comment_body = if overlay.is_adopted {
+                        format!(
+                            "🤖 **[dark-factory]** Remediation coder session finished working on `{}` (attempt {}). Re-running gate verification against the latest commits...",
+                            overlay.branch.clone().unwrap_or_default(),
+                            overlay.attempt
+                        )
+                    } else {
+                        format!(
+                            "🤖 **[dark-factory]** Worker session opened this pull request for bead `{}`. Beginning gate-by-gate safety verification...",
+                            bead_id
+                        )
+                    };
+                    let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+                }
             }
         }
 
@@ -1819,16 +1965,12 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 match crate::reroll::execute(&reroll_deps, &mut overlay) {
                     Ok(crate::reroll::RerollOutcome::Rerolled { new_branch }) => {
                         if overlay.is_adopted {
-                            // Adopted-branch remediation (bead jleechan-tfs1):
-                            // `reroll::execute` already pushed an append-only
-                            // fix commit to the EXISTING contributor branch
-                            // and left the overlay ATTESTED with
-                            // pr_number/branch unchanged. There is no
-                            // factory-spawned session to redispatch to for
-                            // an externally authored branch, so the
-                            // spec-file-validation / REDISPATCHED-or-
-                            // HumanHeld dance below (factory-fabricated path
-                            // only) does not apply here.
+                            // `reroll::execute` already spawned a real coder
+                            // session on the EXISTING contributor branch
+                            // (bead.state is now DISPATCHED, not ATTESTED).
+                            // The fast-tier loop's quiescence-gated
+                            // DISPATCHED -> ATTESTED promotion picks this
+                            // back up once the session finishes.
                             emit(
                                 deps.telemetry_log,
                                 bead_id,
@@ -1839,7 +1981,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 serde_json::json!({"branch": new_branch}),
                             )?;
                             let comment_body = format!(
-                                "🤖 **[dark-factory]** Pushed a remediation commit to `{}` (attempt {}) addressing review feedback. This pull request remains open under your ownership; no replacement branch was created.",
+                                "🤖 **[dark-factory]** Spawned a remediation coder session on `{}` (attempt {}) to address review feedback. This pull request remains open under your ownership; no replacement branch was created.",
                                 new_branch, overlay.attempt
                             );
                             let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);

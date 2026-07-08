@@ -417,6 +417,15 @@ pub struct FakeVcs {
     /// Optional error to return from `head_sha` on every call for a given
     /// branch, modeling a `git rev-parse` failure mid-quiescence-check.
     pub fail_head_sha_for: RefCell<HashMap<String, String>>,
+    /// Scripts `remote_head_sha(branch)`. Reuses the same `heads` map as
+    /// `head_sha` (the fake doesn't model the local-vs-remote-tracking-ref
+    /// distinction) — set `heads.insert(branch, sha)` to script both.
+    ///
+    /// Scripts `is_ancestor(ancestor_sha, descendant_sha)`: `(ancestor_sha,
+    /// descendant_sha) -> bool`. Missing entries default to `true` (i.e.
+    /// "no rewrite detected") so tests that don't exercise the force-push
+    /// detector don't have to script it.
+    pub ancestor_pairs: HashMap<(String, String), bool>,
 }
 
 impl FakeVcs {
@@ -542,6 +551,34 @@ impl Vcs for FakeVcs {
             });
         }
         Ok(())
+    }
+
+    fn remote_head_sha(&self, branch: &str) -> Result<String, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("remote_head_sha({branch})"));
+        self.heads
+            .get(branch)
+            .cloned()
+            .ok_or_else(|| DaemonError::Tool {
+                tool: "git".into(),
+                rc: 1,
+                stderr: format!("no scripted remote head for {branch}"),
+            })
+    }
+
+    fn is_ancestor(&self, ancestor_sha: &str, descendant_sha: &str) -> Result<bool, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("is_ancestor({ancestor_sha},{descendant_sha})"));
+        if ancestor_sha == descendant_sha {
+            return Ok(true);
+        }
+        Ok(self
+            .ancestor_pairs
+            .get(&(ancestor_sha.to_string(), descendant_sha.to_string()))
+            .copied()
+            .unwrap_or(true))
     }
 }
 

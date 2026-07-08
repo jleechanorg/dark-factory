@@ -1461,6 +1461,27 @@ impl Vcs for CliVcs {
         Ok(r.is_ok())
     }
 
+    fn remote_head_sha(&self, branch: &str) -> Result<String, DaemonError> {
+        run_tool("git", &["fetch", "origin", branch], 30)?;
+        self.head_sha(&format!("origin/{branch}"))
+    }
+
+    fn is_ancestor(&self, ancestor_sha: &str, descendant_sha: &str) -> Result<bool, DaemonError> {
+        // `--is-ancestor` exits 0 on true, 1 on false, and non-0/1 on a
+        // genuine git error (e.g. one of the SHAs isn't a known object) —
+        // all non-zero exits collapse to `Ok(false)` here, same fold
+        // `is_remote_ahead` already uses. Callers of `is_ancestor` for the
+        // force-push-detection use case are documented (on the trait) to
+        // treat that `Ok(false)` as fail-closed, unlike `is_remote_ahead`'s
+        // callers.
+        let r = run_tool(
+            "git",
+            &["merge-base", "--is-ancestor", ancestor_sha, descendant_sha],
+            30,
+        );
+        Ok(r.is_ok())
+    }
+
     fn push_fix_commit(&self, branch: &str, message: &str) -> Result<(), DaemonError> {
         // Fetch the branch fresh, then check out a local ref pinned exactly
         // to `origin/<branch>` — this is the append-only starting point: the

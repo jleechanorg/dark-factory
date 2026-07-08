@@ -282,6 +282,43 @@ pub trait Vcs {
     /// ignore local-only work.
     fn is_remote_ahead(&self, branch: &str, remote_sha: &str) -> Result<bool, DaemonError>;
 
+    /// Fetch `branch` fresh from `origin` (read-only: this updates ONLY the
+    /// remote-tracking ref `refs/remotes/origin/<branch>` — never a local
+    /// branch, the index, or the working tree, so it is safe to call every
+    /// tick) and return the resulting `origin/<branch>` HEAD SHA. Used both
+    /// to capture the pre-remediation-session baseline before dispatching a
+    /// coder session onto an adopted branch, and later to read the
+    /// branch's current tip when verifying that baseline is still intact.
+    fn remote_head_sha(&self, branch: &str) -> Result<String, DaemonError>;
+
+    /// `true` iff `ancestor_sha` is an ancestor of `descendant_sha` in the
+    /// local git commit graph (`git merge-base --is-ancestor`). Generic
+    /// two-SHA form of the same merge-base primitive `is_remote_ahead`
+    /// already uses internally; both SHAs' commit objects must already be
+    /// present locally (call `remote_head_sha` first to guarantee that for
+    /// SHAs coming from `origin`).
+    ///
+    /// This is the post-hoc append-only verification for bead
+    /// jleechan-tfs1's hard operator law ("no force-push on adopted
+    /// branches, ever"): the coder session that remediates an adopted PR
+    /// runs as an independent subprocess the daemon does not control at the
+    /// git layer, so "don't force-push" is a PROMPT-level instruction to
+    /// that session, not something the daemon can structurally block the
+    /// way it can block itself from calling `create_branch_at`/`close_pr`.
+    /// This method is how the daemon checks, after the fact, whether the
+    /// session complied.
+    ///
+    /// Unlike `is_remote_ahead` (where an inconclusive/error result should
+    /// NOT false-positive a stall, since a missed stall just retries next
+    /// tick for free), callers of `is_ancestor` for this force-push-
+    /// detection use case MUST treat any non-`Ok(true)` result (`Ok(false)`
+    /// OR `Err`) as "cannot confirm append-only — escalate to a human", not
+    /// as "assume fine and continue". A missed force-push is silent,
+    /// permanent history loss on a branch the daemon does not own; the cost
+    /// of a false-positive escalation (a human reviews and clears it) is
+    /// far lower than the cost of a false pass.
+    fn is_ancestor(&self, ancestor_sha: &str, descendant_sha: &str) -> Result<bool, DaemonError>;
+
     /// Append-only remediation push for an ADOPTED branch (bead jleechan-tfs1):
     /// add exactly one new commit on top of `branch`'s current tip (fetched
     /// fresh from `origin`) and push it non-force to `origin/<branch>`.

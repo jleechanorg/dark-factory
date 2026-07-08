@@ -55,7 +55,14 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- corrupt either of those. Older DBs pre-date this column and get it via
   -- the idempotent `ensure_spawn_failure_count_column` migration in
   -- `SqliteStateStore::open` (same guard pattern as `ensure_is_adopted_column`).
-  spawn_failure_count INTEGER NOT NULL DEFAULT 0
+  spawn_failure_count INTEGER NOT NULL DEFAULT 0,
+  -- Pre-remediation-session HEAD SHA for adopted-branch force-push
+  -- detection (bead jleechan-tfs1 amendment). Nullable: only set for
+  -- adopted beads that have been through a remediation dispatch. Kept in
+  -- sync with the idempotent `ensure_pre_session_head_sha_column`
+  -- migration in `SqliteStateStore::open` (same guard pattern as
+  -- `ensure_is_adopted_column`).
+  pre_session_head_sha TEXT
 );
 
 -- Deletion guard: the daemon/skills may delete ONLY refs recorded here (spec §4.2.8).
