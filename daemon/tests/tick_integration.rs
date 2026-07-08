@@ -2124,6 +2124,93 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// jleechan-3wh0: file:line-cited regression guard for the *actual* root
+/// cause of the 15-orphan-bead defect. This is not a bug in `create_bead`
+/// (that trait method has always required a non-optional `external_ref: &str`
+/// — see `every_create_bead_call_across_both_intake_paths_carries_nonempty_external_ref`
+/// in `intake.rs` for that coverage). The orphans instead come through this
+/// "manual bead adoption" branch of `run_tick` (tick.rs, the block that logs
+/// `INTAKE_BEAD_CREATED` with `serde_json::json!({"manual": true})`): when a
+/// `factory`-labeled bead already exists in `br` (created directly by an
+/// operator/agent, bypassing the daemon entirely) but has no local
+/// `BeadOverlay` row yet, the daemon adopts it into its own tracking state
+/// WITHOUT ever calling `Tracker::create_bead`.
+///
+/// That is legitimate, intentional behavior (`Bead.external_ref: Option<...>`
+/// is documented "None = manual bead" in `tools.rs`) — the defect is that
+/// this path was undocumented/untested against regression, so a future
+/// refactor could silently start (a) calling `create_bead` here with an
+/// empty ref, which would just create MORE orphans, or (b) fabricating a
+/// synthetic external_ref for a bead the daemon never actually verified
+/// against GitHub. This test locks in both invariants: adopting a manual
+/// bead must never invoke `create_bead`, and must never mutate the bead's
+/// external_ref away from what the tracker reported.
+#[test]
+fn manual_bead_adoption_never_calls_create_bead_or_fabricates_external_ref() {
+    let scm = FakeScm::new(); // no issues/PRs in SCM -- this bead did not come through GitHub intake
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(daemon::tools::Bead {
+        id: "manual-bead-999".into(),
+        title: "Orphan-shaped manual bead".into(),
+        description: "created directly via `br create`, no --external-ref".into(),
+        file_tree_summary: "".into(),
+        external_ref: None, // exactly the jleechan-3wh0 orphan shape
+    });
+
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    let telemetry_log = std::env::temp_dir().join("afd_manual_bead_external_ref_test.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
+    assert_eq!(summary.beads_created, 1, "manual bead should get a local overlay row");
+
+    let calls = tracker.calls.borrow();
+    assert!(
+        calls.iter().all(|c| !c.starts_with("create_bead(")),
+        "manual-bead adoption must NEVER call create_bead — it adopts a bead \
+         that already exists in `br`, it does not create a new one. A \
+         create_bead( call here means this path started fabricating \
+         beads/refs, which is the jleechan-3wh0 orphan-defect shape: {calls:?}"
+    );
+
+    // The tracker's own candidate record (what a real `br list` would report)
+    // must remain untouched -- nothing in the tick loop should have called
+    // `br update --external-ref` to synthesize a fake linkage for a bead the
+    // daemon never independently verified against GitHub.
+    let candidate = tracker
+        .candidates
+        .borrow()
+        .iter()
+        .find(|b| b.id == "manual-bead-999")
+        .cloned()
+        .expect("candidate should still be present");
+    assert_eq!(
+        candidate.external_ref, None,
+        "manual bead's external_ref must not be silently fabricated by tick processing"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 #[test]
 fn newly_intaken_bead_dispatch_uses_real_tracker_title() {
     let mut scm = FakeScm::new();
