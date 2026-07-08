@@ -19,7 +19,7 @@
 // binary entirely (design doc says the Rust daemon IS the Stage 2 owner
 // eventually, but this task only implements the Stage-1 substitution rule).
 use crate::config::Config;
-use crate::dispatch;
+use crate::dispatch::{self, MAX_TRANSIENT_SPAWN_RETRY};
 use crate::errors::DaemonError;
 use crate::intake;
 use crate::router::{self, RoutingVerdict};
@@ -669,6 +669,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 branch: Some(adopted.head_ref_name.clone()),
                 session_id: None,
                 is_adopted: true,
+                spawn_failure_count: 0,
             });
             overlay.state = OverlayState::Attested;
             overlay.pr_number = Some(adopted.pr_number);
@@ -748,6 +749,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             branch: None,
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         };
         deps.store.save(&overlay)?;
         summary.beads_created += 1;
@@ -808,6 +810,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     branch: None,
                     session_id: None,
                     is_adopted: false,
+                    spawn_failure_count: 0,
                 };
                 deps.store.save(&o)?;
                 summary.beads_created += 1;
@@ -879,6 +882,68 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         summary.beads_dispatched += dispatch_report.success_count();
 
         for failure in &dispatch_report.failures {
+            if failure.phase == "spawn_retry_cap_exceeded" {
+                // `dispatch::dispatch_ready` already parked this bead
+                // HUMAN_HELD on disk (it has no `Tracker`/`Scm` access to
+                // post a comment itself — see its module doc comment).
+                // Record the state-transition fact unconditionally, then
+                // best-effort escalate exactly once (mirrors
+                // `run_recovery_step`'s cap-escalation idiom below).
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "transient_spawn_retry_cap_exceeded",
+                        "branch": failure.branch.as_deref(),
+                        "error": failure.error.as_str(),
+                        "max_transient_spawn_retry": MAX_TRANSIENT_SPAWN_RETRY,
+                    }),
+                )?;
+                if escalation_already_recorded(deps, &failure.bead_id)? {
+                    continue;
+                }
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: bead `{}` failed to spawn a worker session more than {} consecutive times (transient errors only — e.g. AO session-cap pressure). Automation parked it HUMAN_HELD instead of retrying indefinitely; please check target-repo session capacity before requeuing.",
+                    failure.bead_id, MAX_TRANSIENT_SPAWN_RETRY
+                );
+                if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body) {
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_NOTIFICATION_FAILED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "transient_spawn_retry_cap_exceeded",
+                            "error": err.to_string(),
+                        }),
+                    )?;
+                    continue;
+                }
+                record_escalation(deps, &failure.bead_id, "transient_spawn_retry_cap_exceeded")?;
+                summary.beads_escalated += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "ESCALATION_REQUIRED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "transient_spawn_retry_cap_exceeded",
+                        "max_transient_spawn_retry": MAX_TRANSIENT_SPAWN_RETRY,
+                        "branch": failure.branch.as_deref(),
+                    }),
+                )?;
+                continue;
+            }
+
             let lifecycle_state = if failure.branch.is_some() {
                 OverlayState::Dispatching.as_str()
             } else {

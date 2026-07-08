@@ -490,6 +490,7 @@ mod tests {
             branch: Some(format!("factory/{bead_id}-r1")),
             session_id: Some("s1".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         }
     }
 

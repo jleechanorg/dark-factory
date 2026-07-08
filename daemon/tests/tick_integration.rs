@@ -428,6 +428,7 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
                 branch: None,
                 session_id: None,
                 is_adopted: false,
+                spawn_failure_count: 0,
             })
             .unwrap();
     }
@@ -534,6 +535,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
             branch: Some("factory/bead-1-r1".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
 
@@ -594,6 +596,7 @@ fn test_autonomy_budget_warning_crossing() {
             branch: Some("factory/bead-2-r1".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
 
@@ -648,6 +651,7 @@ fn test_wedge_detection_dispatched_coder_silent() {
             branch: Some("factory/bead-silent-r1".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
 
@@ -716,6 +720,7 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
             branch: Some("factory/jleechan-vj89-r1".into()),
             session_id: Some("wa-3004".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
 
@@ -782,6 +787,7 @@ fn test_dispatch_integrity_sweep_leaves_matching_branch_alone() {
             branch: Some("factory/bead-ok-r1".into()),
             session_id: Some("wa-4001".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
 
@@ -832,6 +838,7 @@ fn test_wedge_detection_attested_session_stalled() {
             branch: Some("factory/bead-stalled-r1".into()),
             session_id: Some("session-abc123yz".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
 
@@ -922,6 +929,7 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             branch: Some("factory/bead-ubas-r1".into()),
             session_id: Some("session-ubas-1".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
 
@@ -1033,6 +1041,7 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             branch: Some("factory/bead-genuinely-stalled-r1".into()),
             session_id: Some("session-stuck-1".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
 
@@ -1120,6 +1129,7 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             branch: Some("factory/bead-local-ahead-r1".into()),
             session_id: Some("session-local-ahead-1".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
 
@@ -1230,6 +1240,7 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             branch: Some("factory/bead-diverged-r1".into()),
             session_id: Some("session-diverged-1".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
 
@@ -1559,6 +1570,7 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
             branch: Some("factory/existing-bead-r1".into()),
             session_id: Some("sess-existing".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         })
         .unwrap();
     store
@@ -2178,6 +2190,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             branch: Some("fix/rewards-box-not-showing-8020-v2".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
     store
@@ -2265,6 +2278,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             branch: Some("fix/rewards-box-not-showing-8020-v2".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
     store
@@ -2355,6 +2369,7 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
             branch: Some("factory/bead-held-r2".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
 
@@ -2434,6 +2449,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             branch: Some("factory/bead-held-cap-r10".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
     // Also seed one above the cap (defensive — matches the shell overlay)
@@ -2450,6 +2466,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             branch: Some("factory/bead-held-over-r11".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
 
@@ -2764,6 +2781,7 @@ fn capped_human_held_comment_failure_retries_before_recording_escalation() {
             branch: Some("factory/bead-held-retry-r10".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
     *tracker.fail_next_comment.borrow_mut() = Some("transient comment failure".into());
@@ -2843,6 +2861,7 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
             branch: Some("factory/bead-held-fallback-r10".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
     tracker.candidates.borrow_mut().push(Bead {
@@ -2922,6 +2941,7 @@ fn capped_human_held_missing_comment_target_does_not_record_escalation() {
             branch: Some("factory/bead-held-missing-target-r10".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
 
@@ -2981,6 +3001,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             branch: Some("factory/er-capped-unknown-r4".into()),
             session_id: Some("session-er-capped".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
     store
@@ -3135,6 +3156,7 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
             branch: Some("factory/er-capped-retry-r4".into()),
             session_id: Some("session-er-capped-retry".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
     store
@@ -3241,6 +3263,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             branch: Some("factory/att-bead-r1".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
     scm.pr_snapshots.insert(
@@ -3338,6 +3361,7 @@ fn attested_ci_pending_does_not_timebox_park() {
             branch: Some("factory/slow-ci-r1".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
     scm.pr_snapshots.insert(
@@ -3441,6 +3465,7 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
             branch: Some("factory/non-green-r1".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
 
@@ -3530,6 +3555,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             branch: Some("factory/att-active-r1".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
     scm.pr_snapshots.insert(
@@ -3626,6 +3652,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
                 branch: Some(format!("factory/{bead}-r1")),
                 session_id: Some("sess-1".into()),
                 is_adopted: false,
+                spawn_failure_count: 0,
             })
             .unwrap();
         store
@@ -3776,6 +3803,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             branch: Some("factory/qdw-near-timebox-r1".into()),
             session_id: Some("sess-1".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         })
         .unwrap();
     store
@@ -3795,6 +3823,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             branch: Some("factory/qdw-healthy-r1".into()),
             session_id: Some("sess-1".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         })
         .unwrap();
     store
@@ -4228,6 +4257,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             branch: Some("factory/qdw-post-refetch-fails-r1".into()),
             session_id: Some("sess-1".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         })
         .unwrap();
     store
@@ -4248,6 +4278,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             branch: Some("factory/qdw-post-refetch-healthy-r1".into()),
             session_id: Some("sess-2".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         })
         .unwrap();
     store
@@ -4401,6 +4432,7 @@ fn qdw_assess_refetch_failure_stays_attested_and_never_closes_pr() {
             branch: Some("factory/qdw-assess-refetch-fails-r1".into()),
             session_id: Some("sess-assess".into()),
             is_adopted: false,
+            spawn_failure_count: 0,
         })
         .unwrap();
     store
@@ -4697,6 +4729,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             branch: Some("factory/real-repo-bead-r1".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
     store
@@ -4871,6 +4904,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             branch: Some("factory/real-repo-bead-asym-r1".into()),
             session_id: None,
             is_adopted: false,
+            spawn_failure_count: 0,
         },
     );
     store
@@ -4981,4 +5015,343 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
 
     let _ = std::fs::remove_file(&telemetry_log);
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+// jleechan follow-up to #198 (fix/dispatch-batch-isolation): #198 fixed the
+// batch-abort bug in `dispatch_ready`'s transient-spawn-failure path (a
+// requeue no longer aborts the rest of the batch), but left the requeue path
+// uncapped. A bead whose `Sessions::spawn` deterministically fails every
+// tick (e.g. the target project pinned at its AO session cap) cycled
+// `Queued -> Dispatching -> transient failure -> Queued` forever: it never
+// reaches `DISPATCHED`, so `query_active_overlays`'s `DISPATCHED`/`ATTESTED`
+// scope never sees it, `autonomy_secs` never accumulates, and the 30-minute
+// wedge-detection net never fires — a livelock with zero telemetry signal.
+// These three tests exercise the new `overlay.spawn_failure_count` counter +
+// `dispatch::MAX_TRANSIENT_SPAWN_RETRY` cap end-to-end through the real
+// `run_tick` call stack (same evidence-floor discipline as the rest of this
+// file — fakes only at the five tool-boundary traits).
+
+/// Below the cap: the bead must stay QUEUED and retriable. Also asserts the
+/// dedicated `spawn_failure_count` counter is what advances — NOT `attempt`
+/// (reusing `attempt` here would corrupt both the `factory/<id>-r<n>` branch
+/// numbering in `dispatch_ready` and the unrelated
+/// `MAX_HUMAN_HELD_RECOVERY_ATTEMPT` cap in `run_recovery_step`).
+#[test]
+fn transient_spawn_failures_below_cap_stay_retriable_and_do_not_park() {
+    const BEAD_ID: &str = "fake-bead-1";
+
+    let mut scm = FakeScm::new();
+    scm.issues.push(Issue {
+        number: 4242,
+        title: "Bead whose spawn fails a few times".into(),
+        body: "transient tool hiccup, not a permanent block".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#4242".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    sessions.fail_spawn_for(BEAD_ID);
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_spawn_retry_below_cap_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // Three consecutive transient spawn failures — well under the cap
+    // (MAX_TRANSIENT_SPAWN_RETRY == 15, dispatch.rs private const).
+    for tick_index in 0..3u64 {
+        let summary = run_tick(&deps, tick_index, 0)
+            .unwrap_or_else(|e| panic!("tick {tick_index} should succeed: {e:?}"));
+        assert_eq!(summary.beads_dispatched, 0, "tick {tick_index}");
+        assert_eq!(
+            summary.beads_parked_human_held, 0,
+            "tick {tick_index}: three transient failures is well under the cap; must not park"
+        );
+        assert_eq!(summary.beads_escalated, 0, "tick {tick_index}");
+    }
+
+    let overlay = store.load(BEAD_ID).unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Queued,
+        "bead must remain retriable (QUEUED), not parked, below the cap"
+    );
+    assert_eq!(
+        overlay.spawn_failure_count, 3,
+        "spawn_failure_count must track the three transient failures"
+    );
+    assert_eq!(
+        overlay.attempt, 1,
+        "plain transient spawn retries must NOT bump `attempt` — that field is reserved for \
+         the branch/re-roll suffix and the HUMAN_HELD recovery cap"
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !log.contains("PARKED_HUMAN_HELD"),
+        "no park should have happened below the cap; got: {log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// At/above the cap: `MAX_TRANSIENT_SPAWN_RETRY + 1` consecutive transient
+/// spawn failures must park the bead HUMAN_HELD (never let it silently cycle
+/// QUEUED<->DISPATCHING forever), post a real escalation comment, and emit
+/// the `PARKED_HUMAN_HELD` / `ESCALATION_REQUIRED` telemetry with reason
+/// `transient_spawn_retry_cap_exceeded`.
+#[test]
+fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
+    // MAX_TRANSIENT_SPAWN_RETRY (daemon::dispatch, `pub(crate)`) == 15;
+    // hardcoded here the same way this file already hardcodes
+    // MAX_HUMAN_HELD_RECOVERY_ATTEMPT (== 10, private in tick.rs) elsewhere,
+    // since neither is reachable from an external test crate.
+    const MAX_TRANSIENT_SPAWN_RETRY: u32 = 15;
+    const BEAD_ID: &str = "fake-bead-1";
+    const EXTERNAL_REF: &str = "owner/repo#8123";
+
+    let mut scm = FakeScm::new();
+    scm.issues.push(Issue {
+        number: 8123,
+        title: "Bead whose spawn deterministically fails".into(),
+        body: "target project pinned at its AO session cap".into(),
+        author_login: "alice".into(),
+        external_ref: EXTERNAL_REF.into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    sessions.fail_spawn_for(BEAD_ID);
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_spawn_retry_cap_exceeded_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // Tick 0: intake creates + routes the bead, then dispatch attempts
+    // spawn — the first transient failure. Must requeue (not park).
+    let summary0 = run_tick(&deps, 0, 0).expect("tick 0 should succeed");
+    assert_eq!(summary0.beads_created, 1);
+    assert_eq!(summary0.beads_routed, 1);
+    assert_eq!(summary0.beads_dispatched, 0);
+    assert_eq!(summary0.beads_parked_human_held, 0);
+    let overlay0 = store.load(BEAD_ID).unwrap().unwrap();
+    assert_eq!(overlay0.state, OverlayState::Queued);
+    assert_eq!(overlay0.spawn_failure_count, 1);
+
+    // Ticks 1..=14: fourteen more transient spawn failures (15 total).
+    // `spawn_failure_count > MAX_TRANSIENT_SPAWN_RETRY` requires STRICTLY
+    // greater than 15, so the bead must stay retriable through exactly 15
+    // consecutive failures — the "still under the cap" half of the bound.
+    for tick_index in 1..=14u64 {
+        let summary = run_tick(&deps, tick_index, 0)
+            .unwrap_or_else(|e| panic!("tick {tick_index} should succeed: {e:?}"));
+        assert_eq!(
+            summary.beads_dispatched, 0,
+            "tick {tick_index}: spawn keeps failing transiently"
+        );
+        assert_eq!(
+            summary.beads_parked_human_held, 0,
+            "tick {tick_index}: bead must not be parked before the cap is exceeded"
+        );
+        let overlay = store.load(BEAD_ID).unwrap().unwrap();
+        assert_eq!(
+            overlay.state,
+            OverlayState::Queued,
+            "tick {tick_index}: bead below the cap must stay QUEUED — this is exactly the \
+             livelock this fix closes if it regresses"
+        );
+        assert_eq!(overlay.spawn_failure_count, (tick_index as u32) + 1);
+    }
+    let at_cap = store.load(BEAD_ID).unwrap().unwrap();
+    assert_eq!(at_cap.spawn_failure_count, MAX_TRANSIENT_SPAWN_RETRY);
+    assert_eq!(at_cap.state, OverlayState::Queued);
+
+    // Tick 15: the 16th consecutive transient spawn failure pushes
+    // spawn_failure_count to 16 (> 15). The bead must park HUMAN_HELD
+    // instead of requeuing again, and tick.rs must post a real escalation
+    // comment + emit telemetry.
+    let summary_cap = run_tick(&deps, 15, 0).expect("cap tick should succeed");
+    assert_eq!(summary_cap.beads_dispatched, 0);
+    assert_eq!(
+        summary_cap.beads_parked_human_held, 1,
+        "the cap-exceeding failure must park the bead HUMAN_HELD"
+    );
+    assert_eq!(
+        summary_cap.beads_escalated, 1,
+        "the cap-exceeding failure must escalate exactly once"
+    );
+    let capped_overlay = store.load(BEAD_ID).unwrap().unwrap();
+    assert_eq!(capped_overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        capped_overlay.spawn_failure_count,
+        MAX_TRANSIENT_SPAWN_RETRY + 1
+    );
+
+    let escalation_comment_count = |tracker: &FakeTracker| {
+        tracker
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| {
+                call.contains(&format!("comment_external({EXTERNAL_REF}"))
+                    && call.contains("Escalation required")
+                    && call.contains(&format!("bead `{BEAD_ID}`"))
+                    && call.contains("consecutive times")
+            })
+            .count()
+    };
+    assert_eq!(
+        escalation_comment_count(&tracker),
+        1,
+        "a real escalation comment must be posted via post_scm_comment_by_bead_id: {:?}",
+        tracker.calls.borrow()
+    );
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("PARKED_HUMAN_HELD") && log.contains("transient_spawn_retry_cap_exceeded"),
+        "park telemetry must record the transient_spawn_retry_cap_exceeded reason; got: {log}"
+    );
+    assert!(
+        log.contains("ESCALATION_REQUIRED"),
+        "cap escalation telemetry must be emitted; got: {log}"
+    );
+
+    // Tick 16: dedup check. `run_recovery_step` runs before `run_slow_tier`
+    // every tick and will find this bead again via
+    // `human_held_at_or_above_attempt` (its `attempt` is still 1, untouched
+    // by the spawn-retry counter, so it's actually BELOW
+    // MAX_HUMAN_HELD_RECOVERY_ATTEMPT and gets auto-recovered to QUEUED —
+    // then, in the very same tick, dispatch is retried and spawn fails
+    // again). Because `spawn_failure_count` was NOT reset by recovery, this
+    // must re-trip the cap and re-park immediately rather than granting a
+    // fresh 15-retry budget, and `escalation_already_recorded` must prevent
+    // a second escalation comment.
+    let summary_dedup = run_tick(&deps, 16, 0).expect("dedup tick should succeed");
+    assert_eq!(
+        summary_dedup.beads_escalated, 0,
+        "an already-escalated capped bead must not escalate again"
+    );
+    assert_eq!(
+        escalation_comment_count(&tracker),
+        1,
+        "dedup must prevent a second escalation comment on a later tick past the cap: {:?}",
+        tracker.calls.borrow()
+    );
+    let final_overlay = store.load(BEAD_ID).unwrap().unwrap();
+    assert_eq!(
+        final_overlay.state,
+        OverlayState::HumanHeld,
+        "a bead whose spawn is permanently broken must not be left cycling QUEUED<->DISPATCHING \
+         forever even across the automated HUMAN_HELD recovery step"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Real progress (a spawn that finally succeeds) must reset the counter to
+/// zero — a bead that flakes twice then recovers should not start its next
+/// unrelated flaky streak already halfway to the cap.
+#[test]
+fn spawn_failure_count_resets_after_a_successful_dispatch() {
+    const BEAD_ID: &str = "fake-bead-1";
+
+    let mut scm = FakeScm::new();
+    scm.issues.push(Issue {
+        number: 5150,
+        title: "Bead that flakes twice then spawns fine".into(),
+        body: "transient hiccup clears up".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#5150".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    sessions.fail_spawn_for(BEAD_ID);
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_spawn_retry_reset_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    for tick_index in 0..2u64 {
+        run_tick(&deps, tick_index, 0)
+            .unwrap_or_else(|e| panic!("tick {tick_index} should succeed: {e:?}"));
+    }
+    let flaky_overlay = store.load(BEAD_ID).unwrap().unwrap();
+    assert_eq!(flaky_overlay.state, OverlayState::Queued);
+    assert_eq!(flaky_overlay.spawn_failure_count, 2);
+
+    // The underlying transient condition clears — spawn now succeeds.
+    sessions.fail_spawn_for.borrow_mut().clear();
+    let summary = run_tick(&deps, 2, 0).expect("recovery tick should succeed");
+    assert_eq!(summary.beads_dispatched, 1);
+
+    let dispatched_overlay = store.load(BEAD_ID).unwrap().unwrap();
+    assert_eq!(dispatched_overlay.state, OverlayState::Dispatched);
+    assert_eq!(
+        dispatched_overlay.spawn_failure_count, 0,
+        "a confirmed successful dispatch must reset the transient-failure counter"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
 }

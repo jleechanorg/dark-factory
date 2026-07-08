@@ -44,7 +44,18 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- `SqliteStateStore::open` (same `pragma_table_info` guard pattern as
   -- `ensure_er_runner_columns`, since SQLite has no
   -- `ADD COLUMN IF NOT EXISTS`).
-  is_adopted INTEGER NOT NULL DEFAULT 0
+  is_adopted INTEGER NOT NULL DEFAULT 0,
+  -- Consecutive transient `Sessions::spawn` failures since the last
+  -- confirmed DISPATCHED (follow-up to #198 dispatch-batch-isolation): a
+  -- bead whose spawn deterministically fails never reaches DISPATCHED, so
+  -- it was invisible to the DISPATCHED/ATTESTED-scoped autonomy_secs +
+  -- wedge-detection net. Deliberately separate from `attempt` (which
+  -- already double-duties as the branch/re-roll suffix AND the
+  -- MAX_HUMAN_HELD_RECOVERY_ATTEMPT cap) so raw infra retries can't
+  -- corrupt either of those. Older DBs pre-date this column and get it via
+  -- the idempotent `ensure_spawn_failure_count_column` migration in
+  -- `SqliteStateStore::open` (same guard pattern as `ensure_is_adopted_column`).
+  spawn_failure_count INTEGER NOT NULL DEFAULT 0
 );
 
 -- Deletion guard: the daemon/skills may delete ONLY refs recorded here (spec §4.2.8).

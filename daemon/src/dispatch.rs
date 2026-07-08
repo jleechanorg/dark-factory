@@ -10,6 +10,20 @@ use crate::router::RoutingVerdict;
 use crate::state::{BeadOverlay, OverlayState, StateStore};
 use crate::tools::{Bead, Sessions, SpawnSpec};
 
+/// Bounded retry cap for transient `Sessions::spawn` failures (follow-up to
+/// #198's dispatch-batch-isolation fix). #198 fixed the batch-abort bug but
+/// left the requeue-on-transient-failure path uncapped: a bead whose spawn
+/// deterministically fails every time (e.g. the target project pinned at its
+/// AO session cap) cycles `Queued -> Dispatching -> transient failure ->
+/// Queued` forever with no attempt increment, no `autonomy_secs`
+/// accumulation (it never reaches `DISPATCHED`, so `query_active_overlays`'s
+/// `DISPATCHED`/`ATTESTED` scope never sees it), and no wedge-detection
+/// trigger — a livelock with zero telemetry signal. Mirrors
+/// `tick::MAX_HUMAN_HELD_RECOVERY_ATTEMPT`'s order of magnitude (10); set
+/// slightly higher because transient spawn hiccups are expected to be more
+/// frequent/short-lived than a full gate-rejection HUMAN_HELD cycle.
+pub(crate) const MAX_TRANSIENT_SPAWN_RETRY: u32 = 15;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchSuccess {
     pub bead_id: String,
@@ -117,6 +131,7 @@ pub fn dispatch_ready(
                 branch: None,
                 session_id: None,
                 is_adopted: false,
+                spawn_failure_count: 0,
             },
             Err(err) if err.is_transient() => {
                 report
@@ -186,8 +201,29 @@ pub fn dispatch_ready(
         let session_id = match sessions.spawn(&spec) {
             Ok(session_id) => session_id,
             Err(err) if err.is_transient() => {
-                overlay.state = OverlayState::Queued;
+                overlay.spawn_failure_count += 1;
                 overlay.session_id = None;
+                if overlay.spawn_failure_count > MAX_TRANSIENT_SPAWN_RETRY {
+                    // Cap exceeded: stop silently cycling Queued<->Dispatching
+                    // forever (the livelock this bead-follow-up closes — see
+                    // `MAX_TRANSIENT_SPAWN_RETRY`'s doc comment). Park
+                    // HUMAN_HELD instead of requeuing again; `tick::run_slow_tier`
+                    // recognizes the `"spawn_retry_cap_exceeded"` phase and
+                    // handles the escalation comment + telemetry (dispatch.rs
+                    // has no `Tracker`/`Scm` access by design — see the
+                    // module doc comment).
+                    overlay.state = OverlayState::HumanHeld;
+                    store.save(&overlay)?;
+                    report.failures.push(failure(
+                        bead,
+                        overlay.attempt,
+                        Some(branch.clone()),
+                        "spawn_retry_cap_exceeded",
+                        err,
+                    ));
+                    continue;
+                }
+                overlay.state = OverlayState::Queued;
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
@@ -237,6 +273,10 @@ pub fn dispatch_ready(
 
         overlay.state = OverlayState::Dispatched;
         overlay.session_id = Some(session_id.0.clone());
+        // Real progress: whatever was previously blocking spawn (session cap,
+        // transient tool error, ...) has cleared, so the retry-cap counter no
+        // longer needs to remember it.
+        overlay.spawn_failure_count = 0;
         if let Err(save_err) = store.save(&overlay) {
             // The worker process now exists but the daemon failed to
             // durably record it as DISPATCHED. Kill the just-spawned worker
@@ -682,6 +722,7 @@ mod tests {
                 branch: None,
                 session_id: None,
                 is_adopted: false,
+                spawn_failure_count: 0,
             })
             .unwrap();
         let cfg = cfg();
