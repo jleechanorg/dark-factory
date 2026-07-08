@@ -5,7 +5,7 @@ mod common;
 
 use common::{FakeScm, FakeTracker};
 use daemon::config::Config;
-use daemon::intake;
+use daemon::intake::{self, IntakeVerdict};
 use daemon::tools::{Bead, Issue, LabeledPr, Permission};
 
 fn test_cfg() -> Config {
@@ -59,9 +59,13 @@ fn new_issue_from_write_tier_collaborator_creates_one_bead() {
     let tracker = FakeTracker::new();
     let cfg = test_cfg();
 
-    let created = intake::normalize(&scm, &tracker, &cfg).unwrap();
+    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
 
     assert_eq!(created, vec!["fake-bead-1".to_string()]);
+    assert!(
+        outcomes.is_empty(),
+        "a clean single-candidate adopt should produce zero skip/error outcomes: {outcomes:?}"
+    );
 
     let calls = tracker.calls.borrow();
     let create_calls: Vec<_> = calls
@@ -95,12 +99,17 @@ fn already_known_external_ref_is_not_duplicated() {
 
     let cfg = test_cfg();
 
-    let created = intake::normalize(&scm, &tracker, &cfg).unwrap();
+    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
 
     assert!(
         created.is_empty(),
         "expected no new beads for an already-known external_ref, got: {created:?}"
     );
+    // jleechan-eazj: the skip must still be reported so telemetry can prove
+    // the daemon saw and evaluated the candidate.
+    assert_eq!(outcomes.len(), 1, "expected exactly one verdict: {outcomes:?}");
+    assert_eq!(outcomes[0].external_ref, "owner/repo#42");
+    assert_eq!(outcomes[0].verdict, IntakeVerdict::SkippedDuplicate);
 
     let calls = tracker.calls.borrow();
     let create_calls: Vec<_> = calls
@@ -126,11 +135,21 @@ fn read_tier_creator_is_skipped_without_create_bead() {
     let tracker = FakeTracker::new();
     let cfg = test_cfg();
 
-    let created = intake::normalize(&scm, &tracker, &cfg).unwrap();
+    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
 
     assert!(
         created.is_empty(),
         "read-tier creator must not produce a new bead, got: {created:?}"
+    );
+    // jleechan-eazj: "ineligible" verdict names the actual precondition that
+    // failed, not a generic message.
+    assert_eq!(outcomes.len(), 1, "expected exactly one verdict: {outcomes:?}");
+    assert_eq!(outcomes[0].external_ref, "owner/repo#7");
+    assert_eq!(
+        outcomes[0].verdict,
+        IntakeVerdict::SkippedIneligible {
+            precondition: "author_permission_below_write_tier:Read".to_string()
+        }
     );
 
     let calls = tracker.calls.borrow();
@@ -166,9 +185,26 @@ fn mixed_batch_only_creates_bead_for_new_write_tier_issue() {
 
     let cfg = test_cfg();
 
-    let created = intake::normalize(&scm, &tracker, &cfg).unwrap();
+    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
 
     assert_eq!(created, vec!["fake-bead-1".to_string()]);
+    // jleechan-eazj: the two non-adopted candidates in this batch (mallory's
+    // read-tier issue and alice's already-known issue 3) must each still
+    // produce exactly one verdict — a mixed batch is exactly the shape
+    // where a per-candidate abort used to silently swallow candidates after
+    // the first hiccup.
+    assert_eq!(outcomes.len(), 2, "expected 2 non-adopted verdicts: {outcomes:?}");
+    let by_ref = |r: &str| outcomes.iter().find(|o| o.external_ref == r);
+    assert_eq!(
+        by_ref("owner/repo#2").map(|o| &o.verdict),
+        Some(&IntakeVerdict::SkippedIneligible {
+            precondition: "author_permission_below_write_tier:Read".to_string()
+        })
+    );
+    assert_eq!(
+        by_ref("owner/repo#3").map(|o| &o.verdict),
+        Some(&IntakeVerdict::SkippedDuplicate)
+    );
 
     let calls = tracker.calls.borrow();
     let create_calls: Vec<_> = calls
@@ -201,12 +237,17 @@ fn create_bead_duplicate_error_is_recovered_as_already_known() {
 
     let cfg = test_cfg();
 
-    let created = intake::normalize(&scm, &tracker, &cfg).unwrap();
+    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
 
     assert!(
         created.is_empty(),
         "duplicate create_bead race must not be reported as newly created: {created:?}"
     );
+    // jleechan-eazj: a write-time-race recovery is still a SkippedDuplicate
+    // verdict, not silence.
+    assert_eq!(outcomes.len(), 1, "expected exactly one verdict: {outcomes:?}");
+    assert_eq!(outcomes[0].external_ref, "owner/repo#8227");
+    assert_eq!(outcomes[0].verdict, IntakeVerdict::SkippedDuplicate);
 
     let calls = tracker.calls.borrow();
     assert_eq!(
@@ -233,12 +274,15 @@ fn pr_create_bead_duplicate_error_is_recovered_as_already_adopted() {
 
     let cfg = test_cfg();
 
-    let adopted = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
 
     assert!(
         adopted.is_empty(),
         "duplicate create_bead race must not produce a fresh adoption: {adopted:?}"
     );
+    assert_eq!(outcomes.len(), 1, "expected exactly one verdict: {outcomes:?}");
+    assert_eq!(outcomes[0].external_ref, "owner/repo#8227");
+    assert_eq!(outcomes[0].verdict, IntakeVerdict::SkippedDuplicate);
     let calls = tracker.calls.borrow();
     assert_eq!(
         calls.iter().filter(|c| c.starts_with("create_bead(")).count(),
@@ -260,7 +304,7 @@ fn new_factory_pr_from_write_tier_collaborator_creates_existing_pr_intake() {
     let tracker = FakeTracker::new();
     let cfg = test_cfg();
 
-    let adopted = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
 
     assert_eq!(adopted.len(), 1);
     assert_eq!(adopted[0].bead_id, "fake-bead-1");
@@ -268,6 +312,10 @@ fn new_factory_pr_from_write_tier_collaborator_creates_existing_pr_intake() {
     assert_eq!(adopted[0].head_ref_name, "feature/existing-pr-51");
     assert_eq!(adopted[0].external_ref, "owner/repo#51");
     assert!(adopted[0].newly_created);
+    assert!(
+        outcomes.is_empty(),
+        "a clean adoption should produce zero skip/error outcomes: {outcomes:?}"
+    );
 
     let calls = tracker.calls.borrow();
     assert!(
@@ -295,11 +343,15 @@ fn factory_pr_with_existing_external_ref_reuses_bead() {
     });
     let cfg = test_cfg();
 
-    let adopted = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
 
     assert_eq!(adopted.len(), 1);
     assert_eq!(adopted[0].bead_id, "existing-pr-bead");
     assert!(!adopted[0].newly_created);
+    assert!(
+        outcomes.is_empty(),
+        "reusing an existing bead should produce zero skip/error outcomes: {outcomes:?}"
+    );
     let create_calls: Vec<_> = tracker
         .calls
         .borrow()
@@ -320,9 +372,17 @@ fn factory_pr_from_read_tier_creator_is_skipped() {
     let tracker = FakeTracker::new();
     let cfg = test_cfg();
 
-    let adopted = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
 
     assert!(adopted.is_empty());
+    assert_eq!(outcomes.len(), 1, "expected exactly one verdict: {outcomes:?}");
+    assert_eq!(outcomes[0].external_ref, "owner/repo#53");
+    assert_eq!(
+        outcomes[0].verdict,
+        IntakeVerdict::SkippedIneligible {
+            precondition: "author_permission_below_write_tier:Read".to_string()
+        }
+    );
     let create_calls: Vec<_> = tracker
         .calls
         .borrow()
@@ -346,9 +406,12 @@ fn fork_factory_pr_is_skipped_with_escalation_comment() {
     let tracker = FakeTracker::new();
     let cfg = test_cfg();
 
-    let adopted = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
 
     assert!(adopted.is_empty());
+    assert_eq!(outcomes.len(), 1, "expected exactly one verdict: {outcomes:?}");
+    assert_eq!(outcomes[0].external_ref, "owner/repo#54");
+    assert_eq!(outcomes[0].verdict, IntakeVerdict::SkippedFork);
     let calls = tracker.calls.borrow();
     assert!(
         calls.iter().all(|call| !call.starts_with("create_bead(")),

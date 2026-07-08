@@ -21,7 +21,7 @@
 use crate::config::Config;
 use crate::dispatch::{self, MAX_TRANSIENT_SPAWN_RETRY};
 use crate::errors::DaemonError;
-use crate::intake;
+use crate::intake::{self, IntakeOutcome, IntakeVerdict};
 use crate::router::{self, RoutingVerdict};
 use crate::state::{BeadOverlay, OverlayState, StateStore};
 use crate::telemetry::{self, TelemetryEvent};
@@ -165,6 +165,50 @@ fn emit(
             metrics,
             context,
         },
+    )
+}
+
+/// jleechan-eazj: emit exactly one structured verdict event for a
+/// non-adopted `intake::IntakeOutcome`. No bead exists yet for these
+/// candidates, so `bead_id` is the `external_ref` (e.g.
+/// `"owner/repo#8171"`) — the same identifier the operator greps for, so
+/// `grep 8171 daemon.jsonl` finds this line even though no bead was ever
+/// created. `ADOPTED` verdicts are NOT handled here: they already carry a
+/// real bead id and are reported by the caller via INTAKE_BEAD_CREATED /
+/// EXISTING_PR_ADOPTED, which predate this helper.
+fn emit_intake_outcome(telemetry_log: &Path, outcome: &IntakeOutcome) -> Result<(), DaemonError> {
+    let (event_type, context) = match &outcome.verdict {
+        IntakeVerdict::SkippedDuplicate => (
+            "SKIPPED_DUPLICATE",
+            serde_json::json!({"external_ref": outcome.external_ref}),
+        ),
+        IntakeVerdict::SkippedFork => (
+            "SKIPPED_FORK",
+            serde_json::json!({"external_ref": outcome.external_ref}),
+        ),
+        IntakeVerdict::SkippedIneligible { precondition } => (
+            "SKIPPED_INELIGIBLE",
+            serde_json::json!({
+                "external_ref": outcome.external_ref,
+                "precondition": precondition,
+            }),
+        ),
+        IntakeVerdict::Errored { reason } => (
+            "ERRORED",
+            serde_json::json!({
+                "external_ref": outcome.external_ref,
+                "reason": reason,
+            }),
+        ),
+    };
+    emit(
+        telemetry_log,
+        &outcome.external_ref,
+        1,
+        "INTAKE",
+        event_type,
+        serde_json::json!({}),
+        context,
     )
 }
 
@@ -614,7 +658,15 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // detection). The freshly-recovered QUEUED beads are picked up by the
     // routing_candidates loop below, so they get dispatched this same tick.
     let mut pr_intake_bead_ids = HashSet::new();
-    for adopted in intake::normalize_labeled_prs(deps.scm, deps.tracker, deps.cfg)? {
+    let (pr_adoptions, pr_skip_outcomes) =
+        intake::normalize_labeled_prs(deps.scm, deps.tracker, deps.cfg)?;
+    // jleechan-eazj: every factory-labeled PR that did NOT result in an
+    // adoption still gets exactly one verdict event here, unconditionally —
+    // before the adoption loop below runs any I/O of its own.
+    for outcome in &pr_skip_outcomes {
+        emit_intake_outcome(deps.telemetry_log, outcome)?;
+    }
+    for adopted in pr_adoptions {
         pr_intake_bead_ids.insert(adopted.bead_id.clone());
         if adopted.newly_created {
             summary.beads_created += 1;
@@ -701,7 +753,13 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         )?;
     }
 
-    let created = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
+    let (created, issue_skip_outcomes) = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
+    // jleechan-eazj: same unconditional per-candidate guarantee as the PR
+    // path above — every factory-labeled issue that did NOT result in a
+    // newly-created bead still gets exactly one verdict event.
+    for outcome in &issue_skip_outcomes {
+        emit_intake_outcome(deps.telemetry_log, outcome)?;
+    }
     let tracker_candidates = deps.tracker.fetch_candidates()?;
     let mut routing_candidates: Vec<Bead> = Vec::new();
     for bead_id in &created {
