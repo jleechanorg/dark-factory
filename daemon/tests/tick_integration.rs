@@ -6192,6 +6192,13 @@ impl Llm for IsoRerollLlm {
 #[test]
 fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() {
     let mut scm = FakeScm::new();
+    // jleechan-tfs1: script remote HEAD SHA for both adopted branches so
+    // `REROLL_ADOPTED_PRE_SESSION_SHA_CAPTURE` succeeds and the bead
+    // isn't parked HumanHeld on a missing-scripting error before the
+    // actual reroll logic runs.
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("alice/cq8r-bead-a-branch".into(), "base-a".into());
+    vcs.heads.insert("bob/cq8r-bead-b-branch".into(), "base-b".into());
     let mut snap_a = qdw_green_snapshot(
         801,
         vec![PrComment { author: "dark-factory-er".into(), body: "/er PASS".into() }],
@@ -6307,6 +6314,16 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
         "bead B's successful append-only re-roll dispatch must advance its attempt counter"
     );
 
+    // jleechan-bpb6: pre_session_head_sha capture (jleechan-tfs1) is a
+    // first-class contract of the new adopted-reroll flow; pin it here
+    // so a regression that drops the capture (or fails closed without
+    // setting the field) is caught by this test.
+    assert!(
+        bead_b.pre_session_head_sha.is_some(),
+        "bead B must record the pre-session HEAD SHA for post-hoc force-push detection (bead jleechan-tfs1); got {:?}",
+        bead_b.pre_session_head_sha
+    );
+
     // jleechan-tfs1 amendment (#209): execute_adopted no longer fabricates a
     // commit via Vcs::push_fix_commit — it dispatches a real coder session
     // via Sessions::spawn instead. This test predates that change.
@@ -6314,6 +6331,17 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
     assert!(
         session_calls.iter().any(|c| c == "spawn(cq8r-bead-b)"),
         "bead B's re-roll must actually dispatch a real coder session: {session_calls:?}"
+    );
+
+    // jleechan-bpb6: pin the Vcs::remote_head_sha call that feeds the
+    // pre_session_head_sha capture above; separates "capture happened"
+    // (bead state) from "capture was correct" (vcs invocation).
+    let vcs_calls = vcs.calls.borrow();
+    assert!(
+        vcs_calls
+            .iter()
+            .any(|c| c.starts_with("remote_head_sha(bob/cq8r-bead-b-branch")),
+        "bead B's re-roll must call Vcs::remote_head_sha for the pre-session HEAD SHA capture: {vcs_calls:?}"
     );
     assert!(
         session_calls.iter().all(|c| c != "spawn(cq8r-bead-a)"),
