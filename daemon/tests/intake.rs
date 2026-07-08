@@ -363,3 +363,77 @@ fn fork_factory_pr_is_skipped_with_escalation_comment() {
         "fork PR must receive an escalation comment: {calls:?}"
     );
 }
+
+/// jleechan-3wh0: external_ref lineage backfill regression coverage.
+///
+/// 15 of 18 pre-existing factory beads were discovered to carry no
+/// `external_ref`, so there's no queryable link back to the GitHub issue/PR
+/// that produced them. Root cause investigation (file:line-cited in the
+/// jleechan-3wh0 PR description) found that *every* in-process bead-creation
+/// call site — both `intake::normalize` (new-issue path) and
+/// `intake::normalize_labeled_prs` (existing-PR-adoption path) — has always
+/// required `external_ref: &str` as a mandatory, non-optional parameter on
+/// the `Tracker::create_bead` trait (see `daemon/src/tools.rs`); no caller in
+/// this codebase's history has ever been able to omit it. The orphans
+/// instead trace to `tick.rs`'s *separate* "manual bead adoption" path
+/// (tick.rs, `serde_json::json!({"manual": true})` marker), which does not
+/// call `create_bead` at all — it only initializes local `BeadOverlay`
+/// tracking state for a bead that was already created *outside* the daemon
+/// (an operator/agent running `br create` directly). See
+/// `tick_integration.rs::manual_bead_adoption_never_calls_create_bead_or_fabricates_external_ref`
+/// for that path's coverage.
+///
+/// This test is the generic regression guard: run a batch through BOTH
+/// creation paths simultaneously and assert every single `create_bead` call
+/// recorded in the tracker's call log — regardless of which path produced
+/// it — carries a non-empty `owner/repo#<number>`-shaped `external_ref`. A
+/// future change that adds a new bead-creation path, or that weakens either
+/// existing path to allow an empty/placeholder ref, will fail this test.
+#[test]
+fn every_create_bead_call_across_both_intake_paths_carries_nonempty_external_ref() {
+    let mut scm = FakeScm::new();
+    scm.issues.push(issue(101, "alice"));
+    scm.issues.push(issue(102, "alice"));
+    scm.prs.push(labeled_pr(201, "alice", "feature/pr-201"));
+    scm.prs.push(labeled_pr(202, "alice", "feature/pr-202"));
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+
+    let created_issues = intake::normalize(&scm, &tracker, &cfg).unwrap();
+    let adopted_prs = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+
+    assert_eq!(created_issues.len(), 2, "expected both new issues to create beads");
+    assert_eq!(adopted_prs.len(), 2, "expected both new PRs to be adopted");
+
+    let calls = tracker.calls.borrow();
+    let create_calls: Vec<&String> =
+        calls.iter().filter(|c| c.starts_with("create_bead(")).collect();
+    assert_eq!(
+        create_calls.len(),
+        4,
+        "expected exactly 4 create_bead calls (2 issue + 2 PR), got: {create_calls:?}"
+    );
+
+    for call in &create_calls {
+        // Call log shape is `create_bead(<title>,<body>,<external_ref>)`.
+        let inner = call
+            .strip_prefix("create_bead(")
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("unexpected create_bead call shape: {call}"));
+        let external_ref = inner
+            .rsplit(',')
+            .next()
+            .unwrap_or_else(|| panic!("create_bead call missing external_ref segment: {call}"));
+        assert!(
+            !external_ref.trim().is_empty(),
+            "create_bead call carried an empty external_ref — this is exactly the jleechan-3wh0 \
+             orphan-bead defect shape: {call}"
+        );
+        assert!(
+            external_ref.contains('#'),
+            "external_ref should be shaped owner/repo#<number>, got '{external_ref}' from call: {call}"
+        );
+    }
+}
