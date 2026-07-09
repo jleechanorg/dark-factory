@@ -694,6 +694,7 @@ pub fn run_tick(
             "beadsParkedHumanHeld": summary.beads_parked_human_held,
             "beadsRecoveredFromHeld": summary.beads_recovered_from_held,
             "beadsEscalated": summary.beads_escalated,
+            "beadsEscalatedLocally": summary.beads_escalated_locally,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
@@ -740,6 +741,30 @@ fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), D
             overlay.bead_id, overlay.attempt, MAX_HUMAN_HELD_RECOVERY_ATTEMPT
         );
         if let Err(err) = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body) {
+            if is_missing_scm_target_error(&err) {
+                record_local_escalation_fallback(
+                    deps,
+                    &overlay.bead_id,
+                    "human_held_recovery_attempt_cap_reached",
+                )?;
+                summary.beads_escalated_locally += 1;
+                emit(
+                    deps.telemetry_log,
+                    &overlay.bead_id,
+                    overlay.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "ESCALATED_LOCALLY",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "human_held_recovery_attempt_cap_reached",
+                        "max_attempt": MAX_HUMAN_HELD_RECOVERY_ATTEMPT,
+                        "pr_number": overlay.pr_number,
+                        "branch": overlay.branch,
+                        "scm_error": err.to_string(),
+                    }),
+                )?;
+                continue;
+            }
             emit(
                 deps.telemetry_log,
                 &overlay.bead_id,
@@ -1113,6 +1138,29 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 );
                 if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
                 {
+                    if is_missing_scm_target_error(&err) {
+                        record_local_escalation_fallback(
+                            deps,
+                            &failure.bead_id,
+                            "transient_spawn_retry_cap_exceeded",
+                        )?;
+                        summary.beads_escalated_locally += 1;
+                        emit(
+                            deps.telemetry_log,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "ESCALATED_LOCALLY",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "transient_spawn_retry_cap_exceeded",
+                                "max_transient_spawn_retry": MAX_TRANSIENT_SPAWN_RETRY,
+                                "branch": failure.branch.as_deref(),
+                                "scm_error": err.to_string(),
+                            }),
+                        )?;
+                        continue;
+                    }
                     emit(
                         deps.telemetry_log,
                         &failure.bead_id,
@@ -1901,6 +1949,41 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         count, bead_id
                     );
                     if let Err(err) = post_scm_comment_by_bead_id(deps, bead_id, &comment_body) {
+                        if is_missing_scm_target_error(&err) {
+                            // Unlike the other two cap-escalation sites, this
+                            // bead has NOT been parked HUMAN_HELD yet (that
+                            // only happens after a successful SCM comment
+                            // below) — mirror that state transition here so
+                            // the local-fallback path is equally terminal
+                            // instead of leaving the bead ATTESTED to churn
+                            // through the same Unknown-only gate report
+                            // forever.
+                            overlay.state = OverlayState::HumanHeld;
+                            overlay.attempt = MAX_HUMAN_HELD_RECOVERY_ATTEMPT;
+                            deps.store.save(&overlay)?;
+                            record_local_escalation_fallback(
+                                deps,
+                                bead_id,
+                                "unknown_only_gate_report_with_er_runner_capped",
+                            )?;
+                            summary.beads_escalated_locally += 1;
+                            summary.beads_parked_human_held += 1;
+                            emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::HumanHeld.as_str(),
+                                "ESCALATED_LOCALLY",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "reason": "unknown_only_gate_report_with_er_runner_capped",
+                                    "er_runner_attempts": count,
+                                    "pr_number": pr,
+                                    "scm_error": err.to_string(),
+                                }),
+                            )?;
+                            continue;
+                        }
                         emit(
                             deps.telemetry_log,
                             bead_id,
@@ -2162,6 +2245,64 @@ fn record_escalation(deps: &TickDeps, bead_id: &str, reason: &str) -> Result<(),
         reason,
         reason,
     )
+}
+
+/// Substring unique to the `Err` `post_scm_comment_by_bead_id` returns when
+/// it could not find ANY SCM comment target — i.e. the bead has no
+/// `overlay.pr_number` and is absent (or has no `external_ref`) from
+/// `fetch_candidates()`. Kept in sync with the message literal in
+/// `post_scm_comment_by_bead_id` below.
+const MISSING_SCM_TARGET_ERROR_MARKER: &str = "no SCM comment target found";
+
+/// Distinguishes a permanently-missing SCM comment target from a transient
+/// tracker/API failure (network error, rate limit, etc). Transient failures
+/// come back as whatever error variant the underlying `Tracker` call
+/// produces (typically `DaemonError::Tool`) and MUST keep retrying every
+/// tick — see `capped_human_held_comment_failure_retries_before_recording_escalation`
+/// and `capped_human_held_candidate_lookup_failure_retries_before_recording_escalation`
+/// in `tests/tick_integration.rs`. A missing target is deterministic: no
+/// `pr_number` and no matching `fetch_candidates()` row will NEVER resolve
+/// on its own, so retrying it forever is pure waste (2026-07-09 live
+/// incident: 45 beads stuck in exactly this state with zero durable trace).
+fn is_missing_scm_target_error(err: &DaemonError) -> bool {
+    matches!(err, DaemonError::Config(msg) if msg.contains(MISSING_SCM_TARGET_ERROR_MARKER))
+}
+
+/// Local park_reason marker prefix written on `bead_overlay` when
+/// `post_scm_comment_by_bead_id` permanently has no target (see
+/// `is_missing_scm_target_error`). Distinguishable from the circuit-breaker
+/// prefix (`park_reason LIKE 'circuit-breaker%'`, which `recover_human_held`
+/// excludes from requeue) so this marker is never mistaken for that guard —
+/// beads reaching this path are already at/above
+/// `MAX_HUMAN_HELD_RECOVERY_ATTEMPT` and therefore already excluded from
+/// requeue by attempt count regardless of `park_reason`.
+const ESCALATION_LOCAL_FALLBACK_PARK_REASON_PREFIX: &str = "escalation_local_fallback";
+
+/// Fallback for the HUMAN_HELD recovery-cap escalation idiom (used by
+/// `run_recovery_step`, the dispatch spawn-retry-cap path, and the
+/// unknown-only-gate-report cap path) when `post_scm_comment_by_bead_id`
+/// fails with `is_missing_scm_target_error`. Because no SCM comment will
+/// ever be postable for this bead, this persists a durable, human-visible
+/// escalation marker directly on the bead's own `bead_overlay` row
+/// (`park_reason`) AND records the same `review_rejection` escalation
+/// sentinel `record_escalation` writes on the success path, so
+/// `escalation_already_recorded` suppresses further attempts on later
+/// ticks — turning "silently lost forever" into "durably visible, once."
+/// Does not touch `overlay.state`/`attempt` (only common-case caller
+/// behavior does that); if the overlay row is somehow gone by the time this
+/// runs, this degrades to just recording the sentinel.
+fn record_local_escalation_fallback(
+    deps: &TickDeps,
+    bead_id: &str,
+    reason: &str,
+) -> Result<(), DaemonError> {
+    if let Some(mut overlay) = deps.store.load(bead_id)? {
+        overlay.park_reason = Some(format!(
+            "{ESCALATION_LOCAL_FALLBACK_PARK_REASON_PREFIX}:{reason}"
+        ));
+        deps.store.save(&overlay)?;
+    }
+    record_escalation(deps, bead_id, reason)
 }
 
 fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
