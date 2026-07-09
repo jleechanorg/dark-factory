@@ -2321,3 +2321,413 @@ exit 1
         assert_eq!(snapshot.ci_status, "unknown");
     }
 }
+
+/// Regression + correctness tests for jleechan-9sl1: `CliVcs::remote_head_sha`
+/// and `CliVcs::is_ancestor` used to shell out to the *local* `git` binary
+/// (`git fetch origin <branch>` / `git merge-base --is-ancestor`), which only
+/// ever operates against the DAEMON's own cwd/repo (its systemd
+/// `WorkingDirectory`) -- never against `cfg.target_repo`, a completely
+/// different repo the daemon automates. That bug made stage-2 adopted-PR
+/// remediation 100% non-functional for any real target repo: `reroll.rs`'s
+/// `execute_adopted`-style path calls `remote_head_sha` to capture a
+/// pre-session baseline SHA before dispatching a coder session (fails every
+/// time), and `tick.rs`'s force-push-detection sweep calls both methods on
+/// every tick for every `Dispatched` adopted bead and is explicitly
+/// fail-closed, so even a lucky dispatch would get falsely flagged as a
+/// history rewrite on the very next tick.
+///
+/// These tests inject a fake `gh` binary on PATH (same technique as
+/// `pr_snapshot_checks_fetch_failure_tests` above) that answers
+/// `gh api repos/<repo>/commits/<branch> --jq .sha` and
+/// `gh api repos/<repo>/compare/<a>...<b> --jq .status` calls, and logs every
+/// invocation's argv to a file so tests can assert on the EXACT URL
+/// `CliVcs` constructed -- proving both that it targets the configured
+/// `target_repo` (not the daemon's own repo) and that a branch name
+/// containing a `/` (e.g. `fix/7887-cc-finish-level-commit`, a real branch
+/// name from the jleechan-93ft incident) survives intact rather than being
+/// mangled by naive string splitting. Written BEFORE the `gh api`
+/// reimplementation landed: at that point these tests failed because the old
+/// code shelled out to local `git` (which never even invokes the fake `gh`
+/// shim, and fails outright since no local git object/remote-tracking ref
+/// for these synthetic branches/SHAs exists in this repo).
+#[cfg(test)]
+mod cli_vcs_gh_tests {
+    use super::CliVcs;
+    use crate::tools::Vcs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    fn env_lock() -> &'static Mutex<()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Write a `gh` shim that answers `gh api <path> --jq <filter>` calls for
+    /// the "commits" (`remote_head_sha`) and "compare" (`is_ancestor`)
+    /// endpoints, scoped to `$GH_TEST_TARGET_REPO` (any other repo path is
+    /// treated as an unknown/404 repo, mirroring a real `gh api` 404 for a
+    /// repo the caller isn't authorized against or that doesn't exist), and
+    /// appends every invocation's argv (one arg per line, `---` separator
+    /// between calls) to `$GH_TEST_ARGV_LOG` when set.
+    fn write_fake_gh_vcs(path: &std::path::Path) {
+        let script = r#"#!/usr/bin/env bash
+set -u
+if [ -n "${GH_TEST_ARGV_LOG:-}" ]; then
+  for a in "$@"; do printf '%s\n' "$a" >> "$GH_TEST_ARGV_LOG"; done
+  printf -- '---\n' >> "$GH_TEST_ARGV_LOG"
+fi
+
+if [ "${1:-}" != "api" ]; then
+  echo "cli_vcs_gh_tests fake gh: unhandled invocation: $*" >&2
+  exit 1
+fi
+shift
+
+url_path=""
+jq_filter=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --jq)
+      jq_filter="$2"
+      shift 2
+      ;;
+    -*)
+      shift
+      ;;
+    *)
+      url_path="$1"
+      shift
+      ;;
+  esac
+done
+
+repo="${GH_TEST_TARGET_REPO:-}"
+case "$url_path" in
+  "repos/${repo}/commits/"*)
+    if [ "$jq_filter" = ".sha" ]; then
+      echo "${GH_TEST_SHA:-}"
+      exit 0
+    fi
+    ;;
+  "repos/${repo}/compare/"*)
+    if [ "$jq_filter" = ".status" ]; then
+      echo "${GH_TEST_STATUS:-}"
+      exit 0
+    fi
+    ;;
+esac
+echo "cli_vcs_gh_tests fake gh: unhandled or repo-mismatched path: $url_path" >&2
+exit 1
+"#;
+        std::fs::write(path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn make_fake_gh_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "afd_cli_vcs_gh_{prefix}_{}_{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        write_fake_gh_vcs(&dir.join("bin").join("gh"));
+        dir
+    }
+
+    /// Prepend `dir/bin` to PATH, set the `GH_TEST_*` env knobs, run `f`,
+    /// then restore PATH/env regardless of outcome. `argv_log` (if `Some`) is
+    /// where the shim will append every call's argv. Serialized by
+    /// `ENV_LOCK` since `cargo test` runs tests in this module in parallel
+    /// within one process and PATH/env are process-global.
+    fn with_fake_gh<T>(
+        prefix: &str,
+        target_repo_env: &str,
+        sha_env: &str,
+        status_env: &str,
+        argv_log: Option<&std::path::Path>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = make_fake_gh_dir(prefix);
+        let bin = dir.join("bin");
+
+        let prior_path = std::env::var_os("PATH");
+        let mut new_path = std::ffi::OsString::from(bin.to_str().unwrap());
+        if let Some(prior) = prior_path.as_ref() {
+            new_path.push(":");
+            new_path.push(prior);
+        }
+        let prior_repo = std::env::var_os("GH_TEST_TARGET_REPO");
+        let prior_sha = std::env::var_os("GH_TEST_SHA");
+        let prior_status = std::env::var_os("GH_TEST_STATUS");
+        let prior_log = std::env::var_os("GH_TEST_ARGV_LOG");
+        // SAFETY: serialized by ENV_LOCK above, matching the established
+        // `pr_snapshot_checks_fetch_failure_tests` pattern for mutating
+        // process env vars in tests.
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+            std::env::set_var("GH_TEST_TARGET_REPO", target_repo_env);
+            std::env::set_var("GH_TEST_SHA", sha_env);
+            std::env::set_var("GH_TEST_STATUS", status_env);
+            if let Some(log) = argv_log {
+                std::env::set_var("GH_TEST_ARGV_LOG", log);
+            } else {
+                std::env::remove_var("GH_TEST_ARGV_LOG");
+            }
+        }
+
+        let result = f();
+
+        unsafe {
+            match prior_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+            match prior_repo {
+                Some(p) => std::env::set_var("GH_TEST_TARGET_REPO", p),
+                None => std::env::remove_var("GH_TEST_TARGET_REPO"),
+            }
+            match prior_sha {
+                Some(p) => std::env::set_var("GH_TEST_SHA", p),
+                None => std::env::remove_var("GH_TEST_SHA"),
+            }
+            match prior_status {
+                Some(p) => std::env::set_var("GH_TEST_STATUS", p),
+                None => std::env::remove_var("GH_TEST_STATUS"),
+            }
+            match prior_log {
+                Some(p) => std::env::set_var("GH_TEST_ARGV_LOG", p),
+                None => std::env::remove_var("GH_TEST_ARGV_LOG"),
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+        result
+    }
+
+    /// `remote_head_sha` must call `gh api repos/<target_repo>/commits/<branch>
+    /// --jq .sha` -- scoped to the CONFIGURED target repo, not the daemon's
+    /// own repo -- and the branch's embedded `/` (a real branch name shape,
+    /// e.g. `fix/7887-cc-finish-level-commit` from jleechan-93ft) must
+    /// survive intact in the constructed URL rather than being mangled by
+    /// naive string splitting.
+    #[test]
+    #[cfg(unix)]
+    fn remote_head_sha_targets_configured_repo_and_preserves_branch_slash() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let log_dir = std::env::temp_dir().join(format!(
+            "afd_cli_vcs_argvlog_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let log_path = log_dir.join("argv.log");
+
+        let expected_sha = "deadbeefcafefeed0123456789abcdef01234567";
+        let branch = "fix/7887-cc-finish-level-commit";
+
+        let result = with_fake_gh(
+            "remote_head_sha_slash",
+            "some-owner/some-repo",
+            expected_sha,
+            "",
+            Some(&log_path),
+            || {
+                let vcs = CliVcs::new("some-owner/some-repo".to_string());
+                vcs.remote_head_sha(branch)
+            },
+        );
+
+        assert_eq!(
+            result.expect("remote_head_sha should succeed against the matching target_repo"),
+            expected_sha
+        );
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.contains("repos/some-owner/some-repo/commits/fix/7887-cc-finish-level-commit"),
+            "expected the exact target_repo+branch URL (with the branch's \
+             embedded slash intact) in the logged gh invocation, got:\n{log}"
+        );
+        assert!(
+            log.contains(".sha"),
+            "expected --jq .sha in the logged gh invocation, got:\n{log}"
+        );
+
+        std::fs::remove_dir_all(&log_dir).ok();
+    }
+
+    /// Companion to the above: the SAME fake `gh` shim only answers for
+    /// `some-owner/some-repo`; constructing `CliVcs` against a DIFFERENT
+    /// repo must fail, proving `remote_head_sha` is actually scoped to
+    /// `self.target_repo` rather than the shim just always answering
+    /// regardless of the URL it was asked for.
+    #[test]
+    #[cfg(unix)]
+    fn remote_head_sha_wrong_target_repo_returns_err() {
+        let result = with_fake_gh(
+            "remote_head_sha_wrong_repo",
+            "some-owner/some-repo",
+            "deadbeefcafefeed0123456789abcdef01234567",
+            "",
+            None,
+            || {
+                let vcs = CliVcs::new("wrong-owner/wrong-repo".to_string());
+                vcs.remote_head_sha("main")
+            },
+        );
+        assert!(
+            result.is_err(),
+            "remote_head_sha against a repo the fake gh doesn't recognize \
+             must fail, not silently succeed: {result:?}"
+        );
+    }
+
+    /// `--jq .sha` prints the literal string `null` (exit 0) when the JSON
+    /// path doesn't resolve (e.g. a genuinely malformed/empty API response)
+    /// -- this must be treated as an error, not returned as a bogus SHA.
+    #[test]
+    #[cfg(unix)]
+    fn remote_head_sha_null_output_is_err() {
+        let result = with_fake_gh(
+            "remote_head_sha_null",
+            "some-owner/some-repo",
+            "null",
+            "",
+            None,
+            || {
+                let vcs = CliVcs::new("some-owner/some-repo".to_string());
+                vcs.remote_head_sha("main")
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a literal 'null' --jq .sha output must not be treated as a \
+             valid SHA: {result:?}"
+        );
+    }
+
+    /// `is_ancestor` status-mapping matrix (compare API status is relative to
+    /// `base...head` = `ancestor_sha...descendant_sha`):
+    /// `identical`/`ahead` -> true (ancestor_sha's history is fully contained
+    /// in descendant_sha's), `behind`/`diverged` -> false.
+    #[test]
+    #[cfg(unix)]
+    fn is_ancestor_status_mapping_matrix() {
+        let cases = [
+            ("identical", true),
+            ("ahead", true),
+            ("behind", false),
+            ("diverged", false),
+        ];
+        for (status, expected) in cases {
+            let result = with_fake_gh(
+                &format!("is_ancestor_{status}"),
+                "some-owner/some-repo",
+                "",
+                status,
+                None,
+                || {
+                    let vcs = CliVcs::new("some-owner/some-repo".to_string());
+                    vcs.is_ancestor(
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    )
+                },
+            );
+            assert_eq!(
+                result.unwrap_or_else(|e| panic!(
+                    "is_ancestor should succeed for status '{status}': {e:?}"
+                )),
+                expected,
+                "status '{status}' mapped to the wrong boolean"
+            );
+        }
+    }
+
+    /// An unrecognized/garbage compare status must propagate as `Err`, not
+    /// be silently folded into `Ok(false)` -- callers rely on `Err` vs
+    /// `Ok(false)` staying distinct internally even though both are treated
+    /// the same way (fail-closed / escalate-to-human) by the force-push-
+    /// detection caller in `tick.rs`.
+    #[test]
+    #[cfg(unix)]
+    fn is_ancestor_unrecognized_status_is_err() {
+        let result = with_fake_gh(
+            "is_ancestor_garbage",
+            "some-owner/some-repo",
+            "",
+            "???",
+            None,
+            || {
+                let vcs = CliVcs::new("some-owner/some-repo".to_string());
+                vcs.is_ancestor(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                )
+            },
+        );
+        assert!(
+            result.is_err(),
+            "an unrecognized compare status must not silently become \
+             Ok(false): {result:?}"
+        );
+    }
+
+    /// `ancestor_sha == descendant_sha` must short-circuit to `Ok(true)`
+    /// WITHOUT ever invoking `gh` -- proven here by removing `gh` (and every
+    /// other binary) from PATH entirely, so any accidental subprocess call
+    /// would fail with "No such file or directory" and this test would fail
+    /// closed instead of coincidentally passing.
+    #[test]
+    #[cfg(unix)]
+    fn is_ancestor_identical_sha_short_circuits_without_gh_call() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let empty_dir = std::env::temp_dir().join(format!(
+            "afd_cli_vcs_no_gh_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&empty_dir).unwrap();
+
+        let prior_path = std::env::var_os("PATH");
+        // PATH containing ONLY an empty directory -- no `gh`, no `git`,
+        // nothing. Any subprocess call this code path makes will fail.
+        unsafe {
+            std::env::set_var("PATH", &empty_dir);
+        }
+
+        let sha = "cccccccccccccccccccccccccccccccccccccccc";
+        let vcs = CliVcs::new("some-owner/some-repo".to_string());
+        let result = vcs.is_ancestor(sha, sha);
+
+        unsafe {
+            match prior_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        std::fs::remove_dir_all(&empty_dir).ok();
+
+        assert!(
+            result.unwrap_or_else(|e| panic!(
+                "identical-SHA short-circuit must succeed even with no gh on PATH: {e:?}"
+            )),
+            "ancestor_sha == descendant_sha must short-circuit to Ok(true)"
+        );
+    }
+}
