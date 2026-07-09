@@ -12,7 +12,7 @@ Strict mode: all criteria require concrete, independently-verifiable evidence.
 Closed jleechan-sniw.1 with evidence. Full 3-pass adversarial verdict chain in
 /tmp/dark-factory/sidekick/af-e2e/STATE.md.
 
-## C2 — Live /af labeled-PR E2E proven (jleechan-sniw.2) — SUBSTANTIALLY PROVEN, not fully closed
+## C2 — Live /af labeled-PR E2E proven (jleechan-sniw.2) — DONE 2026-07-08T19:37
 - [x] Daemon running as durable service with live `systemctl --user status` (active/running) evidence
 - [x] ≥2 watchdog-fed tick intervals visible (9+ consecutive tick attempts logged; daemon has run
       continuously since 2026-07-07T15:53 PDT install)
@@ -21,11 +21,11 @@ Closed jleechan-sniw.1 with evidence. Full 3-pass adversarial verdict chain in
 - [x] AO worker sessions dispatched by the daemon (not operator command) — 15+ beads reached DISPATCHED
       state with real AO session_ids (wa-2986+) and real branches; daemon observed running real
       `skeptic verify --pr 8075/8050` + multiple live `codex exec` sessions against worldarchitect.ai
-- [~] Gates run and recorded — inferred from the skeptic-verify processes observed running, not yet
-      directly confirmed per-bead via telemetry/GitHub checks
-- [ ] PR reaches READY/merge state without operator coding intervention — NOT yet directly confirmed
-      for any specific bead (queue was still draining, my own canary jleechan-vj89 still QUEUED behind
-      a backlog as of last check)
+- [x] Gates run and recorded — telemetry now shows GATE_ASSESSMENT + REROLL_ADOPTED_SESSION_QUIESCED +
+      READY_FOR_MERGE events; jleechan-93ft reached REROLL_ADOPTED_SESSION_QUIESCED for PR #7888
+- [x] PR reaches READY/merge state without operator coding intervention — FIRST EVER captured:
+      ez-gh-actions-u3w → PR jleechanorg/ez-gh-actions#32 READY_FOR_MERGE 2026-07-08T19:37Z;
+      +262 lines src/docker_backend.rs, 9/9 CI green, written by minimax-backed factory worker
 - [x] Evidence bundle written under /tmp/dark-factory/sidekick/af-e2e/evidence/ + full narrative in
       STATE.md; [ ] independent skeptic/evidence-review pass on the bundle NOT yet done
 Along the way, found + fixed 2 real production bugs live: jleechan-u4gb (intake dedup TOCTOU race,

@@ -7,10 +7,9 @@
 //
 //   1. `circuit_breaker_fuzz_corpus` — every case calls the real
 //      `reroll::execute()` (src/reroll.rs) with scripted-but-real
-//      `StateStore`/`Sessions`/`Vcs`/`Scm` fakes from `tests/common`, so the
-//      circuit-breaker hash comparison at reroll.rs:101-140 runs unmodified.
-//      No LLM call is needed for this half — the breaker hashes raw
-//      `review_text` *before* `constraints::extract` is ever invoked.
+//      `StateStore`/`Sessions`/`Vcs`/`Scm` fakes from `tests/common`, plus a
+//      scripted circuit-breaker LLM that returns each corpus case's
+//      pre-labeled semantic ground truth for the comparator prompt.
 //
 //   2. `holdout_leak_fuzz_real_llm` — calls the real `constraints::extract`
 //      (src/constraints.rs:74) with the real `ChainLlm` adapter (subprocess
@@ -22,18 +21,17 @@
 //      token cost) — run explicitly:
 //        cargo test --test constraint_fuzz -- --ignored --nocapture
 //
-// This file is intentionally NOT a pass/fail CI gate (no panicking asserts
-// on the interesting axis) — it's an evidence-generation script. Verdict
-// interpretation happens in the accompanying session report, per the
-// "gate self-certification anti-pattern" guardrail (a check whose expected
-// value comes from its own template can't fail).
+// The deterministic circuit-breaker corpus is a pass/fail CI gate. The
+// `#[ignore]` real-LLM corpora remain evidence-generation scripts because
+// model judgment can have occasional noise.
 
 mod common;
 
-use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeVcs};
+use common::{FakeScm, FakeSessions, FakeStateStore, FakeVcs};
 use daemon::adapters::ChainLlm;
 use daemon::config::Config;
 use daemon::constraints;
+use daemon::errors::DaemonError;
 use daemon::reroll::{self, RerollDeps, RerollOutcome};
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tools::Llm;
@@ -68,10 +66,9 @@ fn feedback_hash(text: &str) -> String {
 
 /// One circuit-breaker corpus case: attempt N-1 was rejected by
 /// `reviewer_a` citing `text_a`; attempt N is rejected by `reviewer_b`
-/// citing `text_b`. `expect_impl_fire` is what the CURRENT byte-exact-hash
-/// implementation will do; `expect_spec_fire` is what spec §4.2.6's
-/// "same semantic rejection reason" language implies SHOULD happen. When
-/// they diverge, that divergence IS the finding.
+/// citing `text_b`. `expect_impl_fire` is what the implementation should do
+/// after applying spec §4.2.6's "same semantic rejection reason" language;
+/// `expect_spec_fire` is the independently assigned semantic ground truth.
 struct CbCase {
     id: &'static str,
     group: &'static str,
@@ -161,27 +158,27 @@ fn cb_corpus() -> Vec<CbCase> {
         // the task brief). Spec's "semantic rejection reason" language
         // implies these SHOULD fire; the byte-exact hash implementation
         // will NOT. (6 pairs / 12 comments)
-        CbCase { id: "C1", group: "near-miss-paraphrase", reviewer_a: "coderabbit", expect_impl_fire: false, expect_spec_fire: true,
+        CbCase { id: "C1", group: "near-miss-paraphrase", reviewer_a: "coderabbit", expect_impl_fire: true, expect_spec_fire: true,
             text_a: "CI is red: `cargo test --test reroll_integration` fails on `test_circuit_breaker` — the HUMAN_HELD transition never happens.",
             reviewer_b: "coderabbit",
             text_b: "The reroll_integration suite is still failing on the circuit-breaker test — the bead isn't reaching HUMAN_HELD like it should. Please re-check this before the next review pass." },
-        CbCase { id: "C2", group: "near-miss-paraphrase", reviewer_a: "skeptic", expect_impl_fire: false, expect_spec_fire: true,
+        CbCase { id: "C2", group: "near-miss-paraphrase", reviewer_a: "skeptic", expect_impl_fire: true, expect_spec_fire: true,
             text_a: "The quiescence wait loop busy-polls at 500ms with no upper bound on CPU wakeups; please back off exponentially.",
             reviewer_b: "skeptic",
             text_b: "Same concern as before — the polling interval in the quiescence wait is fixed at 500ms and never backs off, so it'll burn CPU under sustained load. Needs exponential backoff." },
-        CbCase { id: "C3", group: "near-miss-paraphrase", reviewer_a: "verifier", expect_impl_fire: false, expect_spec_fire: true,
+        CbCase { id: "C3", group: "near-miss-paraphrase", reviewer_a: "verifier", expect_impl_fire: true, expect_spec_fire: true,
             text_a: "Merge conflict against main in daemon/src/state.rs — please rebase before requesting another review.",
             reviewer_b: "verifier",
             text_b: "This branch still hasn't been rebased onto main; state.rs conflicts. Can't proceed with review until that's resolved." },
-        CbCase { id: "C4", group: "near-miss-paraphrase", reviewer_a: "coderabbit", expect_impl_fire: false, expect_spec_fire: true,
+        CbCase { id: "C4", group: "near-miss-paraphrase", reviewer_a: "coderabbit", expect_impl_fire: true, expect_spec_fire: true,
             text_a: "The new `spawn_failure_count` field is never reset on a successful dispatch, so one transient blip permanently inflates it across the bead's whole lifetime.",
             reviewer_b: "coderabbit",
             text_b: "spawn_failure_count still isn't cleared when a dispatch eventually succeeds — a single flaky spawn keeps counting against the bead forever. This is the same gap flagged last round." },
-        CbCase { id: "C5", group: "near-miss-paraphrase", reviewer_a: "skeptic", expect_impl_fire: false, expect_spec_fire: true,
+        CbCase { id: "C5", group: "near-miss-paraphrase", reviewer_a: "skeptic", expect_impl_fire: true, expect_spec_fire: true,
             text_a: "Test `test_reroll_success` doesn't assert on the branch registry call log — a regression here would go undetected.",
             reviewer_b: "skeptic",
             text_b: "test_reroll_success is missing an assertion on the branch registry calls; without it a future regression in register_branch slips through silently." },
-        CbCase { id: "C6", group: "near-miss-paraphrase", reviewer_a: "verifier", expect_impl_fire: false, expect_spec_fire: true,
+        CbCase { id: "C6", group: "near-miss-paraphrase", reviewer_a: "verifier", expect_impl_fire: true, expect_spec_fire: true,
             text_a: "bugbot: this PR still leaves `Cargo.lock` out of sync with `Cargo.toml` — commit the regenerated lockfile.",
             reviewer_b: "verifier",
             text_b: "Cargo.lock is out of date relative to Cargo.toml on this branch again — please regenerate and commit it." },
@@ -208,51 +205,71 @@ fn cb_corpus() -> Vec<CbCase> {
         // ---- Group E: whitespace-only diff, same reviewer/reason. Second
         // adversarial pass — trying to break the corpus with the smallest
         // possible textual delta that's still "different bytes". (2 pairs)
-        CbCase { id: "E1", group: "whitespace-only-diff", reviewer_a: "coderabbit", expect_impl_fire: false, expect_spec_fire: true,
+        CbCase { id: "E1", group: "whitespace-only-diff", reviewer_a: "coderabbit", expect_impl_fire: true, expect_spec_fire: true,
             text_a: "CI is red: `cargo test --test reroll_integration` fails on `test_circuit_breaker` — the HUMAN_HELD transition never happens.",
             reviewer_b: "coderabbit",
             text_b: "CI is red: `cargo test --test reroll_integration` fails on `test_circuit_breaker` —  the HUMAN_HELD transition never happens." },
-        CbCase { id: "E2", group: "whitespace-only-diff", reviewer_a: "skeptic", expect_impl_fire: false, expect_spec_fire: true,
+        CbCase { id: "E2", group: "whitespace-only-diff", reviewer_a: "skeptic", expect_impl_fire: true, expect_spec_fire: true,
             text_a: "Merge conflict against main in daemon/src/state.rs — please rebase before requesting another review.",
             reviewer_b: "skeptic",
             text_b: "Merge conflict against main in daemon/src/state.rs — please rebase before requesting another review. " },
 
         // ---- Group F: case-only diff, same reviewer/reason. (2 pairs)
-        CbCase { id: "F1", group: "case-only-diff", reviewer_a: "verifier", expect_impl_fire: false, expect_spec_fire: true,
+        CbCase { id: "F1", group: "case-only-diff", reviewer_a: "verifier", expect_impl_fire: true, expect_spec_fire: true,
             text_a: "bugbot: this PR still leaves `Cargo.lock` out of sync with `Cargo.toml` — commit the regenerated lockfile.",
             reviewer_b: "verifier",
             text_b: "Bugbot: This PR still leaves `Cargo.lock` out of sync with `Cargo.toml` — commit the regenerated lockfile." },
-        CbCase { id: "F2", group: "case-only-diff", reviewer_a: "coderabbit", expect_impl_fire: false, expect_spec_fire: true,
+        CbCase { id: "F2", group: "case-only-diff", reviewer_a: "coderabbit", expect_impl_fire: true, expect_spec_fire: true,
             text_a: "The new `spawn_failure_count` field is never reset on a successful dispatch, so one transient blip permanently inflates it across the bead's whole lifetime.",
             reviewer_b: "coderabbit",
             text_b: "The new `Spawn_Failure_Count` field is never reset on a successful dispatch, so one transient blip permanently inflates it across the bead's whole lifetime." },
 
         // ---- Group G: trailing "please fix" / punctuation-only append,
         // same reviewer/reason. (2 pairs)
-        CbCase { id: "G1", group: "trailing-append-diff", reviewer_a: "skeptic", expect_impl_fire: false, expect_spec_fire: true,
+        CbCase { id: "G1", group: "trailing-append-diff", reviewer_a: "skeptic", expect_impl_fire: true, expect_spec_fire: true,
             text_a: "Test `test_reroll_success` doesn't assert on the branch registry call log — a regression here would go undetected.",
             reviewer_b: "skeptic",
             text_b: "Test `test_reroll_success` doesn't assert on the branch registry call log — a regression here would go undetected. Please fix before next review." },
-        CbCase { id: "G2", group: "trailing-append-diff", reviewer_a: "verifier", expect_impl_fire: false, expect_spec_fire: true,
+        CbCase { id: "G2", group: "trailing-append-diff", reviewer_a: "verifier", expect_impl_fire: true, expect_spec_fire: true,
             text_a: "Merge conflict against main in daemon/src/state.rs — please rebase before requesting another review.",
             reviewer_b: "verifier",
             text_b: "Merge conflict against main in daemon/src/state.rs — please rebase before requesting another review!" },
     ]
 }
 
+/// Scripted circuit-breaker LLM: answers the "Circuit-Breaker Semantic
+/// Comparator" prompt with this corpus case's own pre-labeled ground truth
+/// (`expect_spec_fire`), and answers any other prompt (i.e. the later
+/// `constraints::extract` call, reached when the breaker does NOT fire) with
+/// a fixed placeholder constraint-extraction JSON. This tests that
+/// reroll.rs's PLUMBING correctly turns "the model said same/different" into
+/// fire/no-fire — it is NOT a substitute for real model-judgment quality,
+/// which `circuit_breaker_fuzz_corpus_real_llm` below covers against the real
+/// `ChainLlm`.
+struct ScriptedCbLlm {
+    same_issue: bool,
+}
+
+impl Llm for ScriptedCbLlm {
+    fn judge(&self, prompt: &str) -> Result<String, DaemonError> {
+        if prompt.contains("Circuit-Breaker Semantic Comparator") {
+            Ok(format!(r#"{{"sameUnderlyingIssue": {}}}"#, self.same_issue))
+        } else {
+            Ok(r#"{"inhibitionSpecs":["placeholder"],"positiveAssertions":["placeholder"],"securityRedactionEncountered":false}"#.into())
+        }
+    }
+}
+
 /// Runs one circuit-breaker corpus case through the REAL `reroll::execute`.
 /// Returns (actually_fired, extraction_ok).
-fn run_cb_case(case: &CbCase, spec_dir: &std::path::Path) -> bool {
+fn run_cb_case(case: &CbCase, spec_dir: &std::path::Path, llm: &dyn Llm) -> bool {
     let scm = FakeScm::new();
     let mut sessions = FakeSessions::new();
     sessions.quiescent = true;
     let mut vcs = FakeVcs::new();
-    vcs.heads.insert("main".into(), format!("base-sha-{}", case.id));
+    vcs.heads
+        .insert("main".into(), format!("base-sha-{}", case.id));
     let store = FakeStateStore::new();
-    let llm = FakeLlm::new();
-    *llm.response.borrow_mut() = Some(Ok(
-        r#"{"inhibitionSpecs":["placeholder"],"positiveAssertions":["placeholder"],"securityRedactionEncountered":false}"#.into(),
-    ));
     let cfg = test_cfg(spec_dir);
     let telemetry_log = std::env::temp_dir().join(format!("afd_cbfuzz_{}.jsonl", case.id));
     let _ = std::fs::remove_file(&telemetry_log);
@@ -272,13 +289,20 @@ fn run_cb_case(case: &CbCase, spec_dir: &std::path::Path) -> bool {
         session_id: None,
         is_adopted: false,
         spawn_failure_count: 0,
+            pre_session_head_sha: None,
     };
     store.save(&bead).unwrap();
 
     // Seed the "prior attempt" (attempt N-1 = 1) rejection exactly as a real
     // attempt-1 `reroll::execute` call would have via `save_rejection`.
     store
-        .save_rejection(&bead_id, 1, case.reviewer_a, &feedback_hash(case.text_a), case.text_a)
+        .save_rejection(
+            &bead_id,
+            1,
+            case.reviewer_a,
+            &feedback_hash(case.text_a),
+            case.text_a,
+        )
         .unwrap();
 
     let deps = RerollDeps {
@@ -286,7 +310,7 @@ fn run_cb_case(case: &CbCase, spec_dir: &std::path::Path) -> bool {
         sessions: &sessions,
         vcs: &vcs,
         store: &store,
-        llm: &llm,
+        llm,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
         reviewer: case.reviewer_b.to_string(),
@@ -310,11 +334,20 @@ fn circuit_breaker_fuzz_corpus() {
     let mut impl_false_negatives_vs_spec = Vec::new(); // impl didn't fire but spec-intent says it should have
     let mut sanity_failures = Vec::new(); // impl disagreed with the deterministic exact-hash prediction itself
 
-    println!("\n=== Circuit-breaker fuzz corpus: {} cases ===", corpus.len());
-    println!("{:<5} {:<28} {:<6} {:<6} {:<6}", "id", "group", "impl", "exp_i", "exp_s");
+    println!(
+        "\n=== Circuit-breaker fuzz corpus: {} cases ===",
+        corpus.len()
+    );
+    println!(
+        "{:<5} {:<28} {:<6} {:<6} {:<6}",
+        "id", "group", "impl", "exp_i", "exp_s"
+    );
 
     for case in &corpus {
-        let fired = run_cb_case(case, &spec_dir);
+        let llm = ScriptedCbLlm {
+            same_issue: case.expect_spec_fire,
+        };
+        let fired = run_cb_case(case, &spec_dir, &llm);
         println!(
             "{:<5} {:<28} {:<6} {:<6} {:<6}",
             case.id, case.group, fired, case.expect_impl_fire, case.expect_spec_fire
@@ -359,9 +392,130 @@ fn circuit_breaker_fuzz_corpus() {
         impl_false_negatives_vs_spec.len()
     );
 
-    // Not a panicking assert by design (see file header) — this is an
-    // evidence-generation script, not a self-certifying gate. The numbers
-    // above are the deliverable.
+    assert!(
+        sanity_failures.is_empty(),
+        "implementation behavior differed from corpus expectation: {:?}",
+        sanity_failures
+    );
+    assert!(
+        false_positives.is_empty(),
+        "circuit-breaker fired on genuinely different reasons: {:?}",
+        false_positives
+    );
+    assert!(
+        impl_false_negatives_vs_spec.is_empty(),
+        "circuit-breaker missed same-reason semantic matches: {:?}",
+        impl_false_negatives_vs_spec
+    );
+}
+
+#[test]
+#[ignore] // real subprocess LLM calls (codex exec) — slow + costs tokens.
+          // Run explicitly: cargo test --test constraint_fuzz -- --ignored --nocapture circuit_breaker_fuzz_corpus_real_llm
+fn circuit_breaker_fuzz_corpus_real_llm() {
+    let llm = ChainLlm;
+    assert!(
+        llm.is_real(),
+        "ChainLlm must report is_real()=true — this test is meaningless against a fake"
+    );
+
+    let spec_dir = std::env::temp_dir().join("afd_cbfuzz_real_spec_dir");
+    let _ = std::fs::remove_dir_all(&spec_dir);
+    std::fs::create_dir_all(&spec_dir).unwrap();
+
+    let corpus = cb_corpus();
+    let mut false_positives = Vec::new();
+    let mut false_negatives = Vec::new();
+
+    println!(
+        "\n=== Circuit-breaker fuzz corpus (REAL LLM via ChainLlm): {} cases ===",
+        corpus.len()
+    );
+    println!("{:<5} {:<28} {:<6} {:<6}", "id", "group", "fired", "expect");
+
+    for case in &corpus {
+        let fired = run_cb_case(case, &spec_dir, &llm);
+        println!(
+            "{:<5} {:<28} {:<6} {:<6}",
+            case.id, case.group, fired, case.expect_spec_fire
+        );
+        if fired && !case.expect_spec_fire {
+            false_positives.push(case.id);
+        }
+        if !fired && case.expect_spec_fire {
+            false_negatives.push(case.id);
+        }
+    }
+
+    std::fs::remove_dir_all(&spec_dir).ok();
+
+    println!("\n--- Circuit-breaker REAL-LLM corpus summary ---");
+    println!(
+        "false positives (fired on genuinely different reason): {:?} (count={})",
+        false_positives,
+        false_positives.len()
+    );
+    println!(
+        "false negatives (same reason, did not fire): {:?} (count={})",
+        false_negatives,
+        false_negatives.len()
+    );
+
+    // jleechan-xq09: this test used to be print-only and could never fail
+    // regardless of what the real model returned -- it proved wiring
+    // (`circuit_breaker_fuzz_corpus` above, run against `ScriptedCbLlm`,
+    // already covers that), not judgment quality, despite being cited in
+    // PR descriptions as "the 52-case corpus proves semantic judgment
+    // works". Real semantic judgment is genuinely non-deterministic run to
+    // run, so this assertion targets ONLY the "reworded/paraphrased same
+    // issue" groups -- the cases that exist specifically BECAUSE a naive
+    // exact-hash/string-equality comparator (the old, pre-semantic
+    // circuit-breaker implementation) would treat them as different issues
+    // and fail to fire: near-miss wording (C1-C6), whitespace-only
+    // (E1-E2), case-only (F1-F2), and trailing-append (G1-G2) diffs -- 12
+    // cases total, all with expect_spec_fire=true. A hard 12/12 bar is too
+    // strict for non-deterministic model output; an 83% (>=10/12) floor is
+    // the documented acceptable-miss-rate threshold -- below that,
+    // semantic judgment quality has regressed and this test SHOULD fail.
+    let reworded_groups = [
+        "near-miss-paraphrase",
+        "whitespace-only-diff",
+        "case-only-diff",
+        "trailing-append-diff",
+    ];
+    let reworded_cases: Vec<&CbCase> = corpus
+        .iter()
+        .filter(|c| reworded_groups.contains(&c.group))
+        .collect();
+    assert_eq!(
+        reworded_cases.len(),
+        12,
+        "expected exactly 12 reworded/paraphrased corpus cases across {:?}; corpus shape changed -- update this assertion's threshold intentionally if that's expected",
+        reworded_groups
+    );
+    let reworded_misses: Vec<&str> = reworded_cases
+        .iter()
+        .filter(|c| false_negatives.contains(&c.id))
+        .map(|c| c.id)
+        .collect();
+    let reworded_hits = reworded_cases.len() - reworded_misses.len();
+    assert!(
+        reworded_hits * 100 >= reworded_cases.len() * 83,
+        "real-LLM semantic judgment regressed on reworded/paraphrased pairs: only {}/{} judged 'same underlying issue' (missed: {:?}); acceptable floor is >=83%",
+        reworded_hits,
+        reworded_cases.len(),
+        reworded_misses
+    );
+
+    // Zero-tolerance axis unaffected by this change: the spec explicitly
+    // names circuit-breaker false positives (firing on a genuinely
+    // DIFFERENT reason) as the strict bar -- assert it here too, now that
+    // this test has a real pass/fail contract instead of print-only output.
+    assert!(
+        false_positives.is_empty(),
+        "circuit-breaker fired on genuinely different reasons per the real LLM: {:?}",
+        false_positives
+    );
 }
 
 /// One holdout-leak corpus case: a single rejection review text, run
@@ -447,21 +601,33 @@ fn holdout_corpus() -> Vec<HoldoutCase> {
           // Run explicitly: cargo test --test constraint_fuzz -- --ignored --nocapture
 fn holdout_leak_fuzz_real_llm() {
     let llm = ChainLlm;
-    assert!(llm.is_real(), "ChainLlm must report is_real()=true — this test is meaningless against a fake");
+    assert!(
+        llm.is_real(),
+        "ChainLlm must report is_real()=true — this test is meaningless against a fake"
+    );
 
     let corpus = holdout_corpus();
     let mut false_negatives = Vec::new(); // expect_leak=true but extractor said false
     let mut false_positives = Vec::new(); // expect_leak=false but extractor said true
     let mut extraction_errors = Vec::new();
 
-    println!("\n=== Holdout-leak fuzz corpus (REAL LLM via ChainLlm): {} cases ===", corpus.len());
-    println!("{:<8} {:<28} {:<8} {:<8}", "id", "group", "expect", "actual");
+    println!(
+        "\n=== Holdout-leak fuzz corpus (REAL LLM via ChainLlm): {} cases ===",
+        corpus.len()
+    );
+    println!(
+        "{:<8} {:<28} {:<8} {:<8}",
+        "id", "group", "expect", "actual"
+    );
 
     for case in &corpus {
         match constraints::extract(&llm, case.text) {
             Ok(extracted) => {
                 let actual = extracted.security_redaction_encountered;
-                println!("{:<8} {:<28} {:<8} {:<8}", case.id, case.group, case.expect_leak, actual);
+                println!(
+                    "{:<8} {:<28} {:<8} {:<8}",
+                    case.id, case.group, case.expect_leak, actual
+                );
                 if case.expect_leak && !actual {
                     false_negatives.push(case.id);
                 }
@@ -470,7 +636,10 @@ fn holdout_leak_fuzz_real_llm() {
                 }
             }
             Err(e) => {
-                println!("{:<8} {:<28} {:<8} ERROR: {e}", case.id, case.group, case.expect_leak);
+                println!(
+                    "{:<8} {:<28} {:<8} ERROR: {e}",
+                    case.id, case.group, case.expect_leak
+                );
                 extraction_errors.push((case.id, e.to_string()));
             }
         }
@@ -478,7 +647,10 @@ fn holdout_leak_fuzz_real_llm() {
 
     println!("\n--- Holdout-leak corpus summary ---");
     println!("total cases: {}", corpus.len());
-    println!("extraction errors (LLM call / parse failure, NOT a leak-judgment result): {:?}", extraction_errors);
+    println!(
+        "extraction errors (LLM call / parse failure, NOT a leak-judgment result): {:?}",
+        extraction_errors
+    );
     println!(
         "holdout-leak FALSE NEGATIVES (expected leak, extractor said no leak): {:?} (count={})",
         false_negatives,

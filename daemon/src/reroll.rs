@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::state::{BeadOverlay, OverlayState, StateStore};
-use crate::tools::{Llm, Scm, Sessions, Vcs};
+use crate::tools::{Llm, Scm, Sessions, SpawnSpec, Vcs};
 use crate::telemetry::{self, TelemetryEvent};
 use crate::constraints;
 use std::path::Path;
@@ -74,6 +74,60 @@ fn emit_telemetry(
     )
 }
 
+/// Circuit-Breaker Semantic Comparator (spec §4.2.6): judges whether two
+/// consecutive same-reviewer rejection texts describe the SAME underlying
+/// issue / root cause, even when reworded, paraphrased, reformatted, or
+/// extended — as opposed to two genuinely different issues. This is a real
+/// model judgment call (ZFC: semantic-similarity judgments must not be
+/// hand-rolled as a scoring function) — mirrors the trailing-JSON-object
+/// parsing contract `constraints::extract` already uses against the same
+/// `Llm` trait.
+fn same_underlying_issue(llm: &dyn Llm, prior_text: &str, new_text: &str) -> Result<bool, DaemonError> {
+    let prompt = format!(
+        "You are the Circuit-Breaker Semantic Comparator for an autonomous coding factory (spec §4.2.6).\n\
+          Two consecutive rejection review comments were left by the SAME reviewer on re-roll attempts of \
+          the same bead. Judge whether they describe the SAME underlying issue / root cause, even if \
+          reworded, paraphrased, reformatted, or extended with extra commentary — as opposed to two \
+          genuinely DIFFERENT issues.\n\n\
+          PRIOR REJECTION:\n\"\"\"\n{prior_text}\n\"\"\"\n\n\
+          NEW REJECTION:\n\"\"\"\n{new_text}\n\"\"\"\n\n\
+          Respond with exactly one JSON object as the last thing in your reply, in this format:\n\
+          {{\"sameUnderlyingIssue\": true|false}}"
+    );
+
+    let reply = llm.judge(&prompt)?;
+
+    // jleechan-cq8r: a malformed/unparseable reply here must NOT construct
+    // `DaemonError::Parse` -- that variant is fatal (`is_transient()` only
+    // covers Tool|Timeout|Deferred) and crashes the whole daemon process
+    // (main.rs calls `std::process::exit(1)` on any non-transient tick
+    // error), reproducing the jleechan-5ia2 crash-loop pattern (PR #197)
+    // through this call site. `ComparatorUnparseable` is transient by
+    // design -- see its doc comment in errors.rs.
+    let last_close = reply.rfind('}').ok_or_else(|| {
+        DaemonError::ComparatorUnparseable(format!("no JSON object found in circuit-breaker comparator reply: {reply:?}"))
+    })?;
+    let prefix = &reply[..=last_close];
+    let last_open = prefix.rfind('{').ok_or_else(|| {
+        DaemonError::ComparatorUnparseable(format!("no JSON object found in circuit-breaker comparator reply: {reply:?}"))
+    })?;
+    let candidate = &prefix[last_open..=last_close];
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CmpResponse {
+        same_underlying_issue: bool,
+    }
+
+    let parsed: CmpResponse = serde_json::from_str(candidate).map_err(|e| {
+        DaemonError::ComparatorUnparseable(format!(
+            "circuit-breaker comparator reply did not contain a valid response object: {e} (reply: {reply:?})"
+        ))
+    })?;
+
+    Ok(parsed.same_underlying_issue)
+}
+
 pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcome, DaemonError> {
     // 1. Lock & Freshness Guard
     let latest = deps.store.load(&bead.bead_id)?;
@@ -106,35 +160,43 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     };
 
     if bead.attempt > 1 {
-        if let Some((prev_reviewer, prev_hash)) = deps.store.load_rejection(&bead.bead_id, bead.attempt - 1)? {
-            if prev_reviewer == deps.reviewer && prev_hash == feedback_hash {
-                bead.state = OverlayState::HumanHeld;
-                deps.store.save(bead)?;
+        if let Some((prev_reviewer, _prev_hash)) = deps.store.load_rejection(&bead.bead_id, bead.attempt - 1)? {
+            if prev_reviewer == deps.reviewer {
+                let prev_text = deps.store.load_rejection_text(&bead.bead_id, bead.attempt - 1)?;
+                let same_issue = match prev_text {
+                    Some(ref prev) if *prev == deps.review_text => true,
+                    Some(ref prev) => same_underlying_issue(deps.llm, prev, &deps.review_text)?,
+                    None => false,
+                };
+                if same_issue {
+                    bead.state = OverlayState::HumanHeld;
+                    deps.store.save(bead)?;
 
-                let (owner, repo) = deps.cfg.target_repo.split_once('/').unwrap_or(("unknown_owner", "unknown_repo"));
-                let healer_scope = format!("{}:{}:{}", owner, repo, &bead.bead_id);
+                    let (owner, repo) = deps.cfg.target_repo.split_once('/').unwrap_or(("unknown_owner", "unknown_repo"));
+                    let healer_scope = format!("{}:{}:{}", owner, repo, &bead.bead_id);
 
-                let healer_report = format!(
-                    "# Healer Report\n\n                     Circuit-breaker triggered for bead {} (scope: {}).\n                     Consecutive re-roll rejections by the same reviewer ({}) citing the same semantic reason:\n\n                     \"\"\"\n                     {}\n                     \"\"\"\n",
-                    bead.bead_id, healer_scope, deps.reviewer, deps.review_text
-                );
+                    let healer_report = format!(
+                        "# Healer Report\n\n                     Circuit-breaker triggered for bead {} (scope: {}).\n                     Consecutive re-roll rejections by the same reviewer ({}) citing the same semantic reason:\n\n                     \"\"\"\n                     {}\n                     \"\"\"\n",
+                        bead.bead_id, healer_scope, deps.reviewer, deps.review_text
+                    );
 
-                emit_telemetry(
-                    deps.telemetry_log,
-                    &bead.bead_id,
-                    bead.attempt,
-                    bead.state.as_str(),
-                    "CIRCUIT_BREAKER_TRIGGERED",
-                    serde_json::json!({}),
-                    serde_json::json!({
-                        "healerScope": healer_scope,
-                        "healerReport": healer_report,
-                        "reviewer": deps.reviewer,
-                        "feedbackHash": feedback_hash,
-                    }),
-                )?;
+                    emit_telemetry(
+                        deps.telemetry_log,
+                        &bead.bead_id,
+                        bead.attempt,
+                        bead.state.as_str(),
+                        "CIRCUIT_BREAKER_TRIGGERED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "healerScope": healer_scope,
+                            "healerReport": healer_report,
+                            "reviewer": deps.reviewer,
+                            "feedbackHash": feedback_hash,
+                        }),
+                    )?;
 
-                return Ok(RerollOutcome::Held("circuit-breaker triggered: same reviewer and feedback hash as prior attempt".into()));
+                    return Ok(RerollOutcome::Held("circuit-breaker triggered: same reviewer and feedback hash as prior attempt".into()));
+                }
             }
         }
     }
@@ -373,19 +435,34 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     Ok(RerollOutcome::Rerolled { new_branch })
 }
 
-/// Adopted-PR remediation (bead jleechan-tfs1, Option A + hard safety
-/// amendment): append-only fix commit on the EXISTING contributor branch.
-/// Never fabricates a replacement branch, never closes the original PR,
-/// never force-pushes or rewrites history. `deps.vcs.push_fix_commit`
-/// enforces the append-only/non-force contract at the git layer (fetch +
-/// checkout onto `origin/<branch>` + `--allow-empty` commit + a *non*-force
-/// push); a non-fast-forward rejection there (remote diverged, or a genuine
-/// conflict with base that would require a rebase) is surfaced here as a
-/// `Held` outcome — this function does NOT retry with a force-push or a
-/// rebase under any circumstance. The caller (`tick::run_fast_tier`) posts
-/// the escalation comment on the PR for a `Held` outcome via the same
-/// generic path it already uses for every other `Held` reason.
-fn execute_adopted(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcome, DaemonError> {
+/// Adopted-PR remediation dispatches a real coder session onto the EXISTING
+/// contributor branch, briefed with the reviewer feedback that caused the red
+/// gate. This function itself never fabricates commits, never creates a
+/// replacement branch, and never closes the original PR — those three
+/// invariants ARE structural: this code path contains no
+/// `create_branch_at`, `close_pr`, or commit-authoring call at all, only
+/// `Sessions::attach`/`Sessions::spawn`.
+///
+/// The "no force-push / no history-rewrite" constraint is DIFFERENT and is
+/// NOT structural in that same sense. It is enforced at the PROMPT level
+/// only (the coder session is instructed not to force-push, in the spawn
+/// prompt built below) PLUS a post-hoc detection backstop added as a
+/// required amendment (bead jleechan-tfs1): this function captures the
+/// branch's pre-session HEAD SHA immediately before dispatch, and every
+/// tick the resulting bead sits `DISPATCHED`, `tick::run_tick`'s
+/// wedge-detection sweep verifies that SHA is still an ancestor of the
+/// branch's current tip (`Vcs::is_ancestor`), parking the bead `HUMAN_HELD`
+/// with an escalation comment naming both SHAs if not. This is detection,
+/// not prevention — the coder session is an independent subprocess running
+/// its own `git push` that the daemon does not control at the git layer,
+/// so the daemon cannot structurally block a force-push at the moment it
+/// happens the way it structurally blocks itself from calling
+/// `create_branch_at`/`close_pr` here. Do not describe the force-push
+/// constraint as "structural" — it is not.
+fn execute_adopted(
+    deps: &RerollDeps,
+    bead: &mut BeadOverlay,
+) -> Result<RerollOutcome, DaemonError> {
     let branch = match bead.branch.clone() {
         Some(b) => b,
         None => {
@@ -413,48 +490,74 @@ fn execute_adopted(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOu
         &bead.bead_id,
         bead.attempt,
         bead.state.as_str(),
-        "REROLL_ADOPTED_APPEND_ONLY_START",
+        "REROLL_ADOPTED_REMEDIATION_START",
         serde_json::json!({}),
         serde_json::json!({"branch": branch}),
     )?;
 
-    let next_attempt = bead.attempt + 1;
-    let commit_message = format!(
-        "fix: address {} review feedback (attempt {})\n\n{}",
-        deps.reviewer, next_attempt, deps.review_text
-    );
-
-    match deps.vcs.push_fix_commit(&branch, &commit_message) {
-        Ok(()) => {
-            bead.attempt = next_attempt;
-            bead.reroll_count += 1;
-            // Branch and pr_number are deliberately left unchanged: same
-            // branch, same PR, still open. There is no factory session to
-            // redispatch to, so the bead goes straight back to ATTESTED —
-            // the next tick's verifier pass re-assesses the PR once CI
-            // catches up to the new commit, exactly like any other push a
-            // contributor makes to their own open PR.
-            bead.state = OverlayState::Attested;
-            deps.store.save(bead)?;
-            emit_telemetry(
-                deps.telemetry_log,
-                &bead.bead_id,
-                bead.attempt,
-                bead.state.as_str(),
-                "REROLL_ADOPTED_FIX_PUSHED",
-                serde_json::json!({
-                    "elapsedAutonomySeconds": bead.autonomy_secs,
-                }),
-                serde_json::json!({"branch": branch}),
-            )?;
-            Ok(RerollOutcome::Rerolled { new_branch: branch })
+    // Duplicate-spawn guard: `execute_adopted` is normally only reachable
+    // when the bead's freshest stored state is ATTESTED or RE_ROLL. This is
+    // a second line of defense against two coder sessions racing commits
+    // onto the same contributor-owned branch.
+    if let Ok(existing_session) = deps.sessions.attach(&branch, &bead.bead_id) {
+        match deps.sessions.is_quiescent(&existing_session) {
+            Ok(false) => {
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_ADOPTED_SESSION_ALREADY_ACTIVE",
+                    serde_json::json!({}),
+                    serde_json::json!({"branch": branch, "sessionId": existing_session.0}),
+                )?;
+                return Ok(RerollOutcome::Rerolled { new_branch: branch });
+            }
+            Ok(true) => {}
+            Err(e) => {
+                bead.state = OverlayState::HumanHeld;
+                deps.store.save(bead)?;
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_ADOPTED_QUIESCENCE_CHECK_FAILED",
+                    serde_json::json!({}),
+                    serde_json::json!({"branch": branch, "error": e.to_string()}),
+                )?;
+                return Ok(RerollOutcome::Held(format!(
+                    "failed to check whether an existing remediation session on adopted branch {branch} is still active: {e}"
+                )));
+            }
         }
+    }
+
+    let next_attempt = bead.attempt + 1;
+    let prompt = format!(
+        "Address the following code review feedback from {reviewer} on this pull \
+         request (attempt {attempt}). Work ONLY on the existing branch `{branch}` - \
+         make real code changes that resolve the issues described below, then commit \
+         and push your changes to that same branch.\n\n\
+         HARD CONSTRAINTS (do not violate under any circumstance):\n\
+         - This is a branch owned by an external contributor. You MUST NOT force-push, \
+         rewrite commits, or otherwise rewrite this branch's history.\n\
+         - You MUST NOT close the existing pull request or open a new one.\n\
+         - You MUST NOT create or push to any other branch.\n\
+         - If resolving the feedback genuinely requires rewriting branch history (e.g. a \
+         base conflict), STOP and leave the branch exactly as-is rather than doing \
+         either - a human will handle it.\n\n\
+         Review feedback:\n{review_text}",
+        reviewer = deps.reviewer,
+        attempt = next_attempt,
+        branch = branch,
+        review_text = deps.review_text,
+    );
+    // Capture the pre-session HEAD SHA for post-hoc force-push detection
+    // (bead jleechan-tfs1 amendment).
+    let pre_session_sha = match deps.vcs.remote_head_sha(&branch) {
+        Ok(sha) => sha,
         Err(e) => {
-            // Append-only push failed — most likely a non-fast-forward
-            // rejection, meaning genuine remediation would require a rebase
-            // or force-push. The daemon has no authority to rewrite a
-            // contributor's history, so this parks HUMAN_HELD rather than
-            // ever falling back to `--force`.
             bead.state = OverlayState::HumanHeld;
             deps.store.save(bead)?;
             emit_telemetry(
@@ -462,14 +565,63 @@ fn execute_adopted(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOu
                 &bead.bead_id,
                 bead.attempt,
                 bead.state.as_str(),
-                "REROLL_ADOPTED_APPEND_ONLY_FAILED",
+                "REROLL_ADOPTED_PRE_SESSION_SHA_CAPTURE_FAILED",
+                serde_json::json!({}),
+                serde_json::json!({"branch": branch, "error": e.to_string()}),
+            )?;
+            return Ok(RerollOutcome::Held(format!(
+                "failed to capture the pre-session HEAD SHA for adopted branch {branch} \
+                 before dispatching a remediation session (required for post-hoc \
+                 force-push detection): {e}"
+            )));
+        }
+    };
+
+    let spec = SpawnSpec {
+        bead_id: bead.bead_id.clone(),
+        branch: branch.clone(),
+        prompt,
+    };
+
+    match deps.sessions.spawn(&spec) {
+        Ok(session_id) => {
+            bead.attempt = next_attempt;
+            bead.reroll_count += 1;
+            bead.session_id = Some(session_id.0.clone());
+            // Reuse DISPATCHED: branch and pr_number are deliberately left
+            // unchanged (same branch, same still-open PR). The fast-tier
+            // quiescence-gated DISPATCHED -> ATTESTED promotion moves this
+            // back to verification after the coder session finishes.
+            bead.state = OverlayState::Dispatched;
+            bead.pre_session_head_sha = Some(pre_session_sha);
+            deps.store.save(bead)?;
+            emit_telemetry(
+                deps.telemetry_log,
+                &bead.bead_id,
+                bead.attempt,
+                bead.state.as_str(),
+                "REROLL_ADOPTED_SESSION_SPAWNED",
+                serde_json::json!({
+                    "elapsedAutonomySeconds": bead.autonomy_secs,
+                }),
+                serde_json::json!({"branch": branch, "sessionId": session_id.0}),
+            )?;
+            Ok(RerollOutcome::Rerolled { new_branch: branch })
+        }
+        Err(e) => {
+            bead.state = OverlayState::HumanHeld;
+            deps.store.save(bead)?;
+            emit_telemetry(
+                deps.telemetry_log,
+                &bead.bead_id,
+                bead.attempt,
+                bead.state.as_str(),
+                "REROLL_ADOPTED_SPAWN_FAILED",
                 serde_json::json!({}),
                 serde_json::json!({"branch": branch, "error": e.to_string()}),
             )?;
             Ok(RerollOutcome::Held(format!(
-                "append-only fix push to adopted branch {branch} failed and needs a human \
-                 (possible remote divergence or a base conflict requiring a rebase/force-push, \
-                 which automation will not perform on a contributor-owned branch): {e}"
+                "failed to spawn a remediation coder session on adopted branch {branch}: {e}"
             )))
         }
     }
