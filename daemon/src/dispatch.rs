@@ -133,6 +133,7 @@ pub fn dispatch_ready(
                 is_adopted: false,
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
+            park_reason: None,
             },
             Err(err) if err.is_transient() => {
                 report
@@ -242,6 +243,7 @@ pub fn dispatch_ready(
                     // has no `Tracker`/`Scm` access by design — see the
                     // module doc comment).
                     overlay.state = OverlayState::HumanHeld;
+                    overlay.park_reason = Some("transient_spawn_retry_cap_exceeded".to_string());
                     store.save(&overlay)?;
                     report.failures.push(failure(
                         bead,
@@ -775,6 +777,7 @@ mod tests {
                 is_adopted: false,
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
+            park_reason: None,
             })
             .unwrap();
         let cfg = cfg();

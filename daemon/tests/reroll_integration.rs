@@ -94,6 +94,7 @@ fn test_circuit_breaker() {
         is_adopted: false,
         spawn_failure_count: 0,
             pre_session_head_sha: None,
+            park_reason: None,
     };
     store.save(&bead).unwrap();
 
@@ -179,6 +180,7 @@ fn test_reroll_success() {
         is_adopted: false,
         spawn_failure_count: 0,
             pre_session_head_sha: None,
+            park_reason: None,
     };
     store.save(&bead).unwrap();
 
@@ -422,6 +424,7 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
         is_adopted: true,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
+        park_reason: None,
     };
     store.save(&bead).unwrap();
     store
@@ -561,6 +564,7 @@ fn test_reroll_adopted_spawn_failure_parks_human_held() {
         is_adopted: true,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
+        park_reason: None,
     };
     store.save(&bead).unwrap();
     store
@@ -648,6 +652,7 @@ fn test_reroll_adopted_skips_duplicate_spawn_when_session_already_active() {
         is_adopted: true,
         spawn_failure_count: 0,
             pre_session_head_sha: None,
+            park_reason: None,
     };
     store.save(&bead).unwrap();
     store
@@ -723,6 +728,7 @@ mod quiescence_timeout_races {
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
+            park_reason: None,
         }
     }
 
@@ -1087,6 +1093,7 @@ fn same_underlying_issue_malformed_reply_is_transient_not_fatal() {
         is_adopted: false,
         spawn_failure_count: 0,
         pre_session_head_sha: None,
+        park_reason: None,
     };
     store.save(&bead).unwrap();
     store

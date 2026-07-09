@@ -26,6 +26,17 @@ pub enum RerollOutcome {
     Held(String),
 }
 
+/// Park reason recorded in `BeadOverlay::park_reason` when the circuit
+/// breaker (bead jleechan-cq8r) trips. Deliberately prefixed with
+/// `"circuit-breaker"` — `StateStore::recover_human_held` (bead
+/// jleechan-4jn1) matches on that prefix to exclude circuit-breaker parks
+/// from automatic requeue, since they exist specifically to STOP retrying
+/// after the same reviewer rejects the same underlying issue twice in a
+/// row. Shared as a constant so the park_reason write and the
+/// `RerollOutcome::Held` message can never drift apart.
+pub const CIRCUIT_BREAKER_PARK_REASON: &str =
+    "circuit-breaker triggered: same reviewer and feedback hash as prior attempt";
+
 fn now_iso8601() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -170,6 +181,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
                 };
                 if same_issue {
                     bead.state = OverlayState::HumanHeld;
+                    bead.park_reason = Some(CIRCUIT_BREAKER_PARK_REASON.to_string());
                     deps.store.save(bead)?;
 
                     let (owner, repo) = deps.cfg.target_repo.split_once('/').unwrap_or(("unknown_owner", "unknown_repo"));
@@ -195,7 +207,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
                         }),
                     )?;
 
-                    return Ok(RerollOutcome::Held("circuit-breaker triggered: same reviewer and feedback hash as prior attempt".into()));
+                    return Ok(RerollOutcome::Held(CIRCUIT_BREAKER_PARK_REASON.into()));
                 }
             }
         }
@@ -233,6 +245,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
             Ok(id) => id,
             Err(e) => {
                 bead.state = OverlayState::HumanHeld;
+                bead.park_reason = Some("reroll_session_attach_failed".to_string());
                 deps.store.save(bead)?;
                 return Ok(RerollOutcome::Held(format!("failed to attach to session: {e}")));
             }
@@ -240,6 +253,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
 
         if let Err(e) = deps.sessions.stop(&session_id) {
             bead.state = OverlayState::HumanHeld;
+            bead.park_reason = Some("reroll_session_stop_failed".to_string());
             deps.store.save(bead)?;
             return Ok(RerollOutcome::Held(format!("failed to stop session: {e}")));
         }
@@ -268,6 +282,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
                 Ok(v) => v,
                 Err(e) => {
                     bead.state = OverlayState::HumanHeld;
+                    bead.park_reason = Some("reroll_quiescence_check_failed".to_string());
                     deps.store.save(bead)?;
                     return Ok(RerollOutcome::Held(format!("quiescence check failed: {e}")));
                 }
@@ -278,6 +293,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
                     Ok(h) => h,
                     Err(e) => {
                         bead.state = OverlayState::HumanHeld;
+                        bead.park_reason = Some("reroll_quiescence_check_failed".to_string());
                         deps.store.save(bead)?;
                         return Ok(RerollOutcome::Held(format!("quiescence check failed: {e}")));
                     }
@@ -307,6 +323,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
 
         if !confirmed {
             bead.state = OverlayState::HumanHeld;
+            bead.park_reason = Some("reroll_quiescence_timeout".to_string());
             deps.store.save(bead)?;
             return Ok(RerollOutcome::Held("quiescence timeout exceeded (60s)".into()));
         }
@@ -469,6 +486,7 @@ fn execute_adopted(
             // Should not happen: adoption always sets `branch` to the
             // contributor's head_ref_name. Park rather than guess.
             bead.state = OverlayState::HumanHeld;
+            bead.park_reason = Some("adopted_missing_branch".to_string());
             deps.store.save(bead)?;
             emit_telemetry(
                 deps.telemetry_log,
@@ -516,6 +534,7 @@ fn execute_adopted(
             Ok(true) => {}
             Err(e) => {
                 bead.state = OverlayState::HumanHeld;
+                bead.park_reason = Some("adopted_quiescence_check_failed".to_string());
                 deps.store.save(bead)?;
                 emit_telemetry(
                     deps.telemetry_log,
@@ -559,6 +578,7 @@ fn execute_adopted(
         Ok(sha) => sha,
         Err(e) => {
             bead.state = OverlayState::HumanHeld;
+            bead.park_reason = Some("adopted_pre_session_sha_capture_failed".to_string());
             deps.store.save(bead)?;
             emit_telemetry(
                 deps.telemetry_log,
@@ -610,6 +630,7 @@ fn execute_adopted(
         }
         Err(e) => {
             bead.state = OverlayState::HumanHeld;
+            bead.park_reason = Some("adopted_spawn_failed".to_string());
             deps.store.save(bead)?;
             emit_telemetry(
                 deps.telemetry_log,

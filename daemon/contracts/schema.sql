@@ -62,7 +62,22 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- sync with the idempotent `ensure_pre_session_head_sha_column`
   -- migration in `SqliteStateStore::open` (same guard pattern as
   -- `ensure_is_adopted_column`).
-  pre_session_head_sha TEXT
+  pre_session_head_sha TEXT,
+  -- Machine-readable reason the bead most recently transitioned to
+  -- HUMAN_HELD (bead jleechan-4jn1: live incident jleechan-93ft / PR
+  -- worldarchitect.ai#7888). Set alongside every state = 'HUMAN_HELD'
+  -- write. `recover_human_held` filters on this column: rows whose
+  -- park_reason starts with 'circuit-breaker' are EXCLUDED from automatic
+  -- requeue (the circuit breaker in reroll.rs parks a bead specifically to
+  -- STOP retrying after repeated identical rejections — requeuing it
+  -- defeats the purpose and caused a 769x re-trigger loop in production).
+  -- Other park reasons (session_stalled, autonomy_timebox_exceeded, etc.)
+  -- are unaffected. Nullable: NULL for beads never parked, and cleared
+  -- back to NULL by `recover_human_held` on successful requeue. Kept in
+  -- sync with the idempotent `ensure_park_reason_column` migration in
+  -- `SqliteStateStore::open` (same guard pattern as
+  -- `ensure_is_adopted_column`).
+  park_reason TEXT
 );
 
 -- Deletion guard: the daemon/skills may delete ONLY refs recorded here (spec §4.2.8).

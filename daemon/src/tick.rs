@@ -293,6 +293,7 @@ pub fn run_tick(
         // 1. Time-box envelope check
         if overlay.autonomy_secs >= deps.cfg.autonomy_timebox_secs {
             overlay.state = OverlayState::HumanHeld;
+            overlay.park_reason = Some("autonomy_timebox_exceeded".to_string());
             deps.store.save(&overlay)?;
             emit(
                 deps.telemetry_log,
@@ -364,6 +365,8 @@ pub fn run_tick(
                             Ok((true, _)) => {}
                             Ok((false, post_sha)) => {
                                 overlay.state = OverlayState::HumanHeld;
+                                overlay.park_reason =
+                                    Some("adopted_branch_history_rewrite_detected".to_string());
                                 deps.store.save(&overlay)?;
                                 emit(
                                     deps.telemetry_log,
@@ -400,6 +403,8 @@ pub fn run_tick(
                             }
                             Err(e) => {
                                 overlay.state = OverlayState::HumanHeld;
+                                overlay.park_reason =
+                                    Some("adopted_branch_append_only_check_failed".to_string());
                                 deps.store.save(&overlay)?;
                                 emit(
                                     deps.telemetry_log,
@@ -462,6 +467,7 @@ pub fn run_tick(
                         let expected_branch = overlay.branch.clone().unwrap_or_default();
                         if actual_branch != expected_branch {
                             overlay.state = OverlayState::HumanHeld;
+                            overlay.park_reason = Some("session_branch_mismatch".to_string());
                             deps.store.save(&overlay)?;
                             emit(
                                 deps.telemetry_log,
@@ -508,6 +514,7 @@ pub fn run_tick(
 
                             if is_silent {
                                 overlay.state = OverlayState::HumanHeld;
+                                overlay.park_reason = Some("coder_silent".to_string());
                                 deps.store.save(&overlay)?;
                                 emit(
                                     deps.telemetry_log,
@@ -634,6 +641,7 @@ pub fn run_tick(
                             }
 
                             overlay.state = OverlayState::HumanHeld;
+                            overlay.park_reason = Some("session_stalled".to_string());
                             deps.store.save(&overlay)?;
                             emit(
                                 deps.telemetry_log,
@@ -835,6 +843,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 is_adopted: true,
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
+            park_reason: None,
             });
             overlay.state = OverlayState::Attested;
             overlay.pr_number = Some(adopted.pr_number);
@@ -922,6 +931,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
+            park_reason: None,
         };
         deps.store.save(&overlay)?;
         summary.beads_created += 1;
@@ -990,6 +1000,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     is_adopted: false,
                     spawn_failure_count: 0,
             pre_session_head_sha: None,
+            park_reason: None,
                 };
                 deps.store.save(&o)?;
                 summary.beads_created += 1;
@@ -1032,6 +1043,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // silent default" discipline router.rs already enforces.
                 let mut held = overlay;
                 held.state = OverlayState::HumanHeld;
+                held.park_reason = Some(format!("router_parse_error: {reason}"));
                 deps.store.save(&held)?;
                 summary.beads_parked_human_held += 1;
                 emit(
@@ -1864,6 +1876,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     }
                     overlay.state = OverlayState::HumanHeld;
                     overlay.attempt = MAX_HUMAN_HELD_RECOVERY_ATTEMPT;
+                    overlay.park_reason =
+                        Some("unknown_only_gate_report_with_er_runner_capped".to_string());
                     deps.store.save(&overlay)?;
                     record_escalation(
                         deps,
@@ -1912,6 +1926,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({"stage": deps.cfg.stage}),
                 )?;
                 overlay.state = OverlayState::HumanHeld;
+                overlay.park_reason =
+                    Some("gate assessment not all-green (stage 1: recorded, not executed)".to_string());
                 deps.store.save(&overlay)?;
                 summary.beads_parked_human_held += 1;
                 emit(
@@ -2019,6 +2035,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                         } else {
                             overlay.state = OverlayState::HumanHeld;
+                            overlay.park_reason =
+                                Some("spec file validation failed in recovery".to_string());
                             deps.store.save(&overlay)?;
                             summary.beads_parked_human_held += 1;
                             emit(
