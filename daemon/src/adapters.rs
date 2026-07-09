@@ -1551,20 +1551,56 @@ impl Vcs for CliVcs {
         Ok(sha.to_string())
     }
 
+    /// jleechan-9sl1: replace local `git merge-base --is-ancestor` (which
+    /// needs both SHAs' git objects present locally -- they never are, since
+    /// they live in `target_repo`'s history, not the daemon's own repo) with
+    /// GitHub's "compare two commits" REST endpoint,
+    /// `GET /repos/{owner}/{repo}/compare/{base}...{head}`, where `status`
+    /// is reported relative to `base...head` (here `base` = `ancestor_sha`,
+    /// `head` = `descendant_sha`):
+    /// - `identical` — same commit → trivially an ancestor → `true`.
+    /// - `ahead` — head is ahead of base: head contains every commit base
+    ///   has, plus more → base (ancestor) is reachable from head
+    ///   (descendant) → `true`.
+    /// - `behind` — head is BEHIND base: base has commits head doesn't →
+    ///   ancestor is NOT reachable from descendant (it's the other way
+    ///   around) → `false`.
+    /// - `diverged` — neither contains the other → `false`.
+    ///
+    /// The identical-SHA case (`ancestor_sha == descendant_sha`) is handled
+    /// by an explicit short-circuit BEFORE any `gh` call, sidestepping the
+    /// need to depend on undocumented behavior for what the compare API
+    /// does when asked to compare a SHA against itself.
+    ///
+    /// Any non-recognized `status`, or a `gh` invocation failure, propagates
+    /// as a real `Err` — unlike the old implementation, this does NOT fold
+    /// every non-`Ok(true)` outcome into `Ok(false)`. Per the trait's doc
+    /// comment, callers already treat `Err` and `Ok(false)` identically
+    /// (fail-closed / escalate to human) for this method's force-push-
+    /// detection use case, but the code itself keeps "confirmed false" and
+    /// "cannot determine" as distinct outcomes rather than silently
+    /// swallowing the latter into the former.
     fn is_ancestor(&self, ancestor_sha: &str, descendant_sha: &str) -> Result<bool, DaemonError> {
-        // `--is-ancestor` exits 0 on true, 1 on false, and non-0/1 on a
-        // genuine git error (e.g. one of the SHAs isn't a known object) —
-        // all non-zero exits collapse to `Ok(false)` here, same fold
-        // `is_remote_ahead` already uses. Callers of `is_ancestor` for the
-        // force-push-detection use case are documented (on the trait) to
-        // treat that `Ok(false)` as fail-closed, unlike `is_remote_ahead`'s
-        // callers.
-        let r = run_tool(
-            "git",
-            &["merge-base", "--is-ancestor", ancestor_sha, descendant_sha],
-            30,
+        if ancestor_sha == descendant_sha {
+            return Ok(true);
+        }
+        let path = format!(
+            "repos/{}/compare/{}...{}",
+            self.target_repo, ancestor_sha, descendant_sha
         );
-        Ok(r.is_ok())
+        let out = run_tool("gh", &["api", &path, "--jq", ".status"], 30)?;
+        let status = out.trim();
+        match status {
+            "identical" | "ahead" => Ok(true),
+            "behind" | "diverged" => Ok(false),
+            other => Err(DaemonError::Tool {
+                tool: "gh".to_string(),
+                rc: 0,
+                stderr: format!(
+                    "gh api {path} returned unrecognized compare status '{other}'"
+                ),
+            }),
+        }
     }
 
     fn push_fix_commit(&self, branch: &str, message: &str) -> Result<(), DaemonError> {
