@@ -732,14 +732,40 @@ impl Scm for CliScm {
             30,
         ) {
             Ok(out) => out,
-            Err(_) => {
+            Err(primary_err) => {
                 // REST Fallback!
                 let ref_url = format!("repos/{}/commits/{}/check-runs", self.repo, view.head_ref_oid);
-                let cr_json = match run_tool("gh", &["api", &ref_url], 30) {
-                    Ok(json) => json,
-                    Err(_) => "{\"check_runs\":[]}".to_string()
-                };
-                
+                // jleechan-e7lp: the primary GraphQL `gh pr checks` call
+                // failed (commonly a GraphQL rate limit). If the REST
+                // fallback ALSO fails to execute, or returns a body that
+                // isn't valid JSON, that is a genuine "we could not
+                // determine CI status" outage — distinct from a PR that
+                // legitimately has zero checks yet (a successful REST call
+                // reports that as `{"check_runs": []}`, not an error).
+                // Previously both failure shapes were silently absorbed
+                // into an empty `checks` vec via `.unwrap_or(...)`, which
+                // collapsed into `ci_status = "unknown"` -> `ci_pending =
+                // true` even though the daemon had no idea what CI actually
+                // looked like. Live incident: bead jleechan-93ft / PR
+                // jleechanorg/worldarchitect.ai#7888 logged
+                // VERIFICATION_PENDING 244+ times in 10 minutes while
+                // GraphQL was rate-limited and the PR's CI was already 100%
+                // terminal. Propagate a `DaemonError::Tool` here instead so
+                // every existing `pr_snapshot` call site's jleechan-qdw
+                // `BEAD_SNAPSHOT_TRANSIENT_ERROR` per-bead-isolation
+                // handling takes over: the bead stays ATTESTED and is
+                // retried next tick, with honest "fetch failed" telemetry
+                // instead of misleading "CI still running" telemetry.
+                let cr_json = run_tool("gh", &["api", &ref_url], 30).map_err(|fallback_err| {
+                    DaemonError::Tool {
+                        tool: "gh".to_string(),
+                        rc: -1,
+                        stderr: format!(
+                            "CI check status unavailable for PR #{pr}: primary `gh pr checks` failed ({primary_err}) and REST check-runs fallback also failed ({fallback_err})"
+                        ),
+                    }
+                })?;
+
                 #[derive(serde::Deserialize)]
                 struct RestCheckRuns {
                     check_runs: Vec<RestCheckRun>,
@@ -750,7 +776,15 @@ impl Scm for CliScm {
                     status: String,
                     conclusion: Option<String>,
                 }
-                let rest_cr: RestCheckRuns = serde_json::from_str(&cr_json).unwrap_or(RestCheckRuns { check_runs: vec![] });
+                let rest_cr: RestCheckRuns = serde_json::from_str(&cr_json).map_err(|parse_err| {
+                    DaemonError::Tool {
+                        tool: "gh".to_string(),
+                        rc: -1,
+                        stderr: format!(
+                            "CI check status unavailable for PR #{pr}: primary `gh pr checks` failed ({primary_err}) and REST check-runs fallback returned non-JSON output: {parse_err}"
+                        ),
+                    }
+                })?;
 
                 let mut legacy_checks: Vec<GhCheck> = rest_cr.check_runs.into_iter().map(|cr| {
                     let (state, bucket) = if cr.status == "completed" {
