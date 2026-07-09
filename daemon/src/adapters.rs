@@ -6,6 +6,32 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// jleechan-9sl1 test-isolation fix: a single process-wide lock shared by
+/// EVERY `#[cfg(test)]` module in this file that mutates the global `PATH`
+/// (and related) env vars to inject a fake `gh`/`codex` binary for hermetic
+/// subprocess testing (`chain_llm_fallback_argv_tests`,
+/// `pr_snapshot_checks_fetch_failure_tests`, `cli_vcs_gh_tests`). Those
+/// modules used to each define their OWN independent `ENV_LOCK` static,
+/// which only serialized tests WITHIN a module -- two tests in DIFFERENT
+/// modules could still mutate `PATH` concurrently under `cargo test`'s
+/// default parallel execution, since `Command::new("gh")`/`"codex"` PATH
+/// resolution and the temp-dir cleanup race is a single shared global
+/// resource with no per-module partition. That cross-module race is exactly
+/// what caused `pr_snapshot_checks_fetch_failure_tests::
+/// genuinely_empty_checks_via_fallback_still_reports_ci_pending` to
+/// intermittently fail with "No such file or directory" pointing at a
+/// DIFFERENT module's already-cleaned-up temp shim dir once a third
+/// PATH-mutating module (`cli_vcs_gh_tests`) was added. Every module below
+/// must call `gh_env_test_lock()` (directly or via a thin per-module
+/// `env_lock()` wrapper) instead of defining its own `ENV_LOCK` -- do not
+/// reintroduce a module-local lock for PATH/env mutation in this file.
+#[cfg(test)]
+static GH_ENV_TEST_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+#[cfg(test)]
+fn gh_env_test_lock() -> &'static Mutex<()> {
+    GH_ENV_TEST_LOCK.get_or_init(|| Mutex::new(()))
+}
+
 
 pub struct CliTracker;
 
@@ -1921,7 +1947,7 @@ mod ci_bucket_tests {
 mod chain_llm_fallback_argv_tests {
     use super::ChainLlm;
     use crate::tools::Llm;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     /// Process-wide mutex that serializes the `PATH` / `HOME` mutations
     /// performed by the fallback-argv tests below. Without this guard,
@@ -1935,12 +1961,14 @@ mod chain_llm_fallback_argv_tests {
     /// `ChainLlm::judge` window, so a single shared binary mutex is
     /// sufficient even though two tests exist.
     ///
-    /// `OnceLock` so the allocation happens once per process; `Mutex` (not
-    /// `RwLock`) because every holder mutates `std::env` between lock
-    /// acquisition and `ChainLlm::judge` and the critical section is short.
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    /// jleechan-9sl1: delegates to the file-level `gh_env_test_lock()` shared
+    /// by every PATH/env-mutating test module in this file -- see that
+    /// function's doc comment for why a module-local lock is insufficient
+    /// (it only serializes within one module, not across the
+    /// `chain_llm_fallback_argv_tests` / `pr_snapshot_checks_fetch_failure_tests`
+    /// / `cli_vcs_gh_tests` modules, which all mutate the same global `PATH`).
     fn env_lock() -> &'static Mutex<()> {
-        ENV_LOCK.get_or_init(|| Mutex::new(()))
+        super::gh_env_test_lock()
     }
 
     /// Write an executable shell script at `path` that prints every element
@@ -2155,15 +2183,16 @@ mod pr_snapshot_checks_fetch_failure_tests {
     use crate::errors::DaemonError;
     use crate::tools::Scm;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
-    /// Process-wide mutex serializing PATH/HOME mutation across this
-    /// module's tests, mirroring `chain_llm_fallback_argv_tests::env_lock`
-    /// (see that doc comment for the full rationale: parallel `cargo test`
-    /// execution would otherwise let two tests clobber each other's PATH).
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    /// jleechan-9sl1: delegates to the file-level `gh_env_test_lock()` shared
+    /// by every PATH/env-mutating test module in this file (previously this
+    /// module had its own independent lock, which only serialized against
+    /// itself, not against `chain_llm_fallback_argv_tests` or
+    /// `cli_vcs_gh_tests` -- see `gh_env_test_lock`'s doc comment for the
+    /// cross-module race that caused).
     fn env_lock() -> &'static Mutex<()> {
-        ENV_LOCK.get_or_init(|| Mutex::new(()))
+        super::gh_env_test_lock()
     }
 
     /// Write a `gh` shim that answers every call `CliScm::pr_snapshot` makes:
@@ -2421,11 +2450,17 @@ mod cli_vcs_gh_tests {
     use super::CliVcs;
     use crate::tools::Vcs;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    /// jleechan-9sl1: delegates to the file-level `gh_env_test_lock()` shared
+    /// by every PATH/env-mutating test module in this file -- a module-local
+    /// lock here would only serialize this module's own tests against each
+    /// other, not against `chain_llm_fallback_argv_tests` or
+    /// `pr_snapshot_checks_fetch_failure_tests`, which mutate the same
+    /// global `PATH`. See `gh_env_test_lock`'s doc comment for the
+    /// cross-module flake this fixes.
     fn env_lock() -> &'static Mutex<()> {
-        ENV_LOCK.get_or_init(|| Mutex::new(()))
+        super::gh_env_test_lock()
     }
 
     /// Write a `gh` shim that answers `gh api <path> --jq <filter>` calls for
