@@ -1516,9 +1516,39 @@ impl Vcs for CliVcs {
         Ok(r.is_ok())
     }
 
+    /// jleechan-9sl1: query GitHub directly for `self.target_repo`'s branch
+    /// tip via `gh api`, instead of `git fetch origin <branch>` against the
+    /// DAEMON's own cwd (its systemd `WorkingDirectory`, the daemon's own
+    /// source repo checkout, not `target_repo`) -- the old implementation
+    /// was structurally incapable of succeeding for any real target repo.
+    /// `GET /repos/{owner}/{repo}/commits/{ref}` (the "get a commit" REST
+    /// endpoint) special-cases its `ref` path segment to allow embedded
+    /// slashes, so a branch name like `fix/7887-cc-finish-level-commit`
+    /// (a real branch from the jleechan-93ft incident) works directly with
+    /// no URL-encoding and no `heads/` prefix needed -- do NOT percent-encode
+    /// the branch or try to split on `/` to separate "owner/repo" from
+    /// "branch"; the branch itself may contain `/`.
     fn remote_head_sha(&self, branch: &str) -> Result<String, DaemonError> {
-        run_tool("git", &["fetch", "origin", branch], 30)?;
-        self.head_sha(&format!("origin/{branch}"))
+        let path = format!("repos/{}/commits/{}", self.target_repo, branch);
+        let out = run_tool("gh", &["api", &path, "--jq", ".sha"], 30)?;
+        let sha = out.trim();
+        // `gh api ... --jq .sha` exits 0 with the literal string `null` when
+        // the JSON path doesn't resolve (e.g. a malformed/unexpected
+        // response shape) -- that is not a valid SHA and must not be
+        // returned as one; the daemon relies on `remote_head_sha`'s return
+        // value as a real git object id for the subsequent `is_ancestor`
+        // check.
+        if sha.is_empty() || sha == "null" {
+            return Err(DaemonError::Tool {
+                tool: "gh".to_string(),
+                rc: 0,
+                stderr: format!(
+                    "gh api {path} returned no sha for branch '{branch}' in {}",
+                    self.target_repo
+                ),
+            });
+        }
+        Ok(sha.to_string())
     }
 
     fn is_ancestor(&self, ancestor_sha: &str, descendant_sha: &str) -> Result<bool, DaemonError> {
