@@ -429,6 +429,7 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
+            pre_session_head_sha: None,
             })
             .unwrap();
     }
@@ -536,6 +537,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
 
@@ -597,6 +599,7 @@ fn test_autonomy_budget_warning_crossing() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
 
@@ -652,6 +655,7 @@ fn test_wedge_detection_dispatched_coder_silent() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
 
@@ -721,6 +725,7 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
             session_id: Some("wa-3004".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
 
@@ -792,6 +797,7 @@ fn test_dispatch_integrity_sweep_leaves_matching_branch_alone() {
             session_id: Some("wa-4001".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
 
@@ -815,6 +821,166 @@ fn test_dispatch_integrity_sweep_leaves_matching_branch_alone() {
 
     let o = store.load("bead-ok").unwrap().unwrap();
     assert_eq!(o.state, OverlayState::Dispatched);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// bead jleechan-tfs1 amendment: an adversarial review found the
+/// append-only guarantee for adopted-branch remediation was enforced ONLY
+/// at the prompt level, with zero code-level detection if the spawned
+/// coder session force-pushed anyway. This reproduces that gap and proves
+/// the post-hoc detection backstop: a bead DISPATCHED on an adopted branch
+/// whose current remote tip is no longer a descendant of the pre-session
+/// HEAD SHA (i.e. history was rewritten) must be parked HUMAN_HELD with an
+/// escalation comment naming both SHAs on the very next tick — never
+/// silently left DISPATCHED as if remediation were proceeding normally.
+#[test]
+fn test_dispatch_integrity_sweep_detects_force_push_on_adopted_branch() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "bead-adopted-rewrite".into(),
+        BeadOverlay {
+            bead_id: "bead-adopted-rewrite".into(),
+            state: OverlayState::Dispatched,
+            attempt: 2,
+            reroll_count: 1,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(999),
+            branch: Some("alice/my-cool-feature".into()),
+            session_id: Some("session-xyz".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: Some("pre-session-sha-abc123".into()),
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_force_push_detection.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut vcs = FakeVcs::new();
+    // The branch's CURRENT remote tip after the (simulated) force-push:
+    vcs.heads
+        .insert("alice/my-cool-feature".into(), "rewritten-sha-999".into());
+    // The pre-session SHA is NOT an ancestor of that new tip — i.e. it was
+    // dropped from history by a force-push/rebase:
+    vcs.ancestor_pairs.insert(
+        (
+            "pre-session-sha-abc123".to_string(),
+            "rewritten-sha-999".to_string(),
+        ),
+        false,
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 1).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "a history-rewrite on an adopted branch must be parked on the very next tick"
+    );
+
+    let o = store.load("bead-adopted-rewrite").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::HumanHeld,
+        "a bead whose adopted branch was force-pushed must never be left DISPATCHED as if remediation is proceeding normally"
+    );
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(logs.contains("PARKED_HUMAN_HELD"), "logs: {}", logs);
+    assert!(
+        logs.contains("adopted_branch_history_rewrite_detected"),
+        "logs: {}",
+        logs
+    );
+    assert!(logs.contains("pre-session-sha-abc123"), "logs: {}", logs);
+    assert!(logs.contains("rewritten-sha-999"), "logs: {}", logs);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Companion to the force-push detection test: an ordinary append-only
+/// remediation commit (the pre-session SHA IS still an ancestor of the
+/// branch's current tip) must NOT be parked HUMAN_HELD by the new sweep —
+/// only a genuine history rewrite should trigger it.
+#[test]
+fn test_dispatch_integrity_sweep_allows_fast_forward_adopted_commit() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "bead-adopted-ff".into(),
+        BeadOverlay {
+            bead_id: "bead-adopted-ff".into(),
+            state: OverlayState::Dispatched,
+            attempt: 2,
+            reroll_count: 1,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(998),
+            branch: Some("bob/another-feature".into()),
+            session_id: Some("session-ff".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: Some("pre-session-sha-def456".into()),
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_force_push_ok.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut vcs = FakeVcs::new();
+    vcs.heads
+        .insert("bob/another-feature".into(), "new-commit-sha-777".into());
+    // No entry in ancestor_pairs for this (ancestor, descendant) pair -> the
+    // fake defaults to `true` (no rewrite), matching a real ancestor check.
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let _summary = run_tick(&deps, 1, 1).unwrap();
+
+    let o = store.load("bead-adopted-ff").unwrap().unwrap();
+    assert_ne!(
+        o.state,
+        OverlayState::HumanHeld,
+        "an ordinary append-only remediation commit must not be parked HUMAN_HELD"
+    );
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !logs.contains("adopted_branch_history_rewrite_detected"),
+        "logs: {}",
+        logs
+    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
@@ -843,6 +1009,7 @@ fn test_wedge_detection_attested_session_stalled() {
             session_id: Some("session-abc123yz".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
 
@@ -934,6 +1101,7 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             session_id: Some("session-ubas-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
 
@@ -1046,6 +1214,7 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             session_id: Some("session-stuck-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
 
@@ -1134,6 +1303,7 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             session_id: Some("session-local-ahead-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
 
@@ -1245,6 +1415,7 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             session_id: Some("session-diverged-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
 
@@ -1577,6 +1748,7 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
             session_id: Some("sess-existing".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         })
         .unwrap();
     store
@@ -1829,16 +2001,15 @@ fn adopted_non_green_pr_parks_human_held_with_v1_escalation() {
 }
 
 /// bead jleechan-tfs1, requirement (a) + (c), full pipeline (Stage 2): a
-/// red-gate reroll on an adopted PR pushes an append-only fix commit to the
+/// red-gate reroll on an adopted PR spawns a remediation coder session on the
 /// EXISTING contributor branch via `run_tick`'s real intake -> verifier ->
 /// reroll wiring (not a direct `reroll::execute` call — this proves the
 /// `is_adopted` flag actually survives the round trip through
 /// `tick::run_slow_tier`'s adoption block, `StateStore::save`/`load`, and
-/// back into `tick::run_fast_tier`'s reroll dispatch). The PR stays open,
-/// branch registry is unchanged, and no force-push/rebase/close_pr ever
-/// happens.
+/// back into `tick::run_fast_tier`'s reroll dispatch). The PR stays open and
+/// branch registry is unchanged.
 #[test]
-fn adopted_red_pr_stage2_reroll_pushes_fix_commit_leaves_pr_open() {
+fn adopted_red_pr_stage2_reroll_spawns_remediation_session_leaves_pr_open() {
     let mut scm = FakeScm::new();
     scm.prs.push(LabeledPr {
         number: 706,
@@ -1870,7 +2041,8 @@ fn adopted_red_pr_stage2_reroll_pushes_fix_commit_leaves_pr_open() {
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
     cfg.stage = 2; // Stage 2: actually execute reroll() rather than just recording the verdict
-    let vcs = FakeVcs::new();
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("alice/my-cool-feature".into(), "pre-session-sha-abc123".into());
     let telemetry_log = std::env::temp_dir().join("afd_adopted_stage2_success.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -1894,11 +2066,13 @@ fn adopted_red_pr_stage2_reroll_pushes_fix_commit_leaves_pr_open() {
     assert_eq!(summary.gates_assessed, 1);
     assert_eq!(
         summary.beads_parked_human_held, 0,
-        "a successful append-only push must not park the bead"
+        "a successful remediation-session spawn must not park the bead"
     );
 
     let overlay = store.load("fake-bead-1").unwrap().unwrap();
-    assert_eq!(overlay.state, OverlayState::Attested);
+    // run_fast_tier does not revisit a bead after the reroll branch in the
+    // same tick, so quiescence-gated promotion happens on a later tick.
+    assert_eq!(overlay.state, OverlayState::Dispatched);
     assert_eq!(overlay.attempt, 2);
     assert_eq!(
         overlay.pr_number,
@@ -1918,13 +2092,24 @@ fn adopted_red_pr_stage2_reroll_pushes_fix_commit_leaves_pr_open() {
         "no fabricated replacement branch should be registered"
     );
 
-    let vcs_calls = vcs.calls.borrow();
-    assert!(
-        vcs_calls
-            .iter()
-            .any(|c| c.starts_with("push_fix_commit(alice/my-cool-feature,")),
-        "adopted stage-2 reroll must push a fix commit to the existing branch: {vcs_calls:?}"
+    let session_prompts = sessions.spawn_prompts.borrow();
+    assert_eq!(
+        session_prompts.len(),
+        1,
+        "adopted stage-2 reroll must spawn exactly one remediation session: {session_prompts:?}"
     );
+    let (spawned_bead_id, prompt) = &session_prompts[0];
+    assert_eq!(spawned_bead_id, "fake-bead-1");
+    assert!(
+        prompt.contains("CI check-run(s) not all success"),
+        "spawn prompt must include the red-gate feedback: {prompt}"
+    );
+    assert!(
+        prompt.contains("alice/my-cool-feature"),
+        "spawn prompt must target the adopted branch: {prompt}"
+    );
+
+    let vcs_calls = vcs.calls.borrow();
     assert!(
         vcs_calls
             .iter()
@@ -1945,7 +2130,7 @@ fn adopted_red_pr_stage2_reroll_pushes_fix_commit_leaves_pr_open() {
     );
     assert!(
         tracker_calls.iter().any(|c| {
-            c.contains("comment_external(owner/repo#706") && c.contains("remediation commit")
+            c.contains("comment_external(owner/repo#706") && c.contains("remediation coder session")
         }),
         "adopted stage-2 success should post a status comment: {tracker_calls:?}"
     );
@@ -1954,14 +2139,12 @@ fn adopted_red_pr_stage2_reroll_pushes_fix_commit_leaves_pr_open() {
 }
 
 /// bead jleechan-tfs1, requirement (d), full pipeline (Stage 2): when the
-/// append-only push genuinely can't land (scripted as a non-fast-forward
-/// rejection — the real-world case is a remote that diverged or a base
-/// conflict needing a rebase), the bead must be parked `HUMAN_HELD` with an
-/// escalation comment actually posted on the PR (via
+/// remediation coder session cannot be spawned, the bead must be parked
+/// `HUMAN_HELD` with an escalation comment actually posted on the PR (via
 /// `tick::post_scm_comment_by_bead_id` -> `Tracker::comment_external`) —
-/// not a silent failure, and never a force-push/rebase fallback.
+/// not a silent failure.
 #[test]
-fn adopted_red_pr_stage2_reroll_append_only_conflict_parks_human_held_with_escalation() {
+fn adopted_red_pr_stage2_reroll_spawn_failure_parks_human_held_with_escalation() {
     let mut scm = FakeScm::new();
     scm.prs.push(LabeledPr {
         number: 707,
@@ -1993,8 +2176,9 @@ fn adopted_red_pr_stage2_reroll_append_only_conflict_parks_human_held_with_escal
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
     cfg.stage = 2;
-    let vcs = FakeVcs::new();
-    vcs.fail_push_fix_commit_for("alice/my-conflicted-feature");
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("alice/my-conflicted-feature".into(), "pre-session-sha-abc123".into());
+    sessions.fail_spawn_for("fake-bead-1");
     let telemetry_log = std::env::temp_dir().join("afd_adopted_stage2_conflict.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -2012,7 +2196,7 @@ fn adopted_red_pr_stage2_reroll_append_only_conflict_parks_human_held_with_escal
         0,
         0,
     )
-    .expect("adopted red PR stage2 append-only failure should park, not error");
+    .expect("adopted red PR stage2 spawn failure should park, not error");
 
     assert_eq!(summary.beads_parked_human_held, 1);
 
@@ -2028,13 +2212,13 @@ fn adopted_red_pr_stage2_reroll_append_only_conflict_parks_human_held_with_escal
         Some("alice/my-conflicted-feature")
     );
 
-    let vcs_calls = vcs.calls.borrow();
+    let session_calls = sessions.calls.borrow();
     assert!(
-        vcs_calls
-            .iter()
-            .any(|c| c.starts_with("push_fix_commit(alice/my-conflicted-feature,")),
-        "must have attempted the append-only push before parking: {vcs_calls:?}"
+        session_calls.iter().any(|c| c == "spawn(fake-bead-1)"),
+        "must have attempted the remediation-session spawn before parking: {session_calls:?}"
     );
+
+    let vcs_calls = vcs.calls.borrow();
     assert!(
         vcs_calls
             .iter()
@@ -2181,7 +2365,10 @@ fn manual_bead_adoption_never_calls_create_bead_or_fabricates_external_ref() {
     };
 
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
-    assert_eq!(summary.beads_created, 1, "manual bead should get a local overlay row");
+    assert_eq!(
+        summary.beads_created, 1,
+        "manual bead should get a local overlay row"
+    );
 
     let calls = tracker.calls.borrow();
     assert!(
@@ -2295,6 +2482,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
     store
@@ -2383,6 +2571,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
     store
@@ -2474,6 +2663,7 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
 
@@ -2554,6 +2744,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
     // Also seed one above the cap (defensive — matches the shell overlay)
@@ -2571,6 +2762,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
 
@@ -2892,6 +3084,7 @@ fn capped_human_held_comment_failure_retries_before_recording_escalation() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
     *tracker.fail_next_comment.borrow_mut() = Some("transient comment failure".into());
@@ -2975,6 +3168,7 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
     tracker.candidates.borrow_mut().push(Bead {
@@ -3055,6 +3249,7 @@ fn capped_human_held_missing_comment_target_does_not_record_escalation() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
 
@@ -3115,6 +3310,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             session_id: Some("session-er-capped".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
     store
@@ -3270,6 +3466,7 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
             session_id: Some("session-er-capped-retry".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
     store
@@ -3381,6 +3578,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
     scm.pr_snapshots.insert(
@@ -3479,6 +3677,7 @@ fn attested_ci_pending_does_not_timebox_park() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
     scm.pr_snapshots.insert(
@@ -3583,6 +3782,7 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
 
@@ -3673,6 +3873,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
     scm.pr_snapshots.insert(
@@ -3770,6 +3971,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
                 session_id: Some("sess-1".into()),
                 is_adopted: false,
                 spawn_failure_count: 0,
+            pre_session_head_sha: None,
             })
             .unwrap();
         store
@@ -3921,6 +4123,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             session_id: Some("sess-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         })
         .unwrap();
     store
@@ -3941,6 +4144,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             session_id: Some("sess-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         })
         .unwrap();
     store
@@ -4375,6 +4579,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             session_id: Some("sess-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         })
         .unwrap();
     store
@@ -4396,6 +4601,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             session_id: Some("sess-2".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         })
         .unwrap();
     store
@@ -4550,6 +4756,7 @@ fn qdw_assess_refetch_failure_stays_attested_and_never_closes_pr() {
             session_id: Some("sess-assess".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         })
         .unwrap();
     store
@@ -4850,6 +5057,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
     store
@@ -5028,6 +5236,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
         },
     );
     store
@@ -5896,6 +6105,200 @@ fn earlier_candidate_create_bead_error_does_not_silence_later_candidate_matching
     assert!(
         body.contains("8171"),
         "raw telemetry JSONL must be grep-able for the issue number, got: {body}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-cq8r: per-bead isolation for the re-roll engine's error path,
+/// in the SAME fast-tier loop `qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier`
+/// above covers for `pr_snapshot` failures. Before this fix, `tick.rs`'s
+/// `match crate::reroll::execute(...) { ... Err(e) => return Err(e) }` arm
+/// propagated ANY re-roll-engine failure -- including a transient LLM call
+/// failure inside the circuit-breaker comparator (`same_underlying_issue`)
+/// -- straight out of `run_fast_tier`, aborting the ENTIRE fast tier for
+/// every OTHER in-flight bead in the same tick, not just the one bead whose
+/// comparator call failed.
+///
+/// Two beads are seeded directly at attempt=2 (already past a first
+/// re-roll, both `is_adopted` to skip session/quiescence mocking and reach
+/// the circuit-breaker comparator via the shortest real path) with a
+/// stored attempt-1 rejection from the SAME reviewer as this tick's
+/// (scripted) red-gate reviewer, so `reroll::execute` actually invokes
+/// `same_underlying_issue` for both:
+///   * bead A's PRIOR rejection text carries a marker the scripted `Llm`
+///     recognizes and answers with a reply containing no JSON object at
+///     all (the exact malformed-reply shape jleechan-cq8r found) --
+///     `same_underlying_issue` returns `Err(ComparatorUnparseable)`.
+///   * bead B's PRIOR rejection text carries no such marker -- the
+///     scripted `Llm` answers normally (`sameUnderlyingIssue: false`), the
+///     breaker does not fire, and the adopted append-only remediation path
+///     completes successfully.
+///
+/// Invariants this test pins:
+///   1. Bead B reaches a successful re-roll (attempt bumped to 3, still
+///      `Attested`) in the SAME tick as bead A's comparator failure --
+///      per-bead isolation, not a tick-wide abort.
+///   2. Bead A is left `ReRoll` (as `reroll::execute` already persisted it
+///      before the failing comparator call) rather than crashing the tick.
+///   3. Telemetry records a `BEAD_PROCESSING_TRANSIENT_ERROR` event with
+///      `phase: "reroll_execute"` for bead A.
+struct IsoRerollLlm;
+
+impl Llm for IsoRerollLlm {
+    fn judge(&self, prompt: &str) -> Result<String, DaemonError> {
+        if prompt.contains("Circuit-Breaker Semantic Comparator") {
+            if prompt.contains("BEAD-A-PRIOR-MARKER") {
+                Ok("the model babbled without any JSON object at all".to_string())
+            } else {
+                Ok(r#"{"sameUnderlyingIssue": false}"#.to_string())
+            }
+        } else {
+            Ok("pass".to_string())
+        }
+    }
+}
+
+#[test]
+fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() {
+    let mut scm = FakeScm::new();
+    let mut snap_a = qdw_green_snapshot(
+        801,
+        vec![PrComment { author: "dark-factory-er".into(), body: "/er PASS".into() }],
+    );
+    snap_a.ci_success = false;
+    snap_a.ci_status = "failure".into();
+    scm.pr_snapshots.insert(801, snap_a);
+
+    let mut snap_b = qdw_green_snapshot(
+        802,
+        vec![PrComment { author: "dark-factory-er".into(), body: "/er PASS".into() }],
+    );
+    snap_b.ci_success = false;
+    snap_b.ci_status = "failure".into();
+    scm.pr_snapshots.insert(802, snap_b);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = IsoRerollLlm;
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    let mut vcs = FakeVcs::new();
+    // jleechan-tfs1 amendment (#209): execute_adopted now captures
+    // pre_session_head_sha via Vcs::remote_head_sha before spawning, and
+    // fails closed (Held) if that lookup errors. Bead B (the only bead in
+    // this test that reaches the real adopted-remediation dispatch path,
+    // since bead A exits early on the comparator failure) needs a scripted
+    // head for its branch or it never reaches its expected `Attested`
+    // outcome — this test predates #209 and only scripted PR snapshots.
+    vcs.heads
+        .insert("bob/cq8r-bead-b-branch".into(), "bead-b-head-sha".into());
+
+    for (bead_id, pr, branch, prior_text) in [
+        ("cq8r-bead-a", 801u64, "alice/cq8r-bead-a-branch", "BEAD-A-PRIOR-MARKER"),
+        ("cq8r-bead-b", 802u64, "bob/cq8r-bead-b-branch", "bead-b-prior-text"),
+    ] {
+        store
+            .save(&BeadOverlay {
+                bead_id: bead_id.into(),
+                state: OverlayState::Attested,
+                attempt: 2,
+                reroll_count: 1,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: Some(pr),
+                branch: Some(branch.into()),
+                session_id: None,
+                is_adopted: true,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+            })
+            .unwrap();
+        store.register_branch(bead_id, branch).unwrap();
+        store
+            .save_rejection(bead_id, 1, "verifier", "deadbeefdeadbeef", prior_text)
+            .unwrap();
+    }
+
+    let telemetry_log =
+        std::env::temp_dir().join(format!("afd_cq8r_iso_{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("bead A's comparator failure must not abort the tick");
+
+    assert_eq!(
+        summary.gates_assessed, 2,
+        "both beads' gates should be assessed in this tick; got {summary:?}"
+    );
+
+    let bead_a = store.load("cq8r-bead-a").unwrap().unwrap();
+    assert_eq!(
+        bead_a.state,
+        OverlayState::ReRoll,
+        "bead A stays ReRoll (persisted by reroll::execute before the comparator failed); got {:?}",
+        bead_a.state
+    );
+    assert_eq!(
+        bead_a.attempt, 2,
+        "bead A's attempt must not advance on a failed comparator call"
+    );
+
+    let bead_b = store.load("cq8r-bead-b").unwrap().unwrap();
+    // jleechan-tfs1 amendment (#209): adopted-PR remediation now dispatches a
+    // real coder session and lands in Dispatched (not an immediate Attested)
+    // — the fast-tier quiescence-gated DISPATCHED -> ATTESTED promotion
+    // re-verifies on a later tick once the coder session finishes. This test
+    // predates that change; the invariant under test (bead A's comparator
+    // failure does not block bead B's re-roll in the same tick) still holds
+    // — bead B reaches Dispatched, not HumanHeld or untouched.
+    assert_eq!(
+        bead_b.state,
+        OverlayState::Dispatched,
+        "bead B must progress its re-roll (to Dispatched, real coder session) in the SAME tick as bead A's comparator failure; got {:?}",
+        bead_b.state
+    );
+    assert_eq!(
+        bead_b.attempt, 3,
+        "bead B's successful append-only re-roll dispatch must advance its attempt counter"
+    );
+
+    // jleechan-tfs1 amendment (#209): execute_adopted no longer fabricates a
+    // commit via Vcs::push_fix_commit — it dispatches a real coder session
+    // via Sessions::spawn instead. This test predates that change.
+    let session_calls = sessions.calls.borrow();
+    assert!(
+        session_calls.iter().any(|c| c == "spawn(cq8r-bead-b)"),
+        "bead B's re-roll must actually dispatch a real coder session: {session_calls:?}"
+    );
+    assert!(
+        session_calls.iter().all(|c| c != "spawn(cq8r-bead-a)"),
+        "bead A must never reach the spawn dispatch after its comparator call failed: {session_calls:?}"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let saw_bpte = telemetry.lines().any(|l| {
+        l.contains("BEAD_PROCESSING_TRANSIENT_ERROR")
+            && l.contains("cq8r-bead-a")
+            && l.contains("\"phase\":\"reroll_execute\"")
+    });
+    assert!(
+        saw_bpte,
+        "expected a BEAD_PROCESSING_TRANSIENT_ERROR/phase=reroll_execute event for bead A; telemetry was:\n{telemetry}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

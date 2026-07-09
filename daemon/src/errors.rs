@@ -24,13 +24,33 @@ pub enum DaemonError {
     /// double-spawn by requeuing the bead and trying again next tick.
     #[error("ao spawn deferred to internal queue: {0}")]
     Deferred(String),
+    /// The re-roll circuit-breaker's semantic comparator
+    /// (`same_underlying_issue` in `reroll.rs`) makes a real LLM call to
+    /// judge whether two consecutive rejection reviews describe the same
+    /// underlying issue. jleechan-cq8r: an occasional malformed or
+    /// unparseable reply from that call used to fall through to
+    /// `DaemonError::Parse`, which is fatal and crashes the whole daemon
+    /// process via `main.rs`'s `std::process::exit(1)` on any
+    /// non-transient tick error -- the EXACT jleechan-5ia2 crash-loop
+    /// pattern (see the `Deferred` variant above, PR #197), reintroduced
+    /// through this brand-new subprocess-LLM call site. Unlike a genuine
+    /// parse bug elsewhere in the daemon, an occasional malformed judge()
+    /// reply is an expected, retry-safe condition: the circuit-breaker
+    /// check runs before `save_rejection` durably records anything for
+    /// this attempt, so nothing is lost or duplicated by backing off and
+    /// retrying the comparator call on a later tick.
+    #[error("circuit-breaker comparator reply unparseable: {0}")]
+    ComparatorUnparseable(String),
 }
 
 impl DaemonError {
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
-            DaemonError::Tool { .. } | DaemonError::Timeout(_) | DaemonError::Deferred(_)
+            DaemonError::Tool { .. }
+                | DaemonError::Timeout(_)
+                | DaemonError::Deferred(_)
+                | DaemonError::ComparatorUnparseable(_)
         )
     }
 
@@ -99,6 +119,20 @@ mod tests {
     #[test]
     fn classifies_deferred_as_transient() {
         assert!(DaemonError::Deferred("REQUEST=sq-abc123".to_string()).is_transient());
+    }
+
+    /// jleechan-cq8r: a malformed/unparseable reply from the circuit-breaker
+    /// comparator (`same_underlying_issue` in `reroll.rs`) is a retry-safe
+    /// condition, not a crash-the-daemon condition -- reproduces the
+    /// jleechan-5ia2 crash-loop pattern (PR #197) through a brand-new
+    /// subprocess-LLM call site; see the `ComparatorUnparseable` variant
+    /// doc comment.
+    #[test]
+    fn classifies_comparator_unparseable_as_transient() {
+        assert!(DaemonError::ComparatorUnparseable(
+            "no JSON object found in circuit-breaker comparator reply".to_string()
+        )
+        .is_transient());
     }
 
     #[test]

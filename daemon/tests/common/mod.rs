@@ -417,6 +417,15 @@ pub struct FakeVcs {
     /// Optional error to return from `head_sha` on every call for a given
     /// branch, modeling a `git rev-parse` failure mid-quiescence-check.
     pub fail_head_sha_for: RefCell<HashMap<String, String>>,
+    /// Scripts `remote_head_sha(branch)`. Reuses the same `heads` map as
+    /// `head_sha` (the fake doesn't model the local-vs-remote-tracking-ref
+    /// distinction) — set `heads.insert(branch, sha)` to script both.
+    ///
+    /// Scripts `is_ancestor(ancestor_sha, descendant_sha)`: `(ancestor_sha,
+    /// descendant_sha) -> bool`. Missing entries default to `true` (i.e.
+    /// "no rewrite detected") so tests that don't exercise the force-push
+    /// detector don't have to script it.
+    pub ancestor_pairs: HashMap<(String, String), bool>,
 }
 
 impl FakeVcs {
@@ -543,6 +552,34 @@ impl Vcs for FakeVcs {
         }
         Ok(())
     }
+
+    fn remote_head_sha(&self, branch: &str) -> Result<String, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("remote_head_sha({branch})"));
+        self.heads
+            .get(branch)
+            .cloned()
+            .ok_or_else(|| DaemonError::Tool {
+                tool: "git".into(),
+                rc: 1,
+                stderr: format!("no scripted remote head for {branch}"),
+            })
+    }
+
+    fn is_ancestor(&self, ancestor_sha: &str, descendant_sha: &str) -> Result<bool, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("is_ancestor({ancestor_sha},{descendant_sha})"));
+        if ancestor_sha == descendant_sha {
+            return Ok(true);
+        }
+        Ok(self
+            .ancestor_pairs
+            .get(&(ancestor_sha.to_string(), descendant_sha.to_string()))
+            .copied()
+            .unwrap_or(true))
+    }
 }
 
 /// Scripted `Llm` fake: returns the scripted response regardless of prompt
@@ -570,6 +607,8 @@ impl Llm for FakeLlm {
     }
 }
 
+type RejectionRecord = (String, String, String);
+
 /// Scripted `StateStore` fake: in-memory overlay map + branch registry, plus a
 /// call log. No SQLite involved — downstream tasks (dispatch, verifier) unit-test
 /// against this instead of `SqliteStateStore` (design doc §3).
@@ -578,7 +617,7 @@ pub struct FakeStateStore {
     pub overlays: RefCell<HashMap<String, BeadOverlay>>,
     pub branches: RefCell<Vec<String>>,
     pub branch_beads: RefCell<HashMap<String, String>>,
-    pub rejections: RefCell<HashMap<(String, u32), (String, String)>>,
+    pub rejections: RefCell<HashMap<(String, u32), RejectionRecord>>,
     pub fail_save_for_state: RefCell<Vec<(String, OverlayState)>>,
     pub calls: RefCell<Vec<String>>,
 }
@@ -735,14 +774,18 @@ impl StateStore for FakeStateStore {
         attempt: u32,
         reviewer: &str,
         feedback_hash: &str,
-        _feedback_text: &str,
+        feedback_text: &str,
     ) -> Result<(), DaemonError> {
         self.calls.borrow_mut().push(format!(
             "save_rejection({bead_id},{attempt},{reviewer},{feedback_hash})"
         ));
         self.rejections.borrow_mut().insert(
             (bead_id.to_string(), attempt),
-            (reviewer.to_string(), feedback_hash.to_string()),
+            (
+                reviewer.to_string(),
+                feedback_hash.to_string(),
+                feedback_text.to_string(),
+            ),
         );
         Ok(())
     }
@@ -759,6 +802,23 @@ impl StateStore for FakeStateStore {
             .rejections
             .borrow()
             .get(&(bead_id.to_string(), attempt))
-            .cloned())
+            .map(|(reviewer, feedback_hash, _feedback_text)| {
+                (reviewer.clone(), feedback_hash.clone())
+            }))
+    }
+
+    fn load_rejection_text(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+    ) -> Result<Option<String>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("load_rejection_text({bead_id},{attempt})"));
+        Ok(self
+            .rejections
+            .borrow()
+            .get(&(bead_id.to_string(), attempt))
+            .map(|(_, _, feedback_text)| feedback_text.clone()))
     }
 }

@@ -205,6 +205,12 @@ impl Vcs for VcsMock {
     fn push_fix_commit(&self, _branch: &str, _message: &str) -> Result<(), daemon::errors::DaemonError> {
         Ok(())
     }
+    fn remote_head_sha(&self, _branch: &str) -> Result<String, daemon::errors::DaemonError> {
+        Ok("deadbeef".into())
+    }
+    fn is_ancestor(&self, _ancestor_sha: &str, _descendant_sha: &str) -> Result<bool, daemon::errors::DaemonError> {
+        Ok(true)
+    }
 }
 
 #[derive(Default)]
@@ -345,6 +351,7 @@ fn attested_overlay(bead_id: &str, pr: u64) -> BeadOverlay {
         session_id: Some("s1".into()),
         is_adopted: false,
         spawn_failure_count: 0,
+            pre_session_head_sha: None,
     }
 }
 
