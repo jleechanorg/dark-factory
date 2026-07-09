@@ -740,10 +740,23 @@ impl StateStore for FakeStateStore {
             .push(format!("recover_human_held({max_attempt})"));
         let mut recovered = Vec::new();
         for overlay in self.overlays.borrow_mut().values_mut() {
-            if overlay.state == OverlayState::HumanHeld && overlay.attempt < max_attempt {
+            // bead jleechan-4jn1: mirrors `SqliteStateStore::recover_human_held`
+            // — circuit-breaker parks (`park_reason` starting with
+            // "circuit-breaker") are excluded from automatic requeue so
+            // fakes exercising `tick::run_recovery_step` don't silently
+            // diverge from production behavior.
+            let is_circuit_breaker = overlay
+                .park_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("circuit-breaker"));
+            if overlay.state == OverlayState::HumanHeld
+                && overlay.attempt < max_attempt
+                && !is_circuit_breaker
+            {
                 overlay.state = OverlayState::Queued;
                 overlay.attempt += 1;
                 overlay.autonomy_secs = 0;
+                overlay.park_reason = None;
                 recovered.push(overlay.clone());
             }
         }

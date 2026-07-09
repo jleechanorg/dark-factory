@@ -685,11 +685,25 @@ impl StateStore for SqliteStateStore {
         // SELECT WHERE bead_id IN (...). rusqlite has no clean RETURNING
         // support, so two statements + an in-memory id list is the simplest
         // fix.
+        //
+        // bead jleechan-4jn1 (live incident jleechan-93ft / PR
+        // worldarchitect.ai#7888): `park_reason LIKE 'circuit-breaker%'`
+        // rows are EXCLUDED from automatic requeue. The circuit breaker
+        // (reroll.rs) parks a bead HUMAN_HELD specifically to STOP retrying
+        // after the same reviewer rejects the same underlying issue twice
+        // in a row — treating that park identically to a transient one
+        // (`session_stalled`, `autonomy_timebox_exceeded`) caused a 769x
+        // re-trigger loop of the same rejected fix in 30 minutes in
+        // production. `park_reason IS NULL` rows (pre-migration data, or
+        // any park site that hasn't been updated to set a reason) keep the
+        // pre-existing auto-recovery behavior — the exclusion is opt-in via
+        // the `circuit-breaker` prefix, not opt-out via NULL.
         let mut id_stmt = self
             .conn
             .prepare(
                 "SELECT bead_id FROM bead_overlay \
-                 WHERE state = 'HUMAN_HELD' AND attempt < ?1",
+                 WHERE state = 'HUMAN_HELD' AND attempt < ?1 \
+                 AND (park_reason IS NULL OR park_reason NOT LIKE 'circuit-breaker%')",
             )
             .map_err(|e| tool_err("recover_human_held id select prepare", e))?;
         let recovered_ids: Vec<String> = id_stmt
@@ -712,7 +726,7 @@ impl StateStore for SqliteStateStore {
         let update_sql = format!(
             "UPDATE bead_overlay \
              SET state = 'QUEUED', attempt = attempt + 1, autonomy_secs = 0, \
-                 pr_number = NULL, session_id = NULL, updated_at = ?1 \
+                 pr_number = NULL, session_id = NULL, park_reason = NULL, updated_at = ?1 \
              WHERE bead_id IN ({})",
             placeholders
         );
@@ -1423,6 +1437,103 @@ mod tests {
         assert_eq!(dispatched.autonomy_secs, 100);
         let ready = store.load("ready").unwrap().unwrap();
         assert_eq!(ready.state, OverlayState::Ready);
+    }
+
+    /// bead jleechan-4jn1 (live incident jleechan-93ft / PR
+    /// worldarchitect.ai#7888): a bead parked HUMAN_HELD by the circuit
+    /// breaker (`park_reason` starting with `"circuit-breaker"`) must NOT be
+    /// requeued by `recover_human_held`, even though its `attempt` is well
+    /// under the recovery cap — the circuit breaker parks it specifically to
+    /// STOP the same reviewer/feedback loop from re-triggering. A bead
+    /// parked for a transient reason (`session_stalled`, mirroring
+    /// `tick::run_tick`'s wedge-detection park) at the exact same attempt
+    /// must still be recovered normally. This is the behavioral difference
+    /// this bead's fix depends on: before the fix, `recover_human_held`'s
+    /// SQL (`WHERE state = 'HUMAN_HELD' AND attempt < ?1`) could not tell
+    /// the two apart and requeued both identically.
+    #[test]
+    fn recover_human_held_excludes_circuit_breaker_parks_but_recovers_transient_parks() {
+        let schema = include_str!("../contracts/schema.sql");
+        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
+
+        let mut overlays = HashMap::new();
+        overlays.insert(
+            "circuit-broken".to_string(),
+            BeadOverlay {
+                bead_id: "circuit-broken".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 6,
+                reroll_count: 3,
+                autonomy_secs: 500,
+                spend_usd: 0.0,
+                pr_number: Some(7888),
+                branch: Some("factory/circuit-broken-r6".into()),
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some(crate::reroll::CIRCUIT_BREAKER_PARK_REASON.to_string()),
+            },
+        );
+        overlays.insert(
+            "transient-stalled".to_string(),
+            BeadOverlay {
+                bead_id: "transient-stalled".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 2,
+                reroll_count: 0,
+                autonomy_secs: 1800,
+                spend_usd: 0.0,
+                pr_number: Some(99),
+                branch: Some("factory/transient-stalled-r2".into()),
+                session_id: Some("session-abc".into()),
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some("session_stalled".to_string()),
+            },
+        );
+        for overlay in overlays.values() {
+            store.save(overlay).unwrap();
+        }
+
+        let recovered = store.recover_human_held(10).unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "only the transient park should be recovered; the circuit-breaker park must be excluded"
+        );
+        assert_eq!(recovered[0].bead_id, "transient-stalled");
+
+        // The circuit-breaker-parked bead is untouched: still HUMAN_HELD,
+        // same attempt, park_reason preserved. This is the exact regression
+        // this bead fixes — production requeued this bead 21 seconds after
+        // park and re-triggered the same rejected fix 769 times in 30
+        // minutes.
+        let circuit_broken = store.load("circuit-broken").unwrap().unwrap();
+        assert_eq!(
+            circuit_broken.state,
+            OverlayState::HumanHeld,
+            "circuit-breaker park must NOT be auto-requeued"
+        );
+        assert_eq!(circuit_broken.attempt, 6, "attempt must not be bumped");
+        assert_eq!(
+            circuit_broken.park_reason.as_deref(),
+            Some(crate::reroll::CIRCUIT_BREAKER_PARK_REASON),
+            "park_reason must survive an excluded recovery pass"
+        );
+
+        // The transient park recovers exactly like the pre-existing
+        // `session_stalled` / `autonomy_timebox_exceeded` behavior: QUEUED,
+        // attempt bumped, autonomy reset, park_reason cleared.
+        let transient = store.load("transient-stalled").unwrap().unwrap();
+        assert_eq!(transient.state, OverlayState::Queued);
+        assert_eq!(transient.attempt, 3);
+        assert_eq!(transient.autonomy_secs, 0);
+        assert_eq!(
+            transient.park_reason, None,
+            "recover_human_held clears park_reason once a bead is back in play"
+        );
     }
 
     /// P2 (Codex review): `recover_human_held` must return ONLY the rows
