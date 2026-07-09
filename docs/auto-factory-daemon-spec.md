@@ -351,9 +351,3 @@ Three LLM roles carry the daemon's judgment (ZFC: Zero-Framework Cognition — r
 1. **Task Router** — input: bead title/description, file tree, dependency map. Output JSON: `{ "routingVerdict": "SMALL_PATH" | "STANDARD_PATH", "justification": "<one sentence>" }`. Routing is model judgment over the whole task shape; no file-count or keyword rules in daemon code.
 2. **Constraint Extractor + Holdout-Leak Screen** — input: rejection review text. Output JSON: `{ "inhibitionSpecs": [...], "positiveAssertions": [...], "securityRedactionEncountered": <bool> }`. Inhibition specs take precedence; holdout internals are redacted before spec mutation (§4.2.6).
 3. **Skeptic Reviewer** — input: diff + spec manifest + validation history. Output verdict uses the runner's normalized grammar (`pass | warn | fail`, marker line `verdict: <token>`), plus `blockingIssues[]`. Binary `PASS/FAIL`-only schemas from external variants are non-conforming.
-<!-- jleechan-s3c timer-fire-test: red control fixture; long-lived regression. -->
-
-This paragraph is the deliberate CI break. Three backticks opens an unclosed fence:
-
-```bash
-unclosed-fence-without-end
