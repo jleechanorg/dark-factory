@@ -2051,3 +2051,257 @@ mod chain_llm_fallback_argv_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// Regression tests for jleechan-e7lp: `pr_snapshot`'s checks-fetch fallback
+/// must distinguish "we could not fetch CI status at all" (primary `gh pr
+/// checks` AND the REST `check-runs` fallback both failed / returned
+/// unparseable output) from "we fetched successfully and the PR genuinely
+/// has zero checks yet". Before this fix both shapes silently collapsed into
+/// an empty `checks` vec, which fabricated `ci_pending = true` even when the
+/// daemon had no real signal — the live incident is bead jleechan-93ft / PR
+/// jleechanorg/worldarchitect.ai#7888 logging VERIFICATION_PENDING 244+
+/// times in 10 minutes while GraphQL was rate-limited and the PR's CI was
+/// already 100% terminal.
+///
+/// These tests inject a fake `gh` binary on PATH (same technique as
+/// `chain_llm_fallback_argv_tests` above) that dispatches on subcommand /
+/// REST path so `CliScm::pr_snapshot` exercises the real fallback code path
+/// end-to-end without touching the network.
+#[cfg(test)]
+mod pr_snapshot_checks_fetch_failure_tests {
+    use super::CliScm;
+    use crate::errors::DaemonError;
+    use crate::tools::Scm;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Process-wide mutex serializing PATH/HOME mutation across this
+    /// module's tests, mirroring `chain_llm_fallback_argv_tests::env_lock`
+    /// (see that doc comment for the full rationale: parallel `cargo test`
+    /// execution would otherwise let two tests clobber each other's PATH).
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    fn env_lock() -> &'static Mutex<()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Write a `gh` shim that answers every call `CliScm::pr_snapshot` makes:
+    /// - `gh pr view ...` -> a fixed, valid PR view JSON.
+    /// - `gh pr checks ...` -> controlled by `$GH_TEST_PRIMARY_CHECKS`.
+    /// - `gh api .../check-runs` -> controlled by `$GH_TEST_FALLBACK_CHECKS`.
+    /// - `gh api .../statuses` -> always an empty legacy-status array.
+    /// - `gh api graphql ...` -> always an empty review-threads reply (this
+    ///   daemon already tolerates GraphQL failure here independently of the
+    ///   checks fetch under test, so keeping it green isolates the
+    ///   assertion to the checks path).
+    ///
+    /// `$GH_TEST_PRIMARY_CHECKS` / `$GH_TEST_FALLBACK_CHECKS` values:
+    /// - `fail` -> exit 1 (simulates a `gh` invocation failure: rate limit,
+    ///   network, timeout).
+    /// - `badjson` -> exit 0 with a non-JSON body (simulates a malformed
+    ///   response).
+    /// - anything else -> exit 0 with a genuinely empty checks array.
+    fn write_fake_gh(path: &std::path::Path) {
+        let script = r#"#!/usr/bin/env bash
+set -u
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  cat <<'JSON'
+{"mergeable":"MERGEABLE","reviews":[],"headRefOid":"deadbeefcafefeed0123456789abcdef01234567","body":"test body","comments":[],"files":[],"updatedAt":"2026-07-08T12:00:00Z"}
+JSON
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
+  case "${GH_TEST_PRIMARY_CHECKS:-}" in
+    fail) echo "gh: GraphQL API rate limit already exceeded" >&2; exit 1 ;;
+    badjson) echo "not json"; exit 0 ;;
+    *) echo "[]"; exit 0 ;;
+  esac
+fi
+if [ "$1" = "api" ]; then
+  url=""
+  for arg in "$@"; do
+    case "$arg" in
+      api) continue ;;
+      -*) continue ;;
+      *) url="$arg"; break ;;
+    esac
+  done
+  case "$url" in
+    *check-runs*)
+      case "${GH_TEST_FALLBACK_CHECKS:-}" in
+        fail) echo "gh: network error" >&2; exit 1 ;;
+        badjson) echo "not json"; exit 0 ;;
+        *) echo '{"check_runs": []}'; exit 0 ;;
+      esac
+      ;;
+    *statuses*)
+      echo "[]"; exit 0
+      ;;
+    graphql)
+      echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}'
+      exit 0
+      ;;
+    *)
+      echo "{}"; exit 0
+      ;;
+  esac
+fi
+echo "pr_snapshot_checks_fetch_failure_tests: unhandled gh invocation: $*" >&2
+exit 1
+"#;
+        std::fs::write(path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Prepare a temp dir containing only the fake `gh` shim and return it
+    /// (caller prepends `<dir>/bin` to PATH). Keyed on nanos + pid so
+    /// concurrent test binaries never collide.
+    fn make_fake_gh_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "afd_pr_snapshot_checks_{prefix}_{}_{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        write_fake_gh(&dir.join("bin").join("gh"));
+        dir
+    }
+
+    /// Run `CliScm::pr_snapshot(pr)` with the fake `gh` shim on PATH and the
+    /// two checks-fetch env knobs set, restoring PATH/env afterwards
+    /// regardless of outcome.
+    fn run_pr_snapshot_with_fake_gh(
+        prefix: &str,
+        primary_checks: &str,
+        fallback_checks: &str,
+        pr: u64,
+    ) -> Result<crate::tools::PrSnapshot, DaemonError> {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let dir = make_fake_gh_dir(prefix);
+        let bin = dir.join("bin");
+
+        let prior_path = std::env::var_os("PATH");
+        let mut new_path = std::ffi::OsString::from(bin.to_str().unwrap());
+        if let Some(prior) = prior_path.as_ref() {
+            new_path.push(":");
+            new_path.push(prior);
+        }
+        let prior_primary = std::env::var_os("GH_TEST_PRIMARY_CHECKS");
+        let prior_fallback = std::env::var_os("GH_TEST_FALLBACK_CHECKS");
+        // SAFETY: serialized by ENV_LOCK above, matching the established
+        // `chain_llm_fallback_argv_tests` pattern for mutating process env
+        // vars in tests.
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+            std::env::set_var("GH_TEST_PRIMARY_CHECKS", primary_checks);
+            std::env::set_var("GH_TEST_FALLBACK_CHECKS", fallback_checks);
+        }
+
+        let scm = CliScm::new("jleechanorg/dark-factory-test".to_string());
+        let result = scm.pr_snapshot(pr);
+
+        unsafe {
+            if let Some(prior) = prior_path {
+                std::env::set_var("PATH", prior);
+            } else {
+                std::env::remove_var("PATH");
+            }
+            if let Some(prior) = prior_primary {
+                std::env::set_var("GH_TEST_PRIMARY_CHECKS", prior);
+            } else {
+                std::env::remove_var("GH_TEST_PRIMARY_CHECKS");
+            }
+            if let Some(prior) = prior_fallback {
+                std::env::set_var("GH_TEST_FALLBACK_CHECKS", prior);
+            } else {
+                std::env::remove_var("GH_TEST_FALLBACK_CHECKS");
+            }
+        }
+        drop(_guard);
+
+        std::fs::remove_dir_all(&dir).ok();
+        result
+    }
+
+    /// (a) Primary `gh pr checks` fails AND the REST `check-runs` fallback
+    /// also fails to execute -> `pr_snapshot` must return `Err`, not a
+    /// fabricated `Ok(snapshot)` with `ci_pending = true` synthesized from
+    /// an empty checks vec. This is the exact jleechan-93ft incident shape.
+    #[test]
+    #[cfg(unix)]
+    fn both_checks_fetch_paths_failing_returns_err_not_fabricated_pending() {
+        let result = run_pr_snapshot_with_fake_gh("both_fail", "fail", "fail", 7888);
+        let err = result.expect_err(
+            "pr_snapshot must fail closed when BOTH the primary `gh pr checks` \
+             call and the REST check-runs fallback fail to execute -- \
+             fabricating an empty checks vec here is exactly the \
+             jleechan-93ft VERIFICATION_PENDING-spam bug",
+        );
+        assert!(
+            matches!(err, DaemonError::Tool { .. }),
+            "expected DaemonError::Tool (transient, retried next tick per \
+             jleechan-qdw), got {err:?}"
+        );
+    }
+
+    /// Same as above but the REST fallback executes and returns a 200 with a
+    /// non-JSON body -- must also fail closed rather than defaulting to an
+    /// empty checks vec.
+    #[test]
+    #[cfg(unix)]
+    fn fallback_non_json_response_returns_err_not_fabricated_pending() {
+        let result = run_pr_snapshot_with_fake_gh("fallback_badjson", "fail", "badjson", 7888);
+        let err = result.expect_err(
+            "pr_snapshot must fail closed when the REST check-runs fallback \
+             returns a body that isn't valid JSON",
+        );
+        assert!(
+            matches!(err, DaemonError::Tool { .. }),
+            "expected DaemonError::Tool, got {err:?}"
+        );
+    }
+
+    /// (b) Both calls execute successfully and genuinely report zero
+    /// checks (the primary `gh pr checks` failed, forcing the REST
+    /// fallback, which itself succeeds with an empty `check_runs` array --
+    /// i.e. the PR really has no checks yet). This must still produce
+    /// `ci_pending = true`, preserving the pre-existing correct behavior;
+    /// the fix is narrowly about distinguishing fetch failure from genuine
+    /// emptiness, not about changing empty-checks-means-pending semantics.
+    #[test]
+    #[cfg(unix)]
+    fn genuinely_empty_checks_via_fallback_still_reports_ci_pending() {
+        let result = run_pr_snapshot_with_fake_gh("genuinely_empty", "fail", "empty", 42);
+        let snapshot = result.expect(
+            "pr_snapshot must succeed when the REST fallback executes and \
+             genuinely reports zero checks",
+        );
+        assert!(
+            snapshot.ci_pending,
+            "a PR with genuinely zero checks yet must still report \
+             ci_pending = true (pre-existing correct behavior)"
+        );
+        assert_eq!(snapshot.ci_status, "unknown");
+    }
+
+    /// Same as (b) but checks come back empty directly from the PRIMARY
+    /// `gh pr checks` call (no fallback needed at all) -- the baseline
+    /// "PR just opened" case, confirming the fix didn't touch this path.
+    #[test]
+    #[cfg(unix)]
+    fn genuinely_empty_checks_via_primary_still_reports_ci_pending() {
+        let result = run_pr_snapshot_with_fake_gh("genuinely_empty_primary", "empty", "empty", 43);
+        let snapshot = result.expect(
+            "pr_snapshot must succeed when the primary call executes and \
+             genuinely reports zero checks",
+        );
+        assert!(snapshot.ci_pending);
+        assert_eq!(snapshot.ci_status, "unknown");
+    }
+}
