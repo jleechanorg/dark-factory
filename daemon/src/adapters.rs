@@ -1459,7 +1459,23 @@ impl Sessions for CliSessions {
     }
 }
 
-pub struct CliVcs;
+/// `target_repo` is the "<owner>/<repo>" the daemon automates (`cfg.target_repo`,
+/// e.g. `jleechanorg/worldarchitect.ai`) -- NOT the daemon's own source repo.
+/// jleechan-9sl1: `remote_head_sha`/`is_ancestor` used to shell out to the
+/// local `git` binary, which only ever operates against the daemon
+/// PROCESS's own cwd (its systemd `WorkingDirectory`, the daemon's own repo
+/// checkout) -- structurally incapable of succeeding for any real
+/// `target_repo`. Both methods now go through `gh api` scoped to this field
+/// instead; see their doc comments below.
+pub struct CliVcs {
+    pub target_repo: String,
+}
+
+impl CliVcs {
+    pub fn new(target_repo: String) -> Self {
+        Self { target_repo }
+    }
+}
 
 impl Vcs for CliVcs {
     fn base_head(&self, base_branch: &str) -> Result<String, DaemonError> {

@@ -432,7 +432,7 @@ fn run(args: Args) -> Result<(), DaemonError> {
             Box::new(CliTracker),
             Box::new(CliSessions::new(&ao_project, &default_agent)),
             Box::new(ChainLlm),
-            Box::new(CliVcs),
+            Box::new(CliVcs::new(cfg.target_repo.clone())),
         )
     };
 

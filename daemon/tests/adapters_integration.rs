@@ -6,7 +6,7 @@ fn test_cli_vcs_real_git() {
     if std::env::var("GITHUB_ACTIONS").is_ok() {
         return;
     }
-    let vcs = CliVcs;
+    let vcs = CliVcs::new("jleechanorg/dark-factory".to_string());
     let sha = vcs.base_head("main").expect("base_head main failed");
     assert_eq!(sha.len(), 40);
 
