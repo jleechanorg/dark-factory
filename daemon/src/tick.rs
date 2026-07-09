@@ -1342,13 +1342,22 @@ fn skeptic_evidence(
         // (self-review would defeat the adversarial guarantee) — and
         // combine via `combine_dual_verdict`. This restores main's
         // pre-rebase dual-reviewer safety net: a single reviewer-tool
-        // outage can never false-park a bead. Only a TOTAL outage of both
-        // reviewers (both unparseable/errored) returns `Err`, which
-        // propagates out of this function to `run_fast_tier`'s per-bead
-        // catch-and-continue (phase = "skeptic_evidence"); the bead stays
-        // ATTESTED and the next tick retries, instead of guessing a
-        // verdict or silently falling back to a third, non-adversarial LLM
-        // call.
+        // outage can never false-park a bead.
+        //
+        // jleechan-baaf: a TOTAL outage of vendor1+vendor2 (both
+        // unparseable/errored) no longer immediately propagates `Err`. If
+        // `priority` has a third, still-untried member (`priority[2]`,
+        // guaranteed distinct from vendor1/vendor2 and from the coder's own
+        // vendor), it is dispatched as a fallback BEFORE giving up — live
+        // incident 2026-07-09: `agy` silently returns empty stdout and
+        // `codex` is quota-exhausted, so with `priority = [codex, claude,
+        // agy]` the pre-fix code never reached the healthy `claude` vendor
+        // at `priority[2]`, permanently false-failing gate 7. Only when the
+        // fallback ALSO fails to produce a parseable verdict (or no third
+        // vendor exists) does `Err` propagate out of this function to
+        // `run_fast_tier`'s per-bead catch-and-continue (phase =
+        // "skeptic_evidence"); the bead stays ATTESTED and the next tick
+        // retries, instead of guessing a verdict.
         let vendor1 = priority.first().copied().unwrap_or("codex").to_string();
         let vendor2 = priority.get(1).copied().unwrap_or("claude").to_string();
 
@@ -1371,9 +1380,34 @@ fn skeptic_evidence(
         let v1 = res1.ok().and_then(|r| verifier::parse_skeptic_verdict(&r));
         let v2 = res2.ok().and_then(|r| verifier::parse_skeptic_verdict(&r));
 
-        // Err propagates via `?` on total outage (jleechan-qdw safety net).
-        let dual_verdict = combine_dual_verdict(v1, v2, bead_id, pr)?
-            .expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)");
+        let dual_verdict = match combine_dual_verdict(v1, v2, bead_id, pr) {
+            Ok(v) => v.expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)"),
+            Err(total_outage_err) => {
+                // vendor1 AND vendor2 both failed to parse. Try the third
+                // priority member (if any) before propagating the outage.
+                match priority.get(2).copied() {
+                    Some(vendor3) => {
+                        let v3 = dispatch_reviewer(vendor3, &prompt)
+                            .ok()
+                            .and_then(|r| verifier::parse_skeptic_verdict(&r));
+                        // Re-use combine_dual_verdict as a single-verdict
+                        // wrapper (its (Some, None) arms already treat a
+                        // lone verdict as a full success); if vendor3 ALSO
+                        // fails to parse this returns the same kind of
+                        // total-outage `Err` as above, now correctly
+                        // reflecting that all THREE available vendors were
+                        // tried (jleechan-qdw safety net preserved).
+                        combine_dual_verdict(v3, None, bead_id, pr)?.expect(
+                            "combine_dual_verdict returns Some(..) whenever it returns Ok(..)",
+                        )
+                    }
+                    // No third vendor available (coder vendor exclusion
+                    // left only two candidates) — propagate the original
+                    // total-outage error.
+                    None => return Err(total_outage_err),
+                }
+            }
+        };
 
         // PR#163 finding 1 (round 1) + finding (round 3, residual): `gha`
         // (a target-repo CI workflow posting a skeptic verdict comment) and
