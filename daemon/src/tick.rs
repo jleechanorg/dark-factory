@@ -1298,6 +1298,20 @@ fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> 
             &["--print", "--dangerously-skip-permissions", prompt],
             120,
         ),
+        // jleechan-bkru: 4th reviewer vendor, added after a live 2026-07-09
+        // incident where codex+claude+agy were ALL simultaneously
+        // non-functional (codex quota-exhausted multi-day, claude weekly
+        // limit hit multi-day, agy quota-exhausted + a separate
+        // session-continuity bug). `gemini` is Google's Gemini CLI
+        // (`@google/gemini-cli`), a distinct product/account/quota from
+        // `agy` (Antigravity). `--yolo` auto-approves tool calls (gemini's
+        // equivalent of `--dangerously-skip-permissions`); `--skip-trust`
+        // is required in headless/non-interactive contexts or the CLI
+        // refuses to run with a "not a trusted directory" error. 150s
+        // timeout (vs. 120s for the other three vendors): live-tested
+        // real-prompt runs took up to ~110s doing genuine `gh`-backed
+        // investigation via tool calls, so 150s leaves headroom.
+        "gemini" => run_tool("gemini", &["-p", prompt, "--yolo", "--skip-trust"], 150),
         other => Err(DaemonError::Tool {
             tool: other.to_string(),
             rc: -1,
@@ -1341,10 +1355,18 @@ fn skeptic_evidence(
         a if a.contains("minimax") => "minimax",
         a if a.contains("agy") => "agy",
         a if a.contains("codex") => "codex",
+        a if a.contains("gemini") => "gemini",
         _ => "",
     };
 
-    let mut priority = vec!["codex", "claude", "agy"];
+    // jleechan-bkru: 4th reviewer vendor (see `dispatch_reviewer`'s
+    // "gemini" arm). Appended at the end so the existing codex/claude/agy
+    // ordering is unchanged; it is reached only via the fallback loop
+    // below when earlier vendors fail to produce a parseable verdict, not
+    // reordered ahead of them — codex/claude/agy's current outage is a
+    // point-in-time incident (quotas reset), not a permanent property of
+    // those vendors.
+    let mut priority = vec!["codex", "claude", "agy", "gemini"];
     if !coder_vendor.is_empty() {
         priority.retain(|&v| v != coder_vendor);
     }
@@ -1440,27 +1462,40 @@ fn skeptic_evidence(
         let dual_verdict = match combine_dual_verdict(v1, v2, bead_id, pr) {
             Ok(v) => v.expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)"),
             Err(total_outage_err) => {
-                // vendor1 AND vendor2 both failed to parse. Try the third
-                // priority member (if any) before propagating the outage.
-                match priority.get(2).copied() {
-                    Some(vendor3) => {
-                        let v3 = dispatch_reviewer(vendor3, &prompt)
-                            .ok()
-                            .and_then(|r| verifier::parse_skeptic_verdict(&r));
-                        // Re-use combine_dual_verdict as a single-verdict
-                        // wrapper (its (Some, None) arms already treat a
-                        // lone verdict as a full success); if vendor3 ALSO
-                        // fails to parse this returns the same kind of
-                        // total-outage `Err` as above, now correctly
-                        // reflecting that all THREE available vendors were
-                        // tried (jleechan-qdw safety net preserved).
-                        combine_dual_verdict(v3, None, bead_id, pr)?.expect(
-                            "combine_dual_verdict returns Some(..) whenever it returns Ok(..)",
-                        )
+                // vendor1 AND vendor2 both failed to parse. Try each
+                // remaining `priority` member (index 2, 3, ...) in turn
+                // before propagating the outage. jleechan-bkru generalizes
+                // the original single priority[2] fallback (jleechan-qdw)
+                // into a loop over ALL remaining vendors, so a 4th (or
+                // later) configured vendor — e.g. `gemini` at priority[3]
+                // — is reachable too. Live incident 2026-07-09: codex
+                // (quota-exhausted), claude (weekly limit hit), AND agy
+                // (quota-exhausted + a session-continuity bug) were ALL
+                // simultaneously non-functional, so a fallback that only
+                // ever tried a single 3rd vendor was no longer sufficient.
+                let mut fallback_verdict = None;
+                for vendor_n in priority.iter().skip(2) {
+                    let v_n = dispatch_reviewer(vendor_n, &prompt)
+                        .ok()
+                        .and_then(|r| verifier::parse_skeptic_verdict(&r));
+                    // Re-use combine_dual_verdict as a single-verdict
+                    // wrapper (its (Some, None) arms already treat a lone
+                    // verdict as a full success); if vendor_n ALSO fails to
+                    // parse this returns the same kind of total-outage
+                    // `Err` as above and the loop tries the next vendor.
+                    if let Ok(v) = combine_dual_verdict(v_n, None, bead_id, pr) {
+                        fallback_verdict = v;
+                        break;
                     }
-                    // No third vendor available (coder vendor exclusion
-                    // left only two candidates) — propagate the original
-                    // total-outage error.
+                }
+                match fallback_verdict {
+                    Some(v) => v,
+                    // Every remaining vendor (if any) also failed to parse
+                    // — or coder vendor exclusion left fewer than 3
+                    // candidates in the first place — propagate the
+                    // original total-outage error so `run_fast_tier`'s
+                    // catch-and-continue retries next tick instead of
+                    // guessing a verdict.
                     None => return Err(total_outage_err),
                 }
             }

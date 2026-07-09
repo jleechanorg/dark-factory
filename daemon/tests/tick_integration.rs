@@ -5603,6 +5603,174 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
 
+// --- jleechan-bkru: 4th-vendor (gemini) fallback gap --------------------
+//
+// Live incident 2026-07-09 (bead jleechan-93ft, worldarchitect.ai PR #7888):
+// codex, claude, AND agy went simultaneously non-functional (codex quota
+// exhausted multi-day, claude weekly limit hit multi-day, agy quota
+// exhausted + a separate session-continuity bug even when fresh). With
+// `priority = [codex, claude, agy]`, once ALL THREE fail to parse,
+// `skeptic_evidence` had zero remaining vendors to fall back to and
+// permanently failed gate 7, even though a `gemini` CLI reviewer was live
+// and produced a real, parseable verdict in manual testing.
+//
+// This test adds a 4th vendor (`gemini`) to `priority` and asserts that
+// when the first three dispatched/fallback vendors (codex, claude, agy)
+// all fail to produce a parseable verdict, `skeptic_evidence` falls back
+// to the 4th (`gemini`) before giving up — generalizing the jleechan-baaf
+// single `priority[2]` fallback into a loop over all remaining vendors.
+#[test]
+#[cfg(unix)]
+fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_fake_reviewers_4thvendor_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    // vendor1 (codex), vendor2 (claude), vendor3 (agy) all "succeed" as
+    // processes but produce output `parse_skeptic_verdict` cannot parse —
+    // matching tonight's live triple-outage.
+    write_fake_reviewer(&fake_bin_dir, "codex", "not a verdict at all");
+    write_fake_reviewer(&fake_bin_dir, "claude", "still not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "agy", "also not a verdict");
+    // vendor4 (gemini) is healthy and would have produced a usable verdict
+    // — the bug (pre-fix) is that `priority[3]` is never reached.
+    write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+
+    // Fix the coder vendor so priority = [codex, claude, agy, gemini]
+    // deterministically.
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
+    ]);
+
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+
+    let mut cfg = test_cfg();
+    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" -> is_test_repo == false
+
+    store.overlays.borrow_mut().insert(
+        "real-repo-bead-4thvendor".into(),
+        BeadOverlay {
+            bead_id: "real-repo-bead-4thvendor".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(558),
+            branch: Some("factory/real-repo-bead-4thvendor-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+        },
+    );
+    store
+        .branches
+        .borrow_mut()
+        .push("factory/real-repo-bead-4thvendor-r1".into());
+    store.branch_beads.borrow_mut().insert(
+        "factory/real-repo-bead-4thvendor-r1".into(),
+        "real-repo-bead-4thvendor".into(),
+    );
+
+    scm.pr_snapshots.insert(
+        558,
+        PrSnapshot {
+            pr_number: 558,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: 0,
+            head_sha: "deadbeef558".into(),
+            body: String::new(),
+            comments: vec![PrComment {
+                author: "some-reviewer".into(),
+                body: "/er PASS".into(),
+            }],
+            files: vec![],
+            updated_at_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            ci_status: "green".into(),
+            coderabbit_status: "green".into(),
+            ci_pending: false,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_real_target_repo_skeptic_4thvendor_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert_eq!(
+        summary.beads_ready, 1,
+        "jleechan-bkru regression: when the first THREE dispatched/fallback \
+         reviewer vendors (codex, claude, agy) all fail to produce a \
+         parseable verdict but a fourth vendor (gemini) is available in \
+         `priority` and would succeed, `skeptic_evidence` must fall back \
+         to it instead of propagating a total-outage Err. \
+         summary={summary:?}\ntelemetry:\n{telemetry}"
+    );
+    assert!(
+        telemetry.contains("\"all_green\":true"),
+        "GATE_ASSESSMENT must report all_green:true once the fourth \
+         vendor's verdict is used; telemetry:\n{telemetry}"
+    );
+
+    let overlay = store
+        .load("real-repo-bead-4thvendor")
+        .unwrap()
+        .expect("overlay must still exist");
+    assert_eq!(
+        overlay.state,
+        OverlayState::Ready,
+        "bead must reach READY via the fourth vendor's verdict, not stay \
+         ATTESTED on a false total-outage"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
 // jleechan follow-up to #198 (fix/dispatch-batch-isolation): #198 fixed the
 // batch-abort bug in `dispatch_ready`'s transient-spawn-failure path (a
 // requeue no longer aborts the rest of the batch), but left the requeue path
