@@ -62,6 +62,15 @@ pub struct TickSummary {
     /// Beads that reached an automation cap and now require explicit
     /// operator/escalation attention instead of silent indefinite retry.
     pub beads_escalated: usize,
+    /// Beads that reached an automation cap AND had no SCM comment target
+    /// at all (no `pr_number`, not found in `fetch_candidates()`), so the
+    /// escalation was recorded only as a local durable marker
+    /// (`bead_overlay.park_reason` + `ESCALATED_LOCALLY` telemetry) instead
+    /// of a GitHub comment. Counted separately from `beads_escalated` so
+    /// operators can tell "posted a comment" apart from "local-only, go
+    /// query `bead_overlay` yourself" (2026-07-09 live incident: 45 beads
+    /// silently lost with no durable trace anywhere).
+    pub beads_escalated_locally: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell

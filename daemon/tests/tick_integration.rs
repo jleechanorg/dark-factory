@@ -3247,7 +3247,27 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
 }
 
 #[test]
-fn capped_human_held_missing_comment_target_does_not_record_escalation() {
+fn capped_human_held_missing_comment_target_records_local_escalation_fallback() {
+    // jleechan-baaf-followup / 2026-07-09 live incident: 45 beads were found
+    // stuck forever with `ESCALATION_NOTIFICATION_FAILED` /
+    // `"config: no SCM comment target found for bead <id>"` and ZERO durable
+    // trace anywhere else — no GitHub comment, no sentinel row, no operator-
+    // visible marker. Every subsequent tick re-attempted and re-failed
+    // identically because `record_escalation` (the sentinel write that makes
+    // `escalation_already_recorded` return `true`) was only ever called on
+    // the success path. A bead with no `pr_number` and no matching
+    // `fetch_candidates()` entry can NEVER get an SCM target — retrying is
+    // pure waste, and silence means an operator has to know to grep
+    // `daemon.jsonl` for a needle they don't know exists.
+    //
+    // This test asserts the fallback: when no SCM comment target exists at
+    // all (as opposed to a transient tracker/API error — see the sibling
+    // `_retries_before_recording_escalation` tests above, which must keep
+    // retrying), the daemon must still leave a durable, human-visible record
+    // — a `park_reason` on the bead's own `bead_overlay` row, plus a
+    // distinct `ESCALATED_LOCALLY` telemetry event — and must record the
+    // escalation sentinel so the tick loop stops silently re-attempting
+    // forever.
     let scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let sessions = FakeSessions::new();
@@ -3274,6 +3294,9 @@ fn capped_human_held_missing_comment_target_does_not_record_escalation() {
             park_reason: None,
         },
     );
+    // No candidates registered on the tracker either — this bead's source
+    // issue/PR has fallen out of the live query window entirely, exactly
+    // like the 45 orphaned beads found live.
 
     let telemetry_log = std::env::temp_dir().join("afd_recover_human_held_missing_target.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -3290,18 +3313,38 @@ fn capped_human_held_missing_comment_target_does_not_record_escalation() {
     };
 
     let summary = run_tick(&deps, 1, 0).expect("missing target should not abort tick");
-    assert_eq!(summary.beads_escalated, 0);
+    assert_eq!(
+        summary.beads_escalated_locally, 1,
+        "a local-only fallback escalation must be counted distinctly from an SCM-posted one"
+    );
     assert!(
         store
             .load_rejection("bead-held-missing-target", u32::MAX)
             .unwrap()
-            .is_none(),
-        "sentinel must stay absent until an operator-facing target exists"
+            .is_some(),
+        "sentinel must be recorded even without an SCM target, or the daemon retries forever"
+    );
+    let overlay_after = store.load("bead-held-missing-target").unwrap().unwrap();
+    assert!(
+        overlay_after
+            .park_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("escalation")),
+        "bead_overlay.park_reason must carry a durable, queryable escalation marker; got: {:?}",
+        overlay_after.park_reason
     );
     let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
     assert!(
-        log.contains("ESCALATION_NOTIFICATION_FAILED"),
-        "missing notification target must be visible in telemetry; got: {log}"
+        log.contains("ESCALATED_LOCALLY"),
+        "a distinct local-escalation telemetry event must be emitted; got: {log}"
+    );
+
+    // Second tick: no infinite retry storm. The sentinel from tick 1 must
+    // suppress a second local-escalation attempt.
+    let summary2 = run_tick(&deps, 2, 0).expect("second tick should not re-escalate");
+    assert_eq!(
+        summary2.beads_escalated_locally, 0,
+        "an already-recorded local escalation must not fire again every tick"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
