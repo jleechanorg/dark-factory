@@ -1,0 +1,19 @@
+# Caps cargo build/test parallelism for the daemon crate.
+#
+# Without this, `cargo test --release` spawns one rustc invocation per
+# integration-test binary (daemon, constraint_fuzz, intake,
+# adapters_integration, tools_fakes, er_runner_integration,
+# reroll_integration, tick_integration, ...), each defaulting to using all
+# detected logical CPUs. On a shared host that multiplies out past the
+# actual core count and starves everything else running on the box.
+#
+# Confirmed twice on 2026-07-10 (jleechanorg/dark-factory#220): a bare
+# `cargo test --release --manifest-path daemon/Cargo.toml` on jeff-ubuntu
+# (32 logical CPUs) spiked load average to 48, making the host unresponsive
+# to SSH for several minutes.
+#
+# 8 leaves headroom for other work (self-hosted CI runners, other AO/Claude
+# sessions) on a 32-thread shared host. Override locally with
+# `cargo build -j <N>` / `CARGO_BUILD_JOBS=<N>` if you have a dedicated box.
+[build]
+jobs = 8
