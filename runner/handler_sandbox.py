@@ -71,11 +71,18 @@ def _get_claude_executable() -> str:
 
 
 def _holdouts_repo_path() -> pathlib.Path:
-    repo = os.environ.get(
-        "DARK_FACTORY_HOLDOUTS",
-        str(pathlib.Path.home() / "projects" / "dark-factory-holdouts"),
-    )
-    return pathlib.Path(repo).expanduser().resolve()
+    default = pathlib.Path.home() / "projects" / "dark-factory-holdouts"
+    repo = os.environ.get("DARK_FACTORY_HOLDOUTS", str(default))
+    resolved = pathlib.Path(repo).expanduser().resolve()
+    if not resolved.is_dir():
+        raise RuntimeError(
+            f"Sealed holdouts repo not found at {resolved!s}. The implementing-agent "
+            "sandbox's deny-list depends on this path existing — silently continuing "
+            "would run the agent with an ineffective (empty) deny rule, defeating the "
+            "isolation guarantee. Set DARK_FACTORY_HOLDOUTS to the sealed sibling repo's "
+            "real location, or clone it to the default path above."
+        )
+    return resolved
 
 
 def _holdout_denied_paths() -> list[pathlib.Path]:

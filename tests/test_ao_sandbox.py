@@ -34,6 +34,7 @@ sys.path.insert(0, str(ROOT))
 from runner.handlers import (  # noqa: E402
     Context,
     _codergen,
+    _holdouts_repo_path,
     _sandboxed_args,
     _sanitized_env,
 )
@@ -252,3 +253,54 @@ def test_ao_subprocess_inherits_sanitized_env(monkeypatch, tmp_path):
     assert "HOLDOUT_TOKEN" not in env, (
         "AO subprocess received *HOLDOUT* env var — holdout leak vector"
     )
+
+
+# ---------------------------------------------------------------------------
+# Portability: _holdouts_repo_path must fail loud, not silently no-op,
+# when the sealed sibling repo cannot be located (bd portability audit).
+# ---------------------------------------------------------------------------
+
+
+def test_holdouts_repo_path_fails_loud_when_no_env_and_default_missing(
+    monkeypatch, tmp_path
+):
+    """No DARK_FACTORY_HOLDOUTS + no sibling checkout at the default location
+    must raise, not silently return a nonexistent path. A nonexistent path
+    fed into `_build_sandbox_profile` produces a deny rule on a directory
+    that will never be hit — which looks safe but actually means the sealed
+    holdouts, wherever they really live on this machine, are NOT covered by
+    the sandbox deny-list. The isolation guarantee this whole repo's
+    CRITICAL Agent Isolation section depends on must not degrade silently.
+    """
+    monkeypatch.delenv("DARK_FACTORY_HOLDOUTS", raising=False)
+    fake_home = tmp_path / "no_holdouts_here"
+    fake_home.mkdir()
+    monkeypatch.setattr(pathlib.Path, "home", lambda: fake_home)
+
+    with pytest.raises(RuntimeError, match="DARK_FACTORY_HOLDOUTS"):
+        _holdouts_repo_path()
+
+
+def test_holdouts_repo_path_fails_loud_when_env_set_but_missing(monkeypatch, tmp_path):
+    """DARK_FACTORY_HOLDOUTS explicitly set to a path that doesn't exist is a
+    misconfiguration, not a valid signal to silently no-op — must also raise.
+    """
+    monkeypatch.setenv(
+        "DARK_FACTORY_HOLDOUTS", str(tmp_path / "does_not_exist_at_all")
+    )
+
+    with pytest.raises(RuntimeError, match="DARK_FACTORY_HOLDOUTS"):
+        _holdouts_repo_path()
+
+
+def test_holdouts_repo_path_succeeds_when_env_points_at_real_dir(monkeypatch, tmp_path):
+    """Regression guard: a valid, existing DARK_FACTORY_HOLDOUTS must still
+    resolve normally (this must not become fail-loud for the happy path).
+    """
+    real_dir = tmp_path / "real_holdouts"
+    real_dir.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(real_dir))
+
+    resolved = _holdouts_repo_path()
+
+    assert resolved == real_dir.resolve()
