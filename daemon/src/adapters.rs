@@ -1080,6 +1080,102 @@ impl Scm for CliScm {
     }
 }
 
+/// Resolve `$DARK_FACTORY_HOLDOUTS` (or its default sibling-repo location) and
+/// fail loudly if it does not exist on disk. Silently continuing with a
+/// nonexistent path would build a sandbox-exec deny rule that can never
+/// match anything real — the implementing-agent isolation guarantee this
+/// repo's CRITICAL Agent Isolation section depends on would degrade to a
+/// no-op without anyone noticing (bd portability audit).
+fn resolve_holdouts_path_or_fail() -> Result<String, DaemonError> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let holdouts = std::env::var("DARK_FACTORY_HOLDOUTS")
+        .unwrap_or_else(|_| format!("{}/projects/dark-factory-holdouts", home));
+    if !std::path::Path::new(&holdouts).is_dir() {
+        return Err(DaemonError::Config(format!(
+            "Sealed holdouts repo not found at {holdouts}. The implementing-agent \
+             sandbox's deny-list depends on this path existing — silently continuing \
+             would run the agent with an ineffective (empty) deny rule. Set \
+             DARK_FACTORY_HOLDOUTS to the sealed sibling repo's real location, or \
+             clone it to the default path above."
+        )));
+    }
+    Ok(holdouts)
+}
+
+#[cfg(test)]
+mod resolve_holdouts_path_tests {
+    use super::{gh_env_test_lock, resolve_holdouts_path_or_fail};
+
+    #[test]
+    fn fails_loud_when_no_env_and_default_missing() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev_holdouts = std::env::var("DARK_FACTORY_HOLDOUTS").ok();
+        let prev_home = std::env::var("HOME").ok();
+        std::env::remove_var("DARK_FACTORY_HOLDOUTS");
+        std::env::set_var("HOME", "/nonexistent-home-for-holdouts-test");
+
+        let result = resolve_holdouts_path_or_fail();
+
+        if let Some(v) = prev_holdouts {
+            std::env::set_var("DARK_FACTORY_HOLDOUTS", v);
+        }
+        if let Some(v) = prev_home {
+            std::env::set_var("HOME", v);
+        }
+
+        let err = result.expect_err("expected a fail-loud error, got Ok");
+        assert!(
+            err.to_string().contains("DARK_FACTORY_HOLDOUTS"),
+            "error should mention DARK_FACTORY_HOLDOUTS, got: {err}"
+        );
+    }
+
+    #[test]
+    fn fails_loud_when_env_set_but_missing() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var("DARK_FACTORY_HOLDOUTS").ok();
+        std::env::set_var(
+            "DARK_FACTORY_HOLDOUTS",
+            "/definitely/does/not/exist/holdouts",
+        );
+
+        let result = resolve_holdouts_path_or_fail();
+
+        match prev {
+            Some(v) => std::env::set_var("DARK_FACTORY_HOLDOUTS", v),
+            None => std::env::remove_var("DARK_FACTORY_HOLDOUTS"),
+        }
+
+        let err = result.expect_err("expected a fail-loud error, got Ok");
+        assert!(err.to_string().contains("DARK_FACTORY_HOLDOUTS"));
+    }
+
+    #[test]
+    fn succeeds_when_env_points_at_real_dir() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = std::env::temp_dir().join("resolve_holdouts_path_tests_real_dir");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = std::env::var("DARK_FACTORY_HOLDOUTS").ok();
+        std::env::set_var("DARK_FACTORY_HOLDOUTS", &tmp);
+
+        let result = resolve_holdouts_path_or_fail();
+
+        match prev {
+            Some(v) => std::env::set_var("DARK_FACTORY_HOLDOUTS", v),
+            None => std::env::remove_var("DARK_FACTORY_HOLDOUTS"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+
+        assert_eq!(result.unwrap(), tmp.to_string_lossy().to_string());
+    }
+}
+
 pub struct CliSessions {
     pub project: String,
     pub agent: String,
@@ -1098,15 +1194,12 @@ impl CliSessions {
     }
 
     fn run_spawn_process(&self, agent: &str, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let holdouts = std::env::var("DARK_FACTORY_HOLDOUTS")
-            .unwrap_or_else(|_| format!("{}/projects/dark-factory-holdouts", home));
-        let profile = format!(
-            "(version 1)\n(allow default)\n(deny file-read* (subpath \"{}\"))\n(deny file-write* (subpath \"{}\"))\n",
-            holdouts, holdouts
-        );
-
         let mut cmd = if std::env::consts::OS == "macos" {
+            let holdouts = resolve_holdouts_path_or_fail()?;
+            let profile = format!(
+                "(version 1)\n(allow default)\n(deny file-read* (subpath \"{}\"))\n(deny file-write* (subpath \"{}\"))\n",
+                holdouts, holdouts
+            );
             let mut c = Command::new("sandbox-exec");
             c.arg("-p").arg(&profile);
             c.arg("ao");
@@ -1277,6 +1370,19 @@ impl Sessions for CliSessions {
             }
         }
 
+        // Resolved once, outside the per-spec loop below: same env var, same
+        // filesystem state for every item in the batch, so there is no need
+        // (and no benefit) to re-resolve or re-validate it per iteration.
+        let sandbox_profile: Option<String> = if std::env::consts::OS == "macos" {
+            let holdouts = resolve_holdouts_path_or_fail()?;
+            Some(format!(
+                "(version 1)\n(allow default)\n(deny file-read* (subpath \"{}\"))\n(deny file-write* (subpath \"{}\"))\n",
+                holdouts, holdouts
+            ))
+        } else {
+            None
+        };
+
         let mut results = vec![None; specs.len()];
         let mut active_indices: Vec<usize> = (0..specs.len()).collect();
 
@@ -1288,17 +1394,9 @@ impl Sessions for CliSessions {
             let mut children = Vec::new();
             for &idx in &active_indices {
                 let spec = &specs[idx];
-                let home = std::env::var("HOME").unwrap_or_default();
-                let holdouts = std::env::var("DARK_FACTORY_HOLDOUTS")
-                    .unwrap_or_else(|_| format!("{}/projects/dark-factory-holdouts", home));
-                let profile = format!(
-                    "(version 1)\n(allow default)\n(deny file-read* (subpath \"{}\"))\n(deny file-write* (subpath \"{}\"))\n",
-                    holdouts, holdouts
-                );
-
-                let mut cmd = if std::env::consts::OS == "macos" {
+                let mut cmd = if let Some(profile) = &sandbox_profile {
                     let mut c = Command::new("sandbox-exec");
-                    c.arg("-p").arg(&profile);
+                    c.arg("-p").arg(profile);
                     c.arg("ao");
                     c
                 } else {
