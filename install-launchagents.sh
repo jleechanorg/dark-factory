@@ -3,9 +3,10 @@
 #
 # Discovers every *.plist.template under daemon/launchd/, substitutes
 # @HOME@, @TICK_INTERVAL@, @STATUS_INTERVAL@, @FACTORY_SLACK_CHANNEL_ID@,
-# and @HERMES_SLACK_BOT_TOKEN@ (the latter two for the #factory Slack wiring),
-# copies the result to $HOME/Library/LaunchAgents/<basename>.plist with mode
-# 0644, and bootstrap/bootout handles the launchd lifecycle.
+# @HERMES_SLACK_BOT_TOKEN@, @GITHUB_WEBHOOK_SECRET@, and @GH_REPOS@
+# (the latter for the GitHub webhook plist), copies the result to
+# $HOME/Library/LaunchAgents/<basename>.plist with mode 0644, and
+# bootstrap/bootout handles the launchd lifecycle.
 #
 # Usage:
 #   ./install-launchagents.sh [--dry-run] [--uninstall] [--label <name>]
@@ -32,13 +33,21 @@
 #   FACTORY_SLACK_CHANNEL_ID  optional override for the #factory channel id
 #                             (default C0BGEC77EP4 — the channel created on
 #                             2026-07-09 in team T09FXQ4LCQP).
+#   GITHUB_WEBHOOK_SECRET     required by ai.dark-factory.github-webhook.plist
+#                             (HMAC-SHA256 secret shared with GitHub). Same
+#                             resolution rules as HERMES_SLACK_BOT_TOKEN.
+#                             Empty -> the webhook plist install fails with exit 5.
+#   GH_REPOS                  comma-separated list of full_name repos accepted
+#                             by the webhook listener (default
+#                             'jleechanorg/worldarchitect.ai,jleechanorg/dark-factory').
+#                             Empty string means 'accept all repos' (operator opt-in).
 #
 # Exit codes:
 #   0  success
 #   2  invalid argument
 #   3  template contains unsupported placeholders
 #   4  bootstrap failed (only when not --dry-run)
-#   5  Slack token required but not provided
+#   5  required secret/token missing (Slack token OR GitHub webhook secret)
 
 set -euo pipefail
 
@@ -127,7 +136,15 @@ ensure_log_dir() {
 #                                 or /usr/local/etc/hermes-token (operator-only);
 #                                 if both are empty, templates that require it
 #                                 are skipped with a clear error.
-ALLOWED_PLACEHOLDERS='@HOME@|@TICK_INTERVAL@|@STATUS_INTERVAL@|@FACTORY_SLACK_CHANNEL_ID@|@HERMES_SLACK_BOT_TOKEN@'
+#   @GITHUB_WEBHOOK_SECRET@       substituted from $GITHUB_WEBHOOK_SECRET
+#                                 or /usr/local/etc/hermes-token (same fallback
+#                                 chain as the Slack token); required by the
+#                                 github-webhook plist (HMAC validation will
+#                                 reject every payload if it's empty).
+#   @GH_REPOS@                    substituted from $GH_REPOS (default
+#                                 'jleechanorg/worldarchitect.ai,jleechanorg/dark-factory');
+#                                 empty string = 'accept all'.
+ALLOWED_PLACEHOLDERS='@HOME@|@TICK_INTERVAL@|@STATUS_INTERVAL@|@FACTORY_SLACK_CHANNEL_ID@|@HERMES_SLACK_BOT_TOKEN@|@GITHUB_WEBHOOK_SECRET@|@GH_REPOS@'
 validate_template_placeholders() {
     local tpl="$1"
     local bad
@@ -159,9 +176,32 @@ resolve_slack_token() {
     return 1
 }
 
+# Resolve the GitHub webhook secret. Same fallback chain as resolve_slack_token.
+# Operators can set GITHUB_WEBHOOK_SECRET directly, or share /usr/local/etc/hermes-token.
+resolve_github_webhook_secret() {
+    if [ -n "${GITHUB_WEBHOOK_SECRET:-}" ]; then
+        printf '%s' "$GITHUB_WEBHOOK_SECRET"
+        return 0
+    fi
+    local fallback="/usr/local/etc/hermes-token"
+    if [ -r "$fallback" ]; then
+        local tok
+        tok="$(head -n 1 "$fallback" 2>/dev/null | tr -d '\r\n' || true)"
+        if [ -n "$tok" ]; then
+            printf '%s' "$tok"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 # Default #factory channel id. Channel ids are not secrets (they appear in
 # Slack URLs), so it's safe to commit. Override via $FACTORY_SLACK_CHANNEL_ID.
 DEFAULT_FACTORY_SLACK_CHANNEL_ID="C0BGEC77EP4"
+
+# Default GH_REPOS allow-list. Two repos the operator actively drives via /af.
+# Operators can override via $GH_REPOS; empty string means 'accept all'.
+DEFAULT_GH_REPOS="jleechanorg/worldarchitect.ai,jleechanorg/dark-factory"
 
 # Resolve the tick interval from env, defaulting to 240s. Validate as positive int.
 TICK_INTERVAL="${AFD_TICK_INTERVAL_SEC:-240}"
@@ -229,8 +269,16 @@ install_one() {
     if grep -q '@HERMES_SLACK_BOT_TOKEN@' "$tpl"; then
         needs_token=1
     fi
+    local needs_webhook_secret=0
+    if grep -q '@GITHUB_WEBHOOK_SECRET@' "$tpl"; then
+        needs_webhook_secret=1
+    fi
     local slack_token=""
+    local webhook_secret=""
     local channel_id="${FACTORY_SLACK_CHANNEL_ID:-$DEFAULT_FACTORY_SLACK_CHANNEL_ID}"
+    # GH_REPOS may be intentionally empty (= 'accept all'); use ${var-} so
+    # an unset env var defaults to the constant rather than to "".
+    local gh_repos="${GH_REPOS-$DEFAULT_GH_REPOS}"
 
     if [ "$needs_token" -eq 1 ]; then
         if ! slack_token="$(resolve_slack_token)"; then
@@ -247,18 +295,34 @@ install_one() {
         fi
     fi
 
+    if [ "$needs_webhook_secret" -eq 1 ]; then
+        if ! webhook_secret="$(resolve_github_webhook_secret)"; then
+            if [ "$DRY_RUN" -eq 1 ]; then
+                printf '[dry-run] [skip] %s requires GITHUB_WEBHOOK_SECRET; would fail in real install\n' "$label" >&2
+                return 0
+            fi
+            echo "[error] $label requires GITHUB_WEBHOOK_SECRET (set env or place in /usr/local/etc/hermes-token mode 0600)" >&2
+            exit 5
+        fi
+        if [ "$DRY_RUN" -eq 1 ]; then
+            printf '[dry-run] resolved GITHUB_WEBHOOK_SECRET (length=%d) for %s\n' "${#webhook_secret}" "$label"
+        fi
+    fi
+
     ensure_log_dir
 
     # Render template -> target via sed. Use % as delimiter so $HOME |'s survive.
     if [ "$DRY_RUN" -eq 1 ]; then
-        printf '[dry-run] sed -e s%%@HOME@%%%s%%g -e s%%@TICK_INTERVAL@%%%s%%g -e s%%@STATUS_INTERVAL@%%%s%%g -e s%%@FACTORY_SLACK_CHANNEL_ID@%%%s%%g -e s%%@HERMES_SLACK_BOT_TOKEN@%%<token len=%d>%%g %s > %s\n' \
-            "$HOME" "$TICK_INTERVAL" "$STATUS_INTERVAL" "$channel_id" "${#slack_token}" "$tpl" "$target"
+        printf '[dry-run] sed -e s%%@HOME@%%%s%%g -e s%%@TICK_INTERVAL@%%%s%%g -e s%%@STATUS_INTERVAL@%%%s%%g -e s%%@FACTORY_SLACK_CHANNEL_ID@%%%s%%g -e s%%@HERMES_SLACK_BOT_TOKEN@%%<slack_token len=%d>%%g -e s%%@GITHUB_WEBHOOK_SECRET@%%<webhook_secret len=%d>%%g -e s%%@GH_REPOS@%%%s%%g %s > %s\n' \
+            "$HOME" "$TICK_INTERVAL" "$STATUS_INTERVAL" "$channel_id" "${#slack_token}" "${#webhook_secret}" "$gh_repos" "$tpl" "$target"
     else
         sed -e "s%@HOME@%${HOME}%g" \
             -e "s%@TICK_INTERVAL@%${TICK_INTERVAL}%g" \
             -e "s%@STATUS_INTERVAL@%${STATUS_INTERVAL}%g" \
             -e "s%@FACTORY_SLACK_CHANNEL_ID@%${channel_id}%g" \
-            -e "s%@HERMES_SLACK_BOT_TOKEN@%${slack_token}%g" "$tpl" > "$target"
+            -e "s%@HERMES_SLACK_BOT_TOKEN@%${slack_token}%g" \
+            -e "s%@GITHUB_WEBHOOK_SECRET@%${webhook_secret}%g" \
+            -e "s%@GH_REPOS@%${gh_repos}%g" "$tpl" > "$target"
         # launchctl rejects group/other-writable plists; force 0644 regardless of umask.
         chmod 0644 "$target"
     fi
