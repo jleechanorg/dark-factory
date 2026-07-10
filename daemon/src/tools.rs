@@ -125,6 +125,12 @@ impl Permission {
 pub struct PrComment {
     pub author: String,
     pub body: String,
+    /// Unix epoch (seconds) the comment was created, or 0 when unknown
+    /// (old offline snapshots, synthetic comments). jleechan-nplh: needed
+    /// so `/er` verdicts posted BEFORE the PR's current head was pushed can
+    /// be recognized as stale instead of short-circuiting re-verification.
+    #[serde(default)]
+    pub created_at_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -151,6 +157,17 @@ pub struct PrSnapshot {
     pub ci_status: String,
     pub coderabbit_status: String,
     pub ci_pending: bool,
+    /// Unix epoch (seconds) of the head commit's committer date, or 0 when
+    /// unknown. jleechan-nplh: the freshness floor for `/er` verdict
+    /// comments — a verdict older than this predates the code it claims to
+    /// verify. Committer date (not author date) is the best available proxy:
+    /// rebases and merges rewrite it. Known limitation (independent review,
+    /// PR#227): it is NOT the push date — a locally backdated commit pushed
+    /// later can leave a window where a verdict for a prior head still
+    /// clears the floor. GitHub exposes no reliable per-commit push
+    /// timestamp, so this floor narrows the stale-verdict hole rather than
+    /// closing it exactly.
+    pub head_committed_epoch: u64,
 }
 
 /// Parameters for spawning a new AO/`aow` session (design doc §4).

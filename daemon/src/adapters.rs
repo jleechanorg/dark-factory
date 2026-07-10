@@ -581,6 +581,7 @@ impl Scm for CliScm {
                     comments: Vec<crate::tools::PrComment>,
                     files: Vec<crate::tools::PrFile>,
                     updated_at_epoch: Option<u64>,
+                    head_committed_epoch: Option<u64>,
                 }
                 if let Ok(snap) = serde_json::from_str::<OfflinePrSnapshot>(&raw) {
                     let ci_status = if snap.ci_success { "green".to_string() } else { "red".to_string() };
@@ -600,6 +601,7 @@ impl Scm for CliScm {
                         ci_status,
                         coderabbit_status,
                         ci_pending: false,
+                        head_committed_epoch: snap.head_committed_epoch.unwrap_or(0),
                     });
                 }
             }
@@ -634,6 +636,12 @@ impl Scm for CliScm {
         struct GhComment {
             author: GhAuthor,
             body: String,
+            // jleechan-nplh: comment age, needed to filter stale `/er`
+            // verdicts against the head commit. Default-tolerated so a gh
+            // schema hiccup degrades to "age unknown" (epoch 0) rather than
+            // failing the whole snapshot.
+            #[serde(default, rename = "createdAt")]
+            created_at: String,
         }
         #[derive(serde::Deserialize, serde::Serialize, Clone)]
         struct GhAuthor {
@@ -703,6 +711,8 @@ impl Scm for CliScm {
                 struct RestComment {
                     user: Option<RestUser>,
                     body: String,
+                    #[serde(default)]
+                    created_at: String,
                 }
                 let rest_comments: Vec<RestComment> = serde_json::from_str(&comments_json).unwrap_or_default();
 
@@ -721,7 +731,7 @@ impl Scm for CliScm {
                     reviews: rest_reviews.into_iter().map(|r| GhReview { author: GhAuthor { login: r.user.map(|u| u.login).unwrap_or_default() }, state: r.state }).collect(),
                     head_ref_oid: rest_pr.head.sha,
                     body: rest_pr.body.unwrap_or_default(),
-                    comments: rest_comments.into_iter().map(|c| GhComment { author: GhAuthor { login: c.user.map(|u| u.login).unwrap_or_default() }, body: c.body }).collect(),
+                    comments: rest_comments.into_iter().map(|c| GhComment { author: GhAuthor { login: c.user.map(|u| u.login).unwrap_or_default() }, body: c.body, created_at: c.created_at }).collect(),
                     files: rest_files.into_iter().map(|f| GhFile { path: f.filename, additions: f.additions, deletions: f.deletions }).collect(),
                     updated_at: rest_pr.updated_at,
                 }
@@ -940,19 +950,28 @@ impl Scm for CliScm {
         let mut pr_comments: Vec<crate::tools::PrComment> = view.comments.into_iter().map(|c| crate::tools::PrComment {
             author: c.author.login,
             body: c.body,
+            created_at_epoch: crate::tools::iso8601_to_epoch(&c.created_at).unwrap_or(0),
         }).collect();
+
+        let updated_at_epoch = crate::tools::iso8601_to_epoch(&view.updated_at).unwrap_or(0);
 
         for c in &checks {
             if c.name.to_lowercase().contains("skeptic") {
+                // Synthetic comments derived from check-runs on the CURRENT
+                // head are fresh by construction; stamp them with the PR's
+                // updatedAt so the jleechan-nplh staleness filter never
+                // discards them as age-unknown.
                 if c.bucket == "pass" || c.state == "SUCCESS" {
                     pr_comments.push(crate::tools::PrComment {
                         author: "github-actions".to_string(),
                         body: "skeptic check run: verdict: pass".to_string(),
+                        created_at_epoch: updated_at_epoch,
                     });
                 } else if c.bucket == "fail" || c.state == "FAILURE" {
                     pr_comments.push(crate::tools::PrComment {
                         author: "github-actions".to_string(),
                         body: "skeptic check run: verdict: fail".to_string(),
+                        created_at_epoch: updated_at_epoch,
                     });
                 }
             }
@@ -964,7 +983,31 @@ impl Scm for CliScm {
             deletions: f.deletions,
         }).collect();
 
-        let updated_at_epoch = crate::tools::iso8601_to_epoch(&view.updated_at).unwrap_or(0);
+        // jleechan-nplh: the head commit's committer date is the freshness
+        // floor for `/er` verdict comments. Failure tolerated (epoch 0 =
+        // unknown = staleness filtering disabled) so a transient gh error
+        // can't take down the whole snapshot — same discipline as the
+        // unresolved-thread GraphQL fallback above.
+        let head_committed_epoch = run_tool(
+            "gh",
+            &[
+                "api",
+                &format!("repos/{}/commits/{}", self.repo, view.head_ref_oid),
+                "--jq",
+                ".commit.committer.date",
+            ],
+            30,
+        )
+        .ok()
+        .and_then(|out| crate::tools::iso8601_to_epoch(out.trim()))
+        .unwrap_or_else(|| {
+            eprintln!(
+                "[warn] failed to fetch head commit committer date for PR #{pr}; \
+                 /er staleness filtering disabled this snapshot"
+            );
+            0
+        });
+
         let ci_pending = ci_status == "unknown";
         let snapshot = PrSnapshot {
             pr_number: pr,
@@ -981,6 +1024,7 @@ impl Scm for CliScm {
             ci_status,
             coderabbit_status,
             ci_pending,
+            head_committed_epoch,
         };
         {
             let mut cache = self.pr_snapshot_cache.lock().unwrap();
