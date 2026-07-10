@@ -2,8 +2,8 @@
 # Idempotent installer for dark-factory launchd agents.
 #
 # Discovers every *.plist.template under daemon/launchd/, substitutes
-# @HOME@, @TICK_INTERVAL@, @FACTORY_SLACK_CHANNEL_ID@, and
-# @HERMES_SLACK_BOT_TOKEN@ (the latter two for the #factory Slack wiring),
+# @HOME@, @TICK_INTERVAL@, @STATUS_INTERVAL@, @FACTORY_SLACK_CHANNEL_ID@,
+# and @HERMES_SLACK_BOT_TOKEN@ (the latter two for the #factory Slack wiring),
 # copies the result to $HOME/Library/LaunchAgents/<basename>.plist with mode
 # 0644, and bootstrap/bootout handles the launchd lifecycle.
 #
@@ -19,6 +19,8 @@
 # Environment:
 #   AFD_TICK_INTERVAL_SEC     optional override for the af-tick StartInterval
 #                             (default 240). Read by ai.dark-factory.af-tick.plist.template.
+#   AFD_STATUS_INTERVAL_SEC   optional override for the status-cron StartInterval
+#                             (default 300). Read by ai.dark-factory.status-cron.plist.template.
 #   HERMES_SLACK_BOT_TOKEN    optional Slack bot token (xoxb-...). Read from the
 #                             operator's environment. If unset, falls back to
 #                             /usr/local/etc/hermes-token (mode 0600, $USER-readable).
@@ -118,13 +120,14 @@ ensure_log_dir() {
 # Installer-managed placeholders:
 #   @HOME@                       always substituted from $HOME
 #   @TICK_INTERVAL@               substituted from AFD_TICK_INTERVAL_SEC
+#   @STATUS_INTERVAL@             substituted from AFD_STATUS_INTERVAL_SEC
 #   @FACTORY_SLACK_CHANNEL_ID@    substituted from $FACTORY_SLACK_CHANNEL_ID
 #                                 (default C0BGEC77EP4 — public channel id)
 #   @HERMES_SLACK_BOT_TOKEN@      substituted from $HERMES_SLACK_BOT_TOKEN
 #                                 or /usr/local/etc/hermes-token (operator-only);
 #                                 if both are empty, templates that require it
 #                                 are skipped with a clear error.
-ALLOWED_PLACEHOLDERS='@HOME@|@TICK_INTERVAL@|@FACTORY_SLACK_CHANNEL_ID@|@HERMES_SLACK_BOT_TOKEN@'
+ALLOWED_PLACEHOLDERS='@HOME@|@TICK_INTERVAL@|@STATUS_INTERVAL@|@FACTORY_SLACK_CHANNEL_ID@|@HERMES_SLACK_BOT_TOKEN@'
 validate_template_placeholders() {
     local tpl="$1"
     local bad
@@ -170,6 +173,19 @@ case "$TICK_INTERVAL" in
 esac
 if [ "$TICK_INTERVAL" -lt 10 ]; then
     echo "[error] AFD_TICK_INTERVAL_SEC=$TICK_INTERVAL is too low (minimum 10s)" >&2
+    exit 2
+fi
+
+# Resolve the status-cron interval from env, defaulting to 300s. Validate as positive int.
+STATUS_INTERVAL="${AFD_STATUS_INTERVAL_SEC:-300}"
+case "$STATUS_INTERVAL" in
+    ''|*[!0-9]*)
+        echo "[error] AFD_STATUS_INTERVAL_SEC must be a positive integer (got: $STATUS_INTERVAL)" >&2
+        exit 2
+        ;;
+esac
+if [ "$STATUS_INTERVAL" -lt 30 ]; then
+    echo "[error] AFD_STATUS_INTERVAL_SEC=$STATUS_INTERVAL is too low (minimum 30s)" >&2
     exit 2
 fi
 
@@ -235,11 +251,12 @@ install_one() {
 
     # Render template -> target via sed. Use % as delimiter so $HOME |'s survive.
     if [ "$DRY_RUN" -eq 1 ]; then
-        printf '[dry-run] sed -e s%%@HOME@%%%s%%g -e s%%@TICK_INTERVAL@%%%s%%g -e s%%@FACTORY_SLACK_CHANNEL_ID@%%%s%%g -e s%%@HERMES_SLACK_BOT_TOKEN@%%<token len=%d>%%g %s > %s\n' \
-            "$HOME" "$TICK_INTERVAL" "$channel_id" "${#slack_token}" "$tpl" "$target"
+        printf '[dry-run] sed -e s%%@HOME@%%%s%%g -e s%%@TICK_INTERVAL@%%%s%%g -e s%%@STATUS_INTERVAL@%%%s%%g -e s%%@FACTORY_SLACK_CHANNEL_ID@%%%s%%g -e s%%@HERMES_SLACK_BOT_TOKEN@%%<token len=%d>%%g %s > %s\n' \
+            "$HOME" "$TICK_INTERVAL" "$STATUS_INTERVAL" "$channel_id" "${#slack_token}" "$tpl" "$target"
     else
         sed -e "s%@HOME@%${HOME}%g" \
             -e "s%@TICK_INTERVAL@%${TICK_INTERVAL}%g" \
+            -e "s%@STATUS_INTERVAL@%${STATUS_INTERVAL}%g" \
             -e "s%@FACTORY_SLACK_CHANNEL_ID@%${channel_id}%g" \
             -e "s%@HERMES_SLACK_BOT_TOKEN@%${slack_token}%g" "$tpl" > "$target"
         # launchctl rejects group/other-writable plists; force 0644 regardless of umask.
