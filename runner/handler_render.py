@@ -23,6 +23,7 @@ Substitutions (in order):
 
 from __future__ import annotations
 
+import json
 import pathlib
 from typing import TYPE_CHECKING
 
@@ -59,7 +60,19 @@ def _substitute_placeholders(text: str, ctx: "Context") -> str:
     """
     text = text.replace("${goal}", ctx.goal)
     for k, v in ctx.state.items():
-        text = text.replace("${state." + k + "}", v)
+        placeholder = "${state." + k + "}"
+        if placeholder not in text:
+            continue
+        # Coerce non-str values to string for substitution. This defends against
+        # ctx.state values that are not strings (e.g., dicts stored by
+        # _resolve_gate_backend in handler_dispatch.py).
+        if isinstance(v, str):
+            rendered = v
+        elif isinstance(v, (dict, list)):
+            rendered = json.dumps(v, sort_keys=True)
+        else:
+            rendered = str(v)
+        text = text.replace(placeholder, rendered)
     diff = ctx.state.get("_last_diff", "")
     if not diff:
         diff = "(no diff captured)"

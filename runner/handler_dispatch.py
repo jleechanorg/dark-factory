@@ -30,6 +30,7 @@ still take effect.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -717,7 +718,18 @@ def _resolve_gate_backend(node: "Node", ctx: "Context") -> tuple[str, dict[str, 
             # the verdict, not the resolver.
             prior_key = f"{node.name}.resolved_backend"
             prior = ctx.state.get(prior_key)
-            prior_meta = ctx.state.get(f"{node.name}.resolved_backend_meta") or {}
+            # Read-back tolerates both legacy dict and JSON string (for backward
+            # compatibility during rollout). Malformed values fall back to {}.
+            raw_meta = ctx.state.get(f"{node.name}.resolved_backend_meta")
+            if isinstance(raw_meta, str):
+                try:
+                    prior_meta = json.loads(raw_meta)
+                except (json.JSONDecodeError, TypeError):
+                    prior_meta = {}
+            elif isinstance(raw_meta, dict):
+                prior_meta = raw_meta
+            else:
+                prior_meta = {}
             if prior and prior_meta.get("reviewer_backend_resolution") == "priority_queue":
                 return prior, prior_meta
             # When prefer_adversarial is set, exclude the run-level coder
@@ -737,7 +749,9 @@ def _resolve_gate_backend(node: "Node", ctx: "Context") -> tuple[str, dict[str, 
             ctx.state[prior_key] = resolved
             pq_meta["prefer_adversarial"] = "true" if prefer_adversarial else "false"
             pq_meta["reviewer_backend_resolution"] = "priority_queue"
-            ctx.state[f"{node.name}.resolved_backend_meta"] = dict(pq_meta)
+            # Store as JSON string to satisfy the contract that ctx.state values
+            # are strings (required by handler_render._substitute_placeholders).
+            ctx.state[f"{node.name}.resolved_backend_meta"] = json.dumps(pq_meta, sort_keys=True)
             return resolved, pq_meta
     if "backend" in node.attrs:
         return str(node.attrs["backend"]), {"reviewer_backend_resolution": "explicit"}

@@ -11,7 +11,9 @@ behavior is aligned with existing lanes (`_resolve_gate_backend`,
 from __future__ import annotations
 
 import json
-
+import pathlib
+import time
+import hashlib
 from typing import TYPE_CHECKING
 
 import runner.handlers as _handlers_shim
@@ -53,6 +55,60 @@ def _parse_shadow_backends(ctx: "Context") -> list[str]:
     if not isinstance(raw, str):
         raw = str(raw)
     return _parse_priority_env(raw)
+
+
+def _check_stale_artifacts(workdir: pathlib.Path, ctx: "Context") -> list[str]:
+    """Check for stale spec artifacts from prior runs and return warning messages.
+
+    This defends against Bug 2: a prior errored run can leave stale spec.md or
+    explore-*.md files that cause the reviewer to emit a verdict contradicting
+    the current run's outcome.
+    """
+    warnings = []
+    current_run_id = getattr(ctx, "run_id", None) or ""
+
+    # Check spec.md files for run_id annotation
+    spec_paths = [
+        workdir / "spec.md",
+        workdir / ".dark-factory" / "spec.md",
+    ]
+    for spec_path in spec_paths:
+        if spec_path.exists():
+            try:
+                content = spec_path.read_text()
+                # Check if spec has a run_id annotation (written by plan node)
+                run_id_marker = "<!-- run_id: "
+                if run_id_marker in content:
+                    # Extract run_id from annotation
+                    start = content.find(run_id_marker) + len(run_id_marker)
+                    end = content.find(" -->", start)
+                    if end > start:
+                        spec_run_id = content[start:end]
+                        if spec_run_id != current_run_id and current_run_id:
+                            warnings.append(
+                                f"STALE spec at {spec_path.name}: created by run {spec_run_id}, "
+                                f"current run is {current_run_id}"
+                            )
+                else:
+                    # No run_id annotation - could be stale from before this fix
+                    content_hash = hashlib.sha256(content.encode()).hexdigest()[:8]
+                    warnings.append(f"spec at {spec_path.name} has no run_id annotation (hash: {content_hash})")
+            except Exception:
+                pass
+
+    # Check for stale explore-*.md files (modified in last 5 minutes = likely stale)
+    df_dir = workdir / ".dark-factory"
+    if df_dir.exists():
+        for md_file in df_dir.glob("explore-*.md"):
+            try:
+                mtime = md_file.stat().st_mtime
+                age_seconds = time.time() - mtime
+                if age_seconds < 300:  # Less than 5 minutes old - could be stale
+                    warnings.append(f"recent explore artifact: {md_file.name} ({age_seconds:.0f}s old)")
+            except Exception:
+                pass
+
+    return warnings
 
 
 def _run_primary_review(
@@ -160,8 +216,65 @@ def _coalesce_parallel_outcome(primary: str, shadows: list[str]) -> str:
     return "failure"
 
 
+def _enforce_outcome_verdict_consistency(result: "Result") -> "Result":
+    """Enforce that verdict matches outcome to prevent contradictory reporting.
+
+    Bug 2: When stale spec artifacts from a prior errored run cause the reviewer
+    to read outdated content, it can emit outcome=failure with verdict=pass (or vice versa).
+    This function normalizes verdict to match outcome so they never contradict.
+    """
+    outcome = result.outcome
+    verdict = result.metadata.get("verdict", "").lower() if result.metadata else ""
+
+    # Map outcome to expected verdict
+    outcome_to_verdict = {
+        "success": "pass",
+        "failure": "fail",
+        "error": "fail",  # Error is a failure mode
+        "partial": "fail",
+    }
+
+    expected_verdict = outcome_to_verdict.get(outcome, "fail")
+
+    if verdict and verdict != expected_verdict:
+        # Inconsistent! Fix the verdict to match outcome
+        md = dict(result.metadata)
+        md["verdict"] = expected_verdict
+        md["verdict_adjusted_for_consistency"] = "true"
+        md["original_verdict"] = verdict
+        return Result(
+            outcome=result.outcome,
+            output=result.output,
+            metadata=md,
+            preferred_label=result.preferred_label,
+            suggested_next_ids=result.suggested_next_ids,
+            context_updates=result.context_updates,
+        )
+
+    return result
+
+
 def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
+    # Bug 2 fix: Check for stale spec artifacts before running review.
+    # If stale artifacts are detected, inject a warning into the prompt so the
+    # reviewer can account for potentially stale content.
+    stale_warnings = _check_stale_artifacts(ctx.workdir, ctx)
+    if stale_warnings:
+        # Store warnings in state for downstream nodes and emit observability event
+        ctx.state["_stale_artifact_warnings"] = "\n".join(stale_warnings)
+        try:
+            from . import engine_observability as _obs
+            seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
+            _obs._emit_event(
+                ctx,
+                "stale_artifact_warning",
+                {"node": node.name, "warnings": stale_warnings},
+                seq,
+            )
+        except Exception:
+            pass
+
     prompt = _handlers_shim._render_prompt(node, ctx)
     if ctx.backend in ("echo", "mock_llm"):
         hint = ctx.state.get(f"{node.name}.outcome", "success")
@@ -214,6 +327,10 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     primary.metadata.update(backend_meta)
 
     if not shadows:
+        # Bug 2 fix: Ensure outcome and verdict are consistent. A contradictory
+        # verdict (e.g., outcome=failure with verdict=pass) can occur when stale
+        # spec artifacts cause the reviewer to misjudge. Force verdict to match outcome.
+        primary = _enforce_outcome_verdict_consistency(primary)
         return primary
 
     result = primary
@@ -234,7 +351,8 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     merged_metadata["parallel_reviewer_shadow_backends"] = ",".join(s.backend for s in shadows)
     merged_metadata["shadow_reviews"] = json.dumps(shadow_reviews, sort_keys=True)
     merged_metadata["parallel_reviewer_outcome"] = final_outcome
-    return Result(
+    # Build result and enforce outcome/verdict consistency
+    final_result = Result(
         outcome=final_outcome,
         output=result.output,
         metadata=merged_metadata,
@@ -242,3 +360,4 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         suggested_next_ids=result.suggested_next_ids,
         context_updates=result.context_updates,
     )
+    return _enforce_outcome_verdict_consistency(final_result)
