@@ -64,20 +64,34 @@
     <string>@HOME@/Library/Logs/dark-factory/af-tick.err.log</string>
 
     <!--
-      Optional Slack #factory notifications. libnotify-slack.sh no-ops when
-      either variable is empty, so leaving these unset keeps the daemon
-      running normally — it just won't post to Slack.
+      Slack #factory notifications. libnotify-slack.sh no-ops when
+      HERMES_SLACK_BOT_TOKEN is empty, so leaving the token unset keeps the
+      daemon running normally — it just won't post to Slack.
+
+      FACTORY_SLACK_CHANNEL_ID is committed literally because Slack channel
+      ids are NOT secrets (they are public identifiers shown in URLs). The
+      current channel id (C0BGEC77EP4) corresponds to the #factory channel
+      created on 2026-07-09 via Slack API in team T09FXQ4LCQP.
 
       HOW TO ENABLE (operator-only; NEVER commit a real token):
-        1. Create the #factory channel in Slack UI and copy the C0… id.
-        2. Run install-launchagents.sh, which substitutes @FACTORY_SLACK_CHANNEL_ID@
-           and @HERMES_SLACK_BOT_TOKEN@ from your environment (e.g. 1Password CLI).
-        3. Verify with: launchctl print gui/$UID/ai.dark-factory.af-tick | grep -A2 EnvironmentVariables
+        1. #factory already exists with id C0BGEC77EP4 — no operator action.
+        2. Set HERMES_SLACK_BOT_TOKEN in your shell environment (or place it
+           in /usr/local/etc/hermes-token readable by $USER) and run
+           install-launchagents.sh, which substitutes the @HERMES_SLACK_BOT_TOKEN@
+           placeholder into the rendered plist. The script refuses to write a
+           plist with an empty token.
+        3. Verify with:
+             launchctl print gui/$UID/ai.dark-factory.af-tick | grep -A4 EnvironmentVariables
+           The token value will be visible to the running user only; do not
+           cat the rendered plist in a shared screen.
     -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>FACTORY_SLACK_CHANNEL_ID</key>
-        <string>@FACTORY_SLACK_CHANNEL_ID@</string>
+        <string>C0BGEC77EP4</string>
+        <!-- @HERMES_SLACK_BOT_TOKEN@ is substituted at install time by
+             install-launchagents.sh from the operator's environment (or
+             /usr/local/etc/hermes-token). Do NOT commit a real token. -->
         <key>HERMES_SLACK_BOT_TOKEN</key>
         <string>@HERMES_SLACK_BOT_TOKEN@</string>
     </dict>

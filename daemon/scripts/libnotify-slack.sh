@@ -12,15 +12,56 @@
 #                           Falls back to thread_ts=$FACTORY_SLACK_THREAD_TS if
 #                           set (so tick output stays in a single topic).
 #
+# Self-test:
+#   When invoked as `libnotify-slack.sh --selftest`, prints
+#   "OK selftest channel=<id>" without posting (unless HERMES_SELFTEST_POST=1,
+#   in which case it actually calls slack_post to verify end-to-end wiring).
+#
 # Env:
 #   HERMES_SLACK_BOT_TOKEN  xoxb-... token (also falls back to SLACK_BOT_TOKEN).
 #   FACTORY_SLACK_CHANNEL_ID  C0... channel (e.g. #factory).
 #   FACTORY_SLACK_THREAD_TS  optional — reply in this thread instead of top-level.
 #   FACTORY_SLACK_ASYNC=1   post in background (default 1; safe for tick loop).
 #   FACTORY_SLACK_TIMEOUT   curl timeout seconds (default 5).
+#   HERMES_SELFTEST_POST=1  (selftest only) actually POST instead of dry-print.
 #
 # Pattern source: ~/bin/monitor-agent.sh line ~2519 (chat.postMessage curl).
 set -u
+
+# When run as a script (not sourced), handle --selftest and exit. When sourced,
+# these branches are skipped because $0 is the parent shell, not this file.
+if [ "${BASH_SOURCE[0]:-}" = "${0:-}" ]; then
+    case "${1:-}" in
+        --selftest)
+            # Default #factory channel (must match install-launchagents.sh default).
+            SELFTEST_CHANNEL="${FACTORY_SLACK_CHANNEL_ID:-C0BGEC77EP4}"
+            if [ -z "${HERMES_SLACK_BOT_TOKEN:-}" ] && [ "${HERMES_SELFTEST_POST:-0}" != "1" ]; then
+                echo "OK selftest channel=${SELFTEST_CHANNEL} (no token; dry-print only)"
+                exit 0
+            fi
+            if [ "${HERMES_SELFTEST_POST:-0}" = "1" ]; then
+                HERMES_SLACK_BOT_TOKEN="${HERMES_SLACK_BOT_TOKEN:-fake-selftest-token}"
+                FACTORY_SLACK_CHANNEL_ID="$SELFTEST_CHANNEL"
+                slack_post "[selftest] libnotify-slack.sh --selftest at $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
+                echo "OK selftest channel=${SELFTEST_CHANNEL} (HERMES_SELFTEST_POST=1; actual post attempted)"
+            else
+                echo "OK selftest channel=${SELFTEST_CHANNEL}"
+            fi
+            exit 0
+            ;;
+        -h|--help)
+            cat <<EOF
+libnotify-slack.sh — Slack poster for the dark-factory daemon.
+
+Usage as a script:
+  libnotify-slack.sh --selftest    dry-print; pass HERMES_SELFTEST_POST=1 to actually post
+
+When sourced (the normal usage), exports slack_capable, slack_post, slack_announce.
+EOF
+            exit 0
+            ;;
+    esac
+fi
 
 slack_token() {
     printf '%s' "${HERMES_SLACK_BOT_TOKEN:-${SLACK_BOT_TOKEN:-}}"
