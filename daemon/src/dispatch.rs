@@ -376,6 +376,7 @@ mod tests {
         // returning a session whose live branch does NOT match what was
         // requested (the wa-3004 contamination scenario).
         scripted_branch: RefCell<HashMap<String, String>>,
+        spawned_prompts: RefCell<Vec<String>>,
     }
 
     impl FakeSessions {
@@ -388,6 +389,7 @@ mod tests {
                 fail_spawn_deferred_for: RefCell::new(Vec::new()),
                 fail_stop_for: RefCell::new(Vec::new()),
                 scripted_branch: RefCell::new(HashMap::new()),
+                spawned_prompts: RefCell::new(Vec::new()),
             }
         }
 
@@ -430,6 +432,7 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("spawn({})", spec.bead_id));
+            self.spawned_prompts.borrow_mut().push(spec.prompt.clone());
             if self.fail_spawn_fatal_for.borrow().contains(&spec.bead_id) {
                 return Err(DaemonError::Parse(format!(
                     "scripted fatal spawn failure for {}",
@@ -791,6 +794,40 @@ mod tests {
         let overlay = store.load("bead-0").unwrap().unwrap();
         assert_eq!(overlay.state, OverlayState::Dispatched);
         assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
+    }
+
+    #[test]
+    fn dispatched_prompt_requires_factory_commit_prefix_and_pr_label() {
+        // jleechan (this session): factory-vs-manual commit/PR provenance
+        // was previously indistinguishable — a factory-driven PR looked
+        // identical to a human-driven one unless someone happened to check
+        // branch naming. The dispatch prompt must instruct the coder to
+        // (a) prefix every commit subject with "factory/<bead-id>: " and
+        // (b) attach a "factory" GitHub PR label at PR-open time, so
+        // provenance is visible in `git log`, PR lists, and PR search
+        // without needing to inspect branch names or the daemon's own
+        // internal state.
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(report.success_count(), 1);
+
+        let prompts = sessions.spawned_prompts.borrow();
+        assert_eq!(prompts.len(), 1);
+        let prompt = &prompts[0];
+        assert!(
+            prompt.contains("factory/bead-0:"),
+            "prompt must instruct the required commit subject prefix \
+             'factory/<bead-id>: ', got: {prompt}"
+        );
+        assert!(
+            prompt.contains("--add-label factory") || prompt.contains("--label factory"),
+            "prompt must instruct attaching the 'factory' GitHub PR label, \
+             got: {prompt}"
+        );
     }
 
     #[test]
