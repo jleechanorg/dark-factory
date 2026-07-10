@@ -62,5 +62,24 @@
 
     <key>StandardErrorPath</key>
     <string>@HOME@/Library/Logs/dark-factory/af-tick.err.log</string>
+
+    <!--
+      Optional Slack #factory notifications. libnotify-slack.sh no-ops when
+      either variable is empty, so leaving these unset keeps the daemon
+      running normally — it just won't post to Slack.
+
+      HOW TO ENABLE (operator-only; NEVER commit a real token):
+        1. Create the #factory channel in Slack UI and copy the C0… id.
+        2. Run install-launchagents.sh, which substitutes @FACTORY_SLACK_CHANNEL_ID@
+           and @HERMES_SLACK_BOT_TOKEN@ from your environment (e.g. 1Password CLI).
+        3. Verify with: launchctl print gui/$UID/ai.dark-factory.af-tick | grep -A2 EnvironmentVariables
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>FACTORY_SLACK_CHANNEL_ID</key>
+        <string>@FACTORY_SLACK_CHANNEL_ID@</string>
+        <key>HERMES_SLACK_BOT_TOKEN</key>
+        <string>@HERMES_SLACK_BOT_TOKEN@</string>
+    </dict>
 </dict>
 </plist>
