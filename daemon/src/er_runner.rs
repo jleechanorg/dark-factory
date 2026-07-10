@@ -37,7 +37,13 @@ pub const MAX_ER_RUNNER_ATTEMPTS: u32 = 3;
 pub const ER_RUNNER_COOLDOWN_SECS: u64 = 300;
 
 /// Wall-clock timeout for the spawned reviewer subprocess.
-pub const ER_RUNNER_TIMEOUT_SECS: u64 = 120;
+///
+/// jleechan-hhmb: raised from 120s in lockstep with tick.rs's
+/// `REVIEWER_TIMEOUT_SECS` — the /er reviewer does the same class of
+/// `gh`-backed end-to-end PR investigation as the gate-7 skeptic, which
+/// was live-measured at 2m27s on a 50-file PR (the old 120s cap killed it
+/// every cycle).
+pub const ER_RUNNER_TIMEOUT_SECS: u64 = 300;
 
 /// Telemetry event names (mirrored in `factory-overlay.sh` and the CXDB
 /// consumers). Kept as `&'static str` so the `emit` call in tick.rs needs

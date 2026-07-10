@@ -1261,6 +1261,20 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 /// has no wired `/er` runner yet, so `er_verdict` is honestly `Absent` (gate 6
 /// -> `Unknown`, never a guessed `Pass`) until a real `/er` invocation is
 /// wired in (bead jleechan-3rf, verifier.rs `evidence_floor_gate`).
+/// Wall-clock timeout for one gate-7 reviewer subprocess, every vendor.
+///
+/// jleechan-hhmb: 120s (codex/claude/agy) killed every GENUINE review — a
+/// real end-to-end skeptic pass over a 50-file PR does `gh`-backed
+/// investigation (diff, checks, comments) before answering. Live-measured
+/// 2026-07-10: the exact claude invocation took 2m27s on
+/// worldarchitect.ai#7888 and was SIGTERM'd by the old limit every cycle,
+/// which — with codex quota-exhausted, agy returning empty stdout, and
+/// gemini UNSUPPORTED_CLIENT (jleechan-yige) — made "both reviewers failed
+/// to produce a parseable verdict" a permanent state. 300s ≈ 2× the
+/// measured duration, same headroom philosophy as gemini's earlier
+/// 110s→150s sizing (PR#216).
+const REVIEWER_TIMEOUT_SECS: u64 = 300;
+
 /// Dispatch one independent reviewer subprocess by vendor name. Extracted
 /// from `skeptic_evidence` so two vendors can be dispatched in parallel
 /// threads (PR#163 finding 2) without duplicating the per-vendor argv
@@ -1271,7 +1285,7 @@ fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> 
         "codex" => run_tool(
             "codex",
             &["exec", "--yolo", "--skip-git-repo-check", prompt],
-            120,
+            REVIEWER_TIMEOUT_SECS,
         ),
         "claude" => {
             let home = std::env::var("HOME").unwrap_or_default();
@@ -1290,13 +1304,13 @@ fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> 
                     "",
                     prompt,
                 ],
-                120,
+                REVIEWER_TIMEOUT_SECS,
             )
         }
         "agy" => run_tool(
             "agy",
             &["--print", "--dangerously-skip-permissions", prompt],
-            120,
+            REVIEWER_TIMEOUT_SECS,
         ),
         // jleechan-bkru: 4th reviewer vendor, added after a live 2026-07-09
         // incident where codex+claude+agy were ALL simultaneously
@@ -1307,11 +1321,12 @@ fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> 
         // `agy` (Antigravity). `--yolo` auto-approves tool calls (gemini's
         // equivalent of `--dangerously-skip-permissions`); `--skip-trust`
         // is required in headless/non-interactive contexts or the CLI
-        // refuses to run with a "not a trusted directory" error. 150s
-        // timeout (vs. 120s for the other three vendors): live-tested
-        // real-prompt runs took up to ~110s doing genuine `gh`-backed
-        // investigation via tool calls, so 150s leaves headroom.
-        "gemini" => run_tool("gemini", &["-p", prompt, "--yolo", "--skip-trust"], 150),
+        // refuses to run with a "not a trusted directory" error.
+        "gemini" => run_tool(
+            "gemini",
+            &["-p", prompt, "--yolo", "--skip-trust"],
+            REVIEWER_TIMEOUT_SECS,
+        ),
         other => Err(DaemonError::Tool {
             tool: other.to_string(),
             rc: -1,
