@@ -216,49 +216,57 @@ def _coalesce_parallel_outcome(primary: str, shadows: list[str]) -> str:
     return "failure"
 
 
-def _enforce_outcome_verdict_consistency(result: "Result") -> "Result":
+def _enforce_outcome_verdict_consistency(result: "Result", *, gate_strict: bool = False) -> "Result":
     """Enforce that verdict matches outcome to prevent contradictory reporting.
 
     Bug 2: When stale spec artifacts from a prior errored run cause the reviewer
     to read outdated content, it can emit outcome=failure with verdict=pass (or vice versa).
-    This function normalizes verdict to match outcome so they never contradict.
+    This function uses real normalization via _normalize_outcome and only rewrites on a GENUINE
+    disagreement between outcome and normalized verdict.
     """
+    # Lazy import to avoid circular import at module load time
+    from .handler_verdict import _normalize_outcome, _VERDICT_NORMALIZE
+
+    md = result.metadata or {}
+    raw_original = str(md.get("verdict", ""))
+    raw = raw_original.strip().lower()
+    # Only reason about RECOGNIZED verdict tokens. Sentinels / unparseable / echo verdicts
+    # ("", "unknown", "echo:success", "infra_failure", …) are NOT in the vocabulary — leave them
+    # untouched; we cannot judge a contradiction we cannot normalize.
+    if raw not in _VERDICT_NORMALIZE:
+        return result
     outcome = result.outcome
-    verdict = result.metadata.get("verdict", "").lower() if result.metadata else ""
-
-    # Map outcome to expected verdict
-    outcome_to_verdict = {
-        "success": "pass",
-        "failure": "fail",
-        "error": "fail",  # Error is a failure mode
-        "partial": "fail",
-    }
-
-    expected_verdict = outcome_to_verdict.get(outcome, "fail")
-
-    if verdict and verdict != expected_verdict:
-        # Inconsistent! Fix the verdict to match outcome
-        md = dict(result.metadata)
-        md["verdict"] = expected_verdict
-        md["verdict_adjusted_for_consistency"] = "true"
-        md["original_verdict"] = verdict
-        return Result(
-            outcome=result.outcome,
-            output=result.output,
-            metadata=md,
-            preferred_label=result.preferred_label,
-            suggested_next_ids=result.suggested_next_ids,
-            context_updates=result.context_updates,
-        )
-
-    return result
+    # _normalize_outcome only yields success/failure. "error" is an infra state, not a verdict
+    # disagreement, so never rewrite on an error outcome.
+    if outcome not in ("success", "failure"):
+        return result
+    normalized = _normalize_outcome(raw, gate_strict=gate_strict)
+    if normalized == outcome:
+        # verdict is CONSISTENT with outcome (e.g. warn→success, approve→success, partial→failure).
+        # Preserve the raw token EXACTLY — no adjustment.
+        return result
+    # Genuine contradiction (e.g. outcome=failure but verdict normalizes to success). Rewrite the
+    # verdict to a canonical token matching the outcome, preserving the original for audit.
+    new_verdict = "pass" if outcome == "success" else "fail"
+    new_md = dict(md)
+    new_md["verdict"] = new_verdict
+    new_md["verdict_adjusted_for_consistency"] = "true"
+    new_md["original_verdict"] = raw_original
+    return Result(
+        outcome=result.outcome,
+        output=result.output,
+        metadata=new_md,
+        preferred_label=result.preferred_label,
+        suggested_next_ids=result.suggested_next_ids,
+        context_updates=result.context_updates,
+    )
 
 
 def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     # Bug 2 fix: Check for stale spec artifacts before running review.
-    # If stale artifacts are detected, inject a warning into the prompt so the
-    # reviewer can account for potentially stale content.
+    # If stale artifacts are detected, record the warning in ctx.state and emit
+    # a stale_artifact_warning event for observability; it does NOT modify the prompt.
     stale_warnings = _check_stale_artifacts(ctx.workdir, ctx)
     if stale_warnings:
         # Store warnings in state for downstream nodes and emit observability event
@@ -330,7 +338,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         # Bug 2 fix: Ensure outcome and verdict are consistent. A contradictory
         # verdict (e.g., outcome=failure with verdict=pass) can occur when stale
         # spec artifacts cause the reviewer to misjudge. Force verdict to match outcome.
-        primary = _enforce_outcome_verdict_consistency(primary)
+        primary = _enforce_outcome_verdict_consistency(primary, gate_strict=gate_strict)
         return primary
 
     result = primary
@@ -360,4 +368,4 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         suggested_next_ids=result.suggested_next_ids,
         context_updates=result.context_updates,
     )
-    return _enforce_outcome_verdict_consistency(final_result)
+    return _enforce_outcome_verdict_consistency(final_result, gate_strict=gate_strict)
