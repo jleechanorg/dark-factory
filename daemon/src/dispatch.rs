@@ -132,8 +132,8 @@ pub fn dispatch_ready(
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
+                pre_session_head_sha: None,
+                park_reason: None,
             },
             Err(err) if err.is_transient() => {
                 report
@@ -179,7 +179,7 @@ pub fn dispatch_ready(
             return Err(err);
         }
 
-        let prompt = match verdict {
+        let prompt_body = match verdict {
             RoutingVerdict::ResearchPath => {
                 format!(
                     "Route to RESEARCH_PATH: Run /factory with pipelines/slim/minimal_research.dot to research: {}",
@@ -194,6 +194,22 @@ pub fn dispatch_ready(
             }
             _ => bead.title.clone(),
         };
+
+        // jleechan (this session): factory-driven and human-driven commits
+        // /PRs were previously indistinguishable without inspecting branch
+        // naming or the daemon's own internal CXDB state. Append explicit
+        // provenance instructions to every dispatch prompt so it's visible
+        // in `git log` (commit subject prefix) and PR lists/search (GitHub
+        // label) without needing daemon-internal knowledge.
+        let commit_prefix = format!("factory/{}: ", bead.id);
+        let provenance_note = format!(
+            "Provenance requirement (factory-dispatched work): prefix every commit \
+subject with '{commit_prefix}' (distinct from a manually-invoked session's \
+'claude/<model>: ' prefix). When opening the PR, attach the 'factory' GitHub \
+label (gh pr edit <PR> --add-label factory; create the label first with \
+'gh label create factory --color ededed' if it does not exist in this repo)."
+        );
+        let prompt = format!("{prompt_body}\n\n{provenance_note}");
 
         let spec = SpawnSpec {
             bead_id: bead.id.clone(),
@@ -779,8 +795,8 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
+                pre_session_head_sha: None,
+                park_reason: None,
             })
             .unwrap();
         let cfg = cfg();

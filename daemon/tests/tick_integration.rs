@@ -2458,13 +2458,20 @@ fn newly_intaken_bead_dispatch_uses_real_tracker_title() {
     assert_eq!(summary.beads_created, 1);
     assert_eq!(summary.beads_dispatched, 1);
     let prompts = sessions.spawn_prompts.borrow();
-    assert_eq!(
-        prompts.as_slice(),
-        &[(
-            "fake-bead-1".to_string(),
-            "Wire a durable Linux trigger (owner/repo)".to_string()
-        )],
-        "new intake must dispatch the real tracker title, not an empty stub prompt"
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].0, "fake-bead-1");
+    assert!(
+        prompts[0]
+            .1
+            .starts_with("Wire a durable Linux trigger (owner/repo)"),
+        "new intake must dispatch the real tracker title, not an empty stub prompt; got: {}",
+        prompts[0].1
+    );
+    assert!(
+        prompts[0].1.contains("factory/fake-bead-1: "),
+        "dispatch prompt must carry the factory commit-prefix provenance \
+instruction; got: {}",
+        prompts[0].1
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
