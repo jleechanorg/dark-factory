@@ -71,6 +71,7 @@ fn fake_scm_returns_scripted_permission_and_records_call() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+            head_committed_epoch: 0,
         },
     );
 

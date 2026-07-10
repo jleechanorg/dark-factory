@@ -110,9 +110,15 @@ pub fn maybe_run(
         _ => return Ok(Outcome::NotApplicable),
     };
 
-    // 2. Already posted? (idempotence)
+    // 2. Already posted? (idempotence) — jleechan-nplh: only a verdict
+    //    posted at/after the CURRENT head commit counts. A verdict that
+    //    predates the head verified code that no longer exists; treating it
+    //    as valid would short-circuit re-verification forever (live
+    //    incident: worldarchitect.ai#7888, a 2026-07-08 PASS suppressed
+    //    re-review of a 2026-07-10 head ~100 commits later).
     let snapshot = deps.scm.pr_snapshot(pr)?;
-    let existing = verifier::parse_er_verdict(&snapshot.comments);
+    let existing =
+        verifier::parse_er_verdict_since(&snapshot.comments, snapshot.head_committed_epoch);
     if existing != ErVerdict::Absent {
         return Ok(Outcome::AlreadyPosted(existing));
     }
@@ -233,6 +239,7 @@ pub fn comments_with_verdict(text: &str) -> Vec<PrComment> {
     vec![PrComment {
         author: "dark-factory-er".into(),
         body: text.into(),
+        created_at_epoch: 0,
     }]
 }
 
@@ -254,6 +261,7 @@ pub fn snapshot_with_comments(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         ci_status: "green".into(),
         coderabbit_status: "green".into(),
         ci_pending: false,
+        head_committed_epoch: 0,
     }
 }
 

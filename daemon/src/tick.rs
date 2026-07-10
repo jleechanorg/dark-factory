@@ -1929,7 +1929,13 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 
         evidence.er_verdict = match posted_verdict {
             Some(v) => v,
-            None => verifier::parse_er_verdict(&snapshot.comments),
+            // jleechan-nplh: a verdict comment older than the current head
+            // commit is stale evidence — gate 6 must not self-certify from
+            // it (same staleness rule as `er_runner::maybe_run` step 2).
+            None => verifier::parse_er_verdict_since(
+                &snapshot.comments,
+                snapshot.head_committed_epoch,
+            ),
         };
         evidence.is_production = verifier::classify_production(&snapshot.files);
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);

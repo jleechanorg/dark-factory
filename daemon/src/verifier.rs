@@ -313,7 +313,35 @@ fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
 }
 
 pub fn parse_er_verdict(comments: &[crate::tools::PrComment]) -> ErVerdict {
+    parse_er_verdict_since(comments, 0)
+}
+
+/// Like `parse_er_verdict`, but only accepts verdicts from comments created
+/// at or after `min_epoch` (the PR head commit's committer date).
+///
+/// jleechan-nplh: an `/er PASS` posted days and dozens of commits before the
+/// current head does not verify the code that would actually merge; treating
+/// it as valid short-circuits re-verification forever (live incident:
+/// worldarchitect.ai#7888, a 2026-07-08 PASS suppressed re-review of a
+/// 2026-07-10 head). Staleness rules:
+///
+/// - `min_epoch == 0` (head commit time unknown — offline snapshots, test
+///   doubles that predate this field): no filtering, identical to
+///   `parse_er_verdict`. Fail-open here is deliberate: without a reference
+///   point every comment would be "stale" and gate 6 would deadlock.
+/// - comment `created_at_epoch == 0` with `min_epoch > 0` (comment age
+///   unknown but head age known): treated as STALE. Fail-closed is safe —
+///   the worst case is one redundant `/er` run, bounded by
+///   `MAX_ER_RUNNER_ATTEMPTS`; the alternative re-opens the self-
+///   certification hole this function exists to close.
+pub fn parse_er_verdict_since(
+    comments: &[crate::tools::PrComment],
+    min_epoch: u64,
+) -> ErVerdict {
     for comment in comments.iter().rev() {
+        if min_epoch > 0 && comment.created_at_epoch < min_epoch {
+            continue;
+        }
         let body_lower = comment.body.to_ascii_lowercase();
         let mut start_idx = 0;
         let mut last_verdict = None;
@@ -616,6 +644,7 @@ mod tests {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+            head_committed_epoch: 0,
         }
     }
 
@@ -1255,26 +1284,55 @@ mod tests {
     fn test_parse_er_verdict() {
         use crate::tools::PrComment;
         // Simple cases
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er PASS".into() }]), ErVerdict::Pass);
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er PARTIAL".into() }]), ErVerdict::Partial);
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er FAIL".into() }]), ErVerdict::Fail);
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er INCONCLUSIVE".into() }]), ErVerdict::Inconclusive);
+        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er PASS".into(), created_at_epoch: 0 }]), ErVerdict::Pass);
+        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er PARTIAL".into(), created_at_epoch: 0 }]), ErVerdict::Partial);
+        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er FAIL".into(), created_at_epoch: 0 }]), ErVerdict::Fail);
+        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er INCONCLUSIVE".into(), created_at_epoch: 0 }]), ErVerdict::Inconclusive);
 
         // Latest comment wins (comments are in chronological order)
         let comments = vec![
-            PrComment { author: "alice".into(), body: "/er FAIL".into() },
-            PrComment { author: "bob".into(), body: "/er PASS".into() },
+            PrComment { author: "alice".into(), body: "/er FAIL".into(), created_at_epoch: 0 },
+            PrComment { author: "bob".into(), body: "/er PASS".into(), created_at_epoch: 0 },
         ];
         assert_eq!(parse_er_verdict(&comments), ErVerdict::Pass);
 
         // Multiple verdicts in one comment: last one wins
         let comments_multiple = vec![
-            PrComment { author: "alice".into(), body: "/er FAIL then /er PASS".into() },
+            PrComment { author: "alice".into(), body: "/er FAIL then /er PASS".into(), created_at_epoch: 0 },
         ];
         assert_eq!(parse_er_verdict(&comments_multiple), ErVerdict::Pass);
 
         // Word boundary check: "/er-gate" or "/er_gate" should not match as "/er" command
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er-gate PASS".into() }]), ErVerdict::Absent);
+        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er-gate PASS".into(), created_at_epoch: 0 }]), ErVerdict::Absent);
+    }
+
+    // jleechan-nplh: staleness filtering against the head commit epoch.
+    #[test]
+    fn test_parse_er_verdict_since_staleness() {
+        use crate::tools::PrComment;
+        let stale_pass = PrComment { author: "er".into(), body: "/er PASS".into(), created_at_epoch: 1_000 };
+        let fresh_fail = PrComment { author: "er".into(), body: "/er FAIL regressed".into(), created_at_epoch: 3_000 };
+
+        // A verdict older than the head commit is ignored entirely.
+        assert_eq!(parse_er_verdict_since(std::slice::from_ref(&stale_pass), 2_000), ErVerdict::Absent);
+
+        // A verdict at/after the head commit is accepted (>= boundary).
+        assert_eq!(parse_er_verdict_since(std::slice::from_ref(&stale_pass), 1_000), ErVerdict::Pass);
+
+        // Stale PASS must not mask a fresh FAIL.
+        assert_eq!(
+            parse_er_verdict_since(&[stale_pass.clone(), fresh_fail], 2_000),
+            ErVerdict::Fail
+        );
+
+        // min_epoch == 0 (head age unknown) disables filtering — identical
+        // to parse_er_verdict, so old offline snapshots keep working.
+        assert_eq!(parse_er_verdict_since(&[stale_pass], 0), ErVerdict::Pass);
+
+        // Comment age unknown (epoch 0) with a known head age: fail closed,
+        // treat as stale.
+        let unknown_age = PrComment { author: "er".into(), body: "/er PASS".into(), created_at_epoch: 0 };
+        assert_eq!(parse_er_verdict_since(&[unknown_age], 2_000), ErVerdict::Absent);
     }
 
     #[test]
@@ -1313,7 +1371,7 @@ mod tests {
         assert!(check_integration_marker("Here is the integration evidence proof", &[]));
 
         // Comment contains marker
-        let comments = vec![PrComment { author: "alice".into(), body: "Found integration evidence".into() }];
+        let comments = vec![PrComment { author: "alice".into(), body: "Found integration evidence".into(), created_at_epoch: 0 }];
         assert!(check_integration_marker("No marker here", &comments));
 
         // Neither contains marker

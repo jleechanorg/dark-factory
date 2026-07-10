@@ -148,6 +148,7 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+            head_committed_epoch: 0,
         },
     );
     // The router call already happened in tick 1; re-script the same `FakeLlm`
@@ -1044,6 +1045,7 @@ fn test_wedge_detection_attested_session_stalled() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+            head_committed_epoch: 0,
         },
     );
 
@@ -1139,6 +1141,7 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+            head_committed_epoch: 0,
         },
     );
 
@@ -1241,6 +1244,7 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             head_sha: same_sha.clone(),
             updated_at_epoch: now_epoch - 2000,
             ci_pending: false,
+            head_committed_epoch: 0,
             ci_success: true,
             mergeable: true,
             coderabbit_approved: true,
@@ -1334,6 +1338,7 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             head_sha: "remote-head-stale".into(),
             updated_at_epoch: now_epoch - 2000,
             ci_pending: false,
+            head_committed_epoch: 0,
             ci_success: true,
             mergeable: true,
             coderabbit_approved: true,
@@ -1443,6 +1448,7 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             head_sha: "remote-head-diverged".into(),
             updated_at_epoch: now_epoch - 2000,
             ci_pending: false,
+            head_committed_epoch: 0,
             ci_success: true,
             mergeable: true,
             coderabbit_approved: true,
@@ -1525,6 +1531,7 @@ fn factory_labeled_existing_pr_is_adopted_and_verified_without_spawn() {
             vec![PrComment {
                 author: "dark-factory-er".into(),
                 body: "/er PASS".into(),
+                created_at_epoch: 0,
             }],
         ),
     );
@@ -1609,6 +1616,7 @@ fn factory_labeled_existing_pr_second_tick_reuses_tracking_bead_without_spawn() 
             vec![PrComment {
                 author: "dark-factory-er".into(),
                 body: "/er PASS".into(),
+                created_at_epoch: 0,
             }],
         ),
     );
@@ -1939,6 +1947,7 @@ fn adopted_non_green_pr_parks_human_held_with_v1_escalation() {
         vec![PrComment {
             author: "dark-factory-er".into(),
             body: "/er PASS".into(),
+            created_at_epoch: 0,
         }],
     );
     snapshot.ci_success = false;
@@ -2042,6 +2051,7 @@ fn adopted_red_pr_stage2_reroll_spawns_remediation_session_leaves_pr_open() {
         vec![PrComment {
             author: "dark-factory-er".into(),
             body: "/er PASS".into(),
+            created_at_epoch: 0,
         }],
     );
     snapshot.ci_success = false;
@@ -2177,6 +2187,7 @@ fn adopted_red_pr_stage2_reroll_spawn_failure_parks_human_held_with_escalation()
         vec![PrComment {
             author: "dark-factory-er".into(),
             body: "/er PASS".into(),
+            created_at_epoch: 0,
         }],
     );
     snapshot.ci_success = false;
@@ -2529,6 +2540,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             ci_status: "unknown".into(),
             coderabbit_status: "approved".into(),
             ci_pending: true,
+            head_committed_epoch: 0,
         },
     );
 
@@ -2619,6 +2631,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             ci_status: "red".into(),
             coderabbit_status: "approved".into(),
             ci_pending: false,
+            head_committed_epoch: 0,
         },
     );
 
@@ -2924,6 +2937,7 @@ fn adopted_pr_that_never_goes_green_escalates_at_recovery_cap_and_dedups() {
         vec![PrComment {
             author: "dark-factory-er".into(),
             body: "/er PASS".into(),
+            created_at_epoch: 0,
         }],
     );
     snapshot.ci_success = false;
@@ -3413,6 +3427,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            head_committed_epoch: 0,
         },
     );
 
@@ -3666,6 +3681,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             ci_status: "unknown".into(),
             coderabbit_status: "approved".into(),
             ci_pending: true,
+            head_committed_epoch: 0,
         },
     );
     store
@@ -3766,6 +3782,7 @@ fn attested_ci_pending_does_not_timebox_park() {
             ci_status: "unknown".into(),
             coderabbit_status: "approved".into(),
             ci_pending: true,
+            head_committed_epoch: 0,
         },
     );
     store
@@ -3964,6 +3981,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             ci_status: "success".into(),
             coderabbit_status: "approved".into(),
             ci_pending: false,
+            head_committed_epoch: 0,
         },
     );
     store
@@ -4068,6 +4086,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
             comments: vec![PrComment {
                 author: "dark-factory-er".into(),
                 body: "/er PASS".into(),
+                created_at_epoch: 0,
             }],
             files: Vec::new(),
             // Fresh epoch so the wedge-detection check (>=30 min stale)
@@ -4077,6 +4096,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            head_committed_epoch: 0,
         },
     );
     // PR 101 deliberately has no scripted entry — `pr_snapshot(101)`
@@ -4243,12 +4263,14 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             comments: vec![PrComment {
                 author: "dark-factory-er".into(),
                 body: "/er PASS".into(),
+                created_at_epoch: 0,
             }],
             files: Vec::new(),
             updated_at_epoch: fresh_epoch,
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            head_committed_epoch: 0,
         },
     );
 
@@ -4613,6 +4635,7 @@ fn qdw_green_snapshot(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         ci_status: "green".into(),
         coderabbit_status: "green".into(),
         ci_pending: false,
+        head_committed_epoch: 0,
     }
 }
 
@@ -4696,6 +4719,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             vec![PrComment {
                 author: "dark-factory-er".into(),
                 body: "/er PASS".into(),
+                created_at_epoch: 0,
             }],
         ),
     );
@@ -4850,6 +4874,7 @@ fn qdw_assess_refetch_failure_stays_attested_and_never_closes_pr() {
             vec![PrComment {
                 author: "dark-factory-er".into(),
                 body: "/er PASS".into(),
+                created_at_epoch: 0,
             }],
         ),
     );
@@ -5166,6 +5191,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             comments: vec![PrComment {
                 author: "some-reviewer".into(),
                 body: "/er PASS".into(),
+                created_at_epoch: 0,
             }],
             files: vec![],
             updated_at_epoch: std::time::SystemTime::now()
@@ -5175,6 +5201,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            head_committed_epoch: 0,
         },
     );
 
@@ -5348,10 +5375,12 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
                 PrComment {
                     author: "some-reviewer".into(),
                     body: "/er PASS".into(),
+                    created_at_epoch: 0,
                 },
                 PrComment {
                     author: "jleechan".into(),
                     body: "Looks good, sign-off from me.".into(),
+                    created_at_epoch: 0,
                 },
             ],
             files: vec![],
@@ -5362,6 +5391,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            head_committed_epoch: 0,
         },
     );
 
@@ -5538,6 +5568,7 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             comments: vec![PrComment {
                 author: "some-reviewer".into(),
                 body: "/er PASS".into(),
+                created_at_epoch: 0,
             }],
             files: vec![],
             updated_at_epoch: std::time::SystemTime::now()
@@ -5547,6 +5578,7 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            head_committed_epoch: 0,
         },
     );
 
@@ -5706,6 +5738,7 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             comments: vec![PrComment {
                 author: "some-reviewer".into(),
                 body: "/er PASS".into(),
+                created_at_epoch: 0,
             }],
             files: vec![],
             updated_at_epoch: std::time::SystemTime::now()
@@ -5715,6 +5748,7 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            head_committed_epoch: 0,
         },
     );
 
@@ -6586,7 +6620,7 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
     let mut scm = FakeScm::new();
     let mut snap_a = qdw_green_snapshot(
         801,
-        vec![PrComment { author: "dark-factory-er".into(), body: "/er PASS".into() }],
+        vec![PrComment { author: "dark-factory-er".into(), body: "/er PASS".into(), created_at_epoch: 0 }],
     );
     snap_a.ci_success = false;
     snap_a.ci_status = "failure".into();
@@ -6594,7 +6628,7 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
 
     let mut snap_b = qdw_green_snapshot(
         802,
-        vec![PrComment { author: "dark-factory-er".into(), body: "/er PASS".into() }],
+        vec![PrComment { author: "dark-factory-er".into(), body: "/er PASS".into(), created_at_epoch: 0 }],
     );
     snap_b.ci_success = false;
     snap_b.ci_status = "failure".into();
