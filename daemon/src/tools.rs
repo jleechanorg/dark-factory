@@ -160,8 +160,13 @@ pub struct PrSnapshot {
     /// Unix epoch (seconds) of the head commit's committer date, or 0 when
     /// unknown. jleechan-nplh: the freshness floor for `/er` verdict
     /// comments — a verdict older than this predates the code it claims to
-    /// verify. Committer date is used (not author date) because rebases and
-    /// merges rewrite it, so it tracks "when this head actually came to be".
+    /// verify. Committer date (not author date) is the best available proxy:
+    /// rebases and merges rewrite it. Known limitation (independent review,
+    /// PR#227): it is NOT the push date — a locally backdated commit pushed
+    /// later can leave a window where a verdict for a prior head still
+    /// clears the floor. GitHub exposes no reliable per-commit push
+    /// timestamp, so this floor narrows the stale-verdict hole rather than
+    /// closing it exactly.
     pub head_committed_epoch: u64,
 }
 
