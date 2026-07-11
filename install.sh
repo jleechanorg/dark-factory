@@ -48,8 +48,9 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # git-lfs is required: .gitattributes tracks artifacts/repro-developer/**/*.{tar.zst,tar.gz,gpg}
-# via LFS filters, and .githooks/pre-push + post-checkout hard-gate on
-# `command -v git-lfs`. A fresh clone/worktree without it fails at checkout time,
+# via LFS filters, whose checkout-time filter requires git-lfs on PATH;
+# .githooks/pre-push separately hard-gates pushes with `command -v git-lfs`.
+# A fresh clone/worktree without it fails at checkout time,
 # before install.sh even runs (see ez-gh-actions-2qfz). Check here too so a
 # re-run on an existing checkout (or a checkout that predates this hook) still
 # surfaces the gap with the correct fix instead of a confusing hook error later.

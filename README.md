@@ -97,9 +97,10 @@ Dark Factory runs in **two phases — generate the spec, then execute the factor
 
 **Prerequisite: [Git LFS](https://git-lfs.com/)** — this repo tracks
 `artifacts/repro-developer/**/*.{tar.zst,tar.gz,gpg}` via LFS filters
-(`.gitattributes`), and `.githooks/pre-push` + `post-checkout` hard-gate on
-`git-lfs` being on `PATH`. Without it, `git clone`/`git worktree add` fails
-at checkout time. Install first:
+(`.gitattributes`), whose checkout-time filter requires `git-lfs` on `PATH`;
+`.githooks/pre-push` separately hard-gates pushes when `git-lfs` is absent.
+Without it, `git clone`/`git worktree add` fails at checkout time. Install
+first:
 `sudo apt-get install -y git-lfs && git lfs install` (Debian/Ubuntu) or
 `brew install git-lfs && git lfs install` (macOS). No sudo? Grab a static
 binary from the [releases page](https://github.com/git-lfs/git-lfs/releases)
