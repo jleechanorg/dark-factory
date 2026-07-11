@@ -1,6 +1,34 @@
 use daemon::adapters::{ChainLlm, CliScm, CliSessions, CliTracker, CliVcs};
 use daemon::tools::{Llm, Scm, Sessions, Tracker, Vcs};
 
+/// Guard for setting environment variables during tests.
+/// SAFETY: must be used with a mutex lock to prevent concurrent test interference.
+struct EnvVarGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl EnvVarGuard {
+    fn set(vars: &[(&'static str, &str)]) -> Self {
+        let mut saved = Vec::new();
+        for (k, v) in vars {
+            saved.push((*k, std::env::var(k).ok()));
+            unsafe { std::env::set_var(k, v) };
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        for (k, v) in &self.saved {
+            match v {
+                Some(val) => unsafe { std::env::set_var(k, val) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+}
+
 #[test]
 fn test_cli_vcs_real_git() {
     if std::env::var("GITHUB_ACTIONS").is_ok() {
@@ -257,4 +285,157 @@ fn test_cli_scm_offline_fallback() {
     assert!(!snap.coderabbit_approved);
     
     let _ = std::fs::remove_file(pr_file);
+}
+
+// ============================================================================
+// Tests for jleechan-kk64: GraphQL failure must report Unknown, not Green
+// ============================================================================
+
+/// Guards every test in this section that needs to mutate process-wide env vars
+/// (`PATH`) so a future second such test can't race this one.
+static FAKE_GH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Write a fake `gh` script into `dir` that responds to different commands.
+/// The script branches on its argv to return different responses for:
+/// - `gh pr view ...` → valid JSON
+/// - `gh pr checks ...` → valid check JSON
+/// - `gh api graphql` → controlled by FAKE_GH_GRAPHQL_MODE env var
+/// - `gh api repos/.../commits/...` → date string
+#[cfg(unix)]
+fn write_fake_gh(dir: &std::path::Path, graphql_mode: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("gh");
+    let script = format!(
+        r#"#!/bin/sh
+# Fake gh for testing GraphQL failure handling
+# graphql_mode: {graphql_mode}
+
+# `gh pr view`/`gh pr checks` arrive as separate argv words ("pr" "view" ...),
+# so match against the joined argv string rather than iterating word-by-word
+# (a per-word loop can never see the two-word substring "pr view").
+args="$*"
+case "$args" in
+    *"pr view"*)
+        echo '{{"mergeable":"MERGEABLE","reviews":[],"headRefOid":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","body":"","comments":[],"files":[],"updatedAt":"2026-01-01T00:00:00Z"}}'
+        exit 0
+        ;;
+    *"pr checks"*)
+        echo '[{{"state":"SUCCESS","bucket":"pass","name":"build"}}]'
+        exit 0
+        ;;
+    *"api graphql"*)
+        mode="${{FAKE_GH_GRAPHQL_MODE:-fail}}"
+        if [ "$mode" = "fail" ]; then
+            echo "gh: GraphQL API rate limit exceeded (HTTP 403)" >&2
+            exit 1
+        elif [ "$mode" = "malformed" ]; then
+            echo '{{"data": "truncated'
+            exit 0
+        else
+            echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
+            exit 0
+        fi
+        ;;
+    *"commits/"*)
+        echo '2026-01-01T00:00:00Z'
+        exit 0
+        ;;
+    *)
+        echo '[]'
+        exit 0
+        ;;
+esac
+"#
+    );
+    std::fs::write(&path, script).unwrap_or_else(|e| panic!("failed to write fake gh: {e}"));
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+}
+
+/// Test: GraphQL command failure should report Unknown, not Green.
+/// This test PROVES the bug: currently the code returns 0 (Green), but it should return None (Unknown).
+#[test]
+#[cfg(unix)]
+fn test_cli_scm_pr_snapshot_graphql_command_failure_reports_unknown_not_green() {
+    let _lock = FAKE_GH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Unique PR number to avoid cache/collision
+    let pr_num = 900001;
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_fake_gh_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+
+    // Set up fake gh with FAIL mode
+    write_fake_gh(&fake_bin_dir, "fail");
+
+    // Prepend fake gh to PATH
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+
+    // Guard both PATH and the mode env var our fake gh reads together so a
+    // panic mid-test still restores prior state via Drop.
+    let _env_guard = EnvVarGuard::set(&[("PATH", &new_path), ("FAKE_GH_GRAPHQL_MODE", "fail")]);
+
+    let scm = CliScm::new("jleechanorg/dark-factory".to_string());
+    let result = scm.pr_snapshot(pr_num);
+
+    // The snapshot fetch should succeed (only the thread count is unknown)
+    assert!(result.is_ok(), "pr_snapshot should succeed even when GraphQL fails: {:?}", result);
+    let snapshot = result.unwrap();
+
+    // BUG: Currently this returns Some(0) — but it SHOULD return None (Unknown)
+    // This assertion will FAIL against the current buggy code, proving the bug exists.
+    assert!(
+        snapshot.unresolved_thread_count.is_none(),
+        "unresolved_thread_count should be None (Unknown) when GraphQL fails, but got: {:?}",
+        snapshot.unresolved_thread_count
+    );
+}
+
+/// Test: GraphQL malformed output should report Unknown, not Green.
+#[test]
+#[cfg(unix)]
+fn test_cli_scm_pr_snapshot_graphql_malformed_output_reports_unknown_not_green() {
+    let _lock = FAKE_GH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let pr_num = 900002;
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_fake_gh_malformed_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+
+    write_fake_gh(&fake_bin_dir, "malformed");
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+
+    let _env_guard =
+        EnvVarGuard::set(&[("PATH", &new_path), ("FAKE_GH_GRAPHQL_MODE", "malformed")]);
+
+    let scm = CliScm::new("jleechanorg/dark-factory".to_string());
+    let result = scm.pr_snapshot(pr_num);
+
+    assert!(result.is_ok(), "pr_snapshot should succeed even when GraphQL is malformed: {:?}", result);
+    let snapshot = result.unwrap();
+
+    // BUG: Currently this returns Some(0) — but it SHOULD return None (Unknown)
+    assert!(
+        snapshot.unresolved_thread_count.is_none(),
+        "unresolved_thread_count should be None (Unknown) when GraphQL is malformed, but got: {:?}",
+        snapshot.unresolved_thread_count
+    );
 }
