@@ -77,7 +77,18 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- sync with the idempotent `ensure_park_reason_column` migration in
   -- `SqliteStateStore::open` (same guard pattern as
   -- `ensure_is_adopted_column`).
-  park_reason TEXT
+  park_reason TEXT,
+  -- Per-bead repo identity (bead jleechan-35y4, Stage A of the multi-repo
+  -- dispatch fix; docs/multirepo-dispatch-investigation-2026-07-11.md).
+  -- NULL ("legacy") means "use the daemon's global cfg.target_repo" — see
+  -- `BeadOverlay::repo` in daemon/src/state.rs, the single accessor every
+  -- call site must use instead of re-implementing this fallback. Set by
+  -- intake from an explicit `target_repo:` body field, else the
+  -- `owner/repo` prefix of the bead's external_ref, else left NULL. Older
+  -- DBs pre-date this column and get it via the idempotent
+  -- `ensure_target_repo_column` migration in `SqliteStateStore::open` (same
+  -- guard pattern as `ensure_is_adopted_column`).
+  target_repo TEXT
 );
 
 -- Deletion guard: the daemon/skills may delete ONLY refs recorded here (spec §4.2.8).

@@ -16,3 +16,21 @@ slow_tick_secs = 600         # intake scan
 autonomy_timebox_secs = 10800  # 3h cumulative per bead chain
 budget_warn_usd = 20.0       # 80%-threshold telemetry warning; monitoring-only
 spec_dir = ".factory/specs/" # per-repo override via .factory.toml (spec Appendix B)
+
+# Multi-repo dispatch routing table (bead jleechan-35y4 Stage B; see
+# docs/multirepo-dispatch-investigation-2026-07-11.md). OPTIONAL — omitting
+# [repos] entirely is fully backward compatible: every bead resolves to the
+# single `target_repo`/`ao_project` pair above, exactly like a pre-Stage-B
+# config. Add an entry here for every additional repo a bead's Stage-A
+# intake resolution (`target_repo:` body field or `external_ref` owner/repo
+# prefix) may name. A bead whose resolved repo has NO entry here AND is not
+# `target_repo` above parks HUMAN_HELD with reason `unmapped_target_repo`
+# (fail loud — never silently dispatched into a guessed repo/AO project).
+#
+# [repos."jleechanorg/worldarchitect.ai"]
+# ao_project = "worldarchitect"
+# push_remote = "worldai"   # dual-remote clone; bare `git push` is WRONG here
+#
+# [repos."jleechanorg/dark-factory"]
+# ao_project = "dark-factory"
+# push_remote = "origin"

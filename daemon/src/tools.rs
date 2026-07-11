@@ -177,11 +177,28 @@ pub struct PrSnapshot {
 }
 
 /// Parameters for spawning a new AO/`aow` session (design doc §4).
+///
+/// `repo`/`ao_project`/`remote` (bead jleechan-35y4, Stage B of the
+/// multi-repo dispatch fix — see
+/// `docs/multirepo-dispatch-investigation-2026-07-11.md`) carry the
+/// dispatch-time repo identity resolved by the caller (`overlay.repo(cfg)` +
+/// `Config::resolve_repo`). Adding them here is the CAPABILITY: today's
+/// `Sessions`/`CliSessions` impl still binds its AO project once at
+/// construction time and does not yet consume these fields per-spawn — that
+/// full call-site migration (dispatch prompt template + spawn-time remote
+/// assertion) is Stage C, bead jleechan-bqdv.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnSpec {
     pub bead_id: String,
     pub branch: String,
     pub prompt: String,
+    /// `owner/repo` this bead's work belongs to (`overlay.repo(cfg)`).
+    pub repo: String,
+    /// AO project name to spawn into for `repo` (`Config::resolve_repo`).
+    pub ao_project: String,
+    /// git remote name the coder must push to for `repo` (e.g. `"origin"`
+    /// or a dual-remote clone's non-default remote like `"worldai"`).
+    pub remote: String,
 }
 
 /// Opaque handle to an AO/`aow` session.
