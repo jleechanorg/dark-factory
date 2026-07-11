@@ -5635,6 +5635,187 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
 
+// jleechan-wzgl: GATE_ASSESSMENT must serialize the full per-gate report
+// (all 7 gates, verdict + reason) AND the gate-7 reviewer vendor identity,
+// not just the aggregate `all_green` boolean. Before this fix, diagnosing
+// which of the 7 gates failed for bead jleechan-93ft required a manual
+// GitHub REST sweep even though `verifier::assess` already computed the
+// per-gate array; and it was impossible to tell from telemetry which
+// vendor produced the gate-7 skeptic verdict, which the af-e2e mission's
+// "ironclad" exit criterion E3 needs to confirm the reviewer was non-self
+// and genuinely ran (not self-certified).
+//
+// This scenario reuses the third-vendor-fallback fixture above (codex and
+// claude both produce unparseable output, agy is the one that actually
+// resolves gate 7) specifically because it makes vendor provenance
+// observable: the fix must report `agy` as the contributing reviewer, not
+// `codex`/`claude` (which were dispatched but never produced a usable
+// verdict) and not a placeholder.
+#[test]
+#[cfg(unix)]
+fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_fake_reviewers_wzgl_gate_report_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    write_fake_reviewer(&fake_bin_dir, "codex", "not a verdict at all");
+    write_fake_reviewer(&fake_bin_dir, "claude", "still not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "agy", "pass");
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
+    ]);
+
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+
+    let mut cfg = test_cfg();
+    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" -> is_test_repo == false
+
+    store.overlays.borrow_mut().insert(
+        "wzgl-gate-report-bead".into(),
+        BeadOverlay {
+            bead_id: "wzgl-gate-report-bead".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(558),
+            branch: Some("factory/wzgl-gate-report-bead-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+        },
+    );
+    store
+        .branches
+        .borrow_mut()
+        .push("factory/wzgl-gate-report-bead-r1".into());
+    store.branch_beads.borrow_mut().insert(
+        "factory/wzgl-gate-report-bead-r1".into(),
+        "wzgl-gate-report-bead".into(),
+    );
+
+    scm.pr_snapshots.insert(
+        558,
+        PrSnapshot {
+            pr_number: 558,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadbeef558".into(),
+            body: String::new(),
+            comments: vec![PrComment {
+                author: "some-reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
+            files: vec![],
+            updated_at_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            ci_status: "green".into(),
+            coderabbit_status: "green".into(),
+            ci_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_wzgl_gate_report_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
+
+    assert_eq!(summary.beads_ready, 1, "bead should reach READY via the agy fallback verdict");
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let gate_assessment_line = telemetry
+        .lines()
+        .find(|line| line.contains("\"eventType\":\"GATE_ASSESSMENT\""))
+        .unwrap_or_else(|| panic!("no GATE_ASSESSMENT line found; telemetry:\n{telemetry}"));
+    let parsed: serde_json::Value = serde_json::from_str(gate_assessment_line)
+        .unwrap_or_else(|e| panic!("GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}"));
+    let context = &parsed["context"];
+
+    let gates = context["gates"]
+        .as_array()
+        .unwrap_or_else(|| panic!("GATE_ASSESSMENT context.gates must be an array; context:\n{context}"));
+    assert_eq!(
+        gates.len(),
+        7,
+        "GATE_ASSESSMENT must report all 7 per-gate results, not just all_green; context:\n{context}"
+    );
+    for gate in gates {
+        assert!(
+            gate.get("gate").and_then(|v| v.as_str()).is_some(),
+            "each gate entry must name the gate; context:\n{context}"
+        );
+        assert!(
+            gate.get("result").and_then(|v| v.as_str()).is_some(),
+            "each gate entry must carry a result; context:\n{context}"
+        );
+    }
+
+    let skeptic_reviewers = context["skeptic_reviewers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("GATE_ASSESSMENT context.skeptic_reviewers must be an array; context:\n{context}"));
+    let skeptic_reviewers: Vec<&str> = skeptic_reviewers
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        skeptic_reviewers,
+        vec!["agy"],
+        "GATE_ASSESSMENT must report the gate-7 reviewer vendor that actually \
+         produced the verdict (agy, the 3rd-vendor fallback), not the first \
+         two dispatched vendors (codex/claude) that failed to parse, and not \
+         a placeholder; context:\n{context}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
 // --- jleechan-bkru: 4th-vendor (gemini) fallback gap --------------------
 //
 // Live incident 2026-07-09 (bead jleechan-93ft, worldarchitect.ai PR #7888):

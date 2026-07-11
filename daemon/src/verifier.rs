@@ -32,6 +32,24 @@ pub enum GateName {
     Skeptic,
 }
 
+impl GateName {
+    /// Stable snake_case identifier for telemetry JSON (jleechan-wzgl:
+    /// GATE_ASSESSMENT serializes the full per-gate report, and a stable
+    /// string key is easier for downstream tooling/greps than `{:?}` debug
+    /// formatting, which is not a serialization contract).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GateName::Ci => "ci",
+            GateName::NoConflicts => "no_conflicts",
+            GateName::CodeRabbitApproved => "code_rabbit_approved",
+            GateName::BugbotClean => "bugbot_clean",
+            GateName::CommentsResolved => "comments_resolved",
+            GateName::EvidenceFloor => "evidence_floor",
+            GateName::Skeptic => "skeptic",
+        }
+    }
+}
+
 /// One gate's verdict. `Unknown` and `Red` are deliberately distinct variants
 /// (design doc §5: "Unknown ≠ Red: infra vs verdict") — `Unknown` means the
 /// gate could not be evaluated (SCM API error, missing/unparseable Skeptic
@@ -61,6 +79,41 @@ impl GateResult {
 pub struct GateReport {
     pub results: [(GateName, GateResult); 7],
     pub all_green: bool,
+}
+
+impl GateReport {
+    /// jleechan-wzgl: serialize the full per-gate breakdown for
+    /// `GATE_ASSESSMENT` telemetry. Before this, the emit call only logged
+    /// `all_green`, so diagnosing which of the 7 gates failed (and why)
+    /// required a manual GitHub REST sweep even though this report already
+    /// carries the answer. `to_json` is the single source of truth for that
+    /// serialization so the telemetry shape can't drift from what `assess`
+    /// actually computed.
+    pub fn to_json(&self) -> serde_json::Value {
+        let gates: Vec<serde_json::Value> = self
+            .results
+            .iter()
+            .map(|(name, result)| {
+                let (verdict, reason): (&str, Option<&str>) = match result {
+                    GateResult::Green => ("green", None),
+                    GateResult::Red(reason) => ("red", Some(reason.as_str())),
+                    GateResult::Unknown(reason) => ("unknown", Some(reason.as_str())),
+                };
+                let mut obj = serde_json::json!({
+                    "gate": name.as_str(),
+                    "result": verdict,
+                });
+                if let Some(r) = reason {
+                    obj["reason"] = serde_json::Value::String(r.to_string());
+                }
+                obj
+            })
+            .collect();
+        serde_json::json!({
+            "all_green": self.all_green,
+            "gates": gates,
+        })
+    }
 }
 
 /// Stage-1 Skeptic verdict grammar (spec §4.2.5): `pass|warn|fail`. `Warn` is
@@ -261,6 +314,18 @@ pub struct PrEvidence {
     /// (or produced directly by an `Llm` adversarial call under Stage 1).
     /// `None` means no verdict is available yet (gate 7 -> `Unknown`).
     pub skeptic_verdict: Option<SkepticVerdict>,
+    /// jleechan-wzgl: identity of the reviewer vendor(s) whose response
+    /// actually contributed to `skeptic_verdict` this tick (e.g. `["agy"]`
+    /// when the dual-dispatch primaries both failed to parse and the
+    /// fallback loop's third vendor produced the usable verdict, or
+    /// `["codex", "claude"]` when both dual-dispatch primaries agreed).
+    /// `["mock_llm"]` marks the Stage-1 `is_test_repo` path (a single
+    /// `Llm::judge` adversarial call, not an independent reviewer CLI) so
+    /// telemetry never mistakes a test-repo mock for a real vendor. Empty
+    /// when no verdict was produced (`skeptic_verdict` is `None`). This is
+    /// GATE_ASSESSMENT's provenance signal for confirming the gate-7
+    /// reviewer was non-self and genuinely ran, not self-certified.
+    pub skeptic_reviewers: Vec<String>,
 }
 
 /// Gate 6 (spec §4.2.5): green only when `/er` returned `Pass` AND the
@@ -685,6 +750,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         }
     }
 
@@ -818,6 +884,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
         let report = assess(&scm, 7, &cfg, &evidence).unwrap();
@@ -840,6 +907,7 @@ mod tests {
             has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
         let report = assess(&scm, 7, &cfg, &evidence).unwrap();
@@ -859,6 +927,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
         let report = assess(&scm, 7, &cfg, &evidence).unwrap();
@@ -878,6 +947,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Fail("wrong fix".into())),
+            ..Default::default()
         };
 
         let report = assess(&scm, 7, &cfg, &evidence).unwrap();
@@ -900,6 +970,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Warn("minor nit".into())),
+            ..Default::default()
         };
 
         let report = assess(&scm, 7, &cfg, &evidence).unwrap();
@@ -919,6 +990,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: None,
+            ..Default::default()
         };
 
         let report = assess(&scm, 7, &cfg, &evidence).unwrap();
@@ -963,6 +1035,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Absent,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
         let report = assess(&scm, 7, &cfg, &evidence).unwrap();
@@ -1011,6 +1084,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Fail,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
         let report = assess(&scm, 7, &cfg, &evidence).unwrap();
@@ -1033,6 +1107,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
         let report = assess(&scm, 7, &cfg, &evidence).unwrap();
@@ -1053,6 +1128,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
         let report = assess(&scm, 7, &cfg, &evidence).unwrap();
@@ -1075,6 +1151,7 @@ mod tests {
             has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
         let report = assess(&scm, 7, &cfg, &evidence).unwrap();
@@ -1096,6 +1173,7 @@ mod tests {
             has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Absent,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
         let report = assess(&scm, 7, &cfg, &evidence).unwrap();
@@ -1118,6 +1196,7 @@ mod tests {
             has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Fail,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
         let report = assess(&scm, 7, &cfg, &evidence).unwrap();
@@ -1451,6 +1530,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: None,
+            ..Default::default()
         };
         assert_eq!(evidence_floor_gate(&prod_pass), GateResult::Green);
 
@@ -1460,6 +1540,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Partial,
             skeptic_verdict: None,
+            ..Default::default()
         };
         assert!(matches!(evidence_floor_gate(&prod_partial), GateResult::Red(_)));
 
@@ -1470,6 +1551,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Partial,
             skeptic_verdict: None,
+            ..Default::default()
         };
         assert_eq!(evidence_floor_gate(&non_prod_partial), GateResult::Green);
 
@@ -1479,6 +1561,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: None,
+            ..Default::default()
         };
         assert_eq!(evidence_floor_gate(&non_prod_pass), GateResult::Green);
 
@@ -1489,6 +1572,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Fail,
             skeptic_verdict: None,
+            ..Default::default()
         };
         assert!(matches!(evidence_floor_gate(&prod_fail), GateResult::Red(_)));
 
@@ -1498,6 +1582,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Inconclusive,
             skeptic_verdict: None,
+            ..Default::default()
         };
         assert!(matches!(evidence_floor_gate(&non_prod_inconclusive), GateResult::Red(_)));
     }

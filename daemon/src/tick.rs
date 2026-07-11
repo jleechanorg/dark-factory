@@ -1426,9 +1426,21 @@ fn skeptic_evidence(
         }
     }
 
+    // jleechan-wzgl: track which reviewer vendor(s) actually contributed a
+    // parseable verdict to `skeptic_verdict`, so GATE_ASSESSMENT telemetry
+    // can report gate-7 provenance (confirming the reviewer was non-self
+    // and genuinely ran, not self-certified) instead of leaving it
+    // unrecoverable. `"mock_llm"` marks the `is_test_repo` path explicitly
+    // as a mock, not a real independent vendor.
+    let mut used_vendors: Vec<String> = Vec::new();
+
     let skeptic_verdict = if is_test_repo {
         let reply = deps.llm.judge(&prompt)?;
-        verifier::parse_skeptic_verdict(&reply)
+        let verdict = verifier::parse_skeptic_verdict(&reply);
+        if verdict.is_some() {
+            used_vendors.push("mock_llm".to_string());
+        }
+        verdict
     } else {
         // PR#163 finding 2: dispatch the first TWO vendors in the
         // coder-exclusion-filtered priority list as INDEPENDENT parallel
@@ -1454,6 +1466,8 @@ fn skeptic_evidence(
         // retries, instead of guessing a verdict.
         let vendor1 = priority.first().copied().unwrap_or("codex").to_string();
         let vendor2 = priority.get(1).copied().unwrap_or("claude").to_string();
+        let vendor1_label = vendor1.clone();
+        let vendor2_label = vendor2.clone();
 
         let prompt1 = prompt.clone();
         let handle1 = std::thread::spawn(move || dispatch_reviewer(&vendor1, &prompt1));
@@ -1473,9 +1487,24 @@ fn skeptic_evidence(
 
         let v1 = res1.ok().and_then(|r| verifier::parse_skeptic_verdict(&r));
         let v2 = res2.ok().and_then(|r| verifier::parse_skeptic_verdict(&r));
+        let v1_present = v1.is_some();
+        let v2_present = v2.is_some();
 
         let dual_verdict = match combine_dual_verdict(v1, v2, bead_id, pr) {
-            Ok(v) => v.expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)"),
+            Ok(v) => {
+                // jleechan-wzgl: both dual-dispatch primaries can
+                // contribute (e.g. two Fails combine into one `Fail`
+                // reason) — record whichever of the two actually produced
+                // a parseable verdict, in dispatch order, so telemetry
+                // never over- or under-reports which vendor(s) ran.
+                if v1_present {
+                    used_vendors.push(vendor1_label.clone());
+                }
+                if v2_present {
+                    used_vendors.push(vendor2_label.clone());
+                }
+                v.expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)")
+            }
             Err(total_outage_err) => {
                 // vendor1 AND vendor2 both failed to parse. Try each
                 // remaining `priority` member (index 2, 3, ...) in turn
@@ -1489,10 +1518,12 @@ fn skeptic_evidence(
                 // simultaneously non-functional, so a fallback that only
                 // ever tried a single 3rd vendor was no longer sufficient.
                 let mut fallback_verdict = None;
+                let mut fallback_vendor: Option<String> = None;
                 for vendor_n in priority.iter().skip(2) {
                     let v_n = dispatch_reviewer(vendor_n, &prompt)
                         .ok()
                         .and_then(|r| verifier::parse_skeptic_verdict(&r));
+                    let v_n_present = v_n.is_some();
                     // Re-use combine_dual_verdict as a single-verdict
                     // wrapper (its (Some, None) arms already treat a lone
                     // verdict as a full success); if vendor_n ALSO fails to
@@ -1500,11 +1531,25 @@ fn skeptic_evidence(
                     // `Err` as above and the loop tries the next vendor.
                     if let Ok(v) = combine_dual_verdict(v_n, None, bead_id, pr) {
                         fallback_verdict = v;
+                        if v_n_present {
+                            fallback_vendor = Some((*vendor_n).to_string());
+                        }
                         break;
                     }
                 }
                 match fallback_verdict {
-                    Some(v) => v,
+                    Some(v) => {
+                        // jleechan-wzgl: v1_present/v2_present were both
+                        // false in this arm (that is what made
+                        // combine_dual_verdict return `Err` above), so only
+                        // the fallback vendor that actually produced this
+                        // verdict is recorded — never codex/claude, which
+                        // were dispatched but never produced usable output.
+                        if let Some(fv) = fallback_vendor {
+                            used_vendors.push(fv);
+                        }
+                        v
+                    }
                     // Every remaining vendor (if any) also failed to parse
                     // — or coder vendor exclusion left fewer than 3
                     // candidates in the first place — propagate the
@@ -1573,6 +1618,7 @@ fn skeptic_evidence(
         has_integration_evidence_marker: false,
         er_verdict: verifier::ErVerdict::Absent,
         skeptic_verdict,
+        skeptic_reviewers: used_vendors,
     })
 }
 
@@ -1958,6 +2004,19 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
         let report = verifier::assess(deps.scm, pr, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
+        // jleechan-wzgl: log the full per-gate breakdown (all 7 gates,
+        // verdict + reason) plus the gate-7 reviewer vendor identity, not
+        // just the aggregate `all_green` boolean — `report.to_json()` is
+        // `verifier::assess`'s own serialization, so this can't drift from
+        // what was actually computed, and `evidence.skeptic_reviewers`
+        // names the vendor(s) that produced this tick's skeptic verdict.
+        let mut gate_assessment_context = report.to_json();
+        if let Some(obj) = gate_assessment_context.as_object_mut() {
+            obj.insert(
+                "skeptic_reviewers".to_string(),
+                serde_json::json!(evidence.skeptic_reviewers),
+            );
+        }
         emit(
             deps.telemetry_log,
             bead_id,
@@ -1965,7 +2024,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             OverlayState::Attested.as_str(),
             "GATE_ASSESSMENT",
             serde_json::json!({}),
-            serde_json::json!({"all_green": report.all_green}),
+            gate_assessment_context,
         )?;
 
         if report.all_green {
