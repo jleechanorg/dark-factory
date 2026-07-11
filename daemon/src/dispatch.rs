@@ -134,6 +134,7 @@ pub fn dispatch_ready(
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
             },
             Err(err) if err.is_transient() => {
                 report
@@ -829,6 +830,7 @@ mod tests {
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
             })
             .unwrap();
         let cfg = cfg();
