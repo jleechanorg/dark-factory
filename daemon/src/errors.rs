@@ -41,6 +41,40 @@ pub enum DaemonError {
     /// retrying the comparator call on a later tick.
     #[error("circuit-breaker comparator reply unparseable: {0}")]
     ComparatorUnparseable(String),
+    /// jleechan-r56m: `CliSessions::spawn_with_fallback` walks a vendor
+    /// fallback chain (e.g. minimax -> claude-code -> agy). Before this fix,
+    /// each iteration overwrote a single `last_err` variable, so once every
+    /// vendor in the chain had failed, only the LAST vendor's error survived
+    /// into the returned `Err`. Live incident: bead jleechan-93ft attempt 3
+    /// (2026-07-10T19:51:59Z) fired `REROLL_ADOPTED_REMEDIATION_START`, all
+    /// three vendors failed, and `REROLL_ADOPTED_SPAWN_FAILED` /
+    /// `PARKED_HUMAN_HELD` telemetry recorded only "ao spawn --agent agy
+    /// rc=1 'Agent plugin agy not found'" -- discarding whatever minimax and
+    /// claude-code failed with, which misled triage into believing the agy
+    /// plugin itself was the root cause instead of merely the last vendor
+    /// tried. This variant carries every attempted vendor name paired with
+    /// its own specific `DaemonError`, so `Display`/`to_string()` (consumed
+    /// verbatim by `reroll.rs`'s `REROLL_ADOPTED_SPAWN_FAILED` telemetry and,
+    /// via the `RerollOutcome::Held` reason string, by `tick.rs`'s
+    /// `PARKED_HUMAN_HELD` telemetry) always shows the whole chain.
+    #[error("all {} fallback vendor(s) failed: {}", .0.len(), format_spawn_attempts(.0))]
+    SpawnFallbackExhausted(Vec<(String, DaemonError)>),
+}
+
+/// Renders every `(vendor, error)` pair collected by
+/// `CliSessions::spawn_with_fallback` into a single semicolon-joined string,
+/// e.g. `"minimax: ao spawn --agent minimax rc=1 'auth failed'; claude-code:
+/// ao spawn --agent claude-code rc=1 'session cap'; agy: ao spawn --agent agy
+/// rc=1 'Agent plugin agy not found'"`. Pulled out as a free function (rather
+/// than inlined in the `#[error(...)]` attribute) purely for readability --
+/// thiserror supports calling it directly via the `.0` field-access
+/// shorthand.
+fn format_spawn_attempts(attempts: &[(String, DaemonError)]) -> String {
+    attempts
+        .iter()
+        .map(|(vendor, err)| format!("{vendor}: {err}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 impl DaemonError {
@@ -51,6 +85,10 @@ impl DaemonError {
                 | DaemonError::Timeout(_)
                 | DaemonError::Deferred(_)
                 | DaemonError::ComparatorUnparseable(_)
+        ) || matches!(
+            self,
+            DaemonError::SpawnFallbackExhausted(attempts)
+                if attempts.last().is_some_and(|(_, e)| e.is_transient())
         )
     }
 
@@ -162,5 +200,88 @@ mod tests {
     fn duplicate_external_ref_bead_id_none_for_non_tool_error() {
         let err = DaemonError::Timeout("br list timed out".to_string());
         assert_eq!(err.duplicate_external_ref_bead_id(), None);
+    }
+
+    /// jleechan-r56m: `Display`/`to_string()` on `SpawnFallbackExhausted`
+    /// must show every attempted vendor's own error, not just one of them --
+    /// this is what `reroll.rs`'s `REROLL_ADOPTED_SPAWN_FAILED` telemetry
+    /// (`"error": e.to_string()`) and, via the `RerollOutcome::Held` reason
+    /// string, `tick.rs`'s `PARKED_HUMAN_HELD` telemetry both consume
+    /// verbatim.
+    #[test]
+    fn spawn_fallback_exhausted_display_includes_every_vendor_error() {
+        let err = DaemonError::SpawnFallbackExhausted(vec![
+            (
+                "minimax".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent minimax".to_string(),
+                    rc: 1,
+                    stderr: "MINIMAX_MARKER".to_string(),
+                },
+            ),
+            (
+                "claude-code".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent claude-code".to_string(),
+                    rc: 1,
+                    stderr: "CLAUDE_CODE_MARKER".to_string(),
+                },
+            ),
+            (
+                "agy".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent agy".to_string(),
+                    rc: 1,
+                    stderr: "Agent plugin agy not found".to_string(),
+                },
+            ),
+        ]);
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("minimax"), "got: {rendered}");
+        assert!(rendered.contains("MINIMAX_MARKER"), "got: {rendered}");
+        assert!(rendered.contains("claude-code"), "got: {rendered}");
+        assert!(rendered.contains("CLAUDE_CODE_MARKER"), "got: {rendered}");
+        assert!(rendered.contains("agy"), "got: {rendered}");
+        assert!(
+            rendered.contains("Agent plugin agy not found"),
+            "got: {rendered}"
+        );
+    }
+
+    /// A `SpawnFallbackExhausted` whose LAST attempt was itself transient
+    /// (e.g. the final vendor hit AO's retry-safe `Deferred` admission-queue
+    /// case) must remain transient overall, preserving the exact retry
+    /// behavior the pre-fix code had when `last_err` alone determined
+    /// transience.
+    #[test]
+    fn spawn_fallback_exhausted_is_transient_when_last_attempt_is_transient() {
+        let err = DaemonError::SpawnFallbackExhausted(vec![
+            (
+                "minimax".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent minimax".to_string(),
+                    rc: 1,
+                    stderr: "auth failure".to_string(),
+                },
+            ),
+            (
+                "claude-code".to_string(),
+                DaemonError::Deferred("REQUEST=sq-abc123".to_string()),
+            ),
+        ]);
+        assert!(err.is_transient());
+    }
+
+    /// A `SpawnFallbackExhausted` whose LAST attempt is a fatal shape (e.g.
+    /// `Config`/`Parse`) must NOT be treated as transient, matching what the
+    /// pre-fix `last_err`-only classification would have done.
+    #[test]
+    fn spawn_fallback_exhausted_is_not_transient_when_last_attempt_is_fatal() {
+        let err = DaemonError::SpawnFallbackExhausted(vec![(
+            "agy".to_string(),
+            DaemonError::Parse("ao spawn --agent agy produced no SESSION= line".to_string()),
+        )]);
+        assert!(!err.is_transient());
     }
 }
