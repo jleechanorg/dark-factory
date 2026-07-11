@@ -66,23 +66,23 @@ case "$out" in
   *) echo "FAIL: legacy 7-gate all-green -> unexpected output: $out"; FAIL=$((FAIL+1)) ;;
 esac
 
-# 2. New 9-gate schema with all-pass -> no-fail (exit 0)
+# 2. 7 required gates + optional code_standards/zfc all-pass -> no-fail (exit 0)
 emit_assessment '{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","code_standards":"pass","zfc":"pass"}'
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"
 rc=$?
 set -e
-assert "9-gate schema all-pass -> exit 0" "0" "$rc"
+assert "7-gate+optional all-pass -> exit 0" "0" "$rc"
 
-# 3. NEW: zfc: "fail" string -> blocks merging (exit 1) -- the bug being fixed
+# 3. Optional zfc: "fail" still blocks merging (guard checks ALL gates present)
 emit_assessment '{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","code_standards":"pass","zfc":"fail"}'
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"
 rc=$?
 set -e
-assert "9-gate schema zfc=fail -> exit 1 (BLOCK)" "1" "$rc"
+assert "optional zfc=fail -> exit 1 (BLOCK)" "1" "$rc"
 case "$out" in
   FAIL:*zfc*) echo "PASS: zfc=fail emits FAIL:zfc message"; PASS=$((PASS+1)) ;;
   *) echo "FAIL: zfc=fail -> unexpected output: $out"; FAIL=$((FAIL+1)) ;;

@@ -271,12 +271,9 @@ gate-assessment)
   python3 - "$4" <<'PYGA' || die "invalid gates json"
 import json, sys
 g = json.loads(sys.argv[1])
-# 9 gates since 2026-07 auto-factory expansion: the original 7 plus
-# code_standards (/.codex/skills/code-standards) and zfc
-# (.claude/skills/zero-framework-cognition). The verifier tick in
-# .claude/skills/auto-factory/SKILL.md step 7 dispatches these two extra
-# reviews; the overlay only stores the verdicts + structured evidence,
-# it does not invoke the skills itself.
+# 7 required gates (canonical source: daemon/src/verifier.rs::GateName).
+# code_standards and zfc are optional advisory keys — accepted but not required.
+# See bead jleechan-1gft for tracking the optional expansion to real automated gates.
 #
 # Verdict value shape (jleechan-240 additive expansion):
 #   * String:  "pass" | "warn" | "fail" | "unknown"
@@ -284,7 +281,8 @@ g = json.loads(sys.argv[1])
 # Legacy aliases "green"/"red"/"unknown" map to "pass"/"fail"/"unknown".
 # Unknown verdict tokens are rejected (no keyword routing — only the
 # invoking model decides pass|warn|fail).
-keys = {"ci_green","no_conflicts","coderabbit","bugbot","comments_resolved","evidence_review","skeptic","code_standards","zfc"}
+REQUIRED_KEYS = {"ci_green","no_conflicts","coderabbit","bugbot","comments_resolved","evidence_review","skeptic"}
+OPTIONAL_KEYS = {"code_standards","zfc"}
 ALIAS = {"green":"pass","red":"fail","warn":"warn","unknown":"unknown","pass":"pass","fail":"fail"}
 VALID = {"pass","warn","fail","unknown"}
 
@@ -305,7 +303,12 @@ def normalize(v, key):
         return ALIAS[verdict]
     raise AssertionError(f"gate[{key}] value must be string or object; got {type(v).__name__}")
 
-assert set(g) == keys, f"gate keys must be exactly {sorted(keys)}, got {sorted(g)}"
+missing = REQUIRED_KEYS - set(g.keys())
+extra = set(g.keys()) - REQUIRED_KEYS - OPTIONAL_KEYS
+if missing:
+    raise AssertionError(f"missing required gates: {sorted(missing)}")
+if extra:
+    raise AssertionError(f"unknown gates (not in REQUIRED or OPTIONAL): {sorted(extra)}")
 verdicts = {k: normalize(v, k) for k, v in g.items()}
 PYGA
   all_green="$(python3 - "$4" <<'PYGB'

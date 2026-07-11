@@ -8,7 +8,7 @@ execution_mode: one-shot
 
 This is an alias for `/auto-factory`. Invoke the auto-factory skill:
 ```
-Skill("auto-factory", args="one tick: drive any factory-labeled beads to /green + /er + /code-standards; if no beads, pick up worldai GH issues labeled factory")
+Skill("auto-factory", args="one tick: drive any factory-labeled beads to /green + /er; /code-standards and /zfc are advisory checks (not required for all_green); if no beads, pick up worldai GH issues labeled factory")
 ```
 
 Then verify, repeat until beads reach READY, and report status.
