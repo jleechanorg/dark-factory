@@ -45,6 +45,13 @@ from .handler_sandbox import (
     _sealed_benchmark_doc_paths,
     _sandboxed_args,
     _sandboxed_args_for_workdir,
+    # Linux isolation backend (jleechan-haux) — re-exported so
+    # tests/security/test_agent_isolation.py can exercise + monkeypatch
+    # them the same way the macOS sandbox-exec helpers are exercised.
+    _linux_preload_lib_path,
+    _verify_linux_preload_denies,
+    _linux_sandbox_prefix,
+    _reset_linux_preload_verification_cache_for_tests,
 )
 
 # AO backend helpers.
