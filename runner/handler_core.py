@@ -6,11 +6,19 @@ Owns:
   * `Handler` — the ``Callable[[Node, Context], Result]`` type alias.
   * `_TIMEOUT_MIN_SECONDS`, `_TIMEOUT_MAX_SECONDS` — policy envelope.
   * `_coerce_timeout` — parse + clamp a timeout attr to the envelope.
+  * `_serialize_state_value` — the single repository-wide convention for
+    rendering a ``ctx.state`` value into placeholder-substitution text.
+    Shared by ``handler_render._substitute_placeholders`` (prompt templates)
+    and ``handler_decision._substitute_state`` (tool/holdout/test_path node
+    attrs) so both substitution paths serialize structured state (dict/list)
+    identically instead of drifting into inconsistent representations
+    (jleechan-7t92).
   * `_start`, `_exit` — the Mdiamond / Msquare builtin handlers.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -84,6 +92,38 @@ def _coerce_timeout(value: object, default: int, *, minimum: int = _TIMEOUT_MIN_
     if parsed > maximum:
         return maximum
     return parsed
+
+
+def _serialize_state_value(key: str, value: object) -> str:
+    """Deterministically render a ``ctx.state`` value for text substitution.
+
+    Repository structured-data convention (established by ``runner/cxdb.py``'s
+    event metadata column and ``handler_dispatch.py``'s
+    ``resolved_backend_meta``): structured values (dict/list) serialize as
+    sort-keyed JSON; scalars serialize via ``str()``. Every placeholder
+    substitution site in the runner (prompt rendering, tool/holdout/test_path
+    attrs) MUST go through this single function so a dict/list value renders
+    identically everywhere instead of drifting between JSON here and Python
+    ``repr()`` there.
+
+    Serialization failure (e.g. a dict holding a non-JSON-serializable nested
+    object, or a scalar whose ``__str__`` raises) must never crash the
+    render. On failure this returns a placeholder that names the offending
+    *key* and the value's *type* only — never the value's content — so a
+    render failure can be diagnosed without risking a leak of sealed/holdout
+    data that might be sitting in ``ctx.state``.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, sort_keys=True)
+        except (TypeError, ValueError):
+            return f"<unserializable state value: key={key!r} type={type(value).__name__}>"
+    try:
+        return str(value)
+    except Exception:
+        return f"<unserializable state value: key={key!r} type={type(value).__name__}>"
 
 
 Handler = Callable[[Node, Context], Result]
