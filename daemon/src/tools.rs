@@ -148,7 +148,13 @@ pub struct PrSnapshot {
     pub mergeable: bool,
     pub coderabbit_approved: bool,
     pub bugbot_error_count: u32,
-    pub unresolved_thread_count: u32,
+    /// Count of unresolved GitHub review threads, or `None` when the
+    /// GraphQL fetch/parse failed and the count could not be proven.
+    /// jleechan-kk64: `None` MUST be treated as unknown/unverifiable by
+    /// every caller — never coerced to `0`/Green. A transient GitHub API
+    /// failure or malformed GraphQL response is not evidence that zero
+    /// threads are unresolved.
+    pub unresolved_thread_count: Option<u32>,
     pub head_sha: String,
     pub body: String,
     pub comments: Vec<PrComment>,

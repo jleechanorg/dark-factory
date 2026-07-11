@@ -549,13 +549,16 @@ pub fn assess(
         ))
     };
 
-    let comments_resolved = if snapshot.unresolved_thread_count == 0 {
-        GateResult::Green
-    } else {
-        GateResult::Red(format!(
-            "{} unresolved review thread(s)",
-            snapshot.unresolved_thread_count
-        ))
+    // jleechan-kk64: `None` means the GraphQL fetch/parse of the
+    // unresolved-review-thread count failed — that is NOT evidence of zero
+    // unresolved threads. Fail closed to `Unknown`, never `Green`.
+    let comments_resolved = match snapshot.unresolved_thread_count {
+        Some(0) => GateResult::Green,
+        Some(n) => GateResult::Red(format!("{n} unresolved review thread(s)")),
+        None => GateResult::Unknown(
+            "unresolved review thread count could not be determined (GraphQL fetch or parse failed)"
+                .to_string(),
+        ),
     };
 
     let evidence_floor = evidence_floor_gate(evidence);
@@ -635,7 +638,30 @@ mod tests {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadbeef".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 0,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            head_committed_epoch: 0,
+        }
+    }
+
+    /// Creates a snapshot with unknown unresolved_thread_count (simulating GraphQL failure).
+    /// This is the scenario this test proves: when thread count is unknown,
+    /// the CommentsResolved gate must return Unknown, NOT Green.
+    fn snapshot_with_unknown_thread_count(pr: u64) -> PrSnapshot {
+        PrSnapshot {
+            pr_number: pr,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: None, // Unknown - GraphQL failed
             head_sha: "deadbeef".into(),
             body: "".into(),
             comments: vec![],
@@ -701,6 +727,44 @@ mod tests {
         assert!(gate(&report, GateName::CodeRabbitApproved).is_green());
         assert!(gate(&report, GateName::BugbotClean).is_green());
         assert!(gate(&report, GateName::CommentsResolved).is_green());
+    }
+
+    #[test]
+    fn unknown_thread_count_marks_comments_resolved_unknown_not_green() {
+        // jleechan-kk64 regression test: a GraphQL fetch/parse failure for
+        // the unresolved-review-thread count (represented here as
+        // `unresolved_thread_count: None`, distinct from the "whole
+        // pr_snapshot call errored" case covered by
+        // `snapshot_fetch_error_marks_thread_gate_unknown_not_red` below)
+        // must make the CommentsResolved gate report Unknown — proving
+        // READY/all_green remains impossible until the thread count is
+        // actually proven, never defaulting to Green.
+        let mut scm = FakeScm::default();
+        scm.snapshots
+            .insert(7, snapshot_with_unknown_thread_count(7));
+        let cfg = test_cfg();
+
+        let report = assess(&scm, 7, &cfg, &all_green_evidence()).unwrap();
+
+        assert!(
+            !report.all_green,
+            "all_green must be false when thread count is unknown, got {report:?}"
+        );
+        let comments_resolved = gate(&report, GateName::CommentsResolved);
+        assert!(
+            matches!(comments_resolved, GateResult::Unknown(_)),
+            "expected CommentsResolved gate to be Unknown when thread count is unproven, got {comments_resolved:?}"
+        );
+        assert!(
+            !comments_resolved.is_green(),
+            "CommentsResolved gate must never be Green when thread count is unproven"
+        );
+        // Every other gate stays unaffected — this is an isolated Unknown,
+        // not a cascade.
+        assert!(gate(&report, GateName::Ci).is_green());
+        assert!(gate(&report, GateName::NoConflicts).is_green());
+        assert!(gate(&report, GateName::CodeRabbitApproved).is_green());
+        assert!(gate(&report, GateName::BugbotClean).is_green());
     }
 
     #[test]

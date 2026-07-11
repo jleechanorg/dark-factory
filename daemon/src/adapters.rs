@@ -592,7 +592,7 @@ impl Scm for CliScm {
                         mergeable: snap.mergeable,
                         coderabbit_approved: snap.coderabbit_approved,
                         bugbot_error_count: snap.bugbot_error_count,
-                        unresolved_thread_count: snap.unresolved_thread_count,
+                        unresolved_thread_count: Some(snap.unresolved_thread_count),
                         head_sha: snap.head_sha,
                         body: snap.body,
                         comments: snap.comments,
@@ -916,6 +916,11 @@ impl Scm for CliScm {
               }
             }
         }";
+        // No REST fallback exists for this query: GitHub's REST API does not
+        // expose per-thread resolution status (only GraphQL's
+        // `reviewThreads.isResolved` does), unlike the `pr view` / `pr
+        // checks` calls above which do have REST equivalents. If GraphQL is
+        // unavailable there is currently no alternate path to this data.
         let gql_out = run_tool(
             "gh",
             &[
@@ -932,18 +937,33 @@ impl Scm for CliScm {
             ],
             30,
         );
-        // jleechan-qdw/GraphQL-rate-limit tolerance: a GraphQL failure here
-        // (rate limit, transient network) must not abort the whole
-        // `pr_snapshot` call — unresolved-thread count degrades to 0 (with a
-        // logged warning) rather than propagating the error via `?`.
-        let unresolved_thread_count = match gql_out {
-            Ok(gql_out_str) => unresolved_thread_count_from_gql(&gql_out_str).unwrap_or_else(|e| {
-                eprintln!("[warn] failed to parse unresolved-thread GraphQL response, defaulting to 0: {e:?}");
-                0
-            }),
+        // jleechan-kk64: a GraphQL failure or parse failure here (rate
+        // limit, transient network, malformed/truncated response) must NOT
+        // report a false `0` unresolved-thread count — that would silently
+        // green-light the `CommentsResolved` gate (verifier.rs) while real
+        // unresolved review threads could still exist, exactly the
+        // fail-open bug this fix closes. Report `None` (unknown) instead;
+        // `verifier::assess` maps `None` to `GateResult::Unknown`, never
+        // `Green`. The rest of `pr_snapshot` still returns `Ok(snapshot)` so
+        // an isolated GraphQL hiccup doesn't take down every other gate —
+        // same discipline as the `head_committed_epoch` fallback below.
+        let unresolved_thread_count: Option<u32> = match gql_out {
+            Ok(gql_out_str) => match unresolved_thread_count_from_gql(&gql_out_str) {
+                Ok(count) => Some(count),
+                Err(e) => {
+                    eprintln!(
+                        "[warn] failed to parse unresolved-thread GraphQL response; \
+                         comments-resolved gate will report Unknown, not Green: {e:?}"
+                    );
+                    None
+                }
+            },
             Err(e) => {
-                eprintln!("[warn] GraphQL query failed, defaulting unresolved threads to 0: {e:?}");
-                0
+                eprintln!(
+                    "[warn] GraphQL query failed; comments-resolved gate will report Unknown, \
+                     not Green: {e:?}"
+                );
+                None
             }
         };
 

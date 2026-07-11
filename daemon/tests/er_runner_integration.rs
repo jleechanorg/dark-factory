@@ -327,7 +327,7 @@ fn all_green_snapshot(pr: u64) -> PrSnapshot {
         mergeable: true,
         coderabbit_approved: true,
         bugbot_error_count: 0,
-        unresolved_thread_count: 0,
+        unresolved_thread_count: Some(0),
         head_sha: "deadbeef".into(),
         body: String::new(),
         comments: Vec::new(),
