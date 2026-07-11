@@ -107,9 +107,10 @@ gh pr list --repo "$TARGET_REPO" --head "factory/<bead_id>-r<attempt>" --state o
 For every ATTESTED bead (PR opened/updated), run the canonical 7 gates as defined in
 `daemon/src/verifier.rs::GateName` (`Ci, NoConflicts, CodeRabbitApproved, BugbotClean,
 CommentsResolved, EvidenceFloor, Skeptic`). The `code_standards` and `zfc` checks are
-optional advisory reviews — they are still worth running and recording as extra evidence,
-but they do NOT count toward `all_green`. See bead jleechan-1gft for tracking the optional
-expansion to real automated gates.
+optional advisory reviews — they are NOT required keys in the gate-assessment JSON and their
+absence never blocks `all_green`. If you DO record them, they participate like any recorded
+gate: a `fail` verdict blocks `all_green` and routes through the same `reroll-verdict` fix
+loop. See bead jleechan-1gft for promoting them to required `GateName` gates in the Rust verifier.
 
 | Verdict  | Meaning                                                                | Gate result     |
 |----------|------------------------------------------------------------------------|-----------------|
@@ -163,7 +164,7 @@ schema (strict, matching `daemon/src/verifier.rs::GateName`) is enforced by `fac
 {"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass",
  "bugbot":"pass","comments_resolved":"pass","evidence_review":"pass",
  "skeptic":"pass"}
- // optional advisory keys (not required for all_green):
+ // optional advisory keys — not required; if present, a fail still blocks:
  // "code_standards":"pass","zfc":"pass"
 ```
 
