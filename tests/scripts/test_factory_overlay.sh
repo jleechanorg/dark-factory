@@ -113,13 +113,13 @@ assert "state after pr-opened" "ATTESTED" "$state"
 pr="$(sqlite3 "$AFD_DB" "SELECT pr_number FROM bead_overlay WHERE bead_id='test-roundtrip';")"
 assert "pr_number after pr-opened" "7888" "$pr"
 
-# 11. gate-assessment ATTESTED, all-green (9-gate schema: 7 originals + code_standards + zfc)
+# 11. gate-assessment ATTESTED, all-green (7 required gates + optional code_standards/zfc)
 gates='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","code_standards":"green","zfc":"green"}'
 out="$("$OVERLAY" gate-assessment test-roundtrip 7888 "$gates")"
 assert "gate-assessment all-green → true" "true" "$(echo "$out" | head -1)"
 assert "gate-assessment cooldown=false" "cooldown_ready=false" "$(echo "$out" | tail -1)"
 
-# 11a. gate-assessment ATTESTED, 9-gate schema (with /code-standards + /zfc)
+# 11a. gate-assessment ATTESTED, 7-gate schema (code_standards/zfc now optional)
 # Pull the bead back to ATTESTED to re-run gate-assessment (was READY).
 "$OVERLAY" intake-upsert test-9gates 'nine gate test' >/dev/null
 "$OVERLAY" route-record test-9gates STANDARD_PATH >/dev/null
@@ -127,28 +127,25 @@ assert "gate-assessment cooldown=false" "cooldown_ready=false" "$(echo "$out" | 
 "$OVERLAY" pr-opened test-9gates 7889 https://github.com/jleechanorg/worldarchitect.ai/pull/7889 >/dev/null
 gates9='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","code_standards":"green","zfc":"green"}'
 out9="$("$OVERLAY" gate-assessment test-9gates 7889 "$gates9")"
-assert "gate-assessment 9-gate schema → true" "true" "$(echo "$out9" | head -1)"
+assert "gate-assessment 7-gate+optional schema → true" "true" "$(echo "$out9" | head -1)"
 
-# 11b. gate-assessment red on /zfc → false (verifies per-gate precedence)
+# 11b. gate-assessment with optional zfc=red → false (optional keys still count in all_green when present)
 "$OVERLAY" intake-upsert test-zfc-red 'zfc red test' >/dev/null
 "$OVERLAY" route-record test-zfc-red STANDARD_PATH >/dev/null
 "$OVERLAY" dispatch-record test-zfc-red fix/zfc-red >/dev/null
 "$OVERLAY" pr-opened test-zfc-red 7890 https://github.com/jleechanorg/worldarchitect.ai/pull/7890 >/dev/null
 gates_zfc_red='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","code_standards":"green","zfc":"red"}'
 out_zfc="$("$OVERLAY" gate-assessment test-zfc-red 7890 "$gates_zfc_red")"
-assert "gate-assessment 9-gate w/ zfc=red → false" "false" "$(echo "$out_zfc" | head -1)"
+assert "gate-assessment 7-gate+optional zfc=red → false (all keys count in all_green)" "false" "$(echo "$out_zfc" | head -1)"
 
-# 11c. gate-assessment rejects missing new keys (legacy 7-gate JSON should fail)
+# 11c. gate-assessment accepts legacy 7-gate JSON (now the canonical contract)
 "$OVERLAY" intake-upsert test-legacy 'legacy 7-gate test' >/dev/null
 "$OVERLAY" route-record test-legacy STANDARD_PATH >/dev/null
 "$OVERLAY" dispatch-record test-legacy fix/legacy-gates >/dev/null
 "$OVERLAY" pr-opened test-legacy 7891 https://github.com/jleechanorg/worldarchitect.ai/pull/7891 >/dev/null
 gates_legacy7='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green"}'
-set +e
-"$OVERLAY" gate-assessment test-legacy 7891 "$gates_legacy7" 2>&1
-rc_legacy=$?
-set -e
-assert "gate-assessment rejects legacy 7-gate schema" "1" "$rc_legacy"
+out_legacy="$("$OVERLAY" gate-assessment test-legacy 7891 "$gates_legacy7")"
+assert "gate-assessment accepts canonical 7-gate schema" "true" "$(echo "$out_legacy" | head -1)"
 
 # 11d. gate-assessment accepts pass/warn/fail (jleechan-240 expansion).
 # Warn is NON-blocking: a single warn still yields all_green=true so the

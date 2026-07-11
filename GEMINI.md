@@ -101,7 +101,7 @@ Before marking Gate 6 as PASS, you must answer explicitly what the evidence prov
 
 ### Human Merge Approval Requirement
 > [!CAUTION]
-> **NEVER** execute `gh pr merge` or merge any PR unprompted, even if all 9 gates are green (the 7 originals + `/code-standards` + `/zfc`). You **MUST** wait for the human user to explicitly type `MERGE APPROVED` in the chat before carrying out the merge.
+> **NEVER** execute `gh pr merge` or merge any PR unprompted, even if all 7 automated gates are green (the canonical gates from `daemon/src/verifier.rs::GateName`: ci_green, no_conflicts, coderabbit, bugbot, comments_resolved, evidence_review, skeptic). The `/code-standards` and `/zfc` checks are separate human-approval-time checks — they are never auto-merged without human `MERGE APPROVED`. You **MUST** wait for the human user to explicitly type `MERGE APPROVED` in the chat before carrying out the merge.
 
 ---
 
