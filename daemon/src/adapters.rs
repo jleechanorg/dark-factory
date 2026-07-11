@@ -131,7 +131,7 @@ impl Tracker for CliTracker {
     }
 
     fn comment_external(&self, external_ref: &str, body: &str) -> Result<(), DaemonError> {
-        if let Some((repo, issue)) = parse_external_ref(external_ref) {
+        if let Some((repo, issue)) = canonicalize_external_ref_for_comment(external_ref) {
             run_tool("gh", &["issue", "comment", &issue, "--repo", &repo, "--body", body], 30)?;
             Ok(())
         } else {
@@ -181,6 +181,38 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
     } else {
         None
     }
+}
+
+/// jleechan-mdgr defense-in-depth: recovers the real `<repo>#<pr>` comment
+/// target from the "double external_ref suffix" corruption, where a bead
+/// that already had a valid `parse_external_ref`-shaped ref ALSO got a
+/// `#local-<bead-id>` disambiguation suffix appended on top of it (see
+/// `daemon/scripts/backfill_external_ref.py`'s `#local-<id>` convention,
+/// which is only ever supposed to apply to a base ref with no `#` of its
+/// own — e.g. a bare GitHub PR URL). The 2026-07-11T00:05:15Z incident
+/// (bead jleechan-8dyu, `jleechanorg/worldarchitect.ai#7888#local-8dyu`)
+/// shows the writer mixing that convention with the SHORT canonical
+/// `owner/repo#N` base, which already contains a `#`, producing 3
+/// `#`-delimited segments and a permanent `comment_external` parse failure.
+///
+/// `parse_external_ref` intentionally stays strict (exactly one `#`) so
+/// this corrupted shape is still detected as invalid on its own; this
+/// helper is the single call site (escalation comment posting) that
+/// recognizes the specific `<repo>#<pr>#local-<token>` shape and strips
+/// the trailing disambiguation suffix to recover the real target, so
+/// already-corrupted stored data (which this PR does NOT bulk-repair) can
+/// still have its escalation comment posted. Any other malformed shape —
+/// bare `local-<id>` refs, full GitHub URLs — is left untouched; those are
+/// jleechan-twa0's territory (parser format acceptance), not this bug.
+fn canonicalize_external_ref_for_comment(external_ref: &str) -> Option<(String, String)> {
+    if let Some(parsed) = parse_external_ref(external_ref) {
+        return Some(parsed);
+    }
+    let parts: Vec<&str> = external_ref.split('#').collect();
+    if parts.len() == 3 && parts[2].starts_with("local-") {
+        return parse_external_ref(&format!("{}#{}", parts[0], parts[1]));
+    }
+    None
 }
 
 fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
@@ -2140,7 +2172,60 @@ pub fn ci_success_from_check_buckets(buckets: &[&str], iteration_stub: bool) -> 
 
 #[cfg(test)]
 mod external_ref_tests {
-    use super::{parse_external_refs_from_br_list, unresolved_thread_count_from_gql};
+    use super::{
+        canonicalize_external_ref_for_comment, parse_external_refs_from_br_list,
+        unresolved_thread_count_from_gql,
+    };
+
+    /// jleechan-mdgr: reproduces the exact 2026-07-11T00:05:15Z corruption —
+    /// `ESCALATION_NOTIFICATION_FAILED` fired for bead jleechan-8dyu with
+    /// error "parse: invalid external_ref format for comment:
+    /// jleechanorg/worldarchitect.ai#7888#local-8dyu". The stored
+    /// `external_ref` already had a valid `<repo>#<pr>` shape AND had a
+    /// `#local-<bead-id>` disambiguation suffix (see
+    /// `daemon/scripts/backfill_external_ref.py`) appended on top of it,
+    /// producing 3 `#`-delimited segments instead of 2. `comment_external`
+    /// must still be able to recover the real `repo#PR` comment target from
+    /// this already-corrupted shape (defense in depth — no bulk data
+    /// cleanup pass) even though the writer itself is fixed to never
+    /// produce this shape again.
+    #[test]
+    fn double_suffix_external_ref_is_recovered_for_comment_target() {
+        let corrupted = "jleechanorg/worldarchitect.ai#7888#local-8dyu";
+        assert_eq!(
+            canonicalize_external_ref_for_comment(corrupted),
+            Some(("jleechanorg/worldarchitect.ai".to_string(), "7888".to_string())),
+            "expected the real repo#PR target to be recovered from the double-suffix corruption"
+        );
+    }
+
+    #[test]
+    fn clean_external_ref_still_parses_unchanged() {
+        assert_eq!(
+            canonicalize_external_ref_for_comment("owner/repo#42"),
+            Some(("owner/repo".to_string(), "42".to_string()))
+        );
+    }
+
+    #[test]
+    fn bare_local_ref_is_not_recovered_by_this_helper() {
+        // jleechan-twa0's territory — a bare `local-<id>` ref (no real PR at
+        // all) is a distinct bug (parser format acceptance), not the
+        // double-append this fixes. Must stay None here so this helper does
+        // not silently grow into twa0's scope.
+        assert_eq!(canonicalize_external_ref_for_comment("local-w1y"), None);
+    }
+
+    #[test]
+    fn triple_hash_ref_without_local_marker_is_not_recovered() {
+        // Only the specific `<repo>#<pr>#local-<id>` shape is recovered;
+        // anything else with more than one `#` and no `local-` marker on
+        // the trailing segment is left as a genuine parse failure.
+        assert_eq!(
+            canonicalize_external_ref_for_comment("owner/repo#42#weird-suffix"),
+            None
+        );
+    }
 
     #[test]
     fn fetch_all_external_refs_includes_closed_beads() {
