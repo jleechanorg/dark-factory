@@ -60,9 +60,7 @@ if [ -n "$TARGET_PRS" ]; then
     # Reject empty tokens (",," or leading/trailing ",") — they would produce
     # invalid SQL like "IN (,1,2)" or "IN (1,2,)".
     case ",${TARGET_PRS}," in
-        *,,*) echo "factory-af-tick: --prs has empty token (got: $TARGET_PRS)" >&2; exit 2 ;;
-        *,)   echo "factory-af-tick: --prs has trailing comma (got: $TARGET_PRS)" >&2; exit 2 ;;
-        ,,*)  echo "factory-af-tick: --prs has leading comma (got: $TARGET_PRS)" >&2; exit 2 ;;
+        *,,*) echo "factory-af-tick: --prs has empty, leading, or trailing comma (got: $TARGET_PRS)" >&2; exit 2 ;;
     esac
 fi
 
