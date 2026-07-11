@@ -41,6 +41,8 @@ ROOT = pathlib.Path(__file__).parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from runner.handlers import (  # noqa: E402
+    Context,
+    _codergen,
     _linux_preload_lib_path,
     _verify_linux_preload_denies,
     _linux_sandbox_prefix,
@@ -49,6 +51,7 @@ from runner.handlers import (  # noqa: E402
     _sandboxed_args_for_workdir,
     _sanitized_env,
 )
+from runner.parser import Node
 
 linux_only = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
@@ -293,3 +296,88 @@ def test_relative_path_after_chdir_is_also_denied(tmp_path, monkeypatch):
     )
     assert proc.returncode != 0
     assert "secret-via-relative-path" not in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# (5) Full-stack: through the real `_codergen` handler, not just the helper.
+#
+# This is the strongest form of the "verify a real pipeline node runs while
+# holdout reads stay denied" acceptance bar: a fake `claude` binary on PATH,
+# invoked exactly the way `_codergen`'s claude branch invokes the real CLI
+# (same argv construction, same env, same sandbox wrapper), attempts to leak
+# a holdout file's content into its own stdout. A pipeline node calling this
+# same backend for a *normal* task must still succeed end to end.
+# ---------------------------------------------------------------------------
+
+
+def _write_fake_claude_binary(bin_dir: pathlib.Path, marker_env_var: str) -> None:
+    """A fake `claude` that tries to `cat` the path in `$<marker_env_var>`
+    and reports the outcome on stdout, then always exits 0 (so `_codergen`'s
+    success/failure branch reflects *containment*, not accidental process
+    failure) -- the test asserts on the reported leak status, not on the
+    handler's outcome field.
+    """
+    shim = bin_dir / "claude"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'target="${{{marker_env_var}}}"\n'
+        'if [ -z "$target" ]; then\n'
+        '  echo "RESULT: no-marker-configured"\n'
+        "  exit 0\n"
+        "fi\n"
+        'contents=$(cat "$target" 2>/dev/null)\n'
+        'if [ -n "$contents" ]; then\n'
+        '  echo "RESULT: LEAKED $contents"\n'
+        "else\n"
+        '  echo "RESULT: DENIED"\n'
+        "fi\n"
+        "exit 0\n"
+    )
+    shim.chmod(0o755)
+
+
+@linux_only
+def test_real_pipeline_node_runs_while_holdout_reads_stay_denied(tmp_path, monkeypatch):
+    """End-to-end through `_codergen(backend="claude")`.
+
+    Two calls through the exact same handler code path used by a real
+    pipeline node:
+      (a) the fake coder tries to read a holdout-path file -> DENIED.
+      (b) the fake coder does a normal task with no holdout access -> the
+          node still completes (`outcome == "success"`), proving the
+          isolation wrapper doesn't break real pipeline execution.
+    """
+    holdouts_repo = tmp_path / "dark-factory-holdouts"
+    holdouts_repo.mkdir()
+    secret = holdouts_repo / "answer.txt"
+    secret.write_text("THE-REAL-HOLDOUT-ANSWER")
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts_repo))
+
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    _write_fake_claude_binary(bin_dir, marker_env_var="TEST_LEAK_TARGET")
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+
+    workdir = tmp_path / "worktree"
+    workdir.mkdir()
+
+    # (a) Attempt to leak the holdout file.
+    monkeypatch.setenv("TEST_LEAK_TARGET", str(secret))
+    node = Node(name="coder_step", attrs={"type": "codergen", "backend": "claude"})
+    ctx = Context(goal="attempt holdout leak", workdir=workdir, backend="claude")
+    result = _codergen(node, ctx)
+    assert "LEAKED" not in result.output, (
+        f"holdout content leaked through a real _codergen(backend='claude') node:\n{result.output}"
+    )
+    assert "THE-REAL-HOLDOUT-ANSWER" not in result.output
+    assert "DENIED" in result.output
+
+    # (b) Same handler, same wrapper, a normal task with no holdout target.
+    monkeypatch.delenv("TEST_LEAK_TARGET", raising=False)
+    node2 = Node(name="coder_step_2", attrs={"type": "codergen", "backend": "claude"})
+    ctx2 = Context(goal="do a normal task", workdir=workdir, backend="claude")
+    result2 = _codergen(node2, ctx2)
+    assert result2.outcome == "success", (
+        f"a normal (non-holdout) pipeline node failed under the isolation wrapper: {result2.output!r}"
+    )
+    assert "no-marker-configured" in result2.output
