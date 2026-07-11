@@ -1317,7 +1317,15 @@ impl CliSessions {
             // worktree, branch, or process was created, so nothing is
             // leaked or double-spawned by requeuing and trying again next
             // tick.
-            if err_msg.to_lowercase().contains("spawn queue is full") {
+            // Anchored on "...is full for project" (not just "spawn queue is
+            // full") to shrink the false-positive surface: this factory's
+            // bead prompts are themselves LLM-generated coding-task text, so
+            // a bead literally about fixing this handling (or quoting this
+            // very error string) could otherwise cause an unrelated spawn
+            // failure whose stderr echoes the bare phrase to be misclassified
+            // as retry-safe backpressure. The longer anchor still tolerates
+            // the variable `'<project-id>'` in the AO-thrown message.
+            if err_msg.to_lowercase().contains("spawn queue is full for project") {
                 return Err(DaemonError::Deferred(format!(
                     "ao spawn --agent {agent} rejected: admission queue full ({})",
                     err_msg.trim()
@@ -1517,6 +1525,26 @@ mod spawn_classification_tests {
         .unwrap();
 
         assert_eq!(session.0, "abc-123");
+    }
+
+    /// Regression guard for the pre-existing fallthrough (unchanged by this
+    /// refactor): a successful exit with neither a `SESSION=` nor a
+    /// `REQUEST=` line is a genuine parse failure, not retry-safe.
+    #[test]
+    fn success_exit_with_no_session_or_request_line_is_parse_error() {
+        let err = CliSessions::classify_spawn_output(
+            "claude-code",
+            true,
+            Some(0),
+            "some unexpected stdout with no marker line\n",
+            "",
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DaemonError::Parse(_)),
+            "expected DaemonError::Parse for a success exit with no SESSION=/REQUEST= line, got {err:?}"
+        );
     }
 }
 
