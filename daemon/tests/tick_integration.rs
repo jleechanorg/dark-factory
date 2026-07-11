@@ -2484,13 +2484,21 @@ fn newly_intaken_bead_dispatch_uses_real_tracker_title() {
     assert_eq!(summary.beads_created, 1);
     assert_eq!(summary.beads_dispatched, 1);
     let prompts = sessions.spawn_prompts.borrow();
-    assert_eq!(
-        prompts.as_slice(),
-        &[(
-            "fake-bead-1".to_string(),
-            "Wire a durable Linux trigger (owner/repo)".to_string()
-        )],
-        "new intake must dispatch the real tracker title, not an empty stub prompt"
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].0, "fake-bead-1");
+    // jleechan-if09: the prompt is now the enriched coder contract; this
+    // test's original intent (the REAL tracker title reaches the coder, not
+    // an empty stub) is preserved as a containment check, plus the enriched
+    // fields the tracker supplied.
+    assert!(
+        prompts[0].1.contains("Wire a durable Linux trigger (owner/repo)"),
+        "new intake must dispatch the real tracker title, not an empty stub prompt: {}",
+        prompts[0].1
+    );
+    assert!(
+        prompts[0].1.contains("systemd user unit acceptance criteria"),
+        "tracker-supplied description must reach the coder prompt: {}",
+        prompts[0].1
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
