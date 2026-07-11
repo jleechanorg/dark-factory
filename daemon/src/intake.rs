@@ -63,6 +63,62 @@ pub struct IntakeOutcome {
     pub verdict: IntakeVerdict,
 }
 
+/// jleechan-35y4 Stage A: resolve which repo a bead belongs to, in
+/// precedence order:
+///
+/// 1. An explicit `target_repo: <owner>/<name>` field in the bead body —
+///    the existing `/auto-factory` drive-existing-pr protocol grammar (see
+///    `.claude/skills/auto-factory/SKILL.md` §1c, alongside
+///    `existing_branch:`/`existing_pr:`). Applies identically to
+///    daemon-created beads and beads created manually via `br`.
+/// 2. Else the `owner/repo` prefix of the bead's `external_ref`
+///    (`"<owner>/<repo>#<number>"`).
+/// 3. Else `None` — legacy/manual bead with no way to determine its repo;
+///    callers fall back to the daemon's global `cfg.target_repo` via
+///    [`crate::state::BeadOverlay::repo`].
+///
+/// This is the single call site for body-field/external_ref repo-identity
+/// parsing — do not re-implement this precedence elsewhere.
+pub fn resolve_target_repo(body: &str, external_ref: Option<&str>) -> Option<String> {
+    if let Some(explicit) = parse_target_repo_body_field(body) {
+        return Some(explicit);
+    }
+    external_ref
+        .and_then(parse_owner_repo_from_external_ref)
+        .map(|(owner_repo, _issue)| owner_repo)
+}
+
+/// Same `owner/repo#N` split as the private `parse_external_ref` helpers in
+/// `adapters.rs`/`tick.rs` (each module keeps its own copy rather than
+/// sharing a `pub(crate)` — matches the existing duplication pattern in this
+/// crate). Strict: exactly one `#`, else `None` rather than guessing.
+fn parse_owner_repo_from_external_ref(external_ref: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = external_ref.split('#').collect();
+    if parts.len() == 2 {
+        Some((parts[0].to_string(), parts[1].to_string()))
+    } else {
+        None
+    }
+}
+
+/// Scan `body` line-by-line for `target_repo: <value>` (matching the
+/// `existing_branch:`/`existing_pr:` grammar documented in
+/// `.claude/skills/auto-factory/SKILL.md`). Returns `None` for a missing
+/// field OR a present-but-blank value — a malformed field must not win over
+/// a usable `external_ref` fallback.
+fn parse_target_repo_body_field(body: &str) -> Option<String> {
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("target_repo:") {
+            let value = rest.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn same_repo_pr(pr: &LabeledPr, cfg: &Config) -> bool {
     if pr.is_cross_repository {
         return false;
@@ -363,6 +419,7 @@ mod tests {
     // contract tests (idempotency, write-tier gate, mixed batch) live in
     // `daemon/tests/intake.rs` per Task 6 Step 1.
     use crate::tools::Permission;
+    use super::resolve_target_repo;
 
     #[test]
     fn permission_write_tier_gate_matches_design_contract() {
@@ -371,5 +428,46 @@ mod tests {
         assert!(!Permission::Read.is_write_tier());
         assert!(!Permission::Triage.is_write_tier());
         assert!(!Permission::None.is_write_tier());
+    }
+
+    // jleechan-35y4 Stage A: intake repo-resolution precedence. Three
+    // branches, exactly matching the doc's precedence order — explicit body
+    // field wins, then external_ref, then None (legacy/global).
+
+    #[test]
+    fn resolve_target_repo_prefers_explicit_body_field_over_external_ref() {
+        let body = "Some description.\ntarget_repo: jleechanorg/dark-factory\nexisting_branch: fix/x\n";
+        let got = resolve_target_repo(body, Some("jleechanorg/worldarchitect.ai#123"));
+        assert_eq!(got.as_deref(), Some("jleechanorg/dark-factory"));
+    }
+
+    #[test]
+    fn resolve_target_repo_falls_back_to_external_ref_prefix_when_no_body_field() {
+        let body = "Just a plain description, no structured fields.";
+        let got = resolve_target_repo(body, Some("jleechanorg/worldarchitect.ai#456"));
+        assert_eq!(got.as_deref(), Some("jleechanorg/worldarchitect.ai"));
+    }
+
+    #[test]
+    fn resolve_target_repo_is_none_when_neither_body_field_nor_external_ref_present() {
+        let got = resolve_target_repo("Just a plain description.", None);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn resolve_target_repo_ignores_blank_target_repo_value() {
+        // A malformed/empty `target_repo:` line must not win over a usable
+        // external_ref fallback.
+        let body = "target_repo:   \n";
+        let got = resolve_target_repo(body, Some("jleechanorg/dark-factory#7"));
+        assert_eq!(got.as_deref(), Some("jleechanorg/dark-factory"));
+    }
+
+    #[test]
+    fn resolve_target_repo_ignores_malformed_external_ref() {
+        // `external_ref` without exactly one '#' doesn't parse — falls
+        // through to None rather than guessing.
+        let got = resolve_target_repo("no structured fields here", Some("not-a-valid-ref"));
+        assert_eq!(got, None);
     }
 }

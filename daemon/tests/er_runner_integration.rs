@@ -317,6 +317,7 @@ fn test_cfg() -> Config {
         autonomy_timebox_secs: 10_800,
         budget_warn_usd: 20.0,
         spec_dir: ".factory/specs/".into(),
+        repos: std::collections::HashMap::new(),
     }
 }
 
@@ -355,6 +356,7 @@ fn attested_overlay(bead_id: &str, pr: u64) -> BeadOverlay {
         spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
     }
 }
 

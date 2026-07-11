@@ -864,6 +864,14 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             Some(OverlayState::Ready) | Some(OverlayState::HumanHeld)
         );
         if should_adopt {
+            // jleechan-35y4 Stage A: adopted PRs are always same-repo
+            // (fork/cross-repo PRs are rejected earlier by `same_repo_pr`
+            // in intake.rs), so this always resolves to `cfg.target_repo`'s
+            // owner/repo today. Still resolved from `external_ref` (not
+            // left `None`) so it stays correct once Stage C/D lift the
+            // same-repo-only restriction for adopted PRs.
+            let target_repo =
+                intake::resolve_target_repo("", Some(adopted.external_ref.as_str()));
             let mut overlay = existing.unwrap_or(BeadOverlay {
                 bead_id: adopted.bead_id.clone(),
                 state: OverlayState::Attested,
@@ -878,6 +886,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo,
             });
             overlay.state = OverlayState::Attested;
             overlay.pr_number = Some(adopted.pr_number);
@@ -952,6 +961,14 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
         }
 
+        // jleechan-35y4 Stage A: resolve per-bead repo identity at intake
+        // time — explicit `target_repo:` body field wins, else the
+        // `owner/repo` prefix of external_ref, else None (legacy/global,
+        // resolved later via `BeadOverlay::repo`).
+        let target_repo = intake::resolve_target_repo(
+            tracker_bead.as_ref().map(|b| b.description.as_str()).unwrap_or(""),
+            tracker_bead.as_ref().and_then(|b| b.external_ref.as_deref()),
+        );
         let overlay = BeadOverlay {
             bead_id: bead_id.clone(),
             state: OverlayState::Queued,
@@ -966,6 +983,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo,
         };
         deps.store.save(&overlay)?;
         summary.beads_created += 1;
@@ -1021,6 +1039,14 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 }
             }
             None => {
+                // jleechan-35y4 Stage A: same intake resolution precedence
+                // as the GH-issue path above, applied identically to
+                // manual `br`-created beads (spec requirement: "Manual `br`
+                // beads: same body-field parse").
+                let target_repo = intake::resolve_target_repo(
+                    bead.description.as_str(),
+                    bead.external_ref.as_deref(),
+                );
                 let o = BeadOverlay {
                     bead_id: bead.id.clone(),
                     state: OverlayState::Queued,
@@ -1035,6 +1061,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo,
                 };
                 deps.store.save(&o)?;
                 summary.beads_created += 1;
@@ -1067,7 +1094,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     OverlayState::Queued.as_str(),
                     "TASK_ROUTED",
                     serde_json::json!({}),
-                    serde_json::json!({"routingVerdict": verdict_str}),
+                    // jleechan-35y4: target_repo now visible in daemon.jsonl
+                    // (null == legacy/global cfg.target_repo).
+                    serde_json::json!({"routingVerdict": verdict_str, "target_repo": overlay.target_repo}),
                 )?;
                 ready.push((bead.clone(), verdict));
             }
@@ -1193,6 +1222,89 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 continue;
             }
 
+            if failure.phase == "unmapped_target_repo" {
+                // jleechan-35y4 (adversarial review of PR #245): this phase
+                // (from `dispatch::dispatch_ready`'s fail-loud park) was
+                // previously falling through to the generic
+                // `BEAD_DISPATCH_TRANSIENT_ERROR` branch below, which
+                // labeled a genuinely HUMAN_HELD, non-transient park as
+                // `lifecycle_state = QUEUED` / `"transient": false`-but-
+                // treated-as-retryable telemetry, incremented no
+                // HUMAN_HELD counter, and posted no escalation comment —
+                // the exact opposite of the "fail loud" intent. Mirror the
+                // `spawn_retry_cap_exceeded` idiom: record the park, then
+                // best-effort escalate exactly once.
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "unmapped_target_repo",
+                        "error": failure.error.as_str(),
+                    }),
+                )?;
+                if escalation_already_recorded(deps, &failure.bead_id)? {
+                    continue;
+                }
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: bead `{}` claims a `target_repo` with no matching `[repos.*]` config entry (and it is not the daemon's global `target_repo`). Automation parked it HUMAN_HELD rather than guessing which repo/AO-project to dispatch into; please add a `[repos.\"<repo>\"]` entry to `config/daemon.toml` (or correct the bead's `target_repo`) before requeuing.",
+                    failure.bead_id
+                );
+                if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
+                {
+                    if is_missing_scm_target_error(&err) {
+                        record_local_escalation_fallback(
+                            deps,
+                            &failure.bead_id,
+                            "unmapped_target_repo",
+                        )?;
+                        summary.beads_escalated_locally += 1;
+                        emit(
+                            deps.telemetry_log,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "ESCALATED_LOCALLY",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "unmapped_target_repo",
+                                "scm_error": err.to_string(),
+                            }),
+                        )?;
+                        continue;
+                    }
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_NOTIFICATION_FAILED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "unmapped_target_repo",
+                            "error": err.to_string(),
+                        }),
+                    )?;
+                    continue;
+                }
+                record_escalation(deps, &failure.bead_id, "unmapped_target_repo")?;
+                summary.beads_escalated += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "ESCALATION_REQUIRED",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "unmapped_target_repo"}),
+                )?;
+                continue;
+            }
+
             let lifecycle_state = if failure.branch.is_some() {
                 OverlayState::Dispatching.as_str()
             } else {
@@ -1224,7 +1336,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 serde_json::json!({}),
                 serde_json::json!({
                     "branch": success.branch.as_str(),
-                    "sessionId": success.session_id.as_str()
+                    "sessionId": success.session_id.as_str(),
+                    // jleechan-35y4: resolved repo now visible in daemon.jsonl.
+                    "target_repo": success.target_repo.as_str(),
                 }),
             )?;
             let comment_body = format!(

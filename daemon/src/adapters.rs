@@ -278,6 +278,21 @@ impl CliScm {
         }
     }
 
+    /// Return a handle targeting a different repo string (bead jleechan-35y4
+    /// Stage B — see
+    /// `docs/multirepo-dispatch-investigation-2026-07-11.md`'s "keep
+    /// traits, add `with_repo` constructor" note). Deliberately a fresh
+    /// `Self::new(repo)` rather than cloning this instance's in-memory TTL
+    /// caches: those caches (`pr_snapshot_cache` keyed by bare PR number,
+    /// `labeled_issues_cache`/`branch_commit_cache` keyed by label/branch
+    /// name) carry no repo qualifier, so reusing them for a different repo
+    /// could return another repo's cached PR/issue/branch data under a
+    /// colliding key. Construction is cheap (empty `HashMap`s), so a fresh
+    /// instance is both simpler and correct.
+    pub fn with_repo(&self, repo: &str) -> Self {
+        Self::new(repo.to_string())
+    }
+
     fn labeled_prs_via_rest(&self, label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
         let out = run_tool(
             "gh",
@@ -1958,6 +1973,23 @@ impl CliVcs {
     pub fn new(target_repo: String) -> Self {
         Self { target_repo }
     }
+
+    /// Clone this adapter targeting a different repo string (bead
+    /// jleechan-35y4 Stage B — see
+    /// `docs/multirepo-dispatch-investigation-2026-07-11.md`'s "keep
+    /// traits, add `with_repo` constructor" note). `CliVcs` carries no
+    /// state beyond `target_repo`, so this is a cheap clone-with-override,
+    /// not a trait signature change — call sites keep using the same `Vcs`
+    /// trait, just against a handle bound to `repo` instead of the
+    /// process-global `cfg.target_repo`. Migrating the ~27 call sites that
+    /// currently read `cfg.target_repo` directly to call this (via
+    /// `overlay.repo(cfg)`) is Stage D, bead jleechan-9xrs — this
+    /// constructor is the capability, not the migration.
+    pub fn with_repo(&self, repo: &str) -> Self {
+        Self {
+            target_repo: repo.to_string(),
+        }
+    }
 }
 
 impl Vcs for CliVcs {
@@ -2249,6 +2281,33 @@ pub fn ci_success_from_check_buckets(buckets: &[&str], iteration_stub: bool) -> 
             .all(|b| matches!(*b, "pass" | "skipping" | "pending"))
     } else {
         buckets.iter().all(|b| matches!(*b, "pass" | "skipping"))
+    }
+}
+
+/// jleechan-35y4 Stage B: `with_repo` constructors on `CliScm`/`CliVcs` — the
+/// repo-parameterized adapter capability the multi-repo dispatch fix
+/// depends on. `CliScm`/`CliVcs` have no test-visible way to invoke gh/git,
+/// so these tests only assert the cheap clone-with-override contract:
+/// the returned handle targets the new repo string, and the original
+/// instance is untouched (it's `&self`, not `self` — no move).
+#[cfg(test)]
+mod with_repo_tests {
+    use super::{CliScm, CliVcs};
+
+    #[test]
+    fn cli_vcs_with_repo_targets_new_repo_and_leaves_original_untouched() {
+        let original = CliVcs::new("jleechanorg/worldarchitect.ai".to_string());
+        let retargeted = original.with_repo("jleechanorg/dark-factory");
+        assert_eq!(retargeted.target_repo, "jleechanorg/dark-factory");
+        assert_eq!(original.target_repo, "jleechanorg/worldarchitect.ai");
+    }
+
+    #[test]
+    fn cli_scm_with_repo_targets_new_repo_and_leaves_original_untouched() {
+        let original = CliScm::new("jleechanorg/worldarchitect.ai".to_string());
+        let retargeted = original.with_repo("jleechanorg/dark-factory");
+        assert_eq!(retargeted.repo, "jleechanorg/dark-factory");
+        assert_eq!(original.repo, "jleechanorg/worldarchitect.ai");
     }
 }
 
