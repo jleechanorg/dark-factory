@@ -28,6 +28,7 @@ import pathlib
 from typing import TYPE_CHECKING
 
 import runner.handlers as _handlers_shim
+from .handler_core import _serialize_state_value
 from .pre_review_lint import findings_to_markdown, findings_to_json, lint_findings
 
 if TYPE_CHECKING:
@@ -37,7 +38,6 @@ if TYPE_CHECKING:
 
 def _resolve_lint_findings(ctx: "Context") -> list[dict]:
     """Return the cached lint findings, computing on first call."""
-    import json
     cached = ctx.state.get("_lint_findings")
     if cached is not None:
         return json.loads(cached)
@@ -63,16 +63,13 @@ def _substitute_placeholders(text: str, ctx: "Context") -> str:
         placeholder = "${state." + k + "}"
         if placeholder not in text:
             continue
-        # Coerce non-str values to string for substitution. This defends against
-        # ctx.state values that are not strings (e.g., dicts stored by
-        # _resolve_gate_backend in handler_dispatch.py).
-        if isinstance(v, str):
-            rendered = v
-        elif isinstance(v, (dict, list)):
-            rendered = json.dumps(v, sort_keys=True)
-        else:
-            rendered = str(v)
-        text = text.replace(placeholder, rendered)
+        # Coerce non-str values via the shared repository structured-data
+        # convention (JSON for dict/list, str() for scalars). This defends
+        # against ctx.state values that are not strings (e.g., dicts stashed
+        # by upstream nodes) and, if serialization itself ever fails, falls
+        # back to a key+type-only message rather than crashing or leaking
+        # the value's content (jleechan-7t92).
+        text = text.replace(placeholder, _serialize_state_value(k, v))
     diff = ctx.state.get("_last_diff", "")
     if not diff:
         diff = "(no diff captured)"
