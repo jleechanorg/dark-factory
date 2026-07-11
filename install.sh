@@ -47,6 +47,24 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
+# git-lfs is required: .gitattributes tracks artifacts/repro-developer/**/*.{tar.zst,tar.gz,gpg}
+# via LFS filters, and .githooks/pre-push + post-checkout hard-gate on
+# `command -v git-lfs`. A fresh clone/worktree without it fails at checkout time,
+# before install.sh even runs (see ez-gh-actions-2qfz). Check here too so a
+# re-run on an existing checkout (or a checkout that predates this hook) still
+# surfaces the gap with the correct fix instead of a confusing hook error later.
+if ! command -v git-lfs >/dev/null 2>&1; then
+  echo "ERROR: git-lfs not found on PATH." >&2
+  echo "This repo uses Git LFS for artifacts/repro-developer/** (see .gitattributes)." >&2
+  echo "Install:" >&2
+  echo "  Debian/Ubuntu : sudo apt-get install -y git-lfs && git lfs install" >&2
+  echo "  macOS (brew)  : brew install git-lfs && git lfs install" >&2
+  echo "  No sudo       : https://github.com/git-lfs/git-lfs/releases -> extract" >&2
+  echo "                  the git-lfs binary to ~/.local/bin/ (must be on PATH)" >&2
+  exit 1
+fi
+echo "==> git-lfs $(git-lfs version | head -1)"
+
 echo "==> uv $(uv --version)"
 echo "==> repo: ${REPO_ROOT}"
 echo "==> python: ${PYTHON_VERSION}"
