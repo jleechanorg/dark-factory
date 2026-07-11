@@ -217,6 +217,20 @@ _LINUX_PRELOAD_SOURCE = (
 
 # Process-lifetime cache: None = not yet checked, True/False = last result.
 # Reset via `_reset_linux_preload_verification_cache_for_tests()` in tests.
+#
+# NOT keyed by lib_path (deliberate, but worth understanding the tradeoff,
+# flagged by independent review of PR #233): within one runner process
+# there is only ever one content-hashed .so on disk at a time (the source
+# file doesn't change mid-run), so this is benign in production. The
+# failure mode to know about: if the FIRST canary check hits a transient
+# error (e.g. /tmp momentarily full, or the 10s subprocess timeout under
+# heavy host load), the cache latches to False for the rest of the
+# process's life, and every codergen node after that fails closed with
+# "isolation unavailable" until the runner restarts. That's the safe
+# direction to fail in (no node ever proceeds unsandboxed), but it is an
+# availability cliff, not just a security one — if Linux codergen nodes
+# start failing closed in a burst, check for a transient canary flake
+# before assuming a real regression.
 _linux_preload_verified: "Optional[bool]" = None
 
 

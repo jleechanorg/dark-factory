@@ -85,10 +85,19 @@ static void deny_paths_init(void) {
 }
 
 /* Returns 1 if `resolved` (an absolute, non-empty path) is under one of the
- * denied prefixes (exact match or `<prefix>/...`). */
+ * denied prefixes (exact match or `<prefix>/...`), OR if `resolved` is
+ * empty/NULL. An empty `resolved` means path resolution itself failed
+ * (see `resolve_at`'s /proc/self/fd readlink failure branch below) — this
+ * shim's whole point is fail-CLOSED containment, so "couldn't figure out
+ * what path this really is" must deny, not silently let the real open()
+ * proceed. This only affects the narrow case where /proc is unavailable
+ * or unreadable during a relative `openat`; ordinary absolute-path and
+ * AT_FDCWD-relative opens always produce a non-empty `resolved` (see
+ * `resolve_absolute`, which never returns an empty string for a non-NULL
+ * input) and are unaffected. */
 static int path_is_denied(const char *resolved) {
     if (!resolved || !*resolved) {
-        return 0;
+        return 1;
     }
     for (int i = 0; i < g_denied_count; i++) {
         const char *prefix = g_denied[i];
@@ -141,9 +150,12 @@ static void resolve_at(int dirfd, const char *path, char *out, size_t outsz) {
     char base[PATH_MAX];
     ssize_t n = readlink(fdlink, base, sizeof(base) - 1);
     if (n <= 0) {
-        /* Can't resolve the base dir; fail safe by treating as unresolved
-         * (not automatically denied, but not silently allowed either --
-         * the real open() will still run normally). */
+        /* Can't resolve the base dir (e.g. /proc unavailable or unreadable).
+         * Leave `out` empty -- `path_is_denied` treats an empty resolved
+         * path as DENIED (fail closed), not as "unresolved, let it
+         * through". This is a narrow edge case (needs /proc gone AND a
+         * relative openat with dirfd != AT_FDCWD) but it must not become
+         * a silent allow. */
         out[0] = '\0';
         return;
     }

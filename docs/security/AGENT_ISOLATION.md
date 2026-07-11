@@ -95,8 +95,26 @@ compiled once and cached by content hash under
   glibc Linux (git, python, node, ripgrep, coreutils). It does not
   intercept `stat`/`lstat`/`access` (existence-probing of a denied path is
   still possible; reading its contents is not).
+- **Hardlink/rename bypass**: `link(2)` and `renameat(2)` are not
+  intercepted. A coder process that already knows a holdout path can
+  `ln $HOLDOUT/scenario.txt /tmp/x` and then read `/tmp/x` — the hardlink
+  resolves to a non-denied path, so the deny check never fires. This is a
+  real gap, flagged by independent review of this PR (see PR #233 review
+  comment). Mitigation for now: the operational contract (this repo's
+  `CLAUDE.md` "CRITICAL: Agent Isolation") never puts holdout *paths*
+  into the implementing agent's prompt, so an agent has no starting
+  point to construct such a hardlink without first guessing the sealed
+  repo's layout. Closing this gap fully needs either `link`/`renameat`
+  interception in the shim or (more robustly) a real mount-namespace
+  backend — tracked in follow-up bead jleechan-l2da.
 - Denies with `ENOENT` (not `EACCES`) deliberately, so a probe can't
   distinguish "path doesn't exist" from "path is denied."
+- When path resolution itself fails (e.g. `/proc/self/fd/<dirfd>` can't be
+  read during a relative `openat`), the shim denies rather than silently
+  allowing the real call through — see `path_is_denied`'s empty-string
+  branch in `deny_paths_preload.c`. This is intentionally fail-closed:
+  "couldn't determine what this path really is" must not become "let it
+  through."
 
 Given the choice between bwrap/systemd-run (unusable or silently-broken on
 this host) and this shim (real, verified, portable), this is the correct
