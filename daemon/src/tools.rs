@@ -235,6 +235,35 @@ pub fn iso8601_to_epoch(s: &str) -> Option<u64> {
     Some(epoch)
 }
 
+/// Pure syntax normalization (no judgment call, ZFC-exempt): does a git
+/// remote URL (`https://github.com/owner/repo.git`, `https://github.com/owner/repo`,
+/// `git@github.com:owner/repo.git`, `git@github.com:owner/repo`, or any of
+/// those forms with a trailing `/`) name the same `owner/repo` as `repo`
+/// (already in canonical `owner/repo` form)?
+///
+/// Bead jleechan-bqdv, Stage C spawn-time remote assertion: the worktree a
+/// coder session lands in may be cloned via either transport depending on
+/// how the local AO project checkout was set up, so the comparison must
+/// tolerate both without guessing at intent — this is deterministic string
+/// normalization, not semantic classification.
+pub fn remote_url_matches_repo(url: &str, repo: &str) -> bool {
+    let url = url.trim().trim_end_matches('/');
+    let repo = repo.trim().trim_end_matches('/');
+    if repo.is_empty() || url.is_empty() {
+        return false;
+    }
+    let stripped = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))
+        .or_else(|| url.strip_prefix("git@github.com:"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"));
+    let Some(path) = stripped else {
+        return false;
+    };
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    path.eq_ignore_ascii_case(repo)
+}
+
 /// `br` CLI. `fetch_candidates` == `br list --status open --label factory --json`.
 pub trait Tracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError>;
@@ -257,6 +286,28 @@ pub trait Scm {
     fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError>;
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError>;
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError>;
+    /// Repo-scoped variant of [`remote_branch_last_commit`](Scm::remote_branch_last_commit)
+    /// (bead jleechan-bqdv, Stage C of the multi-repo dispatch fix — see
+    /// `docs/multirepo-dispatch-investigation-2026-07-11.md`). The daemon's
+    /// coder-silence watcher (`tick.rs`'s `Dispatched` autonomy check) used
+    /// to always poll `cfg.target_repo`'s branch, which is silently wrong
+    /// for any bead whose `overlay.repo(cfg)` names a DIFFERENT repo — the
+    /// watcher could never observe that coder's real progress and would
+    /// eventually park it `coder_silent` even while it was actively pushing
+    /// commits to its own (correct) repo. `repo` should be
+    /// `overlay.repo(cfg)`, not `cfg.target_repo` directly. Default impl
+    /// ignores `repo` and delegates to `remote_branch_last_commit` so
+    /// existing test fakes and any impl that predates this method keep their
+    /// original (single-repo) behavior; `CliScm` overrides it to actually
+    /// retarget the query via `with_repo`.
+    fn remote_branch_last_commit_for_repo(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let _ = repo;
+        self.remote_branch_last_commit(branch)
+    }
 }
 
 /// `ao` / `aow` CLIs.
@@ -291,6 +342,34 @@ pub trait Sessions {
     /// absence of information.
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
         let _ = id;
+        Ok(None)
+    }
+    /// Returns the git remote URL configured for `remote_name` inside the
+    /// worktree backing a just-spawned session for `ao_project`/`branch`,
+    /// or `None` when it cannot be determined (bead jleechan-bqdv, Stage C —
+    /// see `docs/multirepo-dispatch-investigation-2026-07-11.md`). This is
+    /// the spawn-time proper fix for jleechan-9sh5: a worktree cloned from
+    /// the wrong local checkout (e.g. a dual-remote `worldarchitect.ai`
+    /// clone whose `origin` points at `jleechanclaw`, not
+    /// `worldarchitect.ai`) can silently strand a coder pushing to the wrong
+    /// repo. `dispatch::dispatch_ready` calls this immediately after a
+    /// successful `spawn()`, before trusting the dispatch as DISPATCHED, and
+    /// compares the returned URL against the bead's resolved repo
+    /// (`owner/repo`) via `remote_url_matches_repo`.
+    ///
+    /// `Ok(None)` covers both "worktree not found yet" and "adapter cannot
+    /// verify" — same "cannot verify never blocks" contract as
+    /// `session_branch`: the default impl (for fakes/impls that predate this
+    /// check) always returns `Ok(None)`, which callers treat as "cannot
+    /// verify, do not block". This method only ever *rejects* a dispatch on
+    /// a positively confirmed mismatch, never on absence of information.
+    fn worktree_remote_url(
+        &self,
+        ao_project: &str,
+        branch: &str,
+        remote_name: &str,
+    ) -> Result<Option<String>, DaemonError> {
+        let _ = (ao_project, branch, remote_name);
         Ok(None)
     }
     fn spawn_batch(&self, specs: &[SpawnSpec]) -> Result<Vec<SessionId>, DaemonError> {
@@ -501,6 +580,83 @@ fn run_tool_with_cwd(
         rc: status.code().unwrap_or(-1),
         stderr,
     })
+}
+
+#[cfg(test)]
+mod remote_url_matches_repo_tests {
+    use super::remote_url_matches_repo;
+
+    #[test]
+    fn https_url_with_dot_git_suffix_matches() {
+        assert!(remote_url_matches_repo(
+            "https://github.com/jleechanorg/dark-factory.git",
+            "jleechanorg/dark-factory"
+        ));
+    }
+
+    #[test]
+    fn https_url_without_dot_git_suffix_matches() {
+        assert!(remote_url_matches_repo(
+            "https://github.com/jleechanorg/dark-factory",
+            "jleechanorg/dark-factory"
+        ));
+    }
+
+    #[test]
+    fn ssh_style_url_matches() {
+        assert!(remote_url_matches_repo(
+            "git@github.com:jleechanorg/dark-factory.git",
+            "jleechanorg/dark-factory"
+        ));
+    }
+
+    #[test]
+    fn ssh_style_url_without_dot_git_suffix_matches() {
+        assert!(remote_url_matches_repo(
+            "git@github.com:jleechanorg/dark-factory",
+            "jleechanorg/dark-factory"
+        ));
+    }
+
+    #[test]
+    fn full_ssh_scheme_url_matches() {
+        assert!(remote_url_matches_repo(
+            "ssh://git@github.com/jleechanorg/dark-factory.git",
+            "jleechanorg/dark-factory"
+        ));
+    }
+
+    #[test]
+    fn wrong_repo_does_not_match() {
+        // The exact wa-3086 near-miss this bead exists to catch: a
+        // dual-remote worldarchitect.ai worktree whose `origin` points at
+        // jleechanclaw instead of worldarchitect.ai.
+        assert!(!remote_url_matches_repo(
+            "https://github.com/jleechanorg/jleechanclaw.git",
+            "jleechanorg/worldarchitect.ai"
+        ));
+    }
+
+    #[test]
+    fn trailing_slash_is_tolerated() {
+        assert!(remote_url_matches_repo(
+            "https://github.com/jleechanorg/dark-factory/",
+            "jleechanorg/dark-factory"
+        ));
+    }
+
+    #[test]
+    fn unrecognized_host_does_not_match() {
+        assert!(!remote_url_matches_repo(
+            "https://gitlab.com/jleechanorg/dark-factory.git",
+            "jleechanorg/dark-factory"
+        ));
+    }
+
+    #[test]
+    fn empty_url_does_not_match() {
+        assert!(!remote_url_matches_repo("", "jleechanorg/dark-factory"));
+    }
 }
 
 #[cfg(test)]

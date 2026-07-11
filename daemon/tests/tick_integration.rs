@@ -2486,10 +2486,12 @@ fn newly_intaken_bead_dispatch_uses_real_tracker_title() {
     let prompts = sessions.spawn_prompts.borrow();
     assert_eq!(prompts.len(), 1);
     assert_eq!(prompts[0].0, "fake-bead-1");
-    // jleechan-if09: the prompt is now the enriched coder contract; this
-    // test's original intent (the REAL tracker title reaches the coder, not
-    // an empty stub) is preserved as a containment check, plus the enriched
-    // fields the tracker supplied.
+    // jleechan-if09 (PR #247) + jleechan-bqdv Stage C: the default dispatch
+    // arm renders through `build_coder_prompt`, the enriched coder contract
+    // (title + description + repo/remote/branch/push-command instructions),
+    // not the bare bead title. This test's original intent — the REAL
+    // tracker title reaches the coder, not an empty stub — is preserved as a
+    // containment check, plus the tracker-supplied description.
     assert!(
         prompts[0].1.contains("Wire a durable Linux trigger (owner/repo)"),
         "new intake must dispatch the real tracker title, not an empty stub prompt: {}",

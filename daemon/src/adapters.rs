@@ -1189,6 +1189,20 @@ impl Scm for CliScm {
         }
         Ok(Some(epoch))
     }
+
+    /// jleechan-bqdv Stage C: retarget the query at `repo` via `with_repo`
+    /// instead of always polling `self.repo` (the daemon's global
+    /// `cfg.target_repo`, bound at construction time in `main.rs`). Callers
+    /// pass `overlay.repo(cfg)`, so a bead whose resolved repo differs from
+    /// the global one is now actually observable instead of silently
+    /// invisible to the coder-silence watcher.
+    fn remote_branch_last_commit_for_repo(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        self.with_repo(repo).remote_branch_last_commit(branch)
+    }
 }
 
 /// Resolve `$DARK_FACTORY_HOLDOUTS` (or its default sibling-repo location) and
@@ -1287,6 +1301,38 @@ mod resolve_holdouts_path_tests {
     }
 }
 
+/// The worktree directory name AO derives from a `factory/<bead>-r<n>`
+/// branch: the `factory/` prefix stripped. Shared by `run_spawn_process`'s
+/// `--name` argument and `resolve_worktree_path` below so the two can never
+/// drift apart (bead jleechan-bqdv Stage C).
+fn worktree_display_name(branch: &str) -> &str {
+    branch.strip_prefix("factory/").unwrap_or(branch)
+}
+
+/// Root directory AO clones per-session worktrees under. Matches the global
+/// `worktreeDir: ~/.worktrees` default in `~/.agent-orchestrator.yaml`;
+/// overridable via `DARK_FACTORY_AO_WORKTREE_DIR` for tests and non-standard
+/// installs. AO itself remains the sole source of truth for the actual path
+/// it created — this is the daemon's best-effort reconstruction used ONLY
+/// for the spawn-time remote assertion (bead jleechan-bqdv Stage C); every
+/// caller of `worktree_remote_url` treats "path doesn't exist" as "cannot
+/// verify", never as a positive mismatch.
+fn ao_worktree_root() -> String {
+    if let Ok(dir) = std::env::var("DARK_FACTORY_AO_WORKTREE_DIR") {
+        return dir;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    format!("{home}/.worktrees")
+}
+
+/// `<worktree_root>/<ao_project>/<display_name>` — the path a just-spawned
+/// session's worktree is expected to live at.
+fn resolve_worktree_path(ao_project: &str, branch: &str) -> std::path::PathBuf {
+    std::path::Path::new(&ao_worktree_root())
+        .join(ao_project)
+        .join(worktree_display_name(branch))
+}
+
 pub struct CliSessions {
     pub project: String,
     pub agent: String,
@@ -1318,13 +1364,24 @@ impl CliSessions {
         } else {
             Command::new("ao")
         };
-        let display_name = spec.branch.strip_prefix("factory/").unwrap_or(&spec.branch);
+        let display_name = worktree_display_name(&spec.branch);
 
+        // jleechan-bqdv Stage C: spawn into `spec.ao_project` (resolved per
+        // bead by `Config::resolve_repo`, Stage B), not `self.project` (the
+        // daemon's single global project bound once at `CliSessions::new`
+        // construction time). For every pre-existing single-repo config
+        // these are identical — `Config::resolve_repo`'s legacy fallback
+        // path derives `ao_project` via the exact same last-path-segment
+        // rule `CliSessions::new` uses — so this is behavior-preserving for
+        // today's only configured repo, while actually making a bead whose
+        // `target_repo` names a DIFFERENT `[repos.*]` entry spawn into ITS
+        // project instead of silently landing in the global one (the
+        // jleechan-9sh5 root cause).
         cmd.arg("spawn")
             .arg("--prompt")
             .arg(&spec.prompt)
             .arg("--project")
-            .arg(&self.project)
+            .arg(&spec.ao_project)
             .arg("--agent")
             .arg(agent)
             .arg("--name")
@@ -1954,6 +2011,188 @@ impl Sessions for CliSessions {
             }
         }
         Ok(None)
+    }
+
+    /// jleechan-bqdv Stage C: the spawn-time worktree remote assertion's data
+    /// source. Reconstructs the expected worktree path (`resolve_worktree_path`)
+    /// and reads back whatever `remote_name` is actually configured there via
+    /// `git remote get-url`. Any failure to locate the worktree, run `git`,
+    /// or parse its output collapses to `Ok(None)` ("cannot verify") rather
+    /// than an `Err` — matching `session_branch`'s contract that this class
+    /// of check only ever *rejects* a dispatch on a positively confirmed
+    /// mismatch, never on an inability to check (a worktree AO is still in
+    /// the middle of cloning is a normal, retry-safe race, not a violation).
+    fn worktree_remote_url(
+        &self,
+        ao_project: &str,
+        branch: &str,
+        remote_name: &str,
+    ) -> Result<Option<String>, DaemonError> {
+        let path = resolve_worktree_path(ao_project, branch);
+        if !path.is_dir() {
+            return Ok(None);
+        }
+        let cwd = path.to_string_lossy().into_owned();
+        match run_tool_in_dir("git", &["remote", "get-url", remote_name], &cwd, 10) {
+            Ok(out) => {
+                let trimmed = out.trim();
+                if trimmed.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(trimmed.to_string()))
+                }
+            }
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod worktree_remote_url_tests {
+    use super::{gh_env_test_lock, resolve_worktree_path, worktree_display_name, CliSessions};
+    use crate::tools::Sessions;
+
+    #[test]
+    fn worktree_display_name_strips_factory_prefix() {
+        assert_eq!(worktree_display_name("factory/jleechan-bqdv-r1"), "jleechan-bqdv-r1");
+    }
+
+    #[test]
+    fn worktree_display_name_passes_through_when_no_prefix() {
+        assert_eq!(worktree_display_name("some-other-branch"), "some-other-branch");
+    }
+
+    #[test]
+    fn resolve_worktree_path_respects_env_override() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var("DARK_FACTORY_AO_WORKTREE_DIR").ok();
+        std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", "/tmp/afd-worktree-root-test");
+
+        let path = resolve_worktree_path("dark-factory", "factory/jleechan-bqdv-r1");
+
+        match prev {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_WORKTREE_DIR"),
+        }
+
+        assert_eq!(
+            path,
+            std::path::Path::new("/tmp/afd-worktree-root-test/dark-factory/jleechan-bqdv-r1")
+        );
+    }
+
+    #[test]
+    fn worktree_remote_url_returns_none_when_worktree_missing() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var("DARK_FACTORY_AO_WORKTREE_DIR").ok();
+        std::env::set_var(
+            "DARK_FACTORY_AO_WORKTREE_DIR",
+            "/definitely/does/not/exist/afd-worktree-root",
+        );
+
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        let result = sessions.worktree_remote_url("dark-factory", "factory/missing-r1", "origin");
+
+        match prev {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_WORKTREE_DIR"),
+        }
+
+        assert_eq!(result.unwrap(), None, "a missing worktree must be 'cannot verify', not an error");
+    }
+
+    /// End-to-end (real `git`, no shim needed): create a throwaway git repo
+    /// at the exact path `resolve_worktree_path` computes, add a remote, and
+    /// confirm `worktree_remote_url` reads it back.
+    #[test]
+    fn worktree_remote_url_reads_real_git_remote() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_worktree_remote_url_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let prev = std::env::var("DARK_FACTORY_AO_WORKTREE_DIR").ok();
+        std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", &root);
+
+        let worktree_path = resolve_worktree_path("dark-factory", "factory/jleechan-bqdv-r1");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        let cwd = worktree_path.to_string_lossy().into_owned();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&cwd)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "worldai",
+                "https://github.com/jleechanorg/worldarchitect.ai.git",
+            ])
+            .current_dir(&cwd)
+            .status()
+            .unwrap();
+
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        let result =
+            sessions.worktree_remote_url("dark-factory", "factory/jleechan-bqdv-r1", "worldai");
+
+        match prev {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_WORKTREE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            result.unwrap().as_deref(),
+            Some("https://github.com/jleechanorg/worldarchitect.ai.git")
+        );
+    }
+
+    #[test]
+    fn worktree_remote_url_returns_none_for_unconfigured_remote_name() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_worktree_remote_url_unconfigured_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let prev = std::env::var("DARK_FACTORY_AO_WORKTREE_DIR").ok();
+        std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", &root);
+
+        let worktree_path = resolve_worktree_path("dark-factory", "factory/jleechan-bqdv-r1");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        let cwd = worktree_path.to_string_lossy().into_owned();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&cwd)
+            .status()
+            .unwrap();
+
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        let result =
+            sessions.worktree_remote_url("dark-factory", "factory/jleechan-bqdv-r1", "origin");
+
+        match prev {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_WORKTREE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "a remote that isn't configured must be 'cannot verify', not an error"
+        );
     }
 }
 
