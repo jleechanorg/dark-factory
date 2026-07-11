@@ -341,6 +341,24 @@ pub trait Scm {
     fn labeled_prs(&self, label: &str) -> Result<Vec<LabeledPr>, DaemonError>;
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError>;
     fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError>;
+    /// Repo-scoped variant of [`pr_snapshot`](Scm::pr_snapshot) (bead
+    /// jleechan-9xrs, Stage D of the multi-repo dispatch fix — see
+    /// `docs/multirepo-dispatch-investigation-2026-07-11.md`). The
+    /// verification loop (`skeptic_evidence`, `verifier::assess`,
+    /// `er_runner::maybe_run`, and the fast-tier PR-state fetches in
+    /// `tick.rs`) used to always fetch `pr_snapshot` against whatever repo
+    /// the daemon's global adapter was constructed with (`cfg.target_repo`
+    /// at `main.rs` startup) — silently wrong for any bead whose
+    /// `overlay.repo(cfg)` names a DIFFERENT repo. `repo` should be
+    /// `overlay.repo(cfg)`, not `cfg.target_repo` directly. Default impl
+    /// ignores `repo` and delegates to `pr_snapshot` so existing test fakes
+    /// and any impl that predates this method keep their original
+    /// (single-repo) behavior; `CliScm` overrides it to actually retarget
+    /// the query via `with_repo`.
+    fn pr_snapshot_for_repo(&self, repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
+        let _ = repo;
+        self.pr_snapshot(pr)
+    }
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError>;
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError>;
     /// Repo-scoped variant of [`remote_branch_last_commit`](Scm::remote_branch_last_commit)
