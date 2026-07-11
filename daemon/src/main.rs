@@ -536,6 +536,12 @@ fn main() {
 mod tests {
     use super::*;
 
+    // Serializes tests that mutate the process-wide NOTIFY_SOCKET env var. Rust
+    // runs tests in parallel by default, so without this lock two tests can each
+    // set NOTIFY_SOCKET and systemd_notify may send its datagram to the sibling
+    // test's socket, leaving this listener's recv() to time out (WouldBlock).
+    static NOTIFY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn scaffold_compiles() {
         let ok = true;
@@ -823,6 +829,8 @@ mod tests {
         use std::os::unix::net::UnixDatagram;
         use std::time::Duration;
 
+        let _env_guard = NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let socket_path = std::env::temp_dir().join(format!(
             "dark-factory-notify-{}-{}.sock",
             std::process::id(),
@@ -853,6 +861,8 @@ mod tests {
         use std::os::linux::net::SocketAddrExt;
         use std::os::unix::net::{SocketAddr, UnixDatagram};
         use std::time::Duration;
+
+        let _env_guard = NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let socket_name = format!(
             "dark-factory-notify-{}-{}",
