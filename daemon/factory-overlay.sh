@@ -380,7 +380,7 @@ park)
   valid_bead_id "$2"
   cur_attempt="$(get_field "$2" attempt)"
   [[ "$cur_attempt" =~ ^[0-9]+$ ]] || cur_attempt=1
-  sql "UPDATE bead_overlay SET state='HUMAN_HELD', updated_at='$(now)' WHERE bead_id='$(q "$2")';"
+  sql "UPDATE bead_overlay SET state='HUMAN_HELD', park_reason='$(q "$3")', updated_at='$(now)' WHERE bead_id='$(q "$2")';"
   emit "$2" "$cur_attempt" HUMAN_HELD PARKED_HUMAN_HELD "{\"reason\":$(js "$3")}"
   echo "ok"
   ;;
@@ -390,7 +390,7 @@ park-duplicate)
   valid_bead_id "$2"
   cur_attempt="$(get_field "$2" attempt)"
   [[ "$cur_attempt" =~ ^[0-9]+$ ]] || cur_attempt=1
-  sql "UPDATE bead_overlay SET state='HUMAN_HELD', updated_at='$(now)' WHERE bead_id='$(q "$2")';"
+  sql "UPDATE bead_overlay SET state='HUMAN_HELD', park_reason='$(q "$3")', updated_at='$(now)' WHERE bead_id='$(q "$2")';"
   emit "$2" "$cur_attempt" HUMAN_HELD PARKED_DUPLICATE_BEAD "{\"reason\":$(js "$3")}"
   echo "parked $2"
   ;;

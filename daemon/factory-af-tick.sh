@@ -223,17 +223,62 @@ fi
 dispatched=0
 ERR_TMP="$(mktemp -t af_dispatch_err.XXXXXX)"
 trap 'rm -f "$ERR_TMP"' EXIT
-while IFS=$'\t' read -r bead_id pr branch; do
+while IFS=$'\t' read -r bead_id pr branch bead_repo; do
     [ -n "$bead_id" ] || continue
     [ "$dispatched" -ge "$MAX_DISPATCH" ] && break
-    if [ -n "$AO" ] && "$AO" session ls -p "$AO_PROJECT" 2>/dev/null | rg "pulls/${pr}\\b" | rg -q '\[(spawning|running|active|working|pr_open)\]'; then
-        echo "[af] skip $bead_id PR #$pr (active session exists)" >&2
+
+    # Resolve target repo (default to global TARGET_REPO if empty)
+    repo="${bead_repo:-$TARGET_REPO}"
+
+    # Resolve AO project for this repo from config
+    proj="$(python3 - "$CONFIG" "$repo" <<'PY'
+import sys, toml
+config_path = sys.argv[1]
+target_repo = sys.argv[2]
+try:
+    cfg = toml.load(config_path)
+except Exception:
+    cfg = {}
+
+# 1. Look in [repos]
+repos = cfg.get("repos", {})
+if target_repo in repos:
+    print(repos[target_repo].get("ao_project", ""))
+    sys.exit(0)
+
+# 2. Compare to global target_repo
+global_target = cfg.get("target_repo")
+if target_repo == global_target:
+    ao_project = cfg.get("ao_project")
+    if ao_project:
+        print(ao_project)
+        sys.exit(0)
+    # Derivation fallback
+    project = target_repo.split('/')[-1]
+    if project == "worldarchitect.ai":
+        project = "worldarchitect"
+    print(project)
+    sys.exit(0)
+
+# Unmapped
+print("")
+PY
+)"
+
+    if [ -z "$proj" ]; then
+        echo "[af] fail closed: target repo '$repo' has no matching configured AO project. Parking bead $bead_id." >&2
+        "$O" park "$bead_id" "unmapped_target_repo" >/dev/null || true
         continue
     fi
-    echo "[af] remediate $bead_id PR #$pr"
-    # CX-2: thread AO_PROJECT through to factory-ao-remediate.sh so the spawned
-    # session lives in the same AO project the capacity check measured.
-    if bash "$R" "$bead_id" "$pr" "" "$AO_PROJECT" 2>&1; then
+
+    if [ -n "$AO" ] && "$AO" session ls -p "$proj" 2>/dev/null | rg "pulls/${pr}\\b" | rg -q '\[(spawning|running|active|working|pr_open)\]'; then
+        echo "[af] skip $bead_id PR #$pr (active session exists in project $proj)" >&2
+        continue
+    fi
+    echo "[af] remediate $bead_id PR #$pr on $repo in project $proj"
+    # CX-2: thread proj and repo through to factory-ao-remediate.sh so the spawned
+    # session lives in the same AO project.
+    if bash "$R" "$bead_id" "$pr" "$repo" "$proj" 2>&1; then
         cur_state="$(sqlite3 "$DB" "SELECT state FROM bead_overlay WHERE bead_id='$(printf "%s" "$bead_id" | sed "s/'/''/g")';" 2>/dev/null || true)"
         if [ "$cur_state" = "QUEUED" ]; then
             if [ -n "$branch" ]; then
@@ -288,7 +333,7 @@ while IFS=$'\t' read -r bead_id pr branch; do
         echo "[af] skip $bead_id (ao spawn failed)" >&2
     fi
 done < <(sqlite3 "$DB" -separator $'\t' \
-  "SELECT bead_id, pr_number, coalesce(branch,'') FROM bead_overlay
+  "SELECT bead_id, pr_number, coalesce(branch,''), coalesce(target_repo,'') FROM bead_overlay
    WHERE state IN ('QUEUED','ATTESTED') AND pr_number IS NOT NULL
    $bead_filter
    $pr_sql_filter
