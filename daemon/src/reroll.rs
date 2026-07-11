@@ -184,7 +184,19 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
                     bead.park_reason = Some(CIRCUIT_BREAKER_PARK_REASON.to_string());
                     deps.store.save(bead)?;
 
-                    let (owner, repo) = deps.cfg.target_repo.split_once('/').unwrap_or(("unknown_owner", "unknown_repo"));
+                    // jleechan-9xrs Stage D: was `deps.cfg.target_repo` —
+                    // the Healer scope must identify the bead's OWN
+                    // resolved repo, not the daemon-global one, so a
+                    // circuit-breaker trip on a non-default `[repos.*]` bead
+                    // scopes correctly. This path is Stage-2-only (Stage 1
+                    // never reaches `execute`'s "else" branch — see
+                    // `run_fast_tier`'s `Stage 1: recorded, not executed`
+                    // comment in tick.rs) but is fixed for consistency ahead
+                    // of Stage 2 activation.
+                    let bead_repo = bead.repo(deps.cfg).to_string();
+                    let (owner, repo) = bead_repo
+                        .split_once('/')
+                        .unwrap_or(("unknown_owner", "unknown_repo"));
                     let healer_scope = format!("{}:{}:{}", owner, repo, &bead.bead_id);
 
                     let healer_report = format!(

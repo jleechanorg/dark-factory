@@ -110,13 +110,21 @@ enum CiPendingStatus {
     SnapshotUnavailable,
 }
 
-fn ci_pending_for_attested(overlay: &BeadOverlay, scm: &dyn crate::tools::Scm) -> CiPendingStatus {
+/// `repo` (bead jleechan-9xrs, Stage D) is the bead's OWN resolved repo
+/// (`overlay.repo(cfg)`) — was `scm.pr_snapshot(pr)` bound to the daemon's
+/// global `cfg.target_repo`, silently wrong for a bead dispatched into a
+/// different `[repos.*]` entry.
+fn ci_pending_for_attested(
+    overlay: &BeadOverlay,
+    scm: &dyn crate::tools::Scm,
+    repo: &str,
+) -> CiPendingStatus {
     if overlay.state != OverlayState::Attested {
         return CiPendingStatus::NotApplicable;
     }
     match overlay.pr_number {
         None => CiPendingStatus::NotApplicable,
-        Some(pr) => match scm.pr_snapshot(pr) {
+        Some(pr) => match scm.pr_snapshot_for_repo(repo, pr) {
             Ok(snap) => CiPendingStatus::Known(snap.ci_pending),
             Err(_) => CiPendingStatus::SnapshotUnavailable,
         },
@@ -271,7 +279,8 @@ pub fn run_tick(
         // any of those would risk false-parking a near-timebox bead on a
         // single transient `gh`/GraphQL/network hiccup. Skip this overlay
         // for the rest of the active-overlay loop and continue to the next.
-        match ci_pending_for_attested(&overlay, deps.scm) {
+        let active_overlay_repo = overlay.repo(deps.cfg).to_string();
+        match ci_pending_for_attested(&overlay, deps.scm, &active_overlay_repo) {
             CiPendingStatus::SnapshotUnavailable => {
                 let _ = emit(
                     deps.telemetry_log,
@@ -1563,12 +1572,25 @@ fn skeptic_evidence(
     deps: &TickDeps,
     bead_id: &str,
     pr: u64,
+    repo: &str,
     snapshot: &crate::tools::PrSnapshot,
 ) -> Result<PrEvidence, DaemonError> {
+    // jleechan-9xrs Stage D: the reviewer subprocess (`dispatch_reviewer`)
+    // runs `codex exec` / `claude --print` with no cwd override, so `gh`
+    // commands the reviewer issues without an explicit `--repo` default to
+    // whatever repo the daemon process's own cwd happens to be checked out
+    // as. Embedding `repo` (the bead's OWN resolved repo, `overlay.repo(cfg)`
+    // at the call site) plus explicit `--repo` flags — mirroring
+    // `er_runner::build_er_prompt` — makes the reviewer query the RIGHT repo
+    // regardless of daemon cwd, instead of silently reviewing PR #{pr} in
+    // whatever repo happened to be checked out.
     let prompt = format!(
         "You are the Stage-1 Skeptic gate for an autonomous coding factory.\n\
-         Review bead {bead_id}'s PR #{pr} end-to-end (diff, evidence, tests) and \
-         judge whether it is ready to merge.\n\
+         Review bead {bead_id}'s PR #{pr} in repo {repo} end-to-end (diff, \
+         evidence, tests) and judge whether it is ready to merge:\n\
+           gh pr diff {pr} --repo {repo}\n\
+           gh pr view {pr} --repo {repo} --json body,comments\n\
+           gh pr checks {pr} --repo {repo}\n\
          Respond with exactly one line of the form:\n\
          pass|warn <note>|fail <reason>",
     );
@@ -1598,9 +1620,12 @@ fn skeptic_evidence(
         priority.retain(|&v| v != coder_vendor);
     }
 
-    let is_test_repo = deps.cfg.target_repo.contains("fake-")
-        || deps.cfg.target_repo.contains("test-")
-        || deps.cfg.target_repo == "owner/repo";
+    // jleechan-9xrs Stage D: was `deps.cfg.target_repo` — must be the
+    // bead's OWN resolved repo so a test-repo bead dispatched under a
+    // non-test global `cfg.target_repo` (or vice versa) is classified
+    // correctly instead of by the daemon-global repo.
+    let is_test_repo =
+        repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
 
     let mut gha_verdict = "verdict: absent";
     let mut signoff_verdict = "verdict: absent";
@@ -1914,16 +1939,21 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             Some(o) => o,
             None => continue,
         };
+        // jleechan-9xrs Stage D: resolve THIS bead's own repo once per
+        // iteration (`overlay.repo(cfg)` — `None` falls back to
+        // `cfg.target_repo`, so legacy beads are unaffected) and thread it
+        // through every verification-loop call below instead of reading
+        // `deps.cfg.target_repo` directly. See
+        // docs/multirepo-dispatch-investigation-2026-07-11.md Stage D.
+        let repo = overlay.repo(deps.cfg).to_string();
 
         if overlay.state == OverlayState::Dispatched && overlay.pr_number.is_none() {
-            let is_test_repo = deps.cfg.target_repo.contains("fake-")
-                || deps.cfg.target_repo.contains("test-")
-                || deps.cfg.target_repo == "owner/repo";
+            let is_test_repo =
+                repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
 
             if !is_test_repo {
                 if let Some(ref session_id) = overlay.session_id {
-                    let repo = &deps.cfg.target_repo;
-                    let mut project = repo.split('/').next_back().unwrap_or(repo).to_string();
+                    let mut project = repo.split('/').next_back().unwrap_or(&repo).to_string();
                     if project == "worldarchitect.ai" {
                         project = "worldarchitect".to_string();
                     }
@@ -1965,7 +1995,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             "--head",
                             branch,
                             "--repo",
-                            &deps.cfg.target_repo,
+                            &repo,
                             "--json",
                             "number",
                             "--jq",
@@ -2047,7 +2077,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // failure via telemetry and skip to the next bead; the bead stays
         // ATTESTED so the next tick retries the snapshot fetch (no false-
         // green, no false-park on a single transient error).
-        let mut snapshot = match deps.scm.pr_snapshot(pr) {
+        let mut snapshot = match deps.scm.pr_snapshot_for_repo(&repo, pr) {
             Ok(snap) => snap,
             Err(e) => {
                 let _ = emit(
@@ -2075,7 +2105,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             continue;
         }
 
-        let mut evidence = match skeptic_evidence(deps, bead_id, pr, &snapshot) {
+        let mut evidence = match skeptic_evidence(deps, bead_id, pr, &repo, &snapshot) {
             Ok(e) => e,
             Err(e) => {
                 let _ = emit(
@@ -2144,7 +2174,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // later tick rather than falling through into `assess()`,
                 // which performs another `pr_snapshot` and would turn the
                 // outage into Unknown/all_green=false -> HUMAN_HELD.
-                match deps.scm.pr_snapshot(pr) {
+                match deps.scm.pr_snapshot_for_repo(&repo, pr) {
                     Ok(snap) => snapshot = snap,
                     Err(e) => {
                         let _ = emit(
@@ -2214,7 +2244,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
         evidence.has_integration_evidence_marker =
             verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
-        let report = verifier::assess(deps.scm, pr, deps.cfg, &evidence)?;
+        let report = verifier::assess(deps.scm, pr, &repo, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
         // jleechan-wzgl: log the full per-gate breakdown (all 7 gates,
         // verdict + reason) plus the gate-7 reviewer vendor identity, not
@@ -2654,7 +2684,14 @@ fn post_scm_comment_by_bead_id(
 ) -> Result<(), DaemonError> {
     if let Some(overlay) = deps.store.load(bead_id)? {
         if let Some(pr) = overlay.pr_number {
-            let ext_ref = format!("{}#{}", deps.cfg.target_repo, pr);
+            // jleechan-9xrs Stage D: was `deps.cfg.target_repo` — escalation
+            // (and every other caller of this function, including gate
+            // failure / HUMAN_HELD comments) must target the bead's OWN
+            // resolved repo or the comment lands on the wrong repo's PR
+            // entirely (the twa0/mdgr cross-repo escalation class this
+            // stage closes). `overlay` is already loaded here, so
+            // `overlay.repo(cfg)` is free.
+            let ext_ref = format!("{}#{}", overlay.repo(deps.cfg), pr);
             return deps.tracker.comment_external(&ext_ref, body);
         }
     }

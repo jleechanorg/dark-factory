@@ -110,11 +110,16 @@ pub fn maybe_run(
     now_epoch: u64,
 ) -> Result<Outcome, DaemonError> {
     // 1. Bead + PR must be valid (overlay is loaded to validate state + PR
-    //    consistency; the actual fetch is done in step 2)
-    match deps.store.load(bead_id)? {
-        Some(o) if o.state == OverlayState::Attested && o.pr_number == Some(pr) => {}
+    //    consistency; the actual fetch is done in step 2). Captured (not
+    //    discarded) so its resolved repo (jleechan-9xrs Stage D —
+    //    `overlay.repo(cfg)`) can be threaded through the snapshot fetch,
+    //    reviewer prompt, and posted comment's ext_ref below instead of
+    //    `deps.cfg.target_repo`.
+    let overlay = match deps.store.load(bead_id)? {
+        Some(o) if o.state == OverlayState::Attested && o.pr_number == Some(pr) => o,
         _ => return Ok(Outcome::NotApplicable),
     };
+    let repo = overlay.repo(&deps.cfg).to_string();
 
     // 2. Already posted? (idempotence) — jleechan-nplh: only a verdict
     //    posted at/after the CURRENT head commit counts. A verdict that
@@ -122,7 +127,7 @@ pub fn maybe_run(
     //    as valid would short-circuit re-verification forever (live
     //    incident: worldarchitect.ai#7888, a 2026-07-08 PASS suppressed
     //    re-review of a 2026-07-10 head ~100 commits later).
-    let snapshot = deps.scm.pr_snapshot(pr)?;
+    let snapshot = deps.scm.pr_snapshot_for_repo(&repo, pr)?;
     let existing =
         verifier::parse_er_verdict_since(&snapshot.comments, snapshot.head_committed_epoch);
     if existing != ErVerdict::Absent {
@@ -147,7 +152,7 @@ pub fn maybe_run(
     }
 
     // 5. Spawn reviewer
-    let prompt = build_er_prompt(bead_id, pr, &deps.cfg.target_repo);
+    let prompt = build_er_prompt(bead_id, pr, &repo);
     let reply = if !deps.llm.is_real() {
         deps.llm.judge(&prompt)?
     } else {
@@ -160,7 +165,7 @@ pub fn maybe_run(
     let body = format!(
         "🤖 **[dark-factory /er]** Evidence review verdict:\n\n```\n{reply}\n```"
     );
-    let ext_ref = format!("{}#{}", deps.cfg.target_repo, pr);
+    let ext_ref = format!("{}#{}", repo, pr);
     deps.tracker.comment_external(&ext_ref, &body)?;
 
     // 7. Increment attempt counter — only AFTER the comment landed, so a
