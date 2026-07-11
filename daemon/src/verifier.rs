@@ -33,18 +33,30 @@ pub enum GateName {
 }
 
 impl GateName {
-    /// Stable snake_case identifier for telemetry JSON (jleechan-wzgl:
-    /// GATE_ASSESSMENT serializes the full per-gate report, and a stable
-    /// string key is easier for downstream tooling/greps than `{:?}` debug
-    /// formatting, which is not a serialization contract).
+    /// Canonical snake_case JSON key for this gate (jleechan-wzgl:
+    /// GATE_ASSESSMENT serializes the full per-gate report). This is NOT a
+    /// free choice — it MUST match three other already-checked-in
+    /// consumers of this exact vocabulary, or `daemon/scripts/auto-merge-
+    /// guard.sh` silently mis-keys/crashes on the dict it reads back out
+    /// of GATE_ASSESSMENT telemetry:
+    ///   - `daemon/factory-overlay.sh`'s `gate-assessment` subcommand
+    ///     `REQUIRED_KEYS` (canonical source comment there: "canonical
+    ///     source: daemon/src/verifier.rs::GateName").
+    ///   - `tests/test_af_gate_contract.py::extract_gate_names_from_rust`'s
+    ///     hardcoded `gate_map` (Ci -> ci_green, etc.).
+    ///   - `tests/scripts/test_auto_merge_guard_gate_vocabulary.sh`'s fixture
+    ///     keys.
+    ///
+    /// PR #235 (jleechan-l4ki) unified all of the above onto ONE
+    /// vocabulary; this must reuse it verbatim rather than mint a fourth.
     pub fn as_str(&self) -> &'static str {
         match self {
-            GateName::Ci => "ci",
+            GateName::Ci => "ci_green",
             GateName::NoConflicts => "no_conflicts",
-            GateName::CodeRabbitApproved => "code_rabbit_approved",
-            GateName::BugbotClean => "bugbot_clean",
+            GateName::CodeRabbitApproved => "coderabbit",
+            GateName::BugbotClean => "bugbot",
             GateName::CommentsResolved => "comments_resolved",
-            GateName::EvidenceFloor => "evidence_floor",
+            GateName::EvidenceFloor => "evidence_review",
             GateName::Skeptic => "skeptic",
         }
     }
@@ -89,29 +101,37 @@ impl GateReport {
     /// carries the answer. `to_json` is the single source of truth for that
     /// serialization so the telemetry shape can't drift from what `assess`
     /// actually computed.
+    ///
+    /// Shape (PR #239 review round 1 finding): `gates` MUST be a `{gate_name:
+    /// verdict}` object, not an array — `daemon/scripts/auto-merge-guard.sh`'s
+    /// `latest_assessment_no_red` predicate does `for k, v in g.items()` on
+    /// exactly this field, and `daemon/factory-overlay.sh`'s `gate-assessment`
+    /// subcommand (+ its `REQUIRED_KEYS`/`OPTIONAL_KEYS` contract, unified in
+    /// PR #235/jleechan-l4ki) is the other checked-in consumer of this same
+    /// vocabulary. Each verdict is either the plain string `"pass"|"warn"|
+    /// "fail"|"unknown"` (green gates), or the structured `{"verdict": ...,
+    /// "evidence": [...]}` object (red/unknown gates, carrying the reason as
+    /// a one-element `evidence` list) — both shapes are accepted by
+    /// `factory-overlay.sh`'s `normalize()`.
     pub fn to_json(&self) -> serde_json::Value {
-        let gates: Vec<serde_json::Value> = self
-            .results
-            .iter()
-            .map(|(name, result)| {
-                let (verdict, reason): (&str, Option<&str>) = match result {
-                    GateResult::Green => ("green", None),
-                    GateResult::Red(reason) => ("red", Some(reason.as_str())),
-                    GateResult::Unknown(reason) => ("unknown", Some(reason.as_str())),
-                };
-                let mut obj = serde_json::json!({
-                    "gate": name.as_str(),
-                    "result": verdict,
-                });
-                if let Some(r) = reason {
-                    obj["reason"] = serde_json::Value::String(r.to_string());
-                }
-                obj
-            })
-            .collect();
+        let mut gates = serde_json::Map::new();
+        for (name, result) in &self.results {
+            let value = match result {
+                GateResult::Green => serde_json::Value::String("pass".to_string()),
+                GateResult::Red(reason) => serde_json::json!({
+                    "verdict": "fail",
+                    "evidence": [reason],
+                }),
+                GateResult::Unknown(reason) => serde_json::json!({
+                    "verdict": "unknown",
+                    "evidence": [reason],
+                }),
+            };
+            gates.insert(name.as_str().to_string(), value);
+        }
         serde_json::json!({
             "all_green": self.all_green,
-            "gates": gates,
+            "gates": serde_json::Value::Object(gates),
         })
     }
 }

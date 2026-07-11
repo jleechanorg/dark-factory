@@ -2016,6 +2016,12 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 "skeptic_reviewers".to_string(),
                 serde_json::json!(evidence.skeptic_reviewers),
             );
+            // jleechan-wzgl (PR #239 review round 1): `auto-merge-guard.sh`'s
+            // `latest_assessment_no_red` greps GATE_ASSESSMENT lines by
+            // `context.pr_number` before parsing `context.gates` — without
+            // this key the guard's match path is permanently dormant no
+            // matter how correct the `gates` shape is.
+            obj.insert("pr_number".to_string(), serde_json::json!(pr));
         }
         emit(
             deps.telemetry_log,

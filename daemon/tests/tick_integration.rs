@@ -5777,22 +5777,36 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         .unwrap_or_else(|e| panic!("GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}"));
     let context = &parsed["context"];
 
+    // jleechan-wzgl (PR #239 review round 1): `gates` MUST be a
+    // `{gate_name: verdict}` OBJECT using the PR #235/jleechan-l4ki
+    // canonical 7-gate vocabulary — `daemon/scripts/auto-merge-guard.sh`'s
+    // `latest_assessment_no_red` predicate does `for k, v in g.items()` on
+    // this exact field and would crash on `list.items()` if it were an
+    // array, which is why this is asserted as an object, not a length-7
+    // array like round 1 checked.
     let gates = context["gates"]
-        .as_array()
-        .unwrap_or_else(|| panic!("GATE_ASSESSMENT context.gates must be an array; context:\n{context}"));
+        .as_object()
+        .unwrap_or_else(|| panic!("GATE_ASSESSMENT context.gates must be a {{gate_name: verdict}} object, not an array; context:\n{context}"));
+    const CANONICAL_GATE_KEYS: [&str; 7] = [
+        "ci_green",
+        "no_conflicts",
+        "coderabbit",
+        "bugbot",
+        "comments_resolved",
+        "evidence_review",
+        "skeptic",
+    ];
     assert_eq!(
         gates.len(),
         7,
         "GATE_ASSESSMENT must report all 7 per-gate results, not just all_green; context:\n{context}"
     );
-    for gate in gates {
+    for key in CANONICAL_GATE_KEYS {
         assert!(
-            gate.get("gate").and_then(|v| v.as_str()).is_some(),
-            "each gate entry must name the gate; context:\n{context}"
-        );
-        assert!(
-            gate.get("result").and_then(|v| v.as_str()).is_some(),
-            "each gate entry must carry a result; context:\n{context}"
+            gates.contains_key(key),
+            "GATE_ASSESSMENT gates dict must use the PR #235/jleechan-l4ki \
+             canonical vocabulary (daemon/factory-overlay.sh REQUIRED_KEYS); \
+             missing key {key:?}; context:\n{context}"
         );
     }
 
@@ -5810,6 +5824,74 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
          produced the verdict (agy, the 3rd-vendor fallback), not the first \
          two dispatched vendors (codex/claude) that failed to parse, and not \
          a placeholder; context:\n{context}"
+    );
+
+    // jleechan-wzgl (PR #239 review round 1): `pr_number` must be present
+    // in context — without it, `auto-merge-guard.sh`'s
+    // `grep -E "\"pr_number\": *$pr[,}]"` never matches this line at all,
+    // and the dict-shape/vocabulary fix above stays permanently dormant.
+    assert_eq!(
+        context["pr_number"].as_u64(),
+        Some(558),
+        "GATE_ASSESSMENT context must carry pr_number so auto-merge-guard.sh's \
+         grep-by-PR-number match path is reachable; context:\n{context}"
+    );
+
+    // jleechan-wzgl (PR #239 review round 2, team-lead request): don't just
+    // assert our own shape expectations — pipe the ACTUAL emitted line
+    // through auto-merge-guard.sh's REAL predicate (the exact python
+    // heredoc it runs, extracted the same way
+    // tests/scripts/test_auto_merge_guard_gate_vocabulary.sh does) and
+    // confirm the match path is genuinely non-dormant: it parses without
+    // crashing and reports a non-blocking verdict for this all-green
+    // scenario.
+    let guard_script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/auto-merge-guard.sh");
+    let guard_src = std::fs::read_to_string(&guard_script)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", guard_script.display()));
+    let predicate_block: String = guard_src
+        .lines()
+        .skip(40) // 0-indexed: line 41 (1-indexed) of auto-merge-guard.sh
+        .take(29) // lines 41..=69 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh's `sed -n '41,69p'`
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        predicate_block.contains("g.items()"),
+        "extracted predicate block drifted from auto-merge-guard.sh's actual \
+         line range 41-69 (line numbers may have shifted); block:\n{predicate_block}"
+    );
+
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(&predicate_block)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn python3 for auto-merge-guard.sh predicate");
+    child
+        .stdin
+        .take()
+        .expect("child stdin must be piped")
+        .write_all(gate_assessment_line.as_bytes())
+        .expect("failed to write GATE_ASSESSMENT line to predicate stdin");
+    let output = child
+        .wait_with_output()
+        .expect("python3 predicate failed to run to completion");
+    let predicate_stdout = String::from_utf8_lossy(&output.stdout);
+    let predicate_stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "auto-merge-guard.sh's real predicate must accept the emitted \
+         GATE_ASSESSMENT line (dict-shaped gates, canonical vocab) for this \
+         all-green scenario; stdout={predicate_stdout}\nstderr={predicate_stderr}\n\
+         line={gate_assessment_line}"
+    );
+    assert!(
+        predicate_stdout.contains("no-fail"),
+        "expected a non-blocking 'no-fail' verdict from auto-merge-guard.sh's \
+         predicate for this all-green scenario; got: {predicate_stdout}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
