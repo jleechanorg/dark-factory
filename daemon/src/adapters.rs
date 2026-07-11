@@ -179,7 +179,16 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
     if parts.len() == 2 {
         Some((parts[0].to_string(), parts[1].to_string()))
     } else {
-        None
+        let url_parts: Vec<&str> = external_ref
+            .strip_prefix("https://github.com/")?
+            .split('/')
+            .collect();
+        match url_parts.as_slice() {
+            [owner, repo, kind, number] if matches!(*kind, "pull" | "issues") => {
+                Some((format!("{owner}/{repo}"), number.to_string()))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -195,15 +204,15 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
 /// `owner/repo#N` base, which already contains a `#`, producing 3
 /// `#`-delimited segments and a permanent `comment_external` parse failure.
 ///
-/// `parse_external_ref` intentionally stays strict (exactly one `#`) so
-/// this corrupted shape is still detected as invalid on its own; this
-/// helper is the single call site (escalation comment posting) that
-/// recognizes the specific `<repo>#<pr>#local-<token>` shape and strips
-/// the trailing disambiguation suffix to recover the real target, so
-/// already-corrupted stored data (which this PR does NOT bulk-repair) can
-/// still have its escalation comment posted. Any other malformed shape —
-/// bare `local-<id>` refs, full GitHub URLs — is left untouched; those are
-/// jleechan-twa0's territory (parser format acceptance), not this bug.
+/// `parse_external_ref` intentionally stays strict for short-form refs
+/// (exactly one `#`) while also accepting exact GitHub pull/issue URLs, so
+/// this corrupted shape is still detected as invalid on its own. This helper
+/// is the single call site (escalation comment posting) that recognizes the
+/// specific `<repo>#<pr>#local-<token>` shape and strips the trailing
+/// disambiguation suffix to recover the real target, so already-corrupted
+/// stored data (which this PR does NOT bulk-repair) can still have its
+/// escalation comment posted. Any other malformed shape — including bare
+/// `local-<id>` refs — is left untouched.
 fn canonicalize_external_ref_for_comment(external_ref: &str) -> Option<(String, String)> {
     if let Some(parsed) = parse_external_ref(external_ref) {
         return Some(parsed);
@@ -2255,8 +2264,8 @@ pub fn ci_success_from_check_buckets(buckets: &[&str], iteration_stub: bool) -> 
 #[cfg(test)]
 mod external_ref_tests {
     use super::{
-        canonicalize_external_ref_for_comment, parse_external_refs_from_br_list,
-        unresolved_thread_count_from_gql,
+        canonicalize_external_ref_for_comment, parse_external_ref,
+        parse_external_refs_from_br_list, unresolved_thread_count_from_gql,
     };
 
     /// jleechan-mdgr: reproduces the exact 2026-07-11T00:05:15Z corruption —
@@ -2306,6 +2315,38 @@ mod external_ref_tests {
         assert_eq!(
             canonicalize_external_ref_for_comment("owner/repo#42#weird-suffix"),
             None
+        );
+    }
+
+    #[test]
+    fn parse_external_ref_preserves_short_form() {
+        assert_eq!(
+            parse_external_ref("owner/repo#42"),
+            Some(("owner/repo".to_string(), "42".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_external_ref_accepts_github_pull_url() {
+        assert_eq!(
+            parse_external_ref(
+                "https://github.com/jleechanorg/worldarchitect.ai/pull/8064"
+            ),
+            Some((
+                "jleechanorg/worldarchitect.ai".to_string(),
+                "8064".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_external_ref_accepts_github_issue_url() {
+        assert_eq!(
+            parse_external_ref("https://github.com/jleechanorg/dark-factory/issues/238"),
+            Some((
+                "jleechanorg/dark-factory".to_string(),
+                "238".to_string()
+            ))
         );
     }
 
