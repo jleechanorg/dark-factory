@@ -76,6 +76,19 @@ impl Config {
                 }
                 project
             });
+            // NOTE (adversarial review of PR #245): `"origin"` is correct
+            // for a single-remote clone and for dark-factory's own repo,
+            // but a dual-remote worldarchitect.ai clone (`origin` =
+            // jleechanclaw, `worldai` = worldarchitect.ai — see
+            // docs/multirepo-dispatch-investigation-2026-07-11.md step 4)
+            // needs `"worldai"`. Inert TODAY because `SpawnSpec.remote` is
+            // not yet consumed by `CliSessions::spawn` (Stage C, bead
+            // jleechan-bqdv) — but a `target_repo`/`cfg.target_repo` set to
+            // `jleechanorg/worldarchitect.ai` with no explicit
+            // `[repos."jleechanorg/worldarchitect.ai"]` entry will resolve
+            // the WRONG remote here the moment Stage C starts consuming it.
+            // Add that `[repos.*]` entry to `config/daemon.toml` for any
+            // dual-remote repo rather than relying on this fallback.
             return Some(RepoRouting {
                 ao_project,
                 push_remote: "origin".to_string(),

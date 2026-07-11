@@ -757,12 +757,25 @@ impl StateStore for SqliteStateStore {
         // any park site that hasn't been updated to set a reason) keep the
         // pre-existing auto-recovery behavior — the exclusion is opt-in via
         // the `circuit-breaker` prefix, not opt-out via NULL.
+        //
+        // bead jleechan-35y4 (adversarial review of PR #245): `park_reason =
+        // 'unmapped_target_repo'` rows are EXCLUDED for the same reason —
+        // an unmapped repo is a CONFIG problem (missing `[repos.*]` entry),
+        // not something a bare requeue can fix. Without this exclusion the
+        // bead would ping-pong HUMAN_HELD -> QUEUED -> re-park identically
+        // every recovery cycle (attempt incrementing each time, up to the
+        // `max_attempt` cap) instead of staying HUMAN_HELD until an
+        // operator adds the missing config entry — silently defeating the
+        // "fail loud, never guess" intent `dispatch::dispatch_ready`'s
+        // unmapped-repo park is supposed to provide.
         let mut id_stmt = self
             .conn
             .prepare(
                 "SELECT bead_id FROM bead_overlay \
                  WHERE state = 'HUMAN_HELD' AND attempt < ?1 \
-                 AND (park_reason IS NULL OR park_reason NOT LIKE 'circuit-breaker%')",
+                 AND (park_reason IS NULL \
+                      OR (park_reason NOT LIKE 'circuit-breaker%' \
+                          AND park_reason != 'unmapped_target_repo'))",
             )
             .map_err(|e| tool_err("recover_human_held id select prepare", e))?;
         let recovered_ids: Vec<String> = id_stmt
@@ -1609,6 +1622,90 @@ mod tests {
             transient.park_reason, None,
             "recover_human_held clears park_reason once a bead is back in play"
         );
+    }
+
+    /// jleechan-35y4 (adversarial review of PR #245): a bead parked
+    /// HUMAN_HELD with `park_reason = "unmapped_target_repo"` (bead
+    /// jleechan-35y4's own dispatch-time park — see
+    /// `dispatch::dispatch_ready`) must NOT be auto-requeued, for the same
+    /// reason circuit-breaker parks aren't: an unmapped repo is a config
+    /// problem no bare requeue fixes. Without this exclusion the bead would
+    /// ping-pong HUMAN_HELD -> QUEUED -> re-park identically every recovery
+    /// cycle instead of staying HUMAN_HELD until an operator fixes the
+    /// config. A same-attempt transient park (`session_stalled`) must still
+    /// recover normally, exactly like the circuit-breaker test above.
+    #[test]
+    fn recover_human_held_excludes_unmapped_target_repo_parks_but_recovers_transient_parks() {
+        let schema = include_str!("../contracts/schema.sql");
+        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
+
+        let mut overlays = HashMap::new();
+        overlays.insert(
+            "unmapped-repo".to_string(),
+            BeadOverlay {
+                bead_id: "unmapped-repo".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 2,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some("unmapped_target_repo".to_string()),
+                target_repo: Some("someorg/unrelated-repo".to_string()),
+            },
+        );
+        overlays.insert(
+            "transient-stalled".to_string(),
+            BeadOverlay {
+                bead_id: "transient-stalled".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 2,
+                reroll_count: 0,
+                autonomy_secs: 1800,
+                spend_usd: 0.0,
+                pr_number: Some(99),
+                branch: Some("factory/transient-stalled-r2".into()),
+                session_id: Some("session-abc".into()),
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some("session_stalled".to_string()),
+                target_repo: None,
+            },
+        );
+        for overlay in overlays.values() {
+            store.save(overlay).unwrap();
+        }
+
+        let recovered = store.recover_human_held(10).unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "only the transient park should be recovered; the unmapped-repo park must be excluded"
+        );
+        assert_eq!(recovered[0].bead_id, "transient-stalled");
+
+        let unmapped = store.load("unmapped-repo").unwrap().unwrap();
+        assert_eq!(
+            unmapped.state,
+            OverlayState::HumanHeld,
+            "unmapped_target_repo park must NOT be auto-requeued"
+        );
+        assert_eq!(unmapped.attempt, 2, "attempt must not be bumped");
+        assert_eq!(
+            unmapped.park_reason.as_deref(),
+            Some("unmapped_target_repo"),
+            "park_reason must survive an excluded recovery pass"
+        );
+
+        let transient = store.load("transient-stalled").unwrap().unwrap();
+        assert_eq!(transient.state, OverlayState::Queued);
+        assert_eq!(transient.attempt, 3);
     }
 
     /// P2 (Codex review): `recover_human_held` must return ONLY the rows

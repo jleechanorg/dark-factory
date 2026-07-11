@@ -1222,6 +1222,89 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 continue;
             }
 
+            if failure.phase == "unmapped_target_repo" {
+                // jleechan-35y4 (adversarial review of PR #245): this phase
+                // (from `dispatch::dispatch_ready`'s fail-loud park) was
+                // previously falling through to the generic
+                // `BEAD_DISPATCH_TRANSIENT_ERROR` branch below, which
+                // labeled a genuinely HUMAN_HELD, non-transient park as
+                // `lifecycle_state = QUEUED` / `"transient": false`-but-
+                // treated-as-retryable telemetry, incremented no
+                // HUMAN_HELD counter, and posted no escalation comment —
+                // the exact opposite of the "fail loud" intent. Mirror the
+                // `spawn_retry_cap_exceeded` idiom: record the park, then
+                // best-effort escalate exactly once.
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "unmapped_target_repo",
+                        "error": failure.error.as_str(),
+                    }),
+                )?;
+                if escalation_already_recorded(deps, &failure.bead_id)? {
+                    continue;
+                }
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: bead `{}` claims a `target_repo` with no matching `[repos.*]` config entry (and it is not the daemon's global `target_repo`). Automation parked it HUMAN_HELD rather than guessing which repo/AO-project to dispatch into; please add a `[repos.\"<repo>\"]` entry to `config/daemon.toml` (or correct the bead's `target_repo`) before requeuing.",
+                    failure.bead_id
+                );
+                if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
+                {
+                    if is_missing_scm_target_error(&err) {
+                        record_local_escalation_fallback(
+                            deps,
+                            &failure.bead_id,
+                            "unmapped_target_repo",
+                        )?;
+                        summary.beads_escalated_locally += 1;
+                        emit(
+                            deps.telemetry_log,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "ESCALATED_LOCALLY",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "unmapped_target_repo",
+                                "scm_error": err.to_string(),
+                            }),
+                        )?;
+                        continue;
+                    }
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_NOTIFICATION_FAILED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "unmapped_target_repo",
+                            "error": err.to_string(),
+                        }),
+                    )?;
+                    continue;
+                }
+                record_escalation(deps, &failure.bead_id, "unmapped_target_repo")?;
+                summary.beads_escalated += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "ESCALATION_REQUIRED",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "unmapped_target_repo"}),
+                )?;
+                continue;
+            }
+
             let lifecycle_state = if failure.branch.is_some() {
                 OverlayState::Dispatching.as_str()
             } else {
