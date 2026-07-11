@@ -217,7 +217,17 @@ pub fn dispatch_ready(
             // specific pattern must win). Simply requeue and report under a
             // distinct `"spawn_deferred"` phase so it's visually
             // distinguishable downstream from genuine spawn failures.
-            Err(err @ DaemonError::Deferred(_)) => {
+            // jleechan-r56m: `sessions.spawn()` -> `spawn_with_fallback` ->
+            // `fallback_spawn` now wraps an exhausted vendor chain in
+            // `DaemonError::SpawnFallbackExhausted` even when the LAST
+            // attempted vendor's own error was `Deferred` -- a literal
+            // `DaemonError::Deferred(_)` pattern here would go dead for
+            // every real spawn and silently regress this exact w28n
+            // exemption (mass false HUMAN_HELD escalation on pure AO
+            // capacity backpressure). `is_deferred()` unwraps to the
+            // terminal attempt's own classification, restoring the
+            // original behavior.
+            Err(err) if err.is_deferred() => {
                 overlay.state = OverlayState::Queued;
                 overlay.session_id = None;
                 store.save(&overlay)?;
@@ -367,6 +377,14 @@ mod tests {
         // the AO admission-control-queue path (session-cap backpressure)
         // separately from a genuine transient tool failure.
         fail_spawn_deferred_for: RefCell<Vec<String>>,
+        // jleechan-r56m: scripted `DaemonError::SpawnFallbackExhausted`
+        // whose LAST attempted vendor is itself `Deferred` -- reproduces the
+        // real `spawn_with_fallback` shape (an exhausted fallback chain
+        // wrapping a terminal AO admission-queue backpressure), distinct
+        // from `fail_spawn_deferred_for`'s bare `Deferred` which no longer
+        // reflects what `CliSessions::spawn` actually returns once a
+        // fallback chain is exhausted.
+        fail_spawn_fallback_exhausted_deferred_for: RefCell<Vec<String>>,
         fail_stop_for: RefCell<Vec<String>>,
         // jleechan-5ia2: scripted `session_branch` override, keyed by
         // session id. Empty by default (matches the trait's `Ok(None)`
@@ -386,6 +404,7 @@ mod tests {
                 fail_spawn_for: RefCell::new(Vec::new()),
                 fail_spawn_fatal_for: RefCell::new(Vec::new()),
                 fail_spawn_deferred_for: RefCell::new(Vec::new()),
+                fail_spawn_fallback_exhausted_deferred_for: RefCell::new(Vec::new()),
                 fail_stop_for: RefCell::new(Vec::new()),
                 scripted_branch: RefCell::new(HashMap::new()),
             }
@@ -403,6 +422,12 @@ mod tests {
 
         fn fail_spawn_deferred_for(&self, bead_id: &str) {
             self.fail_spawn_deferred_for
+                .borrow_mut()
+                .push(bead_id.to_string());
+        }
+
+        fn fail_spawn_fallback_exhausted_deferred_for(&self, bead_id: &str) {
+            self.fail_spawn_fallback_exhausted_deferred_for
                 .borrow_mut()
                 .push(bead_id.to_string());
         }
@@ -452,6 +477,32 @@ mod tests {
                     "REQUEST=sq-scripted-{}",
                     spec.bead_id
                 )));
+            }
+            if self
+                .fail_spawn_fallback_exhausted_deferred_for
+                .borrow()
+                .contains(&spec.bead_id)
+            {
+                // Mirrors real `spawn_with_fallback` shape: an earlier
+                // vendor failed for an unrelated reason, and the LAST
+                // attempted vendor hit AO's admission-queue backpressure.
+                return Err(DaemonError::SpawnFallbackExhausted(vec![
+                    (
+                        "minimax".to_string(),
+                        DaemonError::Tool {
+                            tool: "ao spawn --agent minimax".to_string(),
+                            rc: 1,
+                            stderr: "scripted unrelated minimax failure".to_string(),
+                        },
+                    ),
+                    (
+                        "agy".to_string(),
+                        DaemonError::Deferred(format!(
+                            "REQUEST=sq-scripted-{}",
+                            spec.bead_id
+                        )),
+                    ),
+                ]));
             }
             Ok(SessionId("fake-session-1".into()))
         }
@@ -1060,6 +1111,66 @@ mod tests {
             bead_1.spawn_failure_count, 0,
             "Deferred backpressure must NEVER increment spawn_failure_count — it shares no \
              budget with genuine transient tool/timeout failures"
+        );
+    }
+
+    /// jleechan-r56m regression guard: real `CliSessions::spawn` (via
+    /// `spawn_with_fallback` -> `fallback_spawn`) wraps an exhausted vendor
+    /// chain in `DaemonError::SpawnFallbackExhausted` even when the LAST
+    /// attempted vendor hit AO's own admission-queue backpressure
+    /// (`Deferred`) -- this is DIFFERENT from the bare `Deferred` the
+    /// previous test scripts. Before adding `DaemonError::is_deferred()` and
+    /// switching this match arm from the literal `Err(err @
+    /// DaemonError::Deferred(_))` pattern to `Err(err) if
+    /// err.is_deferred()`, this exact scenario silently fell through to the
+    /// general `is_transient()` guard, incrementing `spawn_failure_count` on
+    /// pure AO capacity backpressure -- precisely the mass false-escalation
+    /// failure mode jleechan-w28n exists to prevent.
+    #[test]
+    fn spawn_fallback_exhausted_ending_in_deferred_requeues_without_incrementing_counter() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_fallback_exhausted_deferred_for("bead-1");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(3);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        let success_ids: Vec<&str> = report
+            .successes
+            .iter()
+            .map(|success| success.bead_id.as_str())
+            .collect();
+        assert_eq!(
+            success_ids,
+            ["bead-0", "bead-2"],
+            "a wrapped-Deferred spawn for one bead must not abort the rest of the batch"
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-1");
+        assert_eq!(
+            report.failures[0].phase, "spawn_deferred",
+            "a SpawnFallbackExhausted terminating in Deferred must still report the \
+             \"spawn_deferred\" phase, not \"spawn\""
+        );
+        assert!(
+            report.failures[0]
+                .error
+                .contains("scripted unrelated minimax failure"),
+            "the reported error string should still show the earlier vendor's failure too: {}",
+            report.failures[0].error
+        );
+
+        let bead_1 = store.load("bead-1").unwrap().unwrap();
+        assert_eq!(
+            bead_1.state,
+            OverlayState::Queued,
+            "a wrapped-Deferred bead must be requeued, never parked"
+        );
+        assert_eq!(
+            bead_1.spawn_failure_count, 0,
+            "a SpawnFallbackExhausted ending in Deferred must NEVER increment \
+             spawn_failure_count, exactly like a bare Deferred"
         );
     }
 

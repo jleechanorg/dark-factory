@@ -1451,19 +1451,101 @@ impl CliSessions {
             }
         }
 
-        let mut last_err = None;
-        for agent in &fallback_agents {
-            match self.run_spawn_process(agent, spec) {
-                Ok(sess) => return Ok(sess),
-                Err(e) => {
-                    last_err = Some(e);
-                }
+        fallback_spawn(&fallback_agents, |agent| self.run_spawn_process(agent, spec))
+    }
+}
+
+/// Walks `agents` in order, calling `attempt_spawn` for each until one
+/// succeeds. Pulled out of `spawn_with_fallback` into a free function taking
+/// an injectable closure so the fallback-chain-exhaustion aggregation logic
+/// is unit-testable (see `spawn_fallback_tests` below) without shelling out
+/// to a real `ao` binary via `run_spawn_process`.
+///
+/// jleechan-r56m: each iteration used to overwrite a single `last_err`
+/// variable, so once every agent in `agents` had failed, only the LAST
+/// agent's error survived into the returned `Err`. This discarded every
+/// earlier vendor's specific failure reason, which is exactly what made bead
+/// jleechan-93ft attempt 3's `PARKED_HUMAN_HELD` telemetry (2026-07-10) look
+/// like an "agy plugin missing" problem when agy was merely the last vendor
+/// tried in the chain.
+fn fallback_spawn<F>(agents: &[String], mut attempt_spawn: F) -> Result<SessionId, DaemonError>
+where
+    F: FnMut(&str) -> Result<SessionId, DaemonError>,
+{
+    let mut attempts: Vec<(String, DaemonError)> = Vec::new();
+    for agent in agents {
+        match attempt_spawn(agent) {
+            Ok(sess) => return Ok(sess),
+            Err(e) => {
+                attempts.push((agent.clone(), e));
             }
         }
+    }
 
-        Err(last_err.unwrap_or_else(|| {
-            DaemonError::Config("No agents in fallback chain could be run".into())
-        }))
+    Err(if attempts.is_empty() {
+        DaemonError::Config("No agents in fallback chain could be run".into())
+    } else {
+        DaemonError::SpawnFallbackExhausted(attempts)
+    })
+}
+
+#[cfg(test)]
+mod spawn_fallback_tests {
+    use super::fallback_spawn;
+    use crate::errors::DaemonError;
+
+    /// jleechan-r56m red proof: simulate all 3 vendors in a fallback chain
+    /// failing with DIFFERENT, distinguishable errors. Today's aggregation
+    /// (`last_err` overwritten each iteration) only surfaces the LAST
+    /// vendor's error, so the first two vendors' distinguishing markers must
+    /// NOT appear in the final error's `Display` output -- proving the bug
+    /// bead jleechan-r56m describes: triage sees only "agy" and never learns
+    /// minimax/claude-code failed for a different, possibly more important,
+    /// reason.
+    #[test]
+    fn all_vendors_failing_must_surface_every_vendors_error_not_just_the_last() {
+        let agents = vec![
+            "minimax".to_string(),
+            "claude-code".to_string(),
+            "agy".to_string(),
+        ];
+
+        let err = fallback_spawn(&agents, |agent| {
+            Err(match agent {
+                "minimax" => DaemonError::Tool {
+                    tool: "ao spawn --agent minimax".to_string(),
+                    rc: 1,
+                    stderr: "MINIMAX_AUTH_FAILURE_MARKER".to_string(),
+                },
+                "claude-code" => DaemonError::Tool {
+                    tool: "ao spawn --agent claude-code".to_string(),
+                    rc: 1,
+                    stderr: "CLAUDE_CODE_SESSION_CAP_MARKER".to_string(),
+                },
+                "agy" => DaemonError::Tool {
+                    tool: "ao spawn --agent agy".to_string(),
+                    rc: 1,
+                    stderr: "Agent plugin agy not found".to_string(),
+                },
+                other => panic!("unexpected agent {other}"),
+            })
+        })
+        .expect_err("all three vendors fail in this scenario");
+
+        let rendered = err.to_string();
+
+        assert!(
+            rendered.contains("MINIMAX_AUTH_FAILURE_MARKER"),
+            "minimax's specific error must be visible in the aggregated error, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("CLAUDE_CODE_SESSION_CAP_MARKER"),
+            "claude-code's specific error must be visible in the aggregated error, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("Agent plugin agy not found"),
+            "agy's specific error must still be visible in the aggregated error, got: {rendered}"
+        );
     }
 }
 
