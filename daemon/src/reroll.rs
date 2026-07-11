@@ -597,10 +597,32 @@ fn execute_adopted(
         }
     };
 
+    // jleechan-35y4 Stage A/B: adopted-PR remediation is currently
+    // restricted to same-repo PRs (`intake::same_repo_pr` rejects
+    // fork/cross-repo PRs before adoption), so `bead.repo(cfg)` always
+    // resolves to `deps.cfg.target_repo` today and `resolve_repo` is
+    // therefore always `Some`. Falling back to the bead's raw repo string
+    // with `deps.cfg.ao_project` unset (rather than panicking/unwrapping)
+    // keeps this path inert if that restriction is ever lifted before the
+    // Stage C/D call-site sweep reaches this function.
+    let adopted_repo = bead.repo(deps.cfg).to_string();
+    let adopted_routing = deps.cfg.resolve_repo(&adopted_repo).unwrap_or_else(|| {
+        crate::config::RepoRouting {
+            ao_project: deps
+                .cfg
+                .ao_project
+                .clone()
+                .unwrap_or_else(|| adopted_repo.clone()),
+            push_remote: "origin".to_string(),
+        }
+    });
     let spec = SpawnSpec {
         bead_id: bead.bead_id.clone(),
         branch: branch.clone(),
         prompt,
+        repo: adopted_repo,
+        ao_project: adopted_routing.ao_project,
+        remote: adopted_routing.push_remote,
     };
 
     match deps.sessions.spawn(&spec) {

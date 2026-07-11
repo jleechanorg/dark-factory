@@ -50,6 +50,7 @@ fn test_cfg(spec_dir: &std::path::Path) -> Config {
         autonomy_timebox_secs: 10_800,
         budget_warn_usd: 20.0,
         spec_dir: spec_dir.to_string_lossy().to_string(),
+        repos: std::collections::HashMap::new(),
     }
 }
 

@@ -27,6 +27,7 @@ fn test_cfg() -> Config {
             .join("afd_spec_dir_test")
             .to_string_lossy()
             .to_string(),
+        repos: std::collections::HashMap::new(),
     }
 }
 

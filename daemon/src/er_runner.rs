@@ -491,6 +491,7 @@ mod tests {
             autonomy_timebox_secs: 10_800,
             budget_warn_usd: 20.0,
             spec_dir: ".factory/specs/".into(),
+            repos: std::collections::HashMap::new(),
         }
     }
 

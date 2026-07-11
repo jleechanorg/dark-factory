@@ -864,6 +864,14 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             Some(OverlayState::Ready) | Some(OverlayState::HumanHeld)
         );
         if should_adopt {
+            // jleechan-35y4 Stage A: adopted PRs are always same-repo
+            // (fork/cross-repo PRs are rejected earlier by `same_repo_pr`
+            // in intake.rs), so this always resolves to `cfg.target_repo`'s
+            // owner/repo today. Still resolved from `external_ref` (not
+            // left `None`) so it stays correct once Stage C/D lift the
+            // same-repo-only restriction for adopted PRs.
+            let target_repo =
+                intake::resolve_target_repo("", Some(adopted.external_ref.as_str()));
             let mut overlay = existing.unwrap_or(BeadOverlay {
                 bead_id: adopted.bead_id.clone(),
                 state: OverlayState::Attested,
@@ -878,7 +886,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo,
             });
             overlay.state = OverlayState::Attested;
             overlay.pr_number = Some(adopted.pr_number);
@@ -953,6 +961,14 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
         }
 
+        // jleechan-35y4 Stage A: resolve per-bead repo identity at intake
+        // time — explicit `target_repo:` body field wins, else the
+        // `owner/repo` prefix of external_ref, else None (legacy/global,
+        // resolved later via `BeadOverlay::repo`).
+        let target_repo = intake::resolve_target_repo(
+            tracker_bead.as_ref().map(|b| b.description.as_str()).unwrap_or(""),
+            tracker_bead.as_ref().and_then(|b| b.external_ref.as_deref()),
+        );
         let overlay = BeadOverlay {
             bead_id: bead_id.clone(),
             state: OverlayState::Queued,
@@ -967,7 +983,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo,
         };
         deps.store.save(&overlay)?;
         summary.beads_created += 1;
@@ -1023,6 +1039,14 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 }
             }
             None => {
+                // jleechan-35y4 Stage A: same intake resolution precedence
+                // as the GH-issue path above, applied identically to
+                // manual `br`-created beads (spec requirement: "Manual `br`
+                // beads: same body-field parse").
+                let target_repo = intake::resolve_target_repo(
+                    bead.description.as_str(),
+                    bead.external_ref.as_deref(),
+                );
                 let o = BeadOverlay {
                     bead_id: bead.id.clone(),
                     state: OverlayState::Queued,
@@ -1037,7 +1061,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo,
                 };
                 deps.store.save(&o)?;
                 summary.beads_created += 1;
@@ -1070,7 +1094,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     OverlayState::Queued.as_str(),
                     "TASK_ROUTED",
                     serde_json::json!({}),
-                    serde_json::json!({"routingVerdict": verdict_str}),
+                    // jleechan-35y4: target_repo now visible in daemon.jsonl
+                    // (null == legacy/global cfg.target_repo).
+                    serde_json::json!({"routingVerdict": verdict_str, "target_repo": overlay.target_repo}),
                 )?;
                 ready.push((bead.clone(), verdict));
             }
@@ -1227,7 +1253,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 serde_json::json!({}),
                 serde_json::json!({
                     "branch": success.branch.as_str(),
-                    "sessionId": success.session_id.as_str()
+                    "sessionId": success.session_id.as_str(),
+                    // jleechan-35y4: resolved repo now visible in daemon.jsonl.
+                    "target_repo": success.target_repo.as_str(),
                 }),
             )?;
             let comment_body = format!(

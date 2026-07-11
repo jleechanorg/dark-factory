@@ -111,6 +111,9 @@ fn fake_sessions_spawn_attach_stop_quiescent_roundtrip() {
         bead_id: "b1".into(),
         branch: "factory/b1-r1".into(),
         prompt: "do the thing".into(),
+        repo: "owner/repo".into(),
+        ao_project: "repo".into(),
+        remote: "origin".into(),
     };
     let id = fake.spawn(&spec).unwrap();
     assert_eq!(id, SessionId("sess-9".into()));

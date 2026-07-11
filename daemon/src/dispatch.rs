@@ -30,6 +30,10 @@ pub struct DispatchSuccess {
     pub attempt: u32,
     pub branch: String,
     pub session_id: String,
+    /// `overlay.repo(cfg)` at dispatch time (bead jleechan-35y4 Stage A/B):
+    /// surfaced so `tick.rs`'s `TASK_DISPATCHED` telemetry makes the
+    /// resolved repo visible in daemon.jsonl.
+    pub target_repo: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +149,47 @@ pub fn dispatch_ready(
             Err(err) => return Err(err),
         };
 
+        // jleechan-35y4 Stage B: resolve this bead's repo BEFORE touching
+        // branch registration or dispatching state. A bead whose resolved
+        // `target_repo` (Stage A) names neither an explicit `[repos.*]`
+        // entry nor the daemon's global `cfg.target_repo` is unmappable —
+        // fail loud and park HUMAN_HELD rather than silently defaulting to
+        // the global repo (jleechan-9sh5 discipline: never guess a repo).
+        let repo = overlay.repo(cfg).to_string();
+        let routing = match cfg.resolve_repo(&repo) {
+            Some(routing) => routing,
+            None => {
+                overlay.state = OverlayState::HumanHeld;
+                overlay.park_reason = Some("unmapped_target_repo".to_string());
+                if let Err(err) = store.save(&overlay) {
+                    if err.is_transient() {
+                        report.failures.push(failure(
+                            bead,
+                            overlay.attempt,
+                            None,
+                            "unmapped_target_repo_park_save",
+                            err,
+                        ));
+                        continue;
+                    }
+                    return Err(err);
+                }
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    None,
+                    "unmapped_target_repo",
+                    DaemonError::Config(format!(
+                        "bead {} claims target_repo {repo:?}, which has no [repos.\"{repo}\"] \
+                         config entry and is not the daemon's global target_repo {:?} — parking \
+                         HUMAN_HELD rather than guessing which repo/AO-project to dispatch into",
+                        bead.id, cfg.target_repo
+                    )),
+                ));
+                continue;
+            }
+        };
+
         let branch = format!("factory/{}-r{}", bead.id, overlay.attempt);
 
         // Register the branch + persist the DISPATCHING intent BEFORE
@@ -200,6 +245,9 @@ pub fn dispatch_ready(
             bead_id: bead.id.clone(),
             branch: branch.clone(),
             prompt,
+            repo: repo.clone(),
+            ao_project: routing.ao_project.clone(),
+            remote: routing.push_remote.clone(),
         };
         let session_id = match sessions.spawn(&spec) {
             Ok(session_id) => session_id,
@@ -349,6 +397,7 @@ pub fn dispatch_ready(
             attempt: overlay.attempt,
             branch,
             session_id: session_id.0,
+            target_repo: repo,
         });
     }
 
@@ -722,6 +771,7 @@ mod tests {
             autonomy_timebox_secs: 10_800,
             budget_warn_usd: 0.0,
             spec_dir: ".factory/specs/".into(),
+            repos: std::collections::HashMap::new(),
         }
     }
 
@@ -844,6 +894,116 @@ mod tests {
         let overlay = store.load("bead-0").unwrap().unwrap();
         assert_eq!(overlay.state, OverlayState::Dispatched);
         assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
+    }
+
+    /// jleechan-35y4 Stage B acceptance criterion: a bead whose resolved
+    /// `target_repo` (Stage A) names neither an explicit `[repos.*]` entry
+    /// nor the daemon's global `cfg.target_repo` must park HUMAN_HELD with
+    /// reason `unmapped_target_repo` — fail loud, never guess/fall back to
+    /// the global repo (the jleechan-9sh5 discipline this spec explicitly
+    /// calls out). No branch registration, no spawn attempt.
+    #[test]
+    fn dispatch_ready_parks_human_held_when_target_repo_is_unmapped() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                // Neither cfg().target_repo ("owner/repo") nor any
+                // [repos.*] entry (cfg() has an empty repos table) names
+                // this repo.
+                target_repo: Some("someorg/unrelated-repo".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 0, "unmapped repo must never spawn");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].phase, "unmapped_target_repo");
+        assert!(
+            report.failures[0].error.contains("someorg/unrelated-repo"),
+            "error should name the unmapped repo: {}",
+            report.failures[0].error
+        );
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(overlay.park_reason.as_deref(), Some("unmapped_target_repo"));
+        assert!(
+            overlay.branch.is_none(),
+            "no branch should ever be registered/assigned for an unmappable bead"
+        );
+        assert!(
+            store.branches.borrow().is_empty(),
+            "register_branch must never be called for an unmapped repo"
+        );
+        let spawn_calls = sessions
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("spawn("))
+            .count();
+        assert_eq!(spawn_calls, 0, "Sessions::spawn must never be called");
+    }
+
+    /// Companion to the unmapped-repo park test: when the bead's
+    /// `target_repo` DOES have an explicit `[repos.*]` entry (distinct from
+    /// `cfg.target_repo`), dispatch must proceed normally and the resolved
+    /// `SpawnSpec` must carry that entry's `ao_project`/`push_remote`, not
+    /// the global config's.
+    #[test]
+    fn dispatch_ready_uses_repos_table_entry_for_non_global_mapped_repo() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
+            })
+            .unwrap();
+        let mut cfg = cfg();
+        cfg.target_repo = "jleechanorg/dark-factory".to_string();
+        cfg.repos.insert(
+            "jleechanorg/worldarchitect.ai".to_string(),
+            crate::config::RepoConfig {
+                ao_project: "worldarchitect".to_string(),
+                push_remote: "worldai".to_string(),
+            },
+        );
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Dispatched);
     }
 
     #[test]
