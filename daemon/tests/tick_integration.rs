@@ -5635,6 +5635,269 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
 
+// jleechan-wzgl: GATE_ASSESSMENT must serialize the full per-gate report
+// (all 7 gates, verdict + reason) AND the gate-7 reviewer vendor identity,
+// not just the aggregate `all_green` boolean. Before this fix, diagnosing
+// which of the 7 gates failed for bead jleechan-93ft required a manual
+// GitHub REST sweep even though `verifier::assess` already computed the
+// per-gate array; and it was impossible to tell from telemetry which
+// vendor produced the gate-7 skeptic verdict, which the af-e2e mission's
+// "ironclad" exit criterion E3 needs to confirm the reviewer was non-self
+// and genuinely ran (not self-certified).
+//
+// This scenario reuses the third-vendor-fallback fixture above (codex and
+// claude both produce unparseable output, agy is the one that actually
+// resolves gate 7) specifically because it makes vendor provenance
+// observable: the fix must report `agy` as the contributing reviewer, not
+// `codex`/`claude` (which were dispatched but never produced a usable
+// verdict) and not a placeholder.
+#[test]
+#[cfg(unix)]
+fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_fake_reviewers_wzgl_gate_report_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    write_fake_reviewer(&fake_bin_dir, "codex", "not a verdict at all");
+    write_fake_reviewer(&fake_bin_dir, "claude", "still not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "agy", "pass");
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
+    ]);
+
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+
+    let mut cfg = test_cfg();
+    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" -> is_test_repo == false
+
+    store.overlays.borrow_mut().insert(
+        "wzgl-gate-report-bead".into(),
+        BeadOverlay {
+            bead_id: "wzgl-gate-report-bead".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(558),
+            branch: Some("factory/wzgl-gate-report-bead-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+        },
+    );
+    store
+        .branches
+        .borrow_mut()
+        .push("factory/wzgl-gate-report-bead-r1".into());
+    store.branch_beads.borrow_mut().insert(
+        "factory/wzgl-gate-report-bead-r1".into(),
+        "wzgl-gate-report-bead".into(),
+    );
+
+    scm.pr_snapshots.insert(
+        558,
+        PrSnapshot {
+            pr_number: 558,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadbeef558".into(),
+            body: String::new(),
+            comments: vec![PrComment {
+                author: "some-reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
+            files: vec![],
+            updated_at_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            ci_status: "green".into(),
+            coderabbit_status: "green".into(),
+            ci_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_wzgl_gate_report_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
+
+    assert_eq!(summary.beads_ready, 1, "bead should reach READY via the agy fallback verdict");
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let gate_assessment_line = telemetry
+        .lines()
+        .find(|line| line.contains("\"eventType\":\"GATE_ASSESSMENT\""))
+        .unwrap_or_else(|| panic!("no GATE_ASSESSMENT line found; telemetry:\n{telemetry}"));
+    let parsed: serde_json::Value = serde_json::from_str(gate_assessment_line)
+        .unwrap_or_else(|e| panic!("GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}"));
+    let context = &parsed["context"];
+
+    // jleechan-wzgl (PR #239 review round 1): `gates` MUST be a
+    // `{gate_name: verdict}` OBJECT using the PR #235/jleechan-l4ki
+    // canonical 7-gate vocabulary — `daemon/scripts/auto-merge-guard.sh`'s
+    // `latest_assessment_no_red` predicate does `for k, v in g.items()` on
+    // this exact field and would crash on `list.items()` if it were an
+    // array, which is why this is asserted as an object, not a length-7
+    // array like round 1 checked.
+    let gates = context["gates"]
+        .as_object()
+        .unwrap_or_else(|| panic!("GATE_ASSESSMENT context.gates must be a {{gate_name: verdict}} object, not an array; context:\n{context}"));
+    const CANONICAL_GATE_KEYS: [&str; 7] = [
+        "ci_green",
+        "no_conflicts",
+        "coderabbit",
+        "bugbot",
+        "comments_resolved",
+        "evidence_review",
+        "skeptic",
+    ];
+    assert_eq!(
+        gates.len(),
+        7,
+        "GATE_ASSESSMENT must report all 7 per-gate results, not just all_green; context:\n{context}"
+    );
+    for key in CANONICAL_GATE_KEYS {
+        assert!(
+            gates.contains_key(key),
+            "GATE_ASSESSMENT gates dict must use the PR #235/jleechan-l4ki \
+             canonical vocabulary (daemon/factory-overlay.sh REQUIRED_KEYS); \
+             missing key {key:?}; context:\n{context}"
+        );
+    }
+
+    let skeptic_reviewers = context["skeptic_reviewers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("GATE_ASSESSMENT context.skeptic_reviewers must be an array; context:\n{context}"));
+    let skeptic_reviewers: Vec<&str> = skeptic_reviewers
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        skeptic_reviewers,
+        vec!["agy"],
+        "GATE_ASSESSMENT must report the gate-7 reviewer vendor that actually \
+         produced the verdict (agy, the 3rd-vendor fallback), not the first \
+         two dispatched vendors (codex/claude) that failed to parse, and not \
+         a placeholder; context:\n{context}"
+    );
+
+    // jleechan-wzgl (PR #239 review round 1): `pr_number` must be present
+    // in context — without it, `auto-merge-guard.sh`'s
+    // `grep -E "\"pr_number\": *$pr[,}]"` never matches this line at all,
+    // and the dict-shape/vocabulary fix above stays permanently dormant.
+    assert_eq!(
+        context["pr_number"].as_u64(),
+        Some(558),
+        "GATE_ASSESSMENT context must carry pr_number so auto-merge-guard.sh's \
+         grep-by-PR-number match path is reachable; context:\n{context}"
+    );
+
+    // jleechan-wzgl (PR #239 review round 2, team-lead request): don't just
+    // assert our own shape expectations — pipe the ACTUAL emitted line
+    // through auto-merge-guard.sh's REAL predicate (the exact python
+    // heredoc it runs, extracted the same way
+    // tests/scripts/test_auto_merge_guard_gate_vocabulary.sh does) and
+    // confirm the match path is genuinely non-dormant: it parses without
+    // crashing and reports a non-blocking verdict for this all-green
+    // scenario.
+    let guard_script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/auto-merge-guard.sh");
+    let guard_src = std::fs::read_to_string(&guard_script)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", guard_script.display()));
+    let predicate_block: String = guard_src
+        .lines()
+        .skip(40) // 0-indexed: line 41 (1-indexed) of auto-merge-guard.sh
+        .take(29) // lines 41..=69 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh's `sed -n '41,69p'`
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        predicate_block.contains("g.items()"),
+        "extracted predicate block drifted from auto-merge-guard.sh's actual \
+         line range 41-69 (line numbers may have shifted); block:\n{predicate_block}"
+    );
+
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(&predicate_block)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn python3 for auto-merge-guard.sh predicate");
+    child
+        .stdin
+        .take()
+        .expect("child stdin must be piped")
+        .write_all(gate_assessment_line.as_bytes())
+        .expect("failed to write GATE_ASSESSMENT line to predicate stdin");
+    let output = child
+        .wait_with_output()
+        .expect("python3 predicate failed to run to completion");
+    let predicate_stdout = String::from_utf8_lossy(&output.stdout);
+    let predicate_stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "auto-merge-guard.sh's real predicate must accept the emitted \
+         GATE_ASSESSMENT line (dict-shaped gates, canonical vocab) for this \
+         all-green scenario; stdout={predicate_stdout}\nstderr={predicate_stderr}\n\
+         line={gate_assessment_line}"
+    );
+    assert!(
+        predicate_stdout.contains("no-fail"),
+        "expected a non-blocking 'no-fail' verdict from auto-merge-guard.sh's \
+         predicate for this all-green scenario; got: {predicate_stdout}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
 // --- jleechan-bkru: 4th-vendor (gemini) fallback gap --------------------
 //
 // Live incident 2026-07-09 (bead jleechan-93ft, worldarchitect.ai PR #7888):
