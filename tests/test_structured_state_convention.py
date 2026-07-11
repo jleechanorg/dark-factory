@@ -12,7 +12,7 @@ spelled Python-style) instead of the repository's established JSON
 convention (``runner/cxdb.py`` event metadata, ``handler_dispatch.py``'s
 ``resolved_backend_meta``, and the now-fixed ``_substitute_placeholders``).
 
-This file proves three things:
+This file proves four things:
   1. Both substitution sites now serialize dict/list identically (JSON,
      sort_keys) via the shared ``handler_core._serialize_state_value``.
   2. A genuinely unserializable value never crashes a render; the fallback
@@ -22,6 +22,21 @@ This file proves three things:
      sitting in ``ctx.state`` — exercised through ``runner.engine.run`` on
      the real ``pipelines/slim/spec_gen.dot`` graph, not a hand-built
      Context disconnected from the pipeline.
+
+     NOTE on scope (caught by adversarial review of this PR): ``spec_gen.dot``
+     is a spec-only lane (see ``test_spec_gen_has_no_implement_node``) with no
+     ``tool``/``holdout_eval`` nodes, so test #3 only exercises the
+     ``_substitute_placeholders`` (prompt-render) site that #228 already
+     fixed — it is a genuine end-to-end regression guard for the literal
+     "SpecGen fix-loop render" the bead names, but it does NOT exercise this
+     PR's own ``handler_decision._substitute_state`` fix. Test #4 below
+     closes that: it drives the real ``_tool`` node handler (subprocess and
+     all) so the ``handler_decision.py`` fix gets its own engine-level,
+     non-unit-test proof.
+  4. The real ``tool`` node handler (``handler_control._tool``), which is
+     ``_substitute_state``'s actual production call site, renders a dict
+     state value as JSON in the executed shell command — not the pre-fix
+     Python repr — proven by inspecting the subprocess's actual stdout.
 """
 
 from __future__ import annotations
@@ -39,7 +54,7 @@ from runner.handler_core import _serialize_state_value  # noqa: E402
 from runner.handler_decision import _substitute_state  # noqa: E402
 from runner.handler_render import _substitute_placeholders  # noqa: E402
 from runner.handlers import Context, TYPE_REGISTRY  # noqa: E402
-from runner.parser import parse  # noqa: E402
+from runner.parser import Node, parse  # noqa: E402
 
 SPEC_GEN = ROOT / "pipelines" / "slim" / "spec_gen.dot"
 
@@ -161,6 +176,19 @@ def test_spec_gen_fix_main_render_survives_dict_list_scalar_state(monkeypatch, t
     disconnected from the pipeline (unlike the unit tests in
     test_state_dict_substitution.py, which call _substitute_placeholders
     directly and never touch the SpecGen fix loop).
+
+    SCOPE NOTE: this test alone does not prove this PR's own fix (the
+    ``handler_decision._substitute_state`` JSON-convention alignment) did
+    anything, because ``spec_gen.dot`` has no ``tool``/``holdout_eval``
+    nodes for ``_substitute_state`` to run on -- it would pass unchanged even
+    with ONLY #228 applied and this PR's ``handler_decision.py`` change
+    reverted (verified manually while preparing this PR). It IS a genuine,
+    non-tautological regression guard for the literal "SpecGen fix-loop
+    render" scenario the bead names, and it does fail with a real
+    ``TypeError`` against the pre-#228 code (verified against commit
+    ``f59b488~1``). See
+    ``test_tool_node_renders_dict_state_as_json_not_python_repr`` below for
+    the engine-level proof of this PR's actual new fix.
     """
     monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
 
@@ -209,3 +237,48 @@ def test_spec_gen_fix_main_render_survives_dict_list_scalar_state(monkeypatch, t
     node_names = [step.node for step in history]
     assert "fix_main" in node_names
     assert node_names.count("review_main") == 2
+
+
+def test_tool_node_renders_dict_state_as_json_not_python_repr(monkeypatch, tmp_path):
+    """Engine-level proof of THIS PR's actual new fix: the real ``tool`` node
+    handler (``handler_control._tool``) is ``_substitute_state``'s only real
+    production call site (alongside ``handler_holdout`` and
+    ``handler_special_gates``). Drive it end-to-end -- real ``Node``, real
+    ``_tool(node, ctx)``, real subprocess -- with a dict-valued ctx.state
+    entry referenced by the node's ``command=`` attribute, and inspect the
+    subprocess's actual captured stdout.
+
+    Before this PR, ``_substitute_state`` rendered the dict via bare
+    ``str(v)``, so the shell would have received the Python-repr text
+    ``{'a': 1, 'b': 2}`` (single-quoted -- not valid JSON, and inconsistent
+    with the repository's structured-data convention). After this PR it
+    receives ``{"a": 1, "b": 2}`` (sort-keyed JSON, matching the now-fixed
+    ``_substitute_placeholders`` prompt-rendering path exactly).
+    """
+    monkeypatch.setattr(handlers_mod, "_sandboxed_args", lambda args: args)
+
+    tool_handler = TYPE_REGISTRY["tool"]
+    node = Node(
+        name="probe_tool",
+        attrs={
+            "type": "tool",
+            # Single-quote the placeholder: the substituted JSON value itself
+            # contains double quotes, so wrapping it in double quotes would
+            # confuse shlex.split's posix tokenizer. Single quotes let shlex
+            # pass the whole JSON string through as one verbatim argument.
+            "command": "echo '${state.review_main.resolved_backend_meta}'",
+            "timeout": "30",
+        },
+    )
+    ctx = Context(goal="tool node dict-state JSON convention", workdir=ROOT, backend="echo")
+    ctx.state["review_main.resolved_backend_meta"] = {"b": 2, "a": 1}
+
+    result = tool_handler(node, ctx)
+
+    assert result.outcome == "success", result.output
+    # Must be valid JSON, sort-keyed, matching _serialize_state_value exactly.
+    assert json.loads(result.output.strip()) == {"a": 1, "b": 2}
+    assert result.output.strip() == '{"a": 1, "b": 2}'
+    # The pre-fix Python-repr artifact must be gone from the real subprocess output.
+    assert "'a': 1" not in result.output
+    assert "'b': 2" not in result.output

@@ -38,7 +38,6 @@ if TYPE_CHECKING:
 
 def _resolve_lint_findings(ctx: "Context") -> list[dict]:
     """Return the cached lint findings, computing on first call."""
-    import json
     cached = ctx.state.get("_lint_findings")
     if cached is not None:
         return json.loads(cached)
