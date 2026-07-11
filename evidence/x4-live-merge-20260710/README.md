@@ -63,6 +63,67 @@ no GATE_ASSESSMENT exists — the guard concretely declined a green-CI PR. That 
 "green-CI-is-insufficient" refusal branch working end-to-end, in the same function that
 merged #228.
 
+## Independent third-party witness — journald (closes the circularity gap)
+
+The corroboration above (the guard's own log line, and the guard-only
+`~/.dark-factory/merge-timestamps` ledger) has a gap: both are **written by the
+script under test**. Neither can distinguish "the guard's `gh pr merge` call
+executed" from "a human ran `gh pr merge` by hand while authenticated as the
+same `jleechan2015` GitHub identity the guard uses" — `merged_by` in the GitHub
+API response is the account, not the calling process.
+
+To close that gap, this bundle adds a witness that is **not written by
+`auto-merge-guard.sh` at all**: `systemd`/`journald`, the OS-level process
+supervisor that starts and stops the service unit. journald's timestamps and
+unit attribution (`systemd[3285]: Starting/Finished dark-factory-merge-guard.service`)
+come from the systemd user manager itself, independent of anything the script
+prints or writes.
+
+- [`journald-merge-guard-20260710-1340-1355.log`](./journald-merge-guard-20260710-1340-1355.log) —
+  raw output of
+  `journalctl --user -u dark-factory-merge-guard.service --since "2026-07-10 13:40" --until "2026-07-10 13:55" -o short-iso`,
+  captured 2026-07-10. It shows the timer firing the service **every ~60s** through
+  the merge window, with one tick starting `2026-07-10T13:48:00-07:00` and finishing
+  `2026-07-10T13:48:11-07:00` — bracketing `merged_at: 2026-07-10T20:48:04Z`
+  (= `13:48:04 PDT`) to the second. This is systemd's own record that the unit
+  executed at exactly the time PR #228 merged; it is orthogonal proof to the
+  guard's self-reported log and the `merge-timestamps` ledger.
+- [`systemd-exec-main-start-timestamp.txt`](./systemd-exec-main-start-timestamp.txt) —
+  output of `systemctl --user show dark-factory-merge-guard.service -p ExecMainStartTimestamp`
+  (plus a few adjacent properties), captured ~19:43 PDT the same day. **Scope note:**
+  this command only reports the unit's most recent invocation (systemd `show` does
+  not retain per-tick history — journald does), so it does not itself date-stamp
+  the 13:48 merge; its role here is narrower — it confirms the unit is a live,
+  systemd-supervised service with `Result=success`, corroborating that the
+  journald "Starting/Finished" lines above come from a real, currently-running
+  systemd unit rather than a stale or removed one. The per-tick historical proof
+  for the merge window is the journald log, not this file.
+
+**Why this closes the circularity gap:** every other artifact in this bundle
+(the guard's log, the rate-limit ledger, even the GitHub `merged_by` field) is
+either self-reported by the script under test or silent on *who/what* invoked
+`gh pr merge`. journald is written by systemd — a separate, independent OS
+component that faithfully logs unit start/stop regardless of what the guard
+script itself does or claims. It cannot be spoofed by the guard script writing
+a flattering log line, and it is not the human operator's own account activity
+(it is a record of process supervision, not of `gh` CLI invocations by a human).
+Combined with the guard's log and the merge-timestamps ledger, this triangulates
+on: the guard process ran at 13:48:00–13:48:11 PDT (journald, independent) → the
+guard's own log shows `PR 228 MERGED` in that same run (self-reported, but now
+time-anchored by an independent witness) → GitHub shows PR #228 merged at
+13:48:04 PDT (external, independent). No single artifact here proves it alone;
+the combination is what rules out a coincidental hand-merge landing in the same
+60-second window as an unrelated timer tick.
+
+**What this still does NOT prove:** journald confirms the *service ran* in that
+window; it does not itself inspect the process's stdout to show `gh pr merge`
+was invoked (that remains the guard's own log, `merge-guard-pr228-sequence.log`).
+The claim being defended is narrower than "journald proves the merge command
+ran" — it is "journald proves the guard's *process* was executing at the exact
+minute the merge happened, independently of the guard's own self-reporting,"
+which is what rules out the "human merged manually, guard was idle" alternative
+explanation.
+
 ## Assessment source (do not overclaim)
 
 The guard's assessment gate reads the **latest `GATE_ASSESSMENT` event** from the daemon
@@ -99,4 +160,9 @@ env -u GITHUB_TOKEN -u GH_TOKEN gh api repos/jleechanorg/dark-factory/pulls/228 
   --jq '{merged, merged_at, merged_by:.merged_by.login}'  # external anchor
 cat ~/.dark-factory/merge-timestamps                      # guard-only rate ledger
 systemctl --user status dark-factory-merge-guard.timer    # Option A caller
+
+# Independent third-party witness (systemd/journald — not written by the guard script):
+journalctl --user -u dark-factory-merge-guard.service \
+  --since "2026-07-10 13:40" --until "2026-07-10 13:55" -o short-iso
+systemctl --user show dark-factory-merge-guard.service -p ExecMainStartTimestamp
 ```
