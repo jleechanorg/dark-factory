@@ -396,14 +396,22 @@ pub fn dispatch_ready(
         // is fatal (propagated via `?`) rather than swallowed, because a live,
         // untracked, wrong-repo coder session is exactly the near-miss that
         // almost pushed wa-3086 to jleechanclaw instead of dark-factory.
-        // `Ok(None)` ("cannot verify" — worktree not yet visible, adapter
-        // doesn't implement the check) is trust-it, matching
-        // `Sessions::worktree_remote_url`'s documented contract: this check
-        // only ever *rejects* on a positively confirmed mismatch.
+        // `Ok(None)` from `worktree_remote_url` ("cannot verify" — worktree
+        // not yet visible, adapter doesn't implement the check) is trust-it,
+        // matching its documented contract. `remote_url_matches_repo` ALSO
+        // returns `None` for a URL form it can't parse (a different host,
+        // GitHub Enterprise, an unusual scheme) — adversarial review of this
+        // PR caught an earlier version collapsing that into the SAME `false`
+        // a confirmed-wrong-repo URL produces, which would have killed a
+        // perfectly correct session over a merely-unrecognized URL flavor.
+        // Only `Some(false)` — a RECOGNIZED github.com URL naming a
+        // different repo — is a positively confirmed mismatch; `None` (from
+        // either function) must trust-it exactly like the `session_branch`
+        // check above.
         if let Ok(Some(remote_url)) =
             sessions.worktree_remote_url(&routing.ao_project, &branch, &routing.push_remote)
         {
-            if !remote_url_matches_repo(&remote_url, &repo) {
+            if remote_url_matches_repo(&remote_url, &repo) == Some(false) {
                 sessions.stop(&session_id)?;
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
@@ -2009,6 +2017,47 @@ mod tests {
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
         assert_eq!(report.success_count(), 1);
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Dispatched);
+    }
+
+    /// Adversarial review finding (independent Claude review of this PR):
+    /// a remote URL in a form `remote_url_matches_repo` cannot recognize
+    /// (e.g. a different git host, GitHub Enterprise) returns `None`
+    /// ("cannot determine") — the dispatch-time check must trust-it exactly
+    /// like the `Ok(None)` "worktree not visible yet" case, NEVER treat an
+    /// unrecognized format as a confirmed mismatch. Before this fix,
+    /// `remote_url_matches_repo` returned a bare `false` for both "confirmed
+    /// wrong repo" AND "couldn't parse this URL", which would have killed a
+    /// perfectly correct session merely for using an unrecognized URL
+    /// flavor.
+    #[test]
+    fn worktree_remote_unrecognized_url_format_does_not_block_dispatch() {
+        let sessions = FakeSessions::new(0);
+        // A real, live github.com URL, but for a GitHub Enterprise-style
+        // host `remote_url_matches_repo` doesn't parse — NOT a recognized
+        // mismatch, just unparseable.
+        sessions.set_worktree_remote(
+            "repo",
+            "https://github.enterprise.example.com/owner/repo.git",
+        );
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            1,
+            "an unrecognized (unparseable) URL format must never be treated as a confirmed mismatch"
+        );
+        assert!(report.failures.is_empty());
+        let calls = sessions.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("stop(")),
+            "an indeterminate remote-url comparison must never kill the session: {calls:?}"
+        );
         let overlay = store.load("bead-0").unwrap().unwrap();
         assert_eq!(overlay.state, OverlayState::Dispatched);
     }

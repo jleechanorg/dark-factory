@@ -237,31 +237,88 @@ pub fn iso8601_to_epoch(s: &str) -> Option<u64> {
 
 /// Pure syntax normalization (no judgment call, ZFC-exempt): does a git
 /// remote URL (`https://github.com/owner/repo.git`, `https://github.com/owner/repo`,
-/// `git@github.com:owner/repo.git`, `git@github.com:owner/repo`, or any of
-/// those forms with a trailing `/`) name the same `owner/repo` as `repo`
-/// (already in canonical `owner/repo` form)?
+/// `git@github.com:owner/repo.git`, `git@github.com:owner/repo`, an
+/// `ssh://` form with or without an explicit port, a `https://` URL with
+/// embedded credentials/token, or any of those forms with a trailing `/`)
+/// name the same `owner/repo` as `repo` (already in canonical `owner/repo`
+/// form)?
+///
+/// Returns `Some(bool)` when `url` is in a recognized github.com form (the
+/// bool is the actual match/mismatch verdict), or `None` when `url` is in a
+/// form this normalizer does not recognize (a different host — including
+/// GitHub Enterprise — an unusual scheme, or malformed input).
+///
+/// **Adversarial review finding (independent Claude review of this PR):**
+/// the original version of this function returned a bare `bool`, and its
+/// caller (`dispatch::dispatch_ready`) treated `false` as a POSITIVELY
+/// CONFIRMED mismatch — but `false` was also what an unrecognized URL form
+/// produced. That conflates "confirmed wrong repo" with "cannot parse this
+/// URL", which directly violates the surrounding contract (`Sessions::
+/// worktree_remote_url`'s doc comment: "only ever *rejects* on a positively
+/// confirmed mismatch, never on absence of information") and would kill a
+/// perfectly correct session merely for using an unrecognized URL flavor
+/// (GitHub Enterprise, a credential-embedded URL, an explicit SSH port).
+/// `None` now means "cannot determine" and callers must treat it exactly
+/// like `Sessions::worktree_remote_url`'s own `Ok(None)` — trust-it, never
+/// kill on it.
 ///
 /// Bead jleechan-bqdv, Stage C spawn-time remote assertion: the worktree a
 /// coder session lands in may be cloned via either transport depending on
 /// how the local AO project checkout was set up, so the comparison must
 /// tolerate both without guessing at intent — this is deterministic string
 /// normalization, not semantic classification.
-pub fn remote_url_matches_repo(url: &str, repo: &str) -> bool {
+pub fn remote_url_matches_repo(url: &str, repo: &str) -> Option<bool> {
     let url = url.trim().trim_end_matches('/');
     let repo = repo.trim().trim_end_matches('/');
     if repo.is_empty() || url.is_empty() {
-        return false;
+        return None;
     }
-    let stripped = url
-        .strip_prefix("https://github.com/")
-        .or_else(|| url.strip_prefix("http://github.com/"))
-        .or_else(|| url.strip_prefix("git@github.com:"))
-        .or_else(|| url.strip_prefix("ssh://git@github.com/"));
-    let Some(path) = stripped else {
-        return false;
-    };
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    path.eq_ignore_ascii_case(repo)
+
+    // `https://[user[:token]@]github.com/owner/repo[.git]` (including
+    // `http://` and an embedded credentials/token component, e.g.
+    // `https://x-access-token:ghp_xxx@github.com/owner/repo.git`).
+    for scheme in ["https://", "http://"] {
+        let Some(rest) = url.strip_prefix(scheme) else {
+            continue;
+        };
+        // Drop everything up to and including the LAST '@' before the first
+        // '/', which strips any userinfo component without being fooled by
+        // an '@' that might legitimately appear later in a path segment.
+        let host_and_path = match rest.find('/') {
+            Some(slash_idx) => {
+                let (authority, path) = rest.split_at(slash_idx);
+                let host = authority.rsplit('@').next().unwrap_or(authority);
+                format!("{host}{path}")
+            }
+            None => rest.to_string(),
+        };
+        let path = host_and_path.strip_prefix("github.com/")?;
+        let path = path.strip_suffix(".git").unwrap_or(path);
+        return Some(path.eq_ignore_ascii_case(repo));
+    }
+
+    // `git@github.com:owner/repo[.git]` (scp-like syntax; no port support in
+    // this form).
+    if let Some(path) = url.strip_prefix("git@github.com:") {
+        let path = path.strip_suffix(".git").unwrap_or(path);
+        return Some(path.eq_ignore_ascii_case(repo));
+    }
+
+    // `ssh://git@github.com[:PORT]/owner/repo[.git]`.
+    if let Some(rest) = url.strip_prefix("ssh://git@github.com") {
+        let rest = rest.strip_prefix(':').map_or(rest, |after_colon| {
+            // Skip the numeric port, if present, up to the next '/'.
+            after_colon
+                .find('/')
+                .map(|i| &after_colon[i..])
+                .unwrap_or(after_colon)
+        });
+        let path = rest.strip_prefix('/')?;
+        let path = path.strip_suffix(".git").unwrap_or(path);
+        return Some(path.eq_ignore_ascii_case(repo));
+    }
+
+    None
 }
 
 /// `br` CLI. `fetch_candidates` == `br list --status open --label factory --json`.
@@ -588,74 +645,151 @@ mod remote_url_matches_repo_tests {
 
     #[test]
     fn https_url_with_dot_git_suffix_matches() {
-        assert!(remote_url_matches_repo(
-            "https://github.com/jleechanorg/dark-factory.git",
-            "jleechanorg/dark-factory"
-        ));
+        assert_eq!(
+            remote_url_matches_repo(
+                "https://github.com/jleechanorg/dark-factory.git",
+                "jleechanorg/dark-factory"
+            ),
+            Some(true)
+        );
     }
 
     #[test]
     fn https_url_without_dot_git_suffix_matches() {
-        assert!(remote_url_matches_repo(
-            "https://github.com/jleechanorg/dark-factory",
-            "jleechanorg/dark-factory"
-        ));
+        assert_eq!(
+            remote_url_matches_repo(
+                "https://github.com/jleechanorg/dark-factory",
+                "jleechanorg/dark-factory"
+            ),
+            Some(true)
+        );
     }
 
     #[test]
     fn ssh_style_url_matches() {
-        assert!(remote_url_matches_repo(
-            "git@github.com:jleechanorg/dark-factory.git",
-            "jleechanorg/dark-factory"
-        ));
+        assert_eq!(
+            remote_url_matches_repo(
+                "git@github.com:jleechanorg/dark-factory.git",
+                "jleechanorg/dark-factory"
+            ),
+            Some(true)
+        );
     }
 
     #[test]
     fn ssh_style_url_without_dot_git_suffix_matches() {
-        assert!(remote_url_matches_repo(
-            "git@github.com:jleechanorg/dark-factory",
-            "jleechanorg/dark-factory"
-        ));
+        assert_eq!(
+            remote_url_matches_repo(
+                "git@github.com:jleechanorg/dark-factory",
+                "jleechanorg/dark-factory"
+            ),
+            Some(true)
+        );
     }
 
     #[test]
     fn full_ssh_scheme_url_matches() {
-        assert!(remote_url_matches_repo(
-            "ssh://git@github.com/jleechanorg/dark-factory.git",
-            "jleechanorg/dark-factory"
-        ));
+        assert_eq!(
+            remote_url_matches_repo(
+                "ssh://git@github.com/jleechanorg/dark-factory.git",
+                "jleechanorg/dark-factory"
+            ),
+            Some(true)
+        );
+    }
+
+    /// Adversarial review finding: `ssh://` URLs may carry an explicit port
+    /// (e.g. when a firewall forces SSH-over-443). Must still resolve, not
+    /// silently fall through to "unrecognized".
+    #[test]
+    fn full_ssh_scheme_url_with_explicit_port_matches() {
+        assert_eq!(
+            remote_url_matches_repo(
+                "ssh://git@github.com:22/jleechanorg/dark-factory.git",
+                "jleechanorg/dark-factory"
+            ),
+            Some(true)
+        );
+    }
+
+    /// Adversarial review finding: a credential/token-embedded HTTPS remote
+    /// (`https://x-access-token:ghp_xxx@github.com/owner/repo.git`, a common
+    /// CI-injected form) must be recognized, not misclassified as
+    /// "unrecognized" (which would previously have collapsed to a false
+    /// positive mismatch).
+    #[test]
+    fn https_url_with_embedded_credentials_matches() {
+        assert_eq!(
+            remote_url_matches_repo(
+                "https://x-access-token:ghp_abc123@github.com/jleechanorg/dark-factory.git",
+                "jleechanorg/dark-factory"
+            ),
+            Some(true)
+        );
     }
 
     #[test]
-    fn wrong_repo_does_not_match() {
+    fn wrong_repo_is_a_confirmed_mismatch() {
         // The exact wa-3086 near-miss this bead exists to catch: a
         // dual-remote worldarchitect.ai worktree whose `origin` points at
-        // jleechanclaw instead of worldarchitect.ai.
-        assert!(!remote_url_matches_repo(
-            "https://github.com/jleechanorg/jleechanclaw.git",
-            "jleechanorg/worldarchitect.ai"
-        ));
+        // jleechanclaw instead of worldarchitect.ai. This IS a recognized
+        // github.com URL, so it must be a definite `Some(false)`, not `None`.
+        assert_eq!(
+            remote_url_matches_repo(
+                "https://github.com/jleechanorg/jleechanclaw.git",
+                "jleechanorg/worldarchitect.ai"
+            ),
+            Some(false)
+        );
     }
 
     #[test]
     fn trailing_slash_is_tolerated() {
-        assert!(remote_url_matches_repo(
-            "https://github.com/jleechanorg/dark-factory/",
-            "jleechanorg/dark-factory"
-        ));
+        assert_eq!(
+            remote_url_matches_repo(
+                "https://github.com/jleechanorg/dark-factory/",
+                "jleechanorg/dark-factory"
+            ),
+            Some(true)
+        );
+    }
+
+    /// Adversarial review finding (CONFIRMED bug in the original
+    /// implementation): an unrecognized host (a different git host,
+    /// including GitHub Enterprise) must be `None` ("cannot determine"),
+    /// NEVER a confirmed mismatch — the caller in `dispatch::dispatch_ready`
+    /// only kills a session on a positively confirmed mismatch, and treating
+    /// every unparseable URL as "confirmed wrong" would kill perfectly
+    /// correct sessions that merely use a URL flavor this normalizer doesn't
+    /// know about.
+    #[test]
+    fn unrecognized_host_is_indeterminate_not_a_confirmed_mismatch() {
+        assert_eq!(
+            remote_url_matches_repo(
+                "https://gitlab.com/jleechanorg/dark-factory.git",
+                "jleechanorg/dark-factory"
+            ),
+            None
+        );
     }
 
     #[test]
-    fn unrecognized_host_does_not_match() {
-        assert!(!remote_url_matches_repo(
-            "https://gitlab.com/jleechanorg/dark-factory.git",
-            "jleechanorg/dark-factory"
-        ));
+    fn github_enterprise_host_is_indeterminate_not_a_confirmed_mismatch() {
+        assert_eq!(
+            remote_url_matches_repo(
+                "https://github.enterprise.example.com/jleechanorg/dark-factory.git",
+                "jleechanorg/dark-factory"
+            ),
+            None
+        );
     }
 
     #[test]
-    fn empty_url_does_not_match() {
-        assert!(!remote_url_matches_repo("", "jleechanorg/dark-factory"));
+    fn empty_url_is_indeterminate() {
+        assert_eq!(
+            remote_url_matches_repo("", "jleechanorg/dark-factory"),
+            None
+        );
     }
 }
 

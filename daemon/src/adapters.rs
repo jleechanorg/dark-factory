@@ -2015,13 +2015,23 @@ impl Sessions for CliSessions {
 
     /// jleechan-bqdv Stage C: the spawn-time worktree remote assertion's data
     /// source. Reconstructs the expected worktree path (`resolve_worktree_path`)
-    /// and reads back whatever `remote_name` is actually configured there via
-    /// `git remote get-url`. Any failure to locate the worktree, run `git`,
-    /// or parse its output collapses to `Ok(None)` ("cannot verify") rather
-    /// than an `Err` — matching `session_branch`'s contract that this class
-    /// of check only ever *rejects* a dispatch on a positively confirmed
-    /// mismatch, never on an inability to check (a worktree AO is still in
-    /// the middle of cloning is a normal, retry-safe race, not a violation).
+    /// and reads back whatever `remote_name` would actually be pushed to
+    /// there via `git remote get-url --push`. Any failure to locate the
+    /// worktree, run `git`, or parse its output collapses to `Ok(None)`
+    /// ("cannot verify") rather than an `Err` — matching `session_branch`'s
+    /// contract that this class of check only ever *rejects* a dispatch on
+    /// a positively confirmed mismatch, never on an inability to check (a
+    /// worktree AO is still in the middle of cloning is a normal,
+    /// retry-safe race, not a violation).
+    ///
+    /// **Adversarial review finding (independent Claude review of this
+    /// PR):** the original version used `git remote get-url <name>` (the
+    /// FETCH url). What the coder actually pushes with is governed by
+    /// `remote.<name>.pushurl` when one is configured — a real possibility
+    /// for exactly the dual-remote worktree setups this check exists to
+    /// police. `--push` asks git for the URL a `git push` would actually
+    /// use, falling back to the fetch URL automatically when no separate
+    /// pushurl is configured (so the common single-URL case is unaffected).
     fn worktree_remote_url(
         &self,
         ao_project: &str,
@@ -2033,7 +2043,7 @@ impl Sessions for CliSessions {
             return Ok(None);
         }
         let cwd = path.to_string_lossy().into_owned();
-        match run_tool_in_dir("git", &["remote", "get-url", remote_name], &cwd, 10) {
+        match run_tool_in_dir("git", &["remote", "get-url", "--push", remote_name], &cwd, 10) {
             Ok(out) => {
                 let trimmed = out.trim();
                 if trimmed.is_empty() {
@@ -2153,6 +2163,74 @@ mod worktree_remote_url_tests {
         assert_eq!(
             result.unwrap().as_deref(),
             Some("https://github.com/jleechanorg/worldarchitect.ai.git")
+        );
+    }
+
+    /// Adversarial review finding (independent Claude review of this PR):
+    /// when a remote has a SEPARATE `pushurl` configured (distinct from its
+    /// fetch URL — a real dual-remote-worktree scenario), `worktree_remote_url`
+    /// must report the URL a `git push` would actually use, not the fetch
+    /// URL. Regression guard for the `git remote get-url` -> `git remote
+    /// get-url --push` fix.
+    #[test]
+    fn worktree_remote_url_reports_pushurl_when_distinct_from_fetch_url() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_worktree_remote_url_pushurl_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let prev = std::env::var("DARK_FACTORY_AO_WORKTREE_DIR").ok();
+        std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", &root);
+
+        let worktree_path = resolve_worktree_path("dark-factory", "factory/jleechan-bqdv-r1");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        let cwd = worktree_path.to_string_lossy().into_owned();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&cwd)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "worldai",
+                "https://github.com/jleechanorg/jleechanclaw.git",
+            ])
+            .current_dir(&cwd)
+            .status()
+            .unwrap();
+        // Configure a DIFFERENT push URL — the exact scenario that defeats a
+        // plain `git remote get-url` (fetch URL) check.
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "set-url",
+                "--push",
+                "worldai",
+                "https://github.com/jleechanorg/worldarchitect.ai.git",
+            ])
+            .current_dir(&cwd)
+            .status()
+            .unwrap();
+
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        let result =
+            sessions.worktree_remote_url("dark-factory", "factory/jleechan-bqdv-r1", "worldai");
+
+        match prev {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_WORKTREE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            result.unwrap().as_deref(),
+            Some("https://github.com/jleechanorg/worldarchitect.ai.git"),
+            "must report the PUSH url, not the (different) fetch url"
         );
     }
 
