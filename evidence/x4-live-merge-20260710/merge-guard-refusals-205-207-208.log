@@ -1,0 +1,14 @@
+# Refusal counts (grep -c) over one live guard run:
+PR 205 refusals(assessment-missing): 2534
+PR 207 refusals(assessment-missing): 626
+PR 208 refusals(assessment-missing): 2569
+
+# Sample refusal lines (verbatim):
+   2569 PR 208: verifier assessment missing — refusing merge (green CI is insufficient)
+   2534 PR 205: verifier assessment missing — refusing merge (green CI is insufficient)
+   1949 PR 207: CI FAILED — skip (needs attention)
+    626 PR 207: verifier assessment missing — refusing merge (green CI is insufficient)
+     43 PR 205: CI pending — skip
+      9 PR 208: CI pending — skip
+      5 PR 207: CI pending — skip
+      3 PR 205: CI FAILED — skip (needs attention)
