@@ -1279,14 +1279,62 @@ impl CliSessions {
             stderr: format!("execution failed: {e}"),
         })?;
 
-        let out = String::from_utf8_lossy(&output.stdout);
+        let out = String::from_utf8_lossy(&output.stdout).into_owned();
+        let err_msg = String::from_utf8_lossy(&output.stderr).into_owned();
+        Self::classify_spawn_output(agent, output.status.success(), output.status.code(), &out, &err_msg)
+    }
 
-        if !output.status.success() {
-            let err_msg = String::from_utf8_lossy(&output.stderr);
+    /// Pure classification of `ao spawn`'s exit status + stdout/stderr into a
+    /// `SessionId` or a `DaemonError`, split out of `run_spawn_process` so the
+    /// decision logic is unit-testable without shelling out to a real `ao`
+    /// binary.
+    fn classify_spawn_output(
+        agent: &str,
+        success: bool,
+        code: Option<i32>,
+        out: &str,
+        err_msg: &str,
+    ) -> Result<SessionId, DaemonError> {
+        if !success {
+            // jleechan-2s0h / jleechan-la67: AO's spawn-queue admission
+            // control (`packages/core/src/spawn-queue.ts`'s own
+            // `MAX_PENDING_REQUESTS` cap — a DIFFERENT layer than the
+            // "active sessions >= session cap" REQUEST= deferral handled
+            // below) throws a plain `Error` in the CLI that re-propagates
+            // through commander's default handler. That means it surfaces
+            // as a genuine nonzero exit (rc=1, Tool-shaped: stderr contains
+            // "Spawn queue is full for project '<id>' (<n> pending
+            // requests)"), NOT the `REQUEST=` stdout success-with-deferral
+            // pattern. Live incident jleechan-la67 (2026-07-08):
+            // spawn-queue-worldarchitect.json hit its 100-pending cap and
+            // every subsequent `ao spawn` failed rc=1 with this message;
+            // the daemon classified it as `DaemonError::Tool`, a genuine
+            // transient failure that increments `spawn_failure_count`,
+            // eventually parking beads `HumanHeld` purely from admission
+            // backpressure that has nothing to do with the bead itself.
+            // This is provably safe to retry for the same reason as the
+            // REQUEST= case: `enqueueSpawnRequest` threw before any
+            // worktree, branch, or process was created, so nothing is
+            // leaked or double-spawned by requeuing and trying again next
+            // tick.
+            // Anchored on "...is full for project" (not just "spawn queue is
+            // full") to shrink the false-positive surface: this factory's
+            // bead prompts are themselves LLM-generated coding-task text, so
+            // a bead literally about fixing this handling (or quoting this
+            // very error string) could otherwise cause an unrelated spawn
+            // failure whose stderr echoes the bare phrase to be misclassified
+            // as retry-safe backpressure. The longer anchor still tolerates
+            // the variable `'<project-id>'` in the AO-thrown message.
+            if err_msg.to_lowercase().contains("spawn queue is full for project") {
+                return Err(DaemonError::Deferred(format!(
+                    "ao spawn --agent {agent} rejected: admission queue full ({})",
+                    err_msg.trim()
+                )));
+            }
             return Err(DaemonError::Tool {
                 tool: format!("ao spawn --agent {agent}"),
-                rc: output.status.code().unwrap_or(-1),
-                stderr: err_msg.into_owned(),
+                rc: code.unwrap_or(-1),
+                stderr: err_msg.to_string(),
             });
         }
 
@@ -1364,6 +1412,139 @@ impl CliSessions {
         Err(last_err.unwrap_or_else(|| {
             DaemonError::Config("No agents in fallback chain could be run".into())
         }))
+    }
+}
+
+#[cfg(test)]
+mod spawn_classification_tests {
+    use super::CliSessions;
+    use crate::errors::DaemonError;
+
+    /// jleechan-la67 live incident (2026-07-08): once
+    /// `spawn-queue-worldarchitect.json` hit its 100-pending admission cap,
+    /// `ao spawn` began failing rc=1 with stderr containing "Spawn queue is
+    /// full for project 'worldarchitect' (100 pending requests)" — a plain
+    /// thrown `Error` from `enqueueSpawnRequest` (packages/core/src/spawn-queue.ts)
+    /// that re-propagates through commander's default handler. Before this
+    /// fix, `classify_spawn_output` treated ANY nonzero exit as a genuine
+    /// `DaemonError::Tool` vendor failure, indistinguishable from a real
+    /// crash — which increments `spawn_failure_count` and, after
+    /// `MAX_TRANSIENT_SPAWN_RETRY` cycles, parks the bead `HumanHeld` purely
+    /// from admission backpressure that has nothing to do with the bead
+    /// itself. This must classify as `Deferred` instead, exactly like the
+    /// existing `REQUEST=` "at session cap" case, since no worktree/branch/
+    /// process was ever created either way.
+    #[test]
+    fn queue_full_stderr_on_nonzero_exit_is_deferred_not_tool() {
+        let err = CliSessions::classify_spawn_output(
+            "claude-code",
+            false,
+            Some(1),
+            "",
+            "Error: Spawn queue is full for project 'worldarchitect' (100 pending requests)\n",
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DaemonError::Deferred(_)),
+            "queue-full rc=1 must classify as Deferred (retry-later), not a vendor Tool failure: {err:?}"
+        );
+        assert!(
+            err.is_transient(),
+            "Deferred must remain transient so dispatch_ready still requeues it"
+        );
+    }
+
+    /// Matching is case-insensitive since the exact casing of AO's thrown
+    /// error message is not a contract the daemon should be brittle to.
+    #[test]
+    fn queue_full_stderr_matching_is_case_insensitive() {
+        let err = CliSessions::classify_spawn_output(
+            "claude-code",
+            false,
+            Some(1),
+            "",
+            "SPAWN QUEUE IS FULL for project 'worldarchitect' (100 pending requests)",
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, DaemonError::Deferred(_)));
+    }
+
+    /// A genuine crash (e.g. `ao` binary missing, auth failure, unrelated
+    /// CLI error) on a nonzero exit must still classify as a real `Tool`
+    /// vendor failure — this fix must not blanket-suppress all spawn
+    /// failures, only the specific admission-queue-full shape.
+    #[test]
+    fn unrelated_nonzero_exit_is_still_tool_failure() {
+        let err = CliSessions::classify_spawn_output(
+            "claude-code",
+            false,
+            Some(127),
+            "",
+            "ao: command not found",
+        )
+        .unwrap_err();
+
+        match err {
+            DaemonError::Tool { rc, stderr, .. } => {
+                assert_eq!(rc, 127);
+                assert!(stderr.contains("command not found"));
+            }
+            other => panic!("expected DaemonError::Tool for an unrelated failure, got {other:?}"),
+        }
+    }
+
+    /// Existing REQUEST= behavior (jleechan-5ia2) must be unaffected by this
+    /// refactor: a successful exit with no SESSION= line but a REQUEST= line
+    /// still classifies as Deferred.
+    #[test]
+    fn request_line_on_success_exit_is_still_deferred() {
+        let err = CliSessions::classify_spawn_output(
+            "claude-code",
+            true,
+            Some(0),
+            "REQUEST=sq-abc123\n",
+            "",
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, DaemonError::Deferred(_)));
+    }
+
+    /// Existing SESSION= happy path must be unaffected by this refactor.
+    #[test]
+    fn session_line_on_success_exit_is_ok() {
+        let session = CliSessions::classify_spawn_output(
+            "claude-code",
+            true,
+            Some(0),
+            "SESSION=abc-123\n",
+            "",
+        )
+        .unwrap();
+
+        assert_eq!(session.0, "abc-123");
+    }
+
+    /// Regression guard for the pre-existing fallthrough (unchanged by this
+    /// refactor): a successful exit with neither a `SESSION=` nor a
+    /// `REQUEST=` line is a genuine parse failure, not retry-safe.
+    #[test]
+    fn success_exit_with_no_session_or_request_line_is_parse_error() {
+        let err = CliSessions::classify_spawn_output(
+            "claude-code",
+            true,
+            Some(0),
+            "some unexpected stdout with no marker line\n",
+            "",
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DaemonError::Parse(_)),
+            "expected DaemonError::Parse for a success exit with no SESSION=/REQUEST= line, got {err:?}"
+        );
     }
 }
 
