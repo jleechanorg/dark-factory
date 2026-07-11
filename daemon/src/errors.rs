@@ -92,6 +92,34 @@ impl DaemonError {
         )
     }
 
+    /// True for a bare `Deferred`, or for a `SpawnFallbackExhausted` whose
+    /// LAST attempted vendor's own error was itself `Deferred` -- i.e. AO's
+    /// own admission-control queue backpressure (session-cap saturation),
+    /// not a genuine vendor failure.
+    ///
+    /// jleechan-r56m regression note: before `spawn_with_fallback` started
+    /// wrapping exhausted chains in `SpawnFallbackExhausted`, callers like
+    /// `dispatch.rs` matched the literal pattern `DaemonError::Deferred(_)`
+    /// to special-case AO backpressure (jleechan-w28n: this case must never
+    /// increment `spawn_failure_count`, or sustained cap saturation would
+    /// eventually park the whole backlog `HUMAN_HELD` as a mass false
+    /// escalation). Once the terminal vendor's `Deferred` got wrapped in
+    /// `SpawnFallbackExhausted`, that literal-pattern match went dead for
+    /// every real spawn — this accessor restores the special case by
+    /// unwrapping to the terminal attempt's own classification. Callers that
+    /// used to write `Err(err @ DaemonError::Deferred(_))` should use
+    /// `Err(err) if err.is_deferred()` instead, still ahead of the general
+    /// `is_transient()` guard (match arm order still matters).
+    pub fn is_deferred(&self) -> bool {
+        match self {
+            DaemonError::Deferred(_) => true,
+            DaemonError::SpawnFallbackExhausted(attempts) => {
+                attempts.last().is_some_and(|(_, e)| e.is_deferred())
+            }
+            _ => false,
+        }
+    }
+
     /// Detects `br create --external-ref ...` failing because the ref is
     /// already tracked (`br`'s own uniqueness constraint on `external_ref`),
     /// e.g. `Error: Configuration error: External reference 'owner/repo#42'
@@ -157,6 +185,70 @@ mod tests {
     #[test]
     fn classifies_deferred_as_transient() {
         assert!(DaemonError::Deferred("REQUEST=sq-abc123".to_string()).is_transient());
+    }
+
+    #[test]
+    fn bare_deferred_is_deferred() {
+        assert!(DaemonError::Deferred("REQUEST=sq-abc123".to_string()).is_deferred());
+    }
+
+    #[test]
+    fn tool_error_is_not_deferred() {
+        assert!(!DaemonError::Tool {
+            tool: "ao".to_string(),
+            rc: 1,
+            stderr: "boom".to_string(),
+        }
+        .is_deferred());
+    }
+
+    /// jleechan-r56m regression guard: when `spawn_with_fallback`'s LAST
+    /// attempted vendor hit AO's own admission-queue backpressure
+    /// (`Deferred`), `is_deferred()` on the aggregated
+    /// `SpawnFallbackExhausted` must still report `true` so
+    /// `dispatch.rs`'s jleechan-w28n special case (never increment
+    /// `spawn_failure_count` for pure backpressure) keeps firing exactly as
+    /// it did before this fallback-chain aggregation existed.
+    #[test]
+    fn spawn_fallback_exhausted_is_deferred_when_last_attempt_is_deferred() {
+        let err = DaemonError::SpawnFallbackExhausted(vec![
+            (
+                "minimax".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent minimax".to_string(),
+                    rc: 1,
+                    stderr: "auth failure".to_string(),
+                },
+            ),
+            (
+                "claude-code".to_string(),
+                DaemonError::Deferred("REQUEST=sq-scripted".to_string()),
+            ),
+        ]);
+        assert!(err.is_deferred());
+    }
+
+    /// The converse: if the LAST attempt was a genuine (non-Deferred)
+    /// failure, `is_deferred()` must be `false` even if an EARLIER attempt
+    /// happened to be `Deferred` -- only the terminal outcome matters, same
+    /// as pre-fix `last_err` semantics.
+    #[test]
+    fn spawn_fallback_exhausted_is_not_deferred_when_last_attempt_is_not_deferred() {
+        let err = DaemonError::SpawnFallbackExhausted(vec![
+            (
+                "minimax".to_string(),
+                DaemonError::Deferred("REQUEST=sq-scripted".to_string()),
+            ),
+            (
+                "agy".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent agy".to_string(),
+                    rc: 1,
+                    stderr: "Agent plugin agy not found".to_string(),
+                },
+            ),
+        ]);
+        assert!(!err.is_deferred());
     }
 
     /// jleechan-cq8r: a malformed/unparseable reply from the circuit-breaker
