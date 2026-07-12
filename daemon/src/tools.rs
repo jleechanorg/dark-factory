@@ -321,6 +321,16 @@ pub fn remote_url_matches_repo(url: &str, repo: &str) -> Option<bool> {
     None
 }
 
+/// Whether a bead tracked by `br` is open (active), in a non-terminal
+/// working state (in_progress / blocked / deferred / reopened), or closed
+/// (terminal — `closed` / `completed` / `done`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeadStatus {
+    Open,
+    Active,
+    Closed,
+}
+
 /// `br` CLI. `fetch_candidates` == `br list --status open --label factory --json`.
 pub trait Tracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError>;
@@ -332,6 +342,18 @@ pub trait Tracker {
         external_ref: &str,
     ) -> Result<String, DaemonError>;
     fn comment_external(&self, external_ref: &str, body: &str) -> Result<(), DaemonError>;
+    /// Check whether a bead exists and whether it is open or closed.
+    /// `Ok(None)` means the bead does not exist (missing from `br` entirely).
+    /// jleechan-xsg4: needed for fail-closed overlay reconciliation — active
+    /// overlays whose bead is missing or closed must be demoted from
+    /// ATTESTED/DISPATCHED (issue #270).
+    fn bead_status(&self, bead_id: &str) -> Result<Option<BeadStatus>, DaemonError> {
+        let _ = bead_id;
+        Err(DaemonError::Config(format!(
+            "bead_status({bead_id}) not implemented for this tracker; \
+             every Tracker impl must override bead_status"
+        )))
+    }
 }
 
 /// `gh` CLI (REST + GraphQL). Production adapters use short-lived in-memory

@@ -10,8 +10,8 @@
 use daemon::errors::DaemonError;
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tools::{
-    Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec,
-    Tracker, Vcs,
+    Bead, BeadStatus, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions,
+    SpawnSpec, Tracker, Vcs,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -43,6 +43,9 @@ pub struct FakeTracker {
     pub create_bead_fail_for_ref: RefCell<Option<(String, String)>>,
     pub fail_next_fetch_candidates: RefCell<Option<String>>,
     pub fail_next_comment: RefCell<Option<String>>,
+    /// jleechan-xsg4 (issue #270): scripted bead status responses keyed by
+    /// bead_id. `None` means "bead does not exist" (missing from `br`).
+    pub bead_statuses: RefCell<HashMap<String, Option<BeadStatus>>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -148,6 +151,20 @@ impl Tracker for FakeTracker {
             });
         }
         Ok(())
+    }
+
+    fn bead_status(&self, bead_id: &str) -> Result<Option<BeadStatus>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("bead_status({bead_id})"));
+        Ok(Some(
+            self.bead_statuses
+                .borrow()
+                .get(bead_id)
+                .cloned()
+                .flatten()
+                .unwrap_or(BeadStatus::Active),
+        ))
     }
 }
 
@@ -285,7 +302,7 @@ impl Default for FakeSessions {
         Self {
             active_count: 0,
             next_session_id: "fake-session-1".into(),
-            quiescent: true,
+            quiescent: false,
             fail_spawn_for: RefCell::new(Vec::new()),
             fail_spawn_deferred_for: RefCell::new(Vec::new()),
             spawn_prompts: RefCell::new(Vec::new()),
@@ -852,5 +869,55 @@ impl StateStore for FakeStateStore {
             .borrow()
             .get(&(bead_id.to_string(), attempt))
             .map(|(_, _, feedback_text)| feedback_text.clone()))
+    }
+
+    fn stale_dispatched_candidates(
+        &self,
+        min_autonomy_secs: u64,
+    ) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("stale_dispatched_candidates({min_autonomy_secs})"));
+        Ok(self
+            .overlays
+            .borrow()
+            .values()
+            .filter(|overlay| {
+                overlay.state == OverlayState::Dispatched
+                    && (overlay.session_id.is_none()
+                        || overlay.session_id.as_deref().map_or(true, |s| s.trim().is_empty())
+                        || overlay.autonomy_secs >= min_autonomy_secs)
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn requeue_stale_dispatched(
+        &self,
+        bead_id: &str,
+    ) -> Result<BeadOverlay, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("requeue_stale_dispatched({bead_id})"));
+        let mut overlays = self.overlays.borrow_mut();
+        let overlay = overlays
+            .get_mut(bead_id)
+            .ok_or_else(|| DaemonError::Tool {
+                tool: "sqlite".into(),
+                rc: -1,
+                stderr: format!("requeue_stale_dispatched: bead {bead_id} not found"),
+            })?;
+        if overlay.state != OverlayState::Dispatched {
+            return Err(DaemonError::Tool {
+                tool: "sqlite".into(),
+                rc: -1,
+                stderr: format!("requeue_stale_dispatched: bead {bead_id} not in DISPATCHED state"),
+            });
+        }
+        overlay.state = OverlayState::Queued;
+        overlay.session_id = None;
+        overlay.branch = None;
+        overlay.autonomy_secs = 0;
+        Ok(overlay.clone())
     }
 }

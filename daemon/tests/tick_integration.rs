@@ -538,7 +538,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
             spend_usd: 0.0,
             pr_number: None,
             branch: Some("factory/bead-1-r1".into()),
-            session_id: None,
+            session_id: Some("sess-dummy-1".into()),
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -602,7 +602,7 @@ fn test_autonomy_budget_warning_crossing() {
             spend_usd: 0.0,
             pr_number: None,
             branch: Some("factory/bead-2-r1".into()),
-            session_id: None,
+            session_id: Some("sess-dummy-2".into()),
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -643,7 +643,8 @@ fn test_autonomy_budget_warning_crossing() {
 fn test_wedge_detection_dispatched_coder_silent() {
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let sessions = FakeSessions::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let cfg = test_cfg();
@@ -660,7 +661,7 @@ fn test_wedge_detection_dispatched_coder_silent() {
             spend_usd: 0.0,
             pr_number: None,
             branch: Some("factory/bead-silent-r1".into()),
-            session_id: None,
+            session_id: Some("sess-silent".into()),
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -2074,7 +2075,8 @@ fn adopted_red_pr_stage2_reroll_spawns_remediation_session_leaves_pr_open() {
     scm.pr_snapshots.insert(706, snapshot);
 
     let tracker = FakeTracker::new();
-    let sessions = FakeSessions::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
@@ -2210,7 +2212,8 @@ fn adopted_red_pr_stage2_reroll_spawn_failure_parks_human_held_with_escalation()
     scm.pr_snapshots.insert(707, snapshot);
 
     let tracker = FakeTracker::new();
-    let sessions = FakeSessions::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
@@ -7139,7 +7142,8 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
     scm.pr_snapshots.insert(802, snap_b);
 
     let tracker = FakeTracker::new();
-    let sessions = FakeSessions::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
     let llm = IsoRerollLlm;
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();

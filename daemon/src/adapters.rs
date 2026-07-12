@@ -140,6 +140,93 @@ impl Tracker for CliTracker {
             )))
         }
     }
+
+    fn bead_status(&self, bead_id: &str) -> Result<Option<crate::tools::BeadStatus>, DaemonError> {
+        let out = match run_tool("br", &["show", bead_id, "--json"], 30) {
+            Ok(o) => o,
+            Err(e) => {
+                return if is_bead_missing_error(&e) {
+                    Ok(None)
+                } else {
+                    Err(e)
+                };
+            }
+        };
+        let trimmed = out.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let status: String = if let Some(arr_start) = trimmed.find('[') {
+            if arr_start == 0 || trimmed[..arr_start].trim().is_empty() {
+                let arr: Vec<serde_json::Value> =
+                    serde_json::from_str(&trimmed[arr_start..]).map_err(|e| {
+                        DaemonError::Parse(format!(
+                            "failed to parse br show array JSON for {bead_id}: {e}"
+                        ))
+                    })?;
+                if arr.is_empty() {
+                    return Ok(None);
+                }
+                arr[0]
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| {
+                        DaemonError::Parse(format!(
+                            "br show array missing status field for {bead_id}"
+                        ))
+                    })?
+            } else {
+                return Err(DaemonError::Parse(format!(
+                    "unexpected br show output for {bead_id}: {trimmed}"
+                )));
+            }
+        } else if let Some(json_start) = trimmed.find('{') {
+            #[derive(serde::Deserialize)]
+            struct BrShow {
+                status: String,
+            }
+            let data: BrShow =
+                serde_json::from_str(&trimmed[json_start..]).map_err(|e| {
+                    DaemonError::Parse(format!("failed to parse br show JSON for {bead_id}: {e}"))
+                })?;
+            data.status
+        } else {
+            return Err(DaemonError::Parse(format!(
+                "no JSON object or array in br show output for {bead_id}: {out}"
+            )));
+        };
+        Ok(Some(classify_bead_status(
+            bead_id,
+            status.to_ascii_lowercase().as_str(),
+        )?))
+    }
+}
+
+fn is_bead_missing_error(err: &DaemonError) -> bool {
+    match err {
+        DaemonError::Tool { rc, .. } if *rc != 0 => true,
+        _ => false,
+    }
+}
+
+fn classify_bead_status(
+    bead_id: &str,
+    status: &str,
+) -> Result<crate::tools::BeadStatus, DaemonError> {
+    match status {
+        "open" => Ok(crate::tools::BeadStatus::Open),
+        "in_progress" | "blocked" | "deferred" | "active" | "reopened" | "awaiting_review"
+        | "review" => Ok(crate::tools::BeadStatus::Active),
+        "closed" | "completed" | "done" | "resolved" | "merged" => {
+            Ok(crate::tools::BeadStatus::Closed)
+        }
+        other => Err(DaemonError::Parse(format!(
+            "unknown bead status '{other}' for {bead_id}; \
+             expected open / in_progress / blocked / deferred / closed / completed / done or a known \
+             active or terminal status"
+        ))),
+    }
 }
 
 /// Parse `external_ref` values from `br list --json` output.
@@ -1988,7 +2075,7 @@ impl Sessions for CliSessions {
             for entry in arr {
                 if entry.get("name").and_then(|v| v.as_str()) == Some(&id.0) {
                     if let Some(activity) = entry.get("activity").and_then(|v| v.as_str()) {
-                        return Ok(activity == "ready" || activity == "exited" || activity == "missing");
+                        return Ok(activity == "exited" || activity == "missing");
                     }
                 }
             }
