@@ -24,10 +24,13 @@ off by an independent cold codex review before exit.
 /fs --pipeline spec_gen <description>   # explicit static binary pipeline
 /fs --dynamic-graph <description>       # binary-owned dynamic spec graph
 /fs --skip-attractor <description>      # main spec only, still binary-first
-/fs --review <spec_path>                # in-session review of an existing main spec
-/fs --review-attractor <path>           # in-session review of an existing attractor spec
-/fs --show                              # read-only pipeline graph reference
+/fs --review <spec_path>                # review an existing main spec
+/fs --review-attractor <path>           # review an existing attractor spec
 ```
+
+For the pipeline graph reference (no classification, no spec writes, no
+run), use `/factory-spec --show` instead — that mode belongs to
+`/factory-spec`, not `/fs`.
 
 ## See also
 
