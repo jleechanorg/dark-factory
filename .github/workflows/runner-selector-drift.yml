@@ -52,6 +52,13 @@ on:
 
 permissions:
   contents: read
+  # Note: this workflow also needs `manage_runners:org` scope to call
+  # `gh api orgs/{org}/actions/runners`. That scope is NOT available via
+  # `GITHUB_TOKEN` — it requires a dedicated PAT stored as
+  # `secrets.RUNNERS_READ_PAT` with the `manage_runners:org` permission.
+  # If that secret is absent, the drift check will fail loud (exit 2)
+  # which is the correct fail-closed behaviour. See the env block in the
+  # `drift-check` job for the token resolution logic.
 
 jobs:
   drift-check:
@@ -83,18 +90,25 @@ jobs:
 
       - name: Run drift check against live org runners
         env:
-          # Pass the live repo variable through to the script. The script will
-          # read SELF_HOSTED_RUNNER_LABELS directly, fall back to the
-          # GITHUB_REPOSITORY-resolved variable if unset, and finally accept
-          # --selector for local dry-runs.
+          # Pass the live repo variable through to the script.
           SELF_HOSTED_RUNNER_LABELS: ${{ vars.SELF_HOSTED_RUNNER_LABELS }}
           DRIFT_CHECK_ORG: jleechanorg
-          # gh CLI in Actions refuses unauthenticated calls. The default
-          # GITHUB_TOKEN carries the `repo` scope on PRs from the same repo
-          # (sufficient for `gh api orgs/<org>/actions/runners`); for cron /
-          # push-from-fork contexts we'd need a PAT — but those contexts are
-          # scoped to the same repo so the default token still works.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Auth token selection (fail-closed, most-privileged first):
+          #
+          # 1. RUNNERS_READ_PAT: a Fine-Grained PAT with `manage_runners:org`
+          #    read permission on jleechanorg. Required for `gh api
+          #    orgs/{org}/actions/runners`. Store this as a repo/org secret.
+          #    Create via: GitHub → Settings → Developer settings → Fine-grained
+          #    personal access tokens → New token → Resource owner: jleechanorg
+          #    → Repository access: All → Permissions → Organization permissions
+          #    → Self-hosted runners → Read.
+          #
+          # 2. GITHUB_TOKEN fallback: the default Actions token. It has `repo`
+          #    scope but NOT `manage_runners:org`, so the gh api call for org
+          #    runners will return HTTP 403. The script exits 2 (invocation
+          #    error) which fails the workflow loud — correct fail-closed
+          #    behaviour. Do NOT suppress this error with `|| true`.
+          GH_TOKEN: ${{ secrets.RUNNERS_READ_PAT || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           ARGS=(--org jleechanorg --json)

@@ -155,6 +155,68 @@ in this file and update the `select_matching` test in
 `tests/test_check_runner_selector.py` so the conjunction's coverage is
 exercised.
 
+### Known platform coverage gap
+
+`tests/security/test_agent_isolation.py` contains `@linux_only` test cases
+that test the `LD_PRELOAD` deny-path sandbox shim. These tests are **skipped**
+on macOS runners (they emit a `skipif` reason). If the scheduler picks a macOS
+runner, sandbox regressions in the Linux backend can merge green.
+
+Mitigation path:
+1. Request the org runner admin to add a `self-hosted-linux` label to the
+   `ez-runner-c-*` fleet.
+2. Add a `test-linux` required job to `ci.yml` with
+   `runs-on: [self-hosted, self-hosted-linux, ezgha]`.
+3. Until then, the `test` job emits a
+   `::warning title=Platform coverage gap::` annotation when it detects
+   a non-Linux runner, so the gap is visible in the CI log.
+
+## Fork PR isolation
+
+Both `ci.yml` jobs (`test` and `daemon-tests`) include:
+
+```yaml
+if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+```
+
+This prevents fork PR code from executing on the org's persistent self-hosted
+runners. GitHub's [secure-use docs for public repos with self-hosted runners](https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#hardening-for-self-hosted-runners)
+warn that persistent runners can be persistently compromised by untrusted PR
+code (environment variable poisoning, secret extraction from runner cache,
+lateral movement via build artifacts).
+
+**Affected scenarios:**
+- Fork PR → CI jobs are **skipped** (not failed, not rerouted to hosted runners).
+- Same-org PR → CI jobs run normally on self-hosted runners.
+- Push to `main` → CI jobs run normally on self-hosted runners.
+
+**What fork authors see:** the `test` and `daemon-tests` check status will not
+appear on their PR (the jobs are skipped at the workflow level). The PR author
+should open a PR from a branch in `jleechanorg/dark-factory` to get CI coverage.
+
+## drift-check authentication (`RUNNERS_READ_PAT`)
+
+The drift-check workflow calls `gh api orgs/jleechanorg/actions/runners`.
+This endpoint requires the `manage_runners:org` permission, which is **not**
+available via the default `GITHUB_TOKEN`.
+
+Required secret: `RUNNERS_READ_PAT`
+
+To create it:
+1. Go to **GitHub → Settings → Developer settings → Fine-grained personal
+   access tokens → New token**.
+2. Set **Resource owner** to `jleechanorg`.
+3. Set **Repository access** to "All repositories" (or limit to dark-factory).
+4. Under **Permissions → Organization permissions → Self-hosted runners**,
+   grant **Read**.
+5. Store the generated token as a repository or org secret named
+   `RUNNERS_READ_PAT`.
+
+If `RUNNERS_READ_PAT` is not set, the workflow uses `GITHUB_TOKEN` as a
+fallback. The `gh api` call will return HTTP 403, the script exits with
+code 2 (invocation error), and the workflow fails loud. This is the correct
+fail-closed behaviour — do not suppress the error.
+
 ## Failure modes and runbooks
 
 | Symptom | Likely cause | Runbook |
@@ -163,6 +225,9 @@ exercised.
 | Drift-check workflow stays queued | The hardcoded fallback selector itself drifted | Verify via `gh api orgs/jleechanorg/actions/runners?per_page=100 --jq '.runners[].labels[].name' \| sort -u`; patch the workflow's hardcoded list. |
 | Drift-check says FLEET_DOWN | All runners offline | See `~/.claude/skills/self-hosted-runner-preflight/SKILL.md` Class B/E triage. |
 | CI job queues forever with no log | The variable was edited outside `gh api` and is now a YAML list instead of a JSON string | Re-patch the variable to a JSON-array string; verify via `gh api ... --jq .value` |
+| Drift-check exits 2 (invocation error) in CI | `RUNNERS_READ_PAT` secret missing or expired; `GITHUB_TOKEN` 403s on org runners endpoint | Create/renew the `RUNNERS_READ_PAT` secret — see "drift-check authentication" above. |
+| CI jobs not running on fork PRs | Expected: fork PRs are skipped by the `if:` guard | See "Fork PR isolation" above. Fork authors must PR from a same-org branch. |
+| Platform coverage warning in CI log | Job ran on macOS — Linux-only isolation tests skipped | See "Known platform coverage gap" above. |
 
 ## Related
 

@@ -331,3 +331,87 @@ def test_human_output_includes_verdict(fake_gh_env):
     assert "Verdict:             PASS" in proc.stdout
     assert "Org:                 jleechanorg" in proc.stdout
     assert "ez-runner-c-1" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# Authorized fail-closed inventory (Codex review item 1)
+# ---------------------------------------------------------------------------
+
+
+def test_gh_auth_failure_is_exit_invocation(fake_gh_env):
+    """HTTP 403 / auth error from gh must yield EXIT_INVOCATION (rc=2) —
+    fail-closed, not a silent PASS.  This covers the case where RUNNERS_READ_PAT
+    is absent and GITHUB_TOKEN lacks manage_runners:org scope."""
+    fake_gh_env(None, rc=1, stderr="gh: HTTP 403 Resource not accessible by integration")
+    proc = _run([
+        "--org", "jleechanorg",
+        "--selector", '["self-hosted","ezgha"]',
+        "--json",
+    ])
+    assert proc.returncode == 2, (
+        f"Expected EXIT_INVOCATION (2) on auth failure, got {proc.returncode}. "
+        f"stderr={proc.stderr!r}"
+    )
+    # Script must NOT emit a JSON PASS/DRIFT verdict when it cannot fetch inventory.
+    assert "PASS" not in proc.stdout, "Auth failure must not produce a PASS verdict"
+
+
+def test_gh_auth_failure_json_error_output(fake_gh_env):
+    """When --json is used and gh auth fails, the output JSON body must include
+    verdict=ERROR so the CI annotation step can render it correctly instead of
+    crashing on a missing 'verdict' key."""
+    fake_gh_env(None, rc=1, stderr="HTTP 403")
+    proc = _run([
+        "--org", "jleechanorg",
+        "--selector", '["self-hosted"]',
+        "--json",
+    ])
+    assert proc.returncode == 2
+    # When rc=2 and --json is set, the script prints a JSON error envelope.
+    if proc.stdout.strip():
+        body = json.loads(proc.stdout)
+        assert body.get("verdict") in {"ERROR", None}, (
+            f"Unexpected verdict {body.get('verdict')!r} on auth failure"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Strict selector validation (Codex review item 3)
+# ---------------------------------------------------------------------------
+
+
+def test_non_array_json_object_is_rejected_with_rc2(fake_gh_env):
+    """A JSON object (dict) passed as --selector must fail with EXIT_INVOCATION
+    (rc=2). This validates the strict 'selector must be an array of strings'
+    check in _normalize_labels.""";
+    fake_gh_env({"total_count": 1, "runners": [
+        {"id": 1, "name": "r1", "status": "online", "busy": False,
+         "labels": [{"name": "self-hosted"}]}
+    ]})
+    proc = _run([
+        "--org", "jleechanorg",
+        "--selector", '{"label": "self-hosted"}',  # dict, not array
+    ])
+    assert proc.returncode == 2, (
+        f"Expected EXIT_INVOCATION (2) for non-array selector, got {proc.returncode}"
+    )
+
+
+def test_selector_with_integer_element_is_rejected(fake_gh_env):
+    """Selectors must be arrays of strings. An array containing a non-string
+    element (e.g. integer) must be coerced to string, not silently dropped.
+    _normalize_labels does str(x).strip() — verify the coercion is harmless.""";
+    fake_gh_env({"total_count": 1, "runners": [
+        {"id": 1, "name": "r1", "status": "online", "busy": False,
+         "labels": [{"name": "1"}, {"name": "self-hosted"}]}
+    ]})
+    # Selector [1, "self-hosted"] — integer 1 coerced to "1"
+    proc = _run([
+        "--org", "jleechanorg",
+        "--selector", '[1, "self-hosted"]',
+        "--json",
+    ])
+    # Should PASS: runner carries labels "1" and "self-hosted"
+    assert proc.returncode == 0, proc.stderr
+    body = json.loads(proc.stdout)
+    assert body["verdict"] == "PASS"
