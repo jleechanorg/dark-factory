@@ -89,6 +89,12 @@ jobs:
           # --selector for local dry-runs.
           SELF_HOSTED_RUNNER_LABELS: ${{ vars.SELF_HOSTED_RUNNER_LABELS }}
           DRIFT_CHECK_ORG: jleechanorg
+          # gh CLI in Actions refuses unauthenticated calls. The default
+          # GITHUB_TOKEN carries the `repo` scope on PRs from the same repo
+          # (sufficient for `gh api orgs/<org>/actions/runners`); for cron /
+          # push-from-fork contexts we'd need a PAT — but those contexts are
+          # scoped to the same repo so the default token still works.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           ARGS=(--org jleechanorg --json)
@@ -101,7 +107,8 @@ jobs:
           python3 scripts/check_runner_selector.py "${ARGS[@]}" | tee drift-check.json
           VERDICT="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["verdict"])' < drift-check.json)"
           if [ "$VERDICT" != "PASS" ]; then
-            echo "::error title=Runner selector drift detected::verdict=$VERDICT — repo variable SELF_HOSTED_RUNNER_LABELS no longer matches ≥1 online org runner."
+            REASON="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("reason",""))' < drift-check.json)"
+            echo "::error title=Runner selector drift detected::verdict=$VERDICT reason=$REASON — repo variable SELF_HOSTED_RUNNER_LABELS no longer matches ≥1 online org runner."
             exit 1
           fi
           echo "Drift check PASS — selector matches ≥1 live runner."
@@ -116,11 +123,21 @@ jobs:
             echo "drift-check.json missing — skip annotation."
             exit 0
           fi
-          VERDICT="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["verdict"])' < drift-check.json)"
-          MATCH_COUNT="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["match_count"])' < drift-check.json)"
-          cat <<EOF >> "$GITHUB_STEP_SUMMARY"
-          ## Self-hosted runner selector drift check
-          - Selector: \`${{ vars.SELF_HOSTED_RUNNER_LABELS }}\`
-          - Org live runners matched: **$MATCH_COUNT**
-          - Verdict: **$VERDICT**
-          EOF
+          python3 <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          with open("drift-check.json") as fh:
+              data = json.load(fh)
+          verdict = data.get("verdict", "UNKNOWN")
+          match_count = data.get("match_count", "n/a")
+          selector = data.get("selector", [])
+          reason = data.get("reason", "")
+          lines = [
+              "## Self-hosted runner selector drift check",
+              f"- Selector: `{json.dumps(selector)}`",
+              f"- Org live runners matched: **{match_count}**",
+              f"- Verdict: **{verdict}**",
+          ]
+          if reason:
+              lines.append(f"- Reason: {reason}")
+          print("\n".join(lines))
+          PY
