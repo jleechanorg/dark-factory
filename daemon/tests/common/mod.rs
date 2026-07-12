@@ -206,6 +206,25 @@ impl Scm for FakeScm {
             })
     }
 
+    /// jleechan-9xrs Stage D regression coverage: records the `repo`
+    /// argument distinctly from the plain `pr_snapshot({pr})` call log entry
+    /// so integration tests can assert the full fast-tier verification loop
+    /// (skeptic gate, /er runner, gate assessment) fetched the bead's OWN
+    /// resolved repo, not `cfg.target_repo`.
+    fn pr_snapshot_for_repo(&self, repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("pr_snapshot_for_repo({repo},{pr})"));
+        self.pr_snapshots
+            .get(&pr)
+            .cloned()
+            .ok_or_else(|| DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: format!("no scripted snapshot for pr {pr}"),
+            })
+    }
+
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
         self.calls
             .borrow_mut()

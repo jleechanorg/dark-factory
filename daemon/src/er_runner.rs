@@ -119,7 +119,7 @@ pub fn maybe_run(
         Some(o) if o.state == OverlayState::Attested && o.pr_number == Some(pr) => o,
         _ => return Ok(Outcome::NotApplicable),
     };
-    let repo = overlay.repo(&deps.cfg).to_string();
+    let repo = overlay.repo(deps.cfg).to_string();
 
     // 2. Already posted? (idempotence) — jleechan-nplh: only a verdict
     //    posted at/after the CURRENT head commit counts. A verdict that
