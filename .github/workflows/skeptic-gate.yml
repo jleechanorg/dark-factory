@@ -1,23 +1,60 @@
 # SHA-bound Skeptic gate — see issue #278.
 #
-# This workflow is the dark-factory 7-green policy's gate 7. It must:
-#   1. Run on every PR update so the verdict is always bound to the
-#      current head SHA. Stale-SHA verdicts never satisfy a newer head.
-#   2. Use a self-hosted runner (private repo selector) — the workflow
-#      name "skeptic" is exposed as a required check for merge protection.
-#   3. Call a non-Claude reviewer (gemini or codex) — the implementing
-#      model cannot review its own diff. Fail-closed when the reviewer
-#      is unavailable or its output is unparseable.
-#   4. Idempotently post or update a single bot comment per PR — never
-#      create a new comment on rerun.
-#   5. Bind the verdict to repository, PR number, and exact head SHA so
-#      a downstream consumer can reject any stale PASS.
+# BOOTSTRAP CONSTRAINT (per the post-audit bootstrap-audit):
+#
+#   This workflow is intentionally NOT triggered by `pull_request` or
+#   `pull_request_target`. PR-controlled YAML is forgeable; the only
+#   legitimate bootstrap is via an EXTERNAL TRUSTED CALLER that invokes
+#   this workflow through `workflow_call` once the trusted default
+#   branch already contains this file plus `runner/skeptic_gate*.py`.
+#
+#   Until then, gate-7 cannot be self-certified by PR #281's own
+#   workflow. The dark-factory 7-green policy requires a separate seed
+#   in `jleechanorg/.github` (Hermes reusable workflow) that calls
+#   `jleechanorg/dark-factory/.github/workflows/skeptic-gate.yml@main`
+#   from the trusted context. See `docs/skeptic-gate.md` §
+#   "Bootstrap dependency".
+#
+# INPUTS (workflow_call + workflow_dispatch):
+#   pr_number  — required, PR number to (re-)run skeptic on
+#   pr_sha     — optional, head SHA override; if empty, re-resolved
+#                via `gh pr view` from the API
+#   trusted_ref — optional, ref to sparse-checkout gate code from
+#                 (defaults to the repo's default branch)
+#
+# TRIGGER POSTURE:
+#   workflow_call       — for trusted external callers (Hermes reusable).
+#   workflow_dispatch   — for manual operator re-runs (diagnostic only).
+#   pull_request        — INTENTIONALLY ABSENT (forgeable).
+#   pull_request_target — INTENTIONALLY ABSENT (cannot bootstrap; gate
+#                         itself is the asset being added).
 
 name: skeptic
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, edited]
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "PR number to (re-)run skeptic on"
+        required: true
+        type: string
+      pr_sha:
+        description: "Optional PR head SHA override; if empty, re-resolved via gh pr view"
+        required: false
+        type: string
+        default: ""
+      trusted_ref:
+        description: "Ref to sparse-checkout the gate code from (defaults to default branch)"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      # Pass-through secret. The trusted caller decides which secrets
+      # to forward; this workflow treats `secrets.GITHUB_TOKEN` as the
+      # only one it actually uses for posting comments + statuses.
+      github_token:
+        description: "GitHub token for posting comment + status (default: workflow-provided GITHUB_TOKEN)"
+        required: false
   workflow_dispatch:
     inputs:
       pr_number:
@@ -28,13 +65,16 @@ on:
         description: "Optional PR head SHA override; if empty, re-resolved via gh pr view"
         required: false
         type: string
+      trusted_ref:
+        description: "Ref to sparse-checkout the gate code from (defaults to default branch)"
+        required: false
+        type: string
 
-# Forked PRs cannot receive secret-bearing tokens; the gate has nothing
-# meaningful to say there. Skip them rather than fail.
-# Concurrency is per-PR+SHA so a new push cancels an in-flight gate for
-# the old head — preventing an old-SHA run from clobbering a fresh one.
+# Concurrency keyed per PR (newer run cancels older for the same PR so
+# the freshest verdict wins). Note: this only dedupes our own runs;
+# the external trusted caller has its own concurrency group.
 concurrency:
-  group: skeptic-${{ github.event.pull_request.number || inputs.pr_number }}-${{ github.sha }}
+  group: skeptic-pr-${{ inputs.pr_number }}
   cancel-in-progress: true
 
 permissions:
@@ -45,18 +85,49 @@ permissions:
 jobs:
   skeptic:
     name: Skeptic (SHA-bound PASS/FAIL)
-    # Skip on PRs from forks: GITHUB_TOKEN has no write access there.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
-    runs-on: self-hosted
+    runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS || '["self-hosted","self-hosted-mikey"]') }}
     timeout-minutes: 30
     env:
-      SKEPTIC_REVIEWER: "gemini"
-      SKEPTIC_REVIEWER_MODEL: "gemini-2.5-pro"
+      SKEPTIC_REVIEWERS_JSON: '[["codex",""],["gemini","gemini-2.5-pro"]]'
       SKEPTIC_STATUS_CONTEXT: "skeptic"
     steps:
-      - name: Checkout
+      - name: Verify reviewer CLIs are pre-installed (no install)
+        # The reviewer CLIs (codex, gemini) are EXPECTED to be already
+        # installed on the runner image the trusted caller selects.
+        # We deliberately do NOT `npm install -g` here — a mutable
+        # install on a credentialed runner is not pinned and not
+        # fail-closed. If the runner image lacks them, the reviewer
+        # invocation below fails closed with 'reviewer unavailable',
+        # which the gate treats as a FAIL (correct fail-closed
+        # contract).
+        run: |
+          set -euo pipefail
+          missing=0
+          for cli in codex gemini; do
+            if ! command -v "$cli" >/dev/null 2>&1; then
+              echo "[skeptic-gate] $cli MISSING on runner (expected pre-installed)"
+              missing=1
+            else
+              echo "[skeptic-gate] $cli present: $($cli --version || echo unknown)"
+            fi
+          done
+          # This is observational — do NOT install. Fail-closed happens
+          # later via reviewer-unavailable → check_state=failure.
+          exit 0
+
+      - name: Checkout gate code from TRUSTED ref (not PR head)
+        # Sparse-checkout pulls only the gate's Python files from the
+        # trusted ref (default branch by default; the trusted caller
+        # can pin a specific SHA via `inputs.trusted_ref`). PR head
+        # Python is NEVER checked out — an attacker who controls PR
+        # head cannot pivot this credentialed runner into executing
+        # their code.
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
+          ref: ${{ inputs.trusted_ref || github.event.repository.default_branch }}
+          sparse-checkout: |
+            runner/skeptic_gate.py
+            runner/skeptic_gate_cli.py
           persist-credentials: false
 
       - name: Set up Python
@@ -64,35 +135,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Resolve PR number + head SHA
-        id: ctx
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            PR_NUMBER="${{ github.event.pull_request.number }}"
-            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-          else
-            PR_NUMBER="${{ inputs.pr_number }}"
-            HEAD_SHA="${{ inputs.pr_sha }}"
-          fi
-          if [ -z "${HEAD_SHA}" ]; then
-            # Re-resolve from the live PR head (covers stale workflow_dispatch input).
-            HEAD_SHA="$(gh pr view "${PR_NUMBER}" --json headRefOid --jq .headRefOid)"
-          fi
-          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
-          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
-          echo "[skeptic-gate] resolved pr=#${PR_NUMBER} head=${HEAD_SHA:0:12}" >&2
-
       - name: Run skeptic gate
         id: gate
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
-          PR_HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
-          SKEPTIC_REVIEWER: ${{ env.SKEPTIC_REVIEWER }}
-          SKEPTIC_REVIEWER_MODEL: ${{ env.SKEPTIC_REVIEWER_MODEL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN || secrets.github_token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          PR_HEAD_SHA: ${{ inputs.pr_sha }}
+          SKEPTIC_REVIEWERS_JSON: ${{ env.SKEPTIC_REVIEWERS_JSON }}
           SKEPTIC_STATUS_CONTEXT: ${{ env.SKEPTIC_STATUS_CONTEXT }}
         run: |
           set -euo pipefail
@@ -100,6 +149,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --pr-number "${PR_NUMBER}" \
             --pr-sha "${PR_HEAD_SHA}" \
-            --reviewer "${SKEPTIC_REVIEWER}" \
-            --reviewer-model "${SKEPTIC_REVIEWER_MODEL}" \
+            --reviewers-json "${SKEPTIC_REVIEWERS_JSON}" \
             --status-context "${SKEPTIC_STATUS_CONTEXT}"
