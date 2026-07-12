@@ -25,6 +25,19 @@ Versus `/h` / `/goal_harness`:
 Use `/factory` when you want the goal_harness idea as a reproducible external
 pipeline; use `/h` when you want an interactive in-session loop.
 
+## Entry points
+
+| Command | Behavior |
+|---------|----------|
+| `/f` | Full loop, auto-routes PR-mode vs feature-mode (Step 0a below) |
+| `/factory` | Alias for `/f`, identical behavior |
+| `/f-pr` | Explicit PR-mode entry point (skips auto-route, always PR-mode) |
+| `/fs` | Spec-generation entry point; runs `pipelines/slim/spec_gen.dot` or a binary-owned dynamic spec graph — run this first when the goal needs a spec |
+
+`.claude/commands/f.md` is the single writer for the binary-first contract;
+`/factory` and `/f-pr` are thin aliases so auto-detect behavior stays
+identical across entry points.
+
 ## Repos
 
 - `~/projects/dark-factory/` — the runner (factory code; agent can see this)
@@ -40,16 +53,84 @@ pipeline; use `/h` when you want an interactive in-session loop.
 | `pipelines/factory/pr_gates.dot` | start → holdout → /es → /er → /code_standards → exit | Validate an already-implemented in-flight PR diff (Holdout-always policy; requires `--feature <name>` for the holdout) |
 | `pipelines/slim/minimal_feature.dot` | explore → plan → implement → test → review → holdout → gates → exit | Full production pipeline from scratch with a holdout |
 | `pipelines/slim/minimal_pr.dot` | explore → plan → implement → test → review → holdout → gates → exit | Slim in-flight PR iteration loop with parameterized tests (Holdout-always policy; requires `--feature <name>` for the holdout) |
+| `pipelines/slim/spec_gen.dot` | spec-only generation | The LLM decided `/fs` is needed first — STOP and recommend running it before any other pipeline |
+| `pipelines/bug_fix.dot` | red → green → refactor | TDD bug fix with red/green discipline |
+| `pipelines/factory/level5_feature.dot` | full reference pipeline | Full Level-5 reference pipeline with hard-tier gates wired in |
+| **dynamic DOT via binary** | binary-owned graph builder | A static graph can't express the needed phase/fanout; the binary saves/echoes the generated graph in run evidence |
+| **no pipeline** | — | Docs-only / test-only / config-only PRs have no behavioral surface for the holdout to grade — say so and stop |
 
 You can also write your own `.dot` and pass it via `--pipeline`.
 
 ## How to invoke this skill
 
-The user types `/factory $ARGUMENTS`. Parse the arguments and run the steps
-below. **Do not default to a single pipeline** — select the graph that matches
-the task (see **Pipeline selection** below) unless the user passed `--pipeline`.
+The user types `/f $ARGUMENTS` (or `/factory $ARGUMENTS`). Parse the
+arguments and run the steps below. **Do not default to a single pipeline** —
+select the graph that matches the task (see **Pipeline selection** below)
+unless the user passed `--pipeline`.
 
-### Step 0 — Select pipeline (mandatory when `--pipeline` omitted)
+### Step 0a — Auto-route PR-mode vs feature-mode (applies to `/f` and `/factory`; `/f-pr` skips this and forces PR-mode)
+
+Run once before dispatch:
+
+```bash
+gh pr list --head "$(git rev-parse --abbrev-ref HEAD)" \
+  --json number,title,state,isDraft,additions,deletions,changedFiles,baseRefName,headRefName,labels
+echo "$ARGUMENTS"
+```
+
+Reasoning (LLM, not rules):
+- **No open PR** → feature-mode (new work).
+- **Open PR exists** AND goal relates to it → PR-mode (drive the existing PR to green).
+- **Open PR exists** AND goal is unrelated → **ask the user** which mode they meant. Do not silently route.
+
+### Step 0b — Auto-detect CLI backend
+
+When the user invokes Claude via a `~/.bashrc` wrapper (`claudem`, `clauded`,
+`codex`, `agy`), bash exports a `BASH_FUNC_<wrapper>%%` env var. Read these to
+pick the right `--backend` flag so the LLM that runs the audit is the same
+one the user picked from their shell. `%%` in the var name breaks
+`${BASH_FUNC_X%%:-default}` and `${!key}` expansion, so use `printenv`:
+
+```bash
+detect_cli_backend() {
+  local key parent_comm ppid
+  for key in 'BASH_FUNC_claudem%%' 'BASH_FUNC_clauded%%' 'BASH_FUNC_agy%%' 'BASH_FUNC_codex%%' 'BASH_FUNC_claude%%'; do
+    if [ -n "$(printenv "$key" 2>/dev/null)" ]; then
+      case "$key" in
+        *claudem%%) echo "minimax"; return ;;
+        *clauded%%) echo "claude";  return ;;
+        *agy%%)     echo "agy";     return ;;
+        *codex%%)   echo "codex";   return ;;
+        *claude%%)  echo "claude";  return ;;
+      esac
+    fi
+  done
+  case "${ANTHROPIC_BASE_URL:-}" in
+    *api.minimax.io*) echo "minimax"; return ;;
+    *anthropic.com*)  echo "claude";  return ;;
+    *openai.com*)     echo "codex";   return ;;
+  esac
+  ppid="${PPID:-}"
+  if [ -n "$ppid" ]; then
+    parent_comm="$(ps -o comm= -p "$ppid" 2>/dev/null | tr -d ' ')"
+    case "$parent_comm" in
+      *claude*|*claudem*) echo "claude"; return ;;
+      *codex*)            echo "codex";  return ;;
+      *agy*|*antigrav*)   echo "agy";    return ;;
+    esac
+  fi
+  echo "claude"
+}
+DETECTED_BACKEND="$(detect_cli_backend)"
+```
+
+Override precedence (highest to lowest): explicit `--backend <x>` flag >
+`BASH_FUNC_*` wrapper signal > `ANTHROPIC_BASE_URL` > parent process name >
+hardcoded default (`claude`). Always echo the detected backend + source in
+the proof block (see **Output contract**). If `--backend` was passed
+explicitly, note the override rather than the raw detection.
+
+### Step 0c — Select pipeline (mandatory when `--pipeline` omitted)
 
 1. Read the goal and apply **factory-spec Step 0** (greenfield vs brownfield).
 2. Choose a pipeline from
@@ -75,6 +156,9 @@ When `--pipeline` is a short name (no `/` or `.dot`), expand under
 | `minimal_pr` | `pipelines/slim/minimal_pr.dot` |
 | `review_slim` | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` |
 | `review_full` | `benchmarks/attractor-spec-review/pipelines/review_full.dot` |
+| `spec_gen` | `pipelines/slim/spec_gen.dot` |
+| `bug_fix` | `pipelines/bug_fix.dot` |
+| `level5_feature` | `pipelines/factory/level5_feature.dot` |
 
 ### Arg parsing
 
@@ -82,7 +166,7 @@ Honor these flags inside `$ARGUMENTS`:
 
 - `--pipeline <name>` — short name (`gates`, `hello`, `pr_gates`, `minimal_pr`,
   `minimal_feature`, `review_slim`, `review_full`) or path to a `.dot`. If
-  omitted, **auto-select from the goal** (Step 0 above) — never blindly default
+  omitted, **auto-select from the goal** (Step 0c above) — never blindly default
   to `gates.dot` or `minimal_feature.dot`.
 - `--feature <name>` — holdout feature (required when the pipeline includes a
   `holdout_eval` node; default `hello`)
@@ -149,18 +233,74 @@ Whatever is left after flag parsing is the **goal description**.
    `~/projects/dark-factory-holdouts/holdouts/<feature>/` — only the
    PASS/FAIL verdict per scenario name leaked back.
 
+## Reviewer calibration (default on)
+
+`--reviewer-calibration=true` is the default for every real `/f`/`/factory`
+run. Treat the flag as present unless the user explicitly passes
+`--reviewer-calibration=false`.
+
+Calibration compares at least:
+- the factory/in-graph reviewer outcome when the selected DOT has one;
+- a raw terminal mirror review via `codex exec --yolo -m gpt-5.3-codex-spark`;
+- a delegated reviewer/subagent outcome when available in the current session.
+
+All reviewers receive the same frozen envelope: target repo, target PR or
+work item, head SHA, base SHA, diff, PR/task text, evidence paths, test logs,
+factory run ID, and the exact shared review prompt. Store outputs under:
+
+```text
+evidence/<run-id>/reviewer-calibration/
+  envelope.json
+  prompt.txt
+  raw-codex.output.md
+  raw-codex.findings.json
+  subagent.output.md
+  subagent.findings.json
+  factory-reviewer.output.md
+  factory-reviewer.findings.json
+  comparison.json
+  adjudication.md
+```
+
+Do not claim delegated subagents underperformed raw Codex unless the same
+envelope and prompt were reviewed at the same SHA and raw Codex found a
+later-confirmed blocker the delegated reviewer missed. If calibration is
+disabled, the final response must say `Reviewer calibration: disabled` and
+give the explicit reason.
+
+The `gate_er` priority queue is `codex > minimax > agy > claude-sonnet` by
+default; passing `--backend claude` for the run itself does not change how
+`gate_er` resolves its reviewer.
+
 ## Output contract
 
-End every `/factory` invocation with:
+End every `/f`/`/factory` invocation with this proof block. Missing any
+required line means the run is unproven and must be reported as such:
 
-```
-Pipeline:       <name>
-Final outcome:  PASS | FAIL | exhausted | stuck
-Steps:          <n>
-CXDB:           <path>   (run `df-healer --cxdb <path>` to re-cluster)
+```bash
+# CLI backend: <detected-or-override> (source: <BASH_FUNC_X%%|explicit --backend|default>)
+# Literal command run:
+cd /Users/jleechan/projects/<target-repo>
+DARK_FACTORY_HOME=~/projects/dark-factory \
+DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts \
+PATH="$HOME/.local/bin:$PATH" \
+dark-factory \
+  --pipeline <chosen-or-generated-dot> \
+  --goal "<echo of $ARGUMENTS>" \
+  --backend <backend> \
+  --feature <feature-if-any> \
+  --cxdb ~/.dark-factory/cxdb.sqlite
+# Run ID: <id>
+# CXDB SHA: <sha>
+# Final outcome: <success|failure|exhausted|error>
+# Exit code: <integer>
+# Wall-clock: <duration>
+# Logs: <path>
+# Evidence envelope: <path>
+# Reviewer calibration: <enabled|disabled> <artifact-path-or-reason>
 ```
 
-Plus the trace and, on failure, the Healer report.
+Plus the per-node trace and, on failure, the Healer report.
 
 ## Adding a new feature
 
@@ -183,6 +323,19 @@ To add a new sealed-holdout feature `foo`:
   declare the run **invalid** and rerun the pipeline.
 - If `--backend echo` was used, label the run as a wiring smoke, not a real
   validation.
+- Do not claim a factory run based on an in-Claude workflow, `Skill()` call,
+  or prose summary. The only valid proof is an actual `dark-factory` binary
+  invocation plus the proof block above.
+- If the LLM decided `/fs` is needed first, **say so and stop** — do not
+  silently fall through to `gates.dot` and pretend the PR is green.
+- If no pipeline fits (e.g. docs-only PR), **say so and stop** — do not
+  silently fall through to a holdout-bearing pipeline.
+- Do not invent `--feature` values. If there's no holdout directory at
+  `~/projects/dark-factory-holdouts/holdouts/<feature>/`, don't pass `--feature`.
+- When the goal is unrelated to the open PR (Step 0a), **ask the user** which
+  mode they meant. Do not silently route to PR-mode for unrelated work.
+- When the fix loop exhausts (3 attempts), surface the diagnosis verbatim and
+  **stop** — do not auto-merge.
 
 ## Known limits
 
