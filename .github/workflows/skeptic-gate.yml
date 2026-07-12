@@ -1,0 +1,105 @@
+# SHA-bound Skeptic gate — see issue #278.
+#
+# This workflow is the dark-factory 7-green policy's gate 7. It must:
+#   1. Run on every PR update so the verdict is always bound to the
+#      current head SHA. Stale-SHA verdicts never satisfy a newer head.
+#   2. Use a self-hosted runner (private repo selector) — the workflow
+#      name "skeptic" is exposed as a required check for merge protection.
+#   3. Call a non-Claude reviewer (gemini or codex) — the implementing
+#      model cannot review its own diff. Fail-closed when the reviewer
+#      is unavailable or its output is unparseable.
+#   4. Idempotently post or update a single bot comment per PR — never
+#      create a new comment on rerun.
+#   5. Bind the verdict to repository, PR number, and exact head SHA so
+#      a downstream consumer can reject any stale PASS.
+
+name: skeptic
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to (re-)run skeptic on"
+        required: true
+        type: string
+      pr_sha:
+        description: "Optional PR head SHA override; if empty, re-resolved via gh pr view"
+        required: false
+        type: string
+
+# Forked PRs cannot receive secret-bearing tokens; the gate has nothing
+# meaningful to say there. Skip them rather than fail.
+# Concurrency is per-PR+SHA so a new push cancels an in-flight gate for
+# the old head — preventing an old-SHA run from clobbering a fresh one.
+concurrency:
+  group: skeptic-${{ github.event.pull_request.number || inputs.pr_number }}-${{ github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  skeptic:
+    name: Skeptic (SHA-bound PASS/FAIL)
+    # Skip on PRs from forks: GITHUB_TOKEN has no write access there.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+    runs-on: self-hosted
+    timeout-minutes: 30
+    env:
+      SKEPTIC_REVIEWER: "gemini"
+      SKEPTIC_REVIEWER_MODEL: "gemini-2.5-pro"
+      SKEPTIC_STATUS_CONTEXT: "skeptic"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55  # v5.5.0
+        with:
+          python-version: "3.12"
+
+      - name: Resolve PR number + head SHA
+        id: ctx
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            PR_NUMBER="${{ inputs.pr_number }}"
+            HEAD_SHA="${{ inputs.pr_sha }}"
+          fi
+          if [ -z "${HEAD_SHA}" ]; then
+            # Re-resolve from the live PR head (covers stale workflow_dispatch input).
+            HEAD_SHA="$(gh pr view "${PR_NUMBER}" --json headRefOid --jq .headRefOid)"
+          fi
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "[skeptic-gate] resolved pr=#${PR_NUMBER} head=${HEAD_SHA:0:12}" >&2
+
+      - name: Run skeptic gate
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+          PR_HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
+          SKEPTIC_REVIEWER: ${{ env.SKEPTIC_REVIEWER }}
+          SKEPTIC_REVIEWER_MODEL: ${{ env.SKEPTIC_REVIEWER_MODEL }}
+          SKEPTIC_STATUS_CONTEXT: ${{ env.SKEPTIC_STATUS_CONTEXT }}
+        run: |
+          set -euo pipefail
+          python -m runner.skeptic_gate_cli \
+            --repo "$GITHUB_REPOSITORY" \
+            --pr-number "${PR_NUMBER}" \
+            --pr-sha "${PR_HEAD_SHA}" \
+            --reviewer "${SKEPTIC_REVIEWER}" \
+            --reviewer-model "${SKEPTIC_REVIEWER_MODEL}" \
+            --status-context "${SKEPTIC_STATUS_CONTEXT}"
