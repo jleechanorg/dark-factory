@@ -11,6 +11,9 @@
 #   $rc=7  invalid bead_id — skip this bead (will not fix)
 #   $rc=8  bead not found in overlay
 #   $rc=9  io error (sqlite / fs)
+#   $rc=10 checkout drift — refusing to tick (not on main / dirty / behind
+#          origin/main). See "Gate 0" block below. Set AFD_SKIP_DRIFT_CHECK=1
+#          to bypass for local/dev runs (never set on the production plist).
 #
 # Configurable env:
 #   AFD_BEAD_FILTER         space-separated bead IDs to limit the SELECT to
@@ -105,6 +108,53 @@ if [ -n "${AFD_PRIORITY_BEADS:-}" ]; then
 fi
 
 cd "$ROOT"
+
+# ---------- Gate 0: refuse to tick on a drifted checkout ----------
+# Bead jleechan-vxs8: the launchd daemon executes whatever branch happens to
+# be checked out in $ROOT (normally ~/projects/dark-factory, a dev working
+# tree shared with interactive sessions). On 2026-07-11 the tree sat on a
+# feature branch that crashed every tick until another session switched
+# branches out from under the daemon — neither state was a deliberate
+# deploy, and the daemon silently ran whichever code happened to be on disk.
+#
+# Mirrors the ez-gh-actions Gate 0 SHA-pinning pattern: rather than adding a
+# separate deploy-owned checkout (more moving parts, needs its own update
+# step + install-launchagents.sh rewiring), the tick script itself refuses
+# to do dispatch work when the checkout has drifted from origin/main or has
+# uncommitted changes. A drifted checkout fails LOUD (non-zero exit, clear
+# log line) instead of silently running unaudited code.
+#
+# Opt-out for local/dev/test runs (coder sessions iterating on a feature
+# branch must be able to invoke this script directly without tripping the
+# gate): set AFD_SKIP_DRIFT_CHECK=1. The installed launchd plist never sets
+# this — production ticks always run the check.
+if [ "${AFD_SKIP_DRIFT_CHECK:-0}" != "1" ]; then
+    current_branch="$(git branch --show-current 2>/dev/null || true)"
+    if [ "$current_branch" != "main" ]; then
+        echo "factory-af-tick: REFUSING TICK — checkout at $ROOT is on branch '${current_branch:-<detached HEAD>}', not main. The daemon must run from main; switch back with 'git checkout main' or set AFD_SKIP_DRIFT_CHECK=1 for local dev runs." >&2
+        exit 10
+    fi
+
+    if ! git diff --quiet HEAD -- 2>/dev/null || ! git diff --quiet --cached HEAD -- 2>/dev/null; then
+        echo "factory-af-tick: REFUSING TICK — checkout at $ROOT has uncommitted changes on main. Run 'git status' and clean the tree (stash/reset) before the daemon can tick again." >&2
+        exit 10
+    fi
+
+    # Compare local HEAD against origin/main. Best-effort fetch: if the
+    # network/GH auth is unavailable this tick, don't hard-fail on the fetch
+    # itself (that would turn a transient network blip into a dispatch
+    # outage) — only fail when we DO have fresh remote data and it disagrees
+    # with local HEAD.
+    if git fetch origin main --quiet 2>/dev/null; then
+        local_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+        remote_sha="$(git rev-parse refs/remotes/origin/main 2>/dev/null || true)"
+        if [ -n "$local_sha" ] && [ -n "$remote_sha" ] && [ "$local_sha" != "$remote_sha" ]; then
+            echo "factory-af-tick: REFUSING TICK — checkout at $ROOT (HEAD ${local_sha:0:9}) has drifted from origin/main (${remote_sha:0:9}). Run 'git pull --ff-only' to resync before the daemon can tick again." >&2
+            exit 10
+        fi
+    fi
+fi
+
 "$O" init
 "$O" unstick-dispatching
 "$O" recover-held
