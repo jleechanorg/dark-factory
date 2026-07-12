@@ -29,6 +29,13 @@ R="$ROOT/daemon/factory-ao-remediate.sh"
 DB="${AFD_DB:-$HOME/.dark-factory/daemon-cxdb.sqlite}"
 MAX_DISPATCH="${MAX_DISPATCH:-2}"
 AO_PROJECT="${AFD_AO_PROJECT:-worldarchitect}"
+# CONFIG/TARGET_REPO mirror the sibling scripts' pattern (daemon/factory-overlay.sh,
+# daemon/factory-intake-from-gh.sh) so the per-bead repo/project resolution below
+# has the same config file and a default to fall back on when a bead has no
+# target_repo of its own.
+CONFIG="${CONFIG:-$ROOT/config/daemon.toml}"
+[ -f "$CONFIG" ] || CONFIG="$ROOT/daemon/contracts/daemon.toml.example"
+TARGET_REPO="${TARGET_REPO:-}"
 
 # ---------- arg parsing ----------
 TARGET_PRS=""
@@ -225,8 +232,15 @@ while IFS=$'\t' read -r bead_id pr branch bead_repo; do
     [ -n "$bead_id" ] || continue
     [ "$dispatched" -ge "$MAX_DISPATCH" ] && break
 
-    # Resolve target repo (default to global TARGET_REPO if empty)
-    repo="${bead_repo:-$TARGET_REPO}"
+    # Resolve target repo (default to global TARGET_REPO if empty). Fail closed
+    # (skip, don't guess) when neither is set — see bead jleechan-gvdw: a
+    # hardcoded fallback here recreates the same-number cross-repo claim risk
+    # this per-bead repo resolution exists to prevent.
+    repo="${bead_repo:-${TARGET_REPO:-}}"
+    if [ -z "$repo" ]; then
+        echo "[af] skip $bead_id: no repo mapping (fail-closed, no bead_repo or TARGET_REPO)" >&2
+        continue
+    fi
 
     # Resolve AO project for this repo from config
     proj="$(python3 - "$CONFIG" "$repo" <<'PY'

@@ -185,10 +185,15 @@ for b in issues:
 assert "CX-1 br list shape parses" "jleechan-xyz
 jleechan-uvw" "$list_out"
 
-# CX-2: factory-af-tick must pass AO_PROJECT to factory-ao-remediate.sh.
-# Without this, remediation runs against a different AO project than the
-# capacity check measured, causing over-dispatch or wrong-project land.
-if grep -q 'bash "$R" "$bead_id" "$pr" "" "\$AO_PROJECT"' "$TICK" || grep -qE 'bash "\$R"[^"]*"\$AO_PROJECT"' "$TICK"; then
+# CX-2: factory-af-tick must pass the resolved AO project to
+# factory-ao-remediate.sh. Without this, remediation runs against a different
+# AO project than the capacity check measured, causing over-dispatch or
+# wrong-project land. Since the multirepo-dispatch rework (29deb91f, PR #248)
+# the project is resolved per-bead into $proj (not the old global
+# $AO_PROJECT) and threaded through — accept either form.
+if grep -q 'bash "$R" "$bead_id" "$pr" "" "\$AO_PROJECT"' "$TICK" \
+    || grep -qE 'bash "\$R".*"\$AO_PROJECT"' "$TICK" \
+    || grep -qE 'bash "\$R".*"\$proj"' "$TICK"; then
     echo "PASS: factory-af-tick threads AO_PROJECT to factory-ao-remediate.sh"
     PASS=$((PASS + 1))
 else
