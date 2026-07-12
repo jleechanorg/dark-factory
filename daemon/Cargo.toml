@@ -9,3 +9,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 thiserror = "2"
+# jleechan-8e0x: SHA-256 for content-addressing the lossless
+# coder-prompt payload file. There is no existing canonical SHA-256
+# helper in the daemon crate tree (the dispatch adapter does string
+# matching + subprocess argv shaping only); adding `sha2 = "0.10"` is
+# the lightest pure-Rust path to the algorithm and avoids vendoring
+# crypto or pulling `ring` (which transitively pulls a C toolchain via
+# aws-lc-rs / libcrypto). Pinned to the same major as the rest of the
+# resolver footprint.
+sha2 = "0.10"

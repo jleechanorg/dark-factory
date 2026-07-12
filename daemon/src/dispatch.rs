@@ -264,7 +264,35 @@ pub fn dispatch_ready(
             // interim mitigation before this bead's `[repos]` plumbing
             // existed) plus the exact `routing.push_remote`, closing the
             // gap #247's doc comment explicitly deferred to this bead.
-            _ => build_coder_prompt(bead, &branch, &repo, &routing.push_remote),
+            //
+            // jleechan-8e0x (PR #272): compute the lossless untruncated
+            // prompt first (`build_coder_prompt_lossless`), then decide
+            // between (a) materializing via `prompt_payload` and handing
+            // AO a bootstrap, or (b) letting PR #255's shrinker
+            // (`build_coder_prompt`) reduce the inline prompt to fit.
+            // Either arm lands at-or-below AO's 4,096-char spawn ceiling;
+            // the indirection arm is the lossless path.
+            _ => {
+                let full = build_coder_prompt_lossless(
+                    bead, &branch, &repo, &routing.push_remote,
+                );
+                match crate::prompt_payload::materialize_or_bootstrap(&full) {
+                    Ok(crate::prompt_payload::MaterializeOutcome::NoIndirectionNeeded) => {
+                        build_coder_prompt(bead, &branch, &repo, &routing.push_remote)
+                    }
+                    Ok(crate::prompt_payload::MaterializeOutcome::Indirected(i)) => i.bootstrap,
+                    Err(err) => {
+                        overlay.state = OverlayState::HumanHeld;
+                        overlay.park_reason = Some("prompt_indirection_failed".into());
+                        store.save(&overlay)?;
+                        report.failures.push(failure(
+                            bead, overlay.attempt, Some(branch.clone()),
+                            "prompt_indirection_failed", err,
+                        ));
+                        continue;
+                    }
+                }
+            }
         };
 
         let spec = SpawnSpec {
@@ -473,6 +501,15 @@ pub fn dispatch_ready(
             target_repo: repo,
         });
     }
+
+    // PR #272: bounded orphan-payload cleanup. Runs once per dispatch
+    // batch, bounded by a small delete_count so a full directory can't
+    // stall the tick. Failures are swallowed -- this is best-effort
+    // retention, never an excuse to fail the dispatch loop.
+    let _ = crate::prompt_payload::cleanup_orphan_payloads(
+        crate::prompt_payload::ORPHAN_RETENTION_SECS,
+        crate::prompt_payload::ORPHAN_CLEANUP_BATCH,
+    );
 
     Ok(report)
 }
@@ -698,6 +735,79 @@ fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str
     }
 
     prompt
+}
+
+/// Lossless variant of `build_coder_prompt`: identical template, NO
+/// shrinking applied. Used by the indirection path so the payload
+/// written to `~/.dark-factory/prompt-payloads/<sha>.md` is byte-exact
+/// the coder-prompt content. The inline path always goes through
+/// PR #255's `build_coder_prompt` (its shrinker is the fail-safe for
+/// non-indirected beads).
+fn build_coder_prompt_lossless(
+    bead: &crate::tools::Bead,
+    branch: &str,
+    target_repo: &str,
+    remote: &str,
+) -> String {
+    render_coder_prompt(
+        bead,
+        branch,
+        target_repo,
+        remote,
+        bead.description.trim(),
+        bead.file_tree_summary.trim(),
+    )
+}
+
+/// Focused regression tests for the build_coder_prompt /
+/// build_coder_prompt_lossless split + indirection wiring. Kept
+/// self-contained (no test_fixtures dep, no env mutation) so they're
+/// stable across refactors of `FakeStateStore` / `FakeSessions`.
+#[cfg(test)]
+mod prompt_indirection_integration {
+    use super::*;
+    use crate::tools::Bead;
+
+    fn bead(description_len: usize, tree_len: usize) -> Bead {
+        Bead {
+            id: "jleechan-8e0x-test".into(),
+            title: "regression".into(),
+            description: "y".repeat(description_len),
+            file_tree_summary: "z".repeat(tree_len),
+            external_ref: None,
+        }
+    }
+
+    #[test]
+    fn lossless_is_strictly_larger_or_equal_than_shrunk() {
+        let b = bead(8_000, 0);
+        let lossless = build_coder_prompt_lossless(&b, "factory/x-r1", "owner/repo", "origin");
+        let shrunk = build_coder_prompt(&b, "factory/x-r1", "owner/repo", "origin");
+        assert!(
+            lossless.len() >= shrunk.len(),
+            "lossless must contain everything the shrunk version does \
+             (got {} lossless vs {} shrunk)",
+            lossless.len(),
+            shrunk.len()
+        );
+        // Inline (shrunk) path stays under PR #255's cap.
+        assert!(shrunk.len() <= 4_000,
+            "shrunk output must stay under CODER_PROMPT_TOTAL_CAP=4000, got {}",
+            shrunk.len());
+        // Lossless can exceed AO's 4096 (this is the indirection trigger).
+        assert!(lossless.len() > 4_000,
+            "test fixture must compose a >4096-byte lossless prompt (got {})",
+            lossless.len());
+    }
+
+    #[test]
+    fn short_prompt_lossless_equals_shrunk() {
+        let b = bead(200, 50); // tiny, well under caps
+        let lossless = build_coder_prompt_lossless(&b, "factory/x-r1", "owner/repo", "origin");
+        let shrunk = build_coder_prompt(&b, "factory/x-r1", "owner/repo", "origin");
+        assert_eq!(lossless, shrunk,
+            "small beads: lossless and shrunk must render identically");
+    }
 }
 
 #[cfg(test)]
