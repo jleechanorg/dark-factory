@@ -20,6 +20,11 @@ pub struct ExistingPrIntake {
     pub pr_number: u64,
     pub head_ref_name: String,
     pub external_ref: String,
+    /// jleechan-dljf (issue #271): resolved repo identity from the PR's
+    /// external_ref prefix, propagated through to the adoption path so
+    /// `run_slow_tier` never needs to re-derive it. Set by intake at
+    /// creation time; the caller persists it to `BeadOverlay::target_repo`.
+    pub target_repo: Option<String>,
     pub newly_created: bool,
 }
 
@@ -77,15 +82,26 @@ pub struct IntakeOutcome {
 ///    callers fall back to the daemon's global `cfg.target_repo` via
 ///    [`crate::state::BeadOverlay::repo`].
 ///
+/// jleechan-dljf (issue #271): resolved results are validated with
+/// [`crate::config::is_valid_owner_repo`] — a malformed `target_repo:`
+/// body field or a malformed `external_ref` prefix (e.g. no `/`)
+/// returns `None` rather than propagating an unparseable string. This
+/// prevents a bead from claiming a repo the daemon cannot route.
+///
 /// This is the single call site for body-field/external_ref repo-identity
 /// parsing — do not re-implement this precedence elsewhere.
 pub fn resolve_target_repo(body: &str, external_ref: Option<&str>) -> Option<String> {
     if let Some(explicit) = parse_target_repo_body_field(body) {
-        return Some(explicit);
+        if crate::config::is_valid_owner_repo(&explicit) {
+            return Some(explicit);
+        }
+        // jleechan-dljf: malformed body field — fall through to external_ref
+        // instead of propagating an unparseable string.
     }
     external_ref
         .and_then(parse_owner_repo_from_external_ref)
         .map(|(owner_repo, _issue)| owner_repo)
+        .filter(|s| crate::config::is_valid_owner_repo(s))
 }
 
 /// Same `owner/repo#N` split as the private `parse_external_ref` helpers in
@@ -345,11 +361,14 @@ pub fn normalize_labeled_prs(
             .iter()
             .find(|bead| bead.external_ref.as_deref() == Some(pr.external_ref.as_str()))
         {
+            let target_repo =
+                resolve_target_repo(&pr.body, Some(pr.external_ref.as_str()));
             intakes.push(ExistingPrIntake {
                 bead_id: bead.id.clone(),
                 pr_number: pr.number,
                 head_ref_name: pr.head_ref_name,
                 external_ref: pr.external_ref,
+                target_repo,
                 newly_created: false,
             });
             continue;
@@ -401,11 +420,14 @@ pub fn normalize_labeled_prs(
             bead_id, pr.head_ref_name
         );
         let _ = tracker.comment_external(&pr.external_ref, &comment_body);
+        let target_repo =
+            resolve_target_repo(&pr.body, Some(pr.external_ref.as_str()));
         intakes.push(ExistingPrIntake {
             bead_id,
             pr_number: pr.number,
             head_ref_name: pr.head_ref_name,
             external_ref: pr.external_ref,
+            target_repo,
             newly_created: true,
         });
     }
