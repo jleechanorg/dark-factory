@@ -2832,4 +2832,58 @@ mod tests {
             "requeue_stale_dispatched must error when bead does not exist"
         );
     }
+
+    /// Real (in-memory SQLite) requeue: seed all non-reset fields with
+    /// non-trivial values and assert every one is preserved exactly across
+    /// the requeue, while state/branch/session/autonomy are reset.
+    #[test]
+    fn requeue_stale_dispatched_preserves_non_reset_fields_on_real_sqlite() {
+        let store = store();
+        store
+            .save(&BeadOverlay {
+                bead_id: "preserve-target".into(),
+                state: OverlayState::Dispatched,
+                attempt: 7,
+                reroll_count: 3,
+                autonomy_secs: 7200,
+                spend_usd: 12.75,
+                pr_number: Some(888),
+                branch: Some("factory/preserve-target-r7".into()),
+                session_id: Some("sess-old-dead".into()),
+                is_adopted: true,
+                spawn_failure_count: 2,
+                pre_session_head_sha: Some("abc123def456".into()),
+                park_reason: Some("previous_coder_silent".into()),
+                target_repo: Some("jleechanorg/other-repo".into()),
+            })
+            .unwrap();
+
+        let requeued = store.requeue_stale_dispatched("preserve-target").unwrap();
+
+        // Reset assertions
+        assert_eq!(requeued.state, OverlayState::Queued);
+        assert_eq!(requeued.session_id, None);
+        assert_eq!(requeued.branch, None);
+        assert_eq!(requeued.autonomy_secs, 0);
+
+        // Preserved assertions — every non-reset field must survive unchanged
+        assert_eq!(requeued.attempt, 7);
+        assert_eq!(requeued.reroll_count, 3);
+        assert_eq!(requeued.spend_usd, 12.75);
+        assert_eq!(requeued.pr_number, Some(888));
+        assert_eq!(requeued.is_adopted, true);
+        assert_eq!(requeued.spawn_failure_count, 2);
+        assert_eq!(
+            requeued.pre_session_head_sha.as_deref(),
+            Some("abc123def456")
+        );
+        assert_eq!(
+            requeued.park_reason.as_deref(),
+            Some("previous_coder_silent")
+        );
+        assert_eq!(
+            requeued.target_repo.as_deref(),
+            Some("jleechanorg/other-repo")
+        );
+    }
 }
