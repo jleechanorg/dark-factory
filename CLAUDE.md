@@ -75,10 +75,6 @@ no coding sub-agent lanes. The session's ONLY jobs:
    label→merge E2E proof unfalsifiable (2026-07-11/12 incidents: hand-driven
    PRs masked a dead coder loop for a full day).
 
-The only direct actions permitted: merge clicks where the session holds merge
-authority, and operator-authorized NAMED exceptions recorded on the mission
-bead.
-
 ## Setup
 
 ```bash

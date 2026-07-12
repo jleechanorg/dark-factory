@@ -180,32 +180,20 @@ Do not always use `minimal_feature.dot` or `gates.dot` by default.
 .venv/bin/python -m pytest tests/test_engine.py -k green
 ```
 
-## Factory-first work routing (/af) — the factory does the work, not the orchestrator
+## /af — ZERO direct work; monitoring only (operator hard rule)
 
-When the operator directs work through /af (or sets a goal that says so), the
-default is FACTORY-FIRST: every product work item becomes a `factory`-labeled
-bead (with `target_repo:` / `existing_pr:` / `existing_branch:` body fields
-when driving an existing PR) and the DAEMON's intake→route→dispatch→verify
-loop does the work. The orchestrating session (Claude/Codex/Gemini, human or
-agent) does NOT implement product changes directly.
+When the operator directs work through /af (or sets an /af goal), the session
+does **ZERO direct work** — no product code, no factory code, no hand-fixes,
+no coding sub-agent lanes. The session's ONLY jobs:
 
-The orchestrator's legitimate jobs are exactly:
-1. Filing/refining beads and acceptance criteria (specs are the scarce artifact).
-2. Merge authority + deploy-verify on factory-infrastructure PRs.
-3. Unblocking the factory itself: fixing daemon/runner bugs THAT THE FACTORY
-   CANNOT YET SELF-APPLY, each such exception noted on the mission bead with
-   one line of justification.
-4. Verification and gate escalations (requesting reviews, triggering workflows
-   the pipeline cannot yet trigger — file a bead for the gap at the same time).
-
-Red flags that you are violating factory-first (stop and file a bead instead):
-- You are editing product-repo code in a worktree the daemon did not dispatch.
-- You are about to "quickly fix" a review finding on a product PR yourself.
-- You dispatched a sub-agent to do coding work that a factory bead could carry.
-
-Why this is a hard rule: the factory only gets better when its failures are
-exercised and fixed; every hand-done work item hides a factory gap and makes
-the E2E proof (label→merge with zero human steering) unfalsifiable. 2026-07-11
-incident: an orchestrating session hand-drove multiple PRs while the factory's
-coder loop was broken — the goal was only rescued by rebuilding dispatch
-(dark-factory PRs #245/#247/#249/#250) and re-routing work through beads.
+1. File/refine `factory`-labeled beads (SHORT descriptions — AO's spawn
+   prompt cap is 4096 characters; a long bead body makes its own dispatch
+   fail) with `target_repo:` / `existing_pr:` / `existing_branch:` fields
+   when driving an existing PR.
+2. Monitor daemon telemetry (`~/Library/Logs/dark-factory/daemon.jsonl`) and
+   report each lifecycle stage.
+3. Escalate blockers the factory cannot self-fix to the OPERATOR, naming the
+   exact blocker — never hand-fix them. "The factory is broken so I'll do it
+   myself" is the forbidden move: it hides factory gaps and makes the
+   label→merge E2E proof unfalsifiable (2026-07-11/12 incidents: hand-driven
+   PRs masked a dead coder loop for a full day).
