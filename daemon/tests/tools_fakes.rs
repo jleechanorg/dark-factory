@@ -6,7 +6,8 @@ mod common;
 use common::{FakeLlm, FakeScm, FakeSessions, FakeTracker, FakeVcs};
 use daemon::tools::Llm;
 use daemon::tools::{
-    Bead, Issue, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs,
+    Bead, BeadStatus, Issue, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker,
+    Vcs,
 };
 
 #[test]
@@ -24,6 +25,11 @@ fn fake_tracker_records_calls_and_returns_scripted_response() {
         create_bead_fail_for_ref: Default::default(),
         fail_next_fetch_candidates: Default::default(),
         fail_next_comment: Default::default(),
+        bead_statuses: {
+            let mut m = std::collections::HashMap::new();
+            m.insert("b1".to_string(), Some(BeadStatus::Active));
+            std::cell::RefCell::new(m)
+        },
         calls: Default::default(),
     };
 
@@ -36,11 +42,15 @@ fn fake_tracker_records_calls_and_returns_scripted_response() {
 
     fake.comment_external("owner/repo#5", "hello").unwrap();
 
+    let status = fake.bead_status("b1").unwrap();
+    assert_eq!(status, Some(BeadStatus::Active));
+
     let calls = fake.calls.borrow();
-    assert_eq!(calls.len(), 3);
+    assert_eq!(calls.len(), 4);
     assert_eq!(calls[0], "fetch_candidates");
     assert!(calls[1].starts_with("create_bead("));
     assert!(calls[2].starts_with("comment_external("));
+    assert!(calls[3].starts_with("bead_status("));
 }
 
 #[test]

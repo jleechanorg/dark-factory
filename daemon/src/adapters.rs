@@ -139,6 +139,95 @@ impl Tracker for CliTracker {
             )))
         }
     }
+
+    fn bead_status(&self, bead_id: &str) -> Result<Option<crate::tools::BeadStatus>, DaemonError> {
+        let out = match run_tool("br", &["show", bead_id, "--json"], 30) {
+            Ok(o) => o,
+            Err(e) => {
+                return if is_bead_missing_error(&e) {
+                    Ok(None)
+                } else {
+                    Err(e)
+                };
+            }
+        };
+        let trimmed = out.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let status: String = if let Some(arr_start) = trimmed.find('[') {
+            if arr_start == 0 || trimmed[..arr_start].trim().is_empty() {
+                let arr: Vec<serde_json::Value> =
+                    serde_json::from_str(&trimmed[arr_start..]).map_err(|e| {
+                        DaemonError::Parse(format!(
+                            "failed to parse br show array JSON for {bead_id}: {e}"
+                        ))
+                    })?;
+                if arr.is_empty() {
+                    return Ok(None);
+                }
+                arr[0]
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| {
+                        DaemonError::Parse(format!(
+                            "br show array missing status field for {bead_id}"
+                        ))
+                    })?
+            } else {
+                return Err(DaemonError::Parse(format!(
+                    "unexpected br show output for {bead_id}: {trimmed}"
+                )));
+            }
+        } else if let Some(json_start) = trimmed.find('{') {
+            #[derive(serde::Deserialize)]
+            struct BrShow {
+                status: String,
+            }
+            let data: BrShow =
+                serde_json::from_str(&trimmed[json_start..]).map_err(|e| {
+                    DaemonError::Parse(format!("failed to parse br show JSON for {bead_id}: {e}"))
+                })?;
+            data.status
+        } else {
+            return Err(DaemonError::Parse(format!(
+                "no JSON object or array in br show output for {bead_id}: {out}"
+            )));
+        };
+        Ok(Some(classify_bead_status(
+            bead_id,
+            status.to_ascii_lowercase().as_str(),
+        )?))
+    }
+}
+
+fn is_bead_missing_error(err: &DaemonError) -> bool {
+    match err {
+        DaemonError::Tool { rc, stderr, .. } if *rc != 0 => {
+            stderr.to_lowercase().contains("not found") || stderr.to_lowercase().contains("no such")
+        }
+        _ => false,
+    }
+}
+
+fn classify_bead_status(
+    bead_id: &str,
+    status: &str,
+) -> Result<crate::tools::BeadStatus, DaemonError> {
+    match status {
+        "open" => Ok(crate::tools::BeadStatus::Open),
+        "in_progress" | "blocked" | "deferred" | "active" | "reopened" | "awaiting_review"
+        | "review" => Ok(crate::tools::BeadStatus::Active),
+        "closed" | "completed" | "done" | "resolved" | "merged" => {
+            Ok(crate::tools::BeadStatus::Closed)
+        }
+        other => Err(DaemonError::Parse(format!(
+            "unknown bead status '{other}' for {bead_id}; \
+             expected open / in_progress / blocked / deferred / closed / completed / done or a known \
+             active or terminal status"
+        ))),
+    }
 }
 
 /// Parse `external_ref` values from `br list --json` output.
@@ -3125,6 +3214,31 @@ impl Sessions for CliSessions {
         session_is_quiescent(&data, id)
     }
 
+    /// jleechan-xsg4 (issue #270): authoritative session liveness for stale
+    /// DISPATCHED recovery. Same `ao status --json` parsing shape as
+    /// `is_quiescent`, but ONLY "exited" or "missing" is considered dead.
+    /// A session in "ready" state is alive — the coder is working —
+    /// and must NOT be requeued. Transient errors propagate so the caller
+    /// can skip-recover (a single probe failure must never falsely requeue
+    /// a live session).
+    fn is_session_dead(&self, id: &SessionId) -> Result<bool, DaemonError> {
+        let out = run_tool("ao", &["status", "--json"], 30)?;
+        let json_start = out.find('[').unwrap_or(0);
+        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse ao status: {e}"))
+        })?;
+        if let Some(arr) = data.as_array() {
+            for entry in arr {
+                if entry.get("name").and_then(|v| v.as_str()) == Some(&id.0) {
+                    if let Some(activity) = entry.get("activity").and_then(|v| v.as_str()) {
+                        return Ok(activity == "exited" || activity == "missing");
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// jleechan-5ia2: `ao status --json` already reports each session's
     /// `branch` field (verified live: `ao status --json | jq '.[].branch'`).
     /// Reuse the same parsing shape as `is_quiescent` above. Any failure to
@@ -4074,6 +4188,113 @@ pub fn ci_success_from_check_buckets(buckets: &[&str], iteration_stub: bool) -> 
             .all(|b| matches!(*b, "pass" | "skipping" | "pending"))
     } else {
         buckets.iter().all(|b| matches!(*b, "pass" | "skipping"))
+    }
+}
+
+#[cfg(test)]
+mod bead_status_tests {
+    use super::{classify_bead_status, is_bead_missing_error};
+    use crate::errors::DaemonError;
+    use crate::tools::BeadStatus;
+
+    #[test]
+    fn classify_open_returns_open() {
+        match classify_bead_status("b1", "open").unwrap() {
+            BeadStatus::Open => {}
+            other => panic!("expected Open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_in_progress_returns_active() {
+        match classify_bead_status("b1", "in_progress").unwrap() {
+            BeadStatus::Active => {}
+            other => panic!("expected Active, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_closed_returns_closed() {
+        match classify_bead_status("b1", "closed").unwrap() {
+            BeadStatus::Closed => {}
+            other => panic!("expected Closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_completed_returns_closed() {
+        match classify_bead_status("b1", "completed").unwrap() {
+            BeadStatus::Closed => {}
+            other => panic!("expected Closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_unknown_status_is_parse_error() {
+        let r = classify_bead_status("b1", "bogus");
+        assert!(matches!(r, Err(DaemonError::Parse(_))));
+    }
+
+    #[test]
+    fn classify_is_case_sensitive_requiring_pre_lowercased_input() {
+        assert_eq!(classify_bead_status("b1", "open").unwrap(), BeadStatus::Open);
+        assert_eq!(classify_bead_status("b1", "closed").unwrap(), BeadStatus::Closed);
+        assert!(matches!(
+            classify_bead_status("b1", "OPEN"),
+            Err(DaemonError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn is_bead_missing_detects_not_found_tool_error() {
+        let err = DaemonError::Tool {
+            tool: "br".into(),
+            rc: 1,
+            stderr: "Error: bead not found in database".into(),
+        };
+        assert!(is_bead_missing_error(&err));
+    }
+
+    #[test]
+    fn is_bead_missing_detects_no_such_tool_error() {
+        let err = DaemonError::Tool {
+            tool: "br".into(),
+            rc: 1,
+            stderr: "no such bead".into(),
+        };
+        assert!(is_bead_missing_error(&err));
+    }
+
+    #[test]
+    fn is_bead_missing_rejects_transient_error() {
+        let err = DaemonError::Tool {
+            tool: "br".into(),
+            rc: 1,
+            stderr: "connection refused".into(),
+        };
+        assert!(!is_bead_missing_error(&err));
+    }
+
+    #[test]
+    fn is_bead_missing_rejects_config_error() {
+        let err = DaemonError::Config("bad config".into());
+        assert!(!is_bead_missing_error(&err));
+    }
+
+    #[test]
+    fn is_bead_missing_rejects_success_exit() {
+        let err = DaemonError::Tool {
+            tool: "br".into(),
+            rc: 0,
+            stderr: "no error".into(),
+        };
+        assert!(!is_bead_missing_error(&err));
+    }
+
+    #[test]
+    fn is_bead_missing_rejects_parse_error() {
+        let err = DaemonError::Parse("parse error".into());
+        assert!(!is_bead_missing_error(&err));
     }
 }
 
