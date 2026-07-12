@@ -510,7 +510,18 @@ pub fn run_tick(
                 if !overlay.is_adopted {
                     if let Some(ref branch) = overlay.branch {
                         if overlay.autonomy_secs >= 1800 {
-                            let last_commit_epoch = deps.scm.remote_branch_last_commit(branch)?;
+                            // jleechan-bqdv Stage C: poll the bead's OWN
+                            // resolved repo (`overlay.repo(cfg)`), not
+                            // `cfg.target_repo` directly. Before this fix, a
+                            // bead dispatched into a non-default `[repos.*]`
+                            // repo was watched against the wrong repo's
+                            // branch history — the coder-silence watcher
+                            // could never observe real progress and would
+                            // eventually park a perfectly healthy, actively
+                            // pushing coder as `coder_silent`.
+                            let last_commit_epoch = deps
+                                .scm
+                                .remote_branch_last_commit_for_repo(overlay.repo(deps.cfg), branch)?;
                             let now_epoch = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -1301,6 +1312,93 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     "ESCALATION_REQUIRED",
                     serde_json::json!({}),
                     serde_json::json!({"reason": "unmapped_target_repo"}),
+                )?;
+                continue;
+            }
+
+            if failure.phase == "worktree_remote_mismatch" {
+                // jleechan-bqdv Stage C: mirrors the `unmapped_target_repo`
+                // idiom immediately above. `dispatch::dispatch_ready` already
+                // parked this bead HUMAN_HELD (and killed the mismatched
+                // session) on disk before returning this failure — it has no
+                // `Tracker`/`Scm` access to post a comment itself (same
+                // module-boundary reason as every other dispatch.rs park).
+                // Record the state-transition fact unconditionally, then
+                // best-effort escalate exactly once so this NEVER falls
+                // through to the generic `BEAD_DISPATCH_TRANSIENT_ERROR`
+                // branch below (which would misreport a genuinely
+                // HUMAN_HELD, non-transient park as retryable and post no
+                // escalation comment — the exact anti-pattern jleechan-35y4's
+                // review fixed for `unmapped_target_repo`).
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "worktree_remote_mismatch",
+                        "branch": failure.branch.as_deref(),
+                        "error": failure.error.as_str(),
+                    }),
+                )?;
+                if escalation_already_recorded(deps, &failure.bead_id)? {
+                    continue;
+                }
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: bead `{}`'s spawned worktree had a git remote that does NOT match the bead's resolved repo. Automation killed the session and parked it HUMAN_HELD rather than risk the coder pushing to the wrong repo (jleechan-9sh5 / jleechan-bqdv); please verify the target AO project's local checkout/remotes before requeuing. Details: {}",
+                    failure.bead_id,
+                    failure.error.as_str()
+                );
+                if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
+                {
+                    if is_missing_scm_target_error(&err) {
+                        record_local_escalation_fallback(
+                            deps,
+                            &failure.bead_id,
+                            "worktree_remote_mismatch",
+                        )?;
+                        summary.beads_escalated_locally += 1;
+                        emit(
+                            deps.telemetry_log,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "ESCALATED_LOCALLY",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "worktree_remote_mismatch",
+                                "scm_error": err.to_string(),
+                            }),
+                        )?;
+                        continue;
+                    }
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_NOTIFICATION_FAILED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "worktree_remote_mismatch",
+                            "error": err.to_string(),
+                        }),
+                    )?;
+                    continue;
+                }
+                record_escalation(deps, &failure.bead_id, "worktree_remote_mismatch")?;
+                summary.beads_escalated += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "ESCALATION_REQUIRED",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "worktree_remote_mismatch"}),
                 )?;
                 continue;
             }

@@ -8,7 +8,26 @@ use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::router::RoutingVerdict;
 use crate::state::{BeadOverlay, OverlayState, StateStore};
-use crate::tools::{Bead, Sessions, SpawnSpec};
+use crate::tools::{remote_url_matches_repo, Bead, Sessions, SpawnSpec};
+
+/// Coder-dispatch prompt preamble (bead jleechan-bqdv, Stage C of the
+/// multi-repo dispatch fix — see
+/// `docs/multirepo-dispatch-investigation-2026-07-11.md`; supersedes
+/// jleechan-9sh5). States the repo, the EXACT remote name to push to (from
+/// `Config::resolve_repo`'s `RepoRouting.push_remote` — never assumed to be
+/// `origin`), the branch, and the literal push command as text, so a coder
+/// spawned into a dual-remote worktree (`origin=jleechanclaw`,
+/// `worldai=worldarchitect.ai`) cannot silently default to the wrong remote
+/// (the near-miss wa-3086 root cause). Prepended to every dispatch prompt
+/// variant so it survives regardless of routing verdict.
+fn dispatch_prompt_preamble(repo: &str, remote: &str, branch: &str) -> String {
+    format!(
+        "Repo: {repo}\n\
+         Remote: {remote}\n\
+         Branch: {branch}\n\
+         Push command (run this verbatim, never a bare `git push` or a different remote): git push {remote} {branch}\n\n"
+    )
+}
 
 /// Bounded retry cap for transient `Sessions::spawn` failures (follow-up to
 /// #198's dispatch-batch-isolation fix). #198 fixed the batch-abort bug but
@@ -225,20 +244,27 @@ pub fn dispatch_ready(
             return Err(err);
         }
 
+        let preamble = dispatch_prompt_preamble(&repo, &routing.push_remote, &branch);
         let prompt = match verdict {
             RoutingVerdict::ResearchPath => {
                 format!(
-                    "Route to RESEARCH_PATH: Run /factory with pipelines/slim/minimal_research.dot to research: {}",
+                    "{preamble}Route to RESEARCH_PATH: Run /factory with pipelines/slim/minimal_research.dot to research: {}",
                     bead.title
                 )
             }
             RoutingVerdict::GenericPath => {
                 format!(
-                    "Route to GENERIC_PATH: Run /factory with pipelines/slim/spec_gen.dot to handle: {}",
+                    "{preamble}Route to GENERIC_PATH: Run /factory with pipelines/slim/spec_gen.dot to handle: {}",
                     bead.title
                 )
             }
-            _ => build_coder_prompt(bead, &branch, &cfg.target_repo),
+            // jleechan-bqdv Stage C: `build_coder_prompt` (jleechan-if09,
+            // PR #247) now takes the bead's RESOLVED repo (`repo`, from
+            // Stage A/B — not the bare `cfg.target_repo` #247 used as an
+            // interim mitigation before this bead's `[repos]` plumbing
+            // existed) plus the exact `routing.push_remote`, closing the
+            // gap #247's doc comment explicitly deferred to this bead.
+            _ => build_coder_prompt(bead, &branch, &repo, &routing.push_remote),
         };
 
         let spec = SpawnSpec {
@@ -361,6 +387,53 @@ pub fn dispatch_ready(
             }
         }
 
+        // jleechan-bqdv Stage C: spawn-time worktree remote assertion — the
+        // jleechan-9sh5 proper fix. Unlike `session_branch` above (whose
+        // mismatch may belong to someone else's legitimate session, so it is
+        // never killed), a worktree-remote mismatch on the session we JUST
+        // spawned (branch already confirmed to match, immediately above) is
+        // provably ours: `sessions.stop` is called and any failure to kill it
+        // is fatal (propagated via `?`) rather than swallowed, because a live,
+        // untracked, wrong-repo coder session is exactly the near-miss that
+        // almost pushed wa-3086 to jleechanclaw instead of dark-factory.
+        // `Ok(None)` from `worktree_remote_url` ("cannot verify" — worktree
+        // not yet visible, adapter doesn't implement the check) is trust-it,
+        // matching its documented contract. `remote_url_matches_repo` ALSO
+        // returns `None` for a URL form it can't parse (a different host,
+        // GitHub Enterprise, an unusual scheme) — adversarial review of this
+        // PR caught an earlier version collapsing that into the SAME `false`
+        // a confirmed-wrong-repo URL produces, which would have killed a
+        // perfectly correct session over a merely-unrecognized URL flavor.
+        // Only `Some(false)` — a RECOGNIZED github.com URL naming a
+        // different repo — is a positively confirmed mismatch; `None` (from
+        // either function) must trust-it exactly like the `session_branch`
+        // check above.
+        if let Ok(Some(remote_url)) =
+            sessions.worktree_remote_url(&routing.ao_project, &branch, &routing.push_remote)
+        {
+            if remote_url_matches_repo(&remote_url, &repo) == Some(false) {
+                sessions.stop(&session_id)?;
+                overlay.state = OverlayState::HumanHeld;
+                overlay.session_id = None;
+                overlay.park_reason = Some("worktree_remote_mismatch".to_string());
+                store.save(&overlay)?;
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    Some(branch.clone()),
+                    "worktree_remote_mismatch",
+                    DaemonError::Config(format!(
+                        "spawned worktree for bead {} (branch {branch:?}) has remote {:?} pointing at \
+                         {remote_url:?}, which does not match the bead's resolved repo {repo:?}. \
+                         Killed the session and parked HUMAN_HELD rather than risk the coder pushing to \
+                         the wrong repo (jleechan-9sh5 discipline).",
+                        bead.id, routing.push_remote
+                    )),
+                ));
+                continue;
+            }
+        }
+
         overlay.state = OverlayState::Dispatched;
         overlay.session_id = Some(session_id.0.clone());
         // Real progress: whatever was previously blocking spawn (session cap,
@@ -432,10 +505,15 @@ const CODER_PROMPT_TREE_CAP: usize = 3_000;
 /// requirements), and the bounded file-tree summary already rendered for
 /// the router (grep-before-inventing orientation).
 ///
-/// Deliberately NOT here (Stage C, jleechan-bqdv): per-repo remote names
-/// and spawn-time remote assertions — those need the `[repos]` config table
-/// from jleechan-35y4. Until then the prompt names the repo and instructs
-/// the coder to verify its push remote targets that repo before pushing.
+/// jleechan-bqdv Stage C closes the gap this function's original jleechan-if09
+/// version left open: the prompt now states the EXACT remote name
+/// (`Config::resolve_repo`'s `RepoRouting.push_remote` — never assumed to be
+/// `origin`) and the literal `git push <remote> <branch>` command, instead of
+/// telling the coder to self-verify via `git remote -v`. Spawn-time
+/// verification of that same remote (`dispatch_ready`'s
+/// `Sessions::worktree_remote_url` check, right after `spawn()` returns) is
+/// the mechanical backstop for this prompt-level instruction.
+///
 /// Truncate `s` to at most `cap` bytes without splitting a UTF-8 character
 /// (`String::truncate` panics on a non-char-boundary — bead bodies routinely
 /// contain multi-byte unicode).
@@ -450,7 +528,7 @@ fn truncate_at_char_boundary(s: &mut String, cap: usize) {
     s.truncate(n);
 }
 
-fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str) -> String {
+fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str, remote: &str) -> String {
     let mut description = bead.description.trim().to_string();
     if description.len() > CODER_PROMPT_DESCRIPTION_CAP {
         truncate_at_char_boundary(&mut description, CODER_PROMPT_DESCRIPTION_CAP);
@@ -494,12 +572,14 @@ fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str
          {description_block}{external_block}\
          \n\
          REPO: {target_repo} — all commits, pushes, and the PR belong to this \
-         repo and no other. Before your first push, verify your worktree's \
-         push remote actually targets {target_repo} (`git remote -v`); if no \
-         remote does, STOP and report the mismatch instead of pushing.\n\
+         repo and no other.\n\
+         REMOTE: {remote} — this is the EXACT remote name to push to; do not \
+         guess, do not assume `origin`, and do not use any other remote your \
+         worktree happens to have configured, even if one exists.\n\
          BRANCH: {branch} — the daemon watches this exact branch on \
          {target_repo} for your commits. Push to it after EVERY green unit of \
          work; never hold more than ~30 minutes of uncommitted changes.\n\
+         PUSH COMMAND (run this verbatim, never a bare `git push`): git push {remote} {branch}\n\
          \n\
          DELIVERABLE: a pull request from {branch} to the default branch of \
          {target_repo} containing the completed task, with tests proving the \
@@ -557,10 +637,19 @@ mod tests {
         // returning a session whose live branch does NOT match what was
         // requested (the wa-3004 contamination scenario).
         scripted_branch: RefCell<HashMap<String, String>>,
-        // jleechan-if09: captured SpawnSpec.prompt per spawn, so tests can
-        // pin what the coder actually receives (the wiring, not just the
-        // builder function).
-        prompts: RefCell<Vec<String>>,
+        /// jleechan-bqdv Stage C: captures every `(bead_id, prompt)` passed
+        /// to `spawn()`, so the dispatch-prompt-content acceptance test can
+        /// assert on the exact rendered prompt string without needing
+        /// `Sessions::spawn` to do anything else differently. Supersedes
+        /// jleechan-if09's narrower `prompts: RefCell<Vec<String>>` (same
+        /// purpose, plus the bead id).
+        spawn_prompts: RefCell<Vec<(String, String)>>,
+        /// jleechan-bqdv Stage C: scripted `worktree_remote_url` override,
+        /// keyed by `ao_project`. Empty by default (matches the trait's
+        /// `Ok(None)` default — "cannot verify") so every pre-existing test
+        /// keeps trusting a fresh spawn unconditionally; only the
+        /// worktree-remote-mismatch regression tests populate this.
+        scripted_worktree_remote: RefCell<HashMap<String, String>>,
     }
 
     impl FakeSessions {
@@ -574,7 +663,8 @@ mod tests {
                 fail_spawn_fallback_exhausted_deferred_for: RefCell::new(Vec::new()),
                 fail_stop_for: RefCell::new(Vec::new()),
                 scripted_branch: RefCell::new(HashMap::new()),
-                prompts: RefCell::new(Vec::new()),
+                spawn_prompts: RefCell::new(Vec::new()),
+                scripted_worktree_remote: RefCell::new(HashMap::new()),
             }
         }
 
@@ -611,6 +701,15 @@ mod tests {
                 .borrow_mut()
                 .insert(session_id.to_string(), branch.to_string());
         }
+
+        /// Script `worktree_remote_url` to report `url` for any call whose
+        /// `ao_project` argument is `ao_project`, instead of the default
+        /// "cannot verify" (`Ok(None)`).
+        fn set_worktree_remote(&self, ao_project: &str, url: &str) {
+            self.scripted_worktree_remote
+                .borrow_mut()
+                .insert(ao_project.to_string(), url.to_string());
+        }
     }
 
     impl Sessions for FakeSessions {
@@ -623,7 +722,9 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("spawn({})", spec.bead_id));
-            self.prompts.borrow_mut().push(spec.prompt.clone());
+            self.spawn_prompts
+                .borrow_mut()
+                .push((spec.bead_id.clone(), spec.prompt.clone()));
             if self.fail_spawn_fatal_for.borrow().contains(&spec.bead_id) {
                 return Err(DaemonError::Parse(format!(
                     "scripted fatal spawn failure for {}",
@@ -707,6 +808,22 @@ mod tests {
                 .borrow_mut()
                 .push(format!("session_branch({})", id.0));
             Ok(self.scripted_branch.borrow().get(&id.0).cloned())
+        }
+
+        fn worktree_remote_url(
+            &self,
+            ao_project: &str,
+            branch: &str,
+            remote_name: &str,
+        ) -> Result<Option<String>, DaemonError> {
+            self.calls.borrow_mut().push(format!(
+                "worktree_remote_url({ao_project},{branch},{remote_name})"
+            ));
+            Ok(self
+                .scripted_worktree_remote
+                .borrow()
+                .get(ao_project)
+                .cloned())
         }
     }
 
@@ -1559,8 +1676,10 @@ mod tests {
         );
     }
 
-    // jleechan-if09: the coder prompt must carry the full working contract,
-    // not just the bead title.
+    // jleechan-if09 (PR #247): the coder prompt must carry the full working
+    // contract, not just the bead title. Updated for jleechan-bqdv Stage C's
+    // `remote` parameter and its exact-remote/literal-push-command text
+    // (superseding #247's interim `git remote -v` self-check instruction).
     #[test]
     fn coder_prompt_carries_description_repo_branch_and_rules() {
         let bead = Bead {
@@ -1570,7 +1689,7 @@ mod tests {
             file_tree_summary: "src/\n  flux.rs\n  main.rs".into(),
             external_ref: Some("jleechanorg/delorean#42".into()),
         };
-        let prompt = build_coder_prompt(&bead, "factory/bead-x-r1", "jleechanorg/delorean");
+        let prompt = build_coder_prompt(&bead, "factory/bead-x-r1", "jleechanorg/delorean", "worldai");
 
         assert!(prompt.contains("Fix the flux capacitor"), "title missing");
         assert!(
@@ -1586,8 +1705,12 @@ mod tests {
             "watched branch missing — coder can't know where the daemon looks"
         );
         assert!(
-            prompt.contains("git remote -v"),
-            "remote self-check instruction missing (pre-Stage-C mitigation for jleechan-9sh5)"
+            prompt.contains("REMOTE: worldai"),
+            "exact remote name missing (jleechan-bqdv Stage C closes the #247 'git remote -v self-check' gap)"
+        );
+        assert!(
+            prompt.contains("git push worldai factory/bead-x-r1"),
+            "literal push command missing: {prompt}"
         );
         assert!(
             prompt.contains("Do NOT merge"),
@@ -1613,7 +1736,7 @@ mod tests {
             file_tree_summary: String::new(),
             external_ref: None,
         };
-        let prompt = build_coder_prompt(&bead, "factory/bead-y-r1", "owner/repo");
+        let prompt = build_coder_prompt(&bead, "factory/bead-y-r1", "owner/repo", "origin");
 
         assert!(
             prompt.contains("[description truncated]"),
@@ -1643,7 +1766,7 @@ mod tests {
             external_ref: None,
         };
         // Must not panic.
-        let prompt = build_coder_prompt(&bead, "factory/bead-u-r1", "owner/repo");
+        let prompt = build_coder_prompt(&bead, "factory/bead-u-r1", "owner/repo", "origin");
         assert!(prompt.contains("[description truncated]"));
     }
 
@@ -1667,11 +1790,11 @@ mod tests {
         )];
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
         assert_eq!(report.success_count(), 1);
-        let prompts = sessions.prompts.borrow();
+        let prompts = sessions.spawn_prompts.borrow();
         assert!(
-            prompts[0].starts_with("Route to RESEARCH_PATH"),
+            prompts[0].1.contains("Route to RESEARCH_PATH"),
             "routed paths keep their pipeline prompts: {}",
-            prompts[0]
+            prompts[0].1
         );
     }
 
@@ -1695,11 +1818,247 @@ mod tests {
         )];
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
         assert_eq!(report.success_count(), 1);
-        let prompts = sessions.prompts.borrow();
+        let prompts = sessions.spawn_prompts.borrow();
         assert!(
-            prompts[0].contains("acceptance: it works") && prompts[0].contains("Do NOT merge"),
+            prompts[0].1.contains("acceptance: it works") && prompts[0].1.contains("Do NOT merge"),
             "spawned prompt must be the enriched coder prompt, got: {}",
-            prompts[0]
+            prompts[0].1
         );
+    }
+
+    // jleechan-bqdv Stage C acceptance criteria.
+
+    /// (a) The dispatch prompt, given a bead resolved to a specific
+    /// repo/remote, actually contains the repo name, remote name, and
+    /// literal push command text — so the spawned coder never has to guess
+    /// (or default to `origin`) which remote to push to. The default
+    /// (StandardPath) arm renders through `build_coder_prompt`
+    /// (jleechan-if09 + Stage C), which uses UPPERCASE `REPO:`/`REMOTE:`/
+    /// `BRANCH:` labels — distinct from `dispatch_prompt_preamble`'s
+    /// lowercase labels, which only the ResearchPath/GenericPath arms use.
+    #[test]
+    fn dispatch_prompt_states_repo_remote_branch_and_literal_push_command() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(report.success_count(), 1);
+
+        let prompts = sessions.spawn_prompts.borrow();
+        assert_eq!(prompts.len(), 1);
+        let prompt = &prompts[0].1;
+        assert!(prompt.contains("REPO: owner/repo"), "prompt: {prompt}");
+        assert!(prompt.contains("REMOTE: origin"), "prompt: {prompt}");
+        assert!(prompt.contains("BRANCH: factory/bead-0-r1"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("git push origin factory/bead-0-r1"),
+            "prompt must state the literal push command verbatim: {prompt}"
+        );
+    }
+
+    /// Same acceptance criterion for a non-default `[repos.*]`-mapped repo:
+    /// the rendered prompt must use THAT entry's `push_remote`, not
+    /// `"origin"`.
+    #[test]
+    fn dispatch_prompt_uses_repos_table_remote_for_non_global_repo() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
+            })
+            .unwrap();
+        let mut cfg = cfg();
+        cfg.repos.insert(
+            "jleechanorg/worldarchitect.ai".to_string(),
+            crate::config::RepoConfig {
+                ao_project: "worldarchitect".to_string(),
+                push_remote: "worldai".to_string(),
+            },
+        );
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(report.success_count(), 1);
+
+        let prompts = sessions.spawn_prompts.borrow();
+        let prompt = &prompts[0].1;
+        assert!(prompt.contains("REPO: jleechanorg/worldarchitect.ai"), "prompt: {prompt}");
+        assert!(prompt.contains("REMOTE: worldai"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("git push worldai factory/bead-0-r1"),
+            "prompt must use the [repos.*] entry's push_remote, not origin: {prompt}"
+        );
+    }
+
+    /// (b) A remote mismatch at spawn time must be caught: the daemon kills
+    /// the just-spawned session (it is provably ours — branch already
+    /// confirmed to match), parks the bead HUMAN_HELD with reason
+    /// `worktree_remote_mismatch`, and reports a distinct failure phase
+    /// rather than silently trusting the dispatch.
+    #[test]
+    fn worktree_remote_mismatch_kills_session_and_parks_human_held() {
+        let sessions = FakeSessions::new(0);
+        // cfg().target_repo == "owner/repo" derives ao_project "repo" via
+        // Config::resolve_repo's legacy fallback (no explicit ao_project).
+        sessions.set_worktree_remote("repo", "https://github.com/wrong-owner/wrong-repo.git");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            0,
+            "a worktree-remote mismatch must never count as a successful dispatch"
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-0");
+        assert_eq!(report.failures[0].phase, "worktree_remote_mismatch");
+        assert!(
+            report.failures[0].error.contains("wrong-owner/wrong-repo"),
+            "error should name the observed mismatched remote: {}",
+            report.failures[0].error
+        );
+
+        let calls = sessions.calls.borrow();
+        assert!(
+            calls.iter().any(|c| c == "stop(fake-session-1)"),
+            "a confirmed wrong-repo session (provably ours) must be killed: {calls:?}"
+        );
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("worktree_remote_mismatch")
+        );
+        assert_eq!(overlay.session_id, None);
+    }
+
+    /// (c) A matching remote must pass through cleanly: no park, no stop
+    /// call, the bead reaches DISPATCHED exactly as it would have before
+    /// this check existed.
+    #[test]
+    fn worktree_remote_match_passes_through_cleanly() {
+        let sessions = FakeSessions::new(0);
+        sessions.set_worktree_remote("repo", "https://github.com/owner/repo.git");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        assert!(report.failures.is_empty());
+
+        let calls = sessions.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("stop(")),
+            "a matching remote must never be stopped: {calls:?}"
+        );
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Dispatched);
+        assert_eq!(overlay.park_reason, None);
+    }
+
+    /// Failure to kill a confirmed wrong-repo session must be fatal (not
+    /// swallowed) — a live, untracked, wrong-repo coder session is exactly
+    /// the near-miss this bead exists to prevent, so the daemon must not
+    /// silently continue as if nothing happened.
+    #[test]
+    fn worktree_remote_mismatch_stop_failure_is_fatal() {
+        let sessions = FakeSessions::new(0);
+        sessions.set_worktree_remote("repo", "https://github.com/wrong-owner/wrong-repo.git");
+        sessions.fail_stop_for("fake-session-1");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        assert!(
+            matches!(err, DaemonError::Tool { .. }),
+            "failure to kill a confirmed wrong-repo session must be fatal: {err:?}"
+        );
+
+        let calls = sessions.calls.borrow();
+        assert!(calls.iter().any(|c| c == "stop(fake-session-1)"));
+    }
+
+    /// An adapter that cannot verify the worktree's remote (`Ok(None)` — the
+    /// default for every fake/impl predating this check) must never block a
+    /// dispatch: "cannot verify" is trust-it, matching `session_branch`'s
+    /// established contract for this class of post-spawn check.
+    #[test]
+    fn worktree_remote_cannot_verify_does_not_block_dispatch() {
+        let sessions = FakeSessions::new(0);
+        // No `set_worktree_remote` call: default is Ok(None) ("cannot verify").
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Dispatched);
+    }
+
+    /// Adversarial review finding (independent Claude review of this PR):
+    /// a remote URL in a form `remote_url_matches_repo` cannot recognize
+    /// (e.g. a different git host, GitHub Enterprise) returns `None`
+    /// ("cannot determine") — the dispatch-time check must trust-it exactly
+    /// like the `Ok(None)` "worktree not visible yet" case, NEVER treat an
+    /// unrecognized format as a confirmed mismatch. Before this fix,
+    /// `remote_url_matches_repo` returned a bare `false` for both "confirmed
+    /// wrong repo" AND "couldn't parse this URL", which would have killed a
+    /// perfectly correct session merely for using an unrecognized URL
+    /// flavor.
+    #[test]
+    fn worktree_remote_unrecognized_url_format_does_not_block_dispatch() {
+        let sessions = FakeSessions::new(0);
+        // A real, live github.com URL, but for a GitHub Enterprise-style
+        // host `remote_url_matches_repo` doesn't parse — NOT a recognized
+        // mismatch, just unparseable.
+        sessions.set_worktree_remote(
+            "repo",
+            "https://github.enterprise.example.com/owner/repo.git",
+        );
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            1,
+            "an unrecognized (unparseable) URL format must never be treated as a confirmed mismatch"
+        );
+        assert!(report.failures.is_empty());
+        let calls = sessions.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("stop(")),
+            "an indeterminate remote-url comparison must never kill the session: {calls:?}"
+        );
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Dispatched);
     }
 }

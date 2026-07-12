@@ -768,6 +768,16 @@ impl StateStore for SqliteStateStore {
         // operator adds the missing config entry — silently defeating the
         // "fail loud, never guess" intent `dispatch::dispatch_ready`'s
         // unmapped-repo park is supposed to provide.
+        //
+        // bead jleechan-bqdv Stage C: `park_reason = 'worktree_remote_mismatch'`
+        // rows are EXCLUDED for the same reason as `unmapped_target_repo` —
+        // a worktree that cloned with the wrong remote is either a local
+        // checkout/config problem (the AO project's repo clone itself is
+        // misconfigured) or a genuine near-miss that needs a human's eyes
+        // before any coder is spawned into that worktree again; it is never
+        // something a bare requeue alone fixes, and mirroring
+        // `unmapped_target_repo`'s auto-requeue exclusion keeps the two
+        // "spawn-time fail loud" park reasons behaviorally consistent.
         let mut id_stmt = self
             .conn
             .prepare(
@@ -775,7 +785,8 @@ impl StateStore for SqliteStateStore {
                  WHERE state = 'HUMAN_HELD' AND attempt < ?1 \
                  AND (park_reason IS NULL \
                       OR (park_reason NOT LIKE 'circuit-breaker%' \
-                          AND park_reason != 'unmapped_target_repo'))",
+                          AND park_reason != 'unmapped_target_repo' \
+                          AND park_reason != 'worktree_remote_mismatch'))",
             )
             .map_err(|e| tool_err("recover_human_held id select prepare", e))?;
         let recovered_ids: Vec<String> = id_stmt
@@ -1704,6 +1715,87 @@ mod tests {
         );
 
         let transient = store.load("transient-stalled").unwrap().unwrap();
+        assert_eq!(transient.state, OverlayState::Queued);
+        assert_eq!(transient.attempt, 3);
+    }
+
+    /// jleechan-bqdv Stage C: `worktree_remote_mismatch` parks must be
+    /// excluded from `recover_human_held`'s auto-requeue exactly like
+    /// `unmapped_target_repo` — this is the "fail loud, never guess"
+    /// spawn-time park for a coder worktree whose git remote doesn't match
+    /// the bead's resolved repo (jleechan-9sh5 discipline). Without this
+    /// exclusion the bead would ping-pong HUMAN_HELD -> QUEUED -> re-spawn
+    /// into the same (still misconfigured) worktree every recovery cycle.
+    #[test]
+    fn recover_human_held_excludes_worktree_remote_mismatch_parks_but_recovers_transient_parks() {
+        let schema = include_str!("../contracts/schema.sql");
+        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
+
+        let mut overlays = HashMap::new();
+        overlays.insert(
+            "wrong-remote".to_string(),
+            BeadOverlay {
+                bead_id: "wrong-remote".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 2,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: Some("factory/wrong-remote-r2".into()),
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some("worktree_remote_mismatch".to_string()),
+                target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
+            },
+        );
+        overlays.insert(
+            "transient-stalled-2".to_string(),
+            BeadOverlay {
+                bead_id: "transient-stalled-2".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 2,
+                reroll_count: 0,
+                autonomy_secs: 1800,
+                spend_usd: 0.0,
+                pr_number: Some(99),
+                branch: Some("factory/transient-stalled-2-r2".into()),
+                session_id: Some("session-abc".into()),
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some("session_stalled".to_string()),
+                target_repo: None,
+            },
+        );
+        for overlay in overlays.values() {
+            store.save(overlay).unwrap();
+        }
+
+        let recovered = store.recover_human_held(10).unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "only the transient park should be recovered; the worktree-remote-mismatch park must be excluded"
+        );
+        assert_eq!(recovered[0].bead_id, "transient-stalled-2");
+
+        let wrong_remote = store.load("wrong-remote").unwrap().unwrap();
+        assert_eq!(
+            wrong_remote.state,
+            OverlayState::HumanHeld,
+            "worktree_remote_mismatch park must NOT be auto-requeued"
+        );
+        assert_eq!(wrong_remote.attempt, 2, "attempt must not be bumped");
+        assert_eq!(
+            wrong_remote.park_reason.as_deref(),
+            Some("worktree_remote_mismatch"),
+            "park_reason must survive an excluded recovery pass"
+        );
+
+        let transient = store.load("transient-stalled-2").unwrap().unwrap();
         assert_eq!(transient.state, OverlayState::Queued);
         assert_eq!(transient.attempt, 3);
     }
