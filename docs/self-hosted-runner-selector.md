@@ -197,12 +197,19 @@ should open a PR from a branch in `jleechanorg/dark-factory` to get CI coverage.
 ## drift-check authentication (`RUNNERS_READ_PAT`)
 
 The drift-check workflow calls `gh api orgs/jleechanorg/actions/runners`.
-This endpoint requires the `manage_runners:org` permission, which is **not**
-available via the default `GITHUB_TOKEN`.
+This endpoint requires the `manage_runners:org` permission.
 
-Required secret: `RUNNERS_READ_PAT`
+**Primary auth**: The self-hosted runner images in `jleechanorg` are
+pre-authenticated with a token that has `manage_runners:org` scope. When
+`RUNNERS_READ_PAT` is **not** configured, the workflow unsets `GH_TOKEN` so
+`gh` uses the runner's native keyring auth — this is the steady-state path.
 
-To create it:
+**Fallback auth** (`RUNNERS_READ_PAT`): If the runner fleet is re-imaged
+without pre-auth (or on fresh runners), set this secret to ensure the drift
+check can still call the org runners endpoint. The secret is a Fine-Grained
+PAT with `manage_runners:org` read permission on `jleechanorg`.
+
+To create `RUNNERS_READ_PAT` (only needed if runner native auth is absent):
 1. Go to **GitHub → Settings → Developer settings → Fine-grained personal
    access tokens → New token**.
 2. Set **Resource owner** to `jleechanorg`.
@@ -212,10 +219,12 @@ To create it:
 5. Store the generated token as a repository or org secret named
    `RUNNERS_READ_PAT`.
 
-If `RUNNERS_READ_PAT` is not set, the workflow uses `GITHUB_TOKEN` as a
-fallback. The `gh api` call will return HTTP 403, the script exits with
-code 2 (invocation error), and the workflow fails loud. This is the correct
-fail-closed behaviour — do not suppress the error.
+> [!WARNING]
+> Do **not** set `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` in the drift-check
+> env block. The default Actions token lacks `manage_runners:org` and
+> overrides the runner's native auth, causing HTTP 403. The workflow's env
+> block passes `RUNNERS_READ_PAT` (not `GH_TOKEN`) and the run script
+> conditionally exports `GH_TOKEN` only when the PAT is present.
 
 ## Failure modes and runbooks
 
@@ -225,7 +234,7 @@ fail-closed behaviour — do not suppress the error.
 | Drift-check workflow stays queued | The hardcoded fallback selector itself drifted | Verify via `gh api orgs/jleechanorg/actions/runners?per_page=100 --jq '.runners[].labels[].name' \| sort -u`; patch the workflow's hardcoded list. |
 | Drift-check says FLEET_DOWN | All runners offline | See `~/.claude/skills/self-hosted-runner-preflight/SKILL.md` Class B/E triage. |
 | CI job queues forever with no log | The variable was edited outside `gh api` and is now a YAML list instead of a JSON string | Re-patch the variable to a JSON-array string; verify via `gh api ... --jq .value` |
-| Drift-check exits 2 (invocation error) in CI | `RUNNERS_READ_PAT` secret missing or expired; `GITHUB_TOKEN` 403s on org runners endpoint | Create/renew the `RUNNERS_READ_PAT` secret — see "drift-check authentication" above. |
+| Drift-check exits 2 — HTTP 403 | Runner native auth missing (fresh runner without pre-auth); `RUNNERS_READ_PAT` not configured | Configure `RUNNERS_READ_PAT` secret — see "drift-check authentication" above. |
 | CI jobs not running on fork PRs | Expected: fork PRs are skipped by the `if:` guard | See "Fork PR isolation" above. Fork authors must PR from a same-org branch. |
 | Platform coverage warning in CI log | Job ran on macOS — Linux-only isolation tests skipped | See "Known platform coverage gap" above. |
 
