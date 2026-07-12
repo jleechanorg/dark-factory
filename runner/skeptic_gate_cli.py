@@ -45,7 +45,6 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import asdict
 from typing import List, Optional, Tuple
 
 from runner.skeptic_gate import (
@@ -58,7 +57,6 @@ from runner.skeptic_gate import (
     evaluate,
     extract_implementation_identity_from_commit,
     format_comment,
-    parse_verdict,
     verify_published_comment,
     verify_provenance,
 )
@@ -295,32 +293,69 @@ def get_pr_diff(repo: str, pr_number: int) -> str:
     return diff
 
 
-def get_implementation_identity(repo: str, pr_number: int) -> str:
-    """Look up the PR's head commit subject and reduce it to a model
+def get_implementation_identity(repo: str, pr_number: int, head_sha: str = "") -> str:
+    """Look up the PR's HEAD commit subject and reduce it to a model
     identity via deterministic prefix match.
 
     Per post-audit comment 4953064910, the previous implementation
     keyword-matched the author's GitHub login + commit email —
     which is ZFC (keyword routing on free-form text) and silently
-    returned `unknown` for live PRs, making PASS impossible. The
-    canonical mapping is the COMMIT-SUBJECT PREFIX (`claude/…`,
+    returned `unknown` for live PRs, making PASS impossible.
+
+    Per post-audit comment 4953116428, the previous version fetched
+    the OLDEST PR commit (`?per_page=1` returned the first commit,
+    not the head). For multi-commit PRs the implementer identity
+    derived from the wrong commit. The function now binds to the
+    PR HEAD SHA via `?per_page=100` + filter on `sha == head_sha`,
+    falling back to a direct commit lookup at `/commits/{sha}`
+    when head_sha is supplied (the API-authoritative SHA).
+
+    The canonical mapping is the COMMIT-SUBJECT PREFIX (`claude/…`,
     `codex/…`, `gemini/…`, `human: …`), enforced by repo policy
     (see CLAUDE.md "Commit provenance tag"). This function just
     applies the deterministic prefix match.
     """
     owner, name = repo.split("/", 1)
-    try:
-        data = gh_api(
-            "GET",
-            f"repos/{owner}/{name}/pulls/{pr_number}/commits?per_page=1",
-        )
-    except Exception:
+    commit_data: Optional[dict] = None
+    # Preferred path: fetch the commit at the head SHA directly.
+    # This is the API-authoritative implementer commit for the PR's
+    # current head (per post-audit comment 4953116428).
+    if head_sha:
+        try:
+            commit_data = gh_api(
+                "GET",
+                f"repos/{owner}/{name}/commits/{head_sha}",
+            )
+        except Exception:
+            commit_data = None
+    # Fallback: paginate the PR commits and find the one whose sha
+    # matches the head SHA; if head_sha is not supplied, this
+    # function returns "unknown" (conservative).
+    if commit_data is None and head_sha:
+        try:
+            page = 1
+            while True:
+                data = gh_api(
+                    "GET",
+                    f"repos/{owner}/{name}/pulls/{pr_number}/commits"
+                    f"?per_page=100&page={page}",
+                )
+                if not isinstance(data, list) or not data:
+                    break
+                for c in data:
+                    if (c.get("sha") or "").lower() == head_sha.lower():
+                        commit_data = c
+                        break
+                if commit_data is not None or len(data) < 100:
+                    break
+                page += 1
+        except Exception:
+            commit_data = None
+    if commit_data is None:
         return "unknown"
-    if not isinstance(data, list) or not data:
-        return "unknown"
-    subject = ((data[0].get("commit") or {}).get("message") or "").splitlines()[0:1]
-    subject_str = subject[0] if subject else ""
-    return extract_implementation_identity_from_commit(subject_str)
+    message = (commit_data.get("commit") or {}).get("message") or ""
+    subject = message.splitlines()[0] if message else ""
+    return extract_implementation_identity_from_commit(subject)
 
 
 # ---------------------------------------------------------------------------
@@ -337,15 +372,24 @@ def _build_reviewer_cmd(
 ) -> list[str]:
     """Sandbox-mode argv for a reviewer CLI.
 
-    The reviewer reads diff text and emits a verdict. It must NOT be
-    allowed to execute code, write files, or escalate privileges:
-    - codex: `--sandbox=read-only` (no tool execution), no
-      `--dangerously-bypass-approvals-and-sandbox`. The diff is
-      delivered via stdin (`-`), never via argv.
-    - gemini: `-s` (sandbox) and `--approval-mode=default` (no `yolo`).
-      The diff is delivered via stdin (`-p -`), never via argv —
-      gemini's argv cap is ~140KB and breaks on smaller diffs than
-      the 1MiB MAX_DIFF_BYTES gate.
+    Per post-audit comments 4953064910 + 4953116428, the reviewer is
+    invoked with the strongest isolation available short of removing
+    the binary:
+
+    - codex: `--sandbox=read-only` (no writes, no shell), no
+      `--dangerously-bypass-approvals-and-sandbox`. `--ephemeral`
+      forces a fresh session; `--skip-git-repo-check` skips the
+      `codex` repo-required-for-exec gate. `--json` emits structured
+      JSONL so we can extract the agent_message text. The diff is
+      delivered via stdin (`-`), never via argv. The codex config
+      disables the shell tool entirely (`--config shell.enable=false`)
+      so a prompt-injected instruction cannot trigger an in-sandbox
+      shell command (defense-in-depth on top of --sandbox=read-only).
+    - gemini: `-s` (sandbox) and `--approval-mode=default` (no
+      `yolo`). The diff is delivered via stdin (`-p -`), never via
+      argv. The gemini policy engine in headless mode translates
+      `ASK_USER` decisions to `DENY`, so any tool call that would
+      require human input cannot execute.
 
     `codex_bin` / `gemini_bin` allow pinning the absolute path to the
     reviewer binary (defense against mutable PATH — see post-audit
@@ -361,6 +405,16 @@ def _build_reviewer_cmd(
             "--ephemeral",
             "--skip-git-repo-check",
             "--json",
+            # Disable the shell tool entirely. --sandbox=read-only
+            # blocks writes, but the model could still attempt to
+            # read sensitive files via shell. Setting shell.enable=false
+            # removes the tool from the model's API surface.
+            "-c",
+            "shell.enable=false",
+            # Also disable web search; the reviewer has no business
+            # making outbound HTTP calls.
+            "-c",
+            "web_search.enable=false",
         ]
         if model:
             cmd.extend(["-m", model])
@@ -378,9 +432,7 @@ def _build_reviewer_cmd(
             "-p",
             "-",
         ]
-    raise RuntimeError(
-        f"unknown reviewer {reviewer!r}; expected 'codex' or 'gemini'"
-    )
+    raise RuntimeError(f"unknown reviewer {reviewer!r}; expected 'codex' or 'gemini'")
 
 
 def _extract_codex_message(stdout: str) -> str:
@@ -478,8 +530,7 @@ def _parse_reviewers(reviewers_json: str) -> List[Tuple[str, str]]:
         raise SystemExit(f"--reviewers-json is not valid JSON: {exc}") from exc
     if not isinstance(parsed, list) or not parsed:
         raise SystemExit(
-            "--reviewers-json must be a non-empty list of "
-            "[reviewer, model] pairs"
+            "--reviewers-json must be a non-empty list of [reviewer, model] pairs"
         )
     out: List[Tuple[str, str]] = []
     seen = set()
@@ -554,6 +605,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="absolute path to the pinned gemini binary (defense against mutable PATH)",
     )
     parser.add_argument(
+        "--trusted-code-sha",
+        default=os.environ.get("TRUSTED_CODE_SHA", ""),
+        help="40-hex SHA the caller pinned the workflow ref to (immutable code ref)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="do not post comments or set status; print what would happen",
@@ -597,7 +653,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         if not args.dry_run:
             _publish_failure(
-                repo, head_sha, body, args.status_context,
+                repo,
+                head_sha,
+                body,
+                args.status_context,
                 f"diff capture failed: {str(exc)[:80]}",
             )
         return 1
@@ -622,13 +681,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         if not args.dry_run:
             _publish_failure(
-                repo, head_sha, body, args.status_context,
+                repo,
+                head_sha,
+                body,
+                args.status_context,
                 f"diff capture failed: {str(exc)[:80]}",
             )
         return 1
 
     # ---- 3. Implementation identity (commit-subject prefix) -----------------
-    implementation_identity = get_implementation_identity(repo, args.pr_number)
+    implementation_identity = get_implementation_identity(
+        repo, args.pr_number, head_sha
+    )
 
     # ---- 4. Build prompt ----------------------------------------------------
     prompt = build_prompt(
@@ -782,41 +846,59 @@ def main(argv: Optional[list[str]] = None) -> int:
         file=sys.stderr,
     )
 
-    # ---- 9. Side effects: comment + status ---------------------------------
+    # ---- 9. Side effects: comment + status (post-audit 4953116428 fix) -----
+    # Per post-audit comment 4953116428: the previous version published
+    # `skeptic=success` BEFORE the readback step, so a verification
+    # failure left merge protection GREEN. The new order is:
+    #   (a) Publish a `pending` status FIRST (no merge-protection
+    #       damage either way; signals "in flight").
+    #   (b) Upsert the comment.
+    #   (c) Read back the comment + status, verify all 6 fields agree
+    #       with what we wrote (full equality, byte-for-byte).
+    #   (d) ONLY if (c) succeeds AND the aggregate is PASS: publish
+    #       `success`. Any failure → publish `failure` (overwriting
+    #       the prior pending).
+    # `success` is the LAST action, not the first.
     if args.dry_run:
         return 0 if aggregate.check_state == "success" else 1
 
+    # 9a. Pending status (always first; failure of this step is
+    # fail-closed per post-audit 4953064910).
+    try:
+        set_commit_status(
+            repo,
+            head_sha,
+            state="pending",
+            context=args.status_context,
+            description="skeptic-gate in flight",
+        )
+    except Exception as exc:
+        print(f"[skeptic-gate] pending status set failed: {exc}", file=sys.stderr)
+        return 1
+
+    # 9b. Upsert the comment.
     try:
         comment_id = post_or_update_comment(
             repo, args.pr_number, aggregate.comment_body
         )
     except Exception as exc:
         print(f"[skeptic-gate] comment upsert failed: {exc}", file=sys.stderr)
-        return 1
-    # Per post-audit comment 4953064910: status write failure is
-    # fail-closed, not swallowed. A failed status cannot satisfy
-    # the read-back step (which also checks the commit-status
-    # surface), and a stale status from a prior run could otherwise
-    # falsely satisfy gate-7.
-    try:
-        set_commit_status(
-            repo,
-            head_sha,
-            state=aggregate.check_state,
-            context=args.status_context,
-            description=aggregate.reason,
+        # Overwrite pending with failure.
+        _force_failure_status(
+            repo, head_sha, args.status_context, "comment upsert failed"
         )
-    except Exception as exc:
-        print(f"[skeptic-gate] status set failed: {exc}", file=sys.stderr)
         return 1
 
-    # ---- 10. Read back: verify what we just published ----------------------
+    # 10. Read back: verify what we just published ----------------------
     published = read_back_comment(repo, comment_id)
     if published is None:
         print(
             "[skeptic-gate] read-back failed: could not fetch the "
             "freshly-published comment",
             file=sys.stderr,
+        )
+        _force_failure_status(
+            repo, head_sha, args.status_context, "comment read-back failed"
         )
         return 1
 
@@ -852,20 +934,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     if not ok:
         print(f"[skeptic-gate] read-back mismatch: {why}", file=sys.stderr)
+        _force_failure_status(
+            repo,
+            head_sha,
+            args.status_context,
+            f"read-back mismatch: {why[:100]}",
+        )
         return 1
 
-    # The commit status was set to (state, description). Re-fetch and
-    # confirm the API agrees.
+    # The commit status was set to pending. Re-fetch and confirm the
+    # API agrees — if it's not pending anymore (e.g. another run
+    # overwrote it), refuse PASS.
     statuses = gh_api(
         "GET",
         f"repos/{repo.split('/', 1)[0]}/{repo.split('/', 1)[1]}"
         f"/commits/{head_sha}/statuses",
     )
     statuses = statuses if isinstance(statuses, list) else []
-    matched = [
-        s for s in statuses
-        if s.get("context") == args.status_context
-    ]
+    matched = [s for s in statuses if s.get("context") == args.status_context]
     if not matched:
         print(
             f"[skeptic-gate] read-back mismatch: no status with "
@@ -874,21 +960,80 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 1
     found_state = matched[0].get("state")
-    expected_state = aggregate.check_state
-    if found_state != expected_state:
+    if found_state != "pending":
+        # A stale or unexpected status already exists; refuse to write
+        # success and refuse to overwrite (preserves forensic value).
         print(
-            f"[skeptic-gate] read-back mismatch: status state is "
-            f"{found_state!r}, expected {expected_state!r}",
+            f"[skeptic-gate] read-back mismatch: pending status was "
+            f"overwritten to {found_state!r}; refusing to write success",
             file=sys.stderr,
         )
         return 1
 
+    # 11. Final write — success ONLY if aggregate is success AND all
+    # readback checks passed. Any other aggregate state → failure.
+    final_state = aggregate.check_state
+    if final_state != "success":
+        final_state = "failure"
+    try:
+        set_commit_status(
+            repo,
+            head_sha,
+            state=final_state,
+            context=args.status_context,
+            description=aggregate.reason,
+        )
+    except Exception as exc:
+        # A failed final-write must overwrite to failure (per
+        # post-audit comment 4953116428). The retry below attempts
+        # one more time; if that also fails, we return 1 and let
+        # the workflow step fail.
+        print(
+            f"[skeptic-gate] final status set failed (will retry as failure): {exc}",
+            file=sys.stderr,
+        )
+        try:
+            set_commit_status(
+                repo,
+                head_sha,
+                state="failure",
+                context=args.status_context,
+                description=aggregate.reason,
+            )
+        except Exception as exc2:
+            print(
+                f"[skeptic-gate] final status retry failed (cannot "
+                f"overwrite to failure): {exc2}",
+                file=sys.stderr,
+            )
+            return 1
+
     print(
         f"[skeptic-gate] read-back OK: actor={actor} comment_id={comment_id} "
-        f"status_state={found_state}",
+        f"status_state={final_state}",
         file=sys.stderr,
     )
     return 0 if aggregate.check_state == "success" else 1
+
+
+def _force_failure_status(
+    repo: str, head_sha: str, context: str, description: str
+) -> None:
+    """Overwrite the commit status with `failure`. Used by every
+    readback-mismatch path so a stale `pending` cannot satisfy the
+    merge-protection check (per post-audit comment 4953116428).
+    Errors here are logged but not raised — the caller has already
+    decided to fail the gate."""
+    try:
+        set_commit_status(
+            repo,
+            head_sha,
+            state="failure",
+            context=context,
+            description=description,
+        )
+    except Exception as exc:
+        print(f"[skeptic-gate] _force_failure_status failed: {exc}", file=sys.stderr)
 
 
 def _publish_failure(
@@ -898,8 +1043,9 @@ def _publish_failure(
     failures). Always swallows secondary errors so the failure path itself
     is observable."""
     try:
-        set_commit_status(repo, head_sha, state="failure", context=context,
-                           description=description)
+        set_commit_status(
+            repo, head_sha, state="failure", context=context, description=description
+        )
     except Exception as exc:
         print(f"[skeptic-gate] set_commit_status failed: {exc}", file=sys.stderr)
     try:
@@ -922,28 +1068,45 @@ def _pr_number_for_desc(description: str) -> int:
 # ---------------------------------------------------------------------------
 # Body field extractors for the read-back verifier
 # ---------------------------------------------------------------------------
+#
+# Per post-audit comment 4953116428: the readback regexes were
+# too narrow and could not parse PR_NUMBER, REVIEWER, or
+# IMPLEMENTATION_PROVENANCE. The new extractors support all six
+# fields and use anchored, multiline, case-insensitive patterns.
+# Each pattern matches the canonical `**FIELD: value**` form used
+# by `format_comment`.
 
-
-_RE_SHA_LINE = re.compile(r"HEAD_SHA:\s*([0-9a-f]+)", re.IGNORECASE)
-_RE_REPO_LINE = re.compile(r"REPO:\s*([\w.\-]+/[\w.\-]+)", re.IGNORECASE)
-_RE_PR_LINE = re.compile(r"PR_NUMBER:\s*(\d+)", re.IGNORECASE)
-_RE_VERDICT_LINE = re.compile(r"VERDICT:\s*(PASS|FAIL)", re.IGNORECASE)
+_RE_SHA_LINE = re.compile(r"\*\*HEAD_SHA:\s*([0-9a-f]+)\*\*", re.IGNORECASE)
+_RE_REPO_LINE = re.compile(r"\*\*REPO:\s*([\w.\-]+/[\w.\-]+)\*\*", re.IGNORECASE)
+_RE_PR_LINE = re.compile(r"\*\*PR_NUMBER:\s*(\d+)\*\*", re.IGNORECASE)
+_RE_VERDICT_LINE = re.compile(r"\*\*VERDICT:\s*(PASS|FAIL)\*\*", re.IGNORECASE)
+_RE_REVIEWER_LINE = re.compile(r"\*\*REVIEWER:\s*([^*\n]+?)\*\*", re.IGNORECASE)
+_RE_IMPL_LINE = re.compile(
+    r"\*\*IMPLEMENTATION_PROVENANCE:\s*([^*\n]+?)\*\*", re.IGNORECASE
+)
 
 
 def _extract_field(body: str, name: str) -> Optional[str]:
-    """Pull the value of a single contract field (HEAD_SHA/REPO/VERDICT) out of a verdict body.
+    """Pull the value of a single contract field out of a verdict body.
 
+    Supports the six fields the gate emits (`HEAD_SHA`, `REPO`,
+    `PR_NUMBER`, `VERDICT`, `REVIEWER`, `IMPLEMENTATION_PROVENANCE`).
     Returns None when the field is absent or the body is malformed.
     """
     pat = {
         "HEAD_SHA": _RE_SHA_LINE,
         "REPO": _RE_REPO_LINE,
+        "PR_NUMBER": _RE_PR_LINE,
         "VERDICT": _RE_VERDICT_LINE,
+        "REVIEWER": _RE_REVIEWER_LINE,
+        "IMPLEMENTATION_PROVENANCE": _RE_IMPL_LINE,
     }.get(name)
     if pat is None:
         return None
     m = pat.search(body)
-    return m.group(1) if m else None
+    if not m:
+        return None
+    return m.group(1).strip()
 
 
 def _extract_int(body: str, name: str) -> Optional[int]:

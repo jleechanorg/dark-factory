@@ -74,7 +74,7 @@ diff.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Literal, Optional, Tuple
 
 
@@ -191,12 +191,8 @@ _FULL_SHA_RE = re.compile(
 _REPO_RE = re.compile(
     r"^\s*REPO\s*:\s*([\w.\-]+/[\w.\-]+)\s*$", re.MULTILINE | re.IGNORECASE
 )
-_PR_RE = re.compile(
-    r"^\s*PR_NUMBER\s*:\s*(\d+)\s*$", re.MULTILINE | re.IGNORECASE
-)
-_REASON_RE = re.compile(
-    r"^\s*REASON\s*:\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE
-)
+_PR_RE = re.compile(r"^\s*PR_NUMBER\s*:\s*(\d+)\s*$", re.MULTILINE | re.IGNORECASE)
+_REASON_RE = re.compile(r"^\s*REASON\s*:\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE)
 _IDENTITY_RE = re.compile(
     r"^\s*IDENTITY\s*:\s*(claude|codex|gemini|human|unknown)\s*$",
     re.MULTILINE | re.IGNORECASE,
@@ -205,9 +201,7 @@ _IDENTITY_RE = re.compile(
 # Field-name regexes used by the no-prose check. A field line MUST
 # consist only of "<FIELD>: <value>" with nothing else on the line.
 # Case-insensitive to match the per-field regexes (Verdict: Pass is OK).
-_FIELD_LINE_RE = re.compile(
-    r"^[A-Z_]+\s*:.*$", re.MULTILINE | re.IGNORECASE
-)
+_FIELD_LINE_RE = re.compile(r"^[A-Z_]+\s*:.*$", re.MULTILINE | re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -255,12 +249,24 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     lines = output.splitlines()
     field_lines = 0
     leading_comment_lines = 0
+    seen_field_names = set()
     for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
         if re.match(r"^[A-Z_]+\s*:", stripped, re.IGNORECASE):
             field_lines += 1
+            # Track the field name so we can enforce EXACTLY 6 distinct
+            # contract fields. Per post-audit comment 4953116428, the
+            # previous version accepted a 7th field. Now any 7th field
+            # (or duplicate of any of the 6) → reject.
+            field_name_match = re.match(r"^([A-Z_]+)\s*:", stripped, re.IGNORECASE)
+            if field_name_match:
+                fname = field_name_match.group(1).upper()
+                if fname in seen_field_names:
+                    # Duplicate field — anti-injection.
+                    return None
+                seen_field_names.add(fname)
             continue
         # Allow ONE leading comment line (e.g. "# reviewer: codex")
         # before any field line; reject any prose AFTER a field line.
@@ -296,6 +302,21 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         or len(reasons) != 1
         or len(identities) != 1
     ):
+        return None
+
+    # Exact 6-field contract (per post-audit comment 4953116428):
+    # no 7th field allowed. The seen_field_names set already enforced
+    # no duplicates; here we also enforce that EXACTLY 6 distinct
+    # contract fields are present.
+    expected_fields = {
+        "VERDICT",
+        "HEAD_SHA",
+        "REPO",
+        "PR_NUMBER",
+        "REASON",
+        "IDENTITY",
+    }
+    if seen_field_names != expected_fields:
         return None
 
     identity_token = identities[0].lower()
@@ -398,7 +419,9 @@ def extract_implementation_identity_from_commit(commit_subject: str) -> str:
     return "unknown"
 
 
-def bind_reviewer_identity(reviewer_cli: str, declared_identity: str) -> Tuple[bool, str]:
+def bind_reviewer_identity(
+    reviewer_cli: str, declared_identity: str
+) -> Tuple[bool, str]:
     """Refuse a verdict whose declared IDENTITY does not match the CLI
     that emitted it.
 
@@ -746,10 +769,7 @@ def aggregate_results(
     all_success = all(r.check_state == "success" for r in results)
     bound = [r for r in results if r.parsed is not None]
     primary = bound[0] if bound else None
-    primary_verdict = primary.verdict if primary else "FAIL"
-    primary_sha = (
-        primary.parsed.head_sha if primary and primary.parsed else head_sha
-    )
+    primary_sha = primary.parsed.head_sha if primary and primary.parsed else head_sha
 
     extras: List[str] = []
     for r in results:
@@ -778,7 +798,10 @@ def aggregate_results(
         expected_head_sha=head_sha,
         repo=repo,
         pr_number=pr_number,
-        reviewer=primary.reviewer if primary else "(aggregate)",
+        # The headline REVIEWER field is the aggregate identity (the
+        # gate itself), not the primary reviewer's CLI. The per-
+        # reviewer breakdown is in extra_reviewer_lines below.
+        reviewer="(aggregate)",
         implementation_provenance=implementation_provenance,
         reason=agg_reason,
         extra_reviewer_lines=extras,

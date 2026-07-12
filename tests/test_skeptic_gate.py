@@ -21,10 +21,6 @@ hard precondition for claiming the gate is green.
 from __future__ import annotations
 
 import json
-import os
-import re
-from typing import List
-from unittest import mock
 
 import pytest
 
@@ -120,7 +116,9 @@ def test_parse_verdict_rejects_short_sha_minimum_seven():
 
 def test_parse_verdict_rejects_missing_field():
     out = "VERDICT: PASS\nHEAD_SHA: abcdef1234567890abcdef1234567890abcdef12\nREPO: x/y\nPR_NUMBER: 1\nREASON: ok\n"
-    assert parse_verdict(out) is None  # IDENTITY missing → not "exactly one OR zero" misbehavior; we still require
+    assert (
+        parse_verdict(out) is None
+    )  # IDENTITY missing → not "exactly one OR zero" misbehavior; we still require
 
 
 def test_parse_verdict_rejects_duplicate_verdict_lines():
@@ -375,24 +373,19 @@ def test_evaluate_pass_path_yields_success_state():
 
 
 def test_evaluate_stale_sha_yields_failure():
-    out = _valid_output(
-        head_sha="0000000000000000000000000000000000000001"
-    )
+    out = _valid_output(head_sha="0000000000000000000000000000000000000001")
     result = evaluate(review_output=out, **_ctx())
     assert result.check_state == "failure"
     assert "stale" in result.reason.lower()
 
 
 def test_evaluate_missing_reviewer_fails_closed():
-    result = evaluate(review_output=None, review_error="codex: not found",
-                      **_ctx())
+    result = evaluate(review_output=None, review_error="codex: not found", **_ctx())
     assert result.check_state == "failure"
 
 
 def test_evaluate_malformed_output_fails_closed():
-    result = evaluate(
-        review_output="looks good, no extra text", **_ctx()
-    )
+    result = evaluate(review_output="looks good, no extra text", **_ctx())
     assert result.check_state == "failure"
 
 
@@ -401,7 +394,9 @@ def test_evaluate_malformed_output_fails_closed():
 # ===========================================================================
 
 
-def _reviewer_result(*, reviewer: str, ok: bool, identity: str = "codex") -> SkepticResult:
+def _reviewer_result(
+    *, reviewer: str, ok: bool, identity: str = "codex"
+) -> SkepticResult:
     sha = "abcdef1234567890abcdef1234567890abcdef12"
     if ok:
         body = f"{MARKER}\nverdict pass from {reviewer}\n"
@@ -438,7 +433,9 @@ def test_aggregate_results_both_pass_yields_success():
         _reviewer_result(reviewer="gemini", ok=True, identity="gemini"),
     ]
     agg = aggregate_results(
-        results, repo="jleechanorg/dark-factory", pr_number=278,
+        results,
+        repo="jleechanorg/dark-factory",
+        pr_number=278,
         head_sha="abcdef1234567890abcdef1234567890abcdef12",
     )
     assert agg.check_state == "success"
@@ -453,7 +450,9 @@ def test_aggregate_results_one_fail_yields_failure():
         _reviewer_result(reviewer="gemini", ok=False, identity="gemini"),
     ]
     agg = aggregate_results(
-        results, repo="jleechanorg/dark-factory", pr_number=278,
+        results,
+        repo="jleechanorg/dark-factory",
+        pr_number=278,
         head_sha="abcdef1234567890abcdef1234567890abcdef12",
     )
     assert agg.check_state == "failure"
@@ -462,7 +461,9 @@ def test_aggregate_results_one_fail_yields_failure():
 
 def test_aggregate_results_empty_list_yields_failure():
     agg = aggregate_results(
-        [], repo="jleechanorg/dark-factory", pr_number=278,
+        [],
+        repo="jleechanorg/dark-factory",
+        pr_number=278,
         head_sha="abcdef1234567890abcdef1234567890abcdef12",
     )
     assert agg.check_state == "failure"
@@ -823,10 +824,14 @@ def test_invoke_reviewer_nonzero_exit_returns_error():
 
 def _cli_argv(**overrides):
     base = [
-        "--repo", "jleechanorg/dark-factory",
-        "--pr-number", "278",
-        "--pr-sha", "abcdef1234567890abcdef1234567890abcdef12",
-        "--reviewers-json", '[["codex",""],["gemini","gemini-2.5-pro"]]',
+        "--repo",
+        "jleechanorg/dark-factory",
+        "--pr-number",
+        "278",
+        "--pr-sha",
+        "abcdef1234567890abcdef1234567890abcdef12",
+        "--reviewers-json",
+        '[["codex",""],["gemini","gemini-2.5-pro"]]',
         "--dry-run",
     ]
     for k, v in overrides.items():
@@ -852,9 +857,13 @@ def _inline_structured_verdict(
     )
 
 
-def _reviewer_stdout(reviewer: str, *, verdict: str = "PASS",
-                     identity: str = "codex",
-                     head_sha: str = "abcdef1234567890abcdef1234567890abcdef12") -> str:
+def _reviewer_stdout(
+    reviewer: str,
+    *,
+    verdict: str = "PASS",
+    identity: str = "codex",
+    head_sha: str = "abcdef1234567890abcdef1234567890abcdef12",
+) -> str:
     """Emit the stdout that a real CLI would produce.
 
     codex `--json` → JSONL events. The agent_message.text contains the
@@ -879,25 +888,29 @@ def test_cli_forced_pass_with_both_reviewers(monkeypatch, capsys):
     import runner.skeptic_gate_cli as cli_mod
 
     monkeypatch.setattr(
-        cli_mod, "get_pr_head_sha_via_api",
-        lambda repo, pr: "abcdef1234567890abcdef1234567890abcdef12",
+        cli_mod,
+        "get_pr_head_sha_via_api",
+        lambda repo, pr, head_sha="": "abcdef1234567890abcdef1234567890abcdef12",
     )
     monkeypatch.setattr(
-        cli_mod, "get_pr_diff",
-        lambda repo, pr: "diff --git a/foo b/foo\n+hello\n",
+        cli_mod,
+        "get_pr_diff",
+        lambda repo, pr, head_sha="": "diff --git a/foo b/foo\n+hello\n",
     )
     monkeypatch.setattr(
-        cli_mod, "get_implementation_identity",
-        lambda repo, pr: "claude",
+        cli_mod,
+        "get_implementation_identity",
+        lambda repo, pr, head_sha="": "claude",
     )
 
     def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
         # Emit the stdout a real reviewer would produce.
         return [
-            "python3", "-c",
-            "import sys; sys.stdout.write(" +
-            repr(_reviewer_stdout(reviewer, identity=reviewer)) +
-            ")",
+            "python3",
+            "-c",
+            "import sys; sys.stdout.write("
+            + repr(_reviewer_stdout(reviewer, identity=reviewer))
+            + ")",
         ]
 
     monkeypatch.setattr(cli_mod, "_build_reviewer_cmd", fake_cmd)
@@ -913,26 +926,30 @@ def test_cli_forced_fail_with_missing_reviewer(monkeypatch, capsys):
     import runner.skeptic_gate_cli as cli_mod
 
     monkeypatch.setattr(
-        cli_mod, "get_pr_head_sha_via_api",
-        lambda repo, pr: "abcdef1234567890abcdef1234567890abcdef12",
+        cli_mod,
+        "get_pr_head_sha_via_api",
+        lambda repo, pr, head_sha="": "abcdef1234567890abcdef1234567890abcdef12",
     )
     monkeypatch.setattr(
-        cli_mod, "get_pr_diff",
-        lambda repo, pr: "+x\n",
+        cli_mod,
+        "get_pr_diff",
+        lambda repo, pr, head_sha="": "+x\n",
     )
     monkeypatch.setattr(
-        cli_mod, "get_implementation_identity",
-        lambda repo, pr: "claude",
+        cli_mod,
+        "get_implementation_identity",
+        lambda repo, pr, head_sha="": "claude",
     )
 
     def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
         if reviewer == "codex":
             return ["definitely-not-a-real-binary-xyz"]
         return [
-            "python3", "-c",
-            "import sys; sys.stdout.write(" +
-            repr(_reviewer_stdout("gemini", identity="gemini")) +
-            ")",
+            "python3",
+            "-c",
+            "import sys; sys.stdout.write("
+            + repr(_reviewer_stdout("gemini", identity="gemini"))
+            + ")",
         ]
 
     monkeypatch.setattr(cli_mod, "_build_reviewer_cmd", fake_cmd)
@@ -950,26 +967,30 @@ def test_cli_provenance_fails_self_review(monkeypatch, capsys):
     import runner.skeptic_gate_cli as cli_mod
 
     monkeypatch.setattr(
-        cli_mod, "get_pr_head_sha_via_api",
-        lambda repo, pr: "abcdef1234567890abcdef1234567890abcdef12",
+        cli_mod,
+        "get_pr_head_sha_via_api",
+        lambda repo, pr, head_sha="": "abcdef1234567890abcdef1234567890abcdef12",
     )
     monkeypatch.setattr(
-        cli_mod, "get_pr_diff",
-        lambda repo, pr: "+x\n",
+        cli_mod,
+        "get_pr_diff",
+        lambda repo, pr, head_sha="": "+x\n",
     )
     # Implementer is claude; both reviewers declare "claude" identity
     # → provenance fails for both.
     monkeypatch.setattr(
-        cli_mod, "get_implementation_identity",
-        lambda repo, pr: "claude",
+        cli_mod,
+        "get_implementation_identity",
+        lambda repo, pr, head_sha="": "claude",
     )
 
     def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
         return [
-            "python3", "-c",
-            "import sys; sys.stdout.write(" +
-            repr(_reviewer_stdout(reviewer, identity="claude")) +
-            ")",
+            "python3",
+            "-c",
+            "import sys; sys.stdout.write("
+            + repr(_reviewer_stdout(reviewer, identity="claude"))
+            + ")",
         ]
 
     monkeypatch.setattr(cli_mod, "_build_reviewer_cmd", fake_cmd)
@@ -1041,23 +1062,29 @@ def test_adversarial_parse_rejects_second_verdict_in_prose():
 def test_adversarial_commit_prefix_claudem_minimax_m3():
     """Commit-subject prefix `claudem/` maps to `claude`."""
     from runner.skeptic_gate import extract_implementation_identity_from_commit
-    assert extract_implementation_identity_from_commit(
-        "claudem/minimax-M3: feat(ci): skeptic gate redesign"
-    ) == "claude"
+
+    assert (
+        extract_implementation_identity_from_commit(
+            "claudem/minimax-M3: feat(ci): skeptic gate redesign"
+        )
+        == "claude"
+    )
 
 
 def test_adversarial_commit_prefix_codexm_o3():
     """Commit-subject prefix `codexm/` maps to `codex`."""
     from runner.skeptic_gate import extract_implementation_identity_from_commit
-    assert extract_implementation_identity_from_commit(
-        "codexm/o3: fix: race"
-    ) == "codex"
+
+    assert (
+        extract_implementation_identity_from_commit("codexm/o3: fix: race") == "codex"
+    )
 
 
 def test_adversarial_commit_prefix_unknown_for_unprefixed_subject():
     """A commit subject without a known prefix maps to `unknown`,
     which the gate refuses PASS on (conservative fail-closed)."""
     from runner.skeptic_gate import extract_implementation_identity_from_commit
+
     assert (
         extract_implementation_identity_from_commit("naked commit message") == "unknown"
     )
@@ -1068,6 +1095,7 @@ def test_adversarial_commit_prefix_unknown_for_unprefixed_subject():
 def test_adversarial_bind_reviewer_identity_codex_must_declare_codex():
     """A codex CLI invocation that declares `gemini` is rejected."""
     from runner.skeptic_gate import bind_reviewer_identity
+
     ok, why = bind_reviewer_identity("codex", "gemini")
     assert ok is False
     assert "codex" in why and "gemini" in why
@@ -1076,6 +1104,7 @@ def test_adversarial_bind_reviewer_identity_codex_must_declare_codex():
 def test_adversarial_bind_reviewer_identity_gemini_must_declare_gemini():
     """A gemini CLI invocation that declares `codex` is rejected."""
     from runner.skeptic_gate import bind_reviewer_identity
+
     ok, why = bind_reviewer_identity("gemini", "codex")
     assert ok is False
 
@@ -1085,6 +1114,7 @@ def test_adversarial_bind_reviewer_identity_rejects_claude_or_unknown():
     CLIs). Declaring `claude` or `unknown` is refused — a codex
     invocation cannot impersonate Claude."""
     from runner.skeptic_gate import bind_reviewer_identity
+
     ok, _ = bind_reviewer_identity("codex", "claude")
     assert ok is False
     ok, _ = bind_reviewer_identity("codex", "unknown")
@@ -1203,19 +1233,30 @@ def test_adversarial_readback_rejects_empty_sha_field():
 def test_adversarial_workflow_has_no_trusted_ref_input():
     """Per post-audit comment 4953064910, the workflow MUST NOT accept
     a caller-supplied `trusted_ref` (otherwise a PR-controlled caller
-    can re-pin to PR head)."""
+    can re-pin to PR head). The workflow accepts `trusted_code_sha`
+    instead, which MUST be a 40-hex SHA and is verified post-checkout
+    (post-audit 4953116428)."""
     import yaml
+
     with open(".github/workflows/skeptic-gate.yml") as f:
-        wf = yaml.safe_load(f)
+        wf = yaml.safe_load(
+            f.read().replace(chr(10) + "on:", chr(10) + chr(34) + "on" + chr(34) + ":")
+        )
     inputs = ((wf.get("on") or {}).get("workflow_call") or {}).get("inputs") or {}
-    dispatch_inputs = ((wf.get("on") or {}).get("workflow_dispatch") or {}).get("inputs") or {}
+    dispatch_inputs = ((wf.get("on") or {}).get("workflow_dispatch") or {}).get(
+        "inputs"
+    ) or {}
     assert "trusted_ref" not in inputs, (
         "workflow_call.inputs.trusted_ref must be removed "
         "(PR-controlled callers could otherwise re-pin to PR head)"
     )
     assert "trusted_ref" not in dispatch_inputs
-    # Confirm the checkout step uses the trusted default branch, not
-    # any caller-supplied ref.
+    # trusted_code_sha must exist and be 40-hex validated.
+    assert "trusted_code_sha" in inputs, (
+        "workflow_call.inputs.trusted_code_sha is required for the "
+        "immutable-code-ref invariant"
+    )
+    # Confirm the checkout step pins to the trusted SHA, not a branch.
     jobs = (wf.get("jobs") or {}).get("skeptic") or {}
     steps = jobs.get("steps") or []
     checkout = next(
@@ -1223,11 +1264,23 @@ def test_adversarial_workflow_has_no_trusted_ref_input():
     )
     assert checkout is not None
     ref = (checkout.get("with") or {}).get("ref", "")
-    assert "inputs.trusted_ref" not in ref, (
-        f"checkout.ref must not interpolate inputs.trusted_ref; got {ref!r}"
+    assert "default_branch" not in ref, (
+        f"checkout.ref must pin to the trusted SHA, not the moving "
+        f"default branch; got {ref!r}"
     )
-    assert "default_branch" in ref, (
-        f"checkout.ref must pin to the trusted default branch; got {ref!r}"
+    assert "trusted_code_sha" in ref, (
+        f"checkout.ref must interpolate inputs.trusted_code_sha; got {ref!r}"
+    )
+    # A separate validation step must enforce 40-hex format.
+    validation_step = next(
+        (s for s in steps if "trusted_code_sha" in (s.get("name") or "").lower()),
+        None,
+    )
+    assert validation_step is not None, "no trusted_code_sha validation step found"
+    val_script = validation_step.get("run") or ""
+    assert "[0-9a-f]{40}" in val_script, (
+        f"trusted_code_sha validation must enforce 40-hex format; "
+        f"got {val_script[:200]!r}"
     )
 
 
@@ -1235,8 +1288,11 @@ def test_adversarial_workflow_pins_reviewer_binaries():
     """The workflow must assert path/version/sha256 of each reviewer
     binary before invoking it (defense against mutable PATH installs)."""
     import yaml
+
     with open(".github/workflows/skeptic-gate.yml") as f:
-        wf = yaml.safe_load(f)
+        wf = yaml.safe_load(
+            f.read().replace(chr(10) + "on:", chr(10) + chr(34) + "on" + chr(34) + ":")
+        )
     jobs = (wf.get("jobs") or {}).get("skeptic") or {}
     steps = jobs.get("steps") or []
     pin_step = next(
@@ -1260,41 +1316,54 @@ def test_adversarial_workflow_pins_reviewer_binaries():
 
 
 def test_adversarial_workflow_strips_secrets_before_reviewer_invocation():
-    """The reviewer-invocation step must unset GITHUB_TOKEN, GH_TOKEN,
-    HOME, OPENCLAW_*, HERMES_*, SLACK_* secrets before invoking the
-    Python gate (defense in depth: the CLI also strips them)."""
+    """Per post-audit comment 4953116428, the workflow MUST NOT unset
+    GITHUB_TOKEN globally (Python uses `gh` for every API call).
+    Instead, GH_TOKEN is forwarded to the Python gate, which passes
+    a sanitized env (without GH_TOKEN / HOME / etc.) to each
+    reviewer subprocess via `_reviewer_env`. This test verifies the
+    Python gate receives GH_TOKEN (so `gh api` calls work) AND the
+    CLI's `_reviewer_env` strips the secrets at the reviewer-
+    subprocess boundary."""
     import yaml
+
     with open(".github/workflows/skeptic-gate.yml") as f:
-        wf = yaml.safe_load(f)
+        wf = yaml.safe_load(
+            f.read().replace(chr(10) + "on:", chr(10) + chr(34) + "on" + chr(34) + ":")
+        )
     jobs = (wf.get("jobs") or {}).get("skeptic") or {}
     steps = jobs.get("steps") or []
     run_step = next(
-        (
-            s for s in steps
-            if (s.get("name") or "").startswith("Run skeptic")
-        ),
+        (s for s in steps if (s.get("name") or "").startswith("Run skeptic")),
         None,
     )
     assert run_step is not None, "no Run skeptic step found"
-    script = run_step.get("run") or ""
-    for secret in (
+    # GH_TOKEN is forwarded to Python (Python uses gh for API calls).
+    env_block = run_step.get("env") or {}
+    assert "GH_TOKEN" in env_block, (
+        "GH_TOKEN must be in the env block so Python's `gh api` calls work"
+    )
+    # But the CLI's _reviewer_env must strip GH_TOKEN and the other
+    # secrets before invoking reviewer subprocesses (defense-in-depth).
+    from runner.skeptic_gate_cli import REVIEWER_SECRET_ENV_DENY
+
+    expected_deny = {
         "GITHUB_TOKEN",
         "GH_TOKEN",
+        "HOME",
+        "SSH_AUTH_SOCK",
         "OPENCLAW_GATEWAY_TOKEN",
-        "OPENCLAW_SLACK_BOT_TOKEN",
         "SLACK_BOT_TOKEN",
         "HERMES_SLACK_WEBHOOK_URL",
-    ):
-        assert secret in script, (
-            f"reviewer invocation does not unset {secret!r}"
-        )
+    }
+    missing = expected_deny - REVIEWER_SECRET_ENV_DENY
+    assert not missing, f"reviewer env sanitizer must deny {sorted(missing)}"
 
 
 def test_adversarial_cli_rejects_duplicate_reviewer_json():
     """The CLI MUST refuse `--reviewers-json` with duplicate reviewers
     (e.g. two codex entries)."""
     import runner.skeptic_gate_cli as cli_mod
-    import pytest
+
     with pytest.raises(SystemExit):
         cli_mod._parse_reviewers('[["codex",""],["codex","gpt-5"]]')
 
@@ -1302,6 +1371,7 @@ def test_adversarial_cli_rejects_duplicate_reviewer_json():
 def test_adversarial_cli_reviewers_default_is_distinct():
     """The default reviewer list must be distinct (codex AND gemini)."""
     from runner.skeptic_gate_cli import DEFAULT_REVIEWERS_JSON
+
     parsed = json.loads(DEFAULT_REVIEWERS_JSON)
     ids = [item[0] for item in parsed]
     assert len(set(ids)) == len(ids), (
@@ -1317,24 +1387,28 @@ def test_adversarial_status_failure_is_fail_closed(monkeypatch, capsys):
     import runner.skeptic_gate_cli as cli_mod
 
     monkeypatch.setattr(
-        cli_mod, "get_pr_head_sha_via_api",
-        lambda repo, pr: "abcdef1234567890abcdef1234567890abcdef12",
+        cli_mod,
+        "get_pr_head_sha_via_api",
+        lambda repo, pr, head_sha="": "abcdef1234567890abcdef1234567890abcdef12",
     )
     monkeypatch.setattr(
-        cli_mod, "get_pr_diff",
-        lambda repo, pr: "+x\n",
+        cli_mod,
+        "get_pr_diff",
+        lambda repo, pr, head_sha="": "+x\n",
     )
     monkeypatch.setattr(
-        cli_mod, "get_implementation_identity",
-        lambda repo, pr: "claude",
+        cli_mod,
+        "get_implementation_identity",
+        lambda repo, pr, head_sha="": "claude",
     )
 
     def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
         return [
-            "python3", "-c",
-            "import sys; sys.stdout.write(" +
-            repr(_reviewer_stdout(reviewer, identity=reviewer)) +
-            ")",
+            "python3",
+            "-c",
+            "import sys; sys.stdout.write("
+            + repr(_reviewer_stdout(reviewer, identity=reviewer))
+            + ")",
         ]
 
     monkeypatch.setattr(cli_mod, "_build_reviewer_cmd", fake_cmd)
@@ -1345,11 +1419,20 @@ def test_adversarial_status_failure_is_fail_closed(monkeypatch, capsys):
 
     monkeypatch.setattr(cli_mod, "set_commit_status", boom)
 
-    rc = cli_mod.main(["--repo", "jleechanorg/dark-factory",
-                       "--pr-number", "278",
-                       "--pr-sha", "abcdef1234567890abcdef1234567890abcdef12",
-                       "--reviewers-json", '[["codex",""],["gemini","gemini-2.5-pro"]]',
-                       "--expected-actor", "github-actions[bot]"])
+    rc = cli_mod.main(
+        [
+            "--repo",
+            "jleechanorg/dark-factory",
+            "--pr-number",
+            "278",
+            "--pr-sha",
+            "abcdef1234567890abcdef1234567890abcdef12",
+            "--reviewers-json",
+            '[["codex",""],["gemini","gemini-2.5-pro"]]',
+            "--expected-actor",
+            "github-actions[bot]",
+        ]
+    )
     captured = capsys.readouterr()
     assert rc == 1, f"status failure must fail closed, got rc={rc}\n{captured.err}"
     assert "status set failed" in captured.err or "status API" in captured.err
@@ -1361,8 +1444,9 @@ def test_adversarial_diff_oversize_fails_closed(monkeypatch, capsys):
     import runner.skeptic_gate_cli as cli_mod
 
     monkeypatch.setattr(
-        cli_mod, "get_pr_head_sha_via_api",
-        lambda repo, pr: "abcdef1234567890abcdef1234567890abcdef12",
+        cli_mod,
+        "get_pr_head_sha_via_api",
+        lambda repo, pr, head_sha="": "abcdef1234567890abcdef1234567890abcdef12",
     )
 
     def huge_diff(repo, pr):
@@ -1399,3 +1483,376 @@ def test_adversarial_format_comment_includes_implementation_provenance():
     assert "PR_NUMBER: 278" in body
     assert "VERDICT: PASS" in body
     assert "REVIEWER: codex" in body
+
+
+# ===========================================================================
+# Real integration tests — post-audit comment 4953116428 v2 fixes
+# ===========================================================================
+
+
+def test_parse_verdict_rejects_seventh_field():
+    """Strict exact-6-field contract (post-audit comment 4953116428):
+    a reviewer output with a 7th field is rejected outright, even if
+    the original 6 are well-formed."""
+    out = (
+        "VERDICT: PASS\n"
+        "HEAD_SHA: abcdef1234567890abcdef1234567890abcdef12\n"
+        "REPO: jleechanorg/dark-factory\n"
+        "PR_NUMBER: 278\n"
+        "REASON: ok\n"
+        "IDENTITY: codex\n"
+        "EXTRANEOUS: extra-field\n"
+    )
+    assert parse_verdict(out) is None
+
+
+def test_parse_verdict_rejects_seventh_field_other_case():
+    """The 7th-field rejection is case-insensitive (extra FIELD: value)."""
+    out = (
+        "VERDICT: PASS\n"
+        "HEAD_SHA: abcdef1234567890abcdef1234567890abcdef12\n"
+        "REPO: jleechanorg/dark-factory\n"
+        "PR_NUMBER: 278\n"
+        "REASON: ok\n"
+        "IDENTITY: codex\n"
+        "extra_field: anything\n"
+    )
+    assert parse_verdict(out) is None
+
+
+def test_get_implementation_identity_uses_head_sha_direct_lookup():
+    """Provenance must derive from the HEAD commit (not the oldest
+    PR commit). When head_sha is supplied, the gate fetches the
+    commit at that SHA directly via `/commits/{sha}`."""
+    import runner.skeptic_gate_cli as cli_mod
+
+    head_sha = "abcdef1234567890abcdef1234567890abcdef12"
+    calls = {"commits_sha": None, "pr_commits": 0}
+
+    def fake_gh_api(method, path, *, body=None):
+        if method == "GET" and path.endswith(f"/commits/{head_sha}"):
+            calls["commits_sha"] = path
+            return {
+                "sha": head_sha,
+                "commit": {"message": "claudem/minimax-M3: feat: provenance fix\n"},
+            }
+        if "/pulls/" in path and "/commits" in path:
+            calls["pr_commits"] += 1
+            return []
+        return {}
+
+    orig = cli_mod.gh_api
+    cli_mod.gh_api = fake_gh_api
+    try:
+        identity = cli_mod.get_implementation_identity(
+            "jleechanorg/dark-factory", 278, head_sha
+        )
+    finally:
+        cli_mod.gh_api = orig
+    assert identity == "claude"
+    assert calls["commits_sha"] == f"repos/jleechanorg/dark-factory/commits/{head_sha}"
+    assert calls["pr_commits"] == 0
+
+
+def test_get_implementation_identity_falls_back_to_pr_commits_when_head_missing():
+    """If the direct commit lookup fails, the function paginates the
+    PR commits and finds the one whose sha matches the supplied head."""
+    import runner.skeptic_gate_cli as cli_mod
+
+    head_sha = "abcdef1234567890abcdef1234567890abcdef12"
+
+    def fake_gh_api(method, path, *, body=None):
+        if method == "GET" and path.endswith(f"/commits/{head_sha}"):
+            raise RuntimeError("commit not found")
+        if "/pulls/" in path and "/commits" in path:
+            return [
+                {
+                    "sha": "oldest0000000000000000000000000000000000",
+                    "commit": {"message": "naked commit message"},
+                },
+                {
+                    "sha": head_sha,
+                    "commit": {"message": "claudem/minimax-M3: feat: provenance fix"},
+                },
+            ]
+        return {}
+
+    orig = cli_mod.gh_api
+    cli_mod.gh_api = fake_gh_api
+    try:
+        identity = cli_mod.get_implementation_identity(
+            "jleechanorg/dark-factory", 278, head_sha
+        )
+    finally:
+        cli_mod.gh_api = orig
+    assert identity == "claude"
+
+
+def test_extract_field_parses_review_and_implementation_provenance():
+    """Readback extractors must parse REVIEWER and IMPLEMENTATION_PROVENANCE
+    from the comment body. Per post-audit 4953116428 the previous regexes
+    could not extract these fields."""
+    from runner.skeptic_gate_cli import _extract_field, _extract_int
+
+    body = (
+        "<!-- skeptic-gate-verdict -->\n"
+        "## Skeptic Gate — `PASS`\n\n"
+        "**VERDICT: PASS**\n"
+        "**HEAD_SHA: abcdef1234567890abcdef1234567890abcdef12**\n"
+        "**REPO: jleechanorg/dark-factory**\n"
+        "**PR_NUMBER: 278**\n"
+        "**REVIEWER: codex**\n"
+        "**IMPLEMENTATION_PROVENANCE: claude**\n"
+    )
+    assert (
+        _extract_field(body, "HEAD_SHA") == "abcdef1234567890abcdef1234567890abcdef12"
+    )
+    assert _extract_field(body, "REPO") == "jleechanorg/dark-factory"
+    assert _extract_field(body, "VERDICT") == "PASS"
+    assert _extract_field(body, "REVIEWER") == "codex"
+    assert _extract_field(body, "IMPLEMENTATION_PROVENANCE") == "claude"
+    assert _extract_int(body, "PR_NUMBER") == 278
+
+
+def test_status_publish_order_pending_then_success(monkeypatch, capsys):
+    """Per post-audit comment 4953116428: success status must NOT be
+    published before the readback step. The publish order is
+    pending → comment → readback → success. The fake set_commit_status
+    records the sequence; success must come AFTER pending AND AFTER
+    the comment upsert."""
+    import runner.skeptic_gate_cli as cli_mod
+
+    monkeypatch.setattr(
+        cli_mod,
+        "get_pr_head_sha_via_api",
+        lambda repo, pr: "abcdef1234567890abcdef1234567890abcdef12",
+    )
+    monkeypatch.setattr(cli_mod, "get_pr_diff", lambda repo, pr: "+x\n")
+    monkeypatch.setattr(
+        cli_mod, "get_implementation_identity", lambda repo, pr, head_sha="": "claude"
+    )
+
+    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+        return [
+            "python3",
+            "-c",
+            "import sys; sys.stdout.write("
+            + repr(_reviewer_stdout(reviewer, identity=reviewer))
+            + ")",
+        ]
+
+    monkeypatch.setattr(cli_mod, "_build_reviewer_cmd", fake_cmd)
+
+    call_log = []
+    last_posted_body = None
+
+    def fake_post(repo, pr, body):
+        nonlocal last_posted_body
+        last_posted_body = body
+        call_log.append(("post_comment", body[:80]))
+        return 9999
+
+    def fake_read_back(repo, cid):
+        # Echo back the exact body we posted so all 6 fields equality-check.
+        return {
+            "user": {"login": "github-actions[bot]"},
+            "body": last_posted_body or "",
+        }
+
+    def fake_status(repo, sha, *, state, context, description):
+        call_log.append(("set_status", state, description[:50]))
+
+    def fake_statuses(*args, **kwargs):
+        return [{"context": "skeptic", "state": "pending"}]
+
+    monkeypatch.setattr(cli_mod, "post_or_update_comment", fake_post)
+    monkeypatch.setattr(cli_mod, "read_back_comment", fake_read_back)
+    monkeypatch.setattr(cli_mod, "set_commit_status", fake_status)
+    monkeypatch.setattr(cli_mod, "gh_api", fake_statuses)
+
+    rc = cli_mod.main(
+        [
+            "--repo",
+            "jleechanorg/dark-factory",
+            "--pr-number",
+            "278",
+            "--pr-sha",
+            "abcdef1234567890abcdef1234567890abcdef12",
+            "--reviewers-json",
+            '[["codex",""],["gemini","gemini-2.5-pro"]]',
+            "--expected-actor",
+            "github-actions[bot]",
+        ]
+    )
+    assert rc == 0, f"expected PASS rc=0, got rc={rc}"
+    # First status MUST be pending.
+    first_status = next(c for c in call_log if c[0] == "set_status")
+    assert first_status[1] == "pending", (
+        f"first status must be pending; got {first_status}"
+    )
+    # Last status MUST be success.
+    last_status = next(c for c in reversed(call_log) if c[0] == "set_status")
+    assert last_status[1] == "success", (
+        f"last status must be success; got {last_status}"
+    )
+    # The comment post must occur BETWEEN the pending and the success.
+    statuses_with_index = [
+        (i, c) for i, c in enumerate(call_log) if c[0] == "set_status"
+    ]
+    comment_index = next(i for i, c in enumerate(call_log) if c[0] == "post_comment")
+    pending_index = statuses_with_index[0][0]
+    success_index = statuses_with_index[-1][0]
+    assert pending_index < comment_index < success_index, (
+        f"order must be pending({pending_index}) < comment({comment_index}) < "
+        f"success({success_index}); got {call_log}"
+    )
+
+
+def test_status_readback_mismatch_overwrites_to_failure(monkeypatch, capsys):
+    """If the readback step finds a mismatch, the status is overwritten
+    to `failure` (not left as `pending` or allowed to become `success`)."""
+    import runner.skeptic_gate_cli as cli_mod
+
+    monkeypatch.setattr(
+        cli_mod,
+        "get_pr_head_sha_via_api",
+        lambda repo, pr: "abcdef1234567890abcdef1234567890abcdef12",
+    )
+    monkeypatch.setattr(cli_mod, "get_pr_diff", lambda repo, pr: "+x\n")
+    monkeypatch.setattr(
+        cli_mod, "get_implementation_identity", lambda repo, pr, head_sha="": "claude"
+    )
+
+    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+        return [
+            "python3",
+            "-c",
+            "import sys; sys.stdout.write("
+            + repr(_reviewer_stdout(reviewer, identity=reviewer))
+            + ")",
+        ]
+
+    monkeypatch.setattr(cli_mod, "_build_reviewer_cmd", fake_cmd)
+
+    call_log = []
+
+    def fake_post(repo, pr, body):
+        call_log.append(("post_comment",))
+        return 9999
+
+    # The read-back returns a body with a WRONG HEAD_SHA, so the
+    # equality check fails.
+    def fake_read_back(repo, cid):
+        return {
+            "user": {"login": "github-actions[bot]"},
+            "body": "**HEAD_SHA: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef**\n",
+        }
+
+    def fake_status(repo, sha, *, state, context, description):
+        call_log.append(("set_status", state))
+
+    def fake_statuses(*args, **kwargs):
+        return [{"context": "skeptic", "state": "pending"}]
+
+    monkeypatch.setattr(cli_mod, "post_or_update_comment", fake_post)
+    monkeypatch.setattr(cli_mod, "read_back_comment", fake_read_back)
+    monkeypatch.setattr(cli_mod, "set_commit_status", fake_status)
+    monkeypatch.setattr(cli_mod, "gh_api", fake_statuses)
+
+    rc = cli_mod.main(
+        [
+            "--repo",
+            "jleechanorg/dark-factory",
+            "--pr-number",
+            "278",
+            "--pr-sha",
+            "abcdef1234567890abcdef1234567890abcdef12",
+            "--reviewers-json",
+            '[["codex",""],["gemini","gemini-2.5-pro"]]',
+            "--expected-actor",
+            "github-actions[bot]",
+        ]
+    )
+    assert rc == 1, f"read-back mismatch must fail closed; got rc={rc}"
+    statuses = [c for c in call_log if c[0] == "set_status"]
+    assert len(statuses) >= 2, (
+        f"expected at least 2 status writes (pending then failure); got {statuses}"
+    )
+    assert statuses[0][1] == "pending", f"first write must be pending; got {statuses}"
+    assert statuses[-1][1] == "failure", (
+        f"last write must overwrite to failure on readback mismatch; got {statuses}"
+    )
+    assert "success" not in [s[1] for s in statuses], (
+        f"success must NEVER be written on read-back mismatch; got {statuses}"
+    )
+
+
+def test_status_overwritten_failure_never_becomes_success(monkeypatch, capsys):
+    """Even if the aggregate is PASS, if the comment readback fails,
+    the final status must be `failure` (not `success`)."""
+    import runner.skeptic_gate_cli as cli_mod
+
+    monkeypatch.setattr(
+        cli_mod,
+        "get_pr_head_sha_via_api",
+        lambda repo, pr: "abcdef1234567890abcdef1234567890abcdef12",
+    )
+    monkeypatch.setattr(cli_mod, "get_pr_diff", lambda repo, pr: "+x\n")
+    monkeypatch.setattr(
+        cli_mod, "get_implementation_identity", lambda repo, pr, head_sha="": "claude"
+    )
+
+    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+        return [
+            "python3",
+            "-c",
+            "import sys; sys.stdout.write("
+            + repr(_reviewer_stdout(reviewer, identity=reviewer))
+            + ")",
+        ]
+
+    monkeypatch.setattr(cli_mod, "_build_reviewer_cmd", fake_cmd)
+
+    call_log = []
+
+    def fake_post(repo, pr, body):
+        call_log.append("post")
+        return 9999
+
+    def fake_read_back(repo, cid):
+        # Wrong actor → readback fails.
+        return {"user": {"login": "someone-else"}, "body": ""}
+
+    def fake_status(repo, sha, *, state, context, description):
+        call_log.append(("status", state))
+
+    def fake_statuses(*args, **kwargs):
+        return [{"context": "skeptic", "state": "pending"}]
+
+    monkeypatch.setattr(cli_mod, "post_or_update_comment", fake_post)
+    monkeypatch.setattr(cli_mod, "read_back_comment", fake_read_back)
+    monkeypatch.setattr(cli_mod, "set_commit_status", fake_status)
+    monkeypatch.setattr(cli_mod, "gh_api", fake_statuses)
+
+    rc = cli_mod.main(
+        [
+            "--repo",
+            "jleechanorg/dark-factory",
+            "--pr-number",
+            "278",
+            "--pr-sha",
+            "abcdef1234567890abcdef1234567890abcdef12",
+            "--reviewers-json",
+            '[["codex",""],["gemini","gemini-2.5-pro"]]',
+            "--expected-actor",
+            "github-actions[bot]",
+        ]
+    )
+    assert rc == 1
+    states = [c[1] for c in call_log if c[0] == "status"]
+    assert "success" not in states, (
+        f"success must NEVER appear on read-back failure; got {states}"
+    )
+    assert "failure" in states, (
+        f"failure must overwrite pending on read-back failure; got {states}"
+    )
