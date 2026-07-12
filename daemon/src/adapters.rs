@@ -204,8 +204,24 @@ impl Tracker for CliTracker {
 
 fn is_bead_missing_error(err: &DaemonError) -> bool {
     match err {
-        DaemonError::Tool { rc, stderr, .. } if *rc != 0 => {
-            stderr.to_lowercase().contains("not found") || stderr.to_lowercase().contains("no such")
+        DaemonError::Tool { rc, stderr, .. } if *rc == 3 => {
+            let json_start = match stderr.find('{') {
+                Some(pos) => pos,
+                None => return false,
+            };
+            let val: serde_json::Value = match serde_json::from_str(&stderr[json_start..]) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            val.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_str())
+                == Some("ISSUE_NOT_FOUND")
+                && val
+                    .get("error")
+                    .and_then(|e| e.get("retryable"))
+                    .and_then(|r| r.as_bool())
+                    == Some(false)
         }
         _ => false,
     }
@@ -4061,23 +4077,23 @@ mod bead_status_tests {
     }
 
     #[test]
-    fn is_bead_missing_detects_not_found_tool_error() {
+    fn is_bead_missing_rejects_not_found_tool_error() {
         let err = DaemonError::Tool {
             tool: "br".into(),
             rc: 1,
             stderr: "Error: bead not found in database".into(),
         };
-        assert!(is_bead_missing_error(&err));
+        assert!(!is_bead_missing_error(&err));
     }
 
     #[test]
-    fn is_bead_missing_detects_no_such_tool_error() {
+    fn is_bead_missing_rejects_no_such_tool_error() {
         let err = DaemonError::Tool {
             tool: "br".into(),
             rc: 1,
             stderr: "no such bead".into(),
         };
-        assert!(is_bead_missing_error(&err));
+        assert!(!is_bead_missing_error(&err));
     }
 
     #[test]
@@ -5260,5 +5276,302 @@ exit 1
             )),
             "ancestor_sha == descendant_sha must short-circuit to Ok(true)"
         );
+    }
+}
+
+/// Production `CliTracker` tests with a temp `br` on PATH (no mocks — real
+/// subprocess calls driven through a shell shim). Each test holds
+/// `gh_env_test_lock()` so PATH mutations are serialized across all
+/// PATH-mutating test modules in this file (jleechan-9sl1 discipline).
+#[cfg(test)]
+mod cli_tracker_tests {
+    use super::CliTracker;
+    use crate::errors::DaemonError;
+    use crate::tools::Tracker;
+    use std::sync::Mutex;
+
+    fn env_lock() -> &'static Mutex<()> {
+        super::gh_env_test_lock()
+    }
+
+    fn make_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "afd_cli_tracker_{prefix}_{nanos}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_br_shim(dir: &std::path::Path, script: &str) {
+        let br_path = dir.join("br");
+        std::fs::write(&br_path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(
+            &br_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    struct PathGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl PathGuard {
+        fn set(dir: &std::path::Path) -> Self {
+            let prior = std::env::var_os("PATH");
+            unsafe { std::env::set_var("PATH", dir) };
+            PathGuard { prior }
+        }
+    }
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prior {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    // ── is_bead_missing_error classification ──────────────────────────
+
+    #[test]
+    #[cfg(unix)]
+    fn bead_status_missing_rc3_issue_not_found_retryable_false() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = make_temp_dir("br_missing");
+        write_br_shim(
+            &dir,
+            r#"printf '{"error":{"code":"ISSUE_NOT_FOUND","retryable":false,"message":"bead X not found"}}\n' >&2
+exit 3"#,
+        );
+        let _path_guard = PathGuard::set(&dir);
+
+        let tracker = CliTracker;
+        let result = tracker.bead_status("missing-bead");
+
+        match result {
+            Ok(None) => {}
+            other => panic!("expected Ok(None) for missing bead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bead_status_rc3_issue_not_found_retryable_true_is_error_not_missing() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = make_temp_dir("br_retryable_true");
+        write_br_shim(
+            &dir,
+            r#"printf '{"error":{"code":"ISSUE_NOT_FOUND","retryable":true,"message":"transient"}}\n' >&2
+exit 3"#,
+        );
+        let _path_guard = PathGuard::set(&dir);
+
+        let tracker = CliTracker;
+        let result = tracker.bead_status("retryable-bead");
+
+        match result {
+            Err(DaemonError::Tool { .. }) => {}
+            other => panic!("expected Err(Tool) for retryable=true, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bead_status_rc3_wrong_error_code_is_error_not_missing() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = make_temp_dir("br_wrong_code");
+        write_br_shim(
+            &dir,
+            r#"printf '{"error":{"code":"DATABASE_ERROR","retryable":true}}\n' >&2
+exit 3"#,
+        );
+        let _path_guard = PathGuard::set(&dir);
+
+        let tracker = CliTracker;
+        let result = tracker.bead_status("wrong-code-bead");
+
+        match result {
+            Err(DaemonError::Tool { .. }) => {}
+            other => panic!("expected Err(Tool) for wrong error.code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bead_status_rc1_not_found_text_is_error_not_missing() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = make_temp_dir("br_not_found");
+        write_br_shim(
+            &dir,
+            r#"echo 'not found' >&2
+exit 1"#,
+        );
+        let _path_guard = PathGuard::set(&dir);
+
+        let tracker = CliTracker;
+        let result = tracker.bead_status("not-found-bead");
+
+        match result {
+            Err(DaemonError::Tool { .. }) => {}
+            other => panic!("expected Err(Tool) for rc=1 not-found text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bead_status_rc3_non_json_stderr_is_error_not_missing() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = make_temp_dir("br_non_json");
+        write_br_shim(
+            &dir,
+            r#"echo 'no such bead' >&2
+exit 3"#,
+        );
+        let _path_guard = PathGuard::set(&dir);
+
+        let tracker = CliTracker;
+        let result = tracker.bead_status("non-json-bead");
+
+        match result {
+            Err(DaemonError::Tool { .. }) => {}
+            other => panic!("expected Err(Tool) for rc=3 non-JSON stderr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bead_status_rc0_not_found_text_is_error_not_missing() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = make_temp_dir("br_rc0_not_found");
+        write_br_shim(
+            &dir,
+            r#"echo 'not found in database' >&2
+exit 0"#,
+        );
+        let _path_guard = PathGuard::set(&dir);
+
+        let tracker = CliTracker;
+        let result = tracker.bead_status("rc0-not-found");
+
+        match result {
+            Ok(None) => {}
+            other => panic!("expected Ok(None) (empty stdout) for rc=0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bead_status_rc3_empty_stderr_is_error_not_missing() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = make_temp_dir("br_empty_stderr");
+        write_br_shim(&dir, "exit 3");
+        let _path_guard = PathGuard::set(&dir);
+
+        let tracker = CliTracker;
+        let result = tracker.bead_status("empty-stderr-bead");
+
+        match result {
+            Err(DaemonError::Tool { .. }) => {}
+            other => panic!("expected Err(Tool) for rc=3 with empty stderr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bead_status_rc3_malformed_json_is_error_not_missing() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = make_temp_dir("br_malformed");
+        write_br_shim(
+            &dir,
+            r#"printf '{"malformed": true' >&2
+exit 3"#,
+        );
+        let _path_guard = PathGuard::set(&dir);
+
+        let tracker = CliTracker;
+        let result = tracker.bead_status("malformed-json-bead");
+
+        match result {
+            Err(DaemonError::Tool { .. }) => {}
+            other => panic!("expected Err(Tool) for rc=3 malformed JSON, got {other:?}"),
+        }
+    }
+
+    // ── fetch_candidates via production CliTracker ────────────────────
+
+    #[test]
+    #[cfg(unix)]
+    fn fetch_candidates_parses_valid_br_list_json() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = make_temp_dir("br_list");
+        write_br_shim(
+            &dir,
+            r#"printf '{"issues":[{"id":"b1","title":"t1","description":"d1","external_ref":"owner/repo#1"}],"has_more":false}\n'"#,
+        );
+        let _path_guard = PathGuard::set(&dir);
+
+        let tracker = CliTracker;
+        let result = tracker.fetch_candidates();
+
+        match result {
+            Ok(beads) => {
+                assert_eq!(beads.len(), 1);
+                assert_eq!(beads[0].id, "b1");
+                assert_eq!(beads[0].title, "t1");
+            }
+            other => panic!("expected Ok with 1 bead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fetch_candidates_rejects_truncated_output() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = make_temp_dir("br_list_truncated");
+        write_br_shim(
+            &dir,
+            r#"printf '{"issues":[],"has_more":true}\n'"#,
+        );
+        let _path_guard = PathGuard::set(&dir);
+
+        let tracker = CliTracker;
+        let result = tracker.fetch_candidates();
+
+        match result {
+            Err(DaemonError::Parse(msg)) => {
+                assert!(msg.contains("has_more"), "expected has_more error, got: {msg}");
+            }
+            other => panic!("expected Err(Parse) for truncated output, got {other:?}"),
+        }
     }
 }

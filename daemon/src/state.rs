@@ -2635,4 +2635,201 @@ mod tests {
         let h_after = store.load("h").unwrap().unwrap();
         assert_eq!(h_after.autonomy_secs, 10299);
     }
+
+    // ── Reconciliation: stale DISPATCHED candidate selection and requeue ──
+
+    #[test]
+    fn stale_dispatched_candidates_selects_all_dispatched_rows() {
+        let store = store();
+        store
+            .save(&BeadOverlay {
+                bead_id: "d1".into(),
+                state: OverlayState::Dispatched,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 3600,
+                spend_usd: 0.0,
+                pr_number: Some(1),
+                branch: Some("factory/d1-r1".into()),
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+        store
+            .save(&BeadOverlay {
+                bead_id: "d2".into(),
+                state: OverlayState::Dispatched,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 100,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: Some("live-sess".into()),
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+        store
+            .save(&BeadOverlay {
+                bead_id: "a1".into(),
+                state: OverlayState::Attested,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 200,
+                spend_usd: 0.0,
+                pr_number: Some(2),
+                branch: Some("factory/a1-r1".into()),
+                session_id: Some("attested-sess".into()),
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+        store
+            .save(&BeadOverlay {
+                bead_id: "q1".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+
+        let candidates = store.stale_dispatched_candidates(3600).unwrap();
+        let ids: Vec<&str> = candidates.iter().map(|c| c.bead_id.as_str()).collect();
+        assert!(ids.contains(&"d1"));
+        assert!(ids.contains(&"d2"));
+        assert!(!ids.contains(&"a1"), "ATTESTED must not be in DISPATCHED candidates");
+        assert!(!ids.contains(&"q1"), "QUEUED must not be in DISPATCHED candidates");
+    }
+
+    #[test]
+    fn requeue_stale_dispatched_affects_exactly_one_row() {
+        let store = store();
+        store
+            .save(&BeadOverlay {
+                bead_id: "target".into(),
+                state: OverlayState::Dispatched,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 7200,
+                spend_usd: 3.5,
+                pr_number: Some(42),
+                branch: Some("factory/target-r1".into()),
+                session_id: Some("dead-session".into()),
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+        store
+            .save(&BeadOverlay {
+                bead_id: "unrelated".into(),
+                state: OverlayState::Dispatched,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 100,
+                spend_usd: 1.0,
+                pr_number: Some(99),
+                branch: Some("factory/unrelated-r1".into()),
+                session_id: Some("live-session".into()),
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+
+        let requeued = store.requeue_stale_dispatched("target").unwrap();
+        assert_eq!(requeued.state, OverlayState::Queued);
+        assert_eq!(requeued.session_id, None);
+        assert_eq!(requeued.branch, None);
+        assert_eq!(requeued.autonomy_secs, 0);
+
+        let unrelated = store.load("unrelated").unwrap().unwrap();
+        assert_eq!(
+            unrelated.state,
+            OverlayState::Dispatched,
+            "unrelated row must not be touched by requeue_stale_dispatched"
+        );
+        assert_eq!(
+            unrelated.session_id.as_deref(),
+            Some("live-session"),
+            "unrelated session_id must be preserved"
+        );
+        assert_eq!(
+            unrelated.branch.as_deref(),
+            Some("factory/unrelated-r1"),
+            "unrelated branch must be preserved"
+        );
+        assert_eq!(
+            unrelated.autonomy_secs, 100,
+            "unrelated autonomy_secs must be preserved"
+        );
+        assert_eq!(
+            unrelated.spend_usd, 1.0,
+            "unrelated spend_usd must be preserved"
+        );
+    }
+
+    #[test]
+    fn requeue_stale_dispatched_errors_when_not_dispatched() {
+        let store = store();
+        store
+            .save(&BeadOverlay {
+                bead_id: "not-dispatched".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+
+        let result = store.requeue_stale_dispatched("not-dispatched");
+        assert!(
+            result.is_err(),
+            "requeue_stale_dispatched must error when row is not DISPATCHED"
+        );
+    }
+
+    #[test]
+    fn requeue_stale_dispatched_errors_when_bead_not_found() {
+        let store = store();
+        let result = store.requeue_stale_dispatched("nonexistent");
+        assert!(
+            result.is_err(),
+            "requeue_stale_dispatched must error when bead does not exist"
+        );
+    }
 }
