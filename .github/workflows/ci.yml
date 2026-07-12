@@ -19,6 +19,13 @@ on:
 
 jobs:
   test:
+    # Fork-PR isolation: self-hosted runners are persistent and may carry
+    # org secrets / cached build state. Untrusted fork PR code must not
+    # execute on them — the risk is a persistent compromise of the runner
+    # (see GitHub's secure-use docs for public repos with self-hosted runners).
+    # Same guard as evidence-gate.yml: fork PRs are skipped, not silently
+    # rerouted; the PR author must open from a branch in the same org.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
     runs-on: ${{ fromJSON(vars.SELF_HOSTED_RUNNER_LABELS) }}
     permissions:
       contents: read
@@ -39,6 +46,20 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
+
+      - name: Detect runner platform (Linux-only isolation tests)
+        # tests/security/test_agent_isolation.py uses @linux_only markers
+        # and will SKIP on macOS runners. This step surfaces that fact
+        # explicitly so macOS CI runs don't silently omit sandbox coverage.
+        # See docs/self-hosted-runner-selector.md "Adding a platform-specific
+        # job" for the path to a dedicated Linux-only job once a
+        # self-hosted-linux label is available on the org fleet.
+        run: |
+          PLATFORM="$(python3 -c 'import sys; print(sys.platform)')"
+          echo "Runner platform: $PLATFORM"
+          if [ "$PLATFORM" != "linux" ]; then
+            echo "::warning title=Platform coverage gap::Running on $PLATFORM — tests/security/test_agent_isolation.py Linux-only tests will be skipped. Open a follow-up issue to add a self-hosted-linux label to the org runner fleet for mandatory Linux coverage."
+          fi
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
@@ -62,6 +83,9 @@ jobs:
         run: python -m runner.graph_audit pipelines
 
   daemon-tests:
+    # Fork-PR isolation: same guard as the `test` job above.
+    # Self-hosted runners are persistent — fork PR code must not execute on them.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
     runs-on: ${{ fromJSON(vars.SELF_HOSTED_RUNNER_LABELS) }}
     permissions:
       contents: read
