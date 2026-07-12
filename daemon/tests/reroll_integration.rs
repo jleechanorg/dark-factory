@@ -284,7 +284,8 @@ fn test_tick_stage2_integration() {
     scm.permissions.insert("dev".into(), Permission::Write);
 
     let tracker = FakeTracker::new();
-    let sessions = FakeSessions::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
     let mut vcs = FakeVcs::new();
     vcs.heads.insert("main".into(), "base-sha-abc".into());
     vcs.heads
@@ -422,7 +423,8 @@ fn test_tick_stage2_integration() {
 #[test]
 fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
     let scm = FakeScm::new();
-    let sessions = FakeSessions::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
     let mut vcs = FakeVcs::new();
     vcs.heads.insert("alice/my-cool-feature".into(), "pre-session-sha-abc123".into());
     let store = FakeStateStore::new();
@@ -565,7 +567,8 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
 #[test]
 fn test_reroll_adopted_spawn_failure_parks_human_held() {
     let scm = FakeScm::new();
-    let sessions = FakeSessions::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
     sessions.fail_spawn_for("bead-adopted-conflict");
     let mut vcs = FakeVcs::new();
     vcs.heads.insert("alice/my-cool-feature".into(), "pre-session-sha-abc123".into());

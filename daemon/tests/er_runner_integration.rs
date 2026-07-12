@@ -182,6 +182,9 @@ impl daemon::tools::Sessions for SessionsMock {
     fn is_quiescent(&self, _i: &SessionId) -> Result<bool, daemon::errors::DaemonError> {
         Ok(true)
     }
+    fn is_session_dead(&self, _i: &SessionId) -> Result<bool, daemon::errors::DaemonError> {
+        Ok(false)
+    }
 }
 
 #[derive(Default)]
