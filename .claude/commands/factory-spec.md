@@ -1,84 +1,26 @@
 ---
 description: "/factory-spec — create or review a Dark Factory spec (main + attractor) with codex cold review of both"
-type: quality
+type: skill
 execution_mode: immediate
 aliases: []
 ---
 
 # /factory-spec — Two-Phase Spec Generation (Main + Attractor)
 
-Create **two** reviewed specs via the `spec_gen` pipeline: a **main spec**
-(`spec.md`) and an **attractor spec** (`attractor_spec.md`). The main spec
-describes the implementation path; the attractor spec describes the
-convergence goal — the stable end state the system must reach, plus the
-anti-attractor states it must NOT converge to. A cold adversarial codex
-reviewer signs off on **both** before exit.
+Read `.claude/skills/factory-spec/SKILL.md` and execute it as the source of
+truth. Identical workflow to `/fs`; this is an alternate entry point name.
 
-**Install (once):**
-
-```bash
-./install.sh
-export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-$(pwd)}"
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Runs use **`dark-factory`** on PATH — not `python -m runner` from source.
-Pipeline decision table:
-[docs/pipeline-selection.md](../../docs/pipeline-selection.md)
-
-**Usage**:
+## Usage
 
 ```
 /factory-spec <spec description>          # create mode — runs spec_gen (main + attractor)
-/factory-spec --review <spec_path>        # reference review helper, not /fs proof
-/factory-spec --review                    # reference review helper for spec/feature.md
-/factory-spec --review-attractor <path>   # reference review helper for attractor spec
+/factory-spec --review <spec_path>        # in-session review of an existing main spec
+/factory-spec --review-attractor <path>   # in-session review of an existing attractor spec
 /factory-spec --skip-attractor <desc>     # create mode but skip the attractor phase
 /factory-spec --show                      # show pipeline graphs (read-only reference)
-/factory --pipeline <dot> ...   # execute feature pipeline after both specs ready
 ```
 
-## Action
+## See also
 
-Parse `$ARGUMENTS` and execute the `factory-spec` reference workflow:
-
-1. **Detect mode**: `--review` → review main spec; `--review-attractor` →
-   review attractor spec; `--show` → graph reference only; `--skip-attractor` →
-   create mode but skip the attractor phase; otherwise → full create mode
-   (main + attractor).
-2. **Step 0 (create mode only):** classify greenfield vs brownfield — feeds
-   the goal/context string passed to the pipeline (see skill).
-3. **Create mode only:** report auto-chosen options (pinned pipeline + goal
-   string) and ask user to confirm **before any pipeline invocation**.
-   Reference-only helper modes here do not satisfy `/fs`; `/fs` itself is
-   binary-backed and must emit its proof block.
-4. **Run the binary-first workflow** as defined in `.claude/skills/factory-spec/SKILL.md`.
-   Create mode is **pinned to `pipelines/slim/spec_gen.dot`** and runs it
-   only after the step-3 confirmation. The pipeline produces BOTH
-   `spec.md` (main) AND `attractor_spec.md` (attractor) by default;
-   `--skip-attractor` short-circuits the attractor phase to a single-spec
-   run.
-
-## Pipeline summary (create mode)
-
-```
-start → explore_in → explore_fanout → {explore_concept, explore_auth,
-       explore_reuse, explore_risks} → explore_join → explore_stitch →
-       explore_out
-     → plan_main        [plan.md → spec.md]
-     → review_main      [codex cold review of spec.md]              ─┐
-     → plan_attractor   [plan_attractor.md → attractor_spec.md]     │ if main review fails → fix_main → review_main
-     → review_attractor [codex cold review of attractor_spec.md]    ─┐
-     → exit                                                            │ if attractor review fails → fix_attractor → review_attractor
-```
-
-The cold codex reviewer is the same vendor priority in both phases
-(`codex,minimax,agy,claude-sonnet`, `prefer_adversarial=true`). Both phases
-must sign off before the pipeline exits. The attractor spec is generated
-**after** the main spec passes review (sequential, not parallel), so the
-attractor spec can reference the codex-signed-off `spec.md` for the
-consistency check.
-
-The `spec_gen` pipeline's skill-side reference for both nodes (table
-above) is the source of truth for node behavior; review modes do not
-invoke any pipeline.
+- `/fs` — same skill, shorter alias.
+- `/f` — full Dark Factory loop; run after specs are reviewed.
