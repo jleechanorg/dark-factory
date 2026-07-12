@@ -204,9 +204,20 @@ bash "$I"
 # session dedup (below) does NOT re-query AO for every bead. Fixes issue #270:
 # the tick loop was serializing behind 1-2 `ao session ls` calls per bead,
 # blocking dispatch for 40-110s per lane.
+#
+# Cache directory is initialized BEFORE the function definitions so it exists
+# under `set -u` (skeptic fix #1: AFD_SESSION_CACHE_DIR init).
+AFD_SESSION_CACHE_DIR="${AFD_SESSION_CACHE_DIR:-$(mktemp -d -t af_sessions.XXXXXX)}"
+trap 'rm -rf "${AFD_SESSION_CACHE_DIR}"' EXIT
 
 ao_session_cache() {
   local proj="$1"
+  # Validate project name against strict allowlist to prevent path traversal
+  # (skeptic fix #9: validate ao_project cache names).
+  if [[ ! "$proj" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "CACHE_ERROR:invalid_project_name=${proj}"
+    return 0
+  fi
   local cache_file="${AFD_SESSION_CACHE_DIR}/${proj}.txt"
   if [ -f "$cache_file" ]; then
     cat "$cache_file"
@@ -220,32 +231,51 @@ ao_session_cache() {
   if timeout 10 "$AO" session ls -p "$proj" 2>/dev/null > "$cache_file"; then
     :
   else
-    touch "$cache_file"
+    # Fail closed: write a sentinel so callers do NOT treat an empty cache
+    # as "no active sessions" and proceed to dispatch. (skeptic fix #2)
+    echo "CACHE_ERROR:ao_query_failed" > "$cache_file"
   fi
-  [ -s "$cache_file" ] || touch "$cache_file"
+  [ -s "$cache_file" ] || echo "CACHE_ERROR:empty_response" > "$cache_file"
   cat "$cache_file"
 }
 
 ao_active_sessions() {
   # Count non-terminated sessions across cached project data.
+  # Returns: integer count of active sessions, or -1 on cache error (fail closed).
   local proj="$1"
   local raw
   raw="$(ao_session_cache "$proj" 2>/dev/null || true)"
-  if [ -z "$raw" ] || [ "$raw" = "[]" ]; then
+  if [ -z "$raw" ]; then
     echo 0
     return
   fi
-  total="$(echo "$raw" | rg -c '\[(spawning|running|active|working|pr_open)\]' 2>/dev/null || echo 0)"
-  case "$total" in
+  # Fail closed: cache errors propagate as -1 so the capacity gate refuses dispatch.
+  case "$raw" in
+    CACHE_ERROR:*) echo -1; return ;;
+  esac
+  if [ "$raw" = "[]" ]; then
+    echo 0
+    return
+  fi
+  # skeptic fix #9: localize variable name (was 'total', now 'active_count').
+  local active_count
+  active_count="$(echo "$raw" | rg -c '\[(spawning|running|active|working|pr_open)\]' 2>/dev/null || echo 0)"
+  case "$active_count" in
     ''|*[!0-9]*) echo 0 ;;
-    *) echo "$total" ;;
+    *) echo "$active_count" ;;
   esac
 }
 
 ao_session_exists() {
   # Return 0 if an active session exists for the PR in the given project.
+  # Return 1 on session-not-found OR on cache error (fail closed).
   local proj="$1" pr="$2"
-  ao_session_cache "$proj" 2>/dev/null | rg "pulls/${pr}\b" | rg -q '\[(spawning|running|active|working|pr_open)\]' 2>/dev/null
+  local raw
+  raw="$(ao_session_cache "$proj" 2>/dev/null)"
+  case "$raw" in
+    CACHE_ERROR:*) return 1 ;;
+  esac
+  echo "$raw" | rg "pulls/${pr}\b" | rg -q '\[(spawning|running|active|working|pr_open)\]' 2>/dev/null
 }
 
 AO="$(bash "$ROOT/daemon/factory-ao-bin.sh" 2>/dev/null || true)"
@@ -260,12 +290,27 @@ fi
 if [ -n "$AO" ]; then
     # Use cached session data. Pre-populate the cache with the default project
     # so the per-bead loop doesn't re-query AO.
+    # Whole-tick bound (skeptic fix #5): the first cache fill per unique project
+    # costs up to 10s (timeout on `ao session ls`). With the default config
+    # mapping all repos to a single project, this is at most 10s per tick.
+    # Each dispensed bead adds AFD_ASYNC_WAIT_SEC (5s) for fast-fail poll.
+    # Total dispatch-lane bound per tick: 10s + (MAX_DISPATCH * 5s).
     ao_session_cache "$AO_PROJECT" > /dev/null 2>&1
     ao_active="$(ao_active_sessions "$AO_PROJECT")"
-    if [ "${ao_active:-0}" -ge "$AO_CAP" ]; then
-        echo "[af] AO cap: ${ao_active} active >= ${AO_CAP} — skipping dispatch (intake done)" >&2
-        MAX_DISPATCH=0
-    fi
+    case "$ao_active" in
+        -1)
+            # Fail closed: AO session count is unknowable (cache error). Refuse
+            # dispatch rather than proceeding blindly. (skeptic fix #2)
+            echo "[af] AO session cache error — refusing dispatch (fail closed)" >&2
+            MAX_DISPATCH=0
+            ;;
+        *)
+            if [ "${ao_active:-0}" -ge "$AO_CAP" ]; then
+                echo "[af] AO cap: ${ao_active} active >= ${AO_CAP} — skipping dispatch (intake done)" >&2
+                MAX_DISPATCH=0
+            fi
+            ;;
+    esac
 fi
 
 # ---------- build SELECT filters (no SQL injection; values validated above) ----------
@@ -304,7 +349,6 @@ fi
 # ---------- dispatch loop ----------
 dispatched=0
 ERR_TMP="$(mktemp -t af_dispatch_err.XXXXXX)"
-AFD_SESSION_CACHE_DIR="${AFD_SESSION_CACHE_DIR:-$(mktemp -d -t af_sessions.XXXXXX)}"
 trap 'rm -f "$ERR_TMP"; rm -rf "${AFD_SESSION_CACHE_DIR}"' EXIT
 while IFS=$'\t' read -r bead_id pr branch bead_repo; do
     [ -n "$bead_id" ] || continue
@@ -365,6 +409,15 @@ PY
     # does NOT issue a live AO query per bead.
     ao_session_cache "$proj" > /dev/null 2>&1
 
+    # Per-bead fail closed: if the project's session cache is errored, skip
+    # this bead rather than dispatching blindly. (skeptic fix #2)
+    if [ -f "${AFD_SESSION_CACHE_DIR}/${proj}.txt" ]; then
+        if rg -q '^CACHE_ERROR:' "${AFD_SESSION_CACHE_DIR}/${proj}.txt" 2>/dev/null; then
+            echo "[af] skip $bead_id: AO session cache error for project $proj (fail closed)" >&2
+            continue
+        fi
+    fi
+
     if [ -n "$AO" ] && ao_session_exists "$proj" "$pr"; then
         echo "[af] skip $bead_id PR #$pr (active session exists in project $proj)" >&2
         continue
@@ -372,10 +425,13 @@ PY
     echo "[af] remediate $bead_id PR #$pr on $repo in project $proj"
     # CX-2: thread proj and repo through to factory-ao-remediate.sh so the spawned
     # session lives in the same AO project.
-    # AFD_SKIP_FAST_FAIL_POLL=1: fully nonblocking dispatch. The remediation
-    # script queues the spawn and returns immediately; the next tick's session
-    # check is the sole observability channel.
-    if AFD_SKIP_FAST_FAIL_POLL=1 bash "$R" "$bead_id" "$pr" "$repo" "$proj" 2>&1; then
+    # skeptic fix #3: DO NOT skip fast-fail poll (no AFD_SKIP_FAST_FAIL_POLL=1).
+    # The fast-fail window (AFD_ASYNC_WAIT_SEC, default 5s) catches immediate
+    # spawn failures (auth/project errors). Skipping it causes the script to
+    # return 0 immediately, then dispatch-record marks the bead DISPATCHED,
+    # stranding it if the spawn already failed. The bead would remain stranded
+    # until the next tick's rollback-dispatched runs — up to 240s of dead time.
+    if bash "$R" "$bead_id" "$pr" "$repo" "$proj" 2>&1; then
         cur_state="$(sqlite3 "$DB" "SELECT state FROM bead_overlay WHERE bead_id='$(printf "%s" "$bead_id" | sed "s/'/''/g")';" 2>/dev/null || true)"
         if [ "$cur_state" = "QUEUED" ]; then
             if [ -n "$branch" ]; then

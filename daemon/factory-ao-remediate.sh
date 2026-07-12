@@ -71,20 +71,21 @@ ensure_ao_daemon() {
   # Catch broken AO binary first: a 127 exit on any command means the
   # CLI is misconfigured (wrong path, missing exec bit, broken install).
   # Don't queue a doomed spawn in that case.
-  if ! "$AO" --version >/dev/null 2>&1 && ! "$AO" status >/dev/null 2>&1; then
+  # skeptic fix #4: timeout-bind every ao call (--version/status/daemon).
+  if ! timeout 10 "$AO" --version >/dev/null 2>&1 && ! timeout 10 "$AO" status >/dev/null 2>&1; then
     return 1
   fi
   if [[ "$(basename "$AO")" != "ao-go" ]]; then
     # ao-ts manages its own lifecycle; binary is the daemon.
     return 0
   fi
-  if "$AO" status >/dev/null 2>&1; then
+  if timeout 10 "$AO" status >/dev/null 2>&1; then
     return 0
   fi
   echo "[remediate] starting Go AO daemon" >&2
   nohup "$AO" daemon >> /tmp/ao-go-daemon.log 2>&1 &
   for _ in 1 2 3 4 5; do
-    if "$AO" status >/dev/null 2>&1; then
+    if timeout 10 "$AO" status >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -113,7 +114,7 @@ classify_spawn_outcome() {
   if echo "$out" | rg -q 'spawned session |Session [a-z0-9_-]+ created|✓ Session|pr_open|working|spawning|claimed https://'; then
     return 0
   fi
-  if "$AO" session ls 2>/dev/null | rg "pulls/${PR}\b" | rg -q "\[(spawning|running|active|working|pr_open)\]"; then
+  if timeout 10 "$AO" session ls 2>/dev/null | rg "pulls/${PR}\b" | rg -q "\[(spawning|running|active|working|pr_open)\]"; then
     return 0
   fi
   return 1
@@ -128,7 +129,7 @@ if [ "$MODE" = "sync" ]; then
   # Best-effort daemon readiness for sync path (no bounded probe — caller
   # is opting into blocking semantics).
   if [[ "$(basename "$AO")" == "ao-go" ]]; then
-    state="$("$AO" status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null || true)"
+    state="$(timeout 10 "$AO" status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null || true)"
     if [ "$state" != "ready" ] && [ "$state" != "running" ]; then
       echo "[remediate] starting Go AO daemon" >&2
       nohup "$AO" daemon >> /tmp/ao-go-daemon.log 2>&1 &
