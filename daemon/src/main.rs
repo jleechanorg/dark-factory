@@ -181,6 +181,9 @@ impl Tracker for NoopAdapters {
     fn comment_external(&self, _external_ref: &str, _body: &str) -> Result<(), DaemonError> {
         Ok(())
     }
+    fn bead_status(&self, _bead_id: &str) -> Result<Option<daemon::tools::BeadStatus>, DaemonError> {
+        Ok(Some(daemon::tools::BeadStatus::Active))
+    }
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -227,6 +230,9 @@ impl Sessions for NoopAdapters {
     }
     fn is_quiescent(&self, _id: &SessionId) -> Result<bool, DaemonError> {
         Ok(true)
+    }
+    fn is_session_dead(&self, _id: &SessionId) -> Result<bool, DaemonError> {
+        Ok(false)
     }
 }
 

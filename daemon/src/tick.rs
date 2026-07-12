@@ -27,7 +27,7 @@ use crate::state::{
     set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
 };
 use crate::telemetry::{self, TelemetryEvent};
-use crate::tools::{Bead, Llm, PrHeadBranch, Scm, SessionId, Sessions, Tracker, Vcs};
+use crate::tools::{Bead, BeadStatus, Llm, PrHeadBranch, Scm, SessionId, Sessions, Tracker, Vcs};
 use crate::verifier::{self, PrEvidence};
 use std::collections::HashSet;
 use std::path::Path;
@@ -73,6 +73,15 @@ pub struct TickSummary {
     /// query `bead_overlay` yourself" (2026-07-09 live incident: 45 beads
     /// silently lost with no durable trace anywhere).
     pub beads_escalated_locally: usize,
+    /// jleechan-xsg4 (issue #270): active overlays whose bead was missing
+    /// from `br` (deleted) and therefore demoted to HUMAN_HELD this tick.
+    pub beads_reconciled_bead_missing: usize,
+    /// jleechan-xsg4 (issue #270): active overlays whose bead was closed
+    /// (terminal) in `br` and therefore demoted to HUMAN_HELD this tick.
+    pub beads_reconciled_bead_closed: usize,
+    /// jleechan-xsg4 (issue #270): stale DISPATCHED overlays (no live
+    /// session or empty session_id) requeued back to QUEUED this tick.
+    pub beads_recovered_stale_dispatched: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -82,6 +91,12 @@ pub struct TickSummary {
 /// above this cap are deliberately left in HUMAN_HELD for a human to
 /// review — the daemon stops blindly retrying past this point.
 const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
+/// jleechan-xsg4 (issue #270): DISPATCHED overlays older than this
+/// threshold with empty `session_id` (or a dead/unreachable session) are
+/// requeued back to QUEUED so new intake work is not starved by stale
+/// dispatches. 3600 seconds = 1 hour; matches the live incident where
+/// sessionless DISPATCHED rows from 2026-07-06 were still stale >1 day later.
+const STALE_DISPATCHED_TIMEOUT_SECS: u64 = 3600;
 const ESCALATION_REVIEWER: &str = "dark-factory-escalation";
 const ESCALATION_SENTINEL_ATTEMPT: u32 = u32::MAX;
 
@@ -268,6 +283,16 @@ pub fn run_tick(
     if slow_tier_due {
         run_recovery_step(deps, &mut summary)?;
     }
+
+    // jleechan-xsg4 (issue #270): fail-closed overlay reconciliation.
+    // Runs EVERY tick (even non-slow-tier ticks) so that a bead deleted or
+    // closed between ticks is detected promptly, and a stale DISPATCHED
+    // row is never trusted indefinitely. These two steps run BEFORE the
+    // active-overlay autonomy-bump-and-wedge loop so that overlays we
+    // demote/requeue this tick do not re-accumulate autonomy or hit wedge
+    // checks in the same tick.
+    run_bead_reconciliation_step(deps, &mut summary)?;
+    run_dispatched_recovery_step(deps, &mut summary)?;
 
     // jleechan-54ky / sub-fix for jleechan-gib: split the SQL-level "increment
     // every active row" into list + per-row bump so we can pause the autonomy
@@ -782,11 +807,172 @@ pub fn run_tick(
             "beadsRecoveredFromHeld": summary.beads_recovered_from_held,
             "beadsEscalated": summary.beads_escalated,
             "beadsEscalatedLocally": summary.beads_escalated_locally,
+            "beadsReconciledBeadMissing": summary.beads_reconciled_bead_missing,
+            "beadsReconciledBeadClosed": summary.beads_reconciled_bead_closed,
+            "beadsRecoveredStaleDispatched": summary.beads_recovered_stale_dispatched,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
 
     Ok(summary)
+}
+
+/// jleechan-xsg4 (issue #270): reconcile every active overlay against its
+/// bead in `br`. If the bead is missing (deleted) or closed (terminal), the
+/// overlay is demoted from ATTESTED/DISPATCHED to HUMAN_HELD — fail-closed,
+/// never silently trust an active row that no longer has a live bead backing
+/// it. Emits per-bead telemetry and increments the appropriate summary
+/// counters so operators can grep `daemon.jsonl` for
+/// `BEAD_RECONCILED_MISSING` / `BEAD_RECONCILED_CLOSED`.
+fn run_bead_reconciliation_step(
+    deps: &TickDeps,
+    summary: &mut TickSummary,
+) -> Result<(), DaemonError> {
+    let active = deps.store.list_active_overlays()?;
+    for mut overlay in active {
+        match deps.tracker.bead_status(&overlay.bead_id) {
+            Ok(None) => {
+                let prior_state = overlay.state;
+                overlay.state = OverlayState::HumanHeld;
+                overlay.park_reason =
+                    Some("bead_missing_from_tracker_fail_closed".to_string());
+                deps.store.save(&overlay)?;
+                summary.beads_reconciled_bead_missing += 1;
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &overlay.bead_id,
+                    overlay.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "BEAD_RECONCILED_MISSING",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "bead_missing_from_tracker_fail_closed",
+                        "prior_state": prior_state.as_str(),
+                    }),
+                )?;
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: bead `{}` was in state {} but the bead no longer exists in the tracker (`br show` returned no match). The overlay has been parked HUMAN_HELD rather than silently left active (fail-closed, jleechan-xsg4 / issue #270).",
+                    overlay.bead_id,
+                    overlay.state.as_str()
+                );
+                let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
+            }
+            Ok(Some(BeadStatus::Closed)) => {
+                let prior_state = overlay.state;
+                overlay.state = OverlayState::HumanHeld;
+                overlay.park_reason =
+                    Some("bead_closed_terminal_fail_closed".to_string());
+                deps.store.save(&overlay)?;
+                summary.beads_reconciled_bead_closed += 1;
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &overlay.bead_id,
+                    overlay.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "BEAD_RECONCILED_CLOSED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "bead_closed_terminal_fail_closed",
+                        "prior_state": prior_state.as_str(),
+                    }),
+                )?;
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: bead `{}` was in state {} but the bead is now closed (terminal) in the tracker. The overlay has been parked HUMAN_HELD rather than silently left active (fail-closed, jleechan-xsg4 / issue #270).",
+                    overlay.bead_id,
+                    overlay.state.as_str()
+                );
+                let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
+            }
+            Ok(Some(BeadStatus::Open | BeadStatus::Active)) => {}
+            Err(e) => {
+                emit(
+                    deps.telemetry_log,
+                    &overlay.bead_id,
+                    overlay.attempt,
+                    overlay.state.as_str(),
+                    "BEAD_RECONCILIATION_TRANSIENT_ERROR",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "phase": "bead_status_check",
+                        "error": format!("{e:?}"),
+                    }),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// jleechan-xsg4 (issue #270): recover stale DISPATCHED overlays whose
+/// session is dead or nonexistent. For each candidate DISPATCHED row:
+/// - If session_id is NULL or trim-blank: requeue immediately.
+/// - If session_id is non-empty: probe `is_session_dead` (authoritative
+///   live/dead semantics — "ready" is alive, only "exited"/"missing" is dead);
+///   requeue if confirmed dead. If the probe errors, leave the overlay alone
+///   (transient tool failure — retry next tick).
+/// Overlays with a confirmed live session stay DISPATCHED.
+/// Emits `BEAD_RECOVERED_STALE_DISPATCHED` for each requeued overlay.
+fn run_dispatched_recovery_step(
+    deps: &TickDeps,
+    summary: &mut TickSummary,
+) -> Result<(), DaemonError> {
+    let candidates = deps
+        .store
+        .stale_dispatched_candidates(STALE_DISPATCHED_TIMEOUT_SECS)?;
+    for overlay in candidates {
+        let (should_requeue, reason) = match &overlay.session_id {
+            None => (true, "empty_session_id"),
+            Some(sid) => {
+                let trimmed = sid.trim();
+                if trimmed.is_empty() {
+                    (true, "blank_session_id")
+                } else {
+                    let session_id = SessionId(sid.clone());
+                    match deps.sessions.is_session_dead(&session_id) {
+                        Ok(true) => (true, "confirmed_dead_session"),
+                        Ok(false) => (false, ""),
+                        Err(e) => {
+                            emit(
+                                deps.telemetry_log,
+                                &overlay.bead_id,
+                                overlay.attempt,
+                                OverlayState::Dispatched.as_str(),
+                                "BEAD_RECONCILIATION_TRANSIENT_ERROR",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "phase": "stale_dispatched_session_check",
+                                    "session_id": sid,
+                                    "error": format!("{e:?}"),
+                                }),
+                            )?;
+                            continue;
+                        }
+                    }
+                }
+            }
+        };
+        if should_requeue {
+            let requeued = deps.store.requeue_stale_dispatched(&overlay.bead_id)?;
+            summary.beads_recovered_stale_dispatched += 1;
+            emit(
+                deps.telemetry_log,
+                &overlay.bead_id,
+                requeued.attempt,
+                OverlayState::Queued.as_str(),
+                "BEAD_RECOVERED_STALE_DISPATCHED",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "prior_state": OverlayState::Dispatched.as_str(),
+                    "prior_autonomy_secs": overlay.autonomy_secs,
+                    "prior_session_id": overlay.session_id,
+                    "reason": reason,
+                }),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// jleechan-gib: automated HUMAN_HELD exit (Rust port of shell

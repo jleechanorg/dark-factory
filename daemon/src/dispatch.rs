@@ -1141,6 +1141,13 @@ mod tests {
             Ok(true)
         }
 
+        fn is_session_dead(&self, id: &SessionId) -> Result<bool, DaemonError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("is_session_dead({})", id.0));
+            Ok(false)
+        }
+
         fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
             self.calls
                 .borrow_mut()
