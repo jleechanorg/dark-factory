@@ -1,6 +1,6 @@
 ---
 name: factory-spec
-description: Display the Dark Factory pipeline node graphs, gates, node types, edge conditions, and handler mappings.
+description: "Dark Factory spec workflow (`/factory-spec`, `/fs`): create a main spec and an attractor spec through the spec-generation pipeline, review an existing spec against acceptance criteria, or display the canonical reference for pipeline node graphs — gates, node types, edge conditions, handler mappings. Create mode runs `dark-factory --pipeline slim/spec_gen.dot` and must produce a codex-cold-reviewed `spec.md` and `attractor_spec.md`; review and show modes stay in-session."
 ---
 
 # Canonical skill reference
