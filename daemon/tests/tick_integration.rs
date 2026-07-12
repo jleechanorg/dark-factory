@@ -7265,3 +7265,277 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+// --- jleechan-x8tf: run_slow_tier PR-existence probe must target the ---
+// --- bead's OWN resolved repo, not unconditionally `cfg.target_repo` ---
+//
+// Stage D (jleechan-9xrs, PR #250) swept the verification loop's repo call
+// sites but did NOT touch this one: the intake `created`-bead loop in
+// `run_slow_tier` parses a repo out of the bead's `external_ref` via the
+// local `parse_external_ref` helper, discards it (`_`), and unconditionally
+// probes `deps.cfg.target_repo` via `gh pr view --repo <cfg.target_repo>` to
+// decide whether the bead already has an open PR. For any bead whose
+// `external_ref`/`target_repo:` body field names a DIFFERENT repo than the
+// daemon's global default, this silently checks the WRONG repo's PR list —
+// flagged during Stage D review as a risk to Stage E's two-repo E2E
+// acceptance proof (a dark-factory fixture bead's probe could silently
+// check worldarchitect.ai instead).
+//
+// This gates on `Llm::is_real()` (see `tick.rs` around the `parse_external_ref`
+// call), so these tests use a small local `is_real()==true` `Llm` fake — NOT
+// `common::FakeLlm`, which always reports `is_real() == false` (see the
+// `real_target_repo_skeptic_gate_...` test's comment above for why that
+// distinction matters). `cfg.target_repo` is kept at the file's usual
+// `"owner/repo"` test-repo convention so `skeptic_evidence`'s SEPARATE
+// `is_test_repo` gate (driven by repo name, not `Llm::is_real()`) still takes
+// the mock-LLM path and this test stays fast/hermetic apart from the one
+// `gh` shell-out under test.
+struct RealLlmForRepoProbe {
+    response: std::cell::RefCell<Option<Result<String, String>>>,
+}
+
+impl Llm for RealLlmForRepoProbe {
+    fn judge(&self, _prompt: &str) -> Result<String, DaemonError> {
+        match self.response.borrow().as_ref() {
+            Some(Ok(t)) => Ok(t.clone()),
+            Some(Err(e)) => Err(DaemonError::Parse(e.clone())),
+            None => Ok(String::new()),
+        }
+    }
+    fn is_real(&self) -> bool {
+        true
+    }
+}
+
+/// Write a fake `gh` script into `dir` that answers `pr view <num> --repo
+/// <repo> --json number` by (a) recording the value passed to `--repo` into
+/// `capture_file` and (b) printing a valid `{"number": ...}` JSON payload so
+/// the caller's `.is_ok()` check succeeds regardless of which repo was
+/// probed — this test only cares WHICH repo `run_slow_tier` asked about, not
+/// simulating a real PR-not-found case.
+#[cfg(unix)]
+fn write_fake_gh_capturing_repo_arg(
+    dir: &std::path::Path,
+    capture_file: &std::path::Path,
+    expect_num: u64,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("gh");
+    let script = format!(
+        "#!/bin/sh\n\
+         prev=\"\"\n\
+         match=0\n\
+         repo_val=\"\"\n\
+         for arg in \"$@\"; do\n\
+           if [ \"$arg\" = \"{expect_num}\" ]; then\n\
+             match=1\n\
+           fi\n\
+           if [ \"$prev\" = \"--repo\" ]; then\n\
+             repo_val=\"$arg\"\n\
+           fi\n\
+           prev=\"$arg\"\n\
+         done\n\
+         if [ $match -eq 1 ] && [ -n \"$repo_val\" ]; then\n\
+           printf '%s' \"$repo_val\" > \"{capture}\"\n\
+         fi\n\
+         echo '{{\"number\": 1}}'\n",
+        expect_num = expect_num,
+        capture = capture_file.display()
+    );
+    std::fs::write(&path, script)
+        .unwrap_or_else(|e| panic!("failed to write fake gh: {e}"));
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+}
+
+/// The fix: a bead whose `external_ref` names a DIFFERENT repo than
+/// `cfg.target_repo` must have its PR-existence probe target ITS OWN repo,
+/// not silently fall back to the global config repo.
+#[test]
+#[cfg(unix)]
+fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_x8tf_probe_own_repo_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    let capture_file = fake_bin_dir.join("captured_repo.txt");
+    write_fake_gh_capturing_repo_arg(&fake_bin_dir, &capture_file, 42);
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let _env_guard = EnvVarGuard::set(&[("PATH", &new_path)]);
+
+    let mut scm = FakeScm::new();
+    // external_ref names a DIFFERENT repo than cfg.target_repo ("owner/repo"
+    // below) — exactly the multi-repo-fixture-vs-global-default scenario
+    // Stage E's two-repo E2E proof depends on.
+    scm.issues.push(Issue {
+        number: 42,
+        title: "Fixture bead in a different repo".into(),
+        body: "please fix the thing".into(),
+        author_login: "alice".into(),
+        external_ref: "jleechanorg/dark-factory-holdouts#42".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = RealLlmForRepoProbe {
+        response: std::cell::RefCell::new(Some(Ok(
+            r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+        ))),
+    };
+    let store = FakeStateStore::new();
+    let cfg = test_cfg(); // target_repo == "owner/repo"
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_x8tf_probe_own_repo_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("tick should succeed");
+
+    assert_eq!(summary.beads_created, 1, "one bead should be created");
+
+    let captured = std::fs::read_to_string(&capture_file).unwrap_or_else(|e| {
+        panic!(
+            "expected the fake gh to have recorded a --repo arg, but reading \
+             {capture_file:?} failed: {e} (gh pr view was never called with \
+             --repo at all)"
+        )
+    });
+    assert_eq!(
+        captured, "jleechanorg/dark-factory-holdouts",
+        "run_slow_tier's PR-existence probe must target the bead's OWN \
+         resolved repo (from external_ref), not cfg.target_repo \
+         (\"owner/repo\"); captured --repo arg: {captured:?}"
+    );
+
+    let overlay = store
+        .load("fake-bead-1")
+        .unwrap()
+        .expect("overlay must exist");
+    assert_eq!(
+        overlay.target_repo.as_deref(),
+        Some("jleechanorg/dark-factory-holdouts"),
+        "overlay must carry the bead's own resolved target_repo"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+/// Legacy-behavior regression: a bead whose resolved repo happens to MATCH
+/// `cfg.target_repo` (the pre-multi-repo, single-repo default — every other
+/// test in this file uses this shape) must still probe that same repo,
+/// unchanged, after the fix.
+#[test]
+#[cfg(unix)]
+fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_x8tf_probe_legacy_repo_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    let capture_file = fake_bin_dir.join("captured_repo.txt");
+    write_fake_gh_capturing_repo_arg(&fake_bin_dir, &capture_file, 43);
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let _env_guard = EnvVarGuard::set(&[("PATH", &new_path)]);
+
+    let mut scm = FakeScm::new();
+    // external_ref's repo prefix MATCHES cfg.target_repo — the single-repo
+    // shape every other test in this file already exercises.
+    scm.issues.push(Issue {
+        number: 43,
+        title: "Same-repo bead".into(),
+        body: "please fix the other thing".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#43".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = RealLlmForRepoProbe {
+        response: std::cell::RefCell::new(Some(Ok(
+            r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+        ))),
+    };
+    let store = FakeStateStore::new();
+    let cfg = test_cfg(); // target_repo == "owner/repo"
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_x8tf_probe_legacy_repo_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("tick should succeed");
+
+    assert_eq!(summary.beads_created, 1, "one bead should be created");
+
+    let captured = std::fs::read_to_string(&capture_file).unwrap_or_else(|e| {
+        panic!(
+            "expected the fake gh to have recorded a --repo arg, but reading \
+             {capture_file:?} failed: {e} (gh pr view was never called with \
+             --repo at all)"
+        )
+    });
+    assert_eq!(
+        captured, "owner/repo",
+        "single-repo (legacy default) beads must keep probing \
+         cfg.target_repo's value unchanged; captured --repo arg: {captured:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
