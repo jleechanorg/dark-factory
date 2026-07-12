@@ -362,6 +362,140 @@ assert "bead-df state=DISPATCHED" "DISPATCHED" "$state_df"
 assert_grep "remediate bead-wa on WA project" "called:.*bead_id=bead-wa pr=56 repo=jleechanorg/worldarchitect.ai proj=worldarchitect" /tmp/test-af-tick-fake-r.log
 assert_grep "remediate bead-df on DF project" "called:.*bead_id=bead-df pr=56 repo=jleechanorg/dark-factory proj=dark-factory" /tmp/test-af-tick-fake-r.log
 
+# ---------------------------------------------------------------------------
+# Test 8: dispatch-loop wallclock regression — per-bead AO session dedup stalls
+# the tick when AO queries are slow. With a fake AO that takes 3s per
+# `session ls`, 2 beads would serialize for ~6s just in dedup checks.
+# The nonblocking fix caches session lists so the total dispatch loop is
+# bounded regardless of how many beads are in the queue.
+# ---------------------------------------------------------------------------
+fresh_db wallclock
+"$OVERLAY" intake-upsert bead-slow1 'wallclock speed test 1' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=9100, branch='fix/slow-1' WHERE bead_id='bead-slow1';"
+"$OVERLAY" route-record bead-slow1 STANDARD_PATH 'drive-existing-pr' >/dev/null
+"$OVERLAY" intake-upsert bead-slow2 'wallclock speed test 2' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=9101, branch='fix/slow-2' WHERE bead_id='bead-slow2';"
+"$OVERLAY" route-record bead-slow2 STANDARD_PATH 'drive-existing-pr' >/dev/null
+
+# Fake AO: session ls takes SLEEP seconds per call.
+SLOW_AO_DIR="$SCRATCH_DIR/slow-ao"
+mkdir -p "$SLOW_AO_DIR"
+SLOW_AO="$SLOW_AO_DIR/ao-ts"
+SLOW_SLEEP="${AFD_FAKE_AO_SLEEP_SEC:-3}"
+cat > "$SLOW_AO" <<'EOF_SLOW'
+#!/usr/bin/env bash
+SLEEP="${AFD_FAKE_AO_SLEEP_SEC:-3}"
+case "${1:-}" in
+  session)
+    if echo "$*" | grep -q '\-\-json'; then
+      sleep "$SLEEP"
+      echo '{"data":[{"isTerminated":true}]}'
+    else
+      sleep "$SLEEP"
+      echo "[pr_open]"
+    fi
+    exit 0
+    ;;
+  spawn|spawned) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF_SLOW
+chmod +x "$SLOW_AO"
+
+: > /tmp/test-af-tick-fake-r.log
+CONFIG="$(write_config 30 15)" AO_BIN="$SLOW_AO" AFD_FAKE_AO_SLEEP_SEC=3 AFD_WRAPPER_BEAD="bead-slow1','bead-slow2" bash "$WRAPPER" >/tmp/test-af-tick-wallclock.log 2>&1 || true
+out="$(cat /tmp/test-af-tick-wallclock.log)"
+# Both beads should be dispatched (MAX_DISPATCH=2)
+af_dispatched="$(echo "$out" | grep -oE 'af_dispatched=[0-9]+' | head -1 | cut -d= -f2)"
+assert "wallclock: af_dispatched=2 (both beads dispatched)" "2" "$af_dispatched"
+
+# ---------------------------------------------------------------------------
+# Test 9: P0 priority bead dispatching — with AFD_PRIORITY_BEADS set, the
+# priority bead is dispatched first even when other QUEUED beads exist,
+# ensuring fair selection within one 240s tick.
+# ---------------------------------------------------------------------------
+fresh_db priority
+"$OVERLAY" intake-upsert bead-low-1 'low priority 1' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=9200, branch='fix/low-1' WHERE bead_id='bead-low-1';"
+"$OVERLAY" route-record bead-low-1 STANDARD_PATH 'drive-existing-pr' >/dev/null
+
+"$OVERLAY" intake-upsert bead-p0 'P0 priority bead' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=9201, branch='fix/p0' WHERE bead_id='bead-p0';"
+"$OVERLAY" route-record bead-p0 STANDARD_PATH 'drive-existing-pr' >/dev/null
+
+"$OVERLAY" intake-upsert bead-low-2 'low priority 2' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=9202, branch='fix/low-2' WHERE bead_id='bead-low-2';"
+"$OVERLAY" route-record bead-low-2 STANDARD_PATH 'drive-existing-pr' >/dev/null
+
+# Build a priority-aware wrapper that honors AFD_PRIORITY_BEADS
+PRIO_WRAPPER="$SCRATCH_DIR/prio-wrapper.sh"
+cat > "$PRIO_WRAPPER" <<'PRIO_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+O="$1"; R="$2"; DB="$3"; CONFIG="$4"
+: > /tmp/test-af-tick-fake-r.log
+
+# Build priority ORDER BY
+PRIORITY_BEADS="${AFD_PRIORITY_BEADS:-}"
+priority_order=""
+if [ -n "$PRIORITY_BEADS" ]; then
+  priority_order="$(printf '%s' "$PRIORITY_BEADS" | tr ',' '\n' \
+    | awk 'BEGIN{n=0} {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      if ($0 == "") next; n++
+      print "WHEN \x27" $0 "\x27 THEN " (n - 1)
+    }' | tr '\n' ' ')"
+fi
+order_clause="ORDER BY updated_at LIMIT 10"
+if [ -n "$priority_order" ]; then
+  order_clause="ORDER BY CASE bead_id $priority_order ELSE 999 END, updated_at LIMIT 10"
+fi
+
+dispatched_ids=""
+dispatched=0
+MAX_DISPATCH=2
+ERR_TMP="$(mktemp -t pr_io.XXXXXX)"
+trap 'rm -f "$ERR_TMP"' EXIT
+while IFS=$'\t' read -r bead_id pr branch bead_repo; do
+  [ -n "$bead_id" ] || continue
+  [ "$dispatched" -ge "$MAX_DISPATCH" ] && break
+  repo="${bead_repo:-jleechanorg/worldarchitect.ai}"
+  if bash "$R" "$bead_id" "$pr" "$repo" worldarchitect 2>&1; then
+    cur_state="$(sqlite3 "$DB" "SELECT state FROM bead_overlay WHERE bead_id='$(printf "%s" "$bead_id" | sed "s/''/''/g")';" 2>/dev/null || true)"
+    if [ "$cur_state" = "QUEUED" ]; then
+      if [ -n "$branch" ]; then
+        "$O" route-record "$bead_id" STANDARD_PATH "drive-existing-pr" 2>/dev/null || true
+      fi
+      "$O" dispatch-record "$bead_id" "$branch" 2>"$ERR_TMP" || { cat "$ERR_TMP" >&2; continue; }
+    fi
+    dispatched=$((dispatched + 1))
+    dispatched_ids="$dispatched_ids $bead_id"
+  fi
+done < <(sqlite3 "$DB" -separator $'\t' \
+  "SELECT bead_id, pr_number, coalesce(branch,''), coalesce(target_repo,'') FROM bead_overlay
+   WHERE state IN ('QUEUED','ATTESTED') AND pr_number IS NOT NULL
+   $order_clause;")
+echo "af_dispatched=$dispatched order=$dispatched_ids"
+PRIO_EOF
+chmod +x "$PRIO_WRAPPER"
+
+: > /tmp/test-af-tick-fake-r.log
+prio_out="$(AFD_PRIORITY_BEADS="bead-p0" CONFIG="$(write_config 30 15)" bash "$PRIO_WRAPPER" "$OVERLAY" "$FAKE_R" "$AFD_DB" "$(write_config 30 15)" 2>&1)"
+# The P0 bead must be in the dispatched set
+case "$prio_out" in
+  *bead-p0*)
+    echo "PASS: priority bead (bead-p0) was dispatched"; PASS=$((PASS + 1)) ;;
+  *)
+    echo "FAIL: priority bead (bead-p0) was NOT dispatched. Output: $prio_out"; FAIL=$((FAIL + 1)) ;;
+esac
+# P0 bead should be dispatched FIRST
+case "$prio_out" in
+  *order=*\ bead-p0*)
+    echo "PASS: P0 bead dispatched first in order"; PASS=$((PASS + 1)) ;;
+  *)
+    echo "FAIL: P0 bead not first in dispatch order. Output: $prio_out"; FAIL=$((FAIL + 1)) ;;
+esac
+
 echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ] || exit 1

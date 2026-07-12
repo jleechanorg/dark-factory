@@ -183,6 +183,17 @@ disown "$SPAWN_PID" 2>/dev/null || true
 # outcome for downstream observability). This prevents the dispatch-record
 # step in factory-af-tick.sh from stranding a bead in DISPATCHED when the
 # spawn already failed — see Codex P1 finding on PR #193.
+#
+# AFD_SKIP_FAST_FAIL_POLL=1 skips this polling entirely. The caller returns
+# immediately after queueing the spawn, and the next tick's session-dedup
+# check is the sole observability channel. This is the fully nonblocking
+# dispatch path — the tick loop queues all eligible beads and moves on,
+# avoiding serialization behind slow AO preflight/session queries.
+if [ "${AFD_SKIP_FAST_FAIL_POLL:-0}" = "1" ]; then
+  echo "[remediate] async-spawned PR #$PR bead=${BEAD_ID} pid=${SPAWN_PID} log=${SPAWN_LOG} state=pending"
+  exit 0
+fi
+
 ASYNC_WAIT_SEC="${AFD_ASYNC_WAIT_SEC:-5}"
 start_ts=$(date +%s)
 final_state=""

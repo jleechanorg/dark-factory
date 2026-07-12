@@ -334,6 +334,95 @@ esac
 # Wall-clock bound: ~ AFD_ASYNC_WAIT_SEC + small overhead.
 assert_lt "slow-spawn wallclock <10s (wait window respected)" 10 "$elapsed"
 
+# ---------------------------------------------------------------------------
+# Test 8: fast-fail-poll skip — when AFD_SKIP_FAST_FAIL_POLL=1, the async
+# wrapper returns immediately (0) without waiting for the state file.
+# This is the nonblocking dispatch path: the tick loop queues the spawn and
+# moves on, relying on the next tick's session check for outcome observability.
+# ---------------------------------------------------------------------------
+rm -f /tmp/test-remediate-fake-ao.log
+# Use the hanging fake AO; with AFD_SKIP_FAST_FAIL_POLL=1, the wrapper
+# should NOT poll the state file and return immediately.
+start=$(date +%s)
+out="$(AO_BIN="$FAKE_AO" AO_SPAWN_TIMEOUT_SEC=60 AFD_ASYNC_WAIT_SEC=5 AFD_SKIP_FAST_FAIL_POLL=1 timeout 10 bash "$REMEDIATE" test-bead-skipfast 9995 jleechanorg/worldarchitect.ai worldarchitect 2>&1)"
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+echo "[test 8 output]"
+echo "$out" | sed 's/^/    /'
+echo
+assert "skip-fast-fail: exit 0 (immediate ack)" "0" "$rc"
+# With NO polling, the wallclock should be well under 5s (just preflight + fork).
+assert_lt "skip-fast-fail: wallclock <3s (no poll wait)" 3 "$elapsed"
+case "$out" in
+  *async-spawned*)
+    echo "PASS: skip-fast-fail emits 'async-spawned'"; PASS=$((PASS + 1)) ;;
+  *)
+    echo "FAIL: skip-fast-fail did not emit 'async-spawned'"; FAIL=$((FAIL + 1)) ;;
+esac
+# STATE should be "pending" (we skipped the poll).
+case "$out" in
+  *state=pending*)
+    echo "PASS: skip-fast-fail shows state=pending (skipped poll)"; PASS=$((PASS + 1)) ;;
+  *)
+    echo "FAIL: skip-fast-fail state not pending: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Test 9: preflight timeout — when the AO daemon takes too long to start,
+# the `ensure_ao_daemon` function must fail within 5s rather than blocking
+# indefinitely. This is the cold-start fast-failure path.
+# ---------------------------------------------------------------------------
+TIMEOUT_AO="$SCRATCH_DIR/timeout-ao"
+cat > "$TIMEOUT_AO" <<'EOF_TO'
+#!/usr/bin/env bash
+# Simulate an ao-go binary that cannot start its daemon (status always fails,
+# daemon start hangs). The wrapper's preflight is bounded at 5s.
+case "${1:-}" in
+  status) exit 1 ;;
+  daemon) sleep 60 ;;  # daemon start hangs
+  *)
+    # --version also fails so ensure_ao_daemon returns 1 quickly
+    exit 1
+    ;;
+esac
+EOF_TO
+chmod +x "$TIMEOUT_AO"
+rm -f /tmp/test-remediate-fake-ao.log
+start=$(date +%s)
+out="$(AO_BIN="$TIMEOUT_AO" AO_SPAWN_TIMEOUT_SEC=60 AFD_ASYNC_WAIT_SEC=5 timeout 15 bash "$REMEDIATE" test-bead-timeout 9994 jleechanorg/worldarchitect.ai worldarchitect 2>&1)"
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+echo "[test 9 output]"
+echo "$out" | sed 's/^/    /'
+echo
+# Preflight should fail quickly (<10s wallclock, non-zero exit).
+assert_lt "preflight-timeout: wallclock <10s" 10 "$elapsed"
+if [ "$rc" -ne 0 ]; then
+  echo "PASS: preflight-timeout returns non-zero (rc=$rc)"; PASS=$((PASS + 1))
+else
+  echo "FAIL: preflight-timeout returned 0 despite broken AO"; FAIL=$((FAIL + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# Test 10: AO session preflight query nonblocking — when factory-ao-remediate.sh
+# is called with AFD_SKIP_FAST_FAIL_POLL=1, the total wallclock per bead must
+# stay under 3s regardless of AO latency, so the tick dispatch loop stays
+# unbounded.
+# ---------------------------------------------------------------------------
+rm -f /tmp/test-remediate-fake-ao.log
+# Reuse the hanging AO that takes 30s for spawn but returns 0 for status.
+start=$(date +%s)
+for bead_num in 1 2 3; do
+  AO_BIN="$FAKE_AO" AO_SPAWN_TIMEOUT_SEC=60 AFD_ASYNC_WAIT_SEC=5 AFD_SKIP_FAST_FAIL_POLL=1 timeout 10 bash "$REMEDIATE" "test-bead-bulk-$bead_num" 9901 jleechanorg/worldarchitect.ai worldarchitect >/dev/null 2>&1
+done
+elapsed=$(( $(date +%s) - start ))
+echo "[test 10 output]"
+echo "3-bead bulk dispatch wallclock: ${elapsed}s"
+# 3 beads, each with slow AO → without the fix, each would block 5s+.
+# With AFD_SKIP_FAST_FAIL_POLL=1, each should complete in <1s (preflight only).
+# Total < 9s for 3 beads with generous margin for process startup.
+assert_lt "bulk-dispatch: 3 beads <9s total wallclock" 9 "$elapsed"
+
 echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ] || exit 1
