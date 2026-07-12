@@ -362,6 +362,211 @@ assert "bead-df state=DISPATCHED" "DISPATCHED" "$state_df"
 assert_grep "remediate bead-wa on WA project" "called:.*bead_id=bead-wa pr=56 repo=jleechanorg/worldarchitect.ai proj=worldarchitect" /tmp/test-af-tick-fake-r.log
 assert_grep "remediate bead-df on DF project" "called:.*bead_id=bead-df pr=56 repo=jleechanorg/dark-factory proj=dark-factory" /tmp/test-af-tick-fake-r.log
 
+# ---------------------------------------------------------------------------
+# Test 8: wallclock regression — per-bead AO session dedup stalls the tick
+# when AO queries are slow. With session cache, the total dispatch loop is
+# bounded regardless of queue depth.
+# ---------------------------------------------------------------------------
+fresh_db wallclock
+"$OVERLAY" intake-upsert bead-wall-a 'wallclock test a' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=9100, branch='fix/wall-a' WHERE bead_id='bead-wall-a';"
+"$OVERLAY" route-record bead-wall-a STANDARD_PATH 'drive-existing-pr' >/dev/null
+"$OVERLAY" intake-upsert bead-wall-b 'wallclock test b' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=9101, branch='fix/wall-b' WHERE bead_id='bead-wall-b';"
+"$OVERLAY" route-record bead-wall-b STANDARD_PATH 'drive-existing-pr' >/dev/null
+
+SLOW_AO_DIR="$SCRATCH_DIR/slow-ao"
+mkdir -p "$SLOW_AO_DIR"
+SLOW_AO="$SLOW_AO_DIR/ao-ts"
+cat > "$SLOW_AO" <<'EOF_SLOW'
+#!/usr/bin/env bash
+SLEEP="${AFD_FAKE_AO_SLEEP_SEC:-3}"
+case "${1:-}" in
+  session)
+    sleep "$SLEEP"
+    echo "[pr_open]"
+    exit 0
+    ;;
+  spawn|spawned) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF_SLOW
+chmod +x "$SLOW_AO"
+
+: > /tmp/test-af-tick-fake-r.log
+# Build a test daemon dir with the production tick + stubs
+FAKE_DAEMON_WALL="$SCRATCH_DIR/daemon-wall"
+mkdir -p "$FAKE_DAEMON_WALL"
+mkdir -p "$FAKE_DAEMON_WALL/daemon/contracts"
+cp "$FAKE_R" "$FAKE_DAEMON_WALL/daemon/factory-ao-remediate.sh"
+cp "$ROOT/daemon/contracts/schema.sql" "$FAKE_DAEMON_WALL/daemon/contracts/schema.sql" 2>/dev/null || true
+cp "$ROOT/daemon/factory-af-tick.sh" "$FAKE_DAEMON_WALL/daemon/factory-af-tick.sh"
+cat > "$FAKE_DAEMON_WALL/daemon/factory-intake-from-gh.sh" <<'WIEOF'
+#!/usr/bin/env bash
+exit 0
+WIEOF
+chmod +x "$FAKE_DAEMON_WALL/daemon/factory-intake-from-gh.sh"
+ln -sf "$OVERLAY" "$FAKE_DAEMON_WALL/daemon/factory-overlay.sh" 2>/dev/null || true
+cat > "$FAKE_DAEMON_WALL/daemon/factory-ao-bin.sh" <<EOFAOBW
+#!/usr/bin/env bash
+echo "$SLOW_AO"
+EOFAOBW
+chmod +x "$FAKE_DAEMON_WALL/daemon/factory-ao-bin.sh"
+AFD_TICK_WALL="$FAKE_DAEMON_WALL/daemon/factory-af-tick.sh"
+
+start_ts=$(date +%s)
+AFD_SKIP_DRIFT_CHECK=1 \
+  AFD_DB="$AFD_DB" \
+  BR_DB="" \
+  TARGET_REPO="jleechanorg/worldarchitect.ai" \
+  AFD_TICK_DEADLINE_SEC=20 \
+  CONFIG="$(write_config 30 15)" \
+  AO_BIN="$SLOW_AO" \
+  AFD_FAKE_AO_SLEEP_SEC=3 \
+  MAX_DISPATCH=2 \
+  bash "$AFD_TICK_WALL" >/tmp/test-af-tick-wallclock.log 2>&1 || true
+elapsed=$(( $(date +%s) - start_ts ))
+echo "[Test 8 output]"
+head -20 /tmp/test-af-tick-wallclock.log | sed 's/^/    /'
+echo
+if [ "$elapsed" -lt 20 ]; then
+  echo "PASS: wallclock elapsed ${elapsed}s < 20s (cache bounded)"; PASS=$((PASS + 1))
+else
+  echo "FAIL: wallclock elapsed ${elapsed}s >= 20s (unbounded)"; FAIL=$((FAIL + 1))
+fi
+# Old behavior without cache: 2 beads × 3s AO per session ls × (concurrency
+# probe + dedup) = at least 9s. The cache fix bounds total AO calls to one
+# per-project, so 2 beads + cached concurrency probe ≤ 6s of AO time.
+if [ "$elapsed" -lt 15 ]; then
+  echo "PASS: wallclock regression check — ${elapsed}s < 15s (old behavior prevented)"; PASS=$((PASS + 1))
+else
+  echo "FAIL: wallclock regression — ${elapsed}s >= 15s"; FAIL=$((FAIL + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# Test 9: P0 fairness from production metadata (BR issues.priority, no
+# injected priority list). P0 beads (priority=0) dispatch first and
+# outside normal MAX_DISPATCH, independently of any env-var list.
+# ---------------------------------------------------------------------------
+fresh_db priority
+export BR_DB="$SCRATCH_DIR/test-br-metadata.sqlite"
+sqlite3 "$BR_DB" "CREATE TABLE IF NOT EXISTS issues (id TEXT PRIMARY KEY, title TEXT, status TEXT, priority INTEGER DEFAULT 2);"
+# low-1: priority=2 (normal), p0: priority=0 (P0), low-2: priority=2
+sqlite3 "$BR_DB" "INSERT INTO issues (id, title, status, priority) VALUES ('bead-low-1', 'low 1', 'open', 2);"
+sqlite3 "$BR_DB" "INSERT INTO issues (id, title, status, priority) VALUES ('bead-p0', 'p0 bead', 'open', 0);"
+sqlite3 "$BR_DB" "INSERT INTO issues (id, title, status, priority) VALUES ('bead-low-2', 'low 2', 'open', 2);"
+
+"$OVERLAY" intake-upsert bead-low-1 'low priority 1' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=9200, branch='fix/low-1', target_repo='jleechanorg/worldarchitect.ai' WHERE bead_id='bead-low-1';"
+"$OVERLAY" route-record bead-low-1 STANDARD_PATH 'drive-existing-pr' >/dev/null
+
+"$OVERLAY" intake-upsert bead-p0 'P0 priority bead' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=9201, branch='fix/p0', target_repo='jleechanorg/worldarchitect.ai' WHERE bead_id='bead-p0';"
+"$OVERLAY" route-record bead-p0 STANDARD_PATH 'drive-existing-pr' >/dev/null
+
+"$OVERLAY" intake-upsert bead-low-2 'low priority 2' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=9202, branch='fix/low-2', target_repo='jleechanorg/worldarchitect.ai' WHERE bead_id='bead-low-2';"
+"$OVERLAY" route-record bead-low-2 STANDARD_PATH 'drive-existing-pr' >/dev/null
+
+FAKE_DAEMON_PRIO="$SCRATCH_DIR/daemon-prio"
+mkdir -p "$FAKE_DAEMON_PRIO"
+mkdir -p "$FAKE_DAEMON_PRIO/daemon/contracts"
+cp "$FAKE_R" "$FAKE_DAEMON_PRIO/daemon/factory-ao-remediate.sh"
+cp "$ROOT/daemon/contracts/schema.sql" "$FAKE_DAEMON_PRIO/daemon/contracts/schema.sql" 2>/dev/null || true
+cp "$ROOT/daemon/factory-af-tick.sh" "$FAKE_DAEMON_PRIO/daemon/factory-af-tick.sh"
+cat > "$FAKE_DAEMON_PRIO/daemon/factory-intake-from-gh.sh" <<'PEIOF'
+#!/usr/bin/env bash
+exit 0
+PEIOF
+chmod +x "$FAKE_DAEMON_PRIO/daemon/factory-intake-from-gh.sh"
+ln -sf "$OVERLAY" "$FAKE_DAEMON_PRIO/daemon/factory-overlay.sh" 2>/dev/null || true
+FAST_AO_PRIO="$SCRATCH_DIR/fast-ao-prio"
+cat > "$FAST_AO_PRIO" <<'AEOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  session) echo "[]"; exit 0 ;;
+  spawn|spawned) exit 0 ;;
+  status) echo '{"state":"ready"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+AEOF
+chmod +x "$FAST_AO_PRIO"
+cat > "$FAKE_DAEMON_PRIO/daemon/factory-ao-bin.sh" <<EOFAOBP
+#!/usr/bin/env bash
+echo "$FAST_AO_PRIO"
+EOFAOBP
+chmod +x "$FAKE_DAEMON_PRIO/daemon/factory-ao-bin.sh"
+
+AFD_TICK_PRIO="$FAKE_DAEMON_PRIO/daemon/factory-af-tick.sh"
+
+: > /tmp/test-af-tick-fake-r.log
+# MAX_DISPATCH=1: with metadata-driven fairness, P0 (priority=0) dispatches
+# first and outside the normal limit.
+prio_out="$(AFD_SKIP_DRIFT_CHECK=1 \
+  AFD_DB="$AFD_DB" \
+  BR_DB="$BR_DB" \
+  TARGET_REPO="jleechanorg/worldarchitect.ai" \
+  CONFIG="$(write_config 30 15)" \
+  AO_BIN="$FAST_AO_PRIO" \
+  MAX_DISPATCH=1 \
+  bash "$AFD_TICK_PRIO" 2>&1 || true)"
+echo "[Test 9 output]"
+echo "$prio_out" | sed 's/^/    /'
+echo
+
+case "$prio_out" in
+  *"remediate"*"bead-p0"*)
+    echo "PASS: metadata fairness: bead-p0 dispatched via production tick"; PASS=$((PASS + 1)) ;;
+  *)
+    echo "FAIL: metadata fairness: bead-p0 NOT dispatched."; FAIL=$((FAIL + 1)) ;;
+esac
+
+# P0 must dispatch first (sorted by priority ASC). The log line is
+# "[af] remediate [P0] bead-p0 PR #9201..." — grep for bead-p0 anywhere.
+p0_line="$(echo "$prio_out" | grep -n 'bead-p0' | head -1 | cut -d: -f1 || echo 999)"
+low1_line="$(echo "$prio_out" | grep -n 'bead-low-1' | head -1 | cut -d: -f1 || echo 0)"
+if [ "$p0_line" -lt 900 ]; then
+  if [ "$low1_line" = "0" ] || [ "$p0_line" -lt "$low1_line" ]; then
+    echo "PASS: metadata fairness: bead-p0 dispatched before bead-low-1 (line ${p0_line} < ${low1_line})"; PASS=$((PASS + 1))
+  else
+    echo "FAIL: metadata fairness: bead-p0 not first (p0=${p0_line}, low1=${low1_line})"; FAIL=$((FAIL + 1))
+  fi
+fi
+
+# Verify P0 dispatches WITH MAX_DISPATCH=0 (additive, outside limit)
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET state='QUEUED' WHERE bead_id='bead-p0';"
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET state='QUEUED' WHERE bead_id='bead-low-1';"
+: > /tmp/test-af-tick-fake-r.log
+prio_out2="$(AFD_SKIP_DRIFT_CHECK=1 \
+  AFD_DB="$AFD_DB" \
+  BR_DB="$BR_DB" \
+  TARGET_REPO="jleechanorg/worldarchitect.ai" \
+  CONFIG="$(write_config 30 15)" \
+  AO_BIN="$FAST_AO_PRIO" \
+  MAX_DISPATCH=0 \
+  bash "$AFD_TICK_PRIO" 2>&1 || true)"
+case "$prio_out2" in
+  *"remediate"*"bead-p0"*)
+    echo "PASS: metadata fairness: P0 dispatched with MAX_DISPATCH=0 (additive)"; PASS=$((PASS + 1))
+    ;;
+  *)
+    echo "FAIL: metadata fairness: P0 NOT dispatched with MAX_DISPATCH=0"; FAIL=$((FAIL + 1))
+    ;;
+esac
+case "$prio_out2" in
+  *"remediate"*"bead-low-1"*)
+    echo "FAIL: metadata fairness: normal bead dispatched at MAX_DISPATCH=0 (should be blocked)"; FAIL=$((FAIL + 1)) ;;
+  *)
+    echo "PASS: metadata fairness: normal bead correctly blocked at MAX_DISPATCH=0"; PASS=$((PASS + 1)) ;;
+esac
+# Verify af_dispatched count reflects P0-only dispatch
+afd_count="$(echo "$prio_out2" | grep -oE 'af_dispatched=[0-9]+' | head -1 | cut -d= -f2)"
+if [ "${afd_count:-0}" -eq 1 ]; then
+  echo "PASS: metadata fairness: af_dispatched=1 (P0 only) at MAX_DISPATCH=0"; PASS=$((PASS + 1))
+else
+  echo "FAIL: metadata fairness: af_dispatched=${afd_count} expected 1"; FAIL=$((FAIL + 1))
+fi
+
 echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ] || exit 1

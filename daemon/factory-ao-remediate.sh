@@ -68,23 +68,22 @@ PROMPT="Factory bead ${BEAD_ID}: drive PR #${PR} on ${TARGET_REPO} to /green + /
 #      so the tick can skip the bead instead of silently queueing a doomed
 #      spawn that will never produce an `ao session ls` row.
 ensure_ao_daemon() {
-  # Catch broken AO binary first: a 127 exit on any command means the
-  # CLI is misconfigured (wrong path, missing exec bit, broken install).
-  # Don't queue a doomed spawn in that case.
-  if ! "$AO" --version >/dev/null 2>&1 && ! "$AO" status >/dev/null 2>&1; then
+  # Combined preflight bound: --version + status probe must complete within
+  # 10s total. Each individual call has a 10s timeout. A hanging --version
+  # or status that ignores SIGTERM will be killed by the timeout wrapper.
+  if ! timeout 10 "$AO" --version >/dev/null 2>&1 && ! timeout 10 "$AO" status >/dev/null 2>&1; then
     return 1
   fi
   if [[ "$(basename "$AO")" != "ao-go" ]]; then
-    # ao-ts manages its own lifecycle; binary is the daemon.
     return 0
   fi
-  if "$AO" status >/dev/null 2>&1; then
+  if timeout 10 "$AO" status >/dev/null 2>&1; then
     return 0
   fi
   echo "[remediate] starting Go AO daemon" >&2
   nohup "$AO" daemon >> /tmp/ao-go-daemon.log 2>&1 &
   for _ in 1 2 3 4 5; do
-    if "$AO" status >/dev/null 2>&1; then
+    if timeout 10 "$AO" status >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -107,13 +106,17 @@ run_spawn_foreground() {
 }
 
 classify_spawn_outcome() {
-  # $1 = spawn rc, $2 = spawn output. Echoes 0 (success) or 1 (failure).
+  # $1 = spawn rc, $2 = spawn output. Returns 0 (success) or 1 (failure).
+  # Fail closed: malformed/non-UTF-8 output is treated as failure.
   local rc="$1" out="$2"
   if [ "$rc" -eq 0 ]; then return 0; fi
+  if ! printf '%s' "$out" | rg -aq '^'; then
+    return 1
+  fi
   if echo "$out" | rg -q 'spawned session |Session [a-z0-9_-]+ created|✓ Session|pr_open|working|spawning|claimed https://'; then
     return 0
   fi
-  if "$AO" session ls 2>/dev/null | rg "pulls/${PR}\b" | rg -q "\[(spawning|running|active|working|pr_open)\]"; then
+  if timeout 10 "$AO" session ls 2>/dev/null | rg "pulls/${PR}\b" | rg -q "\[(spawning|running|active|working|pr_open)\]"; then
     return 0
   fi
   return 1
@@ -128,7 +131,7 @@ if [ "$MODE" = "sync" ]; then
   # Best-effort daemon readiness for sync path (no bounded probe — caller
   # is opting into blocking semantics).
   if [[ "$(basename "$AO")" == "ao-go" ]]; then
-    state="$("$AO" status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null || true)"
+    state="$(timeout 10 "$AO" status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null || true)"
     if [ "$state" != "ready" ] && [ "$state" != "running" ]; then
       echo "[remediate] starting Go AO daemon" >&2
       nohup "$AO" daemon >> /tmp/ao-go-daemon.log 2>&1 &
@@ -156,9 +159,9 @@ if ! ensure_ao_daemon; then
 fi
 
 mkdir -p "$LOG_DIR" "$STATE_DIR"
-# Mark "pending" so a stale state file from a previous crashed run doesn't
-# cause the next tick to misread it. Background process overwrites with final.
-echo "pending" > "$STATE_FILE"
+# Mark "pending|<project>" so stale state files carry scoped identity for
+# rollback-dispatched's session validation. Background process overwrites.
+echo "pending|${AO_PROJECT}" > "$STATE_FILE"
 
 # Detach the real spawn. Background process records outcome to STATE_FILE.
 (
@@ -168,13 +171,23 @@ echo "pending" > "$STATE_FILE"
   out="${result#*$'\t'}"
   printf '%s' "$out" > "$SPAWN_LOG"
   if classify_spawn_outcome "$rc" "$out" >/dev/null; then
-    echo "ok" > "$STATE_FILE"
+    echo "ok|${AO_PROJECT}" > "$STATE_FILE"
   else
-    echo "fail:rc=$rc" > "$STATE_FILE"
+    echo "fail:rc=$rc|${AO_PROJECT}" > "$STATE_FILE"
   fi
 ) >/dev/null 2>&1 &
 SPAWN_PID=$!
 disown "$SPAWN_PID" 2>/dev/null || true
+
+# AFD_SKIP_FAST_FAIL_POLL=1: skip the fast-fail polling. The caller returns
+# immediately after queueing the spawn. The detached spawn durably persists
+# its outcome (ok/fail:rc=N) to the state file; the next tick's
+# rollback-dispatched reconciles failures. This is the fully nonblocking
+# dispatch path — the tick loop queues all eligible beads and moves on.
+if [ "${AFD_SKIP_FAST_FAIL_POLL:-0}" = "1" ]; then
+  echo "[remediate] async-spawned PR #$PR bead=${BEAD_ID} pid=${SPAWN_PID} log=${SPAWN_LOG} state=pending"
+  exit 0
+fi
 
 # Fast-fail detection: poll the state file for up to AFD_ASYNC_WAIT_SEC
 # before returning. Auth/project errors and broken-daemon errors typically
@@ -188,9 +201,11 @@ start_ts=$(date +%s)
 final_state=""
 while [ $(( $(date +%s) - start_ts )) -lt "$ASYNC_WAIT_SEC" ]; do
   cur="$(cat "$STATE_FILE" 2>/dev/null || true)"
-  case "$cur" in
+  # Extract the outcome token before the first "|" (scoped project separator)
+  outcome="${cur%%|*}"
+  case "$outcome" in
     ok)
-      final_state="ok"
+      final_state="$cur"
       break
       ;;
     fail:*)
@@ -204,15 +219,10 @@ done
 echo "[remediate] async-spawned PR #$PR bead=${BEAD_ID} pid=${SPAWN_PID} log=${SPAWN_LOG} state=${final_state:-pending}"
 case "$final_state" in
   fail:*)
-    # Fast-fail detected within wait window. Refuse so dispatch-record is
-    # skipped — the bead stays QUEUED and the next tick can retry.
     echo "[remediate] fast-fail detected for PR #$PR: $final_state — refusing to acknowledge dispatch" >&2
     exit 1
     ;;
   *)
-    # Either the spawn succeeded within the wait window OR it's still
-    # pending (cold-start slow spawn). Caller treats rc=0 as "dispatch
-    # accepted"; the state file records the eventual outcome.
     exit 0
     ;;
 esac

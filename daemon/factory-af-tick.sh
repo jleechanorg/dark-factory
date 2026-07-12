@@ -17,11 +17,10 @@
 #
 # Configurable env:
 #   AFD_BEAD_FILTER         space-separated bead IDs to limit the SELECT to
-#   AFD_PRIORITY_BEADS      comma-separated bead IDs in dispatch-priority order
-#                           (no hardcoded IDs in this script; see CLAUDE.md ZFC rule)
 #   AFD_AO_PROJECT          AO project name (default: worldarchitect)
 #   MAX_DISPATCH            max beads per tick (default 2)
 #   AO_MAX_CONCURRENT_SESSIONS  AO concurrency cap (default 30)
+#   AFD_TICK_DEADLINE_SEC   whole-tick wallclock deadline (default 60)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export BR_DB="${BR_DB:-$ROOT/.beads/beads.db}"
@@ -90,22 +89,7 @@ if [ -n "${AFD_BEAD_FILTER:-}" ]; then
     esac
 fi
 
-# ---------- validate AFD_PRIORITY_BEADS (CR-4: SQL injection guard) ----------
-# Each comma-separated token MUST match the strict allowlist. Without this, a
-# crafted bead_id like `x' UNION SELECT ... --` is interpolated unescaped into
-# the CASE WHEN fragment below and executed by sqlite3.
-if [ -n "${AFD_PRIORITY_BEADS:-}" ]; then
-    bad_token="$(printf '%s' "$AFD_PRIORITY_BEADS" | tr ',' '\n' \
-        | awk '{
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
-            if ($0 == "") next
-            if ($0 !~ /^[A-Za-z0-9._-]+$/) { print $0; fflush(); exit 0 }
-        }')"
-    if [ -n "$bad_token" ]; then
-        echo "factory-af-tick: AFD_PRIORITY_BEADS has invalid token (must match ^[A-Za-z0-9._-]+\$): $bad_token" >&2
-        exit 2
-    fi
-fi
+
 
 cd "$ROOT"
 
@@ -158,11 +142,82 @@ fi
 "$O" init
 "$O" unstick-dispatching
 "$O" recover-held
-# Roll back DISPATCHED beads whose async spawn failed (state file "fail:rc=N").
-# Closes the Codex P1 loop on PR #193: async-spawn can succeed at the wrapper
-# level (fast-fail window passed) but fail later; the state file records the
-# final outcome and the next tick's `rollback-dispatched` rolls those beads
-# back to QUEUED for retry.
+
+# ---------- AO binary resolution (moved before rollback-dispatched so it can
+#           validate scoped session identity for "ok" state files) ----------
+AO="$(bash "$ROOT/daemon/factory-ao-bin.sh" 2>/dev/null || true)"
+
+# ---------- Session cache ----------
+# Query AO once per project and cache the output so per-bead session dedup
+# does NOT re-query AO for every bead. Fixes issue #270: the tick loop was
+# serializing behind 1-2 `ao session ls` calls per bead, blocking dispatch.
+# Cache directory is ALWAYS created with mktemp (self-owned).
+_afd_self_cache_dir="$(mktemp -d -t af_sessions.XXXXXX)"
+
+ao_session_cache() {
+  local proj="$1"
+  if [[ ! "$proj" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "CACHE_ERROR:invalid_project_name=${proj}"
+    return 0
+  fi
+  local cache_file="${_afd_self_cache_dir}/${proj}.txt"
+  if [ -f "$cache_file" ]; then
+    cat "$cache_file"
+    return
+  fi
+  if [ -z "$AO" ]; then
+    touch "$cache_file"
+    return 0
+  fi
+  if timeout 10 "$AO" session ls -p "$proj" 2>/dev/null > "$cache_file"; then
+    if [ ! -s "$cache_file" ]; then
+      echo "CACHE_ERROR:empty_response" > "$cache_file"
+    fi
+  else
+    local rc=$?
+    echo "CACHE_ERROR:ao_query_failed_rc=${rc}" > "$cache_file"
+  fi
+  cat "$cache_file"
+}
+
+ao_active_sessions() {
+  local proj="$1"
+  local raw
+  raw="$(ao_session_cache "$proj" 2>/dev/null || true)"
+  if [ -z "$raw" ]; then
+    echo 0
+    return
+  fi
+  case "$raw" in
+    CACHE_ERROR:*) echo -1; return ;;
+  esac
+  if [ "$raw" = "[]" ]; then
+    echo 0
+    return
+  fi
+  local active_count
+  active_count="$(echo "$raw" | rg -c '\[(spawning|running|active|working|pr_open)\]' 2>/dev/null || echo 0)"
+  case "$active_count" in
+    ''|*[!0-9]*) echo 0 ;;
+    *) echo "$active_count" ;;
+  esac
+}
+
+ao_session_exists() {
+  local proj="$1" pr="$2"
+  local raw
+  raw="$(ao_session_cache "$proj" 2>/dev/null)"
+  case "$raw" in
+    CACHE_ERROR:*) return 1 ;;
+  esac
+  echo "$raw" | rg "pulls/${pr}\b" | rg -q '\[(spawning|running|active|working|pr_open)\]' 2>/dev/null
+}
+
+# Roll back DISPATCHED beads whose async spawn failed or whose "ok" state file
+# has no real AO session (false-ok stranding guard). Passes AO + session cache
+# via env so rollback-dispatched can validate scoped session identity.
+AFD_AO_BIN="$AO" \
+AFD_SESSION_CACHE_DIR="${_afd_self_cache_dir}" \
 "$O" rollback-dispatched
 
 # Park superseded duplicates. Generic query — no hardcoded bead IDs.
@@ -199,46 +254,27 @@ fi
 
 bash "$I"
 
-# ---------- AO concurrency probe ----------
-AO="$(bash "$ROOT/daemon/factory-ao-bin.sh" 2>/dev/null || true)"
+# ---------- AO concurrency probe (uses cached sessions; fail-closed) ----------
 AO_CAP="${AO_MAX_CONCURRENT_SESSIONS:-30}"
-# Validate AO_PROJECT is non-empty + looks like a project name. Defensive: an
-# empty / malformed project would cause `session ls -p ""` to dump all projects
-# and inflate the active count, falsely tripping AO_MAX_CONCURRENT_SESSIONS.
 if [ -z "${AO_PROJECT:-}" ] || [[ ! "$AO_PROJECT" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "[af] WARN: AFD_AO_PROJECT='${AO_PROJECT:-}' is empty or malformed; defaulting to 'worldarchitect'" >&2
     AO_PROJECT="worldarchitect"
 fi
 if [ -n "$AO" ]; then
-    # CR: scope the --json probe to $AO_PROJECT the same way the non-JSON
-    # fallback below does (`-p "$AO_PROJECT"`). Without -p here, a successful
-    # --json call would count sessions across ALL AO projects, inflating
-    # ao_active and falsely tripping AO_MAX_CONCURRENT_SESSIONS for
-    # deployments using a non-default AFD_AO_PROJECT.
-    if "$AO" session ls -p "$AO_PROJECT" --json >/dev/null 2>&1; then
-        ao_active="$("$AO" session ls -p "$AO_PROJECT" --json 2>/dev/null | python3 -c '
-import json,sys
-try:
-    d = json.load(sys.stdin)
-    if not isinstance(d, dict):
-        print(0); sys.exit(0)
-    sessions = d.get("data") or []
-    if not isinstance(sessions, list):
-        print(0); sys.exit(0)
-    print(sum(1 for s in sessions if isinstance(s, dict) and not s.get("isTerminated")))
-except Exception:
-    print(0)' 2>/dev/null || echo 0)"
-    else
-        ao_active="$("$AO" session ls -p "$AO_PROJECT" 2>/dev/null | rg -c '\[(spawning|running|active|working|pr_open)\]' || echo 0)"
-    fi
-    # Ensure ao_active is a non-negative integer (defensive: rg/race could leave empty)
-    case "${ao_active:-0}" in
-        ''|*[!0-9]*) ao_active=0 ;;
+    ao_session_cache "$AO_PROJECT" > /dev/null 2>&1
+    ao_active="$(ao_active_sessions "$AO_PROJECT")"
+    case "$ao_active" in
+        -1)
+            echo "[af] AO session cache error — refusing dispatch (fail closed)" >&2
+            MAX_DISPATCH=0
+            ;;
+        *)
+            if [ "${ao_active:-0}" -ge "$AO_CAP" ]; then
+                echo "[af] AO cap: ${ao_active} active >= ${AO_CAP} — skipping dispatch (intake done)" >&2
+                MAX_DISPATCH=0
+            fi
+            ;;
     esac
-    if [ "${ao_active:-0}" -ge "$AO_CAP" ]; then
-        echo "[af] AO cap: ${ao_active} active >= ${AO_CAP} — skipping dispatch (intake done)" >&2
-        MAX_DISPATCH=0
-    fi
 fi
 
 # ---------- build SELECT filters (no SQL injection; values validated above) ----------
@@ -255,37 +291,53 @@ if [ -n "${AFD_BEAD_FILTER:-}" ]; then
     bead_filter="AND bead_id = '${bid}'"
 fi
 
-# ---------- priority ORDER BY (configurable via env, no hardcoded IDs) ----------
-# CR-4 SQL injection guard runs above (line 80ish) — each token has been
-# validated against `^[A-Za-z0-9._-]+$` before reaching here.
-priority_order=""
-if [ -n "${AFD_PRIORITY_BEADS:-}" ]; then
-    # Each comma-separated ID becomes "WHEN '<id>' THEN <n>" via awk.
-    priority_order="$(printf '%s' "$AFD_PRIORITY_BEADS" | tr ',' '\n' \
-        | awk 'BEGIN{n=0} {
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
-            if ($0 == "") next
-            n++
-            print "WHEN \x27" $0 "\x27 THEN " (n - 1)
-        }' | tr '\n' ' ')"
-fi
-order_clause="ORDER BY updated_at LIMIT 10"
-if [ -n "$priority_order" ]; then
-    order_clause="ORDER BY CASE bead_id $priority_order ELSE 999 END, updated_at LIMIT 10"
-fi
-
 # ---------- dispatch loop ----------
+TICK_DEADLINE_SEC="${AFD_TICK_DEADLINE_SEC:-60}"
+tick_start_ts=$(date +%s)
 dispatched=0
 ERR_TMP="$(mktemp -t af_dispatch_err.XXXXXX)"
-trap 'rm -f "$ERR_TMP"' EXIT
-while IFS=$'\t' read -r bead_id pr branch bead_repo; do
+trap 'rm -f "$ERR_TMP"; rm -rf "${_afd_self_cache_dir}"' EXIT
+
+# Build the SQL query. Attach BR_DB for metadata-driven priority ordering
+# (fairness derives from production metadata: priority=0 beads sort first).
+_br_attach=""
+_priority_select="2"
+if [ -f "$BR_DB" ]; then
+    _br_attach="ATTACH DATABASE '$(printf "%s" "$BR_DB" | sed "s/'/''/g")' AS br;"
+    _priority_select="COALESCE((SELECT priority FROM br.issues WHERE br.issues.id = bo.bead_id), 2)"
+fi
+
+if [ -f "$BR_DB" ]; then
+    order_clause="ORDER BY ${_priority_select} ASC, bo.updated_at LIMIT 10"
+else
+    order_clause="ORDER BY bo.updated_at LIMIT 10"
+fi
+
+while IFS='|' read -r bead_id pr branch bead_repo bead_priority; do
     [ -n "$bead_id" ] || continue
-    [ "$dispatched" -ge "$MAX_DISPATCH" ] && break
+
+    # Whole-tick deadline: stop dispatch if the tick has exceeded its wall-clock
+    # budget. Shared across all projects and preflight — no synchronous per-bead
+    # preflight, so each bead's remediation returns in <1s (AFD_SKIP_FAST_FAIL_POLL=1).
+    if [ $(( $(date +%s) - tick_start_ts )) -gt "$TICK_DEADLINE_SEC" ]; then
+        echo "[af] whole-tick deadline (${TICK_DEADLINE_SEC}s) exceeded — stopping dispatch after $dispatched beads" >&2
+        break
+    fi
+
+    # Fairness: P0 beads (priority=0 from BR production metadata) dispatch
+    # outside the normal MAX_DISPATCH selection limit — additive, not
+    # replacement. Priority data comes from the BR issues table; no injected
+    # priority list. P0 must also dispatch first (sorted by priority ASC).
+    is_p0="false"
+    [ "${bead_priority:-2}" = "0" ] && is_p0="true"
+
+    if [ "$dispatched" -ge "$MAX_DISPATCH" ]; then
+        if [ "$is_p0" != "true" ]; then
+            break
+        fi
+    fi
 
     # Resolve target repo (default to global TARGET_REPO if empty). Fail closed
-    # (skip, don't guess) when neither is set — see bead jleechan-gvdw: a
-    # hardcoded fallback here recreates the same-number cross-repo claim risk
-    # this per-bead repo resolution exists to prevent.
     repo="${bead_repo:-${TARGET_REPO:-}}"
     if [ -z "$repo" ]; then
         echo "[af] skip $bead_id: no repo mapping (fail-closed, no bead_repo or TARGET_REPO)" >&2
@@ -315,14 +367,12 @@ if target_repo == global_target:
     if ao_project:
         print(ao_project)
         sys.exit(0)
-    # Derivation fallback
     project = target_repo.split('/')[-1]
     if project == "worldarchitect.ai":
         project = "worldarchitect"
     print(project)
     sys.exit(0)
 
-# Unmapped
 print("")
 PY
 )"
@@ -333,21 +383,40 @@ PY
         continue
     fi
 
-    if [ -n "$AO" ] && "$AO" session ls -p "$proj" 2>/dev/null | rg "pulls/${pr}\\b" | rg -q '\[(spawning|running|active|working|pr_open)\]'; then
+    if [[ ! "$proj" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        echo "[af] fail closed: invalid project name '$proj' for $bead_id — skip" >&2
+        continue
+    fi
+
+    # Pre-populate session cache for this project
+    ao_session_cache "$proj" > /dev/null 2>&1
+
+    # Per-bead fail closed: if the project's session cache is errored, skip
+    if [ -f "${_afd_self_cache_dir}/${proj}.txt" ]; then
+        if rg -q '^CACHE_ERROR:' "${_afd_self_cache_dir}/${proj}.txt" 2>/dev/null; then
+            echo "[af] skip $bead_id: AO session cache error for project $proj (fail closed)" >&2
+            continue
+        fi
+    fi
+
+    if [ -n "$AO" ] && ao_session_exists "$proj" "$pr"; then
         echo "[af] skip $bead_id PR #$pr (active session exists in project $proj)" >&2
         continue
     fi
-    echo "[af] remediate $bead_id PR #$pr on $repo in project $proj"
-    # CX-2: thread proj and repo through to factory-ao-remediate.sh so the spawned
-    # session lives in the same AO project.
-    if bash "$R" "$bead_id" "$pr" "$repo" "$proj" 2>&1; then
+
+    p0_tag=""
+    [ "$is_p0" = "true" ] && p0_tag=" [P0]"
+    echo "[af] remediate${p0_tag} $bead_id PR #$pr on $repo in project $proj"
+
+    # Nonblocking dispatch: AFD_SKIP_FAST_FAIL_POLL=1 returns immediately after
+    # queueing spawn. No per-bead wait. Detached spawn durably persists outcome
+    # to state file; next tick's rollback-dispatched reconciles failures.
+    if AFD_SKIP_FAST_FAIL_POLL=1 bash "$R" "$bead_id" "$pr" "$repo" "$proj" 2>&1; then
         cur_state="$(sqlite3 "$DB" "SELECT state FROM bead_overlay WHERE bead_id='$(printf "%s" "$bead_id" | sed "s/'/''/g")';" 2>/dev/null || true)"
         if [ "$cur_state" = "QUEUED" ]; then
             if [ -n "$branch" ]; then
                 "$O" route-record "$bead_id" STANDARD_PATH "drive-existing-pr" 2>/dev/null || true
             fi
-            # Capture both rc and stderr; case on rc (structured) — stderr is
-            # logged verbatim for human operators but never parsed.
             set +e
             "$O" dispatch-record "$bead_id" "$branch" 2>"$ERR_TMP"
             rc=$?
@@ -355,48 +424,25 @@ PY
             err="$(cat "$ERR_TMP" 2>/dev/null || true)"
             case "$rc" in
                 0) : ;;
-                3)  # over capacity — capacity gate refused
-                    cur_cap="$("$O" capacity 2>/dev/null || echo 0)"
-                    echo "[af] over capacity — skip $bead_id (capacity=$cur_cap)" >&2
-                    continue
-                    ;;
-                4)  # branch conflict — branch owned by another bead
-                    echo "[af] branch conflict $branch — skip $bead_id: $err" >&2
-                    continue
-                    ;;
-                5)  # require_state — bead is not QUEUED (race or already advanced)
-                    echo "[af] require_state failed for $bead_id (state=$cur_state not QUEUED)" >&2
-                    continue
-                    ;;
-                6)  # valid_branch / valid_pr — input format invalid (will not fix)
-                    echo "[af] invalid input for $bead_id: $err" >&2
-                    continue
-                    ;;
-                7)  # invalid bead_id — input format invalid (will not fix)
-                    echo "[af] invalid bead_id for $bead_id: $err" >&2
-                    continue
-                    ;;
-                9)  # EX_IO — sqlite / fs failure. CR-5: hard-fail the tick so
-                    # the IO error is not silently swallowed by the generic
-                    # 'continue' branch. The overlay returned a structured code
-                    # specifically because it could not write — continuing would
-                    # mask real disk/db problems and re-dispatch the same bead.
-                    echo "[af] dispatch-record EX_IO for $bead_id (rc=9): $err" >&2
-                    exit 9
-                    ;;
-                *)  # unexpected / genuine failure
-                    echo "[af] dispatch-record failed for $bead_id (rc=$rc): $err" >&2
-                    continue
-                    ;;
+                3)  echo "[af] over capacity — skip $bead_id" >&2; continue ;;
+                4)  echo "[af] branch conflict $branch — skip $bead_id: $err" >&2; continue ;;
+                5)  echo "[af] require_state failed for $bead_id" >&2; continue ;;
+                6)  echo "[af] invalid input for $bead_id: $err" >&2; continue ;;
+                7)  echo "[af] invalid bead_id for $bead_id: $err" >&2; continue ;;
+                9)  echo "[af] dispatch-record EX_IO for $bead_id (rc=9): $err" >&2; exit 9 ;;
+                *)  echo "[af] dispatch-record failed for $bead_id (rc=$rc): $err" >&2; continue ;;
             esac
         fi
         dispatched=$((dispatched + 1))
     else
         echo "[af] skip $bead_id (ao spawn failed)" >&2
     fi
-done < <(sqlite3 "$DB" -separator $'\t' \
-  "SELECT bead_id, pr_number, coalesce(branch,''), coalesce(target_repo,'') FROM bead_overlay
-   WHERE state IN ('QUEUED','ATTESTED') AND pr_number IS NOT NULL
+done < <(sqlite3 "$DB" -separator '|' \
+  "${_br_attach}
+   SELECT bo.bead_id, bo.pr_number, coalesce(bo.branch,''), coalesce(bo.target_repo,''),
+          ${_priority_select}
+   FROM bead_overlay bo
+   WHERE bo.state IN ('QUEUED','ATTESTED') AND bo.pr_number IS NOT NULL
    $bead_filter
    $pr_sql_filter
    $order_clause;")

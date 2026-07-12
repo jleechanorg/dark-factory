@@ -334,6 +334,99 @@ esac
 # Wall-clock bound: ~ AFD_ASYNC_WAIT_SEC + small overhead.
 assert_lt "slow-spawn wallclock <10s (wait window respected)" 10 "$elapsed"
 
+# ---------------------------------------------------------------------------
+# Test 8: AFD_SKIP_FAST_FAIL_POLL=1 — nonblocking dispatch skips fast-fail
+# poll and returns immediately with state=pending.
+# ---------------------------------------------------------------------------
+rm -f /tmp/test-remediate-fake-ao.log
+start=$(date +%s)
+out="$(AO_BIN="$FAKE_AO" AO_SPAWN_TIMEOUT_SEC=60 AFD_ASYNC_WAIT_SEC=5 AFD_SKIP_FAST_FAIL_POLL=1 timeout 10 bash "$REMEDIATE" test-bead-skipfast 9995 jleechanorg/worldarchitect.ai worldarchitect 2>&1)"
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+echo "[test 8 output]"
+echo "$out" | sed 's/^/    /'
+echo
+assert "skip-fast-fail: exit 0 (immediate ack)" "0" "$rc"
+assert_lt "skip-fast-fail: wallclock <3s (no poll wait)" 3 "$elapsed"
+case "$out" in
+  *async-spawned*)
+    echo "PASS: skip-fast-fail emits 'async-spawned'"; PASS=$((PASS + 1)) ;;
+  *)
+    echo "FAIL: skip-fast-fail did not emit 'async-spawned'"; FAIL=$((FAIL + 1)) ;;
+esac
+case "$out" in
+  *state=pending*)
+    echo "PASS: skip-fast-fail shows state=pending (skipped poll)"; PASS=$((PASS + 1)) ;;
+  *)
+    echo "FAIL: skip-fast-fail state not pending: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Test 9: preflight timeout — when AO daemon hangs, ensure_ao_daemon must
+# fail within the combined preflight bound rather than blocking indefinitely.
+# ---------------------------------------------------------------------------
+TIMEOUT_AO="$SCRATCH_DIR/timeout-ao"
+cat > "$TIMEOUT_AO" <<'EOF_TO'
+#!/usr/bin/env bash
+case "${1:-}" in
+  status) exit 1 ;;
+  daemon) sleep 60 ;;
+  *) exit 1 ;;
+esac
+EOF_TO
+chmod +x "$TIMEOUT_AO"
+rm -f /tmp/test-remediate-fake-ao.log
+start=$(date +%s)
+out="$(AO_BIN="$TIMEOUT_AO" AO_SPAWN_TIMEOUT_SEC=60 AFD_ASYNC_WAIT_SEC=5 timeout 15 bash "$REMEDIATE" test-bead-timeout 9994 jleechanorg/worldarchitect.ai worldarchitect 2>&1)"
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+echo "[test 9 output]"
+echo "$out" | sed 's/^/    /'
+echo
+assert_lt "preflight-timeout: wallclock <12s" 12 "$elapsed"
+if [ "$rc" -ne 0 ]; then
+  echo "PASS: preflight-timeout returns non-zero (rc=$rc)"; PASS=$((PASS + 1))
+else
+  echo "FAIL: preflight-timeout returned 0 despite broken AO"; FAIL=$((FAIL + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# Test 10: two-hanging-probe regression — when two separate preflight
+# attempts each encounter hanging AO calls, both must complete within
+# the combined deadline. Proves neither can block the other indefinitely.
+# ---------------------------------------------------------------------------
+DUAL_HANG_AO="$SCRATCH_DIR/dual-hang-ao"
+cat > "$DUAL_HANG_AO" <<'EOF_DH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  status) echo '{"state":"ready"}'; exit 0 ;;
+  session) echo "[]"; exit 0 ;;
+  spawn) sleep 30; echo "spawned session fake-${RANDOM}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF_DH
+chmod +x "$DUAL_HANG_AO"
+rm -f /tmp/test-remediate-fake-ao.log
+start=$(date +%s)
+# Two sequential preflight runs — each spawns a 30s-hang process but
+# AFD_SKIP_FAST_FAIL_POLL=1 ensures both return in <3s each.
+out1="$(AO_BIN="$DUAL_HANG_AO" AO_SPAWN_TIMEOUT_SEC=60 AFD_ASYNC_WAIT_SEC=5 AFD_SKIP_FAST_FAIL_POLL=1 timeout 10 bash "$REMEDIATE" test-bead-hang-a 9993 jleechanorg/worldarchitect.ai worldarchitect 2>&1)"
+out2="$(AO_BIN="$DUAL_HANG_AO" AO_SPAWN_TIMEOUT_SEC=60 AFD_ASYNC_WAIT_SEC=5 AFD_SKIP_FAST_FAIL_POLL=1 timeout 10 bash "$REMEDIATE" test-bead-hang-b 9992 jleechanorg/worldarchitect.ai worldarchitect 2>&1)"
+elapsed=$(( $(date +%s) - start ))
+echo "[test 10 output]"
+echo "Hang A: $(echo "$out1" | head -1)" | sed 's/^/    /'
+echo "Hang B: $(echo "$out2" | head -1)" | sed 's/^/    /'
+echo "Two hanging probes wallclock: ${elapsed}s"
+assert_lt "two-hanging-probe: wallclock <9s (combined bound)" 9 "$elapsed"
+case "$out1" in
+  *async-spawned*) echo "PASS: two-hanging-probe A completed"; PASS=$((PASS + 1)) ;;
+  *) echo "FAIL: two-hanging-probe A failed"; FAIL=$((FAIL + 1)) ;;
+esac
+case "$out2" in
+  *async-spawned*) echo "PASS: two-hanging-probe B completed"; PASS=$((PASS + 1)) ;;
+  *) echo "FAIL: two-hanging-probe B failed"; FAIL=$((FAIL + 1)) ;;
+esac
+
 echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ] || exit 1

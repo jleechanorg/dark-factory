@@ -484,32 +484,92 @@ unstick-dispatching)
   ;;
 
 rollback-dispatched)
-  # Codex P1 finding on PR #193: factory-ao-remediate.sh (async mode) returns
-  # success optimistically when the spawn is still pending. If the spawn then
-  # fails AFTER the fast-fail window (slow internal error, daemon dies
-  # mid-spawn), the bead is stranded as DISPATCHED with no AO session. This
-  # subcommand reads each DISPATCHED bead's spawn-state file (written by the
-  # detached background process in factory-ao-remediate.sh) and rolls the bead
-  # back to QUEUED when the state file shows "fail:rc=N".
+  # Reconcile DISPATCHED beads whose detached async spawn failed or whose
+  # "ok" state file has no real AO session (false-ok stranding guard).
+  # factory-ao-remediate.sh (async mode) returns 0 optimistically after
+  # queueing the spawn. This subcommand reads each DISPATCHED bead's
+  # spawn-state file and rolls back failures.
   #
   # State file path: $AFD_SPAWN_STATE_DIR/${bead_id}-${pr_number}.state
-  # State values: "pending" (spawn still running), "ok" (success),
-  #               "fail:rc=N" (failure with rc)
+  # State values (new format with scoped project): "ok|<proj>",
+  #   "fail:rc=N|<proj>", "pending|<proj>"
+  # Legacy format (no pipe): "ok", "fail:rc=N", "pending" — treated as
+  #   unscoped (no session identity validation possible).
+  #
+  # Reconciliation rules:
+  #   fail:*      — immediate rollback (spawn reported failure)
+  #   pending     — rollback if state file is stale (> spawn timeout elapsed
+  #                 since last modification), guarding against background-
+  #                 process crash / indefinite hang.
+  #   ok|<proj>   — validate scoped session identity: query AO session cache
+  #                 (or live AO if cache unavailable) for an active session
+  #                 in <proj> for this PR. If no session exists → false-ok,
+  #                 rollback. Guard prevents strand-dispatch on a spawn that
+  #                 reported success but actually failed.
   SPAWN_STATE_DIR_ROLL="${AFD_SPAWN_STATE_DIR:-$HOME/Library/Application Support/dark-factory/spawns}"
+  STALE_SEC="${AFD_PENDING_STALE_SEC:-180}"
+  now_epoch="$(date +%s)"
+  AO_ROLL="${AFD_AO_BIN:-}"
+  SESSION_CACHE_DIR="${AFD_SESSION_CACHE_DIR:-}"
   rolled=0
   while IFS='|' read -r rb_id rb_pr; do
     [ -n "$rb_id" ] || continue
     state_file="$SPAWN_STATE_DIR_ROLL/${rb_id}-${rb_pr}.state"
     [ -f "$state_file" ] || continue
     cur="$(cat "$state_file" 2>/dev/null || true)"
-    case "$cur" in
+    outcome="${cur%%|*}"
+    proj="${cur#*|}"
+    [ "$proj" = "$cur" ] && proj=""  # no pipe → legacy unscoped format
+    rollback=0
+    reason=""
+    case "$outcome" in
       fail:*)
-        sql "UPDATE bead_overlay SET state='QUEUED', updated_at='$(now)' WHERE bead_id='$(q "$rb_id")' AND state='DISPATCHED';"
-        ctx="$(python3 -c 'import json,sys; v=sys.argv[1]; print(json.dumps({"pr_number":(int(v) if v not in ("","NULL") else None), "reason":"async_spawn_failed","state_file_value":v}))' "$rb_pr" "$cur")"
-        emit "$rb_id" 0 QUEUED ROLLBACK_DISPATCHED "$ctx"
-        rolled=$((rolled + 1))
+        rollback=1
+        reason="async_spawn_failed"
+        ;;
+      pending)
+        # Check staleness: if the state file hasn't been modified for
+        # STALE_SEC seconds, the spawn process is dead/hung.
+        if [ "$(uname)" = "Darwin" ]; then
+          file_epoch="$(stat -f %m "$state_file" 2>/dev/null || echo 0)"
+        else
+          file_epoch="$(stat -c %Y "$state_file" 2>/dev/null || echo 0)"
+        fi
+        if [ "${file_epoch:-0}" -gt 0 ] && [ $(( now_epoch - file_epoch )) -gt "$STALE_SEC" ]; then
+          rollback=1
+          reason="async_spawn_stale_pending"
+        fi
+        ;;
+      ok)
+        # Scoped session identity validation: when we have a project + AO,
+        # verify a real session exists for this PR in that project. Without
+        # project scope, skip validation (legacy state file).
+        if [ -n "$proj" ] && [ -n "$AO_ROLL" ]; then
+          session_ok="false"
+          # Try the session cache first (populated by the tick's preflight)
+          if [ -n "$SESSION_CACHE_DIR" ] && [ -f "${SESSION_CACHE_DIR}/${proj}.txt" ]; then
+            if rg -q "pulls/${rb_pr}\b" "${SESSION_CACHE_DIR}/${proj}.txt" 2>/dev/null && \
+               rg -q '\[(spawning|running|active|working|pr_open)\]' "${SESSION_CACHE_DIR}/${proj}.txt" 2>/dev/null; then
+              session_ok="true"
+            fi
+          fi
+          # Fall back to a live query if cache didn't confirm
+          if [ "$session_ok" != "true" ] && timeout 10 "$AO_ROLL" session ls -p "$proj" 2>/dev/null | rg "pulls/${rb_pr}\b" | rg -q '\[(spawning|running|active|working|pr_open)\]' 2>/dev/null; then
+            session_ok="true"
+          fi
+          if [ "$session_ok" != "true" ]; then
+            rollback=1
+            reason="false_ok_no_session"
+          fi
+        fi
         ;;
     esac
+    if [ "$rollback" = "1" ]; then
+      sql "UPDATE bead_overlay SET state='QUEUED', updated_at='$(now)' WHERE bead_id='$(q "$rb_id")' AND state='DISPATCHED';"
+      ctx="$(python3 -c 'import json,sys; print(json.dumps({"pr_number":(int(sys.argv[1]) if sys.argv[1] not in ("","NULL") else None), "reason":sys.argv[2],"state_file_value":sys.argv[4],"project":(sys.argv[3] or None)}))' "$rb_pr" "$reason" "$proj" "$cur")"
+      emit "$rb_id" 0 QUEUED ROLLBACK_DISPATCHED "$ctx"
+      rolled=$((rolled + 1))
+    fi
   done < <(sql -separator '|' "SELECT bead_id, coalesce(cast(pr_number as text),'') FROM bead_overlay WHERE state='DISPATCHED' AND pr_number IS NOT NULL;")
   echo "rolled=$rolled"
   ;;
