@@ -8,21 +8,33 @@ Order of operations (each step is fail-closed over fail-open):
   1. Resolve authoritative API head SHA (`gh pr view`). Refuse if it
      does not equal the event/input SHA (defense against stale-dispatch
      attacks).
-  2. Gather diff (`gh pr diff`). Refuse if it exceeds `MAX_DIFF_BYTES` —
-     a partial review cannot satisfy the gate.
-  3. Look up the commit author. Derive the `implementation_identity`.
+  2. Gather diff (`gh pr diff`). Refuse if it exceeds `MAX_DIFF_BYTES`
+     (a partial review cannot satisfy the gate). The diff is passed to
+     reviewers via stdin (never via argv, to avoid E2BIG on the ~140KB
+     gemini CLI boundary).
+  3. Look up the PR's head commit subject and derive the
+     `implementation_identity` deterministically from the commit-
+     subject prefix (no ZFC keyword routing on free-form text).
   4. Build the prompt (PR context + diff + implementation_identity).
-  5. Run each reviewer (default: codex AND gemini, both with sandbox-
-     mode flags so they cannot execute code). Strip secrets from the
-     env passed to the reviewer. Timeout-bounded.
-  6. Verify provenance for each reviewer (the reviewer must declare a
-     different identity from the implementer).
-  7. Aggregate: ALL reviewers must PASS.
-  8. Re-check the API head SHA before publish (defense against a new
+  5. Reject duplicate reviewer identities in the input list (a PR may
+     not be reviewed twice by the same model).
+  6. Run each reviewer (default: codex AND gemini, both invoked with
+     sandbox-mode flags so they cannot execute code). The subprocess
+     env is allow-list only — HOME, GITHUB_TOKEN, all
+     OPENCLAW_*/HERMES_*/SLACK_* secrets are stripped. Timeout-
+     bounded.
+  7. Verify CLI→identity binding (codex CLI must declare `codex`;
+     gemini CLI must declare `gemini`) and provenance (the reviewer
+     must declare a different identity from the implementer).
+  8. Aggregate: ALL reviewers must PASS.
+  9. Re-check the API head SHA before publish (defense against a new
      push mid-run).
-  9. Post/upsert the bot comment + commit status.
- 10. Read both back via `gh api`. Verify actor/bot identity, marker,
-     SHA, repo, PR number, verdict. Fail closed if any disagree.
+ 10. Post/upsert the bot comment + commit status. Status write
+     failure fails closed.
+ 11. Read both back via `gh api`. Verify actor/bot identity, marker,
+     SHA, repo, PR number, verdict, reviewer, implementation_provenance
+     — full equality, byte-for-byte, on all 6 fields. Fail closed if
+     any disagree.
 """
 
 from __future__ import annotations
@@ -41,8 +53,10 @@ from runner.skeptic_gate import (
     ReadBackCheck,
     SkepticResult,
     aggregate_results,
+    bind_reviewer_identity,
     build_prompt,
     evaluate,
+    extract_implementation_identity_from_commit,
     format_comment,
     parse_verdict,
     verify_published_comment,
@@ -68,42 +82,56 @@ EXPECTED_BOT_ACTOR = "github-actions[bot]"
 
 # Env keys that MUST NOT leak into the reviewer subprocess. Even
 # read-only model invocations shouldn't see GITHUB_TOKEN, GH_TOKEN,
-# or any OPENCLAW_* secret.
+# or any OPENCLAW_* secret. Per post-audit comment 4953064910, HOME
+# is also stripped so the reviewer process cannot read user-level
+# credentials or shell rc files.
 REVIEWER_SECRET_ENV_DENY = {
     "GITHUB_TOKEN",
     "GH_TOKEN",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "MAIL",
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
     "OPENCLAW_GATEWAY_TOKEN",
     "OPENCLAW_URL",
     "OPENCLAW_SLACK_BOT_TOKEN",
     "OPENCLAW_SLACK_APP_TOKEN",
     "SLACK_BOT_TOKEN",
     "SLACK_APP_TOKEN",
+    "SLACK_USER_TOKEN",
     "HERMES_SLACK_WEBHOOK_URL",
     "HERMES_OPENCLAW_BOT_TOKEN",
     "HERMES_OPENCLAW_APP_TOKEN",
+    "HERMES_GATEWAY_TOKEN",
+    "HERMES_HOME",
+    "HERMES_ENV",
+    "NPM_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AZURE_CLIENT_SECRET",
+    "GCP_SERVICE_ACCOUNT_KEY",
 }
 
-# Env keys that we DO pass through (read-only signal): reviewer CLIs
-# need their own credentials + reasonable APIs to read files.
+# Env keys that we DO pass through (reviewer CLIs need them to call
+# the underlying model API). PATH is set by the workflow to a
+# minimal list containing only the pinned reviewer bin dirs.
 REVIEWER_ENV_ALLOWLIST = {
     "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
     "TMPDIR",
     "LANG",
     "LC_ALL",
     "TERM",
     "PWD",
-    "SHELL",
-    "XDG_RUNTIME_DIR",
-    "XDG_CONFIG_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_DATA_HOME",
-    "NPM_CONFIG_PREFIX",
-    "NPM_TOKEN",  # needed for codex; treat as reviewer-owned
     "OPENAI_API_KEY",  # codex uses OpenAI
     "GOOGLE_API_KEY",  # gemini uses Google
+    "ANTHROPIC_API_KEY",
 }
 
 
@@ -267,13 +295,18 @@ def get_pr_diff(repo: str, pr_number: int) -> str:
     return diff
 
 
-def get_commit_author_identity(repo: str, pr_number: int) -> str:
-    """Look up the PR's commit author and reduce it to a model identity.
+def get_implementation_identity(repo: str, pr_number: int) -> str:
+    """Look up the PR's head commit subject and reduce it to a model
+    identity via deterministic prefix match.
 
-    The mapping is intentionally generous: anything that looks like a
-    bot identity returns `unknown` (because we cannot prove the
-    implementer was Claude and therefore cannot prove a reviewer is
-    independent of it).
+    Per post-audit comment 4953064910, the previous implementation
+    keyword-matched the author's GitHub login + commit email —
+    which is ZFC (keyword routing on free-form text) and silently
+    returned `unknown` for live PRs, making PASS impossible. The
+    canonical mapping is the COMMIT-SUBJECT PREFIX (`claude/…`,
+    `codex/…`, `gemini/…`, `human: …`), enforced by repo policy
+    (see CLAUDE.md "Commit provenance tag"). This function just
+    applies the deterministic prefix match.
     """
     owner, name = repo.split("/", 1)
     try:
@@ -285,18 +318,9 @@ def get_commit_author_identity(repo: str, pr_number: int) -> str:
         return "unknown"
     if not isinstance(data, list) or not data:
         return "unknown"
-    author = (data[0].get("author") or {}).get("login") or ""
-    email = (
-        (data[0].get("commit", {}).get("author", {}) or {}).get("email", "") or ""
-    )
-    blob = f"{author.lower()} {email.lower()}"
-    if "claude" in blob:
-        return "claude"
-    if "codex" in blob or "openai" in blob:
-        return "codex"
-    if "gemini" in blob or "google" in blob:
-        return "gemini"
-    return "unknown"
+    subject = ((data[0].get("commit") or {}).get("message") or "").splitlines()[0:1]
+    subject_str = subject[0] if subject else ""
+    return extract_implementation_identity_from_commit(subject_str)
 
 
 # ---------------------------------------------------------------------------
@@ -304,18 +328,33 @@ def get_commit_author_identity(repo: str, pr_number: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _build_reviewer_cmd(reviewer: str, model: str) -> list[str]:
+def _build_reviewer_cmd(
+    reviewer: str,
+    model: str,
+    *,
+    codex_bin: str = "",
+    gemini_bin: str = "",
+) -> list[str]:
     """Sandbox-mode argv for a reviewer CLI.
 
     The reviewer reads diff text and emits a verdict. It must NOT be
     allowed to execute code, write files, or escalate privileges:
     - codex: `--sandbox=read-only` (no tool execution), no
-      `--dangerously-bypass-approvals-and-sandbox`.
+      `--dangerously-bypass-approvals-and-sandbox`. The diff is
+      delivered via stdin (`-`), never via argv.
     - gemini: `-s` (sandbox) and `--approval-mode=default` (no `yolo`).
+      The diff is delivered via stdin (`-p -`), never via argv —
+      gemini's argv cap is ~140KB and breaks on smaller diffs than
+      the 1MiB MAX_DIFF_BYTES gate.
+
+    `codex_bin` / `gemini_bin` allow pinning the absolute path to the
+    reviewer binary (defense against mutable PATH — see post-audit
+    comment 4953064910). When empty, the bare name is used (the
+    workflow's PATH is reduced to a minimal set).
     """
     if reviewer == "codex":
         cmd = [
-            "codex",
+            codex_bin or "codex",
             "exec",
             "--sandbox",
             "read-only",
@@ -325,18 +364,19 @@ def _build_reviewer_cmd(reviewer: str, model: str) -> list[str]:
         ]
         if model:
             cmd.extend(["-m", model])
+        # Diff is passed via stdin (`-`); we never put it in argv.
         cmd.append("-")
         return cmd
     if reviewer == "gemini":
         return [
-            "gemini",
+            gemini_bin or "gemini",
             "-m",
             model,
             "-s",
             "--approval-mode",
             "default",
             "-p",
-            "__PROMPT_PLACEHOLDER__",
+            "-",
         ]
     raise RuntimeError(
         f"unknown reviewer {reviewer!r}; expected 'codex' or 'gemini'"
@@ -376,21 +416,23 @@ def invoke_reviewer(
     *,
     parent_env: Optional[dict] = None,
     timeout: int = 900,
+    codex_bin: str = "",
+    gemini_bin: str = "",
 ) -> Tuple[Optional[str], Optional[str]]:
     """Run the reviewer CLI; return (stdout, error_message).
 
-    Reviewers run with a sanitized env (no GITHUB_TOKEN, no Slack/OpenClaw
-    secrets). Their process is sandboxed (`--sandbox=read-only` for
-    codex, `-s` for gemini). stdout is destructured to the agent's text
-    for codex's `--json` mode.
+    Reviewers run with a sanitized env (no GITHUB_TOKEN, no HOME, no
+    Slack/OpenClaw/Hermes secrets, no SSH agent socket, no cloud
+    credentials). Their process is sandboxed (`--sandbox=read-only`
+    for codex, `-s` for gemini). stdout is destructured to the
+    agent's text for codex's `--json` mode. The prompt is delivered
+    via stdin (`-` / `-p -`), never via argv — this avoids E2BIG
+    when the diff approaches 140KB on gemini's argv cap.
     """
-    cmd = _build_reviewer_cmd(reviewer, model)
-    if "__PROMPT_PLACEHOLDER__" in cmd:
-        idx = cmd.index("__PROMPT_PLACEHOLDER__")
-        cmd[idx] = prompt
-        stdin_input = None
-    else:
-        stdin_input = prompt
+    cmd = _build_reviewer_cmd(
+        reviewer, model, codex_bin=codex_bin, gemini_bin=gemini_bin
+    )
+    stdin_input = prompt
 
     env = _reviewer_env(parent_env if parent_env is not None else os.environ)
 
@@ -423,7 +465,13 @@ def invoke_reviewer(
 
 
 def _parse_reviewers(reviewers_json: str) -> List[Tuple[str, str]]:
-    """Parse the `--reviewers-json` argument into [(reviewer, model), ...]."""
+    """Parse the `--reviewers-json` argument into [(reviewer, model), ...].
+
+    Per post-audit comment 4953064910, duplicate reviewer identities
+    in the list are rejected outright — a PR may not be reviewed twice
+    by the same model (e.g. `[["codex",""], ["codex","gpt-5"]]` is
+    refused).
+    """
     try:
         parsed = json.loads(reviewers_json)
     except json.JSONDecodeError as exc:
@@ -434,6 +482,7 @@ def _parse_reviewers(reviewers_json: str) -> List[Tuple[str, str]]:
             "[reviewer, model] pairs"
         )
     out: List[Tuple[str, str]] = []
+    seen = set()
     for item in parsed:
         if (
             not isinstance(item, list)
@@ -447,6 +496,12 @@ def _parse_reviewers(reviewers_json: str) -> List[Tuple[str, str]]:
             raise SystemExit(
                 f"reviewer {item[0]!r} not allowed; expected 'codex' or 'gemini'"
             )
+        if item[0] in seen:
+            raise SystemExit(
+                f"duplicate reviewer {item[0]!r} in --reviewers-json; "
+                "the gate requires distinct reviewers per PR"
+            )
+        seen.add(item[0])
         out.append((item[0], item[1]))
     return out
 
@@ -487,6 +542,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--expected-actor",
         default=os.environ.get("SKEPTIC_EXPECTED_ACTOR", EXPECTED_BOT_ACTOR),
         help="actor the read-back step expects on the published comment",
+    )
+    parser.add_argument(
+        "--codex-bin",
+        default=os.environ.get("SKEPTIC_CODEX_BIN", ""),
+        help="absolute path to the pinned codex binary (defense against mutable PATH)",
+    )
+    parser.add_argument(
+        "--gemini-bin",
+        default=os.environ.get("SKEPTIC_GEMINI_BIN", ""),
+        help="absolute path to the pinned gemini binary (defense against mutable PATH)",
     )
     parser.add_argument(
         "--dry-run",
@@ -536,9 +601,34 @@ def main(argv: Optional[list[str]] = None) -> int:
                 f"diff capture failed: {str(exc)[:80]}",
             )
         return 1
+    # Defense-in-depth size check (also enforced inside get_pr_diff,
+    # but the CLI-level check cannot be bypassed by a mock):
+    diff_bytes = len(diff.encode("utf-8"))
+    if diff_bytes > MAX_DIFF_BYTES:
+        exc = RuntimeError(
+            f"diff is too large: {diff_bytes} bytes > MAX_DIFF_BYTES "
+            f"({MAX_DIFF_BYTES}); the gate cannot pass on a partial "
+            f"review. Split the PR or raise MAX_DIFF_BYTES explicitly."
+        )
+        print(f"[skeptic-gate] diff capture failed: {exc}", file=sys.stderr)
+        body = format_comment(
+            verdict="FAIL",
+            head_sha=head_sha,
+            expected_head_sha=head_sha,
+            repo=repo,
+            pr_number=args.pr_number,
+            reviewer="(none)",
+            reason=f"diff capture failed: {exc}",
+        )
+        if not args.dry_run:
+            _publish_failure(
+                repo, head_sha, body, args.status_context,
+                f"diff capture failed: {str(exc)[:80]}",
+            )
+        return 1
 
-    # ---- 3. Implementation identity (commit author) ---------------------------
-    implementation_identity = get_commit_author_identity(repo, args.pr_number)
+    # ---- 3. Implementation identity (commit-subject prefix) -----------------
+    implementation_identity = get_implementation_identity(repo, args.pr_number)
 
     # ---- 4. Build prompt ----------------------------------------------------
     prompt = build_prompt(
@@ -568,7 +658,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             file=sys.stderr,
         )
         review_output, review_error = invoke_reviewer(
-            reviewer_name, model, prompt, parent_env=dict(env)
+            reviewer_name,
+            model,
+            prompt,
+            parent_env=dict(env),
+            codex_bin=args.codex_bin,
+            gemini_bin=args.gemini_bin,
         )
         result = evaluate(
             review_output=review_output,
@@ -576,6 +671,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             repo=repo,
             pr_number=args.pr_number,
             head_sha=head_sha,
+            implementation_provenance=implementation_identity,
             base_sha="unknown",
             diff=diff,
             reviewer=reviewer_name,
@@ -588,26 +684,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             file=sys.stderr,
         )
 
-    # ---- 6. Provenance check (per reviewer) --------------------------------
-    proven = []
+    # ---- 6. CLI→identity binding + provenance (per reviewer) --------------
     for r in per_reviewer:
         if r.parsed is None:
-            proven.append((False, f"{r.reviewer} did not produce a parseable verdict", r))
-            continue
-        ok, why = verify_provenance(
-            implementation_identity, r.parsed.reviewer_identity
-        )
-        proven.append((ok, why, r))
-
-    # Force any non-independent reviewer into FAIL even if its verdict
-    # was PASS — the audit trail preserves the verdict text but the gate
-    # state is FAIL.
-    for (ok, why, r) in proven:
-        if not ok:
             r2 = SkepticResult(
                 check_state="failure",
                 verdict=None,
-                reason=why,
+                reason=f"{r.reviewer} did not produce a parseable verdict",
                 comment_body=format_comment(
                     verdict="FAIL",
                     head_sha=head_sha,
@@ -615,14 +698,62 @@ def main(argv: Optional[list[str]] = None) -> int:
                     repo=repo,
                     pr_number=args.pr_number,
                     reviewer=r.reviewer,
-                    reason=why,
+                    implementation_provenance=implementation_identity,
+                    reason=f"{r.reviewer} did not produce a parseable verdict",
                 ),
                 parsed=r.parsed,
                 reviewer=r.reviewer,
             )
-            # replace in per_reviewer
-            idx = per_reviewer.index(r)
-            per_reviewer[idx] = r2
+            per_reviewer[per_reviewer.index(r)] = r2
+            continue
+        # 6a. CLI → declared identity binding (codex CLI must declare codex;
+        #     gemini CLI must declare gemini).
+        ok_bind, why_bind = bind_reviewer_identity(
+            r.reviewer or "", r.parsed.reviewer_identity
+        )
+        if not ok_bind:
+            r2 = SkepticResult(
+                check_state="failure",
+                verdict=None,
+                reason=why_bind,
+                comment_body=format_comment(
+                    verdict="FAIL",
+                    head_sha=head_sha,
+                    expected_head_sha=head_sha,
+                    repo=repo,
+                    pr_number=args.pr_number,
+                    reviewer=r.reviewer,
+                    implementation_provenance=implementation_identity,
+                    reason=why_bind,
+                ),
+                parsed=r.parsed,
+                reviewer=r.reviewer,
+            )
+            per_reviewer[per_reviewer.index(r)] = r2
+            continue
+        # 6b. Implementer vs reviewer independence.
+        ok_prov, why_prov = verify_provenance(
+            implementation_identity, r.parsed.reviewer_identity
+        )
+        if not ok_prov:
+            r2 = SkepticResult(
+                check_state="failure",
+                verdict=None,
+                reason=why_prov,
+                comment_body=format_comment(
+                    verdict="FAIL",
+                    head_sha=head_sha,
+                    expected_head_sha=head_sha,
+                    repo=repo,
+                    pr_number=args.pr_number,
+                    reviewer=r.reviewer,
+                    implementation_provenance=implementation_identity,
+                    reason=why_prov,
+                ),
+                parsed=r.parsed,
+                reviewer=r.reviewer,
+            )
+            per_reviewer[per_reviewer.index(r)] = r2
 
     # ---- 7. Aggregate: ALL reviewers must PASS -----------------------------
     aggregate = aggregate_results(
@@ -630,6 +761,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         repo=repo,
         pr_number=args.pr_number,
         head_sha=head_sha,
+        implementation_provenance=implementation_identity,
     )
 
     # ---- 8. Pre-publish API head re-check ---------------------------------
@@ -661,6 +793,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     except Exception as exc:
         print(f"[skeptic-gate] comment upsert failed: {exc}", file=sys.stderr)
         return 1
+    # Per post-audit comment 4953064910: status write failure is
+    # fail-closed, not swallowed. A failed status cannot satisfy
+    # the read-back step (which also checks the commit-status
+    # surface), and a stale status from a prior run could otherwise
+    # falsely satisfy gate-7.
     try:
         set_commit_status(
             repo,
@@ -671,6 +808,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
     except Exception as exc:
         print(f"[skeptic-gate] status set failed: {exc}", file=sys.stderr)
+        return 1
 
     # ---- 10. Read back: verify what we just published ----------------------
     published = read_back_comment(repo, comment_id)
@@ -692,9 +830,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         body_repo=_extract_field(body, "REPO"),
         body_pr_number=_extract_int(body, "PR_NUMBER"),
         body_verdict=_extract_field(body, "VERDICT"),
+        body_reviewer=_extract_field(body, "REVIEWER"),
+        body_implementation_provenance=_extract_field(
+            body, "IMPLEMENTATION_PROVENANCE"
+        ),
     )
 
-    ok, why = verify_published_comment(rb, expected_actor=args.expected_actor)
+    # Full equality read-back on all 6 fields (per post-audit comment
+    # 4953064910 — the previous version only checked non-empty).
+    expected_verdict = aggregate.verdict or "FAIL"
+    expected_reviewer = aggregate.reviewer or "(aggregate)"
+    ok, why = verify_published_comment(
+        rb,
+        expected_actor=args.expected_actor,
+        expected_sha=head_sha,
+        expected_repo=repo,
+        expected_pr_number=args.pr_number,
+        expected_verdict=expected_verdict,
+        expected_reviewer=expected_reviewer,
+        expected_implementation_provenance=implementation_identity,
+    )
     if not ok:
         print(f"[skeptic-gate] read-back mismatch: {why}", file=sys.stderr)
         return 1
@@ -776,6 +931,10 @@ _RE_VERDICT_LINE = re.compile(r"VERDICT:\s*(PASS|FAIL)", re.IGNORECASE)
 
 
 def _extract_field(body: str, name: str) -> Optional[str]:
+    """Pull the value of a single contract field (HEAD_SHA/REPO/VERDICT) out of a verdict body.
+
+    Returns None when the field is absent or the body is malformed.
+    """
     pat = {
         "HEAD_SHA": _RE_SHA_LINE,
         "REPO": _RE_REPO_LINE,
@@ -788,6 +947,7 @@ def _extract_field(body: str, name: str) -> Optional[str]:
 
 
 def _extract_int(body: str, name: str) -> Optional[int]:
+    """Like `_extract_field`, but parse the matched substring as an int (PR_NUMBER)."""
     s = _extract_field(body, name)
     return int(s) if s and s.isdigit() else None
 

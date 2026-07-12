@@ -6,10 +6,14 @@ does not meet the head-of-PR contract.
 
 Public surface
 --------------
-- `parse_verdict(output)`            — strictly-anchored extractor. Returns
-                                       `None` if any of the 5 required
-                                       fields is missing, malformed, or
-                                       appears more than once.
+- `parse_verdict(output)`            — strictly-anchored extractor.
+                                       Returns `None` if any required
+                                       field is missing, malformed,
+                                       appears more than once, OR if
+                                       the output contains extra prose
+                                       outside the strict contract
+                                       (no free-form text, no Markdown
+                                       code blocks containing tokens).
 - `bind_to_pr(parsed, ...)`          — validates the parsed verdict binds
                                        to the live PR head SHA. **Stale-
                                        SHA PASS must never satisfy a
@@ -17,23 +21,39 @@ Public surface
                                        invariant.
 - `verify_provenance(impl, reviewer)`— refuses PASS when the implementing
                                        model is the same model that
-                                       reviewed. Multi-reviewer verdicts
-                                       are checked against their model
-                                       identities, not their handles.
+                                       reviewed.
+- `extract_implementation_identity_from_commit(commit_subject)` —
+                                       deterministic identity derivation
+                                       from the commit-subject prefix
+                                       (e.g. `claudem/minimax-M3: …`
+                                       → `claude`). This is a pure
+                                       string-prefix match — no ZFC
+                                       keyword routing on free-form
+                                       text. Unknown / un-prefixed
+                                       subjects map to `unknown`, which
+                                       the gate refuses PASS on.
+- `bind_reviewer_identity(cli_name, declared_identity)` —
+                                       refuses a verdict whose declared
+                                       IDENTITY does not match the CLI
+                                       that emitted it (codex CLI must
+                                       declare `codex`, gemini must
+                                       declare `gemini`).
 - `format_comment(...)`              — idempotent upsert body — the
                                        `MARKER` HTML comment makes the
-                                       GitHub comment replaceable in place
-                                       rather than appended.
+                                       GitHub comment replaceable in
+                                       place rather than appended.
 - `evaluate(output, error, ...)`     — deterministic verdict-binding for
                                        a single reviewer call.
 - `aggregate_results(results, ...)`  — combines per-reviewer results; ALL
-                                       must PASS for the gate to count as
-                                       green.
-- `read_back_published(...)`         — fetches the freshly-published
-                                       comment + commit-status back and
-                                       verifies (actor, repo, PR, SHA,
-                                       verdict). Anything that disagrees
-                                       is a fail.
+                                       must PASS for the gate to count
+                                       as green. Rejects duplicate
+                                       reviewer identities.
+- `verify_published_comment(...)`    — full equality read-back. ALL six
+                                       fields (HEAD_SHA, REPO,
+                                       PR_NUMBER, VERDICT, REVIEWER,
+                                       IMPLEMENTATION_PROVENANCE) must
+                                       equal what we wrote; missing or
+                                       mismatched values fail closed.
 - `build_prompt(...)`                — pure string assembly. No judgment
                                        calls — the reviewer is the one
                                        that judges the diff.
@@ -44,8 +64,11 @@ The reviewer (a non-Claude CLI) emits a structured verdict. This module
 is **only** allowed to validate the structured verdict, bind the SHA,
 shape the comment, and aggregate per-reviewer results. There is no
 `if text.contains("...")` routing, no scoring, no semantic classification
-of the diff. Failures flow from missing, malformed, or duplicate
-structured fields — never from this code's opinion of the diff.
+of the diff. Implementation-identity derivation is a deterministic
+prefix match on the commit subject — not a keyword classification of
+free-form prose. Failures flow from missing, malformed, duplicate, or
+extra-prose structured fields — never from this code's opinion of the
+diff.
 """
 
 from __future__ import annotations
@@ -62,8 +85,38 @@ MARKER = "<!-- skeptic-gate-verdict -->"
 
 # Allowed model identities, normalized to a known set so provenance
 # checks don't have to parse free-form author strings. Unknown model
-# strings map to `UNKNOWN` (which is never allowed as a self-review).
+# strings map to `unknown` (which is never allowed as a self-review).
 ModelIdentity = Literal["claude", "codex", "gemini", "unknown"]
+
+# Mapping from reviewer CLI name to the identity it MUST declare in
+# its structured verdict. The CLI is bound to its identity — a codex
+# process claiming `gemini` (or vice-versa) is rejected outright. This
+# prevents a malicious PR-controlled reviewer invocation from
+# impersonating another reviewer.
+REVIEWER_CLI_TO_IDENTITY = {
+    "codex": "codex",
+    "gemini": "gemini",
+}
+
+# Commit-subject prefixes that map to model identities. The mapping is
+# a deterministic prefix match — no ZFC keyword routing on free-form
+# text. A subject that does not start with one of these prefixes
+# resolves to `unknown`, which the gate refuses PASS on.
+#
+# Adding a new prefix here IS an explicit PR-time decision — the
+# reviewer must review and merge the addition. Comment-only additions
+# (sed/keyword substitutions in commit messages) cannot change the
+# implementation identity.
+COMMIT_PREFIX_TO_IDENTITY = {
+    "claude/": "claude",
+    "claudem/": "claude",
+    "codex/": "codex",
+    "codexm/": "codex",
+    "gemini/": "gemini",
+    "geminim/": "gemini",
+    "human:": "human",
+    "antig/": "unknown",  # Antigravity is the IDE; identity is whatever it spawned
+}
 
 
 @dataclass(frozen=True)
@@ -145,8 +198,15 @@ _REASON_RE = re.compile(
     r"^\s*REASON\s*:\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE
 )
 _IDENTITY_RE = re.compile(
-    r"^\s*IDENTITY\s*:\s*(claude|codex|gemini|unknown)\s*$",
+    r"^\s*IDENTITY\s*:\s*(claude|codex|gemini|human|unknown)\s*$",
     re.MULTILINE | re.IGNORECASE,
+)
+
+# Field-name regexes used by the no-prose check. A field line MUST
+# consist only of "<FIELD>: <value>" with nothing else on the line.
+# Case-insensitive to match the per-field regexes (Verdict: Pass is OK).
+_FIELD_LINE_RE = re.compile(
+    r"^[A-Z_]+\s*:.*$", re.MULTILINE | re.IGNORECASE
 )
 
 
@@ -158,17 +218,59 @@ _IDENTITY_RE = re.compile(
 def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     """Extract a structured verdict from a reviewer's free-form stdout.
 
-    **Strict contract**:
-    - 5 required fields, each MUST appear EXACTLY ONCE on its own line:
-      `VERDICT`, `HEAD_SHA`, `REPO`, `PR_NUMBER`, `REASON`.
-    - 1 optional field, MUST appear EXACTLY ONCE OR ZERO TIMES:
-      `IDENTITY` (`claude` | `codex` | `gemini` | `unknown`).
+    **Strict no-prose contract** (per post-audit comment 4953064910):
+
+    - 6 required fields, each MUST appear EXACTLY ONCE on its own line:
+      `VERDICT`, `HEAD_SHA`, `REPO`, `PR_NUMBER`, `REASON`, `IDENTITY`.
+    - The output MUST consist ONLY of:
+        - up to one comment line (e.g. a leading `# reviewer: codex`)
+        - the 6 contract fields, each on its own line
+        - any number of blank lines
+      No Markdown code blocks, no extra prose, no second VERDICT line
+      smuggled inside a triple-backtick fence.
     - Any field appearing more than once → reject (anti-injection).
     - Any required field missing → reject (fail-closed).
+    - The 6 lines themselves MUST be the ONLY non-blank lines (no
+      trailing prose, no surrounding commentary).
+
+    A reviewer that wraps the contract in a Markdown code block
+    (```\\nVERDICT: PASS\\n…\\n```) is rejected. The deterministic
+    parser enforces the bare-text contract, not "find a record
+    somewhere inside prose."
     """
     if not isinstance(output, str):
         return None
 
+    # ---- No-prose check --------------------------------------------------
+    # Strip the leading comment line if present; reject anything that
+    # still looks like Markdown prose or contains a code fence.
+    if "```" in output:
+        # A code-fence in reviewer output is a code-block injection
+        # attempt. Reject unconditionally.
+        return None
+
+    # Count non-blank lines that start with a contract field token
+    # ("<UPPER>:"). Anything else is prose and must be a leading
+    # comment only — single line, starting with `#`.
+    lines = output.splitlines()
+    field_lines = 0
+    leading_comment_lines = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.match(r"^[A-Z_]+\s*:", stripped, re.IGNORECASE):
+            field_lines += 1
+            continue
+        # Allow ONE leading comment line (e.g. "# reviewer: codex")
+        # before any field line; reject any prose AFTER a field line.
+        if field_lines == 0 and leading_comment_lines == 0 and stripped.startswith("#"):
+            leading_comment_lines = 1
+            continue
+        # Prose outside the leading-comment window — reject.
+        return None
+
+    # ---- Field extraction (anchored, exactly-once) ----------------------
     verdicts = _VERDICT_RE.findall(output)
     shas = _FULL_SHA_RE.findall(output)
     short_shas = _SHA_RE.findall(output)
@@ -197,7 +299,7 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         return None
 
     identity_token = identities[0].lower()
-    if identity_token not in ("claude", "codex", "gemini", "unknown"):
+    if identity_token not in ("claude", "codex", "gemini", "human", "unknown"):
         return None
 
     verdict_token = verdicts[0].upper()
@@ -268,6 +370,60 @@ def bind_to_pr(
 # ---------------------------------------------------------------------------
 
 
+def extract_implementation_identity_from_commit(commit_subject: str) -> str:
+    """Deterministically derive the implementer's identity from the
+    commit subject prefix.
+
+    The mapping is a pure prefix match — no ZFC keyword routing on
+    free-form text. A subject that does not start with one of the
+    prefixes in `COMMIT_PREFIX_TO_IDENTITY` returns `"unknown"`,
+    which the gate refuses PASS on (conservative fail-closed).
+
+    Examples:
+        >>> extract_implementation_identity_from_commit("claudem/minimax-M3: feat(x): ...")
+        'claude'
+        >>> extract_implementation_identity_from_commit("codexm/o3: fix: ...")
+        'codex'
+        >>> extract_implementation_identity_from_commit("naked commit message")
+        'unknown'
+    """
+    if not isinstance(commit_subject, str):
+        return "unknown"
+    subject = commit_subject.strip()
+    if not subject:
+        return "unknown"
+    for prefix, identity in COMMIT_PREFIX_TO_IDENTITY.items():
+        if subject.startswith(prefix):
+            return identity
+    return "unknown"
+
+
+def bind_reviewer_identity(reviewer_cli: str, declared_identity: str) -> Tuple[bool, str]:
+    """Refuse a verdict whose declared IDENTITY does not match the CLI
+    that emitted it.
+
+    Codex CLI must declare `codex`; gemini CLI must declare `gemini`.
+    This binds the reviewer process to its identity — a codex
+    invocation cannot claim `gemini`, and vice-versa. A reviewer that
+    declares `claude` or `unknown` is also refused (the CLI list is
+    fixed; only the two pinned binaries can satisfy gate-7).
+    """
+    cli = (reviewer_cli or "").strip().lower()
+    declared = (declared_identity or "").strip().lower()
+    expected = REVIEWER_CLI_TO_IDENTITY.get(cli)
+    if expected is None:
+        return False, (
+            f"reviewer CLI {cli!r} is not in the pinned allow-list; "
+            f"expected one of {sorted(REVIEWER_CLI_TO_IDENTITY)}"
+        )
+    if declared != expected:
+        return False, (
+            f"reviewer CLI {cli!r} declared identity {declared!r}, "
+            f"but {cli!r} must declare {expected!r}"
+        )
+    return True, f"reviewer CLI {cli!r} bound to identity {declared!r}"
+
+
 def verify_provenance(
     implementation_identity: str,
     reviewer_identity: str,
@@ -287,6 +443,11 @@ def verify_provenance(
         return False, (
             "reviewer identity is unknown — the reviewer must declare "
             "its model via the IDENTITY line in its structured verdict"
+        )
+    if rev == "human":
+        return False, (
+            "reviewer identity 'human' is not an independent model; "
+            "the gate requires a non-implementer model"
         )
     if impl == "unknown":
         # Conservative refusal: if the implementer is unknown we cannot
@@ -309,6 +470,7 @@ def verify_provenance(
 
 
 def comment_marker() -> str:
+    """Return the unique HTML-marker string this gate uses to identify its bot comment."""
     return MARKER
 
 
@@ -320,6 +482,7 @@ def format_comment(
     repo: str,
     pr_number: int,
     reviewer: str,
+    implementation_provenance: str = "unknown",
     reason: str = "",
     extra_reviewer_lines: Optional[List[str]] = None,
 ) -> str:
@@ -331,9 +494,12 @@ def format_comment(
     reviewer said) but is visually marked STALE so the gate consumer
     knows not to honor it.
 
-    `extra_reviewer_lines` lets the multi-reviewer aggregator append a
-    per-reviewer breakdown without breaking the upsert marker. The
-    marker is still on its own line at the very top.
+    The 6 required fields (VERDICT, HEAD_SHA, REPO, PR_NUMBER,
+    REVIEWER, IMPLEMENTATION_PROVENANCE) are emitted in the canonical
+    form the read-back verifier expects. `extra_reviewer_lines` lets
+    the multi-reviewer aggregator append a per-reviewer breakdown
+    WITHOUT breaking the upsert marker or the read-back field
+    extraction.
     """
     head_sha_norm = head_sha.lower()
     expected_norm = expected_head_sha.lower()
@@ -364,6 +530,7 @@ def format_comment(
         f"**REPO: {repo}**\n"
         f"**PR_NUMBER: {pr_number}**\n"
         f"**REVIEWER: {reviewer}**\n"
+        f"**IMPLEMENTATION_PROVENANCE: {implementation_provenance}**\n"
         f"{reason_block}"
         f"{extras}"
         f"{stale_block}\n"
@@ -388,6 +555,7 @@ def evaluate(
     repo: str,
     pr_number: int,
     head_sha: str,
+    implementation_provenance: str = "unknown",
     base_sha: str = "",  # kept for future use
     diff: str = "",  # kept for future use
     reviewer: str = "reviewer",
@@ -398,6 +566,10 @@ def evaluate(
     - `review_error` is the captured error/timeout/missing-binary
       message. At least one is meaningful; if both are None/empty, the
       reviewer did not run at all and the gate fails closed.
+    - `implementation_provenance` is the deterministic implementer
+      identity derived from the commit subject prefix; it is rendered
+      into the comment body so the read-back verifier can equality-
+      check it.
     """
     if review_error or not (review_output and review_output.strip()):
         reason = "reviewer unavailable"
@@ -414,6 +586,7 @@ def evaluate(
             repo=repo,
             pr_number=pr_number,
             reviewer=reviewer,
+            implementation_provenance=implementation_provenance,
             reason=reason,
         )
         return SkepticResult(
@@ -429,8 +602,9 @@ def evaluate(
     if parsed is None:
         reason = (
             "reviewer output was unparseable (one or more of "
-            "VERDICT/HEAD_SHA/REPO/PR_NUMBER/REASON missing, "
-            "duplicated, or HEAD_SHA not 40 hex chars — fail-closed)"
+            "VERDICT/HEAD_SHA/REPO/PR_NUMBER/REASON/IDENTITY missing, "
+            "duplicated, or HEAD_SHA not 40 hex chars, or extra prose/"
+            "code-block present — fail-closed)"
         )
         body = format_comment(
             verdict="FAIL",
@@ -439,6 +613,7 @@ def evaluate(
             repo=repo,
             pr_number=pr_number,
             reviewer=reviewer,
+            implementation_provenance=implementation_provenance,
             reason=reason,
         )
         return SkepticResult(
@@ -464,6 +639,7 @@ def evaluate(
             repo=repo,
             pr_number=pr_number,
             reviewer=reviewer,
+            implementation_provenance=implementation_provenance,
             reason=binding.reason,
         )
         return SkepticResult(
@@ -482,6 +658,7 @@ def evaluate(
         repo=repo,
         pr_number=pr_number,
         reviewer=reviewer,
+        implementation_provenance=implementation_provenance,
         reason=parsed.reason or "",
     )
     return SkepticResult(
@@ -500,8 +677,16 @@ def aggregate_results(
     repo: str,
     pr_number: int,
     head_sha: str,
+    implementation_provenance: str = "unknown",
 ) -> SkepticResult:
-    """Combine per-reviewer results; ALL must be success for the gate."""
+    """Combine per-reviewer results; ALL must be success for the gate.
+
+    Also rejects duplicate reviewer identities in the input list — if
+    the workflow is invoked with `[["codex",""],["codex","gpt-5"]]`
+    (two codex invocations), the gate fails closed. This is enforced
+    even before any reviewer runs, because a single PR is not allowed
+    to be reviewed twice by the same model.
+    """
     if not results:
         reason = "no reviewers ran — gate cannot pass without any review"
         body = format_comment(
@@ -511,6 +696,42 @@ def aggregate_results(
             repo=repo,
             pr_number=pr_number,
             reviewer="(none)",
+            implementation_provenance=implementation_provenance,
+            reason=reason,
+        )
+        return SkepticResult(
+            check_state="failure",
+            verdict=None,
+            reason=reason,
+            comment_body=body,
+            parsed=None,
+            reviewer="(aggregate)",
+        )
+
+    # Duplicate-reviewer guard: the input list must contain distinct
+    # reviewer identities. Two codex invocations (or two gemini
+    # invocations) on the same PR are rejected outright.
+    seen_reviewers = []
+    duplicates = []
+    for r in results:
+        rid = (r.reviewer or "").strip().lower()
+        if rid in seen_reviewers and rid:
+            duplicates.append(rid)
+        elif rid:
+            seen_reviewers.append(rid)
+    if duplicates:
+        reason = (
+            f"duplicate reviewer identities in input list: {sorted(set(duplicates))}; "
+            "the gate requires distinct reviewers per PR"
+        )
+        body = format_comment(
+            verdict="FAIL",
+            head_sha=head_sha,
+            expected_head_sha=head_sha,
+            repo=repo,
+            pr_number=pr_number,
+            reviewer="(aggregate)",
+            implementation_provenance=implementation_provenance,
             reason=reason,
         )
         return SkepticResult(
@@ -558,6 +779,7 @@ def aggregate_results(
         repo=repo,
         pr_number=pr_number,
         reviewer=primary.reviewer if primary else "(aggregate)",
+        implementation_provenance=implementation_provenance,
         reason=agg_reason,
         extra_reviewer_lines=extras,
     )
@@ -585,15 +807,30 @@ class ReadBackCheck:
     body_repo: Optional[str]
     body_pr_number: Optional[int]
     body_verdict: Optional[str]
+    body_reviewer: Optional[str]
+    body_implementation_provenance: Optional[str]
 
 
-def verify_published_comment(readback: ReadBackCheck, *, expected_actor: str) -> Tuple[bool, str]:
-    """Verify what we just published.
+def verify_published_comment(
+    readback: ReadBackCheck,
+    *,
+    expected_actor: str,
+    expected_sha: str,
+    expected_repo: str,
+    expected_pr_number: int,
+    expected_verdict: str,
+    expected_reviewer: str,
+    expected_implementation_provenance: str,
+) -> Tuple[bool, str]:
+    """Verify what we just published — full equality read-back.
 
-    Returns (ok, reason). ok=True only when:
-    - actor is the expected bot identity (`github-actions[bot]`)
-    - body contains the marker (so the upsert can find it on rerun)
-    - body SHA, repo, PR number, verdict all match what we wrote
+    Returns (ok, reason). ok=True ONLY when every published field
+    equals the value we wrote, byte-for-byte (HEAD_SHA is the full
+    40-hex form, lower-cased). Missing or mismatched fields fail
+    closed. Per post-audit comment 4953064910, the previous version
+    only checked non-empty; an attacker (or a stale publication
+    API) could therefore post a comment that satisfied the read-
+    back while publishing a different SHA/repo/PR/verdict.
     """
     if readback.actor != expected_actor:
         return False, (
@@ -602,14 +839,39 @@ def verify_published_comment(readback: ReadBackCheck, *, expected_actor: str) ->
         )
     if not readback.body_contains_marker:
         return False, "published comment body is missing the upsert marker"
-    if not readback.body_sha:
-        return False, "published comment body is missing HEAD_SHA"
-    if not readback.body_repo:
-        return False, "published comment body is missing REPO"
-    if readback.body_pr_number is None:
-        return False, "published comment body is missing PR_NUMBER"
-    if not readback.body_verdict:
-        return False, "published comment body is missing VERDICT"
+    if (readback.body_sha or "").lower() != expected_sha.lower():
+        return False, (
+            f"published comment HEAD_SHA is {readback.body_sha!r}, "
+            f"expected {expected_sha!r}"
+        )
+    if (readback.body_repo or "") != expected_repo:
+        return False, (
+            f"published comment REPO is {readback.body_repo!r}, "
+            f"expected {expected_repo!r}"
+        )
+    if readback.body_pr_number != expected_pr_number:
+        return False, (
+            f"published comment PR_NUMBER is {readback.body_pr_number!r}, "
+            f"expected {expected_pr_number!r}"
+        )
+    if (readback.body_verdict or "").upper() != expected_verdict.upper():
+        return False, (
+            f"published comment VERDICT is {readback.body_verdict!r}, "
+            f"expected {expected_verdict!r}"
+        )
+    if (readback.body_reviewer or "") != expected_reviewer:
+        return False, (
+            f"published comment REVIEWER is {readback.body_reviewer!r}, "
+            f"expected {expected_reviewer!r}"
+        )
+    if (
+        readback.body_implementation_provenance or ""
+    ) != expected_implementation_provenance:
+        return False, (
+            f"published comment IMPLEMENTATION_PROVENANCE is "
+            f"{readback.body_implementation_provenance!r}, expected "
+            f"{expected_implementation_provenance!r}"
+        )
     return True, "comment read-back agrees with the published verdict"
 
 
@@ -693,17 +955,21 @@ def build_prompt(
 
 
 __all__ = [
+    "COMMIT_PREFIX_TO_IDENTITY",
     "MARKER",
     "ModelIdentity",
     "ParsedVerdict",
+    "REVIEWER_CLI_TO_IDENTITY",
     "ReadBackCheck",
     "SkepticResult",
     "ValidationResult",
     "aggregate_results",
+    "bind_reviewer_identity",
     "bind_to_pr",
     "build_prompt",
     "comment_marker",
     "evaluate",
+    "extract_implementation_identity_from_commit",
     "format_comment",
     "parse_verdict",
     "verify_published_comment",

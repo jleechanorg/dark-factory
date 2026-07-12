@@ -578,8 +578,19 @@ def test_verify_published_comment_accepts_correct_readback():
         body_repo="jleechanorg/dark-factory",
         body_pr_number=278,
         body_verdict="PASS",
+        body_reviewer="codex",
+        body_implementation_provenance="claude",
     )
-    ok, why = verify_published_comment(rb, expected_actor="github-actions[bot]")
+    ok, why = verify_published_comment(
+        rb,
+        expected_actor="github-actions[bot]",
+        expected_sha="abcdef1234567890abcdef1234567890abcdef12",
+        expected_repo="jleechanorg/dark-factory",
+        expected_pr_number=278,
+        expected_verdict="PASS",
+        expected_reviewer="codex",
+        expected_implementation_provenance="claude",
+    )
     assert ok is True
 
 
@@ -592,8 +603,19 @@ def test_verify_published_comment_rejects_wrong_actor():
         body_repo="jleechanorg/dark-factory",
         body_pr_number=278,
         body_verdict="PASS",
+        body_reviewer="codex",
+        body_implementation_provenance="claude",
     )
-    ok, _ = verify_published_comment(rb, expected_actor="github-actions[bot]")
+    ok, _ = verify_published_comment(
+        rb,
+        expected_actor="github-actions[bot]",
+        expected_sha="abcdef1234567890abcdef1234567890abcdef12",
+        expected_repo="jleechanorg/dark-factory",
+        expected_pr_number=278,
+        expected_verdict="PASS",
+        expected_reviewer="codex",
+        expected_implementation_provenance="claude",
+    )
     assert ok is False
 
 
@@ -605,8 +627,19 @@ def test_verify_published_comment_rejects_missing_marker():
         body_repo="jleechanorg/dark-factory",
         body_pr_number=278,
         body_verdict="PASS",
+        body_reviewer="codex",
+        body_implementation_provenance="claude",
     )
-    ok, _ = verify_published_comment(rb, expected_actor="github-actions[bot]")
+    ok, _ = verify_published_comment(
+        rb,
+        expected_actor="github-actions[bot]",
+        expected_sha="abcdef1234567890abcdef1234567890abcdef12",
+        expected_repo="jleechanorg/dark-factory",
+        expected_pr_number=278,
+        expected_verdict="PASS",
+        expected_reviewer="codex",
+        expected_implementation_provenance="claude",
+    )
     assert ok is False
 
 
@@ -667,7 +700,10 @@ def test_build_reviewer_cmd_gemini_uses_sandbox():
 
 
 def test_reviewer_env_strips_secrets():
-    """The sanitizer must NOT leak GITHUB_TOKEN, GH_TOKEN, OPENCLAW_*."""
+    """The sanitizer must NOT leak GITHUB_TOKEN, GH_TOKEN, HOME,
+    OPENCLAW_*, HERMES_*, SLACK_*, SSH agent socket, or cloud
+    credentials. Per post-audit comment 4953064910, HOME is stripped
+    so the reviewer process cannot read user-level credentials."""
     from runner.skeptic_gate_cli import _reviewer_env
 
     parent = {
@@ -678,6 +714,9 @@ def test_reviewer_env_strips_secrets():
         "HERMES_SLACK_WEBHOOK_URL": "secret",
         "PATH": "/usr/bin",
         "HOME": "/root",
+        "USER": "jleechan",
+        "SSH_AUTH_SOCK": "/tmp/ssh-XXXX",
+        "AWS_ACCESS_KEY_ID": "AKIA...",
         "OPENAI_API_KEY": "sk-xxx",
         "FOO_BAR": "user-set",
     }
@@ -687,11 +726,15 @@ def test_reviewer_env_strips_secrets():
     assert "OPENCLAW_GATEWAY_TOKEN" not in sanitized
     assert "SLACK_BOT_TOKEN" not in sanitized
     assert "HERMES_SLACK_WEBHOOK_URL" not in sanitized
-    # Allowlist passes through
+    # HOME/USER are stripped (defense against shell-rc reads).
+    assert "HOME" not in sanitized
+    assert "USER" not in sanitized
+    assert "SSH_AUTH_SOCK" not in sanitized
+    assert "AWS_ACCESS_KEY_ID" not in sanitized
+    # Allowlist passes through (PATH, TMPDIR, OPENAI_API_KEY).
     assert sanitized["PATH"] == "/usr/bin"
-    assert sanitized["HOME"] == "/root"
     assert sanitized["OPENAI_API_KEY"] == "sk-xxx"
-    # Non-allowlisted, non-secret is dropped (conservative)
+    # Non-allowlisted, non-secret is dropped (conservative).
     assert "FOO_BAR" not in sanitized
 
 
@@ -738,7 +781,7 @@ def test_invoke_reviewer_missing_binary_returns_error():
 
     original = cli_mod._build_reviewer_cmd
 
-    def fake_cmd(reviewer, model):
+    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
         return ["definitely-not-a-real-binary-xyz"]
 
     cli_mod._build_reviewer_cmd = fake_cmd
@@ -759,7 +802,7 @@ def test_invoke_reviewer_nonzero_exit_returns_error():
 
     original = cli_mod._build_reviewer_cmd
 
-    def fake_cmd(reviewer, model):
+    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
         return ["false"]  # always exits 1
 
     cli_mod._build_reviewer_cmd = fake_cmd
@@ -844,11 +887,11 @@ def test_cli_forced_pass_with_both_reviewers(monkeypatch, capsys):
         lambda repo, pr: "diff --git a/foo b/foo\n+hello\n",
     )
     monkeypatch.setattr(
-        cli_mod, "get_commit_author_identity",
+        cli_mod, "get_implementation_identity",
         lambda repo, pr: "claude",
     )
 
-    def fake_cmd(reviewer, model):
+    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
         # Emit the stdout a real reviewer would produce.
         return [
             "python3", "-c",
@@ -878,11 +921,11 @@ def test_cli_forced_fail_with_missing_reviewer(monkeypatch, capsys):
         lambda repo, pr: "+x\n",
     )
     monkeypatch.setattr(
-        cli_mod, "get_commit_author_identity",
+        cli_mod, "get_implementation_identity",
         lambda repo, pr: "claude",
     )
 
-    def fake_cmd(reviewer, model):
+    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
         if reviewer == "codex":
             return ["definitely-not-a-real-binary-xyz"]
         return [
@@ -917,11 +960,11 @@ def test_cli_provenance_fails_self_review(monkeypatch, capsys):
     # Implementer is claude; both reviewers declare "claude" identity
     # → provenance fails for both.
     monkeypatch.setattr(
-        cli_mod, "get_commit_author_identity",
+        cli_mod, "get_implementation_identity",
         lambda repo, pr: "claude",
     )
 
-    def fake_cmd(reviewer, model):
+    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
         return [
             "python3", "-c",
             "import sys; sys.stdout.write(" +
@@ -935,3 +978,424 @@ def test_cli_provenance_fails_self_review(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert rc == 1, f"expected FAIL rc=1, got rc={rc}\n{captured.err}"
     assert "AGGREGATE verdict=None" in captured.err
+
+
+# ===========================================================================
+# Adversarial integration tests — post-audit comment 4953064910
+# ===========================================================================
+#
+# Each test below corresponds to a specific attack described in the
+# post-audit comment and the audit response. A PASS on the corresponding
+# PR gate must satisfy ALL of them.
+
+
+def test_adversarial_parse_rejects_code_block_injection():
+    """A reviewer that wraps the verdict in a Markdown code block must
+    be rejected — code-fence injection (the reviewer tries to hide a
+    second VERDICT inside ```…```)."""
+    out = (
+        "```\n"
+        "VERDICT: PASS\n"
+        "HEAD_SHA: abcdef1234567890abcdef1234567890abcdef12\n"
+        "REPO: jleechanorg/dark-factory\n"
+        "PR_NUMBER: 278\n"
+        "REASON: ok\n"
+        "IDENTITY: codex\n"
+        "```\n"
+    )
+    assert parse_verdict(out) is None
+
+
+def test_adversarial_parse_rejects_trailing_prose():
+    """A reviewer that emits the verdict followed by free-form prose
+    must be rejected — the deterministic side requires the strict
+    no-prose contract."""
+    out = (
+        "VERDICT: PASS\n"
+        "HEAD_SHA: abcdef1234567890abcdef1234567890abcdef12\n"
+        "REPO: jleechanorg/dark-factory\n"
+        "PR_NUMBER: 278\n"
+        "REASON: ok\n"
+        "IDENTITY: codex\n"
+        "\n"
+        "Here's my reasoning in detail: ...\n"
+    )
+    assert parse_verdict(out) is None
+
+
+def test_adversarial_parse_rejects_second_verdict_in_prose():
+    """A reviewer that emits a second VERDICT line inside a free-form
+    paragraph must be rejected (anti-injection)."""
+    out = (
+        "VERDICT: PASS\n"
+        "HEAD_SHA: abcdef1234567890abcdef1234567890abcdef12\n"
+        "REPO: jleechanorg/dark-factory\n"
+        "PR_NUMBER: 278\n"
+        "REASON: ok\n"
+        "IDENTITY: codex\n"
+        "But I also wrote VERDICT: FAIL for archival\n"
+    )
+    assert parse_verdict(out) is None
+
+
+def test_adversarial_commit_prefix_claudem_minimax_m3():
+    """Commit-subject prefix `claudem/` maps to `claude`."""
+    from runner.skeptic_gate import extract_implementation_identity_from_commit
+    assert extract_implementation_identity_from_commit(
+        "claudem/minimax-M3: feat(ci): skeptic gate redesign"
+    ) == "claude"
+
+
+def test_adversarial_commit_prefix_codexm_o3():
+    """Commit-subject prefix `codexm/` maps to `codex`."""
+    from runner.skeptic_gate import extract_implementation_identity_from_commit
+    assert extract_implementation_identity_from_commit(
+        "codexm/o3: fix: race"
+    ) == "codex"
+
+
+def test_adversarial_commit_prefix_unknown_for_unprefixed_subject():
+    """A commit subject without a known prefix maps to `unknown`,
+    which the gate refuses PASS on (conservative fail-closed)."""
+    from runner.skeptic_gate import extract_implementation_identity_from_commit
+    assert (
+        extract_implementation_identity_from_commit("naked commit message") == "unknown"
+    )
+    assert extract_implementation_identity_from_commit("") == "unknown"
+    assert extract_implementation_identity_from_commit(None) == "unknown"
+
+
+def test_adversarial_bind_reviewer_identity_codex_must_declare_codex():
+    """A codex CLI invocation that declares `gemini` is rejected."""
+    from runner.skeptic_gate import bind_reviewer_identity
+    ok, why = bind_reviewer_identity("codex", "gemini")
+    assert ok is False
+    assert "codex" in why and "gemini" in why
+
+
+def test_adversarial_bind_reviewer_identity_gemini_must_declare_gemini():
+    """A gemini CLI invocation that declares `codex` is rejected."""
+    from runner.skeptic_gate import bind_reviewer_identity
+    ok, why = bind_reviewer_identity("gemini", "codex")
+    assert ok is False
+
+
+def test_adversarial_bind_reviewer_identity_rejects_claude_or_unknown():
+    """Reviewer identity must be `codex` or `gemini` (the two pinned
+    CLIs). Declaring `claude` or `unknown` is refused — a codex
+    invocation cannot impersonate Claude."""
+    from runner.skeptic_gate import bind_reviewer_identity
+    ok, _ = bind_reviewer_identity("codex", "claude")
+    assert ok is False
+    ok, _ = bind_reviewer_identity("codex", "unknown")
+    assert ok is False
+
+
+def test_adversarial_aggregate_rejects_duplicate_reviewer_identities():
+    """A list of two codex results (or two gemini results) is rejected
+    outright — a PR may not be reviewed twice by the same model."""
+    codex_pass = evaluate(
+        review_output=_valid_output(verdict="PASS", identity="codex"),
+        repo="jleechanorg/dark-factory",
+        pr_number=278,
+        head_sha="abcdef1234567890abcdef1234567890abcdef12",
+        reviewer="codex",
+        implementation_provenance="claude",
+    )
+    duplicate = evaluate(
+        review_output=_valid_output(verdict="PASS", identity="codex"),
+        repo="jleechanorg/dark-factory",
+        pr_number=278,
+        head_sha="abcdef1234567890abcdef1234567890abcdef12",
+        reviewer="codex",
+        implementation_provenance="claude",
+    )
+    agg = aggregate_results(
+        [codex_pass, duplicate],
+        repo="jleechanorg/dark-factory",
+        pr_number=278,
+        head_sha="abcdef1234567890abcdef1234567890abcdef12",
+    )
+    assert agg.check_state == "failure"
+    assert "duplicate reviewer identities" in agg.reason
+
+
+def test_adversarial_readback_rejects_wrong_sha():
+    """Equality read-back fails when the published comment's HEAD_SHA
+    differs from what we wrote."""
+    rb = ReadBackCheck(
+        actor="github-actions[bot]",
+        body_contains_marker=True,
+        body_sha="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        body_repo="jleechanorg/dark-factory",
+        body_pr_number=278,
+        body_verdict="PASS",
+        body_reviewer="codex",
+        body_implementation_provenance="claude",
+    )
+    ok, why = verify_published_comment(
+        rb,
+        expected_actor="github-actions[bot]",
+        expected_sha="abcdef1234567890abcdef1234567890abcdef12",
+        expected_repo="jleechanorg/dark-factory",
+        expected_pr_number=278,
+        expected_verdict="PASS",
+        expected_reviewer="codex",
+        expected_implementation_provenance="claude",
+    )
+    assert ok is False
+    assert "HEAD_SHA" in why
+
+
+def test_adversarial_readback_rejects_wrong_implementation_provenance():
+    """Equality read-back fails when the published comment's
+    IMPLEMENTATION_PROVENANCE differs from what we wrote."""
+    rb = ReadBackCheck(
+        actor="github-actions[bot]",
+        body_contains_marker=True,
+        body_sha="abcdef1234567890abcdef1234567890abcdef12",
+        body_repo="jleechanorg/dark-factory",
+        body_pr_number=278,
+        body_verdict="PASS",
+        body_reviewer="codex",
+        body_implementation_provenance="codex",  # claimed a non-claude implementer
+    )
+    ok, why = verify_published_comment(
+        rb,
+        expected_actor="github-actions[bot]",
+        expected_sha="abcdef1234567890abcdef1234567890abcdef12",
+        expected_repo="jleechanorg/dark-factory",
+        expected_pr_number=278,
+        expected_verdict="PASS",
+        expected_reviewer="codex",
+        expected_implementation_provenance="claude",
+    )
+    assert ok is False
+    assert "IMPLEMENTATION_PROVENANCE" in why
+
+
+def test_adversarial_readback_rejects_empty_sha_field():
+    """Per post-audit comment 4953064910, the previous read-back only
+    checked non-empty; here we verify equality (empty ≠ expected)."""
+    rb = ReadBackCheck(
+        actor="github-actions[bot]",
+        body_contains_marker=True,
+        body_sha=None,
+        body_repo="jleechanorg/dark-factory",
+        body_pr_number=278,
+        body_verdict="PASS",
+        body_reviewer="codex",
+        body_implementation_provenance="claude",
+    )
+    ok, why = verify_published_comment(
+        rb,
+        expected_actor="github-actions[bot]",
+        expected_sha="abcdef1234567890abcdef1234567890abcdef12",
+        expected_repo="jleechanorg/dark-factory",
+        expected_pr_number=278,
+        expected_verdict="PASS",
+        expected_reviewer="codex",
+        expected_implementation_provenance="claude",
+    )
+    assert ok is False
+
+
+def test_adversarial_workflow_has_no_trusted_ref_input():
+    """Per post-audit comment 4953064910, the workflow MUST NOT accept
+    a caller-supplied `trusted_ref` (otherwise a PR-controlled caller
+    can re-pin to PR head)."""
+    import yaml
+    with open(".github/workflows/skeptic-gate.yml") as f:
+        wf = yaml.safe_load(f)
+    inputs = ((wf.get("on") or {}).get("workflow_call") or {}).get("inputs") or {}
+    dispatch_inputs = ((wf.get("on") or {}).get("workflow_dispatch") or {}).get("inputs") or {}
+    assert "trusted_ref" not in inputs, (
+        "workflow_call.inputs.trusted_ref must be removed "
+        "(PR-controlled callers could otherwise re-pin to PR head)"
+    )
+    assert "trusted_ref" not in dispatch_inputs
+    # Confirm the checkout step uses the trusted default branch, not
+    # any caller-supplied ref.
+    jobs = (wf.get("jobs") or {}).get("skeptic") or {}
+    steps = jobs.get("steps") or []
+    checkout = next(
+        (s for s in steps if (s.get("name") or "").startswith("Checkout")), None
+    )
+    assert checkout is not None
+    ref = (checkout.get("with") or {}).get("ref", "")
+    assert "inputs.trusted_ref" not in ref, (
+        f"checkout.ref must not interpolate inputs.trusted_ref; got {ref!r}"
+    )
+    assert "default_branch" in ref, (
+        f"checkout.ref must pin to the trusted default branch; got {ref!r}"
+    )
+
+
+def test_adversarial_workflow_pins_reviewer_binaries():
+    """The workflow must assert path/version/sha256 of each reviewer
+    binary before invoking it (defense against mutable PATH installs)."""
+    import yaml
+    with open(".github/workflows/skeptic-gate.yml") as f:
+        wf = yaml.safe_load(f)
+    jobs = (wf.get("jobs") or {}).get("skeptic") or {}
+    steps = jobs.get("steps") or []
+    pin_step = next(
+        (s for s in steps if "pinned" in (s.get("name") or "").lower()), None
+    )
+    assert pin_step is not None, "no reviewer-binary pinning step found"
+    script = pin_step.get("run") or ""
+    assert "sha256sum" in script, "sha256 verification missing"
+    assert "check_binary" in script or "codex" in script and "gemini" in script
+    # Env vars for pinned paths/versions/sha256 must be present.
+    env = jobs.get("env") or {}
+    for key in (
+        "SKEPTIC_CODEX_BIN",
+        "SKEPTIC_CODEX_VERSION",
+        "SKEPTIC_CODEX_SHA256",
+        "SKEPTIC_GEMINI_BIN",
+        "SKEPTIC_GEMINI_VERSION",
+        "SKEPTIC_GEMINI_SHA256",
+    ):
+        assert key in env, f"missing env var {key} for reviewer binary pinning"
+
+
+def test_adversarial_workflow_strips_secrets_before_reviewer_invocation():
+    """The reviewer-invocation step must unset GITHUB_TOKEN, GH_TOKEN,
+    HOME, OPENCLAW_*, HERMES_*, SLACK_* secrets before invoking the
+    Python gate (defense in depth: the CLI also strips them)."""
+    import yaml
+    with open(".github/workflows/skeptic-gate.yml") as f:
+        wf = yaml.safe_load(f)
+    jobs = (wf.get("jobs") or {}).get("skeptic") or {}
+    steps = jobs.get("steps") or []
+    run_step = next(
+        (
+            s for s in steps
+            if (s.get("name") or "").startswith("Run skeptic")
+        ),
+        None,
+    )
+    assert run_step is not None, "no Run skeptic step found"
+    script = run_step.get("run") or ""
+    for secret in (
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "OPENCLAW_GATEWAY_TOKEN",
+        "OPENCLAW_SLACK_BOT_TOKEN",
+        "SLACK_BOT_TOKEN",
+        "HERMES_SLACK_WEBHOOK_URL",
+    ):
+        assert secret in script, (
+            f"reviewer invocation does not unset {secret!r}"
+        )
+
+
+def test_adversarial_cli_rejects_duplicate_reviewer_json():
+    """The CLI MUST refuse `--reviewers-json` with duplicate reviewers
+    (e.g. two codex entries)."""
+    import runner.skeptic_gate_cli as cli_mod
+    import pytest
+    with pytest.raises(SystemExit):
+        cli_mod._parse_reviewers('[["codex",""],["codex","gpt-5"]]')
+
+
+def test_adversarial_cli_reviewers_default_is_distinct():
+    """The default reviewer list must be distinct (codex AND gemini)."""
+    from runner.skeptic_gate_cli import DEFAULT_REVIEWERS_JSON
+    parsed = json.loads(DEFAULT_REVIEWERS_JSON)
+    ids = [item[0] for item in parsed]
+    assert len(set(ids)) == len(ids), (
+        f"DEFAULT_REVIEWERS_JSON contains duplicates: {ids}"
+    )
+
+
+def test_adversarial_status_failure_is_fail_closed(monkeypatch, capsys):
+    """If `set_commit_status` raises, the gate returns 1 (fail-closed),
+    not 0. Per post-audit comment 4953064910, the previous version
+    swallowed the error and could let a stale status satisfy the
+    read-back."""
+    import runner.skeptic_gate_cli as cli_mod
+
+    monkeypatch.setattr(
+        cli_mod, "get_pr_head_sha_via_api",
+        lambda repo, pr: "abcdef1234567890abcdef1234567890abcdef12",
+    )
+    monkeypatch.setattr(
+        cli_mod, "get_pr_diff",
+        lambda repo, pr: "+x\n",
+    )
+    monkeypatch.setattr(
+        cli_mod, "get_implementation_identity",
+        lambda repo, pr: "claude",
+    )
+
+    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+        return [
+            "python3", "-c",
+            "import sys; sys.stdout.write(" +
+            repr(_reviewer_stdout(reviewer, identity=reviewer)) +
+            ")",
+        ]
+
+    monkeypatch.setattr(cli_mod, "_build_reviewer_cmd", fake_cmd)
+    monkeypatch.setattr(cli_mod, "post_or_update_comment", lambda *a, **k: 9999)
+
+    def boom(*a, **k):
+        raise RuntimeError("status API 5xx")
+
+    monkeypatch.setattr(cli_mod, "set_commit_status", boom)
+
+    rc = cli_mod.main(["--repo", "jleechanorg/dark-factory",
+                       "--pr-number", "278",
+                       "--pr-sha", "abcdef1234567890abcdef1234567890abcdef12",
+                       "--reviewers-json", '[["codex",""],["gemini","gemini-2.5-pro"]]',
+                       "--expected-actor", "github-actions[bot]"])
+    captured = capsys.readouterr()
+    assert rc == 1, f"status failure must fail closed, got rc={rc}\n{captured.err}"
+    assert "status set failed" in captured.err or "status API" in captured.err
+
+
+def test_adversarial_diff_oversize_fails_closed(monkeypatch, capsys):
+    """A diff exceeding MAX_DIFF_BYTES must fail closed (no truncation,
+    no PASS)."""
+    import runner.skeptic_gate_cli as cli_mod
+
+    monkeypatch.setattr(
+        cli_mod, "get_pr_head_sha_via_api",
+        lambda repo, pr: "abcdef1234567890abcdef1234567890abcdef12",
+    )
+
+    def huge_diff(repo, pr):
+        return "x" * (cli_mod.MAX_DIFF_BYTES + 1)
+
+    monkeypatch.setattr(cli_mod, "get_pr_diff", huge_diff)
+
+    rc = cli_mod.main(_cli_argv())
+    captured = capsys.readouterr()
+    assert rc == 1, f"oversize diff must fail closed, got rc={rc}\n{captured.err}"
+    assert (
+        "diff capture failed" in captured.err
+        or "too large" in captured.err
+        or "MAX_DIFF_BYTES" in captured.err
+    )
+
+
+def test_adversarial_format_comment_includes_implementation_provenance():
+    """The published comment must include IMPLEMENTATION_PROVENANCE so
+    the read-back verifier can equality-check it."""
+    body = format_comment(
+        verdict="PASS",
+        head_sha="abcdef1234567890abcdef1234567890abcdef12",
+        expected_head_sha="abcdef1234567890abcdef1234567890abcdef12",
+        repo="jleechanorg/dark-factory",
+        pr_number=278,
+        reviewer="codex",
+        implementation_provenance="claude",
+        reason="ok",
+    )
+    assert "IMPLEMENTATION_PROVENANCE: claude" in body
+    assert "HEAD_SHA: abcdef1234567890abcdef1234567890abcdef12" in body
+    assert "REPO: jleechanorg/dark-factory" in body
+    assert "PR_NUMBER: 278" in body
+    assert "VERDICT: PASS" in body
+    assert "REVIEWER: codex" in body
