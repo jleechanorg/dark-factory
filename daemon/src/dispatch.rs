@@ -493,9 +493,9 @@ const CODER_PROMPT_DESCRIPTION_CAP: usize = 6_000;
 /// backstop.
 const CODER_PROMPT_TREE_CAP: usize = 3_000;
 
-/// jleechan-niqz: hard ceiling on the TOTAL composed prompt returned by
-/// `build_coder_prompt`, independent of (and enforced AFTER) the per-section
-/// caps above.
+/// jleechan-niqz: ceiling `build_coder_prompt` reconciles the variable
+/// (description, file-tree) content AGAINST, enforced AFTER the
+/// per-section caps above.
 ///
 /// The sum of `CODER_PROMPT_DESCRIPTION_CAP` (6,000), `CODER_PROMPT_TREE_CAP`
 /// (3,000), and the fixed REPO/REMOTE/BRANCH/PUSH/DELIVERABLE/RULES
@@ -504,6 +504,20 @@ const CODER_PROMPT_TREE_CAP: usize = 3_000;
 /// the spawn argument (agent-orchestrator `packages/cli/src/commands/spawn.ts`
 /// around line 160: `Error("Prompt must be at most 4096 characters")`) —
 /// nothing in the per-section caps reconciles against that number.
+///
+/// Known residual (flagged by independent review, not closed by this fix):
+/// `bead.id` and `bead.title` are interpolated uncapped and are deliberately
+/// never shrunk here — priority order (see `build_coder_prompt`) treats
+/// them, along with REPO/REMOTE/BRANCH/PUSH/RULES, as highest-priority
+/// content that must survive truncation intact. In practice they are
+/// naturally short (`br` ids are ~10 chars; titles are GitHub-issue/bead
+/// titles, realistically under a few hundred chars), so the fixed-section
+/// total stays well under this cap — but nothing in this function *asserts*
+/// that, so a pathologically long title could in principle still exceed
+/// AO's real ceiling even after description/tree are fully shrunk. Capping
+/// title would need its own priority decision (it's supposed to be
+/// load-bearing, unlike description/tree); tracked as a follow-up rather
+/// than folded into this fix silently.
 ///
 /// LIVE EVIDENCE this is not theoretical: canary bead jleechan-j4i8
 /// (2026-07-12T01:26:41Z) hit `BEAD_DISPATCH_TRANSIENT_ERROR` with all 3
