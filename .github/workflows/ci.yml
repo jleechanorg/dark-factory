@@ -81,6 +81,19 @@ jobs:
           git fetch origin main
           git show-ref --verify --quiet refs/heads/main || git branch main origin/main
 
+      - name: Install Rust toolchain (stable)
+        # Self-hosted runners do not ship with `cargo` pre-installed (verified
+        # on jleechanorg org runners 2026-07-12, PR #287 CI run). dtolnay's
+        # rust-toolchain action installs rustup + the requested toolchain in
+        # one step; we then cache the daemon crate's build artifacts so
+        # subsequent runs are fast.
+        uses: dtolnay/rust-toolchain@e3e0712b0c5996967f93e5070f25f594c9018c3c  # stable
+
+      - name: Cache cargo registry/target for daemon crate
+        uses: Swatinem/rust-cache@82a2a2f4dd44e2dad84fb7612f5b46469ce0bfee  # v2.7.5
+        with:
+          workspaces: daemon -> target
+
       - name: cargo test (daemon crate)
         working-directory: daemon
         run: cargo test --verbose
