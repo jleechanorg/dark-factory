@@ -153,7 +153,6 @@ impl Tracker for FakeTracker {
 }
 
 /// Scripted `Scm` fake: pre-seeded issues/permissions/snapshots keyed by input.
-#[derive(Default)]
 pub struct FakeScm {
     pub issues: Vec<Issue>,
     pub prs: Vec<LabeledPr>,
@@ -161,11 +160,75 @@ pub struct FakeScm {
     pub pr_snapshots: HashMap<u64, PrSnapshot>,
     pub remote_branches: HashMap<String, Option<u64>>,
     pub calls: RefCell<Vec<String>>,
+    /// jleechan-y8vk: external persisted-state seam. When set, every gh
+    /// invocation reads this file and verifies that the expected
+    /// `bead_id\ttarget_repo` line exists — proving target_repo was
+    /// durably persisted BEFORE the fake gh subprocess was invoked.
+    pub seam_path: Option<std::path::PathBuf>,
+}
+
+impl Default for FakeScm {
+    fn default() -> Self {
+        Self {
+            issues: Vec::new(),
+            prs: Vec::new(),
+            permissions: HashMap::new(),
+            pr_snapshots: HashMap::new(),
+            remote_branches: HashMap::new(),
+            calls: RefCell::new(Vec::new()),
+            seam_path: None,
+        }
+    }
 }
 
 impl FakeScm {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Verify the seam file is non-empty (at least one overlay.save already
+    /// happened with a target_repo before this gh call). No-op when seam_path
+    /// is None (tests that don't exercise the seam contract).
+    fn verify_seam_nonempty(&self) {
+        let Some(ref seam_path) = self.seam_path else {
+            return;
+        };
+        let body = std::fs::read_to_string(seam_path).unwrap_or_default();
+        if body.trim().is_empty() {
+            panic!(
+                "SEAM EMPTY: FakeScm gh call at {} found seam file {:?} with \
+                 empty/missing content — no overlay.save with target_repo occurred \
+                 before this gh invocation",
+                std::panic::Location::caller(),
+                seam_path
+            );
+        }
+    }
+
+    /// Verify the seam file contains a line with `repo` (the bead's resolved
+    /// target_repo was durably persisted BEFORE this gh invocation).
+    /// No-op when seam_path is None.
+    fn verify_seam_contains_repo(&self, expected_repo: &str) {
+        let Some(ref seam_path) = self.seam_path else {
+            return;
+        };
+        let Ok(body) = std::fs::read_to_string(seam_path) else {
+            return;
+        };
+        for line in body.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() == 2 && parts[1] == expected_repo {
+                return;
+            }
+        }
+        panic!(
+            "SEAM MISSING REPO: FakeScm gh call at {} found seam file {:?} but \
+             no entry with target_repo={:?} — target_repo not durably persisted \
+             before this gh invocation. Seam content:\n{body}",
+            std::panic::Location::caller(),
+            seam_path,
+            expected_repo
+        );
     }
 }
 
@@ -174,6 +237,7 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("labeled_issues({label})"));
+        self.verify_seam_nonempty();
         Ok(self.issues.clone())
     }
 
@@ -181,6 +245,7 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("labeled_prs({label})"));
+        self.verify_seam_nonempty();
         Ok(self.prs.clone())
     }
 
@@ -188,6 +253,7 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("collaborator_permission({login})"));
+        self.verify_seam_nonempty();
         Ok(self
             .permissions
             .get(login)
@@ -197,6 +263,7 @@ impl Scm for FakeScm {
 
     fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError> {
         self.calls.borrow_mut().push(format!("pr_snapshot({pr})"));
+        self.verify_seam_nonempty();
         self.pr_snapshots
             .get(&pr)
             .cloned()
@@ -207,11 +274,11 @@ impl Scm for FakeScm {
             })
     }
 
- (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
     fn pr_snapshot_for_repo(&self, repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
         self.calls
             .borrow_mut()
             .push(format!("pr_snapshot_for_repo({repo},{pr})"));
+        self.verify_seam_contains_repo(repo);
         self.pr_snapshots
             .get(&pr)
             .cloned()
@@ -226,6 +293,7 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("close_pr({pr},{comment})"));
+        self.verify_seam_nonempty();
         Ok(())
     }
 
@@ -233,6 +301,7 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("remote_branch_last_commit({branch})"));
+        self.verify_seam_nonempty();
         if let Some(&res) = self.remote_branches.get(branch) {
             Ok(res)
         } else {

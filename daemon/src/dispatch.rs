@@ -237,9 +237,12 @@ pub fn dispatch_ready(
             }
         };
 
-        // jleechan-87ea: emit DERIVED_ROUTE_RESOLVED BEFORE any spawn
-        // attempt so derived-route telemetry is durable even for deferred
-        // or failed spawns. Emitted once per bead per routing resolution.
+        // jleechan-87ea: emit DERIVED_ROUTE_RESOLVED BEFORE any derived
+        // dispatch, branch-register, or spawn so derived-route telemetry is
+        // durable even for deferred or failed spawns. Fail-closed: the emit
+        // is NOT best-effort — a DERIVED route whose telemetry cannot be
+        // written must park rather than silently dispatch without a durable
+        // provenance record (jleechan-y8vk correction).
         if routing.source == RoutingSource::Derived {
             if let Some(log) = telemetry_log {
                 let ev = TelemetryEvent {
@@ -254,7 +257,21 @@ pub fn dispatch_ready(
                         "routing_source": "derived",
                     }),
                 };
-                let _ = crate::telemetry::emit(log, &ev);
+                if let Err(err) = crate::telemetry::emit(log, &ev) {
+                    overlay.state = OverlayState::Queued;
+                    store.save(&overlay)?;
+                    report.failures.push(failure(
+                        bead,
+                        overlay.attempt,
+                        None,
+                        "derived_route_telemetry",
+                        DaemonError::Config(format!(
+                            "DERIVED_ROUTE_RESOLVED telemetry emit failed for bead {} (repo {repo:?}): {err}",
+                            bead.id
+                        )),
+                    ));
+                    continue;
+                }
             }
         }
 
@@ -307,7 +324,7 @@ pub fn dispatch_ready(
                     bead.title
                 )
             }
-            _ => build_coder_prompt(bead, &branch, &repo), (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
+            _ => build_coder_prompt(bead, &branch, &repo, &routing.push_remote),
         };
 
         let spec = SpawnSpec {
@@ -784,10 +801,14 @@ mod tests {
         // returning a session whose live branch does NOT match what was
         // requested (the wa-3004 contamination scenario).
         scripted_branch: RefCell<HashMap<String, String>>,
+        // jleechan-bqdv: scripted `worktree_remote_url` override, keyed by
+        // ao_project. Empty by default (matches the trait's `Ok(None)`) so
+        // pre-existing tests are unaffected.
+        scripted_worktree_remote: RefCell<HashMap<String, String>>,
         // jleechan-if09: captured (bead_id, SpawnSpec.prompt) per spawn, so
         // tests can pin what the coder actually receives (the wiring, not
         // just the builder function).
-        spawn_prompts: RefCell<Vec<(String, String)>>, (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
+        spawn_prompts: RefCell<Vec<(String, String)>>,
     }
 
     impl FakeSessions {
@@ -801,8 +822,8 @@ mod tests {
                 fail_spawn_fallback_exhausted_deferred_for: RefCell::new(Vec::new()),
                 fail_stop_for: RefCell::new(Vec::new()),
                 scripted_branch: RefCell::new(HashMap::new()),
+                scripted_worktree_remote: RefCell::new(HashMap::new()),
                 spawn_prompts: RefCell::new(Vec::new()),
- (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
             }
         }
 
@@ -2064,7 +2085,7 @@ mod tests {
         assert_eq!(report.success_count(), 1);
         let prompts = sessions.spawn_prompts.borrow();
         assert!(
-            prompts[0].1.starts_with("Route to RESEARCH_PATH"), (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
+            prompts[0].1.contains("Route to RESEARCH_PATH"),
             "routed paths keep their pipeline prompts: {}",
             prompts[0].1
         );
@@ -2115,7 +2136,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(report.success_count(), 1);
 
         let prompts = sessions.spawn_prompts.borrow();
@@ -2165,7 +2186,7 @@ mod tests {
         );
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(report.success_count(), 1);
 
         let prompts = sessions.spawn_prompts.borrow();
@@ -2193,7 +2214,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(
             report.success_count(),
@@ -2235,7 +2256,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(report.success_count(), 1);
         assert!(report.failures.is_empty());
@@ -2264,7 +2285,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
         assert!(
             matches!(err, DaemonError::Tool { .. }),
             "failure to kill a confirmed wrong-repo session must be fatal: {err:?}"
@@ -2286,7 +2307,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(report.success_count(), 1);
         let overlay = store.load("bead-0").unwrap().unwrap();
@@ -2317,7 +2338,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(
             report.success_count(),
@@ -2332,5 +2353,252 @@ mod tests {
         );
         let overlay = store.load("bead-0").unwrap().unwrap();
         assert_eq!(overlay.state, OverlayState::Dispatched);
+    }
+
+    // jleechan-y8vk: DERIVED_ROUTE_RESOLVED fail-closed telemetry tests.
+    // The emit must succeed before any derived dispatch, branch-register,
+    // or spawn. Four scenarios: success, deferred, spawn failure,
+    // unwritable log.
+
+    /// DERIVED_ROUTE_RESOLVED is emitted and dispatch succeeds.
+    #[test]
+    fn derived_route_telemetry_emitted_on_success() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("jleechanorg/ez-gh-actions".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let telemetry_log = std::env::temp_dir().join(format!(
+            "afd_derived_route_success_{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let report =
+            dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
+
+        assert_eq!(report.success_count(), 1, "derived route must dispatch");
+        assert!(report.failures.is_empty());
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Dispatched);
+
+        let log_content = std::fs::read_to_string(&telemetry_log).unwrap();
+        assert!(
+            log_content.contains("DERIVED_ROUTE_RESOLVED"),
+            "DERIVED_ROUTE_RESOLVED event must be emitted before dispatch: {log_content}"
+        );
+        assert!(
+            log_content.contains("jleechanorg/ez-gh-actions"),
+            "telemetry context must carry the derived target_repo"
+        );
+
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+
+    /// DERIVED_ROUTE_RESOLVED is emitted even when spawn is deferred
+    /// (admission-control backpressure), BEFORE the spawn attempt.
+    #[test]
+    fn derived_route_telemetry_emitted_on_deferred_spawn() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_deferred_for("bead-0");
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("jleechanorg/ez-gh-actions".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let telemetry_log = std::env::temp_dir().join(format!(
+            "afd_derived_route_deferred_{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let report =
+            dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
+
+        assert_eq!(report.success_count(), 0);
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| f.phase == "spawn_deferred"),
+            "deferred spawn must be reported"
+        );
+
+        let log_content = std::fs::read_to_string(&telemetry_log).unwrap();
+        assert!(
+            log_content.contains("DERIVED_ROUTE_RESOLVED"),
+            "DERIVED_ROUTE_RESOLVED must be emitted BEFORE the deferred spawn: {log_content}"
+        );
+
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+
+    /// DERIVED_ROUTE_RESOLVED is emitted even when spawn fails with
+    /// a transient tool error, BEFORE the spawn attempt.
+    #[test]
+    fn derived_route_telemetry_emitted_on_spawn_failure() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_for("bead-0");
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("jleechanorg/ez-gh-actions".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let telemetry_log = std::env::temp_dir().join(format!(
+            "afd_derived_route_spawn_fail_{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let report =
+            dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
+
+        assert_eq!(report.success_count(), 0);
+        assert!(
+            report.failures.iter().any(|f| f.phase == "spawn"),
+            "spawn failure must be reported"
+        );
+
+        let log_content = std::fs::read_to_string(&telemetry_log).unwrap();
+        assert!(
+            log_content.contains("DERIVED_ROUTE_RESOLVED"),
+            "DERIVED_ROUTE_RESOLVED must be emitted BEFORE the failed spawn: {log_content}"
+        );
+        assert!(
+            log_content.contains("jleechanorg/ez-gh-actions"),
+            "telemetry context must carry the derived target_repo even on failure"
+        );
+
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+
+    /// Unwritable telemetry log must block derived-route dispatch
+    /// (fail-closed): no branch register, no spawn, no dispatch state.
+    #[test]
+    #[cfg(unix)]
+    fn derived_route_unwritable_log_blocks_dispatch() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("jleechanorg/ez-gh-actions".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        // A directory path where a file can't be opened (isdir error)
+        let unwritable_dir = std::env::temp_dir().join(format!(
+            "afd_derived_unwritable_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&unwritable_dir);
+        std::fs::create_dir_all(&unwritable_dir).unwrap();
+
+        let report = dispatch_ready(
+            &sessions,
+            &store,
+            &cfg,
+            &ready,
+            Some(&unwritable_dir),
+        )
+        .unwrap();
+
+        // The dispatch must NOT succeed for the derived bead
+        assert_eq!(report.success_count(), 0, "derived route must not dispatch on unwritable log");
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| f.phase == "derived_route_telemetry"),
+            "fail-closed: derived route must fail with derived_route_telemetry phase when emit fails: {:?}",
+            report.failures
+        );
+
+        // The bead must remain Queued (NOT Dispatched)
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Queued, "bead must stay Queued after emit failure");
+
+        // No branch must have been registered
+        let branches = store.owned_branches().unwrap();
+        assert!(
+            branches.is_empty(),
+            "no branch must be registered on emit failure"
+        );
+
+        // No spawn must have been attempted
+        let calls = sessions.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("spawn(")),
+            "no spawn must have been attempted on emit failure: {calls:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&unwritable_dir);
     }
 }

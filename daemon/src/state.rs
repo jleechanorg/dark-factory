@@ -2040,4 +2040,99 @@ mod tests {
         assert_eq!(got.park_reason, Some("session_stalled".into()));
         assert_eq!(got.target_repo, Some("jleechanorg/dark-factory".into()));
     }
+
+    /// jleechan-y8vk: the real intake update path must be able to change
+    /// exactly `target_repo` (what `intake::resolve_target_repo` computes
+    /// from the bead's body/external_ref) without corrupting any other field.
+    /// Seed every unrelated field with distinct non-default values, then
+    /// simulate an intake-supplied target_repo update only, and prove all
+    /// other fields remain unchanged.
+    #[test]
+    fn overlay_populated_intake_update_only_target_repo_changes() {
+        let s = store();
+
+        let original = BeadOverlay {
+            bead_id: "b-intake-update".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 5,
+            reroll_count: 2,
+            autonomy_secs: 3600,
+            spend_usd: 8.50,
+            pr_number: Some(99),
+            branch: Some("factory/b-intake-update-r5".into()),
+            session_id: Some("ao-session-xyz789".into()),
+            is_adopted: true,
+            spawn_failure_count: 1,
+            pre_session_head_sha: Some("deadbeefcafe".into()),
+            park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
+            target_repo: Some("jleechanorg/worldarchitect.ai".into()),
+        };
+        s.save(&original).unwrap();
+
+        let loaded = s.load("b-intake-update").unwrap().unwrap();
+        assert_eq!(loaded.target_repo, Some("jleechanorg/worldarchitect.ai".into()));
+
+        let updated = BeadOverlay {
+            bead_id: loaded.bead_id,
+            state: loaded.state,
+            attempt: loaded.attempt,
+            reroll_count: loaded.reroll_count,
+            autonomy_secs: loaded.autonomy_secs,
+            spend_usd: loaded.spend_usd,
+            pr_number: loaded.pr_number,
+            branch: loaded.branch,
+            session_id: loaded.session_id,
+            is_adopted: loaded.is_adopted,
+            spawn_failure_count: loaded.spawn_failure_count,
+            pre_session_head_sha: loaded.pre_session_head_sha,
+            park_reason: loaded.park_reason,
+            target_repo: Some("jleechanorg/dark-factory".into()),
+        };
+        s.save(&updated).unwrap();
+
+        let got = s.load("b-intake-update").unwrap().unwrap();
+
+        assert_eq!(got.bead_id, "b-intake-update");
+        assert_eq!(
+            got.state, OverlayState::HumanHeld,
+            "state must not change during intake update"
+        );
+        assert_eq!(got.attempt, 5, "attempt must not change");
+        assert_eq!(got.reroll_count, 2, "reroll_count must not change");
+        assert_eq!(got.autonomy_secs, 3600, "autonomy_secs must not change");
+        assert_eq!(got.spend_usd, 8.50, "spend_usd must not change");
+        assert_eq!(got.pr_number, Some(99), "pr_number must not change");
+        assert_eq!(
+            got.branch,
+            Some("factory/b-intake-update-r5".into()),
+            "branch must not change"
+        );
+        assert_eq!(
+            got.session_id,
+            Some("ao-session-xyz789".into()),
+            "session_id must not change"
+        );
+        assert_eq!(got.is_adopted, true, "is_adopted must not change");
+        assert_eq!(got.spawn_failure_count, 1, "spawn_failure_count must not change");
+        assert_eq!(
+            got.pre_session_head_sha,
+            Some("deadbeefcafe".into()),
+            "pre_session_head_sha must not change"
+        );
+        assert_eq!(
+            got.park_reason,
+            Some("transient_spawn_retry_cap_exceeded".into()),
+            "park_reason must not change"
+        );
+        assert_eq!(
+            got.target_repo,
+            Some("jleechanorg/dark-factory".into()),
+            "target_repo must reflect the intake-supplied update"
+        );
+        assert_ne!(
+            got.target_repo,
+            original.target_repo,
+            "target_repo must actually differ from original to prove the update took effect"
+        );
+    }
 }

@@ -31,6 +31,103 @@ use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
 use daemon::tools::{Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrSnapshot, Scm};
 use daemon::verifier::SkepticVerdict;
 
+/// jleechan-y8vk: externally visible persisted-state seam. Wraps a
+/// `StateStore` and writes a `bead_id\ttarget_repo` line to a seam file on
+/// every `save()`, so shell-level fake `gh` subprocesses can independently
+/// verify that `target_repo` was already durable before they were invoked —
+/// not just after the tick finishes.
+struct SeamStore<'a, S: StateStore> {
+    inner: &'a S,
+    seam_path: &'a std::path::Path,
+}
+
+impl<'a, S: StateStore> SeamStore<'a, S> {
+    fn write_seam(&self, overlay: &BeadOverlay) {
+        if let Some(ref repo) = overlay.target_repo {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.seam_path)
+                .ok();
+            if let Some(mut f) = f {
+                let _ = std::io::Write::write_fmt(
+                    &mut f,
+                    format_args!("{}\t{}\n", overlay.bead_id, repo),
+                );
+            }
+        }
+    }
+}
+
+impl<'a, S: StateStore> StateStore for SeamStore<'a, S> {
+    fn load(&self, bead_id: &str) -> Result<Option<BeadOverlay>, DaemonError> {
+        self.inner.load(bead_id)
+    }
+
+    fn save(&self, overlay: &BeadOverlay) -> Result<(), DaemonError> {
+        self.write_seam(overlay);
+        self.inner.save(overlay)
+    }
+
+    fn register_branch(&self, bead_id: &str, branch: &str) -> Result<(), DaemonError> {
+        self.inner.register_branch(bead_id, branch)
+    }
+
+    fn bead_id_for_branch(&self, branch: &str) -> Result<Option<String>, DaemonError> {
+        self.inner.bead_id_for_branch(branch)
+    }
+
+    fn owned_branches(&self) -> Result<Vec<String>, DaemonError> {
+        self.inner.owned_branches()
+    }
+
+    fn increment_active_autonomy(
+        &self,
+        elapsed_secs: u64,
+    ) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.inner.increment_active_autonomy(elapsed_secs)
+    }
+
+    fn list_active_overlays(&self) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.inner.list_active_overlays()
+    }
+
+    fn bump_autonomy_secs(&self, bead_id: &str, delta_secs: u64) -> Result<(), DaemonError> {
+        self.inner.bump_autonomy_secs(bead_id, delta_secs)
+    }
+
+    fn recover_human_held(&self, max_attempt: u32) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.inner.recover_human_held(max_attempt)
+    }
+
+    fn human_held_at_or_above_attempt(
+        &self,
+        max_attempt: u32,
+    ) -> Result<Vec<BeadOverlay>, DaemonError> {
+        self.inner.human_held_at_or_above_attempt(max_attempt)
+    }
+
+    fn save_rejection(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+        reviewer: &str,
+        feedback_hash: &str,
+        feedback_text: &str,
+    ) -> Result<(), DaemonError> {
+        self.inner
+            .save_rejection(bead_id, attempt, reviewer, feedback_hash, feedback_text)
+    }
+
+    fn load_rejection(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+    ) -> Result<Option<(String, String)>, DaemonError> {
+        self.inner.load_rejection(bead_id, attempt)
+    }
+}
+
 fn test_cfg() -> Config {
     Config {
         target_repo: "owner/repo".into(),
@@ -7313,10 +7410,17 @@ impl Llm for RealLlmForRepoProbe {
 /// the caller's `.is_ok()` check succeeds regardless of which repo was
 /// probed — this test only cares WHICH repo `run_slow_tier` asked about, not
 /// simulating a real PR-not-found case.
+///
+/// jleechan-y8vk: the fake gh also checks `seam_file` (an externally visible
+/// persisted-state seam populated by `SeamStore` on every `save()`) before
+/// proceeding. If any `bead_id\ttarget_repo` entry in the seam file matches
+/// the `--repo` being probed, the seam confirms that `target_repo` was
+/// already durable before this gh invocation — not only args/post-run.
 #[cfg(unix)]
 fn write_fake_gh_capturing_repo_arg(
     dir: &std::path::Path,
     capture_file: &std::path::Path,
+    seam_file: &std::path::Path,
     expect_num: u64,
 ) {
     use std::os::unix::fs::PermissionsExt;
@@ -7337,10 +7441,26 @@ fn write_fake_gh_capturing_repo_arg(
          done\n\
          if [ $match -eq 1 ] && [ -n \"$repo_val\" ]; then\n\
            printf '%s' \"$repo_val\" > \"{capture}\"\n\
-         fi\n\
-         echo '{{\"number\": 1}}'\n",
-        expect_num = expect_num,
-        capture = capture_file.display()
+           if [ -f \"{seam}\" ]; then\n\
+             found=0\n\
+             while IFS='\t' read -r bead_id persisted_repo _rest; do\n\
+               if [ \"$persisted_repo\" = \"$repo_val\" ]; then\n\
+                 found=1; break\n\
+               fi\n\
+             done < \"{seam}\"\n\
+              if [ $found -eq 0 ]; then\n\
+                printf 'SEAM_MISS:%s' \"$repo_val\" >> \"{capture}\"\n\
+              else\n\
+                printf 'SEAM_OK' >> \"{capture}\"\n\
+              fi\n\
+            else\n\
+              printf 'SEAM_NOFILE' >> \"{capture}\"\n\
+            fi\n\
+          fi\n\
+          echo '{{\"number\": 1}}'\n",
+         expect_num = expect_num,
+         capture = capture_file.display(),
+         seam = seam_file.display()
     );
     std::fs::write(&path, script)
         .unwrap_or_else(|e| panic!("failed to write fake gh: {e}"));
@@ -7369,16 +7489,14 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     let capture_file = fake_bin_dir.join("captured_repo.txt");
-    write_fake_gh_capturing_repo_arg(&fake_bin_dir, &capture_file, 42);
+    let seam_file = fake_bin_dir.join("seam.txt");
+    write_fake_gh_capturing_repo_arg(&fake_bin_dir, &capture_file, &seam_file, 42);
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
     let _env_guard = EnvVarGuard::set(&[("PATH", &new_path)]);
 
     let mut scm = FakeScm::new();
-    // external_ref names a DIFFERENT repo than cfg.target_repo ("owner/repo"
-    // below) — exactly the multi-repo-fixture-vs-global-default scenario
-    // Stage E's two-repo E2E proof depends on.
     scm.issues.push(Issue {
         number: 42,
         title: "Fixture bead in a different repo".into(),
@@ -7395,8 +7513,9 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
             r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
         ))),
     };
-    let store = FakeStateStore::new();
-    let cfg = test_cfg(); // target_repo == "owner/repo"
+    let inner = FakeStateStore::new();
+    let store = SeamStore { inner: &inner, seam_path: &seam_file };
+    let cfg = test_cfg();
     let vcs = FakeVcs::new();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_x8tf_probe_own_repo_{}.jsonl",
@@ -7429,14 +7548,22 @@ fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
              --repo at all)"
         )
     });
-    assert_eq!(
-        captured, "jleechanorg/dark-factory-holdouts",
+    assert!(
+        captured.starts_with("jleechanorg/dark-factory-holdouts"),
         "run_slow_tier's PR-existence probe must target the bead's OWN \
-         resolved repo (from external_ref), not cfg.target_repo \
-         (\"owner/repo\"); captured --repo arg: {captured:?}"
+         resolved repo, not cfg.target_repo; captured: {captured:?}"
+    );
+    assert!(
+        captured.contains("SEAM_OK"),
+        "persisted-state seam must confirm target_repo was durable \
+         before gh invocation; got: {captured:?}"
+    );
+    assert!(
+        !captured.contains("SEAM_MISS") && !captured.contains("SEAM_NOFILE"),
+        "seam check must pass; got: {captured:?}"
     );
 
-    let overlay = store
+    let overlay = inner
         .load("fake-bead-1")
         .unwrap()
         .expect("overlay must exist");
@@ -7471,15 +7598,14 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     let capture_file = fake_bin_dir.join("captured_repo.txt");
-    write_fake_gh_capturing_repo_arg(&fake_bin_dir, &capture_file, 43);
+    let seam_file = fake_bin_dir.join("seam.txt");
+    write_fake_gh_capturing_repo_arg(&fake_bin_dir, &capture_file, &seam_file, 43);
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
     let _env_guard = EnvVarGuard::set(&[("PATH", &new_path)]);
 
     let mut scm = FakeScm::new();
-    // external_ref's repo prefix MATCHES cfg.target_repo — the single-repo
-    // shape every other test in this file already exercises.
     scm.issues.push(Issue {
         number: 43,
         title: "Same-repo bead".into(),
@@ -7496,8 +7622,9 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
             r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
         ))),
     };
-    let store = FakeStateStore::new();
-    let cfg = test_cfg(); // target_repo == "owner/repo"
+    let inner = FakeStateStore::new();
+    let store = SeamStore { inner: &inner, seam_path: &seam_file };
+    let cfg = test_cfg();
     let vcs = FakeVcs::new();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_x8tf_probe_legacy_repo_{}.jsonl",
@@ -7530,10 +7657,15 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
              --repo at all)"
         )
     });
-    assert_eq!(
-        captured, "owner/repo",
+    assert!(
+        captured.starts_with("owner/repo"),
         "single-repo (legacy default) beads must keep probing \
-         cfg.target_repo's value unchanged; captured --repo arg: {captured:?}"
+         cfg.target_repo's value unchanged; captured: {captured:?}"
+    );
+    assert!(
+        captured.contains("SEAM_OK"),
+        "persisted-state seam must confirm target_repo was durable \
+         before gh invocation for legacy beads; got: {captured:?}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -7544,10 +7676,18 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
 /// from DIFFERENT repos sharing the SAME PR number (#52) must each persist
 /// target_repo BEFORE the gh pr view probe and each probe must use the
 /// bead's OWN --repo, NOT cfg.target_repo or another bead's repo.
+///
+/// jleechan-y8vk: the fake gh also checks `seam_file` (an externally visible
+/// persisted-state seam populated by `SeamStore` on every `save()`) at each
+/// invocation. For every `--repo` being probed, it verifies that at least one
+/// `bead_id\ttarget_repo` entry with that repo already exists in the seam —
+/// confirming `target_repo` was durable BEFORE this gh invocation, not only
+/// args or post-run assertions.
 #[cfg(unix)]
 fn write_fake_gh_append_capturing_repo_arg(
     dir: &std::path::Path,
     capture_file: &std::path::Path,
+    seam_file: &std::path::Path,
 ) {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join("gh");
@@ -7566,10 +7706,25 @@ fn write_fake_gh_append_capturing_repo_arg(
            prev=\"$arg\"\n\
          done\n\
          if [ -n \"$repo_val\" ] && [ -n \"$pr_num\" ]; then\n\
-           printf '%s\t%s\\n' \"$pr_num\" \"$repo_val\" >> \"{capture}\"\n\
+           printf '%s\t%s' \"$pr_num\" \"$repo_val\" >> \"{capture}\"\n\
+           if [ -f \"{seam}\" ]; then\n\
+             found=0\n\
+             while IFS='\t' read -r bead_id persisted_repo _rest; do\n\
+               if [ \"$persisted_repo\" = \"$repo_val\" ]; then\n\
+                 found=1; printf '\\tSEAM_OK' >> \"{capture}\"; break\n\
+               fi\n\
+             done < \"{seam}\"\n\
+             if [ $found -eq 0 ]; then\n\
+               printf '\\tSEAM_MISS' >> \"{capture}\"\n\
+             fi\n\
+           else\n\
+             printf '\\tSEAM_NOFILE' >> \"{capture}\"\n\
+           fi\n\
+           printf '\\n' >> \"{capture}\"\n\
          fi\n\
          echo '{{{{\"number\": 1}}}}'\n",
-        capture = capture_file.display()
+        capture = capture_file.display(),
+        seam = seam_file.display()
     );
     std::fs::write(&path, script)
         .unwrap_or_else(|e| panic!("failed to write fake gh: {e}"));
@@ -7595,14 +7750,14 @@ fn same_pr_number_different_repos_persist_target_repo_before_probe_and_each_uses
     ));
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     let capture_file = fake_bin_dir.join("captured_repos.txt");
-    write_fake_gh_append_capturing_repo_arg(&fake_bin_dir, &capture_file);
+    let seam_file = fake_bin_dir.join("seam.txt");
+    write_fake_gh_append_capturing_repo_arg(&fake_bin_dir, &capture_file, &seam_file);
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
     let _env_guard = EnvVarGuard::set(&[("PATH", &new_path)]);
 
     let mut scm = FakeScm::new();
-    // Two issues from DIFFERENT repos but SAME PR number (#52).
     scm.issues.push(Issue {
         number: 52,
         title: "PR in worldarchitect".into(),
@@ -7620,8 +7775,6 @@ fn same_pr_number_different_repos_persist_target_repo_before_probe_and_each_uses
     scm.permissions.insert("alice".into(), Permission::Write);
 
     let tracker = FakeTracker::new();
-    // jleechan-dljf: sequential IDs so both beads get distinct ids through
-    // the full intake pipeline.
     tracker.create_bead_seq_ids.borrow_mut().push("bead-ez-52".into());
     tracker.create_bead_seq_ids.borrow_mut().push("bead-wa-52".into());
 
@@ -7631,9 +7784,10 @@ fn same_pr_number_different_repos_persist_target_repo_before_probe_and_each_uses
             r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
         ))),
     };
-    let store = FakeStateStore::new();
+    let inner = FakeStateStore::new();
+    let store = SeamStore { inner: &inner, seam_path: &seam_file };
 
-    let cfg = test_cfg(); // target_repo == "owner/repo"
+    let cfg = test_cfg();
     let vcs = FakeVcs::new();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_dljf_two_repo_same_pr_{}.jsonl",
@@ -7659,10 +7813,9 @@ fn same_pr_number_different_repos_persist_target_repo_before_probe_and_each_uses
 
     assert_eq!(summary.beads_created, 2, "two beads should be created via intake");
 
-    // Both overlays must exist and carry their own target_repo.
-    let wa_overlay = store.load("bead-wa-52").unwrap()
+    let wa_overlay = inner.load("bead-wa-52").unwrap()
         .expect("worldarchitect overlay must exist");
-    let ez_overlay = store.load("bead-ez-52").unwrap()
+    let ez_overlay = inner.load("bead-ez-52").unwrap()
         .expect("ez-gh-actions overlay must exist");
 
     assert_eq!(
@@ -7680,7 +7833,6 @@ fn same_pr_number_different_repos_persist_target_repo_before_probe_and_each_uses
         "SAME PR number (#52) in different repos must resolve to DIFFERENT target_repos"
     );
 
-    // The fake gh captured --repo args for BOTH beads.
     let captured = std::fs::read_to_string(&capture_file).unwrap_or_else(|e| {
         panic!(
             "expected the fake gh to have recorded --repo args; reading {capture_file:?} failed: {e}"
@@ -7689,34 +7841,133 @@ fn same_pr_number_different_repos_persist_target_repo_before_probe_and_each_uses
     let lines: Vec<&str> = captured.trim().lines().collect();
     assert_eq!(lines.len(), 2, "two gh pr view probes expected, one per bead, got {lines:?}");
 
-    let pr_repos: Vec<(&str, &str)> = lines
-        .iter()
-        .map(|line| {
-            let parts: Vec<&str> = line.split('\t').collect();
-            (parts[0], parts[1])
-        })
-        .collect();
+    // Each line is: pr_num\t--repo[\tSEAM_OK|SEAM_MISS]
+    for line in &lines {
+        let parts: Vec<&str> = line.split('\t').collect();
+        assert_eq!(parts[0], "52", "each probe must be for PR #52");
+        assert!(
+            parts[1] == "jleechanorg/worldarchitect.ai"
+                || parts[1] == "jleechanorg/ez-gh-actions",
+            "each probe repo must be one of the two bead target_repos, got: {parts:?}"
+        );
+        assert!(
+            parts[1] != "owner/repo",
+            "no probe must use cfg.target_repo (owner/repo)"
+        );
+        if parts.len() >= 3 {
+            assert_eq!(
+                parts[2], "SEAM_OK",
+                "persisted-state seam must confirm target_repo was durable \
+                 before gh invocation; got: {parts:?}"
+            );
+        } else {
+            panic!("seam verification field missing from capture line: {parts:?}");
+        }
+    }
 
+    // Verify the seam file itself contains both target_repos.
+    let seam_content = std::fs::read_to_string(&seam_file).unwrap_or_default();
     assert!(
-        pr_repos.contains(&("52", "jleechanorg/worldarchitect.ai")),
-        "one probe must use --repo jleechanorg/worldarchitect.ai for PR #52, got: {pr_repos:?}"
+        seam_content.contains("jleechanorg/worldarchitect.ai"),
+        "seam file must contain worldarchitect target_repo: {seam_content}"
     );
     assert!(
-        pr_repos.contains(&("52", "jleechanorg/ez-gh-actions")),
-        "one probe must use --repo jleechanorg/ez-gh-actions for PR #52, got: {pr_repos:?}"
-    );
-    assert_ne!(
-        pr_repos[0].1, pr_repos[1].1,
-        "PR #52 in two different repos must probe DIFFERENT --repo values"
-    );
-
-    // Neither probe used cfg.target_repo ("owner/repo").
-    assert!(
-        !pr_repos.iter().any(|(_, repo)| *repo == "owner/repo"),
-        "no probe must use cfg.target_repo; must use bead's own target_repo"
+        seam_content.contains("jleechanorg/ez-gh-actions"),
+        "seam file must contain ez-gh-actions target_repo: {seam_content}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+/// jleechan-y8vk: populated overlay goes through real intake mutation and
+/// proves only target_repo changes. Creates an issue whose body carries an
+/// explicit `target_repo:` field, drives one tick through the real intake
+/// path, and verifies that the resulting BeadOverlay has `target_repo` set
+/// to the body-specified value while every other field remains at its
+/// fresh-overlay default.
+#[test]
+fn populated_overlay_through_real_intake_only_target_repo_differs() {
+    let mut scm = FakeScm::new();
+    scm.issues.push(Issue {
+        number: 301,
+        title: "Multi-repo task".into(),
+        body: "target_repo: jleechanorg/ez-gh-actions\nFix the thing.".into(),
+        author_login: "alice".into(),
+        external_ref: "jleechanorg/dark-factory#301".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".to_string();
+    cfg.repos.insert(
+        "jleechanorg/ez-gh-actions".to_string(),
+        daemon::config::RepoConfig {
+            ao_project: "ez-gh-actions".to_string(),
+            push_remote: "origin".to_string(),
+        },
+    );
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_intake_populated_overlay_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("tick should succeed");
+
+    assert_eq!(
+        summary.beads_created, 1,
+        "one bead should be created from the intake issue"
+    );
+
+    let overlay = store.load("fake-bead-1").unwrap()
+        .expect("overlay must exist after intake");
+
+    assert_eq!(
+        overlay.target_repo.as_deref(),
+        Some("jleechanorg/ez-gh-actions"),
+        "target_repo must be resolved from explicit body field, \
+         ignoring cfg.target_repo {target_repo:?}",
+        target_repo = cfg.target_repo,
+    );
+
+    // Every other field must match the fresh-overlay default — only
+    // target_repo was set by intake resolution.
+    assert_eq!(overlay.state, OverlayState::Dispatched);
+    assert_eq!(overlay.attempt, 1);
+    assert_eq!(overlay.reroll_count, 0);
+    assert_eq!(overlay.autonomy_secs, 0);
+    assert!((overlay.spend_usd - 0.0).abs() < f64::EPSILON);
+    assert_eq!(overlay.pr_number, None);
+    assert!(overlay.branch.is_some(), "dispatch must set a branch");
+    assert!(overlay.session_id.is_some(), "dispatch must set session_id");
+    assert!(!overlay.is_adopted);
+    assert_eq!(overlay.spawn_failure_count, 0);
+    assert_eq!(overlay.pre_session_head_sha, None);
+    assert_eq!(overlay.park_reason, None);
+
+    let _ = std::fs::remove_file(&telemetry_log);
 }
 

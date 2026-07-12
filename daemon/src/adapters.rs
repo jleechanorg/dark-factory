@@ -1203,16 +1203,12 @@ impl Scm for CliScm {
         Ok(Some(epoch))
     }
 
-    fn pr_snapshot_for_repo(&self, repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
-        self.with_repo(repo).pr_snapshot(pr)
-    }
-
     /// jleechan-bqdv Stage C: retarget the query at `repo` via `with_repo`
     /// instead of always polling `self.repo` (the daemon's global
     /// `cfg.target_repo`, bound at construction time in `main.rs`). Callers
     /// pass `overlay.repo(cfg)`, so a bead whose resolved repo differs from
     /// the global one is now actually observable instead of silently
-    /// invisible to the coder-silence watcher. (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
+    /// invisible to the coder-silence watcher.
     fn remote_branch_last_commit_for_repo(
         &self,
         repo: &str,

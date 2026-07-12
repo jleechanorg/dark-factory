@@ -569,7 +569,7 @@ fn skeptic_gate(evidence: &PrEvidence) -> GateResult {
 /// `cfg` is accepted per the design-doc signature for future per-repo gate
 /// config (unused today — Stage 1 has no per-gate config knobs yet);
 /// `#[allow(unused_variables)]` documents that rather than dropping the
-/// parameter ahead of a design-doc revision. (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
+/// parameter ahead of a design-doc revision.
 #[allow(unused_variables)]
 pub fn assess(
     scm: &dyn Scm,
@@ -711,12 +711,11 @@ mod tests {
                 })
         }
 
- (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
         fn pr_snapshot_for_repo(&self, repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
             self.calls
                 .borrow_mut()
                 .push(format!("pr_snapshot_for_repo({repo},{pr})"));
-            self.pr_snapshot(pr) (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
+            self.pr_snapshot(pr)
         }
 
         fn close_pr(&self, _pr: u64, _comment: &str) -> Result<(), DaemonError> {

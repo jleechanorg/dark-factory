@@ -361,14 +361,11 @@ pub trait Scm {
     }
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError>;
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError>;
-    fn pr_snapshot_for_repo(&self, _repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
-        self.pr_snapshot(pr)
-    }
     fn remote_branch_last_commit_for_repo(
         &self,
         _repo: &str,
         branch: &str,
-    ) -> Result<Option<u64>, DaemonError> { (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
+    ) -> Result<Option<u64>, DaemonError> {
         self.remote_branch_last_commit(branch)
     }
 }
