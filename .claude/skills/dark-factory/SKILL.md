@@ -218,8 +218,13 @@ Honor these flags inside `$ARGUMENTS`:
   `minimal_feature`, `review_slim`, `review_full`) or path to a `.dot`. If
   omitted, **auto-select from the goal** (Step 0c above) — never blindly default
   to `gates.dot` or `minimal_feature.dot`.
-- `--feature <name>` — holdout feature (required when the pipeline includes a
-  `holdout_eval` node; default `hello`)
+- `--feature <name>` — holdout feature. Required when the pipeline includes a
+  `holdout_eval` node, but never default it blindly: pass it only after
+  confirming `~/projects/dark-factory-holdouts/holdouts/<name>/` actually
+  exists (`hello` is a real, feature-agnostic holdout and a reasonable choice
+  when the goal has no more specific holdout, but confirm the directory
+  exists before passing it rather than defaulting unconditionally — see
+  Honesty rules below on not inventing `--feature` values)
 - `--backend echo|claude|codex|ao|agy` — default `claude`. Use `echo` for cost-free
   dry-runs that verify wiring without LLM calls.
 - `--max-steps <N>` — default 100

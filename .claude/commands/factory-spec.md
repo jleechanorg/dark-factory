@@ -12,7 +12,7 @@ truth. Identical workflow to `/fs`; this is an alternate entry point name.
 
 ## Usage
 
-```
+```text
 /factory-spec <spec description>          # create mode — runs spec_gen (main + attractor)
 /factory-spec --review <spec_path>        # in-session review of an existing main spec
 /factory-spec --review-attractor <path>   # in-session review of an existing attractor spec

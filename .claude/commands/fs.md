@@ -19,7 +19,7 @@ off by an independent cold codex review before exit.
 
 ## Usage
 
-```
+```text
 /fs <spec description>                  # DEFAULT: binary spec_gen run (main + attractor)
 /fs --pipeline spec_gen <description>   # explicit static binary pipeline
 /fs --dynamic-graph <description>       # binary-owned dynamic spec graph
