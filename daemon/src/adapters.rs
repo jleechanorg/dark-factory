@@ -153,7 +153,12 @@ impl Tracker for CliTracker {
         };
         let trimmed = out.trim();
         if trimmed.is_empty() {
-            return Ok(None);
+            return Err(DaemonError::Parse(format!(
+                "br show exit-0 empty stdout for {bead_id}; \
+                 expected JSON object or array — empty output is not proof \
+                 the bead is missing (only rc=3 with ISSUE_NOT_FOUND \
+                 retryable=false means the bead is missing)"
+            )));
         }
         let status: String = if let Some(arr_start) = trimmed.find('[') {
             if arr_start == 0 || trimmed[..arr_start].trim().is_empty() {
@@ -164,7 +169,13 @@ impl Tracker for CliTracker {
                         ))
                     })?;
                 if arr.is_empty() {
-                    return Ok(None);
+                    return Err(DaemonError::Parse(format!(
+                        "br show exit-0 empty JSON array for {bead_id}; \
+                         expected at least one object with a status field — \
+                         empty array is not proof the bead is missing (only \
+                         rc=3 with ISSUE_NOT_FOUND retryable=false means \
+                         the bead is missing)"
+                    )));
                 }
                 arr[0]
                     .get("status")
@@ -5782,8 +5793,70 @@ exit 0"#,
         let result = tracker.bead_status("rc0-not-found");
 
         match result {
-            Ok(None) => {}
-            other => panic!("expected Ok(None) (empty stdout) for rc=0, got {other:?}"),
+            Err(DaemonError::Parse(msg)) => {
+                assert!(
+                    msg.contains("empty stdout"),
+                    "expected 'empty stdout' in Parse error, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Err(Parse) for exit-0 empty stdout, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bead_status_rc0_empty_stdout_is_parse_error_not_missing() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = make_temp_dir("br_rc0_empty_out");
+        write_br_shim(&dir, "exit 0");
+        let _path_guard = PathGuard::set(&dir);
+
+        let tracker = CliTracker;
+        let result = tracker.bead_status("rc0-empty-out");
+
+        match result {
+            Err(DaemonError::Parse(msg)) => {
+                assert!(
+                    msg.contains("empty stdout"),
+                    "expected 'empty stdout' in Parse error, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Err(Parse) for exit-0 empty stdout, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bead_status_rc0_empty_json_array_is_parse_error_not_missing() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = make_temp_dir("br_rc0_empty_arr");
+        write_br_shim(
+            &dir,
+            r#"printf '[]\n'"#,
+        );
+        let _path_guard = PathGuard::set(&dir);
+
+        let tracker = CliTracker;
+        let result = tracker.bead_status("rc0-empty-arr");
+
+        match result {
+            Err(DaemonError::Parse(msg)) => {
+                assert!(
+                    msg.contains("empty JSON array"),
+                    "expected 'empty JSON array' in Parse error, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Err(Parse) for exit-0 empty JSON array, got {other:?}"
+            ),
         }
     }
 
