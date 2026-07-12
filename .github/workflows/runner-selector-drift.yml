@@ -93,24 +93,25 @@ jobs:
           # Pass the live repo variable through to the script.
           SELF_HOSTED_RUNNER_LABELS: ${{ vars.SELF_HOSTED_RUNNER_LABELS }}
           DRIFT_CHECK_ORG: jleechanorg
-          # Auth token selection (fail-closed, most-privileged first):
-          #
-          # 1. RUNNERS_READ_PAT: a Fine-Grained PAT with `manage_runners:org`
-          #    read permission on jleechanorg. Required for `gh api
-          #    orgs/{org}/actions/runners`. Store this as a repo/org secret.
-          #    Create via: GitHub → Settings → Developer settings → Fine-grained
-          #    personal access tokens → New token → Resource owner: jleechanorg
-          #    → Repository access: All → Permissions → Organization permissions
-          #    → Self-hosted runners → Read.
-          #
-          # 2. GITHUB_TOKEN fallback: the default Actions token. It has `repo`
-          #    scope but NOT `manage_runners:org`, so the gh api call for org
-          #    runners will return HTTP 403. The script exits 2 (invocation
-          #    error) which fails the workflow loud — correct fail-closed
-          #    behaviour. Do NOT suppress this error with `|| true`.
-          GH_TOKEN: ${{ secrets.RUNNERS_READ_PAT || secrets.GITHUB_TOKEN }}
+          # RUNNERS_READ_PAT: optional org secret with `manage_runners:org` read
+          # permission. When set, it is exported as GH_TOKEN inside the run
+          # block to give gh api access to orgs/{org}/actions/runners.
+          # When not set, gh uses the runner's native auth (keyring / pre-auth
+          # on the self-hosted image) — which typically has the necessary scope
+          # for self-hosted org runners. Do NOT hard-code GH_TOKEN to
+          # GITHUB_TOKEN here: the default Actions token lacks manage_runners:org
+          # and would override the runner's native auth, causing HTTP 403.
+          RUNNERS_READ_PAT: ${{ secrets.RUNNERS_READ_PAT }}
         run: |
           set -euo pipefail
+          # Use RUNNERS_READ_PAT if configured; otherwise rely on runner auth.
+          if [ -n "${RUNNERS_READ_PAT:-}" ]; then
+            export GH_TOKEN="$RUNNERS_READ_PAT"
+            echo "Using RUNNERS_READ_PAT for gh api call."
+          else
+            unset GH_TOKEN || true
+            echo "RUNNERS_READ_PAT not set — using runner native gh auth."
+          fi
           ARGS=(--org jleechanorg --json)
           if [ "${{ inputs.min_matches }}" != "" ]; then
             ARGS+=(--min-matches "${{ inputs.min_matches }}")
