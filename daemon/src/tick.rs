@@ -962,11 +962,40 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             .iter()
             .find(|bead| bead.id == *bead_id)
             .cloned();
+        // jleechan-35y4 Stage A: resolve per-bead repo identity at intake
+        // time — explicit `target_repo:` body field wins, else the
+        // `owner/repo` prefix of external_ref, else None (legacy/global,
+        // resolved later via `BeadOverlay::repo`). Computed BEFORE the
+        // PR-existence probe below (jleechan-x8tf) so that probe can target
+        // the bead's OWN resolved repo instead of unconditionally
+        // `cfg.target_repo`.
+        let target_repo = intake::resolve_target_repo(
+            tracker_bead.as_ref().map(|b| b.description.as_str()).unwrap_or(""),
+            tracker_bead.as_ref().and_then(|b| b.external_ref.as_deref()),
+        );
+
         if deps.llm.is_real() {
             if let Some(bead) = tracker_bead.as_ref() {
                 if let Some(ref ext_ref) = bead.external_ref {
                     if let Some((_, num_str)) = parse_external_ref(ext_ref) {
                         if let Ok(num) = num_str.parse::<u64>() {
+                            // jleechan-x8tf: probe the bead's OWN resolved
+                            // repo (`target_repo`, computed above), not
+                            // unconditionally `deps.cfg.target_repo` — this
+                            // used to parse a repo out of `ext_ref` via
+                            // `parse_external_ref` and then discard it
+                            // (`_`), silently falling back to the global
+                            // config repo. For any bead whose external_ref
+                            // or `target_repo:` body field names a repo
+                            // OTHER than `cfg.target_repo` (e.g. a
+                            // dark-factory fixture bead while the daemon's
+                            // global default is worldarchitect.ai), this
+                            // probe silently checked the WRONG repo's PR
+                            // list — corrupting any multi-repo E2E proof
+                            // that depends on this check landing on the
+                            // bead's own repo.
+                            let probe_repo =
+                                target_repo.as_deref().unwrap_or(&deps.cfg.target_repo);
                             if crate::tools::run_tool(
                                 "gh",
                                 &[
@@ -974,7 +1003,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                     "view",
                                     &num.to_string(),
                                     "--repo",
-                                    &deps.cfg.target_repo,
+                                    probe_repo,
                                     "--json",
                                     "number",
                                 ],
@@ -989,15 +1018,6 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 }
             }
         }
-
-        // jleechan-35y4 Stage A: resolve per-bead repo identity at intake
-        // time — explicit `target_repo:` body field wins, else the
-        // `owner/repo` prefix of external_ref, else None (legacy/global,
-        // resolved later via `BeadOverlay::repo`).
-        let target_repo = intake::resolve_target_repo(
-            tracker_bead.as_ref().map(|b| b.description.as_str()).unwrap_or(""),
-            tracker_bead.as_ref().and_then(|b| b.external_ref.as_deref()),
-        );
         let overlay = BeadOverlay {
             bead_id: bead_id.clone(),
             state: OverlayState::Queued,
