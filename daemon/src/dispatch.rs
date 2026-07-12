@@ -480,12 +480,45 @@ pub fn dispatch_ready(
 /// Maximum characters of bead description embedded in the coder prompt.
 /// Long enough for real acceptance criteria (tonight's beads run 1-3 KB),
 /// bounded so a pathological bead body can't blow the spawn argv/context.
+///
+/// jleechan-niqz: this cap alone is NOT a safety net against AO's real
+/// spawn-argument ceiling — see `CODER_PROMPT_TOTAL_CAP` below, which
+/// reconciles this cap plus `CODER_PROMPT_TREE_CAP` plus the fixed
+/// boilerplate against that ceiling.
 const CODER_PROMPT_DESCRIPTION_CAP: usize = 6_000;
 
 /// Maximum characters of the pre-rendered file-tree summary embedded in the
 /// coder prompt (the summary is already bounded at render time; this is
-/// defense in depth).
+/// defense in depth). See `CODER_PROMPT_TOTAL_CAP` for the real total-budget
+/// backstop.
 const CODER_PROMPT_TREE_CAP: usize = 3_000;
+
+/// jleechan-niqz: hard ceiling on the TOTAL composed prompt returned by
+/// `build_coder_prompt`, independent of (and enforced AFTER) the per-section
+/// caps above.
+///
+/// The sum of `CODER_PROMPT_DESCRIPTION_CAP` (6,000), `CODER_PROMPT_TREE_CAP`
+/// (3,000), and the fixed REPO/REMOTE/BRANCH/PUSH/DELIVERABLE/RULES
+/// boilerplate (~900 chars) can pass 9,000 chars even though each section
+/// looks individually bounded. AO's own CLI enforces a hard, real ceiling on
+/// the spawn argument (agent-orchestrator `packages/cli/src/commands/spawn.ts`
+/// around line 160: `Error("Prompt must be at most 4096 characters")`) —
+/// nothing in the per-section caps reconciles against that number.
+///
+/// LIVE EVIDENCE this is not theoretical: canary bead jleechan-j4i8
+/// (2026-07-12T01:26:41Z) hit `BEAD_DISPATCH_TRANSIENT_ERROR` with all 3
+/// fallback vendors (minimax, claude-code, agy) failing identically with
+/// AO's exact "Prompt must be at most 4096 characters" error. That failure
+/// is deterministic, not transient — every retry composes the identical
+/// oversized prompt and gets the identical rejection — yet the daemon
+/// classifies it as retryable, burns through `MAX_TRANSIENT_SPAWN_RETRY`
+/// (15), and parks the bead `HUMAN_HELD`.
+///
+/// 4,000 leaves ~96 chars of headroom under AO's 4,096 for any
+/// byte-vs-char counting differences or argv/wrapper overhead `ao spawn`
+/// itself may add on top of the prompt string. Do not raise this to 4,096
+/// or above without first re-verifying AO's own limit and how it counts.
+const CODER_PROMPT_TOTAL_CAP: usize = 4_000;
 
 /// Build the full coder prompt for a SMALL_PATH/STANDARD_PATH dispatch.
 ///
@@ -528,12 +561,18 @@ fn truncate_at_char_boundary(s: &mut String, cap: usize) {
     s.truncate(n);
 }
 
-fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str, remote: &str) -> String {
-    let mut description = bead.description.trim().to_string();
-    if description.len() > CODER_PROMPT_DESCRIPTION_CAP {
-        truncate_at_char_boundary(&mut description, CODER_PROMPT_DESCRIPTION_CAP);
-        description.push_str("\n[description truncated]");
-    }
+/// Render the full coder prompt template from already-capped `description`
+/// and `tree` text. Split out of `build_coder_prompt` so the total-budget
+/// reconciliation pass (jleechan-niqz) can re-render cheaply after shrinking
+/// `description`/`tree` further, without duplicating the template.
+fn render_coder_prompt(
+    bead: &crate::tools::Bead,
+    branch: &str,
+    target_repo: &str,
+    remote: &str,
+    description: &str,
+    tree: &str,
+) -> String {
     let description_block = if description.is_empty() {
         String::new()
     } else {
@@ -551,11 +590,6 @@ fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str
         None => String::new(),
     };
 
-    let mut tree = bead.file_tree_summary.trim().to_string();
-    if tree.len() > CODER_PROMPT_TREE_CAP {
-        truncate_at_char_boundary(&mut tree, CODER_PROMPT_TREE_CAP);
-        tree.push_str("\n[tree truncated]");
-    }
     let tree_block = if tree.is_empty() {
         String::new()
     } else {
@@ -595,6 +629,61 @@ fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str
         id = bead.id,
         title = bead.title,
     )
+}
+
+/// Shrink `text` by roughly `excess` chars from the end, at a UTF-8
+/// boundary, then (re)apply `marker` as a truncation-notice suffix.
+///
+/// Idempotent with respect to `marker`: if `text` already ends with a
+/// previous application of `marker` (e.g. from the earlier per-section cap
+/// truncation), that occurrence is stripped first so repeated shrinking
+/// never duplicates the notice or silently double-counts its length against
+/// the budget.
+fn shrink_by(text: &mut String, excess: usize, marker: &str) {
+    if let Some(pos) = text.rfind(marker) {
+        text.truncate(pos);
+    }
+    let target = text.len().saturating_sub(excess).saturating_sub(marker.len());
+    truncate_at_char_boundary(text, target);
+    if !text.is_empty() {
+        text.push_str(marker);
+    }
+}
+
+fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str, remote: &str) -> String {
+    let mut description = bead.description.trim().to_string();
+    if description.len() > CODER_PROMPT_DESCRIPTION_CAP {
+        truncate_at_char_boundary(&mut description, CODER_PROMPT_DESCRIPTION_CAP);
+        description.push_str("\n[description truncated]");
+    }
+
+    let mut tree = bead.file_tree_summary.trim().to_string();
+    if tree.len() > CODER_PROMPT_TREE_CAP {
+        truncate_at_char_boundary(&mut tree, CODER_PROMPT_TREE_CAP);
+        tree.push_str("\n[tree truncated]");
+    }
+
+    let mut prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &tree);
+
+    // jleechan-niqz: the per-section caps above bound `description` and
+    // `tree` independently but never reconciled their SUM (plus the fixed
+    // boilerplate) against AO's real 4096-char spawn ceiling. Enforce the
+    // total budget here, sacrificing the lowest-priority content first —
+    // the file-tree summary, then the description — and never touching the
+    // fixed id/title/REPO/REMOTE/BRANCH/PUSH/RULES sections.
+    if prompt.len() > CODER_PROMPT_TOTAL_CAP && !tree.is_empty() {
+        let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
+        shrink_by(&mut tree, excess, "\n[tree truncated]");
+        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &tree);
+    }
+
+    if prompt.len() > CODER_PROMPT_TOTAL_CAP && !description.is_empty() {
+        let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
+        shrink_by(&mut description, excess, "\n[description truncated]");
+        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &tree);
+    }
+
+    prompt
 }
 
 #[cfg(test)]
@@ -1768,6 +1857,108 @@ mod tests {
         // Must not panic.
         let prompt = build_coder_prompt(&bead, "factory/bead-u-r1", "owner/repo", "origin");
         assert!(prompt.contains("[description truncated]"));
+    }
+
+    // jleechan-niqz regression test: reproduces the EXACT failure shape that
+    // struck the live canary bead jleechan-j4i8 (2026-07-12T01:26:41Z) —
+    // all 3 fallback vendors failed identically with AO's real
+    // "Prompt must be at most 4096 characters" error. Under the OLD code,
+    // `build_coder_prompt` only capped `description` and `file_tree_summary`
+    // INDEPENDENTLY (6,000 + 3,000 chars respectively); their sum plus the
+    // fixed boilerplate composed to well over 9,000 chars here, blowing
+    // past AO's real 4,096-char spawn ceiling
+    // (agent-orchestrator packages/cli/src/commands/spawn.ts:160-161). This
+    // test must fail against that old behavior and pass once the total
+    // budget is enforced.
+    #[test]
+    fn coder_prompt_total_length_stays_under_ao_spawn_ceiling() {
+        const AO_HARD_SPAWN_LIMIT: usize = 4_096;
+
+        let bead = Bead {
+            id: "jleechan-j4i8".into(),
+            title: "Regression-shape bead: description + tree summary would sum past 4096"
+                .into(),
+            // A "moderate-length" description like the live incident's
+            // ~1,100 chars, but sized here to sit under its own 6,000-char
+            // per-section cap while still contributing meaningfully to the
+            // total — the bug is about the SUM, not any one section
+            // exceeding its own cap.
+            description: "Fix the flux capacitor calibration drift. ".repeat(80),
+            // A file-tree summary that alone fits under its own 3,000-char
+            // per-section cap but, combined with the description and fixed
+            // boilerplate above, pushes the OLD uncapped-total prompt past
+            // 4,096 chars — the exact shape that stranded jleechan-j4i8.
+            file_tree_summary: "daemon/src/dispatch.rs\ndaemon/src/tools.rs\n".repeat(60),
+            external_ref: Some("jleechanorg/dark-factory#999".into()),
+        };
+
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/jleechan-j4i8-r1",
+            "jleechanorg/dark-factory",
+            "origin",
+        );
+
+        assert!(
+            prompt.len() <= CODER_PROMPT_TOTAL_CAP,
+            "total prompt length {} exceeds the daemon's own {}-char budget",
+            prompt.len(),
+            CODER_PROMPT_TOTAL_CAP
+        );
+        assert!(
+            prompt.len() < AO_HARD_SPAWN_LIMIT,
+            "total prompt length {} would still trip AO's real {}-char spawn \
+             ceiling (agent-orchestrator packages/cli/src/commands/spawn.ts:160-161) \
+             — this is the exact live failure from jleechan-j4i8",
+            prompt.len(),
+            AO_HARD_SPAWN_LIMIT
+        );
+
+        // Fixed, highest-priority sections must survive truncation intact —
+        // never sacrificed to make room for description/tree content.
+        assert!(prompt.contains("jleechan-j4i8"), "bead id must survive");
+        assert!(
+            prompt.contains("Regression-shape bead"),
+            "title must survive"
+        );
+        assert!(
+            prompt.contains("REPO: jleechanorg/dark-factory"),
+            "REPO line must survive"
+        );
+        assert!(
+            prompt.contains("REMOTE: origin"),
+            "REMOTE line must survive"
+        );
+        assert!(
+            prompt.contains("git push origin factory/jleechan-j4i8-r1"),
+            "literal PUSH COMMAND must survive"
+        );
+        assert!(
+            prompt.contains("Do NOT merge"),
+            "RULES section must survive"
+        );
+    }
+
+    // Companion to the above: the total-budget shrink must never panic on a
+    // non-UTF8-boundary cut, exactly like the per-section cap's existing
+    // guarantee — exercise it via a tree summary whose bytes only align on
+    // multi-byte character boundaries.
+    #[test]
+    fn coder_prompt_total_length_shrink_is_utf8_boundary_safe() {
+        let bead = Bead {
+            id: "bead-total-unicode".into(),
+            title: "Unicode total-budget task".into(),
+            description: "Acceptance criteria text. ".repeat(100),
+            // Multi-byte emoji repeated well past what the total budget can
+            // afford alongside the description above, forcing the total
+            // shrink path (not just the per-section cap) to cut mid-run.
+            file_tree_summary: "\u{1F980}".repeat(2_000),
+            external_ref: None,
+        };
+
+        // Must not panic.
+        let prompt = build_coder_prompt(&bead, "factory/bead-total-unicode-r1", "owner/repo", "origin");
+        assert!(prompt.len() <= CODER_PROMPT_TOTAL_CAP);
     }
 
     // The routed research/generic paths keep their pipeline-invocation
