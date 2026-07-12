@@ -88,6 +88,15 @@ impl Config {
                 }
                 project
             });
+            if self.is_ao_project_collision(&ao_project, repo) {
+                eprintln!(
+                    "auto-factory daemon: ao_project collision: global target_repo '{}' \
+                     resolves to ao_project='{}' which is already claimed by an explicit \
+                     [repos.*] entry for a different repo; routing failed closed",
+                    repo, ao_project
+                );
+                return None;
+            }
             return Some(RepoRouting {
                 ao_project,
                 push_remote: "origin".to_string(),
@@ -110,8 +119,20 @@ impl Config {
         };
 
         if self.is_ao_project_collision(&ao_project, repo) {
+            eprintln!(
+                "auto-factory daemon: ao_project collision: derived ao_project='{}' \
+                 for repo '{}' conflicts with an explicit [repos.*] entry for a \
+                 different repo; routing failed closed",
+                ao_project, repo
+            );
             return None;
         }
+
+        eprintln!(
+            "auto-factory daemon: derived routing for '{}' -> ao_project='{}', push_remote='origin' \
+             (no explicit [repos.\"{}\"] entry)",
+            repo, ao_project, repo
+        );
 
         Some(RepoRouting {
             ao_project,
@@ -137,16 +158,39 @@ struct OwnerRepo {
 /// Validate that `s` is a well-formed `owner/repo` string with exactly one
 /// `/` and non-empty segments on both sides. Returns `None` for malformed
 /// input — the caller must fail closed.
+///
+/// jleechan-dljf (issue #271): also rejects whitespace, control characters,
+/// and chars not allowed in GitHub owner/repo names. Valid GitHub codepoints:
+/// alphanumeric, hyphen, underscore, and (repo only) dot.
 fn validate_owner_repo(s: &str) -> Option<OwnerRepo> {
+    if s.len() != s.trim().len() {
+        return None;
+    }
     let mut parts = s.splitn(2, '/');
     let owner = parts.next()?;
     let name = parts.next()?;
     if owner.is_empty() || name.is_empty() || name.contains('/') {
         return None;
     }
+    if !is_valid_github_name_segment(owner) || !is_valid_github_name_segment(name) {
+        return None;
+    }
     Some(OwnerRepo {
         name: name.to_string(),
     })
+}
+
+fn is_valid_github_name_segment(s: &str) -> bool {
+    s.chars().all(|c| {
+        c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
+    })
+}
+
+/// Public boolean check — `true` when `s` is a well-formed `owner/repo`
+/// string (bead jleechan-dljf, issue #271). Used by `intake::resolve_target_repo`
+/// to reject malformed results from body field or external_ref prefix.
+pub fn is_valid_owner_repo(s: &str) -> bool {
+    validate_owner_repo(s).is_some()
 }
 
 pub fn load(path: &Path) -> Result<Config, DaemonError> {
@@ -568,6 +612,233 @@ spec_dir = ".factory/specs/"
                 push_remote: "origin".to_string(),
             }),
             "worldarchitect.ai unseen repo derivation must preserve the worldarchitect special case"
+        );
+    }
+
+    // jleechan-dljf (issue #271): acceptance criterion — identical PR
+    // numbers across different repos must never cross-route. The live bug
+    // was ez-gh-actions PRs #52 and #63 getting routed against worldarchitect
+    // PRs with the same numbers. Each repo resolves to a DISTINCT ao_project
+    // (via explicit entry or derived default), so same-number PRs in
+    // different repos are always isolated.
+
+    /// Two different repos with the SAME PR number must resolve to
+    /// DIFFERENT AO projects — proving #52 on worldarchitect cannot
+    /// cross-route to ez-gh-actions and vice versa.
+    #[test]
+    fn same_pr_number_different_repos_do_not_cross_route_issue_52() {
+        let dir = std::env::temp_dir().join("afd_cfg_test_cross_route_52");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("cross_route_52.toml");
+        std::fs::write(
+            &p,
+            r#"
+target_repo = "jleechanorg/worldarchitect.ai"
+ao_project = "worldarchitect"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+"#,
+        )
+        .unwrap();
+        let cfg = load(&p).unwrap();
+
+        // PR #52 on worldarchitect resolves to ao_project="worldarchitect"
+        let wa_routing = cfg.resolve_repo("jleechanorg/worldarchitect.ai").unwrap();
+        // PR #52 on ez-gh-actions resolves to ao_project="ez-gh-actions" (derived default)
+        let ez_routing = cfg.resolve_repo("jleechanorg/ez-gh-actions").unwrap();
+        // PR #52 on dark-factory resolves to ao_project="dark-factory" (derived default)
+        let df_routing = cfg.resolve_repo("jleechanorg/dark-factory").unwrap();
+
+        assert_eq!(wa_routing.ao_project, "worldarchitect");
+        assert_eq!(ez_routing.ao_project, "ez-gh-actions");
+        assert_eq!(df_routing.ao_project, "dark-factory");
+
+        assert_ne!(
+            wa_routing.ao_project, ez_routing.ao_project,
+            "PR #52 on worldarchitect must NOT route to same AO project as PR #52 on ez-gh-actions"
+        );
+        assert_ne!(
+            wa_routing.ao_project, df_routing.ao_project,
+            "PR #52 on worldarchitect must NOT route to same AO project as PR #52 on dark-factory"
+        );
+        assert_ne!(
+            df_routing.ao_project, ez_routing.ao_project,
+            "PR #52 on dark-factory must NOT route to same AO project as PR #52 on ez-gh-actions"
+        );
+    }
+
+    /// Same as above for PR #63: the second concrete example cited in
+    /// issue #271 (ez-gh-actions PR #63 was logged as worldarchitect).
+    #[test]
+    fn same_pr_number_different_repos_do_not_cross_route_issue_63() {
+        let dir = std::env::temp_dir().join("afd_cfg_test_cross_route_63");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("cross_route_63.toml");
+        std::fs::write(
+            &p,
+            r#"
+target_repo = "jleechanorg/worldarchitect.ai"
+ao_project = "worldarchitect"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+
+[repos."jleechanorg/ez-gh-actions"]
+ao_project = "ez-gh-actions-custom"
+push_remote = "ezremote"
+"#,
+        )
+        .unwrap();
+        let cfg = load(&p).unwrap();
+
+        // PR #63 on worldarchitect → worldarchitect
+        let wa_routing = cfg.resolve_repo("jleechanorg/worldarchitect.ai").unwrap();
+        // PR #63 on ez-gh-actions → ez-gh-actions-custom (explicit entry overrides derived)
+        let ez_routing = cfg.resolve_repo("jleechanorg/ez-gh-actions").unwrap();
+
+        assert_eq!(wa_routing.ao_project, "worldarchitect");
+        assert_eq!(ez_routing.ao_project, "ez-gh-actions-custom");
+        assert_ne!(
+            wa_routing.ao_project, ez_routing.ao_project,
+            "PR #63 on worldarchitect must NOT route to same AO project as PR #63 on ez-gh-actions"
+        );
+    }
+
+    // ── jleechan-dljf skeptic fixes ──────────────────────────────────────
+
+    /// jleechan-dljf (issue #271): `is_valid_owner_repo` must reject
+    /// whitespace, control characters, and chars not allowed in GitHub
+    /// owner/repo names. Malformed input must fail closed.
+    #[test]
+    fn is_valid_owner_repo_rejects_whitespace_control_and_invalid_chars() {
+        assert!(is_valid_owner_repo("jleechanorg/dark-factory"));
+        assert!(is_valid_owner_repo("foo-bar/foo_bar.baz"));
+        // Whitespace
+        assert!(!is_valid_owner_repo(" owner/repo"));
+        assert!(!is_valid_owner_repo("owner /repo"));
+        assert!(!is_valid_owner_repo(" \towner/repo"));
+        assert!(!is_valid_owner_repo("owner/repo "));
+        assert!(!is_valid_owner_repo("owner/repo\n"));
+        // Control characters
+        assert!(!is_valid_owner_repo("owner\x00/repo"));
+        assert!(!is_valid_owner_repo("owner/repo\x1f"));
+        assert!(!is_valid_owner_repo("owner/\x7frepo"));
+        // Invalid chars (not alphanumeric, hyphen, underscore, dot)
+        assert!(!is_valid_owner_repo("owner/repo!"));
+        assert!(!is_valid_owner_repo("owner/repo@"));
+        assert!(!is_valid_owner_repo("owner/repo#"));
+        assert!(!is_valid_owner_repo("owner/re$po"));
+        // Empty segments
+        assert!(!is_valid_owner_repo(""));
+        assert!(!is_valid_owner_repo("/repo"));
+        assert!(!is_valid_owner_repo("owner/"));
+        // Too many slashes
+        assert!(!is_valid_owner_repo("a/b/c"));
+    }
+
+    /// jleechan-dljf (issue #271): global target_repo's ao_project must be
+    /// checked against explicit [repos.*] entries for collisions. If the
+    /// global ao_project matches an explicit entry for a DIFFERENT repo,
+    /// routing must fail closed (None) rather than silently routing two
+    /// repos to the same AO project.
+    #[test]
+    fn resolve_repo_fails_for_global_ao_project_collision_with_explicit_repo() {
+        let dir =
+            std::env::temp_dir().join("afd_cfg_test_global_ao_collision");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("global_ao_collision.toml");
+        std::fs::write(
+            &p,
+            r#"
+target_repo = "jleechanorg/dark-factory"
+ao_project = "shared-project"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+
+[repos."jleechanorg/other-repo"]
+ao_project = "shared-project"
+push_remote = "origin"
+"#,
+        )
+        .unwrap();
+        let cfg = load(&p).unwrap();
+        // Explicit entry for other-repo resolves fine.
+        assert!(cfg.resolve_repo("jleechanorg/other-repo").is_some());
+        // Global target_repo (dark-factory) has ao_project="shared-project"
+        // which collides with the explicit [repos."jleechanorg/other-repo"]
+        // entry — must fail closed.
+        assert_eq!(
+            cfg.resolve_repo("jleechanorg/dark-factory"),
+            None,
+            "global target_repo ao_project 'shared-project' collides with explicit [repos.'jleechanorg/other-repo'] entry"
+        );
+    }
+
+    /// jleechan-dljf (issue #271): two explicit [repos] entries with the
+    /// same ao_project must be detectable. The explicit entries themselves
+    /// resolve (they're explicitly configured), but a third derived repo
+    /// that would map to the same ao_project must fail closed.
+    #[test]
+    fn resolve_repo_explicit_explicit_collision_blocked_for_derived() {
+        let dir =
+            std::env::temp_dir().join("afd_cfg_test_explicit_explicit_collision");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("explicit_explicit_collision.toml");
+        std::fs::write(
+            &p,
+            r#"
+target_repo = "jleechanorg/dark-factory"
+ao_project = "dark-factory"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+
+[repos."jleechanorg/repo-a"]
+ao_project = "duplicate-project"
+push_remote = "origin"
+
+[repos."jleechanorg/repo-b"]
+ao_project = "duplicate-project"
+push_remote = "otherremote"
+"#,
+        )
+        .unwrap();
+        let cfg = load(&p).unwrap();
+        // Both explicit entries resolve independently.
+        assert!(cfg.resolve_repo("jleechanorg/repo-a").is_some());
+        assert!(cfg.resolve_repo("jleechanorg/repo-b").is_some());
+        // An unseen repo whose derived ao_project would be
+        // "duplicate-project" collides with BOTH explicit entries.
+        assert_eq!(
+            cfg.resolve_repo("unseenorg/duplicate-project"),
+            None,
+            "derived ao_project 'duplicate-project' collides with multiple explicit [repos] entries"
         );
     }
 }
