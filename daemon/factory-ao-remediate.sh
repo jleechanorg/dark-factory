@@ -58,7 +58,17 @@ else
   MODE="async"
 fi
 
-PROMPT="Factory bead ${BEAD_ID}: drive PR #${PR} on ${TARGET_REPO} to /green + /er. Push to existing branch only; do NOT open new PR; do NOT merge."
+PROMPT="Factory bead ${BEAD_ID}: drive PR #${PR} on ${TARGET_REPO} to /green + /er. Push to existing branch only; do NOT open new PR; do NOT merge.
+
+MANDATORY (bead ez-gh-actions-oxog — PR-scope-mismatch prevention):
+
+1) Read the bead body via 'br show ${BEAD_ID} --format json' and identify which acceptance criteria from the bead description the diff actually addresses. Surface this as a 'Bead acceptance criteria addressed:' line in the PR body (and as a 'Bead acceptance criteria addressed:' section in the final commit message body). If the bead's body lists numbered criteria (e.g. AC1, AC2, acceptance criterion 1), list each by its identifier; otherwise list the key phrases from the bead body that the diff implements.
+
+2) The branch name must reflect WHAT the diff actually does, not the bead it was filed under. If the bead title mentions keywords (filesystem, migration, convergence, timeout, deadline, drain, etc.) but the diff is implementing a different fix, surface that explicitly in the PR body. The factory's dispatch-record emits a [oxog WARN] when bead title scope-stems do not appear in the branch name — do NOT silently rename a generic branch to look like a different fix; instead, document the scope in the PR body.
+
+3) The PR body MUST contain a 'Bead acceptance criteria addressed:' section listing which criteria from the bead body this PR addresses. The diff MUST contain those keywords AND tests MUST exercise those paths. If the diff does not address all acceptance criteria in the bead, the PR body MUST list which ones are intentionally deferred and why.
+
+Reference: bead ez-gh-actions-oxog. Live evidence: ez-gh-actions PR #56 had mergeable=unstable, fmt-dirty, and a real defect not addressed because the branch title claimed one fix but the diff shipped another."
 
 # Pre-flight: ensure AO is reachable. Bounded at 5s wallclock so the
 # async path never blocks more than that on cold-start. Two failure modes

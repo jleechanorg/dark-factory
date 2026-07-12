@@ -112,6 +112,14 @@ Capture:
 
 ## 6. PR + bead status
 
+### 6a. Bead acceptance criteria addressed (MANDATORY — bead ez-gh-actions-oxog)
+
+The PR body MUST contain a `## Bead acceptance criteria addressed` section listing which acceptance-criteria items from the bead body this PR implements. If the bead lists numbered criteria (e.g. `AC1`, `AC2`, `acceptance criterion 1`), list each by its identifier; otherwise list the key phrases from the bead body that the diff actually implements. If the diff does not address all criteria, list which are intentionally deferred and why.
+
+The branch name `feat/qw5-n-shadow-fanout` reflects what the diff actually does (N-shadow reviewer fan-out), NOT the bead it was filed under. The factory's dispatch-record emits a `[oxog WARN]` when bead title scope-stems do not appear in the branch name — if you are working on a fix whose bead title mentions keywords the diff does not address, document the scope honestly in the PR body instead of renaming the branch to disguise it.
+
+### 6b. Open the PR
+
 Once pilot runs and the implementation is locked, push the branch and open the PR:
 
 ```bash

@@ -77,6 +77,83 @@ sql() { sqlite3 -cmd '.timeout 5000' "$DB" "$@"; }
 q() { printf '%s' "$1" | sed "s/'/''/g"; }
 js() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
 valid_bead_id() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die_code $EX_BEAD_ID "invalid bead_id: $1"; }
+
+# warn_branch_scope_mismatch <bead_id> <branch> — bead ez-gh-actions-oxog.
+#
+# Compares scope-defining keywords from the bead's title (sourced via
+# `br show --json`) against the branch name. If a bead title contains any of
+# the curated "scope-defining" stems AND the branch contains NONE of them,
+# emit a stderr WARN to the dispatch log. The verifier can surface this
+# warn during review.
+#
+# Rationale: 2026-07-12 cold skeptic on ez-gh-actions PR #56 — the bead
+# title claimed lima/dual-namespace/converge work, but the branch was named
+# after the bead-id and the diff shipped unrelated deadline-clamping code.
+# The warn is the early factory-side signal that "branch name does not
+# reflect what the bead is actually about" so the verifier can spot-check
+# the PR body and diff scope before approving merge.
+#
+# This is a WARN, not a hard fail. Coders may legitimately use generic
+# branch names (e.g. `fix/<bead_id>`) when the bead title is already
+# descriptive. The warn is meant to catch the mismatch pattern, not to
+# enforce branch-naming policy.
+#
+# The function intentionally swallows all errors — a missing br binary, an
+# unparseable JSON, or a br db lookup failure must NEVER block dispatch.
+# A missing signal is better than a false hard-fail that strands beads.
+warn_branch_scope_mismatch() {
+  local bead_id="$1" branch="$2"
+  # Curated scope-defining stems. Add to this set when a new class of
+  # PR-scope-mismatch is observed; do NOT add generic terms (e.g. "fix",
+  # "the", "and") — those create false positives.
+  local scope_stems="lima colima docker container filesystem fs migration migrate converge convergence timeout deadline drain clamp reap sigterm signal restart probe detect recover recovery stale orphan zombie webhook"
+  local bead_title=""
+  bead_title="$("$BR_BIN" show "$bead_id" --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    if isinstance(data, list) and data:
+        print((data[0] or {}).get("title", "") or "")
+    elif isinstance(data, dict):
+        print(data.get("title", "") or "")
+    else:
+        print("")
+except Exception:
+    pass' 2>/dev/null || true)"
+  if [ -z "$bead_title" ]; then
+    return 0  # no signal — silently skip
+  fi
+  local title_lc branch_lc
+  title_lc="$(printf '%s' "$bead_title" | tr '[:upper:]' '[:lower:]')"
+  branch_lc="$(printf '%s' "$branch" | tr '[:upper:]' '[:lower:]')"
+  local title_stems=()
+  local stem
+  for stem in $scope_stems; do
+    # Match if the stem appears as a substring in the title (covers
+    # `converge` matching `convergence` and `reap` matching `reaper`).
+    case " $title_lc " in
+      *" $stem "*|*"${stem}"*)
+        title_stems+=("$stem")
+        ;;
+    esac
+  done
+  if [ "${#title_stems[@]}" -eq 0 ]; then
+    return 0  # title has no scope-defining stems — nothing to check
+  fi
+  local branch_match=0
+  for stem in "${title_stems[@]}"; do
+    case " $branch_lc " in
+      *"${stem}"*)
+        branch_match=1
+        break
+        ;;
+    esac
+  done
+  if [ "$branch_match" -eq 0 ]; then
+    echo "[oxog WARN] bead=${bead_id} branch='${branch}' — bead title claims scope (${title_stems[*]}) but branch name contains none of those stems. PR body MUST list the bead's acceptance criteria it addresses; verifier will spot-check diff scope. (bead ez-gh-actions-oxog)" >&2
+  fi
+}
+
 valid_branch()  {
   [[ "$1" =~ ^factory/[A-Za-z0-9._-]+-r[0-9]+$ ]] && return 0
   if [[ "$1" =~ ^[A-Za-z0-9._/-]+$ ]] && [[ ! "$1" =~ ^factory/ ]] && [[ ! "$1" =~ ^refs/ ]] && [[ "$1" != "HEAD" ]]; then
@@ -157,6 +234,10 @@ dispatch-record)
   [ $# -eq 3 ] || die_code $EX_USAGE "usage: dispatch-record <bead_id> <branch>"
   valid_bead_id "$2" || die_code $EX_BEAD_ID "invalid bead_id: $2"
   valid_branch "$3"   || die_code $EX_VALID_INPUT "invalid branch: $3"
+  # Bead ez-gh-actions-oxog: warn-only branch-scope gate (PR-scope-mismatch
+  # prevention). Logs to stderr; never blocks dispatch. See the helper above
+  # for the curated stem list and rationale.
+  warn_branch_scope_mismatch "$2" "$3"
   # CR-6: probe row count FIRST so a missing bead returns rc=8 (EX_NOT_FOUND)
   # instead of the rc=5 (EX_REQUIRE_STATE) it would produce if we let `cur` be
   # empty and matched the case fallback. get_field returns empty for both
