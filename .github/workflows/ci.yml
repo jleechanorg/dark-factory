@@ -87,10 +87,10 @@ jobs:
         # rust-toolchain action installs rustup + the requested toolchain in
         # one step; we then cache the daemon crate's build artifacts so
         # subsequent runs are fast.
-        uses: dtolnay/rust-toolchain@e3e0712b0c5996967f93e5070f25f594c9018c3c  # stable
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1 (stable)
 
       - name: Cache cargo registry/target for daemon crate
-        uses: Swatinem/rust-cache@82a2a2f4dd44e2dad84fb7612f5b46469ce0bfee  # v2.7.5
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc  # v2.9.1
         with:
           workspaces: daemon -> target
 
