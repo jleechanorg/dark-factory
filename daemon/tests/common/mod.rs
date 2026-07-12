@@ -639,6 +639,9 @@ pub struct FakeStateStore {
     pub rejections: RefCell<HashMap<(String, u32), RejectionRecord>>,
     pub fail_save_for_state: RefCell<Vec<(String, OverlayState)>>,
     pub calls: RefCell<Vec<String>>,
+    /// PR #272: in-memory mirror of the `prompt_payload` side
+    /// table. `bead_id -> path`; a rebind replaces the entry.
+    pub payload_bindings: RefCell<HashMap<String, String>>,
 }
 
 impl FakeStateStore {
@@ -735,6 +738,71 @@ impl StateStore for FakeStateStore {
             if overlay.state == OverlayState::Dispatched || overlay.state == OverlayState::Attested
             {
                 out.push(overlay.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    fn bind_payload(&self, bead_id: &str, path: &str) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("bind_payload({bead_id},{path})"));
+        self.payload_bindings
+            .borrow_mut()
+            .insert(bead_id.to_string(), path.to_string());
+        Ok(())
+    }
+
+    fn unbind_payload(&self, bead_id: &str) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("unbind_payload({bead_id})"));
+        self.payload_bindings.borrow_mut().remove(bead_id);
+        Ok(())
+    }
+
+    fn count_active_references_to_path(&self, path: &str) -> Result<usize, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("count_active_references_to_path({path})"));
+        // JOIN with overlay to exclude terminal states -- mirrors the
+        // production SQL JOIN. A row whose bead is in a terminal
+        // state doesn't count toward keeping the file alive.
+        let mut count = 0;
+        let bindings = self.payload_bindings.borrow();
+        let overlays = self.overlays.borrow();
+        for (bid, p) in bindings.iter() {
+            if p == path {
+                if let Some(o) = overlays.get(bid) {
+                    if !matches!(
+                        o.state,
+                        OverlayState::Ready | OverlayState::HumanHeld | OverlayState::BudgetHeld
+                    ) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    fn list_active_payload_paths(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push("list_active_payload_paths".into());
+        // JOIN-equivalent: skip rows whose bead is in a terminal state.
+        let bindings = self.payload_bindings.borrow();
+        let overlays = self.overlays.borrow();
+        let mut out = std::collections::HashSet::new();
+        for (bid, p) in bindings.iter() {
+            let excluded = overlays.get(bid).is_some_and(|o| {
+                matches!(
+                    o.state,
+                    OverlayState::Ready | OverlayState::HumanHeld | OverlayState::BudgetHeld
+                )
+            });
+            if !excluded {
+                out.insert(p.clone());
             }
         }
         Ok(out)

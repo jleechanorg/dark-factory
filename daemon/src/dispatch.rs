@@ -155,9 +155,9 @@ pub fn dispatch_ready(
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             },
             Err(err) if err.is_transient() => {
                 report
@@ -273,14 +273,20 @@ pub fn dispatch_ready(
             // in this PR; the dispatch batch halts and the tick
             // machinery surfaces the halt.
             _ => {
-                let full = build_coder_prompt_lossless(
-                    bead, &branch, &repo, &routing.push_remote,
-                );
+                let full = build_coder_prompt_lossless(bead, &branch, &repo, &routing.push_remote);
                 match crate::prompt_payload::materialize_or_bootstrap(&full)? {
                     crate::prompt_payload::MaterializeOutcome::NoIndirectionNeeded => {
                         build_coder_prompt(bead, &branch, &repo, &routing.push_remote)
                     }
-                    crate::prompt_payload::MaterializeOutcome::Indirected(i) => i.bootstrap,
+                    crate::prompt_payload::MaterializeOutcome::Indirected(i) => {
+                        // Persist the durably-bound payload reference
+                        // BEFORE spawning the worker so the bounded
+                        // orphan sweep can never reap a payload an
+                        // active coder session depends on (even across
+                        // a daemon restart). Errors here halt the batch.
+                        store.bind_payload(&bead.id, i.payload_path.to_string_lossy().as_ref())?;
+                        i.bootstrap
+                    }
                 }
             }
         };
@@ -494,12 +500,20 @@ pub fn dispatch_ready(
 
     // PR #272: bounded orphan-payload cleanup. Runs once per dispatch
     // batch, bounded by a small delete_count so a full directory can't
-    // stall the tick. Failures are swallowed -- this is best-effort
-    // retention, never an excuse to fail the dispatch loop.
-    let _ = crate::prompt_payload::cleanup_orphan_payloads(
-        crate::prompt_payload::ORPHAN_RETENTION_SECS,
-        crate::prompt_payload::ORPHAN_CLEANUP_BATCH,
-    );
+    // stall the tick. The skip-set is the list of absolute paths
+    // currently bound to an active overlay -- the file on disk is
+    // safe from this sweep until EVERY bead referencing it has
+    // transitioned past a terminal state (handled via the
+    // `count_active_references_to_path` JOIN in SqliteStateStore::save).
+    // Failures are swallowed -- this is best-effort retention, never
+    // an excuse to fail the dispatch loop.
+    if let Ok(active) = store.list_active_payload_paths() {
+        let _ = crate::prompt_payload::cleanup_orphan_payloads(
+            crate::prompt_payload::ORPHAN_RETENTION_SECS,
+            crate::prompt_payload::ORPHAN_CLEANUP_BATCH,
+            &active,
+        );
+    }
 
     Ok(report)
 }
@@ -684,14 +698,22 @@ fn shrink_by(text: &mut String, excess: usize, marker: &str) {
     if let Some(pos) = text.rfind(marker) {
         text.truncate(pos);
     }
-    let target = text.len().saturating_sub(excess).saturating_sub(marker.len());
+    let target = text
+        .len()
+        .saturating_sub(excess)
+        .saturating_sub(marker.len());
     truncate_at_char_boundary(text, target);
     if !text.is_empty() {
         text.push_str(marker);
     }
 }
 
-fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str, remote: &str) -> String {
+fn build_coder_prompt(
+    bead: &crate::tools::Bead,
+    branch: &str,
+    target_repo: &str,
+    remote: &str,
+) -> String {
     let mut description = bead.description.trim().to_string();
     if description.len() > CODER_PROMPT_DESCRIPTION_CAP {
         truncate_at_char_boundary(&mut description, CODER_PROMPT_DESCRIPTION_CAP);
@@ -919,10 +941,7 @@ mod tests {
                     ),
                     (
                         "agy".to_string(),
-                        DaemonError::Deferred(format!(
-                            "REQUEST=sq-scripted-{}",
-                            spec.bead_id
-                        )),
+                        DaemonError::Deferred(format!("REQUEST=sq-scripted-{}", spec.bead_id)),
                     ),
                 ]));
             }
@@ -990,6 +1009,9 @@ mod tests {
         branch_beads: RefCell<HashMap<String, String>>,
         rejections: RefCell<HashMap<(String, u32), (String, String)>>,
         fail_save_for_state: RefCell<Vec<(String, OverlayState)>>,
+        /// PR #272: in-memory mirror of the `prompt_payload` side
+        /// table. `bead_id -> path`; a rebind replaces the entry.
+        payload_bindings: RefCell<HashMap<String, String>>,
     }
 
     impl FakeStateStore {
@@ -1078,6 +1100,34 @@ mod tests {
                 }
             }
             Ok(out)
+        }
+
+        fn bind_payload(&self, bead_id: &str, path: &str) -> Result<(), DaemonError> {
+            self.payload_bindings
+                .borrow_mut()
+                .insert(bead_id.to_string(), path.to_string());
+            Ok(())
+        }
+
+        fn unbind_payload(&self, bead_id: &str) -> Result<(), DaemonError> {
+            self.payload_bindings.borrow_mut().remove(bead_id);
+            Ok(())
+        }
+
+        fn count_active_references_to_path(&self, path: &str) -> Result<usize, DaemonError> {
+            Ok(self
+                .payload_bindings
+                .borrow()
+                .values()
+                .filter(|p| *p == path)
+                .count())
+        }
+
+        fn list_active_payload_paths(
+            &self,
+        ) -> Result<std::collections::HashSet<String>, DaemonError> {
+            let b = self.payload_bindings.borrow();
+            Ok(b.values().cloned().collect())
         }
 
         fn bump_autonomy_secs(&self, bead_id: &str, delta_secs: u64) -> Result<(), DaemonError> {
@@ -1266,9 +1316,9 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -1841,7 +1891,12 @@ mod tests {
             file_tree_summary: "src/\n  flux.rs\n  main.rs".into(),
             external_ref: Some("jleechanorg/delorean#42".into()),
         };
-        let prompt = build_coder_prompt(&bead, "factory/bead-x-r1", "jleechanorg/delorean", "worldai");
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/bead-x-r1",
+            "jleechanorg/delorean",
+            "worldai",
+        );
 
         assert!(prompt.contains("Fix the flux capacitor"), "title missing");
         assert!(
@@ -1939,8 +1994,7 @@ mod tests {
 
         let bead = Bead {
             id: "jleechan-j4i8".into(),
-            title: "Regression-shape bead: description + tree summary would sum past 4096"
-                .into(),
+            title: "Regression-shape bead: description + tree summary would sum past 4096".into(),
             // A "moderate-length" description like the live incident's
             // ~1,100 chars, but sized here to sit under its own 6,000-char
             // per-section cap while still contributing meaningfully to the
@@ -2020,7 +2074,12 @@ mod tests {
         };
 
         // Must not panic.
-        let prompt = build_coder_prompt(&bead, "factory/bead-total-unicode-r1", "owner/repo", "origin");
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/bead-total-unicode-r1",
+            "owner/repo",
+            "origin",
+        );
         assert!(prompt.len() <= CODER_PROMPT_TOTAL_CAP);
     }
 
@@ -2105,7 +2164,10 @@ mod tests {
         let prompt = &prompts[0].1;
         assert!(prompt.contains("REPO: owner/repo"), "prompt: {prompt}");
         assert!(prompt.contains("REMOTE: origin"), "prompt: {prompt}");
-        assert!(prompt.contains("BRANCH: factory/bead-0-r1"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("BRANCH: factory/bead-0-r1"),
+            "prompt: {prompt}"
+        );
         assert!(
             prompt.contains("git push origin factory/bead-0-r1"),
             "prompt must state the literal push command verbatim: {prompt}"
@@ -2152,7 +2214,10 @@ mod tests {
 
         let prompts = sessions.spawn_prompts.borrow();
         let prompt = &prompts[0].1;
-        assert!(prompt.contains("REPO: jleechanorg/worldarchitect.ai"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("REPO: jleechanorg/worldarchitect.ai"),
+            "prompt: {prompt}"
+        );
         assert!(prompt.contains("REMOTE: worldai"), "prompt: {prompt}");
         assert!(
             prompt.contains("git push worldai factory/bead-0-r1"),

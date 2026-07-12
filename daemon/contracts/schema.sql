@@ -98,6 +98,28 @@ CREATE TABLE IF NOT EXISTS branch_registry (
   created_at TEXT NOT NULL
 );
 
+-- PR #272: durable side table of persisted coder-prompt payloads.
+-- Composite primary key (bead_id, path) so two beads that share a
+-- content-addressed path (identical >4000-char prompt -> same SHA)
+-- each get a row; the file persists until BOTH beads reach a
+-- terminal state. A row exists for every bead whose dispatch went
+-- through the indirection path. Rows are removed when a bead
+-- reaches a terminal state -- by `SqliteStateStore::save` AFTER the
+-- overlay terminal row is committed. The file is unlinked only when
+-- the active reference count for that path falls to ZERO (no other
+-- bead still references it).
+--
+-- Why a side table instead of a `payload_path` column on `bead_overlay`:
+-- a column-based approach forces every test-only `BeadOverlay {...}`
+-- literal to add a new field; this side table keeps `BeadOverlay`
+-- unchanged and centralizes payload metadata where retention logic
+-- already lives.
+CREATE TABLE IF NOT EXISTS prompt_payload (
+  bead_id    TEXT PRIMARY KEY,
+  path       TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 
 -- Circuit breaker: tracking of review rejections per attempt to detect consecutive failures
 CREATE TABLE IF NOT EXISTS review_rejection (

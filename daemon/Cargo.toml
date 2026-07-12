@@ -18,3 +18,11 @@ thiserror = "2"
 # aws-lc-rs / libcrypto). Pinned to the same major as the rest of the
 # resolver footprint.
 sha2 = "0.10"
+# jleechan-8e0x: `O_NOFOLLOW` constant for the no-follow open in
+# `prompt_payload.rs` is platform-defined (different bit on Linux vs
+# macOS). Using `libc::O_NOFOLLOW` under `cfg(unix)` keeps the
+# constant portable across the daemon's Linux (systemd) and macOS
+# (launchd) production targets without hardcoding a single
+# arch-specific value. The dep is already a transitive of `rusqlite`
+# on Linux/macOS so there is no compile-time cost.
+libc = "0.2"

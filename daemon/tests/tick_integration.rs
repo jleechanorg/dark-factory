@@ -431,9 +431,9 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             })
             .unwrap();
     }
@@ -2081,7 +2081,10 @@ fn adopted_red_pr_stage2_reroll_spawns_remediation_session_leaves_pr_open() {
     let mut cfg = test_cfg();
     cfg.stage = 2; // Stage 2: actually execute reroll() rather than just recording the verdict
     let mut vcs = FakeVcs::new();
-    vcs.heads.insert("alice/my-cool-feature".into(), "pre-session-sha-abc123".into());
+    vcs.heads.insert(
+        "alice/my-cool-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
     let telemetry_log = std::env::temp_dir().join("afd_adopted_stage2_success.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -2217,7 +2220,10 @@ fn adopted_red_pr_stage2_reroll_spawn_failure_parks_human_held_with_escalation()
     let mut cfg = test_cfg();
     cfg.stage = 2;
     let mut vcs = FakeVcs::new();
-    vcs.heads.insert("alice/my-conflicted-feature".into(), "pre-session-sha-abc123".into());
+    vcs.heads.insert(
+        "alice/my-conflicted-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
     sessions.fail_spawn_for("fake-bead-1");
     let telemetry_log = std::env::temp_dir().join("afd_adopted_stage2_conflict.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -2493,12 +2499,16 @@ fn newly_intaken_bead_dispatch_uses_real_tracker_title() {
     // tracker title reaches the coder, not an empty stub — is preserved as a
     // containment check, plus the tracker-supplied description.
     assert!(
-        prompts[0].1.contains("Wire a durable Linux trigger (owner/repo)"),
+        prompts[0]
+            .1
+            .contains("Wire a durable Linux trigger (owner/repo)"),
         "new intake must dispatch the real tracker title, not an empty stub prompt: {}",
         prompts[0].1
     );
     assert!(
-        prompts[0].1.contains("systemd user unit acceptance criteria"),
+        prompts[0]
+            .1
+            .contains("systemd user unit acceptance criteria"),
         "tracker-supplied description must reach the coder prompt: {}",
         prompts[0].1
     );
@@ -4099,9 +4109,9 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
                 session_id: Some("sess-1".into()),
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             })
             .unwrap();
         store
@@ -4589,6 +4599,22 @@ impl StateStore for QdwAttemptStore {
 
     fn list_active_overlays(&self) -> Result<Vec<BeadOverlay>, DaemonError> {
         self.inner.list_active_overlays()
+    }
+
+    fn bind_payload(&self, bead_id: &str, path: &str) -> Result<(), DaemonError> {
+        self.inner.bind_payload(bead_id, path)
+    }
+
+    fn unbind_payload(&self, bead_id: &str) -> Result<(), DaemonError> {
+        self.inner.unbind_payload(bead_id)
+    }
+
+    fn count_active_references_to_path(&self, path: &str) -> Result<usize, DaemonError> {
+        self.inner.count_active_references_to_path(path)
+    }
+
+    fn list_active_payload_paths(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
+        self.inner.list_active_payload_paths()
     }
 
     fn bump_autonomy_secs(&self, bead_id: &str, delta_secs: u64) -> Result<(), DaemonError> {
@@ -5793,10 +5819,8 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         },
     );
 
-    let telemetry_log = std::env::temp_dir().join(format!(
-        "afd_wzgl_gate_report_{}.jsonl",
-        std::process::id()
-    ));
+    let telemetry_log =
+        std::env::temp_dir().join(format!("afd_wzgl_gate_report_{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&telemetry_log);
 
     let summary = run_tick(
@@ -5815,15 +5839,20 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     )
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
-    assert_eq!(summary.beads_ready, 1, "bead should reach READY via the agy fallback verdict");
+    assert_eq!(
+        summary.beads_ready, 1,
+        "bead should reach READY via the agy fallback verdict"
+    );
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
     let gate_assessment_line = telemetry
         .lines()
         .find(|line| line.contains("\"eventType\":\"GATE_ASSESSMENT\""))
         .unwrap_or_else(|| panic!("no GATE_ASSESSMENT line found; telemetry:\n{telemetry}"));
-    let parsed: serde_json::Value = serde_json::from_str(gate_assessment_line)
-        .unwrap_or_else(|e| panic!("GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(gate_assessment_line).unwrap_or_else(|e| {
+            panic!("GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}")
+        });
     let context = &parsed["context"];
 
     // jleechan-wzgl (PR #239 review round 1): `gates` MUST be a
@@ -5859,9 +5888,9 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         );
     }
 
-    let skeptic_reviewers = context["skeptic_reviewers"]
-        .as_array()
-        .unwrap_or_else(|| panic!("GATE_ASSESSMENT context.skeptic_reviewers must be an array; context:\n{context}"));
+    let skeptic_reviewers = context["skeptic_reviewers"].as_array().unwrap_or_else(|| {
+        panic!("GATE_ASSESSMENT context.skeptic_reviewers must be an array; context:\n{context}")
+    });
     let skeptic_reviewers: Vec<&str> = skeptic_reviewers
         .iter()
         .filter_map(|v| v.as_str())
@@ -6019,8 +6048,7 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
     snapshot.ci_status = "failure".into();
     scm.pr_snapshots.insert(pr, snapshot);
 
-    let telemetry_log =
-        std::env::temp_dir().join("afd_9xrs_cross_repo_verification_loop.jsonl");
+    let telemetry_log = std::env::temp_dir().join("afd_9xrs_cross_repo_verification_loop.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
     let summary = run_tick(
@@ -6110,7 +6138,9 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
     let skeptic_prompt = llm_calls
         .iter()
         .find(|c| c.contains("Stage-1 Skeptic"))
-        .unwrap_or_else(|| panic!("expected a Stage-1 Skeptic prompt among judge() calls, got: {llm_calls:?}"));
+        .unwrap_or_else(|| {
+            panic!("expected a Stage-1 Skeptic prompt among judge() calls, got: {llm_calls:?}")
+        });
     assert!(
         skeptic_prompt.contains("owner/repo"),
         "skeptic prompt must embed the bead's own repo, got: {skeptic_prompt:?}"
@@ -7124,7 +7154,11 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
     let mut scm = FakeScm::new();
     let mut snap_a = qdw_green_snapshot(
         801,
-        vec![PrComment { author: "dark-factory-er".into(), body: "/er PASS".into(), created_at_epoch: 0 }],
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
     );
     snap_a.ci_success = false;
     snap_a.ci_status = "failure".into();
@@ -7132,7 +7166,11 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
 
     let mut snap_b = qdw_green_snapshot(
         802,
-        vec![PrComment { author: "dark-factory-er".into(), body: "/er PASS".into(), created_at_epoch: 0 }],
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
     );
     snap_b.ci_success = false;
     snap_b.ci_status = "failure".into();
@@ -7156,8 +7194,18 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
         .insert("bob/cq8r-bead-b-branch".into(), "bead-b-head-sha".into());
 
     for (bead_id, pr, branch, prior_text) in [
-        ("cq8r-bead-a", 801u64, "alice/cq8r-bead-a-branch", "BEAD-A-PRIOR-MARKER"),
-        ("cq8r-bead-b", 802u64, "bob/cq8r-bead-b-branch", "bead-b-prior-text"),
+        (
+            "cq8r-bead-a",
+            801u64,
+            "alice/cq8r-bead-a-branch",
+            "BEAD-A-PRIOR-MARKER",
+        ),
+        (
+            "cq8r-bead-b",
+            802u64,
+            "bob/cq8r-bead-b-branch",
+            "bead-b-prior-text",
+        ),
     ] {
         store
             .save(&BeadOverlay {
