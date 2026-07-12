@@ -28,7 +28,7 @@ use daemon::er_runner;
 use daemon::errors::DaemonError;
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
-use daemon::tools::{Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrSnapshot, Scm};
+use daemon::tools::{Bead, BeadStatus, Issue, LabeledPr, Llm, Permission, PrComment, PrSnapshot, Scm};
 use daemon::verifier::SkepticVerdict;
 
 fn test_cfg() -> Config {
@@ -7538,4 +7538,503 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
 
     let _ = std::fs::remove_file(&telemetry_log);
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+// ─────────────────────────────────────────────────────────────
+// jleechan-xsg4 (issue #270): Fail-closed overlay reconciliation
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn test_bead_reconciliation_missing_bead_parks_human_held() {
+    let cfg = test_cfg();
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let vcs = FakeVcs::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_bead_missing_test");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let overlay = BeadOverlay {
+        bead_id: "bead-missing-1".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 0,
+        spend_usd: 0.0,
+        pr_number: Some(300),
+        branch: Some("factory/bead-missing-1-r1".into()),
+        session_id: Some("sess-abc".into()),
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+    };
+    store.save(&overlay).unwrap();
+    store.register_branch("bead-missing-1", "factory/bead-missing-1-r1").unwrap();
+
+    tracker
+        .bead_statuses
+        .borrow_mut()
+        .insert("bead-missing-1".into(), None);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("tick should succeed");
+
+    assert_eq!(
+        summary.beads_reconciled_bead_missing, 1,
+        "missing bead MUST be counted in beads_reconciled_bead_missing"
+    );
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "missing bead overlay MUST be parked HUMAN_HELD"
+    );
+
+    let final_overlay = store.load("bead-missing-1").unwrap().unwrap();
+    assert_eq!(
+        final_overlay.state,
+        OverlayState::HumanHeld,
+        "overlay MUST transition to HUMAN_HELD (fail-closed)"
+    );
+    assert!(
+        final_overlay
+            .park_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("bead_missing")),
+        "park_reason must indicate bead was missing, got: {final_overlay:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&telemetry_dir);
+}
+
+#[test]
+fn test_bead_reconciliation_closed_bead_parks_human_held() {
+    let cfg = test_cfg();
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let vcs = FakeVcs::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_bead_closed_test");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let overlay = BeadOverlay {
+        bead_id: "bead-closed-1".into(),
+        state: OverlayState::Dispatched,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 0,
+        spend_usd: 0.0,
+        pr_number: Some(301),
+        branch: Some("factory/bead-closed-1-r1".into()),
+        session_id: Some("sess-def".into()),
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+    };
+    store.save(&overlay).unwrap();
+
+    tracker
+        .bead_statuses
+        .borrow_mut()
+        .insert("bead-closed-1".into(), Some(BeadStatus::Closed));
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("tick should succeed");
+
+    assert_eq!(
+        summary.beads_reconciled_bead_closed, 1,
+        "closed bead MUST be counted in beads_reconciled_bead_closed"
+    );
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "closed bead overlay MUST be parked HUMAN_HELD"
+    );
+
+    let final_overlay = store.load("bead-closed-1").unwrap().unwrap();
+    assert_eq!(
+        final_overlay.state,
+        OverlayState::HumanHeld,
+        "overlay MUST transition to HUMAN_HELD (fail-closed)"
+    );
+    assert!(
+        final_overlay
+            .park_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("bead_closed")),
+        "park_reason must indicate bead was closed, got: {final_overlay:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&telemetry_dir);
+}
+
+#[test]
+fn test_stale_dispatched_empty_session_id_requeues() {
+    let cfg = test_cfg();
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let vcs = FakeVcs::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_empty_session_test");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let overlay = BeadOverlay {
+        bead_id: "bead-empty-sid-1".into(),
+        state: OverlayState::Dispatched,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 0,
+        spend_usd: 0.0,
+        pr_number: None,
+        branch: Some("factory/bead-empty-sid-1-r1".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+    };
+    store.save(&overlay).unwrap();
+
+    tracker
+        .bead_statuses
+        .borrow_mut()
+        .insert("bead-empty-sid-1".into(), Some(BeadStatus::Open));
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    assert_eq!(
+        summary.beads_recovered_stale_dispatched, 1,
+        "empty-session-id DISPATCHED MUST be counted in beads_recovered_stale_dispatched"
+    );
+
+    let final_overlay = store.load("bead-empty-sid-1").unwrap().unwrap();
+    assert_eq!(
+        final_overlay.state,
+        OverlayState::Queued,
+        "empty-session-id DISPATCHED overlay MUST be requeued to QUEUED"
+    );
+    assert_eq!(
+        final_overlay.session_id, None,
+        "session_id must be cleared on requeue"
+    );
+    assert_eq!(
+        final_overlay.branch, None,
+        "branch must be cleared on requeue"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&telemetry_dir);
+}
+
+#[test]
+fn test_stale_dispatched_dead_session_requeues() {
+    let cfg = test_cfg();
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let vcs = FakeVcs::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_dead_session_test");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let overlay = BeadOverlay {
+        bead_id: "bead-dead-sess-1".into(),
+        state: OverlayState::Dispatched,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 7200,
+        spend_usd: 0.0,
+        pr_number: None,
+        branch: Some("factory/bead-dead-sess-1-r1".into()),
+        session_id: Some("sess-dead-1".into()),
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+    };
+    store.save(&overlay).unwrap();
+
+    tracker
+        .bead_statuses
+        .borrow_mut()
+        .insert("bead-dead-sess-1".into(), Some(BeadStatus::Open));
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    assert_eq!(
+        summary.beads_recovered_stale_dispatched, 1,
+        "dead-session DISPATCHED MUST be counted in beads_recovered_stale_dispatched"
+    );
+
+    let final_overlay = store.load("bead-dead-sess-1").unwrap().unwrap();
+    assert_eq!(
+        final_overlay.state,
+        OverlayState::Queued,
+        "dead-session DISPATCHED overlay MUST be requeued to QUEUED"
+    );
+    assert_eq!(
+        final_overlay.autonomy_secs, 0,
+        "autonomy_secs must reset to 0 on requeue"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&telemetry_dir);
+}
+
+#[test]
+fn test_stale_dispatched_live_session_not_requeued() {
+    let cfg = test_cfg();
+    let mut scm = FakeScm::new();
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.remote_branches.insert(
+        "factory/bead-live-sess-1-r1".into(),
+        Some(now_epoch - 60), // committed 60s ago (not silent)
+    );
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let vcs = FakeVcs::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_live_session_test");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let overlay = BeadOverlay {
+        bead_id: "bead-live-sess-1".into(),
+        state: OverlayState::Dispatched,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 7200,
+        spend_usd: 0.0,
+        pr_number: None,
+        branch: Some("factory/bead-live-sess-1-r1".into()),
+        session_id: Some("sess-live-1".into()),
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+    };
+    store.save(&overlay).unwrap();
+
+    tracker
+        .bead_statuses
+        .borrow_mut()
+        .insert("bead-live-sess-1".into(), Some(BeadStatus::Open));
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    assert_eq!(
+        summary.beads_recovered_stale_dispatched, 0,
+        "live-session DISPATCHED MUST NOT be requeued"
+    );
+
+    let final_overlay = store.load("bead-live-sess-1").unwrap().unwrap();
+    assert_eq!(
+        final_overlay.state,
+        OverlayState::Dispatched,
+        "live-session overlay MUST stay DISPATCHED"
+    );
+    assert!(
+        final_overlay.session_id.is_some(),
+        "session_id must persist for a live session"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&telemetry_dir);
+}
+
+#[test]
+fn test_stale_active_fixture_count_decreases() {
+    let cfg = test_cfg();
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let vcs = FakeVcs::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_fixture_count_test");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    for (bead_id, state, session_id, bead_status, aut_secs) in &[
+        (
+            "fixture-closed",
+            OverlayState::Dispatched,
+            Some("sess-a"),
+            Some(BeadStatus::Closed),
+            0u64,
+        ),
+        (
+            "fixture-stale-dispatched",
+            OverlayState::Dispatched,
+            None,
+            Some(BeadStatus::Open),
+            5000,
+        ),
+    ] {
+        let overlay = BeadOverlay {
+            bead_id: (*bead_id).into(),
+            state: *state,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: *aut_secs,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some(format!("factory/{bead_id}-r1")),
+            session_id: session_id.map(|s| s.to_string()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        };
+        store.save(&overlay).unwrap();
+        if let Some(s) = bead_status {
+            tracker
+                .bead_statuses
+                .borrow_mut()
+                .insert((*bead_id).into(), Some(*s));
+        } else {
+            tracker
+                .bead_statuses
+                .borrow_mut()
+                .insert((*bead_id).into(), None);
+        }
+    }
+
+    let pre_active = store.list_active_overlays().unwrap();
+    assert_eq!(
+        pre_active.len(), 2,
+        "pre-condition: 2 active overlays (2 DISPATCHED)"
+    );
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    let post_active = store.list_active_overlays().unwrap();
+    assert_eq!(
+        post_active.len(), 0,
+        "post-condition: 0 active overlays remain after reconciliation"
+    );
+
+    assert_eq!(
+        summary.beads_reconciled_bead_closed, 1,
+        "fixture-closed must be reconciled"
+    );
+    assert_eq!(
+        summary.beads_recovered_stale_dispatched, 1,
+        "fixture-stale-dispatched must be recovered"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&telemetry_dir);
 }
