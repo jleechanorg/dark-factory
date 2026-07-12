@@ -1,0 +1,126 @@
+# runner-selector-drift.yml
+#
+# Detects drift between the SELF_HOSTED_RUNNER_LABELS repo variable and the
+# live org runner inventory before the CI jobs become invisible. Refs:
+#   - bead jleechan-z284 (factory configuration blocker)
+#   - issue jleechanorg/dark-factory#286
+#
+# This workflow uses a HARDCODED self-hosted runner selector
+# (`[self-hosted, self-hosted-mikey, ezgha]`) on purpose: it must be reachable
+# even when the repo variable is broken, because a broken selector is the very
+# failure mode this gate exists to detect. Routing the gate through
+# `vars.SELF_HOSTED_RUNNER_LABELS` would defeat the purpose — if the variable
+# drifts to a no-match selector, the gate itself queues forever and the drift
+# goes silent.
+#
+# Triggers:
+#   - push to main                → catch drift the moment it ships
+#   - pull_request to main        → catch drift before it ships
+#   - schedule (weekly)           → catch drift from runner fleet changes
+#                                   (labels added/removed, runners retired)
+#   - workflow_dispatch           → manual run on demand
+#
+# Exit codes of scripts/check_runner_selector.py:
+#   0 = PASS    (≥ --min-matches runners online satisfy the selector)
+#   1 = DRIFT   (selector matches fewer than required)
+#   2 = invocation error (gh failure, malformed selector, etc.)
+#   3 = FLEET_DOWN (no runners online at all)
+# Any non-zero rc fails this workflow loud.
+name: Self-hosted runner selector drift check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly on Mondays at 09:00 UTC — runner fleets change rarely but when
+    # they do (retire/replace) the labels drift; weekly is a low-cost canary.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      min_matches:
+        description: "Minimum runners that must satisfy the selector"
+        required: false
+        type: number
+        default: 1
+      include_offline:
+        description: "Count offline runners too (look past liveness)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  drift-check:
+    name: Verify SELF_HOSTED_RUNNER_LABELS matches live org runners
+    # HARDCODED selector — see workflow header. Update this list ONLY when the
+    # underlying runner labels change AND you've verified via `gh api
+    # orgs/jleechanorg/actions/runners?per_page=100` that the new labels exist
+    # on at least one online runner. Editing this without verifying is itself a
+    # drift event.
+    runs-on: [self-hosted, self-hosted-mikey, ezgha]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install gh CLI (drift check uses gh api under the hood)
+        # The drift check shells out to `gh api`. Some self-hosted runner
+        # images don't have `gh` on PATH, so we install it from the GitHub
+        # CLI tarball. Pinned via the official `cli/cli` release URL.
+        run: |
+          set -euo pipefail
+          if command -v gh >/dev/null 2>&1; then
+            echo "gh already present: $(gh --version | head -1)"
+            exit 0
+          fi
+          echo "::error::gh CLI not found on this self-hosted runner — install it before this gate can run."
+          exit 2
+
+      - name: Run drift check against live org runners
+        env:
+          # Pass the live repo variable through to the script. The script will
+          # read SELF_HOSTED_RUNNER_LABELS directly, fall back to the
+          # GITHUB_REPOSITORY-resolved variable if unset, and finally accept
+          # --selector for local dry-runs.
+          SELF_HOSTED_RUNNER_LABELS: ${{ vars.SELF_HOSTED_RUNNER_LABELS }}
+          DRIFT_CHECK_ORG: jleechanorg
+        run: |
+          set -euo pipefail
+          ARGS=(--org jleechanorg --json)
+          if [ "${{ inputs.min_matches }}" != "" ]; then
+            ARGS+=(--min-matches "${{ inputs.min_matches }}")
+          fi
+          if [ "${{ inputs.include_offline }}" = "true" ]; then
+            ARGS+=(--include-offline)
+          fi
+          python3 scripts/check_runner_selector.py "${ARGS[@]}" | tee drift-check.json
+          VERDICT="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["verdict"])' < drift-check.json)"
+          if [ "$VERDICT" != "PASS" ]; then
+            echo "::error title=Runner selector drift detected::verdict=$VERDICT — repo variable SELF_HOSTED_RUNNER_LABELS no longer matches ≥1 online org runner."
+            exit 1
+          fi
+          echo "Drift check PASS — selector matches ≥1 live runner."
+
+      - name: Annotate drift verdict on PR (machine + human readable)
+        if: always() && github.event_name == 'pull_request'
+        # A short summary comment so reviewers see the verdict without
+        # clicking through the job log. No-op on push/cron/dispatch.
+        run: |
+          set -euo pipefail
+          if [ ! -f drift-check.json ]; then
+            echo "drift-check.json missing — skip annotation."
+            exit 0
+          fi
+          VERDICT="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["verdict"])' < drift-check.json)"
+          MATCH_COUNT="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["match_count"])' < drift-check.json)"
+          cat <<EOF >> "$GITHUB_STEP_SUMMARY"
+          ## Self-hosted runner selector drift check
+          - Selector: \`${{ vars.SELF_HOSTED_RUNNER_LABELS }}\`
+          - Org live runners matched: **$MATCH_COUNT**
+          - Verdict: **$VERDICT**
+          EOF

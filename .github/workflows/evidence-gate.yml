@@ -21,7 +21,11 @@ jobs:
   validate-evidence-bundles:
     name: Evidence Gate
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
-    runs-on: ubuntu-latest
+    # Self-hosted only — see bead jleechan-z284 / issue #286. GitHub-hosted
+    # fallbacks are forbidden; the drift-check workflow
+    # (`.github/workflows/runner-selector-drift.yml`) catches selector breaks
+    # before this job becomes invisible.
+    runs-on: ${{ fromJSON(vars.SELF_HOSTED_RUNNER_LABELS) }}
     timeout-minutes: 5
     steps:
       - name: Checkout repository

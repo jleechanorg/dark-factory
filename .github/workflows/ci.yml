@@ -6,9 +6,20 @@ on:
   pull_request:
     branches: [main]
 
+# All jobs target the org's self-hosted runner pool via the
+# SELF_HOSTED_RUNNER_LABELS repo variable. The variable is parsed from a JSON
+# array string into a YAML label list using fromJSON(...). When the variable
+# drifts to a selector that matches zero online runners, jobs queue forever —
+# that is why runner-selector-drift.yml runs as a separate, hardcoded-selector
+# cron + push gate to detect the drift before CI becomes invisible.
+#
+# Never set `runs-on: ubuntu-latest` here. GitHub-hosted runners are the
+# explicit fallback we are forbidding under bead jleechan-z284 / issue #286.
+# See docs/self-hosted-runner-selector.md.
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.SELF_HOSTED_RUNNER_LABELS) }}
     permissions:
       contents: read
     env:
@@ -51,7 +62,7 @@ jobs:
         run: python -m runner.graph_audit pipelines
 
   daemon-tests:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.SELF_HOSTED_RUNNER_LABELS) }}
     permissions:
       contents: read
     steps:
