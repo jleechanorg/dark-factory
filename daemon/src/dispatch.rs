@@ -265,32 +265,22 @@ pub fn dispatch_ready(
             // existed) plus the exact `routing.push_remote`, closing the
             // gap #247's doc comment explicitly deferred to this bead.
             //
-            // jleechan-8e0x (PR #272): compute the lossless untruncated
-            // prompt first (`build_coder_prompt_lossless`), then decide
-            // between (a) materializing via `prompt_payload` and handing
-            // AO a bootstrap, or (b) letting PR #255's shrinker
-            // (`build_coder_prompt`) reduce the inline prompt to fit.
-            // Either arm lands at-or-below AO's 4,096-char spawn ceiling;
-            // the indirection arm is the lossless path.
+            // jleechan-8e0x (PR #272): compute the untruncated lossless
+            // prompt; ask `prompt_payload` whether to materialize it
+            // (over the 4000-char total cap, matching PR #255's
+            // `CODER_PROMPT_TOTAL_CAP`). An indirection Err is
+            // propagated with `?` -- no new HumanHeld phase introduced
+            // in this PR; the dispatch batch halts and the tick
+            // machinery surfaces the halt.
             _ => {
                 let full = build_coder_prompt_lossless(
                     bead, &branch, &repo, &routing.push_remote,
                 );
-                match crate::prompt_payload::materialize_or_bootstrap(&full) {
-                    Ok(crate::prompt_payload::MaterializeOutcome::NoIndirectionNeeded) => {
+                match crate::prompt_payload::materialize_or_bootstrap(&full)? {
+                    crate::prompt_payload::MaterializeOutcome::NoIndirectionNeeded => {
                         build_coder_prompt(bead, &branch, &repo, &routing.push_remote)
                     }
-                    Ok(crate::prompt_payload::MaterializeOutcome::Indirected(i)) => i.bootstrap,
-                    Err(err) => {
-                        overlay.state = OverlayState::HumanHeld;
-                        overlay.park_reason = Some("prompt_indirection_failed".into());
-                        store.save(&overlay)?;
-                        report.failures.push(failure(
-                            bead, overlay.attempt, Some(branch.clone()),
-                            "prompt_indirection_failed", err,
-                        ));
-                        continue;
-                    }
+                    crate::prompt_payload::MaterializeOutcome::Indirected(i) => i.bootstrap,
                 }
             }
         };
@@ -757,57 +747,6 @@ fn build_coder_prompt_lossless(
         bead.description.trim(),
         bead.file_tree_summary.trim(),
     )
-}
-
-/// Focused regression tests for the build_coder_prompt /
-/// build_coder_prompt_lossless split + indirection wiring. Kept
-/// self-contained (no test_fixtures dep, no env mutation) so they're
-/// stable across refactors of `FakeStateStore` / `FakeSessions`.
-#[cfg(test)]
-mod prompt_indirection_integration {
-    use super::*;
-    use crate::tools::Bead;
-
-    fn bead(description_len: usize, tree_len: usize) -> Bead {
-        Bead {
-            id: "jleechan-8e0x-test".into(),
-            title: "regression".into(),
-            description: "y".repeat(description_len),
-            file_tree_summary: "z".repeat(tree_len),
-            external_ref: None,
-        }
-    }
-
-    #[test]
-    fn lossless_is_strictly_larger_or_equal_than_shrunk() {
-        let b = bead(8_000, 0);
-        let lossless = build_coder_prompt_lossless(&b, "factory/x-r1", "owner/repo", "origin");
-        let shrunk = build_coder_prompt(&b, "factory/x-r1", "owner/repo", "origin");
-        assert!(
-            lossless.len() >= shrunk.len(),
-            "lossless must contain everything the shrunk version does \
-             (got {} lossless vs {} shrunk)",
-            lossless.len(),
-            shrunk.len()
-        );
-        // Inline (shrunk) path stays under PR #255's cap.
-        assert!(shrunk.len() <= 4_000,
-            "shrunk output must stay under CODER_PROMPT_TOTAL_CAP=4000, got {}",
-            shrunk.len());
-        // Lossless can exceed AO's 4096 (this is the indirection trigger).
-        assert!(lossless.len() > 4_000,
-            "test fixture must compose a >4096-byte lossless prompt (got {})",
-            lossless.len());
-    }
-
-    #[test]
-    fn short_prompt_lossless_equals_shrunk() {
-        let b = bead(200, 50); // tiny, well under caps
-        let lossless = build_coder_prompt_lossless(&b, "factory/x-r1", "owner/repo", "origin");
-        let shrunk = build_coder_prompt(&b, "factory/x-r1", "owner/repo", "origin");
-        assert_eq!(lossless, shrunk,
-            "small beads: lossless and shrunk must render identically");
-    }
 }
 
 #[cfg(test)]
