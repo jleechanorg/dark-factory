@@ -484,32 +484,60 @@ unstick-dispatching)
   ;;
 
 rollback-dispatched)
-  # Codex P1 finding on PR #193: factory-ao-remediate.sh (async mode) returns
-  # success optimistically when the spawn is still pending. If the spawn then
-  # fails AFTER the fast-fail window (slow internal error, daemon dies
-  # mid-spawn), the bead is stranded as DISPATCHED with no AO session. This
-  # subcommand reads each DISPATCHED bead's spawn-state file (written by the
-  # detached background process in factory-ao-remediate.sh) and rolls the bead
-  # back to QUEUED when the state file shows "fail:rc=N".
+  # Reconcile DISPATCHED beads whose detached async spawn failed or hung.
+  # factory-ao-remediate.sh (async mode) returns 0 optimistically after
+  # queueing the spawn. This subcommand reads each DISPATCHED bead's
+  # spawn-state file and rolls back failures.
   #
   # State file path: $AFD_SPAWN_STATE_DIR/${bead_id}-${pr_number}.state
-  # State values: "pending" (spawn still running), "ok" (success),
-  #               "fail:rc=N" (failure with rc)
+  # State values: "pending" (spawn running/hung), "ok" (success),
+  #               "fail:rc=N" (failure with rc).
+  #
+  # Reconciliation rules:
+  #   fail:*   → immediate rollback (spawn reported failure)
+  #   pending  → rollback if state file is stale (> spawn timeout elapsed
+  #              since last modification), guarding against background-
+  #              process crash / indefinite hang.
+  #   ok       → leave as DISPATCHED (session is active)
   SPAWN_STATE_DIR_ROLL="${AFD_SPAWN_STATE_DIR:-$HOME/Library/Application Support/dark-factory/spawns}"
+  # Staleness threshold: AO spawn timeout (default 120s) + 60s buffer.
+  # A state file that still says "pending" after 180s means the background
+  # process either crashed or hung indefinitely.
+  STALE_SEC="${AFD_PENDING_STALE_SEC:-180}"
+  now_epoch="$(date +%s)"
   rolled=0
   while IFS='|' read -r rb_id rb_pr; do
     [ -n "$rb_id" ] || continue
     state_file="$SPAWN_STATE_DIR_ROLL/${rb_id}-${rb_pr}.state"
     [ -f "$state_file" ] || continue
     cur="$(cat "$state_file" 2>/dev/null || true)"
+    rollback=0
+    reason=""
     case "$cur" in
       fail:*)
-        sql "UPDATE bead_overlay SET state='QUEUED', updated_at='$(now)' WHERE bead_id='$(q "$rb_id")' AND state='DISPATCHED';"
-        ctx="$(python3 -c 'import json,sys; v=sys.argv[1]; print(json.dumps({"pr_number":(int(v) if v not in ("","NULL") else None), "reason":"async_spawn_failed","state_file_value":v}))' "$rb_pr" "$cur")"
-        emit "$rb_id" 0 QUEUED ROLLBACK_DISPATCHED "$ctx"
-        rolled=$((rolled + 1))
+        rollback=1
+        reason="async_spawn_failed"
+        ;;
+      pending)
+        # Check staleness: if the state file hasn't been modified for
+        # STALE_SEC seconds, the spawn process is dead/hung.
+        if [ "$(uname)" = "Darwin" ]; then
+          file_epoch="$(stat -f %m "$state_file" 2>/dev/null || echo 0)"
+        else
+          file_epoch="$(stat -c %Y "$state_file" 2>/dev/null || echo 0)"
+        fi
+        if [ "${file_epoch:-0}" -gt 0 ] && [ $(( now_epoch - file_epoch )) -gt "$STALE_SEC" ]; then
+          rollback=1
+          reason="async_spawn_stale_pending"
+        fi
         ;;
     esac
+    if [ "$rollback" = "1" ]; then
+      sql "UPDATE bead_overlay SET state='QUEUED', updated_at='$(now)' WHERE bead_id='$(q "$rb_id")' AND state='DISPATCHED';"
+      ctx="$(python3 -c 'import json,sys; print(json.dumps({"pr_number":(int(sys.argv[1]) if sys.argv[1] not in ("","NULL") else None), "reason":sys.argv[2],"state_file_value":sys.argv[3]}))' "$rb_pr" "$reason" "$cur")"
+      emit "$rb_id" 0 QUEUED ROLLBACK_DISPATCHED "$ctx"
+      rolled=$((rolled + 1))
+    fi
   done < <(sql -separator '|' "SELECT bead_id, coalesce(cast(pr_number as text),'') FROM bead_overlay WHERE state='DISPATCHED' AND pr_number IS NOT NULL;")
   echo "rolled=$rolled"
   ;;

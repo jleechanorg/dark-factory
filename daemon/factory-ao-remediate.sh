@@ -68,23 +68,25 @@ PROMPT="Factory bead ${BEAD_ID}: drive PR #${PR} on ${TARGET_REPO} to /green + /
 #      so the tick can skip the bead instead of silently queueing a doomed
 #      spawn that will never produce an `ao session ls` row.
 ensure_ao_daemon() {
-  # Catch broken AO binary first: a 127 exit on any command means the
-  # CLI is misconfigured (wrong path, missing exec bit, broken install).
-  # Don't queue a doomed spawn in that case.
-  if ! "$AO" --version >/dev/null 2>&1 && ! "$AO" status >/dev/null 2>&1; then
+  # Combined preflight bound: the --version + status probe must complete
+  # within 10s total. Each individual call has a 10s timeout; the loop
+  # retries are bounded at 5 attempts × 1s sleep = 5s extra after a failed
+  # `ao status`. A hanging --version or status that ignores SIGTERM will
+  # be killed by the outer caller's timeout.
+  if ! timeout 10 "$AO" --version >/dev/null 2>&1 && ! timeout 10 "$AO" status >/dev/null 2>&1; then
     return 1
   fi
   if [[ "$(basename "$AO")" != "ao-go" ]]; then
     # ao-ts manages its own lifecycle; binary is the daemon.
     return 0
   fi
-  if "$AO" status >/dev/null 2>&1; then
+  if timeout 10 "$AO" status >/dev/null 2>&1; then
     return 0
   fi
   echo "[remediate] starting Go AO daemon" >&2
   nohup "$AO" daemon >> /tmp/ao-go-daemon.log 2>&1 &
   for _ in 1 2 3 4 5; do
-    if "$AO" status >/dev/null 2>&1; then
+    if timeout 10 "$AO" status >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -107,13 +109,18 @@ run_spawn_foreground() {
 }
 
 classify_spawn_outcome() {
-  # $1 = spawn rc, $2 = spawn output. Echoes 0 (success) or 1 (failure).
+  # $1 = spawn rc, $2 = spawn output. Returns 0 (success) or 1 (failure).
+  # Fail closed: malformed/non-UTF-8 output is treated as failure.
   local rc="$1" out="$2"
   if [ "$rc" -eq 0 ]; then return 0; fi
+  if ! printf '%s' "$out" | rg -aq '^'; then
+    # Output is binary/malformed — cannot classify as success (fail closed).
+    return 1
+  fi
   if echo "$out" | rg -q 'spawned session |Session [a-z0-9_-]+ created|✓ Session|pr_open|working|spawning|claimed https://'; then
     return 0
   fi
-  if "$AO" session ls 2>/dev/null | rg "pulls/${PR}\b" | rg -q "\[(spawning|running|active|working|pr_open)\]"; then
+  if timeout 10 "$AO" session ls 2>/dev/null | rg "pulls/${PR}\b" | rg -q "\[(spawning|running|active|working|pr_open)\]"; then
     return 0
   fi
   return 1
@@ -125,10 +132,9 @@ if [ "$MODE" = "sync" ]; then
   if [ -x "$MINIMAX_SYNC" ]; then
     bash "$MINIMAX_SYNC" --all || echo "[remediate] WARN: MiniMax sync failed — sessions may use Anthropic OAuth" >&2
   fi
-  # Best-effort daemon readiness for sync path (no bounded probe — caller
-  # is opting into blocking semantics).
+  # Best-effort daemon readiness for sync path (caller opts into blocking).
   if [[ "$(basename "$AO")" == "ao-go" ]]; then
-    state="$("$AO" status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null || true)"
+    state="$(timeout 10 "$AO" status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null || true)"
     if [ "$state" != "ready" ] && [ "$state" != "running" ]; then
       echo "[remediate] starting Go AO daemon" >&2
       nohup "$AO" daemon >> /tmp/ao-go-daemon.log 2>&1 &
@@ -175,6 +181,18 @@ echo "pending" > "$STATE_FILE"
 ) >/dev/null 2>&1 &
 SPAWN_PID=$!
 disown "$SPAWN_PID" 2>/dev/null || true
+
+# AFD_SKIP_FAST_FAIL_POLL=1: skip the fast-fail polling. The caller returns
+# immediately after queueing the spawn, and the next tick's session-dedup
+# check + rollback-dispatched are the observability channel. This is the
+# fully nonblocking dispatch path — the tick loop queues all eligible beads
+# and moves on, avoiding serialization behind slow AO preflight/session
+# queries. The detached spawn durably persists its outcome (ok/fail:rc=N)
+# to the state file; the next tick's rollback-dispatched reconciles failures.
+if [ "${AFD_SKIP_FAST_FAIL_POLL:-0}" = "1" ]; then
+  echo "[remediate] async-spawned PR #$PR bead=${BEAD_ID} pid=${SPAWN_PID} log=${SPAWN_LOG} state=pending"
+  exit 0
+fi
 
 # Fast-fail detection: poll the state file for up to AFD_ASYNC_WAIT_SEC
 # before returning. Auth/project errors and broken-daemon errors typically

@@ -334,6 +334,76 @@ esac
 # Wall-clock bound: ~ AFD_ASYNC_WAIT_SEC + small overhead.
 assert_lt "slow-spawn wallclock <10s (wait window respected)" 10 "$elapsed"
 
+# ---------------------------------------------------------------------------
+# Test 8: AFD_SKIP_FAST_FAIL_POLL=1 — nonblocking dispatch skips fast-fail
+# poll and returns immediately with state=pending.
+# ---------------------------------------------------------------------------
+rm -f /tmp/test-remediate-fake-ao.log
+start=$(date +%s)
+out="$(AO_BIN="$FAKE_AO" AO_SPAWN_TIMEOUT_SEC=60 AFD_ASYNC_WAIT_SEC=5 AFD_SKIP_FAST_FAIL_POLL=1 timeout 10 bash "$REMEDIATE" test-bead-skipfast 9995 jleechanorg/worldarchitect.ai worldarchitect 2>&1)"
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+echo "[test 8 output]"
+echo "$out" | sed 's/^/    /'
+echo
+assert "skip-fast-fail: exit 0 (immediate ack)" "0" "$rc"
+assert_lt "skip-fast-fail: wallclock <3s (no poll wait)" 3 "$elapsed"
+case "$out" in
+  *async-spawned*)
+    echo "PASS: skip-fast-fail emits 'async-spawned'"; PASS=$((PASS + 1)) ;;
+  *)
+    echo "FAIL: skip-fast-fail did not emit 'async-spawned'"; FAIL=$((FAIL + 1)) ;;
+esac
+case "$out" in
+  *state=pending*)
+    echo "PASS: skip-fast-fail shows state=pending (skipped poll)"; PASS=$((PASS + 1)) ;;
+  *)
+    echo "FAIL: skip-fast-fail state not pending: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Test 9: preflight timeout — when AO daemon hangs, `ensure_ao_daemon` must
+# fail within the combined preflight bound rather than blocking indefinitely.
+# ---------------------------------------------------------------------------
+TIMEOUT_AO="$SCRATCH_DIR/timeout-ao"
+cat > "$TIMEOUT_AO" <<'EOF_TO'
+#!/usr/bin/env bash
+case "${1:-}" in
+  status) exit 1 ;;
+  daemon) sleep 60 ;;
+  *) exit 1 ;;
+esac
+EOF_TO
+chmod +x "$TIMEOUT_AO"
+rm -f /tmp/test-remediate-fake-ao.log
+start=$(date +%s)
+out="$(AO_BIN="$TIMEOUT_AO" AO_SPAWN_TIMEOUT_SEC=60 AFD_ASYNC_WAIT_SEC=5 timeout 15 bash "$REMEDIATE" test-bead-timeout 9994 jleechanorg/worldarchitect.ai worldarchitect 2>&1)"
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+echo "[test 9 output]"
+echo "$out" | sed 's/^/    /'
+echo
+assert_lt "preflight-timeout: wallclock <12s" 12 "$elapsed"
+if [ "$rc" -ne 0 ]; then
+  echo "PASS: preflight-timeout returns non-zero (rc=$rc)"; PASS=$((PASS + 1))
+else
+  echo "FAIL: preflight-timeout returned 0 despite broken AO"; FAIL=$((FAIL + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# Test 10: bulk nonblocking dispatch — with AFD_SKIP_FAST_FAIL_POLL=1,
+# total wallclock for N beads must stay bounded regardless of AO latency.
+# ---------------------------------------------------------------------------
+rm -f /tmp/test-remediate-fake-ao.log
+start=$(date +%s)
+for bead_num in 1 2 3; do
+  AO_BIN="$FAKE_AO" AO_SPAWN_TIMEOUT_SEC=60 AFD_ASYNC_WAIT_SEC=5 AFD_SKIP_FAST_FAIL_POLL=1 timeout 10 bash "$REMEDIATE" "test-bead-bulk-$bead_num" 9901 jleechanorg/worldarchitect.ai worldarchitect >/dev/null 2>&1
+done
+elapsed=$(( $(date +%s) - start ))
+echo "[test 10 output]"
+echo "3-bead bulk dispatch wallclock: ${elapsed}s"
+assert_lt "bulk-dispatch: 3 beads <9s total wallclock" 9 "$elapsed"
+
 echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ] || exit 1
