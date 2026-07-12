@@ -58,6 +58,28 @@ Operational rules:
    graph shape, specs, holdouts, and scoring contracts are the important assets.
 7. **Deprecate human interactive hat**: All coding LLM work must be shifted to the auto-factory. Humans only define intent (create GitHub issues/beads) and write comments on PRs for feedback. The auto-factory autonomously processes and drives branches to green without human-interactive coding sessions.
 
+## /af — ZERO direct work; monitoring only (operator hard rule)
+
+When the operator directs work through /af (or sets an /af goal), the session
+does **ZERO direct work** — no product code, no factory code, no hand-fixes,
+no coding sub-agent lanes. The session's ONLY jobs:
+
+1. File/refine `factory`-labeled beads (SHORT descriptions — AO's spawn
+   prompt cap is 4096 characters; a long bead body makes its own dispatch
+   fail) with `target_repo:` / `existing_pr:` / `existing_branch:` fields
+   when driving an existing PR.
+2. Monitor daemon telemetry (`~/Library/Logs/dark-factory/daemon.jsonl`) and
+   report each lifecycle stage.
+3. Escalate blockers the factory cannot self-fix to the OPERATOR, naming the
+   exact blocker — never hand-fix them. "The factory is broken so I'll do it
+   myself" is the forbidden move: it hides factory gaps and makes the
+   label→merge E2E proof unfalsifiable (2026-07-11/12 incidents: hand-driven
+   PRs masked a dead coder loop for a full day).
+
+The only direct actions permitted: merge clicks where the session holds merge
+authority, and operator-authorized NAMED exceptions recorded on the mission
+bead.
+
 ## Setup
 
 ```bash
