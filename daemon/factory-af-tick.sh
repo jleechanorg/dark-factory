@@ -35,7 +35,16 @@ AO_PROJECT="${AFD_AO_PROJECT:-worldarchitect}"
 # target_repo of its own.
 CONFIG="${CONFIG:-$ROOT/config/daemon.toml}"
 [ -f "$CONFIG" ] || CONFIG="$ROOT/daemon/contracts/daemon.toml.example"
-TARGET_REPO="${TARGET_REPO:-}"
+TARGET_REPO="${TARGET_REPO:-$(python3 - "$CONFIG" <<'PY'
+import sys, toml
+try:
+    cfg = toml.load(sys.argv[1])
+    print(cfg.get("target_repo", ""))
+except Exception:
+    print("")
+PY
+)}"
+
 
 # ---------- arg parsing ----------
 TARGET_PRS=""
