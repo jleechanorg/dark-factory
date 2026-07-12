@@ -140,6 +140,22 @@ impl Tracker for CliTracker {
             )))
         }
     }
+
+    fn bead_status(&self, bead_id: &str) -> Result<Option<crate::tools::BeadStatus>, DaemonError> {
+        let out = run_tool("br", &["show", bead_id, "--json"], 30)?;
+        let json_start = out.find('{').unwrap_or(0);
+        #[derive(serde::Deserialize)]
+        struct BrShow {
+            status: String,
+        }
+        let data: BrShow = serde_json::from_str(&out[json_start..]).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse br show JSON: {e}"))
+        })?;
+        Ok(Some(match data.status.to_ascii_lowercase().as_str() {
+            "open" => crate::tools::BeadStatus::Open,
+            _ => crate::tools::BeadStatus::Closed,
+        }))
+    }
 }
 
 /// Parse `external_ref` values from `br list --json` output.

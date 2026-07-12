@@ -243,6 +243,34 @@ pub trait StateStore {
     fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
         Ok(())
     }
+    /// jleechan-xsg4 (issue #270): return DISPATCHED overlay rows that are
+    /// candidates for stale-session recovery. Candidates are rows where
+    /// `session_id IS NULL` (was never set or was cleared) OR
+    /// `autonomy_secs >= min_autonomy_secs` (aged beyond the timeout).
+    /// The caller is responsible for checking session liveness and issuing
+    /// the actual requeue — this method only returns candidate rows.
+    fn stale_dispatched_candidates(
+        &self,
+        min_autonomy_secs: u64,
+    ) -> Result<Vec<BeadOverlay>, DaemonError> {
+        let _ = min_autonomy_secs;
+        Ok(Vec::new())
+    }
+    /// jleechan-xsg4 (issue #270): requeue a DISPATCHED bead back to QUEUED,
+    /// clearing session_id and branch. Returns the updated overlay for
+    /// telemetry. Must only be called after confirming the session is dead
+    /// or absent — the caller owns session-liveness verification.
+    fn requeue_stale_dispatched(
+        &self,
+        bead_id: &str,
+    ) -> Result<BeadOverlay, DaemonError> {
+        let _ = bead_id;
+        Err(DaemonError::Tool {
+            tool: "state_store".into(),
+            rc: -1,
+            stderr: "requeue_stale_dispatched not implemented".into(),
+        })
+    }
 }
 
 /// `StateStore` impl against `~/.dark-factory/daemon-cxdb.sqlite` (WAL mode,
@@ -574,6 +602,86 @@ impl StateStore for SqliteStateStore {
             )
             .map_err(|e| tool_err("reconcile_dispatching", e))?;
         Ok(())
+    }
+
+    fn stale_dispatched_candidates(
+        &self,
+        min_autonomy_secs: u64,
+    ) -> Result<Vec<BeadOverlay>, DaemonError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
+                 pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, \
+                 park_reason, target_repo \
+                 FROM bead_overlay \
+                 WHERE state = 'DISPATCHED' \
+                   AND (session_id IS NULL OR autonomy_secs >= ?1)",
+            )
+            .map_err(|e| tool_err("stale_dispatched_candidates prepare", e))?;
+        let rows = stmt
+            .query_map(params![min_autonomy_secs as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                ))
+            })
+            .map_err(|e| tool_err("stale_dispatched_candidates query", e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, park_reason, target_repo) =
+                r.map_err(|e| tool_err("stale_dispatched_candidates row", e))?;
+            out.push(BeadOverlay {
+                bead_id,
+                state: OverlayState::from_str(&state_str)?,
+                attempt: attempt as u32,
+                reroll_count: reroll_count as u32,
+                autonomy_secs: autonomy_secs as u64,
+                spend_usd,
+                pr_number: pr_number.map(|v| v as u64),
+                branch,
+                session_id,
+                is_adopted: is_adopted != 0,
+                spawn_failure_count: spawn_failure_count as u32,
+                pre_session_head_sha,
+                park_reason,
+                target_repo,
+            });
+        }
+        Ok(out)
+    }
+
+    fn requeue_stale_dispatched(
+        &self,
+        bead_id: &str,
+    ) -> Result<BeadOverlay, DaemonError> {
+        self.conn
+            .execute(
+                "UPDATE bead_overlay \
+                 SET state = 'QUEUED', session_id = NULL, branch = NULL, \
+                     autonomy_secs = 0, updated_at = ?2 \
+                 WHERE bead_id = ?1 AND state = 'DISPATCHED'",
+                params![bead_id, now_iso8601()],
+            )
+            .map_err(|e| tool_err("requeue_stale_dispatched", e))?;
+        self.load(bead_id)?
+            .ok_or_else(|| DaemonError::Tool {
+                tool: "sqlite".into(),
+                rc: -1,
+                stderr: format!("requeue_stale_dispatched: bead {bead_id} not found after update"),
+            })
     }
 
     fn load(&self, bead_id: &str) -> Result<Option<BeadOverlay>, DaemonError> {
