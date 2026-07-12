@@ -1481,6 +1481,21 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     "routing_source": success.routing_source.as_str(),
                 }),
             )?;
+
+            if success.routing_source == "derived" {
+                emit(
+                    deps.telemetry_log,
+                    &success.bead_id,
+                    success.attempt,
+                    OverlayState::Dispatched.as_str(),
+                    "DERIVED_ROUTE_RESOLVED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "target_repo": success.target_repo.as_str(),
+                        "routing_source": "derived",
+                    }),
+                )?;
+            }
             let comment_body = format!(
                 "🤖 **[dark-factory]** Spawned worker session in slot for bead `{}` (attempt {}). Branch: `{}`.",
                 success.bead_id, success.attempt, success.branch

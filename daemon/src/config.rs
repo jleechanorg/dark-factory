@@ -235,6 +235,36 @@ pub fn load(path: &Path) -> Result<Config, DaemonError> {
         .map_err(|e| DaemonError::Config(format!("{}: {e}", path.display())))?;
     let cfg: Config =
         toml::from_str(&raw).map_err(|e| DaemonError::Config(e.to_string()))?;
+
+    if !is_valid_owner_repo(&cfg.target_repo) {
+        return Err(DaemonError::Config(format!(
+            "invalid target_repo {:?}: must be owner/repo format (alphanumeric, \
+             hyphens allowed in owner; alphanumeric, hyphens, underscores, dots \
+             allowed in repo name)",
+            cfg.target_repo
+        )));
+    }
+
+    for (repo, rc) in &cfg.repos {
+        if repo.is_empty() {
+            return Err(DaemonError::Config(
+                "empty [repos] key: each entry must be in owner/repo format".to_string(),
+            ));
+        }
+        if !is_valid_owner_repo(repo) {
+            return Err(DaemonError::Config(format!(
+                "invalid [repos] key {:?}: must be owner/repo format",
+                repo
+            )));
+        }
+        if rc.ao_project.is_empty() {
+            return Err(DaemonError::Config(format!(
+                "empty ao_project for [repos.\"{}\"]",
+                repo
+            )));
+        }
+    }
+
     let mut seen_ao_projects: HashMap<&str, &str> = HashMap::new();
 
     // jleechan-dljf symmetric: check the global target_repo's effective
@@ -938,5 +968,233 @@ push_remote = "origin"
         assert!(msg.contains("global-explicit") || msg.contains("global "));
         assert!(msg.contains("shared-project"));
         assert!(msg.contains("other-repo"));
+    }
+
+    #[test]
+    fn load_rejects_malformed_target_repo() {
+        let dir = std::env::temp_dir().join("afd_cfg_test_malformed_target_repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("malformed_target.toml");
+        std::fs::write(
+            &p,
+            r#"target_repo = "not-valid"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+"#,
+        )
+        .unwrap();
+        let result = load(&p);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("owner/repo format"),
+            "malformed target_repo must be rejected at load time"
+        );
+    }
+
+    #[test]
+    fn load_rejects_empty_target_repo() {
+        let dir = std::env::temp_dir().join("afd_cfg_test_empty_target_repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("empty_target.toml");
+        std::fs::write(
+            &p,
+            r#"target_repo = ""
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+"#,
+        )
+        .unwrap();
+        let result = load(&p);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("owner/repo format"));
+    }
+
+    #[test]
+    fn load_rejects_malformed_repos_key() {
+        let dir = std::env::temp_dir().join("afd_cfg_test_malformed_repos_key");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("malformed_repos.toml");
+        std::fs::write(
+            &p,
+            r#"
+target_repo = "jleechanorg/dark-factory"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+
+[repos."no-slash"]
+ao_project = "bad"
+push_remote = "origin"
+"#,
+        )
+        .unwrap();
+        let result = load(&p);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("owner/repo format"));
+        assert!(msg.contains("no-slash"));
+    }
+
+    #[test]
+    fn load_rejects_empty_repos_key() {
+        let dir = std::env::temp_dir().join("afd_cfg_test_empty_repos_key");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("empty_repos_key.toml");
+        std::fs::write(
+            &p,
+            r#"target_repo = "jleechanorg/dark-factory"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+
+[repos.""]
+ao_project = "bad"
+push_remote = "origin"
+"#,
+        )
+        .unwrap();
+        let result = load(&p);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty [repos] key"));
+    }
+
+    #[test]
+    fn load_rejects_empty_ao_project_in_repos() {
+        let dir = std::env::temp_dir().join("afd_cfg_test_empty_ao_project_repos");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("empty_ao_project.toml");
+        std::fs::write(
+            &p,
+            r#"target_repo = "jleechanorg/dark-factory"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+
+[repos."jleechanorg/other"]
+ao_project = ""
+push_remote = "origin"
+"#,
+        )
+        .unwrap();
+        let result = load(&p);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty ao_project"));
+    }
+
+    #[test]
+    fn load_rejects_target_repo_with_git_suffix() {
+        let dir = std::env::temp_dir().join("afd_cfg_test_git_suffix_target");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("git_suffix_target.toml");
+        std::fs::write(
+            &p,
+            r#"target_repo = "owner/repo.git"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+"#,
+        )
+        .unwrap();
+        let result = load(&p);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("owner/repo format"));
+    }
+
+    #[test]
+    fn load_rejects_target_repo_with_too_many_slashes() {
+        let dir = std::env::temp_dir().join("afd_cfg_test_multi_slash_target");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("multi_slash_target.toml");
+        std::fs::write(
+            &p,
+            r#"target_repo = "a/b/c"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+"#,
+        )
+        .unwrap();
+        let result = load(&p);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("owner/repo format"));
+    }
+
+    /// Duplicate repos keys: TOML parser rejects duplicate table keys at the
+    /// parser level, which surfaces as a DaemonError::Config. This test
+    /// proves the parser-level guard exists.
+    #[test]
+    fn load_rejects_duplicate_repos_key() {
+        let dir = std::env::temp_dir().join("afd_cfg_test_duplicate_repos_key");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("duplicate_repos.toml");
+        std::fs::write(
+            &p,
+            r#"target_repo = "jleechanorg/dark-factory"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+
+[repos."jleechanorg/foo"]
+ao_project = "foo-proj"
+push_remote = "origin"
+
+[repos."jleechanorg/foo"]
+ao_project = "foo-proj-dup"
+push_remote = "origin"
+"#,
+        )
+        .unwrap();
+        let result = load(&p);
+        assert!(result.is_err(), "duplicate repos keys must be rejected");
     }
 }

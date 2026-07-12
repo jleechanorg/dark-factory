@@ -562,18 +562,14 @@ fn skeptic_gate(evidence: &PrEvidence) -> GateResult {
     }
 }
 
-/// Assess all 7 gates for `pr` (spec §4.2.5, design doc §5). `repo` (bead
-/// jleechan-9xrs, Stage D — see
-/// `docs/multirepo-dispatch-investigation-2026-07-11.md`) is the bead's OWN
-/// resolved repo (`overlay.repo(cfg)`), used to fetch the PR snapshot from
-/// the RIGHT repo instead of whichever repo `cfg.target_repo` names — a bead
-/// dispatched into a non-default `[repos.*]` entry used to have its gates
-/// silently assessed against the daemon-global repo's PR #N (or, worse,
-/// against no PR at all in that repo). `cfg` is accepted per the
-/// design-doc signature for future per-repo gate config (unused today —
-/// Stage 1 has no per-gate config knobs yet); `#[allow(unused_variables)]`
-/// documents that rather than dropping the parameter ahead of a design-doc
-/// revision.
+/// Assess all 7 gates for `pr` (spec §4.2.5, design doc §5). `repo` is the
+/// bead's own resolved repo (`overlay.repo(cfg)`) — the PR snapshot is fetched
+/// from THIS repo, not `cfg.target_repo`, so a bead dispatched into a
+/// non-default `[repos.*]` entry has its gates assessed against the right PR.
+/// `cfg` is accepted per the design-doc signature for future per-repo gate
+/// config (unused today — Stage 1 has no per-gate config knobs yet);
+/// `#[allow(unused_variables)]` documents that rather than dropping the
+/// parameter ahead of a design-doc revision. (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
 #[allow(unused_variables)]
 pub fn assess(
     scm: &dyn Scm,
@@ -715,22 +711,12 @@ mod tests {
                 })
         }
 
-        /// jleechan-9xrs Stage D regression coverage: records the `repo`
-        /// argument distinctly from the plain `pr_snapshot({pr})` call log
-        /// entry so tests can assert `assess()` fetched the bead's OWN
-        /// resolved repo, not `cfg.target_repo`.
+ (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
         fn pr_snapshot_for_repo(&self, repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
             self.calls
                 .borrow_mut()
                 .push(format!("pr_snapshot_for_repo({repo},{pr})"));
-            self.snapshots
-                .get(&pr)
-                .cloned()
-                .ok_or_else(|| DaemonError::Tool {
-                    tool: "gh".into(),
-                    rc: 1,
-                    stderr: format!("no scripted snapshot for pr {pr}"),
-                })
+            self.pr_snapshot(pr) (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
         }
 
         fn close_pr(&self, _pr: u64, _comment: &str) -> Result<(), DaemonError> {

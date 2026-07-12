@@ -361,26 +361,14 @@ pub trait Scm {
     }
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError>;
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError>;
-    /// Repo-scoped variant of [`remote_branch_last_commit`](Scm::remote_branch_last_commit)
-    /// (bead jleechan-bqdv, Stage C of the multi-repo dispatch fix — see
-    /// `docs/multirepo-dispatch-investigation-2026-07-11.md`). The daemon's
-    /// coder-silence watcher (`tick.rs`'s `Dispatched` autonomy check) used
-    /// to always poll `cfg.target_repo`'s branch, which is silently wrong
-    /// for any bead whose `overlay.repo(cfg)` names a DIFFERENT repo — the
-    /// watcher could never observe that coder's real progress and would
-    /// eventually park it `coder_silent` even while it was actively pushing
-    /// commits to its own (correct) repo. `repo` should be
-    /// `overlay.repo(cfg)`, not `cfg.target_repo` directly. Default impl
-    /// ignores `repo` and delegates to `remote_branch_last_commit` so
-    /// existing test fakes and any impl that predates this method keep their
-    /// original (single-repo) behavior; `CliScm` overrides it to actually
-    /// retarget the query via `with_repo`.
+    fn pr_snapshot_for_repo(&self, _repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
+        self.pr_snapshot(pr)
+    }
     fn remote_branch_last_commit_for_repo(
         &self,
-        repo: &str,
+        _repo: &str,
         branch: &str,
-    ) -> Result<Option<u64>, DaemonError> {
-        let _ = repo;
+    ) -> Result<Option<u64>, DaemonError> { (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
         self.remote_branch_last_commit(branch)
     }
 }

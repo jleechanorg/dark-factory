@@ -207,11 +207,7 @@ impl Scm for FakeScm {
             })
     }
 
-    /// jleechan-9xrs Stage D regression coverage: records the `repo`
-    /// argument distinctly from the plain `pr_snapshot({pr})` call log entry
-    /// so integration tests can assert the full fast-tier verification loop
-    /// (skeptic gate, /er runner, gate assessment) fetched the bead's OWN
-    /// resolved repo, not `cfg.target_repo`.
+ (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
     fn pr_snapshot_for_repo(&self, repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
         self.calls
             .borrow_mut()

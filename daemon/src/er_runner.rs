@@ -110,11 +110,7 @@ pub fn maybe_run(
     now_epoch: u64,
 ) -> Result<Outcome, DaemonError> {
     // 1. Bead + PR must be valid (overlay is loaded to validate state + PR
-    //    consistency; the actual fetch is done in step 2). Captured (not
-    //    discarded) so its resolved repo (jleechan-9xrs Stage D —
-    //    `overlay.repo(cfg)`) can be threaded through the snapshot fetch,
-    //    reviewer prompt, and posted comment's ext_ref below instead of
-    //    `deps.cfg.target_repo`.
+    //    consistency; the actual fetch is done in step 2) (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
     let overlay = match deps.store.load(bead_id)? {
         Some(o) if o.state == OverlayState::Attested && o.pr_number == Some(pr) => o,
         _ => return Ok(Outcome::NotApplicable),
@@ -151,7 +147,7 @@ pub fn maybe_run(
         }
     }
 
-    // 5. Spawn reviewer
+    // 5. Spawn reviewer — use the bead's own resolved repo, not cfg.target_repo (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
     let prompt = build_er_prompt(bead_id, pr, &repo);
     let reply = if !deps.llm.is_real() {
         deps.llm.judge(&prompt)?

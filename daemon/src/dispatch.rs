@@ -258,13 +258,7 @@ pub fn dispatch_ready(
                     bead.title
                 )
             }
-            // jleechan-bqdv Stage C: `build_coder_prompt` (jleechan-if09,
-            // PR #247) now takes the bead's RESOLVED repo (`repo`, from
-            // Stage A/B — not the bare `cfg.target_repo` #247 used as an
-            // interim mitigation before this bead's `[repos]` plumbing
-            // existed) plus the exact `routing.push_remote`, closing the
-            // gap #247's doc comment explicitly deferred to this bead.
-            _ => build_coder_prompt(bead, &branch, &repo, &routing.push_remote),
+            _ => build_coder_prompt(bead, &branch, &repo), (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
         };
 
         let spec = SpawnSpec {
@@ -741,19 +735,10 @@ mod tests {
         // returning a session whose live branch does NOT match what was
         // requested (the wa-3004 contamination scenario).
         scripted_branch: RefCell<HashMap<String, String>>,
-        /// jleechan-bqdv Stage C: captures every `(bead_id, prompt)` passed
-        /// to `spawn()`, so the dispatch-prompt-content acceptance test can
-        /// assert on the exact rendered prompt string without needing
-        /// `Sessions::spawn` to do anything else differently. Supersedes
-        /// jleechan-if09's narrower `prompts: RefCell<Vec<String>>` (same
-        /// purpose, plus the bead id).
-        spawn_prompts: RefCell<Vec<(String, String)>>,
-        /// jleechan-bqdv Stage C: scripted `worktree_remote_url` override,
-        /// keyed by `ao_project`. Empty by default (matches the trait's
-        /// `Ok(None)` default — "cannot verify") so every pre-existing test
-        /// keeps trusting a fresh spawn unconditionally; only the
-        /// worktree-remote-mismatch regression tests populate this.
-        scripted_worktree_remote: RefCell<HashMap<String, String>>,
+        // jleechan-if09: captured (bead_id, SpawnSpec.prompt) per spawn, so
+        // tests can pin what the coder actually receives (the wiring, not
+        // just the builder function).
+        spawn_prompts: RefCell<Vec<(String, String)>>, (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
     }
 
     impl FakeSessions {
@@ -768,7 +753,7 @@ mod tests {
                 fail_stop_for: RefCell::new(Vec::new()),
                 scripted_branch: RefCell::new(HashMap::new()),
                 spawn_prompts: RefCell::new(Vec::new()),
-                scripted_worktree_remote: RefCell::new(HashMap::new()),
+ (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
             }
         }
 
@@ -1327,7 +1312,10 @@ mod tests {
         let prompts = sessions.spawn_prompts.borrow();
         let prompt = &prompts[0].1;
         assert!(prompt.contains("jleechanorg/ez-gh-actions"));
-        assert!(prompt.contains("origin"));
+        assert!(
+            !prompt.contains("jleechanorg/dark-factory"),
+            "prompt must NOT contain cfg.target_repo; bead target_repo must be used instead"
+        );
     }
 
     /// Companion to the malformed-repo park test: when the bead's
@@ -2027,7 +2015,7 @@ mod tests {
         assert_eq!(report.success_count(), 1);
         let prompts = sessions.spawn_prompts.borrow();
         assert!(
-            prompts[0].1.contains("Route to RESEARCH_PATH"),
+            prompts[0].1.starts_with("Route to RESEARCH_PATH"), (opencode/deepseek-v4-pro: fix(daemon): infra-compliant cherry-pick — _for_repo trait methods, verifier repo param, er_runner bead-repo routing, config load-time target_repo/repos validation, DERIVED_ROUTE_RESOLVED JSONL pre-dispatch (jleechan-87ea, #271))
             "routed paths keep their pipeline prompts: {}",
             prompts[0].1
         );
