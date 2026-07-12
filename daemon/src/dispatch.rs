@@ -4,10 +4,11 @@
 // `StateStore` trait calls — no subprocess use, no LLM judgment (ZFC: routing
 // to SMALL_PATH/STANDARD_PATH already happened in router.rs; this module only
 // spawns whatever `ready` already contains, in order).
-use crate::config::Config;
+use crate::config::{Config, RoutingSource};
 use crate::errors::DaemonError;
 use crate::router::RoutingVerdict;
 use crate::state::{BeadOverlay, OverlayState, StateStore};
+use crate::telemetry::TelemetryEvent;
 use crate::tools::{remote_url_matches_repo, Bead, Sessions, SpawnSpec};
 
 /// Coder-dispatch prompt preamble (bead jleechan-bqdv, Stage C of the
@@ -125,11 +126,38 @@ fn failure(
 /// Returns a per-bead report. Never spawns past the cap; if zero slots are
 /// free, returns an empty report without calling `sessions.spawn` (verified by
 /// the fake's call log in tests — spec §4.2.8's caps are absolute).
+
+fn now_iso8601() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (y, mo, d) = civil_from_days(days as i64);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 pub fn dispatch_ready(
     sessions: &dyn Sessions,
     store: &dyn StateStore,
     cfg: &Config,
     ready: &[(Bead, RoutingVerdict)],
+    telemetry_log: Option<&std::path::Path>,
 ) -> Result<DispatchReport, DaemonError> {
     let active = sessions.active_count()?;
     let free_slots = cfg.max_workers.saturating_sub(active);
@@ -208,6 +236,27 @@ pub fn dispatch_ready(
                 continue;
             }
         };
+
+        // jleechan-87ea: emit DERIVED_ROUTE_RESOLVED BEFORE any spawn
+        // attempt so derived-route telemetry is durable even for deferred
+        // or failed spawns. Emitted once per bead per routing resolution.
+        if routing.source == RoutingSource::Derived {
+            if let Some(log) = telemetry_log {
+                let ev = TelemetryEvent {
+                    timestamp: now_iso8601(),
+                    bead_id: bead.id.clone(),
+                    attempt_id: overlay.attempt,
+                    lifecycle_state: OverlayState::Queued.as_str().to_string(),
+                    event_type: "DERIVED_ROUTE_RESOLVED".to_string(),
+                    metrics: serde_json::json!({}),
+                    context: serde_json::json!({
+                        "target_repo": &repo,
+                        "routing_source": "derived",
+                    }),
+                };
+                let _ = crate::telemetry::emit(log, &ev);
+            }
+        }
 
         let branch = format!("factory/{}-r{}", bead.id, overlay.attempt);
 
@@ -1124,7 +1173,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(40);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(
             report.success_count(),
@@ -1147,7 +1196,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(40);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(
             report.success_count(),
@@ -1170,7 +1219,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(40);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(report.success_count(), 0);
         let spawn_calls = sessions
@@ -1211,7 +1260,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(report.success_count(), 1);
 
         assert_eq!(store.branches.borrow().as_slice(), ["factory/bead-0-r1"]);
@@ -1249,7 +1298,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(report.success_count(), 0, "malformed repo must never spawn");
         assert_eq!(report.failures.len(), 1);
@@ -1300,7 +1349,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(report.success_count(), 1, "unseen valid repo must dispatch");
         assert_eq!(report.failures.len(), 0);
@@ -1356,7 +1405,7 @@ mod tests {
         );
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(report.success_count(), 1);
         let overlay = store.load("bead-0").unwrap().unwrap();
@@ -1370,7 +1419,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(5);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(
             report.success_count(),
             1,
@@ -1398,7 +1447,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(report.success_count(), 1);
 
         // Final state is DISPATCHED (spawn + confirmation both succeeded),
@@ -1431,7 +1480,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(
             report.success_count(),
@@ -1471,7 +1520,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(report.success_count(), 0);
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].bead_id, "bead-0");
@@ -1504,7 +1553,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(report.success_count(), 1);
         assert_eq!(report.successes[0].bead_id, "bead-1");
@@ -1535,7 +1584,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(
             report.success_count(),
@@ -1554,7 +1603,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(3);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         let success_ids: Vec<&str> = report
             .successes
@@ -1596,7 +1645,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(3);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         let success_ids: Vec<&str> = report
             .successes
@@ -1653,7 +1702,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(3);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         let success_ids: Vec<&str> = report
             .successes
@@ -1701,7 +1750,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
         assert!(
             matches!(err, DaemonError::Parse(_)),
             "non-transient spawn failure must stop the batch: {err:?}"
@@ -1726,7 +1775,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(report.success_count(), 1);
         assert_eq!(report.successes[0].bead_id, "bead-1");
@@ -1755,7 +1804,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
         assert!(
             matches!(err, DaemonError::Tool { .. }),
             "failed rollback requeue must be fatal so top-level reconciliation can recover: {err:?}"
@@ -1782,7 +1831,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
         assert!(
             matches!(err, DaemonError::Tool { .. }),
             "stop failure must remain fatal because a live untracked worker may remain: {err:?}"
@@ -2011,7 +2060,7 @@ mod tests {
             },
             RoutingVerdict::ResearchPath,
         )];
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(report.success_count(), 1);
         let prompts = sessions.spawn_prompts.borrow();
         assert!(
@@ -2039,7 +2088,7 @@ mod tests {
             },
             RoutingVerdict::StandardPath,
         )];
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(report.success_count(), 1);
         let prompts = sessions.spawn_prompts.borrow();
         assert!(

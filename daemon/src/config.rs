@@ -1197,4 +1197,137 @@ push_remote = "origin"
         let result = load(&p);
         assert!(result.is_err(), "duplicate repos keys must be rejected");
     }
+
+    /// jleechan-dljf skeptic: overlength owner segment in target_repo must
+    /// be rejected at load time (regression: is_valid_owner_repo is covered,
+    /// but Config::load wasn't explicitly tested for this path).
+    #[test]
+    fn load_rejects_overlength_target_repo() {
+        // Owner > 39 chars
+        let dir = std::env::temp_dir().join("afd_cfg_test_overlength_target_owner");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("overlength_owner_target.toml");
+        let long_owner = "a".repeat(40);
+        std::fs::write(
+            &p,
+            format!(
+                r#"target_repo = "{long_owner}/repo"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+"#,
+            ),
+        )
+        .unwrap();
+        let result = load(&p);
+        assert!(
+            result.is_err(),
+            "target_repo with owner > 39 chars must be rejected at load time"
+        );
+
+        // Repo > 100 chars
+        let dir2 = std::env::temp_dir().join("afd_cfg_test_overlength_target_repo");
+        std::fs::create_dir_all(&dir2).unwrap();
+        let p2 = dir2.join("overlength_repo_target.toml");
+        let long_repo = "a".repeat(101);
+        std::fs::write(
+            &p2,
+            format!(
+                r#"target_repo = "owner/{long_repo}"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+"#,
+            ),
+        )
+        .unwrap();
+        let result2 = load(&p2);
+        assert!(
+            result2.is_err(),
+            "target_repo with repo > 100 chars must be rejected at load time"
+        );
+    }
+
+    /// jleechan-dljf skeptic: overlength owner or repo in a [repos] key
+    /// must be rejected at load time (regression: is_valid_owner_repo is
+    /// covered for standalone strings, but the load-time validation path
+    /// through repos keys wasn't explicitly tested for overlength).
+    #[test]
+    fn load_rejects_overlength_repos_key() {
+        // Owner > 39 chars in [repos] key
+        let dir = std::env::temp_dir().join("afd_cfg_test_overlength_repos_owner");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("overlength_owner_repos.toml");
+        let long_owner = "a".repeat(40);
+        std::fs::write(
+            &p,
+            format!(
+                r#"target_repo = "jleechanorg/dark-factory"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+
+[repos."{long_owner}/valid-repo"]
+ao_project = "test-proj"
+push_remote = "origin"
+"#,
+            ),
+        )
+        .unwrap();
+        let result = load(&p);
+        assert!(
+            result.is_err(),
+            "repos key with owner > 39 chars must be rejected at load time"
+        );
+
+        // Repo > 100 chars in [repos] key
+        let dir2 = std::env::temp_dir().join("afd_cfg_test_overlength_repos_repo");
+        std::fs::create_dir_all(&dir2).unwrap();
+        let p2 = dir2.join("overlength_repo_repos.toml");
+        let long_repo = "a".repeat(101);
+        std::fs::write(
+            &p2,
+            format!(
+                r#"target_repo = "jleechanorg/dark-factory"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+
+[repos."valid-owner/{long_repo}"]
+ao_project = "test-proj"
+push_remote = "origin"
+"#,
+            ),
+        )
+        .unwrap();
+        let result2 = load(&p2);
+        assert!(
+            result2.is_err(),
+            "repos key with repo > 100 chars must be rejected at load time"
+        );
+    }
 }

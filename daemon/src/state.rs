@@ -1964,4 +1964,80 @@ mod tests {
         let h_after = store.load("h").unwrap().unwrap();
         assert_eq!(h_after.autonomy_secs, 10299);
     }
+
+    /// jleechan-87ea skeptic: overlay target_repo must survive save/load
+    /// roundtrip and be verifiable at every lookup instant — proves the
+    /// fake-gh seam: when a BeadOverlay carries a persisted target_repo,
+    /// loading it at any point returns the same repo identity, not None
+    /// or the daemon global default.
+    #[test]
+    fn overlay_target_repo_persists_through_repeated_loads() {
+        let s = store();
+        let target = Some("jleechanorg/ez-gh-actions".to_string());
+        let o = BeadOverlay {
+            bead_id: "b-repo".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: None,
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: target.clone(),
+        };
+        s.save(&o).unwrap();
+
+        // Multiple load instants — each must return the same persisted repo.
+        for _ in 0..5 {
+            let got = s.load("b-repo").unwrap().unwrap();
+            assert_eq!(got.target_repo, target, "target_repo must survive each load instant");
+        }
+    }
+
+    /// jleechan-87ea skeptic: a populated overlay with non-default metadata
+    /// in every field (state, attempt, reroll, session, branch, target_repo,
+    /// park_reason, etc.) must preserve all values through a save/load
+    /// roundtrip — repository persistence must not clobber unrelated state.
+    #[test]
+    fn overlay_populated_metadata_persists_full_roundtrip() {
+        let s = store();
+        let o = BeadOverlay {
+            bead_id: "b-full".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 7,
+            reroll_count: 3,
+            autonomy_secs: 4200,
+            spend_usd: 12.75,
+            pr_number: Some(271),
+            branch: Some("factory/b-full-r7".into()),
+            session_id: Some("ao-session-abc123".into()),
+            is_adopted: true,
+            spawn_failure_count: 2,
+            pre_session_head_sha: Some("abc123def456".into()),
+            park_reason: Some("session_stalled".into()),
+            target_repo: Some("jleechanorg/dark-factory".into()),
+        };
+        s.save(&o).unwrap();
+        let got = s.load("b-full").unwrap().unwrap();
+
+        assert_eq!(got.bead_id, "b-full");
+        assert_eq!(got.state, OverlayState::HumanHeld);
+        assert_eq!(got.attempt, 7);
+        assert_eq!(got.reroll_count, 3);
+        assert_eq!(got.autonomy_secs, 4200);
+        assert_eq!(got.spend_usd, 12.75);
+        assert_eq!(got.pr_number, Some(271));
+        assert_eq!(got.branch, Some("factory/b-full-r7".into()));
+        assert_eq!(got.session_id, Some("ao-session-abc123".into()));
+        assert_eq!(got.is_adopted, true);
+        assert_eq!(got.spawn_failure_count, 2);
+        assert_eq!(got.pre_session_head_sha, Some("abc123def456".into()));
+        assert_eq!(got.park_reason, Some("session_stalled".into()));
+        assert_eq!(got.target_repo, Some("jleechanorg/dark-factory".into()));
+    }
 }
