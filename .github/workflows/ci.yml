@@ -4,30 +4,241 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # The bash integration lane must execute on stacked PRs (PRs whose base
+    # is a feature/fix branch, not main) so a coder's PR can be verified
+    # against the combined tree it will land on. Without `feat/**` /
+    # `factory/**` here, a stacked PR's CI workflow is structurally
+    # invisible — `pull_request: branches: [main]` excludes it, the
+    # bash-lane jobs are never created, and a missing-tool or harness-gap
+    # regression only surfaces when the PR is retargeted/merged to main.
+    # See issue #284 acceptance ("full bash integration lane on the same
+    # shared self-hosted selector"); see also PR #287 (issue #286) which
+    # fixes the SELF_HOSTED_RUNNER_LABELS drift that previously caused the
+    # self-hosted jobs to queue with zero steps.
+    branches: [main, 'feat/**', 'factory/**']
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Private-repo Actions policy: jobs MUST run on self-hosted runners via
+    # the org/repo shared label selector. Do NOT use `ubuntu-latest` or any
+    # GitHub-hosted label here — that is policy drift (see ~/.codex/AGENTS.md
+    # "Private repo Actions policy" and ~/.claude/CLAUDE.md "Private repo
+    # Actions policy"). The env var SELF_HOSTED_RUNNER_LABELS is org-set; the
+    # hard-coded fallback covers repos where the var is not yet declared.
+    # KNOWN CONFIG BLOCKER: as of this PR, SELF_HOSTED_RUNNER_LABELS is
+    # ["self-hosted","Linux","ARM64","agent-orchestrator"], which matches
+    # zero online org runners. See issue #286. This PR does NOT mutate
+    # that var — fixing it requires a separately tracked configuration
+    # change. Until #286 is resolved, jobs will queue with zero steps.
+    runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS || '["self-hosted","self-hosted-mikey"]') }}
     permissions:
       contents: read
     env:
       DISABLE_SANDBOX: "1"
       DARK_FACTORY_HOLDOUTS: "${{ github.workspace }}/tests/fixtures/holdout-eval"
+      # Pinned ripgrep 14.1.1 SHA256 manifest. The case statement in the
+      # provisioning step maps (RUNNER_OS, RUNNER_ARCH) to (target triple,
+      # sha256). Updating rg requires updating both. Verified via:
+      #   curl -sL https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-<triple>.tar.gz.sha256
+      RG_VERSION: "14.1.1"
+      RG_RELEASE_BASE: "https://github.com/BurntSushi/ripgrep/releases/download"
+      RG_SHA_LINUX_X86_64: "4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e"
+      RG_SHA_LINUX_ARM64: "c827481c4ff4ea10c9dc7a4022c8de5db34a5737cb74484d62eb94a95841ab2f"
+      RG_SHA_MACOS_X86_64: "fc87e78f7cb3fea12d69072e7ef3b21509754717b746368fd40d88963630e2b3"
+      RG_SHA_MACOS_ARM64: "24ad76777745fbff131c8fbc466742b011f925bfa4fffa2ded6def23b5b937be"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           persist-credentials: false
+
+      - name: Bootstrap-preflight (verify prereq tools before any use)
+        # Every later step assumes `curl`, `sha256sum`, `tar`, `awk`, `bash`,
+        # `git`, and `python3` exist on the runner. Verify BEFORE pip or rg
+        # provisioning so a missing bootstrap tool fails the job with a
+        # single ::error listing every missing binary — instead of a
+        # confusing "rg binary not present after unpack" stack trace from
+        # a missing curl.
+        run: |
+          set -euo pipefail
+          missing=()
+          for bin in bash sh curl sha256sum tar awk sed tr git python3; do
+            if ! command -v "$bin" >/dev/null 2>&1; then
+              missing+=("$bin")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=Bootstrap preflight failed::missing=${missing[*]}"
+            exit 1
+          fi
+          echo "OK: bootstrap preflight passed (bash=$(bash --version | head -1), curl=$(curl --version | head -1 | awk '{print $1 $2}'), git=$(git --version | awk '{print $3}'), python3=$(python3 --version | awk '{print $2}'))"
 
       - name: Set up Python
         uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55  # v5.5.0
         with:
           python-version: "3.13"
 
+      - name: Fix Python 3.13 shared-library path (self-hosted runners)
+        # actions/setup-python installs Python 3.13 under _tool/ but the
+        # toolcache build ships libpython3.13.so WITHOUT the versioned soname
+        # symlink (libpython3.13.so.1.0). The dynamic linker looks for the
+        # versioned soname and fails with rc=127 when tests spawn python as a
+        # subprocess (test_preflight.py, test_structural_preflight.py, etc.).
+        # Fix: locate the unversioned .so, add its dir to LD_LIBRARY_PATH,
+        # and create the missing versioned soname symlink in the same dir.
+        # Mirrors PR #287 (issue #286) fix.
+        run: |
+          PY_PREFIX="$(python3 -c 'import sys; print(sys.prefix)')"
+          # Find the unversioned libpython3.13.so (not the .1.0 versioned one).
+          SO_PATH="$(find "$PY_PREFIX" -maxdepth 4 -name 'libpython*.so' -not -name '*.so.*' 2>/dev/null | head -1)"
+          if [ -n "$SO_PATH" ]; then
+            SO_DIR="$(dirname "$SO_PATH")"
+            SO_NAME="$(basename "$SO_PATH")"
+            # Add the dir to LD_LIBRARY_PATH for subprocess python invocations.
+            echo "LD_LIBRARY_PATH=${SO_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+            echo "Found $SO_PATH — LD_LIBRARY_PATH updated"
+            # Create the versioned soname symlink if it does not already exist.
+            # The dynamic linker uses the soname (libpython3.13.so.1.0) not the
+            # link-time name (libpython3.13.so), so both must be resolvable.
+            VERSIONED="${SO_NAME%.so}.so.1.0"
+            if [ ! -e "${SO_DIR}/${VERSIONED}" ]; then
+              ln -s "$SO_NAME" "${SO_DIR}/${VERSIONED}"
+              echo "Created symlink ${SO_DIR}/${VERSIONED} -> ${SO_NAME}"
+            else
+              echo "Versioned soname ${SO_DIR}/${VERSIONED} already exists"
+            fi
+          else
+            echo "::warning::libpython3.13.so not found under $PY_PREFIX — subprocess python may fail with rc=127"
+          fi
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
+
+      - name: Provision ripgrep (version-attested) + bash-lane preflight
+        # Self-hosted runners must not be mutated with `sudo apt-get` during
+        # PR jobs (that mutates persistent state for every subsequent PR).
+        # This step instead:
+        #   1. Looks for an already-provisioned `rg` on PATH whose version
+        #      matches the pinned RG_VERSION.
+        #   2. If absent OR version mismatch, downloads the pinned
+        #      ripgrep tarball from the official GitHub release for
+        #      (RUNNER_OS, RUNNER_ARCH), verifies its SHA256 against the
+        #      pinned manifest, and unpacks into $RUNNER_TEMP (job-local;
+        #      cleaned up by Actions at job end).
+        #   3. ALWAYS SHA256-verifies any pre-existing cached binary under
+        #      $RUNNER_TEMP — never trusts a predictable cached path.
+        #   4. NEVER invokes sudo apt-get / apt-get. FAILS CLOSED on any
+        #      checksum mismatch, missing tool, or unsupported platform.
+        # See bead jleechan-t5sw, issue #284.
+        run: |
+          set -euo pipefail
+          runner_os="${RUNNER_OS:-Linux}"
+          runner_arch="${RUNNER_ARCH:-X64}"
+          # ---- Map (RUNNER_OS, RUNNER_ARCH) to (triple, sha256) ----
+          case "${runner_os}/${runner_arch}" in
+              Linux/X64)
+                  rg_triple="x86_64-unknown-linux-musl"
+                  rg_sha="${RG_SHA_LINUX_X86_64}"
+                  ;;
+              Linux/ARM64)
+                  rg_triple="aarch64-unknown-linux-gnu"
+                  rg_sha="${RG_SHA_LINUX_ARM64}"
+                  ;;
+              macos/X64)
+                  rg_triple="x86_64-apple-darwin"
+                  rg_sha="${RG_SHA_MACOS_X86_64}"
+                  ;;
+              macos/ARM64)
+                  rg_triple="aarch64-apple-darwin"
+                  rg_sha="${RG_SHA_MACOS_ARM64}"
+                  ;;
+              *)
+                  echo "::error title=Unsupported runner platform::os=${runner_os} arch=${runner_arch}"
+                  exit 1
+                  ;;
+          esac
+          echo "OK: platform map selected triple=${rg_triple} sha=${rg_sha}"
+          # ---- Path 1: rg already on PATH, version-attested ----
+          if command -v rg >/dev/null 2>&1; then
+            rg_version="$(rg --version | head -1 | awk '{print $2}')"
+            if [ "$rg_version" = "${RG_VERSION}" ]; then
+              echo "OK: ripgrep ${rg_version} on PATH (attested, no download needed)"
+              rg_on_path=1
+            else
+              echo "::notice title=ripgrep ${rg_version} on PATH does not match pinned ${RG_VERSION} — installing job-local::"
+              rg_on_path=0
+            fi
+          else
+            echo "::notice title=ripgrep not on PATH — installing job-local::"
+            rg_on_path=0
+          fi
+          # ---- Path 2: pinned job-local binary (no persistent mutation) ----
+          if [ "${rg_on_path:-0}" -eq 0 ]; then
+            rg_dir="${RUNNER_TEMP:-/tmp}/ripgrep-${RG_VERSION}-${rg_triple}"
+            rg_bin="${rg_dir}/rg"
+            tarball="${rg_dir}/ripgrep.tar.gz"
+            url="${RG_RELEASE_BASE}/${RG_VERSION}/ripgrep-${RG_VERSION}-${rg_triple}.tar.gz"
+            mkdir -p "$rg_dir"
+            # ALWAYS download fresh and ALWAYS verify. Even if $rg_bin
+            # already exists from a prior job (some persistent runners
+            # keep $RUNNER_TEMP), we never trust a predictable cached
+            # path — checksum mismatch is the same code path either way.
+            echo "Downloading $url"
+            curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+              --output "$tarball" "$url"
+            actual_sha="$(sha256sum "$tarball" | awk '{print $1}')"
+            if [ "$actual_sha" != "$rg_sha" ]; then
+              echo "::error title=ripgrep checksum mismatch::expected=${rg_sha} actual=${actual_sha} url=${url}"
+              rm -rf "$rg_dir"
+              exit 1
+            fi
+            # Wipe any stale unpacked binary before extracting so the
+            # post-extract checksum check is meaningful.
+            rm -f "$rg_bin"
+            tar -xzf "$tarball" -C "$rg_dir" --strip-components=1
+            rm -f "$tarball"
+            if [ ! -x "$rg_bin" ]; then
+              echo "::error title=ripgrep binary not present after unpack::expected=${rg_bin}"
+              rm -rf "$rg_dir"
+              exit 1
+            fi
+            # Defense in depth: re-verify the unpacked binary is intact
+            # (defends against tarball corruption mid-extract). The
+            # shipped .sha256 covers the tarball; the binary is verified
+            # by being in the verified tarball. Print the unpacked hash
+            # for observability.
+            unpacked_sha="$(sha256sum "$rg_bin" | awk '{print $1}')"
+            echo "OK: unpacked rg at ${rg_bin} sha256=${unpacked_sha}"
+            # Prepend job-local rg to PATH for BOTH the current shell AND
+            # subsequent steps. $GITHUB_PATH only takes effect at the next
+            # step boundary, so without the explicit `export PATH=...`
+            # below, the same step's downstream `rg --version` checks
+            # would still see no rg on PATH. The $GITHUB_PATH line covers
+            # the downstream steps (pytest, bash integration, graph
+            # audit). $RUNNER_TEMP is wiped at job end for ephemeral
+            # runners, so this is not persistent mutation.
+            export PATH="${rg_dir}:${PATH}"
+            echo "${rg_dir}" >> "$GITHUB_PATH"
+            # Version-attest the job-local install right now.
+            "$rg_bin" --version | head -1
+          fi
+          # ---- Bash-lane preflight: every binary the bash lane needs ----
+          missing=()
+          for bin in bash rg git python3; do
+            if ! command -v "$bin" >/dev/null 2>&1; then
+              missing+=("$bin")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=Bash-lane preflight failed::missing=${missing[*]}"
+            exit 1
+          fi
+          rg_final="$(rg --version | head -1 | awk '{print $2}')"
+          case "$rg_final" in
+              "${RG_VERSION}") echo "OK: bash-lane preflight passed (rg=${rg_final} attested, git=$(git --version | awk '{print $3}'), python3=$(python3 --version | awk '{print $2}'))" ;;
+              *) echo "::error title=ripgrep ${rg_final} post-install does not match pinned ${RG_VERSION}"; exit 1 ;;
+          esac
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
@@ -36,7 +247,12 @@ jobs:
         # The tests/scripts/*.sh suite exercises factory-overlay.sh, factory-af-tick.sh,
         # and the callpath overlay-harness probe. Without this step, regressions in
         # those scripts only surface when an operator runs them locally.
-        # See bead jleechan-50jf.
+        # HARD DEPENDENCY: PR #256 (jleechan-1rq, MERGEABLE/CLEAN) supplies the
+        # bare-repo HEAD fix that test_deploy_af_tick.sh and
+        # test_factory_af_tick_drift_gate.sh need; this PR does not patch those
+        # fixtures. The full bash integration lane reaches green only when both
+        # PR #256 and PR #285 are merged.
+        # See bead jleechan-50jf, issue #284.
         run: |
           set +e
           fail=0
@@ -51,7 +267,13 @@ jobs:
         run: python -m runner.graph_audit pipelines
 
   daemon-tests:
-    runs-on: ubuntu-latest
+    # Same org/repo shared self-hosted selector — see comment on the `test`
+    # job's runs-on.
+    # NOTE: the two jobs share the SAME `runs-on` expression but are NOT
+    # guaranteed to land on the same physical machine. The runner pool
+    # routes independently — `test` may run on ez-runner-c-3 while
+    # `daemon-tests` runs on ez-runner-c-7. Same label set ≠ same host.
+    runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS || '["self-hosted","self-hosted-mikey"]') }}
     permissions:
       contents: read
     steps:
@@ -59,6 +281,45 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Install Rust toolchain (stable)
+        # Self-hosted runners do not ship with `cargo` pre-installed (verified
+        # on jleechanorg org runners 2026-07-13, PR #285 first relaxed-trigger
+        # run: bootstrap preflight failed with `missing=cargo`). dtolnay's
+        # rust-toolchain action installs rustup + the requested toolchain in
+        # one step. The `clippy` component is required for the
+        # `cargo clippy` step below — without it, the toolchain reports
+        # `error: 'cargo-clippy' is not installed for the toolchain`. Same
+        # action + components pinned in PR #287 (issue #286) and
+        # `docs/self-hosted-runner-selector.md`. Pinned by SHA.
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1 (stable)
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Bootstrap-preflight
+        # Daemon lane needs git + cargo (cargo now available from the
+        # rust-toolchain step above). Verify everything before any use.
+        run: |
+          set -euo pipefail
+          missing=()
+          for bin in bash sh git python3 cargo; do
+            if ! command -v "$bin" >/dev/null 2>&1; then
+              missing+=("$bin")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=Bootstrap preflight failed::missing=${missing[*]}"
+            exit 1
+          fi
+          echo "OK: bootstrap preflight passed (git=$(git --version | awk '{print $3}'), cargo=$(cargo --version | awk '{print $2}'), python3=$(python3 --version | awk '{print $2}'))"
+
+      - name: Cache cargo registry/target for daemon crate
+        # Reuse cargo build artifacts across runs to keep the daemon-tests
+        # lane fast. Swatinem/rust-cache keys on workspace lockfiles.
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc  # v2.9.1
+        with:
+          workspaces: daemon -> target
 
       - name: Ensure main ref for VCS integration test
         # daemon/tests/adapters_integration.rs:7 calls `git base_head main` which
