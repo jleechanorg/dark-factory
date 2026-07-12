@@ -575,7 +575,16 @@ pub fn run_tick(
                     // loop and freeze every other active overlay. Log the
                     // error and skip to the next overlay; the wedge check
                     // re-runs on the next tick when the snapshot succeeds.
-                    let pr_snapshot = match deps.scm.pr_snapshot(pr_number) {
+                    // jleechan-9xrs Stage D: was `deps.scm.pr_snapshot(pr_number)`
+                    // — this is the SAME active-overlay loop iteration whose
+                    // sibling `ci_pending_for_attested` call above already
+                    // resolves `active_overlay_repo`; missing this one meant
+                    // the wedge-detection / timebox-park path still read a
+                    // cross-repo bead's PR from `cfg.target_repo`.
+                    let pr_snapshot = match deps
+                        .scm
+                        .pr_snapshot_for_repo(&active_overlay_repo, pr_number)
+                    {
                         Ok(snap) => snap,
                         Err(e) => {
                             let _ = emit(

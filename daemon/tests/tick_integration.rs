@@ -6044,8 +6044,19 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
     let overlay = store.load(bead_id).unwrap().unwrap();
     assert_eq!(overlay.state, OverlayState::HumanHeld);
 
-    // 1. Snapshot fetches (skeptic_evidence + verifier::assess) must have
-    //    gone through pr_snapshot_for_repo with the bead's OWN repo.
+    // 1. EVERY snapshot fetch in the whole verification loop (the
+    //    active-overlay wedge-detection fetch in `run_tick`, plus
+    //    skeptic_evidence + verifier::assess in `run_fast_tier`) must have
+    //    gone through `pr_snapshot_for_repo` with the bead's OWN repo --
+    //    never the plain (cfg-bound) `pr_snapshot`. This positive assertion
+    //    on its own is not sufficient: a stray missed call site that still
+    //    calls plain `pr_snapshot(pr)` logs a call string containing
+    //    neither "owner/repo" nor "global-real-repo" (FakeScm's plain
+    //    `pr_snapshot` call-log format carries no repo string at all), so
+    //    it would silently pass both the positive check above and a
+    //    "doesn't contain global-real-repo" negative check. The explicit
+    //    "zero plain pr_snapshot(...) calls" assertion below closes that
+    //    gap.
     let scm_calls = scm.calls.borrow();
     assert!(
         scm_calls
@@ -6058,25 +6069,55 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
         "verification loop must never fall back to cfg.target_repo for a \
          bead with an explicit target_repo, got: {scm_calls:?}"
     );
+    assert!(
+        !scm_calls.iter().any(|c| c.starts_with("pr_snapshot(")),
+        "found a call to the plain (cfg-bound) pr_snapshot -- every \
+         verification-loop snapshot fetch must go through \
+         pr_snapshot_for_repo instead, got: {scm_calls:?}"
+    );
 
-    // 2. The skeptic prompt (captured via the mock LLM's judge() call log)
-    //    must embed the bead's own repo, not cfg.target_repo -- and the
-    //    mock path being reached at all proves is_test_repo was computed
-    //    from the bead's repo, not the (non-test-pattern) global one.
+    // 2. The skeptic prompt must embed the bead's own repo, not
+    //    cfg.target_repo -- AND `skeptic_evidence` reaching the mock LLM
+    //    path AT ALL proves `is_test_repo` was computed from the bead's own
+    //    repo, not cfg.target_repo (which matches no test pattern here).
+    //
+    //    `er_runner::maybe_run` ALSO calls the mock LLM unconditionally
+    //    (its dispatch is gated on `Llm::is_real()`, which `FakeLlm`
+    //    defaults to `false`, independent of `is_test_repo`) -- so a naive
+    //    "at least one judge() call happened" assertion cannot distinguish
+    //    the fix from the bug: reverting `is_test_repo` back to
+    //    `cfg.target_repo` still produces exactly one judge() call (from
+    //    er_runner alone) if the real `codex`/`claude`/`agy` binaries
+    //    happen to be on `PATH` and return a parseable verdict, silently
+    //    passing this test while `skeptic_evidence` spawned REAL reviewer
+    //    subprocesses instead of using the mock. Two independent checks
+    //    close that gap: (a) an EXACT call count of 2 (skeptic +
+    //    er_runner -- one fewer than expected if skeptic took the real
+    //    subprocess branch instead), and (b) inspecting the
+    //    skeptic-specific prompt (identified by its unique "Stage-1
+    //    Skeptic" marker, distinct from er_runner's "/er (evidence
+    //    review)" marker) for the bead's own repo.
     let llm_calls = llm.calls.borrow();
+    assert_eq!(
+        llm_calls.len(),
+        2,
+        "expected exactly 2 mock LLM calls (skeptic_evidence + \
+         er_runner::maybe_run); a count of 1 means skeptic_evidence took \
+         the REAL dual-reviewer subprocess branch instead of the mock \
+         path, i.e. is_test_repo was computed from cfg.target_repo (not \
+         the bead's own repo). got: {llm_calls:?}"
+    );
+    let skeptic_prompt = llm_calls
+        .iter()
+        .find(|c| c.contains("Stage-1 Skeptic"))
+        .unwrap_or_else(|| panic!("expected a Stage-1 Skeptic prompt among judge() calls, got: {llm_calls:?}"));
     assert!(
-        !llm_calls.is_empty(),
-        "expected the skeptic gate to consult the mock LLM (proves \
-         is_test_repo used the bead's own repo, not cfg.target_repo which \
-         does not match any test pattern)"
+        skeptic_prompt.contains("owner/repo"),
+        "skeptic prompt must embed the bead's own repo, got: {skeptic_prompt:?}"
     );
     assert!(
-        llm_calls.iter().any(|c| c.contains("owner/repo")),
-        "skeptic prompt must embed the bead's own repo, got: {llm_calls:?}"
-    );
-    assert!(
-        !llm_calls.iter().any(|c| c.contains("global-real-repo")),
-        "skeptic prompt must not leak cfg.target_repo, got: {llm_calls:?}"
+        !skeptic_prompt.contains("global-real-repo"),
+        "skeptic prompt must not leak cfg.target_repo, got: {skeptic_prompt:?}"
     );
 
     // 3. The PARKED_HUMAN_HELD escalation comment's ext_ref must target the
