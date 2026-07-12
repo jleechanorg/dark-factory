@@ -34,9 +34,18 @@ pipeline; use `/h` when you want an interactive in-session loop.
 | `/f-pr` | Explicit PR-mode entry point (skips auto-route, always PR-mode) |
 | `/fs` | Spec-generation entry point; runs `pipelines/slim/spec_gen.dot` or a binary-owned dynamic spec graph — run this first when the goal needs a spec |
 
-`.claude/commands/f.md` is the single writer for the binary-first contract;
-`/factory` and `/f-pr` are thin aliases so auto-detect behavior stays
-identical across entry points.
+This skill file is the single source of truth for the binary-first contract;
+`.claude/commands/f.md` is the canonical command entry point, with `/factory`
+and `/f-pr` as thin aliases so auto-detect behavior stays identical across
+entry points.
+
+**What "binary-first" bans**: an in-Claude prose-only workflow that claims a
+factory run without a logged binary invocation is not a valid run — see
+**Honesty rules** below. Every default run must preserve required default
+nodes or their graph-level equivalents: plan/spec producer, independent
+review, bounded fix loop, evidence gates, and exit summary. Dynamic graph
+generation is valid only when the generated/selected DOT graph is saved or
+echoed in the run evidence.
 
 ## Repos
 
@@ -323,6 +332,9 @@ To add a new sealed-holdout feature `foo`:
   declare the run **invalid** and rerun the pipeline.
 - If `--backend echo` was used, label the run as a wiring smoke, not a real
   validation.
+- Reviewer calibration is default-on. If `--reviewer-calibration=false` is
+  passed, quote the explicit opt-out reason and do not imply raw-Codex-vs-
+  subagent quality was measured.
 - Do not claim a factory run based on an in-Claude workflow, `Skill()` call,
   or prose summary. The only valid proof is an actual `dark-factory` binary
   invocation plus the proof block above.

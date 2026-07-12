@@ -90,6 +90,12 @@ writes, no run.
 
 ## Proof block (create mode, binary-backed)
 
+The default graph must preserve these nodes or their generated equivalents:
+main spec plan, independent cold review, bounded main-spec fix loop,
+attractor-spec plan, independent cold review, bounded attractor fix loop,
+and exit. An in-Claude prose-only workflow that claims a spec run without a
+logged binary invocation is not a valid run.
+
 End every `/fs` create-mode response with this proof block. Missing any
 required line means the run is unproven:
 
