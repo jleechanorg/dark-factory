@@ -1100,6 +1100,19 @@ impl Scm for CliScm {
         Ok(snapshot)
     }
 
+    /// jleechan-9xrs Stage D: retarget the query at `repo` via `with_repo`
+    /// instead of always fetching against `self.repo` (the daemon's global
+    /// `cfg.target_repo`, bound at construction time in `main.rs`). Callers
+    /// pass `overlay.repo(cfg)`, so the whole verification loop (skeptic
+    /// gate, /er runner, gate assessment) now reads the bead's OWN PR/CI/
+    /// review state instead of silently reading another repo's PR with the
+    /// same number. Fresh `with_repo` instance (not a cache-sharing clone)
+    /// so a cross-repo call can never return another repo's cached
+    /// `pr_snapshot_cache` entry under a colliding PR-number key.
+    fn pr_snapshot_for_repo(&self, repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
+        self.with_repo(repo).pr_snapshot(pr)
+    }
+
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
         let offline_path = std::path::Path::new(".beads/offline").join(format!("pr_{}.json", pr));
         if offline_path.exists() {

@@ -5947,6 +5947,197 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
 
+/// jleechan-9xrs Stage D end-to-end regression: a bead whose `target_repo`
+/// is a "test-repo" placeholder (`owner/repo`), dispatched under a daemon
+/// whose GLOBAL `cfg.target_repo` is a DIFFERENT, non-test-pattern repo,
+/// must have its ENTIRE verification loop (skeptic gate's `is_test_repo`
+/// classification + snapshot fetch, gate assessment's snapshot fetch, and
+/// the PARKED_HUMAN_HELD escalation comment) target the bead's OWN repo —
+/// never `cfg.target_repo`. See
+/// docs/multirepo-dispatch-investigation-2026-07-11.md Stage D.
+///
+/// This is a strong regression pin: before the Stage D fix, `is_test_repo`
+/// was computed from `cfg.target_repo` (here a real-looking, non-test
+/// string), so `skeptic_evidence` would have taken the REAL dual-reviewer
+/// dispatch branch (spawning `codex`/`claude`/`agy` subprocesses) instead of
+/// the mock `FakeLlm` path — this test's `FakeLlm` script would never be
+/// consulted, and the test would hang/fail against a `PATH` with no
+/// scripted reviewer binaries.
+#[test]
+fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+
+    let mut cfg = test_cfg();
+    // Deliberately NOT "owner/repo" / "fake-*" / "test-*" -- if is_test_repo
+    // were (incorrectly) computed from this, skeptic_evidence would try to
+    // spawn real reviewer subprocesses.
+    cfg.target_repo = "myorg/global-real-repo".into();
+
+    let pr = 4242;
+    let bead_id = "bxrs-cross-repo";
+    store.overlays.borrow_mut().insert(
+        bead_id.into(),
+        BeadOverlay {
+            bead_id: bead_id.into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some(format!("factory/{bead_id}-r1")),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            // The bead's OWN resolved repo: a test-pattern placeholder,
+            // deliberately DIFFERENT from cfg.target_repo above.
+            target_repo: Some("owner/repo".into()),
+        },
+    );
+    store
+        .branches
+        .borrow_mut()
+        .push(format!("factory/{bead_id}-r1"));
+    store
+        .branch_beads
+        .borrow_mut()
+        .insert(format!("factory/{bead_id}-r1"), bead_id.into());
+
+    // CI is red -> gate assessment is not all-green -> Stage 1 parks
+    // HUMAN_HELD and posts an escalation comment via
+    // post_scm_comment_by_bead_id.
+    let mut snapshot = qdw_green_snapshot(pr, vec![]);
+    snapshot.ci_success = false;
+    snapshot.ci_status = "failure".into();
+    scm.pr_snapshots.insert(pr, snapshot);
+
+    let telemetry_log =
+        std::env::temp_dir().join("afd_9xrs_cross_repo_verification_loop.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("run_tick should succeed for a cross-repo bead");
+
+    assert_eq!(summary.gates_assessed, 1);
+    assert_eq!(summary.beads_parked_human_held, 1);
+    let overlay = store.load(bead_id).unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+
+    // 1. EVERY snapshot fetch in the whole verification loop (the
+    //    active-overlay wedge-detection fetch in `run_tick`, plus
+    //    skeptic_evidence + verifier::assess in `run_fast_tier`) must have
+    //    gone through `pr_snapshot_for_repo` with the bead's OWN repo --
+    //    never the plain (cfg-bound) `pr_snapshot`. This positive assertion
+    //    on its own is not sufficient: a stray missed call site that still
+    //    calls plain `pr_snapshot(pr)` logs a call string containing
+    //    neither "owner/repo" nor "global-real-repo" (FakeScm's plain
+    //    `pr_snapshot` call-log format carries no repo string at all), so
+    //    it would silently pass both the positive check above and a
+    //    "doesn't contain global-real-repo" negative check. The explicit
+    //    "zero plain pr_snapshot(...) calls" assertion below closes that
+    //    gap.
+    let scm_calls = scm.calls.borrow();
+    assert!(
+        scm_calls
+            .iter()
+            .any(|c| c == &format!("pr_snapshot_for_repo(owner/repo,{pr})")),
+        "expected pr_snapshot_for_repo with the bead's own repo, got: {scm_calls:?}"
+    );
+    assert!(
+        !scm_calls.iter().any(|c| c.contains("global-real-repo")),
+        "verification loop must never fall back to cfg.target_repo for a \
+         bead with an explicit target_repo, got: {scm_calls:?}"
+    );
+    assert!(
+        !scm_calls.iter().any(|c| c.starts_with("pr_snapshot(")),
+        "found a call to the plain (cfg-bound) pr_snapshot -- every \
+         verification-loop snapshot fetch must go through \
+         pr_snapshot_for_repo instead, got: {scm_calls:?}"
+    );
+
+    // 2. The skeptic prompt must embed the bead's own repo, not
+    //    cfg.target_repo -- AND `skeptic_evidence` reaching the mock LLM
+    //    path AT ALL proves `is_test_repo` was computed from the bead's own
+    //    repo, not cfg.target_repo (which matches no test pattern here).
+    //
+    //    `er_runner::maybe_run` ALSO calls the mock LLM unconditionally
+    //    (its dispatch is gated on `Llm::is_real()`, which `FakeLlm`
+    //    defaults to `false`, independent of `is_test_repo`) -- so a naive
+    //    "at least one judge() call happened" assertion cannot distinguish
+    //    the fix from the bug: reverting `is_test_repo` back to
+    //    `cfg.target_repo` still produces exactly one judge() call (from
+    //    er_runner alone) if the real `codex`/`claude`/`agy` binaries
+    //    happen to be on `PATH` and return a parseable verdict, silently
+    //    passing this test while `skeptic_evidence` spawned REAL reviewer
+    //    subprocesses instead of using the mock. Two independent checks
+    //    close that gap: (a) an EXACT call count of 2 (skeptic +
+    //    er_runner -- one fewer than expected if skeptic took the real
+    //    subprocess branch instead), and (b) inspecting the
+    //    skeptic-specific prompt (identified by its unique "Stage-1
+    //    Skeptic" marker, distinct from er_runner's "/er (evidence
+    //    review)" marker) for the bead's own repo.
+    let llm_calls = llm.calls.borrow();
+    assert_eq!(
+        llm_calls.len(),
+        2,
+        "expected exactly 2 mock LLM calls (skeptic_evidence + \
+         er_runner::maybe_run); a count of 1 means skeptic_evidence took \
+         the REAL dual-reviewer subprocess branch instead of the mock \
+         path, i.e. is_test_repo was computed from cfg.target_repo (not \
+         the bead's own repo). got: {llm_calls:?}"
+    );
+    let skeptic_prompt = llm_calls
+        .iter()
+        .find(|c| c.contains("Stage-1 Skeptic"))
+        .unwrap_or_else(|| panic!("expected a Stage-1 Skeptic prompt among judge() calls, got: {llm_calls:?}"));
+    assert!(
+        skeptic_prompt.contains("owner/repo"),
+        "skeptic prompt must embed the bead's own repo, got: {skeptic_prompt:?}"
+    );
+    assert!(
+        !skeptic_prompt.contains("global-real-repo"),
+        "skeptic prompt must not leak cfg.target_repo, got: {skeptic_prompt:?}"
+    );
+
+    // 3. The PARKED_HUMAN_HELD escalation comment's ext_ref must target the
+    //    bead's own repo -- this is the twa0/mdgr escalation cross-repo
+    //    class Stage D closes.
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls
+            .iter()
+            .any(|c| c.starts_with(&format!("comment_external(owner/repo#{pr}"))),
+        "escalation comment must target the bead's own repo, got: {tracker_calls:?}"
+    );
+    assert!(
+        !tracker_calls.iter().any(|c| c.contains("global-real-repo")),
+        "escalation comment must not leak cfg.target_repo, got: {tracker_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 // --- jleechan-bkru: 4th-vendor (gemini) fallback gap --------------------
 //
 // Live incident 2026-07-09 (bead jleechan-93ft, worldarchitect.ai PR #7888):
