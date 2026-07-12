@@ -92,6 +92,47 @@ Reasoning (LLM, not rules):
 - **Open PR exists** AND goal relates to it → PR-mode (drive the existing PR to green).
 - **Open PR exists** AND goal is unrelated → **ask the user** which mode they meant. Do not silently route.
 
+### `/f-pr` — explicit PR-mode entry point
+
+`/f-pr` skips Step 0a and always runs PR-mode. Use the LLM to **read the
+PR's actual context and pick the right pipeline** — this is a reasoning
+task, not a deterministic rule table (no `if is_draft then X`, no
+`if labels contains 'bug' then bug_fix.dot`, no keyword-routing).
+
+1. **Resolve the PR number**: from `$ARGUMENTS` if present, else
+   `gh pr list --head "$(git rev-parse --abbrev-ref HEAD)" --json number --jq '.[0].number'`,
+   else ask the user.
+2. **Read PR context as facts, not routing rules**:
+   ```bash
+   gh pr view <N> --json number,title,state,isDraft,additions,deletions,changedFiles,baseRefName,headRefName,body,files,labels
+   gh pr view <N> --json statusCheckRollup
+   gh pr diff <N> --name-only
+   gh pr view <N> --comments   # optional
+   ls specs/ roadmap*/ docs/design/ 2>/dev/null   # optional
+   ```
+3. **Reason about**: what kind of work this is (new feature / bug fix /
+   refactor / docs / test-only / infra — from diff+body+files, never
+   pre-bucketed by label alone); whether a spec already covers the
+   change (if so, `/fs` is skippable — deciding `/fs` is needed first
+   and stopping is a valid terminal state, do not force a run); holdout
+   eligibility (pass `--feature <name>` only if
+   `~/projects/dark-factory-holdouts/holdouts/<feature>/` actually
+   exists — never invent one); and what evidence mix (`/es` + `/er` +
+   `/code_standards` minimum, `holdout_eval` for behavior-grade) the
+   pipeline needs to deliver without over-running.
+4. Pick the pipeline from **Available pipelines** above using that
+   reasoning, pick the backend (`echo` for wiring smoke; `claude` unless
+   the PR's reviewer queue or `gate_er` priority queue says otherwise),
+   then construct, show, and run the command — same shape as Step 0c
+   below but `cd` into the PR's target repo, not `dark-factory`.
+5. Report the verdict per **Output contract** below.
+
+`/f-pr` honesty rules (in addition to the shared ones under **Honesty
+rules**): the `gate_er` priority queue (`codex > minimax > agy >
+claude-sonnet`) still resolves the reviewer even when `--backend claude`
+was passed for the run itself — passing `--backend claude` does not mean
+`gate_er` uses claude by default.
+
 ### Step 0b — Auto-detect CLI backend
 
 When the user invokes Claude via a `~/.bashrc` wrapper (`claudem`, `clauded`,
