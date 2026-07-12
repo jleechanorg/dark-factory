@@ -854,7 +854,7 @@ fn run_bead_reconciliation_step(
                 let comment_body = format!(
                     "🤖 **[dark-factory]** Escalation required: bead `{}` was in state {} but the bead no longer exists in the tracker (`br show` returned no match). The overlay has been parked HUMAN_HELD rather than silently left active (fail-closed, jleechan-xsg4 / issue #270).",
                     overlay.bead_id,
-                    overlay.state.as_str()
+                    prior_state.as_str()
                 );
                 let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
             }
@@ -881,7 +881,7 @@ fn run_bead_reconciliation_step(
                 let comment_body = format!(
                     "🤖 **[dark-factory]** Escalation required: bead `{}` was in state {} but the bead is now closed (terminal) in the tracker. The overlay has been parked HUMAN_HELD rather than silently left active (fail-closed, jleechan-xsg4 / issue #270).",
                     overlay.bead_id,
-                    overlay.state.as_str()
+                    prior_state.as_str()
                 );
                 let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
             }

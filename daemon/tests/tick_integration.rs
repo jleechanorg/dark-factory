@@ -8124,6 +8124,22 @@ fn reconciliation_parks_human_held_when_bead_is_missing() {
         serde_json::from_str(reconcile_line).unwrap();
     assert_eq!(reconcile_ev["context"]["prior_state"], "ATTESTED");
 
+    let comment_call = tracker
+        .calls
+        .borrow()
+        .iter()
+        .find(|c| c.contains("comment_external") && c.contains("bead-missing"))
+        .cloned()
+        .expect("expected a comment_external call for bead-missing");
+    assert!(
+        comment_call.contains("was in state ATTESTED"),
+        "comment body must reference the prior state ATTESTED: {comment_call}"
+    );
+    assert!(
+        !comment_call.contains("was in state HUMAN_HELD"),
+        "comment body must NOT reference the new HUMAN_HELD state: {comment_call}"
+    );
+
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -8201,6 +8217,22 @@ fn reconciliation_parks_human_held_when_bead_is_closed() {
     let reconcile_ev: serde_json::Value =
         serde_json::from_str(reconcile_line).unwrap();
     assert_eq!(reconcile_ev["context"]["prior_state"], "DISPATCHED");
+
+    let comment_call = tracker
+        .calls
+        .borrow()
+        .iter()
+        .find(|c| c.contains("comment_external") && c.contains("bead-closed"))
+        .cloned()
+        .expect("expected a comment_external call for bead-closed");
+    assert!(
+        comment_call.contains("was in state DISPATCHED"),
+        "comment body must reference the prior state DISPATCHED: {comment_call}"
+    );
+    assert!(
+        !comment_call.contains("was in state HUMAN_HELD"),
+        "comment body must NOT reference the new HUMAN_HELD state: {comment_call}"
+    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
