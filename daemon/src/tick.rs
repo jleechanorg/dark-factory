@@ -868,6 +868,7 @@ fn run_bead_reconciliation_step(
 ///   live/dead semantics — "ready" is alive, only "exited"/"missing" is dead);
 ///   requeue if confirmed dead. If the probe errors, leave the overlay alone
 ///   (transient tool failure — retry next tick).
+///
 /// Overlays with a confirmed live session stay DISPATCHED.
 /// Emits `BEAD_RECOVERED_STALE_DISPATCHED` for each requeued overlay.
 fn run_dispatched_recovery_step(
