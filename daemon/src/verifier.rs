@@ -256,7 +256,9 @@ pub fn parse_skeptic_verdict(raw: &str) -> Option<SkepticVerdict> {
         }
     }
 
-    if gate7_verdict.is_some() && gha_verdict.is_none() && signoff_verdict.is_none()
+    if gate7_verdict.is_some()
+        && gha_verdict.is_none()
+        && signoff_verdict.is_none()
         && !raw.to_ascii_lowercase().contains("subsystem:")
     {
         return gate7_verdict;
@@ -363,7 +365,9 @@ fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
             }
             ErVerdict::Pass => {}
             ErVerdict::Partial => {
-                return GateResult::Red("/er verdict is PARTIAL (PRODUCTION requires PASS)".to_string());
+                return GateResult::Red(
+                    "/er verdict is PARTIAL (PRODUCTION requires PASS)".to_string(),
+                );
             }
             ErVerdict::Fail => {
                 return GateResult::Red("/er verdict is FAIL".to_string());
@@ -419,10 +423,7 @@ pub fn parse_er_verdict(comments: &[crate::tools::PrComment]) -> ErVerdict {
 ///   the worst case is one redundant `/er` run, bounded by
 ///   `MAX_ER_RUNNER_ATTEMPTS`; the alternative re-opens the self-
 ///   certification hole this function exists to close.
-pub fn parse_er_verdict_since(
-    comments: &[crate::tools::PrComment],
-    min_epoch: u64,
-) -> ErVerdict {
+pub fn parse_er_verdict_since(comments: &[crate::tools::PrComment], min_epoch: u64) -> ErVerdict {
     for comment in comments.iter().rev() {
         if min_epoch > 0 && comment.created_at_epoch < min_epoch {
             continue;
@@ -442,7 +443,10 @@ pub fn parse_er_verdict_since(
             };
             if is_valid_start && is_valid_end {
                 let sub = &body_lower[absolute_idx + 3..];
-                let tokens: Vec<&str> = sub.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()).collect();
+                let tokens: Vec<&str> = sub
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 for token in tokens {
                     match token {
                         "pass" | "passed" => {
@@ -477,13 +481,13 @@ pub fn parse_er_verdict_since(
 pub fn classify_production(files: &[crate::tools::PrFile]) -> bool {
     for file in files {
         let path = &file.path;
-        if path.starts_with("mvp_site/") 
-            && !path.starts_with("mvp_site/tests/") 
-            && !path.starts_with("mvp_site/test_integration/") 
+        if path.starts_with("mvp_site/")
+            && !path.starts_with("mvp_site/tests/")
+            && !path.starts_with("mvp_site/test_integration/")
         {
             return true;
         }
-        
+
         let path_lower = path.to_lowercase();
         if path_lower.contains("prompt") || path_lower.starts_with("prompts/") {
             return true;
@@ -491,10 +495,10 @@ pub fn classify_production(files: &[crate::tools::PrFile]) -> bool {
         if path.starts_with(".github/") {
             return true;
         }
-        if path_lower.contains("ci/") 
+        if path_lower.contains("ci/")
             || path_lower.contains("/ci/")
             || path_lower.starts_with("ci")
-            || path_lower.contains("deploy") 
+            || path_lower.contains("deploy")
             || path_lower.contains("merge-safety")
             || path_lower.contains("merge_safety")
             || path_lower.contains("merge-guard")
@@ -505,8 +509,8 @@ pub fn classify_production(files: &[crate::tools::PrFile]) -> bool {
         {
             return true;
         }
-        if path_lower.starts_with("migrations/") 
-            || path_lower.contains("/migrations/") 
+        if path_lower.starts_with("migrations/")
+            || path_lower.contains("/migrations/")
             || path_lower.starts_with("db/")
             || path_lower.contains("/db/")
             || path_lower.ends_with("schema.sql")
@@ -523,7 +527,7 @@ pub fn calculate_non_test_loc(files: &[crate::tools::PrFile]) -> u32 {
     let mut total = 0;
     for file in files {
         let path_lower = file.path.to_lowercase();
-        let is_test = path_lower.contains("test") 
+        let is_test = path_lower.contains("test")
             || path_lower.contains("/test/")
             || path_lower.contains("/tests/");
         if !is_test {
@@ -535,17 +539,17 @@ pub fn calculate_non_test_loc(files: &[crate::tools::PrFile]) -> u32 {
 
 pub fn check_integration_marker(body: &str, comments: &[crate::tools::PrComment]) -> bool {
     let lower_body = body.to_lowercase();
-    if lower_body.contains("has_integration_evidence_marker") 
-       || lower_body.contains("integration-evidence") 
-       || lower_body.contains("integration evidence") 
+    if lower_body.contains("has_integration_evidence_marker")
+        || lower_body.contains("integration-evidence")
+        || lower_body.contains("integration evidence")
     {
         return true;
     }
     for comment in comments {
         let lower_comment = comment.body.to_lowercase();
-        if lower_comment.contains("has_integration_evidence_marker") 
-           || lower_comment.contains("integration-evidence") 
-           || lower_comment.contains("integration evidence") 
+        if lower_comment.contains("has_integration_evidence_marker")
+            || lower_comment.contains("integration-evidence")
+            || lower_comment.contains("integration evidence")
         {
             return true;
         }
@@ -1536,40 +1540,99 @@ mod tests {
     fn test_parse_er_verdict() {
         use crate::tools::PrComment;
         // Simple cases
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er PASS".into(), created_at_epoch: 0 }]), ErVerdict::Pass);
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er PARTIAL".into(), created_at_epoch: 0 }]), ErVerdict::Partial);
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er FAIL".into(), created_at_epoch: 0 }]), ErVerdict::Fail);
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er INCONCLUSIVE".into(), created_at_epoch: 0 }]), ErVerdict::Inconclusive);
+        assert_eq!(
+            parse_er_verdict(&[PrComment {
+                author: "alice".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0
+            }]),
+            ErVerdict::Pass
+        );
+        assert_eq!(
+            parse_er_verdict(&[PrComment {
+                author: "alice".into(),
+                body: "/er PARTIAL".into(),
+                created_at_epoch: 0
+            }]),
+            ErVerdict::Partial
+        );
+        assert_eq!(
+            parse_er_verdict(&[PrComment {
+                author: "alice".into(),
+                body: "/er FAIL".into(),
+                created_at_epoch: 0
+            }]),
+            ErVerdict::Fail
+        );
+        assert_eq!(
+            parse_er_verdict(&[PrComment {
+                author: "alice".into(),
+                body: "/er INCONCLUSIVE".into(),
+                created_at_epoch: 0
+            }]),
+            ErVerdict::Inconclusive
+        );
 
         // Latest comment wins (comments are in chronological order)
         let comments = vec![
-            PrComment { author: "alice".into(), body: "/er FAIL".into(), created_at_epoch: 0 },
-            PrComment { author: "bob".into(), body: "/er PASS".into(), created_at_epoch: 0 },
+            PrComment {
+                author: "alice".into(),
+                body: "/er FAIL".into(),
+                created_at_epoch: 0,
+            },
+            PrComment {
+                author: "bob".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            },
         ];
         assert_eq!(parse_er_verdict(&comments), ErVerdict::Pass);
 
         // Multiple verdicts in one comment: last one wins
-        let comments_multiple = vec![
-            PrComment { author: "alice".into(), body: "/er FAIL then /er PASS".into(), created_at_epoch: 0 },
-        ];
+        let comments_multiple = vec![PrComment {
+            author: "alice".into(),
+            body: "/er FAIL then /er PASS".into(),
+            created_at_epoch: 0,
+        }];
         assert_eq!(parse_er_verdict(&comments_multiple), ErVerdict::Pass);
 
         // Word boundary check: "/er-gate" or "/er_gate" should not match as "/er" command
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er-gate PASS".into(), created_at_epoch: 0 }]), ErVerdict::Absent);
+        assert_eq!(
+            parse_er_verdict(&[PrComment {
+                author: "alice".into(),
+                body: "/er-gate PASS".into(),
+                created_at_epoch: 0
+            }]),
+            ErVerdict::Absent
+        );
     }
 
     // jleechan-nplh: staleness filtering against the head commit epoch.
     #[test]
     fn test_parse_er_verdict_since_staleness() {
         use crate::tools::PrComment;
-        let stale_pass = PrComment { author: "er".into(), body: "/er PASS".into(), created_at_epoch: 1_000 };
-        let fresh_fail = PrComment { author: "er".into(), body: "/er FAIL regressed".into(), created_at_epoch: 3_000 };
+        let stale_pass = PrComment {
+            author: "er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 1_000,
+        };
+        let fresh_fail = PrComment {
+            author: "er".into(),
+            body: "/er FAIL regressed".into(),
+            created_at_epoch: 3_000,
+        };
 
         // A verdict older than the head commit is ignored entirely.
-        assert_eq!(parse_er_verdict_since(std::slice::from_ref(&stale_pass), 2_000), ErVerdict::Absent);
+        assert_eq!(
+            parse_er_verdict_since(std::slice::from_ref(&stale_pass), 2_000),
+            ErVerdict::Absent
+        );
 
         // A verdict at/after the head commit is accepted (>= boundary).
-        assert_eq!(parse_er_verdict_since(std::slice::from_ref(&stale_pass), 1_000), ErVerdict::Pass);
+        assert_eq!(
+            parse_er_verdict_since(std::slice::from_ref(&stale_pass), 1_000),
+            ErVerdict::Pass
+        );
 
         // Stale PASS must not mask a fresh FAIL.
         assert_eq!(
@@ -1583,33 +1646,84 @@ mod tests {
 
         // Comment age unknown (epoch 0) with a known head age: fail closed,
         // treat as stale.
-        let unknown_age = PrComment { author: "er".into(), body: "/er PASS".into(), created_at_epoch: 0 };
-        assert_eq!(parse_er_verdict_since(&[unknown_age], 2_000), ErVerdict::Absent);
+        let unknown_age = PrComment {
+            author: "er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        };
+        assert_eq!(
+            parse_er_verdict_since(&[unknown_age], 2_000),
+            ErVerdict::Absent
+        );
     }
 
     #[test]
     fn test_classify_production() {
         use crate::tools::PrFile;
         // Production cases
-        assert!(classify_production(&[PrFile { path: "mvp_site/src/main.rs".into(), additions: 1, deletions: 0 }]));
-        assert!(classify_production(&[PrFile { path: "prompts/custom.md".into(), additions: 1, deletions: 0 }]));
-        assert!(classify_production(&[PrFile { path: ".github/workflows/ci.yml".into(), additions: 1, deletions: 0 }]));
-        assert!(classify_production(&[PrFile { path: "deploy.sh".into(), additions: 1, deletions: 0 }]));
-        assert!(classify_production(&[PrFile { path: "contracts/schema.sql".into(), additions: 1, deletions: 0 }]));
+        assert!(classify_production(&[PrFile {
+            path: "mvp_site/src/main.rs".into(),
+            additions: 1,
+            deletions: 0
+        }]));
+        assert!(classify_production(&[PrFile {
+            path: "prompts/custom.md".into(),
+            additions: 1,
+            deletions: 0
+        }]));
+        assert!(classify_production(&[PrFile {
+            path: ".github/workflows/ci.yml".into(),
+            additions: 1,
+            deletions: 0
+        }]));
+        assert!(classify_production(&[PrFile {
+            path: "deploy.sh".into(),
+            additions: 1,
+            deletions: 0
+        }]));
+        assert!(classify_production(&[PrFile {
+            path: "contracts/schema.sql".into(),
+            additions: 1,
+            deletions: 0
+        }]));
 
         // Non-production exclusions
-        assert!(!classify_production(&[PrFile { path: "mvp_site/tests/main_test.rs".into(), additions: 1, deletions: 0 }]));
-        assert!(!classify_production(&[PrFile { path: "mvp_site/test_integration/main_test.rs".into(), additions: 1, deletions: 0 }]));
-        assert!(!classify_production(&[PrFile { path: "daemon/src/main.rs".into(), additions: 1, deletions: 0 }]));
+        assert!(!classify_production(&[PrFile {
+            path: "mvp_site/tests/main_test.rs".into(),
+            additions: 1,
+            deletions: 0
+        }]));
+        assert!(!classify_production(&[PrFile {
+            path: "mvp_site/test_integration/main_test.rs".into(),
+            additions: 1,
+            deletions: 0
+        }]));
+        assert!(!classify_production(&[PrFile {
+            path: "daemon/src/main.rs".into(),
+            additions: 1,
+            deletions: 0
+        }]));
     }
 
     #[test]
     fn test_calculate_non_test_loc() {
         use crate::tools::PrFile;
         let files = vec![
-            PrFile { path: "mvp_site/src/main.rs".into(), additions: 100, deletions: 0 },
-            PrFile { path: "mvp_site/tests/test_main.rs".into(), additions: 50, deletions: 0 },
-            PrFile { path: "daemon/src/lib.rs".into(), additions: 30, deletions: 0 },
+            PrFile {
+                path: "mvp_site/src/main.rs".into(),
+                additions: 100,
+                deletions: 0,
+            },
+            PrFile {
+                path: "mvp_site/tests/test_main.rs".into(),
+                additions: 50,
+                deletions: 0,
+            },
+            PrFile {
+                path: "daemon/src/lib.rs".into(),
+                additions: 30,
+                deletions: 0,
+            },
         ];
         assert_eq!(calculate_non_test_loc(&files), 130);
     }
@@ -1618,12 +1732,25 @@ mod tests {
     fn test_check_integration_marker() {
         use crate::tools::PrComment;
         // PR body contains marker
-        assert!(check_integration_marker("Here is the has_integration_evidence_marker", &[]));
-        assert!(check_integration_marker("Here is the integration-evidence proof", &[]));
-        assert!(check_integration_marker("Here is the integration evidence proof", &[]));
+        assert!(check_integration_marker(
+            "Here is the has_integration_evidence_marker",
+            &[]
+        ));
+        assert!(check_integration_marker(
+            "Here is the integration-evidence proof",
+            &[]
+        ));
+        assert!(check_integration_marker(
+            "Here is the integration evidence proof",
+            &[]
+        ));
 
         // Comment contains marker
-        let comments = vec![PrComment { author: "alice".into(), body: "Found integration evidence".into(), created_at_epoch: 0 }];
+        let comments = vec![PrComment {
+            author: "alice".into(),
+            body: "Found integration evidence".into(),
+            created_at_epoch: 0,
+        }];
         assert!(check_integration_marker("No marker here", &comments));
 
         // Neither contains marker
@@ -1651,7 +1778,10 @@ mod tests {
             skeptic_verdict: None,
             ..Default::default()
         };
-        assert!(matches!(evidence_floor_gate(&prod_partial), GateResult::Red(_)));
+        assert!(matches!(
+            evidence_floor_gate(&prod_partial),
+            GateResult::Red(_)
+        ));
 
         // NON_PRODUCTION: Pass and Partial are Green
         let non_prod_partial = PrEvidence {
@@ -1683,7 +1813,10 @@ mod tests {
             skeptic_verdict: None,
             ..Default::default()
         };
-        assert!(matches!(evidence_floor_gate(&prod_fail), GateResult::Red(_)));
+        assert!(matches!(
+            evidence_floor_gate(&prod_fail),
+            GateResult::Red(_)
+        ));
 
         let non_prod_inconclusive = PrEvidence {
             is_production: false,
@@ -1693,6 +1826,9 @@ mod tests {
             skeptic_verdict: None,
             ..Default::default()
         };
-        assert!(matches!(evidence_floor_gate(&non_prod_inconclusive), GateResult::Red(_)));
+        assert!(matches!(
+            evidence_floor_gate(&non_prod_inconclusive),
+            GateResult::Red(_)
+        ));
     }
 }

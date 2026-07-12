@@ -181,7 +181,10 @@ spec_dir = ".factory/specs/"
         )
         .unwrap();
         let cfg = load(&p).unwrap();
-        assert!(cfg.repos.is_empty(), "repos table must default to empty when absent");
+        assert!(
+            cfg.repos.is_empty(),
+            "repos table must default to empty when absent"
+        );
         assert_eq!(
             cfg.resolve_repo("owner/repo"),
             Some(RepoRouting {

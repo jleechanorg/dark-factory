@@ -2224,7 +2224,9 @@ mod tests {
     /// end-to-end against `SqliteStateStore`.
     #[test]
     fn shared_payload_survives_first_terminalization_dies_on_second() {
-        use std::os::unix::fs::PermissionsExt;
+        // Hold the payload-env lock so a parallel prompt_payload
+        // or dispatch test can't observe our env-var override.
+        let _env_lock = crate::prompt_payload::lock_env_for_test();
         let schema = include_str!("../contracts/schema.sql");
         let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
 
@@ -2393,8 +2395,229 @@ mod tests {
     /// file alive -- otherwise a crash between the overlay-terminal
     /// COMMIT and the post-commit `unbind_payload` would orphan
     /// that file for the bounded sweep's mtime window. The JOIN
-    /// enforces this: even if the unbind is lost, the JOIN-based
-    /// skip-set excludes the row.
+    /// PR #272 follow-up (jleechan-94rk): a real on-disk SQLite
+    /// store MUST survive a daemon restart with all payload
+    /// bindings intact. Tests file-backed lifecycle: open on a
+    /// real tempdir path, bind_payload, drop the connection,
+    /// reopen on the same path, and verify the binding still
+    /// resolves (the orphan sweep must keep the file alive
+    /// because the active overlay still references it).
+    #[test]
+    fn file_backed_sqlite_survives_close_reopen_with_bindings() {
+        let dir = std::env::temp_dir().join(format!(
+            "state_restart_{}_{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("daemon.sqlite");
+        // Plant a real payload file that the binding will point at.
+        let payload = dir.join("eeeeeeee".repeat(8).to_string() + ".md");
+        std::fs::write(&payload, b"persistent payload content").unwrap();
+
+        // Phase 1: open, bind, drop.
+        {
+            let store = SqliteStateStore::open(&db_path).expect("file-backed open must succeed");
+            // Active overlay row so the binding isn't orphaned.
+            store
+                .save(&BeadOverlay {
+                    bead_id: "bead-restart".into(),
+                    state: OverlayState::Dispatched,
+                    attempt: 1,
+                    reroll_count: 0,
+                    autonomy_secs: 0,
+                    spend_usd: 0.0,
+                    pr_number: None,
+                    branch: Some("factory/restart-r1".into()),
+                    session_id: Some("ao-restart".into()),
+                    is_adopted: false,
+                    spawn_failure_count: 0,
+                    pre_session_head_sha: None,
+                    park_reason: None,
+                    target_repo: None,
+                })
+                .unwrap();
+            store
+                .bind_payload("bead-restart", &payload.to_string_lossy())
+                .unwrap();
+            assert_eq!(
+                store
+                    .count_active_references_to_path(&payload.to_string_lossy())
+                    .unwrap(),
+                1,
+                "fresh binding must have exactly one active reference"
+            );
+            // store drops here -> WAL checkpoint + connection close.
+        }
+        assert!(db_path.exists(), "sqlite file must persist across close");
+
+        // Phase 2: reopen, verify state + binding survived.
+        {
+            let store =
+                SqliteStateStore::open(&db_path).expect("reopen on existing file must succeed");
+            let overlay = store
+                .load("bead-restart")
+                .expect("load must succeed")
+                .expect("overlay row must survive restart");
+            assert_eq!(overlay.state, OverlayState::Dispatched);
+            assert_eq!(overlay.session_id.as_deref(), Some("ao-restart"));
+            // count_active_references_to_path is the JOIN-based
+            // helper that the orphan sweep consults; if the
+            // binding survived close/reopen AND the overlay row
+            // still references it, the count must be 1.
+            assert_eq!(
+                store
+                    .count_active_references_to_path(&payload.to_string_lossy())
+                    .unwrap(),
+                1,
+                "post-restart active-reference count must match pre-restart"
+            );
+            // list_active_payload_paths is the JOIN-based set the
+            // orphan sweep iterates -- it must surface the bound
+            // payload so the sweep SKIPS it.
+            let active = store.list_active_payload_paths().unwrap();
+            assert!(
+                active.contains(&payload.to_string_lossy().into_owned()),
+                "list_active_payload_paths must include the bound payload"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Terminal-row orphan eligibility: a payload whose bead has
+    /// PR #272 follow-up (jleechan-94rk): terminal save MUST commit
+    /// the overlay row BEFORE unlinking the payload file. If the
+    /// order were reversed (unlink first, commit second), a crash
+    /// between them would leave the bead in a non-terminal state
+    /// with no payload file -- a strictly worse failure than "the
+    /// bounded orphan sweep has one more file to reap". This test
+    /// plants a bead+payload pair, verifies both are intact,
+    /// triggers a terminal save, and asserts the file is removed
+    /// ONLY after the overlay row is durably HumanHeld.
+    #[test]
+    fn terminal_save_commits_overlay_before_unlinking_payload() {
+        let _env_lock = crate::prompt_payload::lock_env_for_test();
+        let schema = include_str!("../contracts/schema.sql");
+        let dir = std::env::temp_dir().join(format!(
+            "state_commit_order_{}_{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // delete_payload refuses to unlink anything outside the
+        // configured payloads root -- so the payload file MUST
+        // live under DARK_FACTORY_PROMPT_PAYLOADS_DIR for the
+        // terminal-cleanup branch to actually unlink it.
+        let prev = std::env::var("DARK_FACTORY_PROMPT_PAYLOADS_DIR").ok();
+        std::env::set_var("DARK_FACTORY_PROMPT_PAYLOADS_DIR", &dir);
+        let payload_path = dir.join("eeeeeeee".repeat(8).to_string() + ".md");
+        std::fs::write(&payload_path, b"must-survive-until-commit").unwrap();
+        // Open the in-memory store (the file-backed restart test
+        // exercises the close/reopen path; here we just need the
+        // save() contract).
+        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
+
+        // Bind the payload to a bead that is currently Dispatched
+        // (active reference count = 1).
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-x".into(),
+                state: OverlayState::Dispatched,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: Some("factory/x-r1".into()),
+                session_id: Some("ao-x".into()),
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+        store
+            .bind_payload("bead-x", &payload_path.to_string_lossy())
+            .unwrap();
+        assert!(
+            payload_path.exists(),
+            "payload file must exist before the terminal transition"
+        );
+        assert_eq!(
+            store
+                .count_active_references_to_path(&payload_path.to_string_lossy())
+                .unwrap(),
+            1,
+            "active Dispatched overlay must count as 1 reference"
+        );
+
+        // Terminal save: this must commit the overlay FIRST
+        // (overlay.state -> HumanHeld) and only THEN unbind +
+        // unlink the payload.
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-x".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: Some("factory/x-r1".into()),
+                session_id: Some("ao-x".into()),
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some("test_terminal_commit_order".to_string()),
+                target_repo: None,
+            })
+            .unwrap();
+        // Post-terminal: overlay row IS HumanHeld, file IS gone.
+        let overlay = store.load("bead-x").unwrap().unwrap();
+        assert_eq!(
+            overlay.state,
+            OverlayState::HumanHeld,
+            "terminal overlay must be HumanHeld AFTER save returns"
+        );
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("test_terminal_commit_order"),
+            "park_reason must persist through the terminal transition"
+        );
+        assert!(
+            !payload_path.exists(),
+            "payload file must be unlinked AFTER the terminal overlay is committed"
+        );
+        // Active-reference count must drop to 0 because the JOIN
+        // excludes terminal rows.
+        assert_eq!(
+            store
+                .count_active_references_to_path(&payload_path.to_string_lossy())
+                .unwrap(),
+            0,
+            "terminal overlay must NOT count toward active references"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        match prev {
+            Some(v) => std::env::set_var("DARK_FACTORY_PROMPT_PAYLOADS_DIR", v),
+            None => std::env::remove_var("DARK_FACTORY_PROMPT_PAYLOADS_DIR"),
+        }
+    }
+
+    /// already been moved to a terminal state must be considered
+    /// SWEEP-ELIGIBLE -- not keepalive -- even if the row still
+    /// exists in `prompt_payload`. The JOIN-based
+    /// `count_active_references_to_path` and
+    /// `list_active_payload_paths` helpers enforce this: even if
+    /// the unbind is lost, the JOIN-based skip-set excludes the row.
     #[test]
     fn terminal_row_orphan_is_sweep_eligible_not_keepalive() {
         let schema = include_str!("../contracts/schema.sql");

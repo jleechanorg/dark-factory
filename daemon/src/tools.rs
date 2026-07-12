@@ -62,7 +62,11 @@ pub fn summarize_file_tree(root: &std::path::Path, max_entries: usize) -> String
                 continue; // skip .git, .venv, dotfiles — noise for a router prompt
             }
             let path = entry.path();
-            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
 
             if path.is_dir() {
                 entries.push(format!("{rel}/"));
@@ -582,13 +586,11 @@ fn run_tool_with_cwd(
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|e| DaemonError::Tool {
-            tool: cmd.to_string(),
-            rc: -1,
-            stderr: format!("spawn failed: {e}"),
-        })?;
+    let mut child = command.spawn().map_err(|e| DaemonError::Tool {
+        tool: cmd.to_string(),
+        rc: -1,
+        stderr: format!("spawn failed: {e}"),
+    })?;
 
     // Take the pipes and hand them to dedicated reader threads immediately so
     // they drain concurrently with the wait/poll loop below. Readers run to
@@ -939,19 +941,14 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_tool_in_dir_sets_child_cwd() {
-        let tmp = std::env::temp_dir().join(format!(
-            "afd_run_tool_in_dir_{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("afd_run_tool_in_dir_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         // Run `pwd` in the tmp dir — if `current_dir` is honored, the output
         // is the canonicalized tmp path; if it is dropped, we get the daemon's
         // cwd which is something else under `cargo test`.
         let out = run_tool_in_dir("pwd", &[], tmp.to_str().unwrap(), 5).unwrap();
         assert!(
-            std::path::Path::new(out.trim())
-                .canonicalize()
-                .unwrap()
+            std::path::Path::new(out.trim()).canonicalize().unwrap()
                 == std::path::Path::new(tmp.to_str().unwrap())
                     .canonicalize()
                     .unwrap(),

@@ -418,8 +418,8 @@ mod tests {
     // Unit-level coverage for the pure permission-gate helper; the fake-backed
     // contract tests (idempotency, write-tier gate, mixed batch) live in
     // `daemon/tests/intake.rs` per Task 6 Step 1.
-    use crate::tools::Permission;
     use super::resolve_target_repo;
+    use crate::tools::Permission;
 
     #[test]
     fn permission_write_tier_gate_matches_design_contract() {
@@ -436,7 +436,8 @@ mod tests {
 
     #[test]
     fn resolve_target_repo_prefers_explicit_body_field_over_external_ref() {
-        let body = "Some description.\ntarget_repo: jleechanorg/dark-factory\nexisting_branch: fix/x\n";
+        let body =
+            "Some description.\ntarget_repo: jleechanorg/dark-factory\nexisting_branch: fix/x\n";
         let got = resolve_target_repo(body, Some("jleechanorg/worldarchitect.ai#123"));
         assert_eq!(got.as_deref(), Some("jleechanorg/dark-factory"));
     }

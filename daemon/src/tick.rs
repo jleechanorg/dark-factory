@@ -528,9 +528,10 @@ pub fn run_tick(
                             // could never observe real progress and would
                             // eventually park a perfectly healthy, actively
                             // pushing coder as `coder_silent`.
-                            let last_commit_epoch = deps
-                                .scm
-                                .remote_branch_last_commit_for_repo(overlay.repo(deps.cfg), branch)?;
+                            let last_commit_epoch = deps.scm.remote_branch_last_commit_for_repo(
+                                overlay.repo(deps.cfg),
+                                branch,
+                            )?;
                             let now_epoch = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -899,8 +900,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             // owner/repo today. Still resolved from `external_ref` (not
             // left `None`) so it stays correct once Stage C/D lift the
             // same-repo-only restriction for adopted PRs.
-            let target_repo =
-                intake::resolve_target_repo("", Some(adopted.external_ref.as_str()));
+            let target_repo = intake::resolve_target_repo("", Some(adopted.external_ref.as_str()));
             let mut overlay = existing.unwrap_or(BeadOverlay {
                 bead_id: adopted.bead_id.clone(),
                 state: OverlayState::Attested,
@@ -913,9 +913,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 session_id: None,
                 is_adopted: true,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo,
             });
             overlay.state = OverlayState::Attested;
             overlay.pr_number = Some(adopted.pr_number);
@@ -995,8 +995,13 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // `owner/repo` prefix of external_ref, else None (legacy/global,
         // resolved later via `BeadOverlay::repo`).
         let target_repo = intake::resolve_target_repo(
-            tracker_bead.as_ref().map(|b| b.description.as_str()).unwrap_or(""),
-            tracker_bead.as_ref().and_then(|b| b.external_ref.as_deref()),
+            tracker_bead
+                .as_ref()
+                .map(|b| b.description.as_str())
+                .unwrap_or(""),
+            tracker_bead
+                .as_ref()
+                .and_then(|b| b.external_ref.as_deref()),
         );
         let overlay = BeadOverlay {
             bead_id: bead_id.clone(),
@@ -1088,9 +1093,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     session_id: None,
                     is_adopted: false,
                     spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo,
+                    pre_session_head_sha: None,
+                    park_reason: None,
+                    target_repo,
                 };
                 deps.store.save(&o)?;
                 summary.beads_created += 1;
@@ -1633,8 +1638,7 @@ fn skeptic_evidence(
     // bead's OWN resolved repo so a test-repo bead dispatched under a
     // non-test global `cfg.target_repo` (or vice versa) is classified
     // correctly instead of by the daemon-global repo.
-    let is_test_repo =
-        repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
+    let is_test_repo = repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
 
     let mut gha_verdict = "verdict: absent";
     let mut signoff_verdict = "verdict: absent";
@@ -2244,10 +2248,9 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             // jleechan-nplh: a verdict comment older than the current head
             // commit is stale evidence — gate 6 must not self-certify from
             // it (same staleness rule as `er_runner::maybe_run` step 2).
-            None => verifier::parse_er_verdict_since(
-                &snapshot.comments,
-                snapshot.head_committed_epoch,
-            ),
+            None => {
+                verifier::parse_er_verdict_since(&snapshot.comments, snapshot.head_committed_epoch)
+            }
         };
         evidence.is_production = verifier::classify_production(&snapshot.files);
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
@@ -2424,8 +2427,9 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({"stage": deps.cfg.stage}),
                 )?;
                 overlay.state = OverlayState::HumanHeld;
-                overlay.park_reason =
-                    Some("gate assessment not all-green (stage 1: recorded, not executed)".to_string());
+                overlay.park_reason = Some(
+                    "gate assessment not all-green (stage 1: recorded, not executed)".to_string(),
+                );
                 deps.store.save(&overlay)?;
                 summary.beads_parked_human_held += 1;
                 emit(

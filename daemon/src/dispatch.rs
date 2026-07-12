@@ -94,6 +94,64 @@ fn failure(
     }
 }
 
+/// Park an already-`Dispatching` bead as `HumanHeld` after a
+/// post-save failure (e.g. prompt-payload materialization or binding
+/// error). Mirrors the unmapped-repo park path at lines 181-208: the
+/// original error is recorded on the report, the overlay is flipped to
+/// `HumanHeld` with a deterministic `park_reason`, and a non-transient
+/// park-save error returns `Err` to halt the dispatch batch so the
+/// caller does not silently strand an overlay in `Dispatching` with
+/// no spawned session.
+///
+/// Returns `Ok(())` when the caller should `continue` to the next bead
+/// (park saved OR transient park-save error pushed to the report);
+/// returns `Err(save_err)` for non-transient park-save errors.
+fn park_after_dispatching(
+    store: &dyn StateStore,
+    overlay: &mut BeadOverlay,
+    bead: &Bead,
+    report: &mut DispatchReport,
+    branch: &str,
+    park_reason: &'static str,
+    original_err: DaemonError,
+) -> Result<(), DaemonError> {
+    overlay.state = OverlayState::HumanHeld;
+    overlay.park_reason = Some(park_reason.to_string());
+    if let Err(save_err) = store.save(overlay) {
+        if save_err.is_transient() {
+            report.failures.push(failure(
+                bead,
+                overlay.attempt,
+                Some(branch.to_string()),
+                // Distinct phase tag for the park-save failure itself
+                // so reporters can separate it from the original cause.
+                // Concatenate at runtime: `park_reason` is a
+                // `&'static str` already chosen by the caller, and
+                // pre-declaring every variant here would just re-list
+                // the same call sites.
+                match park_reason {
+                    "prompt_payload_materialization_failed" => {
+                        "prompt_payload_materialization_failed_park_save"
+                    }
+                    "prompt_payload_bind_failed" => "prompt_payload_bind_failed_park_save",
+                    _ => "post_save_park_save",
+                },
+                save_err,
+            ));
+            return Ok(());
+        }
+        return Err(save_err);
+    }
+    report.failures.push(failure(
+        bead,
+        overlay.attempt,
+        Some(branch.to_string()),
+        park_reason,
+        original_err,
+    ));
+    Ok(())
+}
+
 /// Dispatch as many `ready` beads as the safety envelope allows.
 ///
 /// Free slots = `min(max_workers - active_count, max_batch)` (spec §4.2.8).
@@ -268,24 +326,58 @@ pub fn dispatch_ready(
             // jleechan-8e0x (PR #272): compute the untruncated lossless
             // prompt; ask `prompt_payload` whether to materialize it
             // (over the 4000-char total cap, matching PR #255's
-            // `CODER_PROMPT_TOTAL_CAP`). An indirection Err is
-            // propagated with `?` -- no new HumanHeld phase introduced
-            // in this PR; the dispatch batch halts and the tick
-            // machinery surfaces the halt.
+            // `CODER_PROMPT_TOTAL_CAP`). If materialization OR the
+            // payload-binding save fails AFTER the DISPATCHING intent
+            // has been durably saved above, mirror the unmapped-repo
+            // park path (lines 181-208) so the bead cannot strand in
+            // `Dispatching` with no spawned session — park HumanHeld,
+            // record a per-bead failure, and continue. If the park
+            // save itself fails with a NON-transient store error,
+            // return Err to halt the batch (matches the unmapped-repo
+            // contract); transient park-save errors stay per-bead.
             _ => {
                 let full = build_coder_prompt_lossless(bead, &branch, &repo, &routing.push_remote);
-                match crate::prompt_payload::materialize_or_bootstrap(&full)? {
-                    crate::prompt_payload::MaterializeOutcome::NoIndirectionNeeded => {
+                match crate::prompt_payload::materialize_or_bootstrap(&full) {
+                    Ok(crate::prompt_payload::MaterializeOutcome::NoIndirectionNeeded) => {
                         build_coder_prompt(bead, &branch, &repo, &routing.push_remote)
                     }
-                    crate::prompt_payload::MaterializeOutcome::Indirected(i) => {
+                    Ok(crate::prompt_payload::MaterializeOutcome::Indirected(i)) => {
                         // Persist the durably-bound payload reference
                         // BEFORE spawning the worker so the bounded
                         // orphan sweep can never reap a payload an
                         // active coder session depends on (even across
-                        // a daemon restart). Errors here halt the batch.
-                        store.bind_payload(&bead.id, i.payload_path.to_string_lossy().as_ref())?;
+                        // a daemon restart). On save failure, park
+                        // HumanHeld with the same shape as the
+                        // materialize-failure path above so neither
+                        // indirection sub-step can strand a Dispatching
+                        // overlay.
+                        if let Err(bind_err) =
+                            store.bind_payload(&bead.id, i.payload_path.to_string_lossy().as_ref())
+                        {
+                            park_after_dispatching(
+                                store,
+                                &mut overlay,
+                                bead,
+                                &mut report,
+                                &branch,
+                                "prompt_payload_bind_failed",
+                                bind_err,
+                            )?;
+                            continue;
+                        }
                         i.bootstrap
+                    }
+                    Err(materialize_err) => {
+                        park_after_dispatching(
+                            store,
+                            &mut overlay,
+                            bead,
+                            &mut report,
+                            &branch,
+                            "prompt_payload_materialization_failed",
+                            materialize_err,
+                        )?;
+                        continue;
                     }
                 }
             }
@@ -1009,6 +1101,13 @@ mod tests {
         branch_beads: RefCell<HashMap<String, String>>,
         rejections: RefCell<HashMap<(String, u32), (String, String)>>,
         fail_save_for_state: RefCell<Vec<(String, OverlayState)>>,
+        /// PR #272 follow-up: per-bead scriptable `bind_payload`
+        /// failure list. Any `bead_id` listed here makes
+        /// `bind_payload` return `Err(DaemonError::Tool)` (transient)
+        /// so the post-save `park_after_dispatching` regression test
+        /// can drive the failure path deterministically without
+        /// coupling to filesystem state or env-var taint checks.
+        fail_bind_payload_for: RefCell<Vec<String>>,
         /// PR #272: in-memory mirror of the `prompt_payload` side
         /// table. `bead_id -> path`; a rebind replaces the entry.
         payload_bindings: RefCell<HashMap<String, String>>,
@@ -1032,6 +1131,12 @@ mod tests {
             self.fail_save_for_state
                 .borrow_mut()
                 .push((bead_id.to_string(), state));
+        }
+
+        fn fail_bind_payload_for(&self, bead_id: &str) {
+            self.fail_bind_payload_for
+                .borrow_mut()
+                .push(bead_id.to_string());
         }
     }
 
@@ -1103,6 +1208,18 @@ mod tests {
         }
 
         fn bind_payload(&self, bead_id: &str, path: &str) -> Result<(), DaemonError> {
+            if self
+                .fail_bind_payload_for
+                .borrow()
+                .iter()
+                .any(|b| b == bead_id)
+            {
+                return Err(DaemonError::Tool {
+                    tool: "prompt_payload".into(),
+                    rc: -1,
+                    stderr: format!("scripted bind_payload failure for {bead_id}"),
+                });
+            }
             self.payload_bindings
                 .borrow_mut()
                 .insert(bead_id.to_string(), path.to_string());
@@ -1397,6 +1514,183 @@ mod tests {
             .filter(|c| c.starts_with("spawn("))
             .count();
         assert_eq!(spawn_calls, 0, "Sessions::spawn must never be called");
+    }
+
+    /// PR #272 follow-up (jleechan-8e0x audit): when
+    /// `prompt_payload::materialize_or_bootstrap` returns
+    /// `Indirected` (lossless prompt above 4000 chars) but the
+    /// subsequent `store.bind_payload` save fails, the bead must NOT
+    /// strand in `Dispatching` with no spawned session. Mirror the
+    /// unmapped-repo park path: flip to `HumanHeld` with
+    /// `park_reason = "prompt_payload_bind_failed"`, push a per-bead
+    /// failure, and continue. Without this, the daemon would leave
+    /// `state = Dispatching` on disk after the bind failure and the
+    /// next tick would re-enter the same path forever (the failure
+    /// mode the unmapped-repo test was written to prevent).
+    #[test]
+    fn dispatch_ready_parks_human_held_when_bind_payload_fails() {
+        // Hold the payload-env lock for the duration of this test
+        // so a parallel prompt_payload test (which uses EnvScope)
+        // can't observe our DARK_FACTORY_PROMPT_PAYLOADS_DIR write.
+        let _env_lock = crate::prompt_payload::lock_env_for_test();
+        // Description well above CODER_PROMPT_DESCRIPTION_CAP so the
+        // composed lossless prompt exceeds PR #255's
+        // CODER_PROMPT_TOTAL_CAP (4000) and triggers the
+        // `Indirected` arm — that's the only path that calls
+        // `store.bind_payload`.
+        let oversized_desc = "x".repeat(8_000);
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+        // Script the bind_payload failure. FakeStateStore returns
+        // DaemonError::Tool (transient) — exercises the
+        // `park_after_dispatching` transient-vs-non-transient branch
+        // where a successful park save pushes the original bind
+        // error to the report.
+        store.fail_bind_payload_for("bead-0");
+
+        let mut ready = beads(1);
+        ready[0].0.description = oversized_desc;
+
+        let report = dispatch_ready(&sessions, &store, &cfg(), &ready).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            0,
+            "bind_payload failure must not spawn"
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(
+            report.failures[0].phase, "prompt_payload_bind_failed",
+            "phase tag must identify the original bind failure, not the park save"
+        );
+        assert!(
+            report.failures[0].transient,
+            "DaemonError::Tool from bind_payload is transient; report must reflect that"
+        );
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            overlay.state,
+            OverlayState::HumanHeld,
+            "bead must be parked HumanHeld, not stranded Dispatching"
+        );
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("prompt_payload_bind_failed")
+        );
+        assert!(
+            overlay.branch.is_some(),
+            "branch was registered before the bind step so it must persist on the parked overlay"
+        );
+        let spawn_calls = sessions
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("spawn("))
+            .count();
+        assert_eq!(spawn_calls, 0, "Sessions::spawn must never be called");
+    }
+
+    /// PR #272 follow-up (jleechan-94rk): a prompt whose text
+    /// contains the literal value of any env var named *HOLDOUT*
+    /// must NOT materialize -- even via the dispatch path. The
+    /// `materialize_or_bootstrap` helper refuses the write BEFORE
+    /// any file IO, but the dispatch path uses `?` to propagate
+    /// the error up. We mirror the unmapped-repo park path: the
+    /// bead must end up `HumanHeld` with `park_reason =
+    /// "prompt_payload_materialization_failed"` and no spawn may
+    /// occur.
+    #[test]
+    fn dispatch_ready_parks_human_held_when_holdout_env_value_in_prompt() {
+        let _env_lock = crate::prompt_payload::lock_env_for_test();
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+        // Synthesize a HOLDOUT env var with a known literal value
+        // and embed it in the bead's oversized description. The
+        // literal-substring check runs against the env table only
+        // -- no prose scan.
+        let secret = "/sealed/dark-factory-holdouts-zzzzdispatchtest";
+        let prev = std::env::var("DARK_FACTORY_HOLDOUTS").ok();
+        std::env::set_var("DARK_FACTORY_HOLDOUTS", secret);
+        let mut description = String::with_capacity(8_500);
+        description.push_str(&"y".repeat(4_500));
+        description.push_str(&format!("\nlook: {secret}\n"));
+        description.push_str(&"z".repeat(3_500));
+        let mut ready = beads(1);
+        ready[0].0.description = description;
+
+        let report = dispatch_ready(&sessions, &store, &cfg(), &ready).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            0,
+            "holdout-touched prompt must NOT spawn"
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(
+            report.failures[0].phase, "prompt_payload_materialization_failed",
+            "phase must identify the materialize-failure path (holdout rejection surfaces here)"
+        );
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            overlay.state,
+            OverlayState::HumanHeld,
+            "bead must be parked HumanHeld -- the sealed holdouts path must never reach a persisted payload"
+        );
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("prompt_payload_materialization_failed")
+        );
+        let spawn_calls = sessions
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("spawn("))
+            .count();
+        assert_eq!(
+            spawn_calls, 0,
+            "Sessions::spawn must never be called for a holdout-touched prompt"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("DARK_FACTORY_HOLDOUTS", v),
+            None => std::env::remove_var("DARK_FACTORY_HOLDOUTS"),
+        }
     }
 
     /// Companion to the unmapped-repo park test: when the bead's
@@ -2056,6 +2350,49 @@ mod tests {
         );
     }
 
+    /// PR #272 follow-up (jleechan-94rk): a SHORT prompt (one that
+    /// fits under CODER_PROMPT_TOTAL_CAP without indirection) must
+    /// be byte-for-byte identical between `build_coder_prompt`
+    /// (the inline path; PR #255's shrinker) and
+    /// `build_coder_prompt_lossless` (the indirection path's
+    /// payload source). The dispatch path picks the inline variant
+    /// when `materialize_or_bootstrap` returns NoIndirectionNeeded,
+    /// so ANY drift between the two would silently produce a
+    /// different prompt depending on which arm the dispatch
+    /// landed in -- a regression class the skeptic explicitly
+    /// called out (short prompts must remain byte-for-byte
+    /// unchanged).
+    #[test]
+    fn short_prompt_is_byte_for_byte_identical_lossless_and_shrunken() {
+        // Bead sized so the lossless prompt is well below the
+        // 4000-char indirection threshold AND well below both
+        // per-section caps (6000 for description, 4096 for tree),
+        // so neither build_coder_prompt's section-truncation nor
+        // total-shrinking arms should fire. ~3,400 chars total
+        // leaves comfortable headroom under 4,000.
+        let bead = Bead {
+            id: "bead-short".into(),
+            title: "Short regression-shape bead".into(),
+            description: "Implement the small refactor described in the spec.".into(),
+            file_tree_summary: "src/foo.rs\nsrc/bar.rs\n".repeat(8),
+            external_ref: None,
+        };
+        let branch = "factory/bead-short-r1";
+        let repo = "owner/repo";
+        let remote = "origin";
+        let lossless = build_coder_prompt_lossless(&bead, branch, repo, remote);
+        let inline = build_coder_prompt(&bead, branch, repo, remote);
+        assert!(
+            lossless.len() <= CODER_PROMPT_TOTAL_CAP,
+            "test premise: lossless prompt ({} chars) must be <= TOTAL_CAP for this to exercise the short-prompt path",
+            lossless.len()
+        );
+        assert_eq!(
+            inline, lossless,
+            "short prompts must be byte-for-byte identical between lossless and inline paths"
+        );
+    }
+
     // Companion to the above: the total-budget shrink must never panic on a
     // non-UTF8-boundary cut, exactly like the per-section cap's existing
     // guarantee — exercise it via a tree summary whose bytes only align on
@@ -2136,6 +2473,121 @@ mod tests {
             prompts[0].1.contains("acceptance: it works") && prompts[0].1.contains("Do NOT merge"),
             "spawned prompt must be the enriched coder prompt, got: {}",
             prompts[0].1
+        );
+    }
+
+    /// PR #272 follow-up (jleechan-94rk): an OVERSIZED prompt
+    /// (lossless output > CODER_PROMPT_TOTAL_CAP) must take the
+    /// indirection path -- the spawn receives the BOOTSTRAP (not
+    /// the full prompt), and the bootstrap references the disk
+    /// payload + SHA-256. The bootstrap must remain
+    /// byte-for-byte the Indirected.bootstrap the prompt_payload
+    /// module returned, and its length must stay under
+    /// BOOTSTRAP_PROMPT_CAP.
+    ///
+    /// Also verifies the binding was recorded (so the bounded
+    /// orphan sweep can keep the file alive) and the spawn was
+    /// called EXACTLY once. Companion to
+    /// `dispatch_ready_parks_human_held_when_bind_payload_fails`
+    /// which exercises the failure arm of the same path.
+    #[test]
+    fn dispatch_ready_oversized_prompt_hands_bootstrap_to_spawn() {
+        let _env_lock = crate::prompt_payload::lock_env_for_test();
+        let oversized_desc = "x".repeat(8_000);
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+        let mut ready = beads(1);
+        ready[0].0.description = oversized_desc;
+
+        let report = dispatch_ready(&sessions, &store, &cfg(), &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1, "oversized dispatch must spawn");
+        assert_eq!(report.failures.len(), 0);
+        let prompts = sessions.spawn_prompts.borrow();
+        assert_eq!(prompts.len(), 1, "spawn must be called exactly once");
+        let (bead_id, prompt) = &prompts[0];
+        assert_eq!(bead_id, "bead-0");
+        // Bootstrap signature -- it must reference a path +
+        // SHA-256 + read-and-verify ritual. NOT the full 8,000-
+        // char body.
+        assert!(
+            prompt.contains("Read and follow"),
+            "bootstrap must include the read-and-verify ritual, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("SHA-256"),
+            "bootstrap must name the SHA-256, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Verify SHA-256"),
+            "bootstrap must ask the worker to verify SHA-256 before doing any work, got: {prompt}"
+        );
+        assert!(
+            prompt.len() < 4_000,
+            "bootstrap must fit in AO's spawn ceiling ({} chars), got {}",
+            4_000,
+            prompt.len()
+        );
+        assert!(
+            !prompt.contains(&"x".repeat(1_000)),
+            "spawned prompt must NOT contain the lossless body -- only the bootstrap, got len={}",
+            prompt.len()
+        );
+        // Verify the binding was recorded so the orphan sweep
+        // keeps the payload file alive while the worker reads it.
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            overlay.state,
+            OverlayState::Dispatched,
+            "spawn succeeded so overlay must be Dispatched (not HumanHeld)"
+        );
+        let binding = store
+            .payload_bindings
+            .borrow()
+            .get("bead-0")
+            .cloned()
+            .expect("payload binding must be recorded after a successful spawn");
+        assert!(
+            !binding.is_empty(),
+            "payload binding must point at a non-empty path"
+        );
+        // The bootstrap's referenced path must round-trip the
+        // binding: worker reads <binding>, hash <binding>, and the
+        // bind column already records it. The bootstrap template
+        // appends a period after the path ("task at <path>.\n"),
+        // so strip the trailing punctuation before comparing.
+        let marker = "Read and follow the complete coding task at ";
+        let after = prompt
+            .split_once(marker)
+            .expect("bootstrap contains the marker")
+            .1;
+        let bootstrap_path = after
+            .split('\n')
+            .next()
+            .unwrap()
+            .trim()
+            .trim_end_matches(['.', ',']);
+        assert_eq!(
+            bootstrap_path, binding,
+            "bootstrap path must round-trip the recorded binding"
         );
     }
 
