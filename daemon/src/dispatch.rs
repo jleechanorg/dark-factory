@@ -1235,14 +1235,11 @@ mod tests {
         assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
     }
 
-    /// jleechan-35y4 Stage B acceptance criterion: a bead whose resolved
-    /// `target_repo` (Stage A) names neither an explicit `[repos.*]` entry
-    /// nor the daemon's global `cfg.target_repo` must park HUMAN_HELD with
-    /// reason `unmapped_target_repo` — fail loud, never guess/fall back to
-    /// the global repo (the jleechan-9sh5 discipline this spec explicitly
-    /// calls out). No branch registration, no spawn attempt.
+    /// jleechan-dljf (issue #271): valid `owner/repo` strings now derive safe
+    /// defaults, so they no longer park HUMAN_HELD. Only MALFORMED repo
+    /// strings still fail closed.
     #[test]
-    fn dispatch_ready_parks_human_held_when_target_repo_is_unmapped() {
+    fn dispatch_ready_parks_human_held_when_target_repo_is_malformed() {
         let sessions = FakeSessions::new(0);
         let store = FakeStateStore::new();
         store
@@ -1260,10 +1257,7 @@ mod tests {
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
-                // Neither cfg().target_repo ("owner/repo") nor any
-                // [repos.*] entry (cfg() has an empty repos table) names
-                // this repo.
-                target_repo: Some("someorg/unrelated-repo".to_string()),
+                target_repo: Some("just-a-bare-string".to_string()),
             })
             .unwrap();
         let cfg = cfg();
@@ -1271,27 +1265,20 @@ mod tests {
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
-        assert_eq!(report.success_count(), 0, "unmapped repo must never spawn");
+        assert_eq!(report.success_count(), 0, "malformed repo must never spawn");
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].phase, "unmapped_target_repo");
         assert!(
-            report.failures[0].error.contains("someorg/unrelated-repo"),
-            "error should name the unmapped repo: {}",
-            report.failures[0].error
+            report.failures[0].error.contains("just-a-bare-string"),
+            "error should name the malformed repo"
         );
 
         let overlay = store.load("bead-0").unwrap().unwrap();
         assert_eq!(overlay.state, OverlayState::HumanHeld);
         assert_eq!(overlay.park_reason.as_deref(), Some("unmapped_target_repo"));
-        assert!(
-            overlay.branch.is_none(),
-            "no branch should ever be registered/assigned for an unmappable bead"
-        );
-        assert!(
-            store.branches.borrow().is_empty(),
-            "register_branch must never be called for an unmapped repo"
-        );
-        let spawn_calls = sessions
+        assert!(overlay.branch.is_none());
+        assert!(store.branches.borrow().is_empty());
+        let spawn_calls: usize = sessions
             .calls
             .borrow()
             .iter()
@@ -1300,7 +1287,49 @@ mod tests {
         assert_eq!(spawn_calls, 0, "Sessions::spawn must never be called");
     }
 
-    /// Companion to the unmapped-repo park test: when the bead's
+    /// jleechan-dljf (issue #271): a valid unseen repo must derive safe
+    /// defaults and dispatch normally — no per-repo config required.
+    #[test]
+    fn dispatch_ready_derives_defaults_for_unseen_valid_repo() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("jleechanorg/ez-gh-actions".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1, "unseen valid repo must dispatch");
+        assert_eq!(report.failures.len(), 0);
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Dispatched);
+        assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
+
+        let prompts = sessions.spawn_prompts.borrow();
+        let prompt = &prompts[0].1;
+        assert!(prompt.contains("jleechanorg/ez-gh-actions"));
+        assert!(prompt.contains("origin"));
+    }
+
+    /// Companion to the malformed-repo park test: when the bead's
     /// `target_repo` DOES have an explicit `[repos.*]` entry (distinct from
     /// `cfg.target_repo`), dispatch must proceed normally and the resolved
     /// `SpawnSpec` must carry that entry's `ao_project`/`push_remote`, not

@@ -7539,3 +7539,191 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
     let _ = std::fs::remove_file(&telemetry_log);
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
+
+/// jleechan-dljf production integration regression (issue #271): two beads
+/// from DIFFERENT repos sharing the SAME PR number (#52) must each persist
+/// target_repo BEFORE the gh pr view probe and each probe must use the
+/// bead's OWN --repo, NOT cfg.target_repo or another bead's repo.
+#[cfg(unix)]
+fn write_fake_gh_append_capturing_repo_arg(
+    dir: &std::path::Path,
+    capture_file: &std::path::Path,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("gh");
+    let script = format!(
+        "#!/bin/sh\n\
+         prev=\"\"\n\
+         repo_val=\"\"\n\
+         pr_num=\"\"\n\
+         for arg in \"$@\"; do\n\
+           case \"$arg\" in\n\
+             [0-9]*) pr_num=\"$arg\" ;;\n\
+           esac\n\
+           if [ \"$prev\" = \"--repo\" ]; then\n\
+             repo_val=\"$arg\"\n\
+           fi\n\
+           prev=\"$arg\"\n\
+         done\n\
+         if [ -n \"$repo_val\" ] && [ -n \"$pr_num\" ]; then\n\
+           printf '%s\t%s\\n' \"$pr_num\" \"$repo_val\" >> \"{capture}\"\n\
+         fi\n\
+         echo '{{{{\"number\": 1}}}}'\n",
+        capture = capture_file.display()
+    );
+    std::fs::write(&path, script)
+        .unwrap_or_else(|e| panic!("failed to write fake gh: {e}"));
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn same_pr_number_different_repos_persist_target_repo_before_probe_and_each_uses_correct_repo() {
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_dljf_two_repo_same_pr_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    let capture_file = fake_bin_dir.join("captured_repos.txt");
+    write_fake_gh_append_capturing_repo_arg(&fake_bin_dir, &capture_file);
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let _env_guard = EnvVarGuard::set(&[("PATH", &new_path)]);
+
+    let mut scm = FakeScm::new();
+    scm.issues.push(Issue {
+        number: 52,
+        title: "PR in worldarchitect".into(),
+        body: "target_repo: jleechanorg/worldarchitect.ai".into(),
+        author_login: "alice".into(),
+        external_ref: "jleechanorg/worldarchitect.ai#52".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "bead-ez-52".into(),
+        title: "PR in ez-gh-actions".into(),
+        description: "target_repo: jleechanorg/ez-gh-actions".into(),
+        file_tree_summary: String::new(),
+        external_ref: Some("jleechanorg/ez-gh-actions#52".into()),
+    });
+
+    let sessions = FakeSessions::new();
+    let llm = RealLlmForRepoProbe {
+        response: std::cell::RefCell::new(Some(Ok(
+            r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+        ))),
+    };
+    let store = FakeStateStore::new();
+    store
+        .save(&BeadOverlay {
+            bead_id: "bead-ez-52".into(),
+            state: OverlayState::Queued,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: None,
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("jleechanorg/ez-gh-actions".to_string()),
+        })
+        .unwrap();
+
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_dljf_two_repo_same_pr_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("tick should succeed");
+
+    assert!(summary.beads_created >= 1, "at least one bead should be created via intake");
+
+    let tracker_candidates = tracker.candidates.borrow();
+    let wa_bead = tracker_candidates
+        .iter()
+        .find(|b| b.external_ref.as_deref() == Some("jleechanorg/worldarchitect.ai#52"))
+        .expect("worldarchitect bead must exist");
+
+    let wa_overlay = store.load(&wa_bead.id).unwrap().expect("worldarchitect overlay must exist");
+    assert_eq!(
+        wa_overlay.target_repo.as_deref(),
+        Some("jleechanorg/worldarchitect.ai"),
+        "worldarchitect bead must have its own target_repo persisted before gh probe"
+    );
+
+    let ez_overlay = store.load("bead-ez-52").unwrap().expect("ez-gh-actions overlay must exist");
+    assert_eq!(
+        ez_overlay.target_repo.as_deref(),
+        Some("jleechanorg/ez-gh-actions"),
+        "ez-gh-actions bead must have its own target_repo persisted"
+    );
+
+    assert_ne!(
+        wa_overlay.target_repo, ez_overlay.target_repo,
+        "SAME PR number (#52) in different repos must resolve to DIFFERENT target_repos"
+    );
+
+    let captured = std::fs::read_to_string(&capture_file).unwrap_or_else(|e| {
+        panic!(
+            "expected the fake gh to have recorded --repo args; reading {capture_file:?} failed: {e}"
+        )
+    });
+    let lines: Vec<&str> = captured.trim().lines().collect();
+    assert!(lines.len() >= 1, "at least one gh pr view probe expected");
+
+    let pr_repos: Vec<(&str, &str)> = lines
+        .iter()
+        .map(|line| {
+            let parts: Vec<&str> = line.split('\t').collect();
+            (parts[0], parts[1])
+        })
+        .collect();
+
+    assert!(
+        pr_repos.iter().any(|(num, repo)| *num == "52" && *repo == "jleechanorg/worldarchitect.ai"),
+        "one probe must use --repo jleechanorg/worldarchitect.ai for PR #52, got: {pr_repos:?}"
+    );
+
+    assert!(
+        !pr_repos.iter().any(|(_, repo)| *repo == "owner/repo"),
+        "no probe must use cfg.target_repo (owner/repo); must use bead's own target_repo"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+

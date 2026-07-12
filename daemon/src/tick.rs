@@ -893,14 +893,10 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             Some(OverlayState::Ready) | Some(OverlayState::HumanHeld)
         );
         if should_adopt {
-            // jleechan-35y4 Stage A: adopted PRs are always same-repo
-            // (fork/cross-repo PRs are rejected earlier by `same_repo_pr`
-            // in intake.rs), so this always resolves to `cfg.target_repo`'s
-            // owner/repo today. Still resolved from `external_ref` (not
-            // left `None`) so it stays correct once Stage C/D lift the
-            // same-repo-only restriction for adopted PRs.
-            let target_repo =
-                intake::resolve_target_repo("", Some(adopted.external_ref.as_str()));
+            // jleechan-dljf (issue #271): target_repo is pre-resolved by
+            // intake::normalize_labeled_prs and propagated through
+            // ExistingPrIntake — use it directly rather than re-deriving.
+            let target_repo = adopted.target_repo.clone();
             let mut overlay = existing.unwrap_or(BeadOverlay {
                 bead_id: adopted.bead_id.clone(),
                 state: OverlayState::Attested,
@@ -957,45 +953,51 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     let tracker_candidates = deps.tracker.fetch_candidates()?;
     let mut routing_candidates: Vec<Bead> = Vec::new();
     for bead_id in &created {
-        let mut pr_number = None;
         let tracker_bead = tracker_candidates
             .iter()
             .find(|bead| bead.id == *bead_id)
             .cloned();
-        // jleechan-35y4 Stage A: resolve per-bead repo identity at intake
-        // time — explicit `target_repo:` body field wins, else the
-        // `owner/repo` prefix of external_ref, else None (legacy/global,
-        // resolved later via `BeadOverlay::repo`). Computed BEFORE the
-        // PR-existence probe below (jleechan-x8tf) so that probe can target
-        // the bead's OWN resolved repo instead of unconditionally
-        // `cfg.target_repo`.
+
         let target_repo = intake::resolve_target_repo(
             tracker_bead.as_ref().map(|b| b.description.as_str()).unwrap_or(""),
             tracker_bead.as_ref().and_then(|b| b.external_ref.as_deref()),
         );
+
+        // jleechan-dljf (issue #271): persist the overlay WITH target_repo
+        // BEFORE the `gh pr view` probe, then update pr_number afterward.
+        // This prevents a regression where target_repo was lost if the
+        // probe failed after computing target_repo but before any save.
+        let overlay = BeadOverlay {
+            bead_id: bead_id.clone(),
+            state: OverlayState::Queued,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: None,
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo,
+        };
+        deps.store.save(&overlay)?;
+        summary.beads_created += 1;
+
+        // jleechan-dljf (issue #271): probe for an existing PR AFTER
+        // persisting the overlay. If found, update pr_number on the
+        // already-persisted overlay.
+        let mut pr_number = None;
 
         if deps.llm.is_real() {
             if let Some(bead) = tracker_bead.as_ref() {
                 if let Some(ref ext_ref) = bead.external_ref {
                     if let Some((_, num_str)) = parse_external_ref(ext_ref) {
                         if let Ok(num) = num_str.parse::<u64>() {
-                            // jleechan-x8tf: probe the bead's OWN resolved
-                            // repo (`target_repo`, computed above), not
-                            // unconditionally `deps.cfg.target_repo` — this
-                            // used to parse a repo out of `ext_ref` via
-                            // `parse_external_ref` and then discard it
-                            // (`_`), silently falling back to the global
-                            // config repo. For any bead whose external_ref
-                            // or `target_repo:` body field names a repo
-                            // OTHER than `cfg.target_repo` (e.g. a
-                            // dark-factory fixture bead while the daemon's
-                            // global default is worldarchitect.ai), this
-                            // probe silently checked the WRONG repo's PR
-                            // list — corrupting any multi-repo E2E proof
-                            // that depends on this check landing on the
-                            // bead's own repo.
                             let probe_repo =
-                                target_repo.as_deref().unwrap_or(&deps.cfg.target_repo);
+                                overlay.target_repo.as_deref().unwrap_or(&deps.cfg.target_repo);
                             if crate::tools::run_tool(
                                 "gh",
                                 &[
@@ -1018,24 +1020,11 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 }
             }
         }
-        let overlay = BeadOverlay {
-            bead_id: bead_id.clone(),
-            state: OverlayState::Queued,
-            attempt: 1,
-            reroll_count: 0,
-            autonomy_secs: 0,
-            spend_usd: 0.0,
-            pr_number,
-            branch: None,
-            session_id: None,
-            is_adopted: false,
-            spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo,
-        };
-        deps.store.save(&overlay)?;
-        summary.beads_created += 1;
+        if let Some(num) = pr_number {
+            let mut updated = deps.store.load(bead_id)?.unwrap_or(overlay);
+            updated.pr_number = Some(num);
+            deps.store.save(&updated)?;
+        }
         emit(
             deps.telemetry_log,
             bead_id,
