@@ -29,20 +29,14 @@ use std::collections::HashMap;
 pub struct FakeTracker {
     pub candidates: RefCell<Vec<Bead>>,
     pub create_bead_result: RefCell<Option<Result<String, String>>>,
-    /// Scripts `create_bead` to fail with the exact `br create` duplicate
-    /// error shape (`DaemonError::duplicate_external_ref_bead_id` parses
-    /// it), simulating jleechan-u4gb: a concurrent/stale `fetch_all_external_refs`
-    /// snapshot missed a ref that `br create`'s own uniqueness check
-    /// correctly rejects. Value is the existing bead id to report.
     pub create_bead_duplicate_of: RefCell<Option<String>>,
-    /// jleechan-eazj: scripts a NON-duplicate `create_bead` failure for one
-    /// specific `external_ref` only (consumed once), so a multi-candidate
-    /// batch can exercise "candidate A's create_bead errors, candidate B's
-    /// does not" — the exact shape needed to prove one candidate's error no
-    /// longer starves the rest of the batch of telemetry.
     pub create_bead_fail_for_ref: RefCell<Option<(String, String)>>,
     pub fail_next_fetch_candidates: RefCell<Option<String>>,
     pub fail_next_comment: RefCell<Option<String>>,
+    /// jleechan-dljf: sequential bead IDs consumed one per create_bead call.
+    /// When non-empty and create_bead_result is None, pops the first entry
+    /// as the returned bead ID instead of the default "fake-bead-1".
+    pub create_bead_seq_ids: RefCell<Vec<String>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -122,7 +116,14 @@ impl Tracker for FakeTracker {
                 rc: 1,
                 stderr: e.clone(),
             }),
-            None => Ok("fake-bead-1".into()),
+            None => {
+                let id = self
+                    .create_bead_seq_ids
+                    .borrow_mut()
+                    .pop()
+                    .unwrap_or_else(|| "fake-bead-1".into());
+                Ok(id)
+            }
         };
         if let Ok(id) = &result {
             self.candidates.borrow_mut().push(Bead {

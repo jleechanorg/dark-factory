@@ -626,6 +626,7 @@ fn execute_adopted(
                 .clone()
                 .unwrap_or_else(|| adopted_repo.clone()),
             push_remote: "origin".to_string(),
+            source: crate::config::RoutingSource::GlobalTarget,
         }
     });
     let spec = SpawnSpec {

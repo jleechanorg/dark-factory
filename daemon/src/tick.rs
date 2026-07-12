@@ -963,28 +963,34 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             tracker_bead.as_ref().and_then(|b| b.external_ref.as_deref()),
         );
 
-        // jleechan-dljf (issue #271): persist the overlay WITH target_repo
-        // BEFORE the `gh pr view` probe, then update pr_number afterward.
-        // This prevents a regression where target_repo was lost if the
-        // probe failed after computing target_repo but before any save.
-        let overlay = BeadOverlay {
-            bead_id: bead_id.clone(),
-            state: OverlayState::Queued,
-            attempt: 1,
-            reroll_count: 0,
-            autonomy_secs: 0,
-            spend_usd: 0.0,
-            pr_number: None,
-            branch: None,
-            session_id: None,
-            is_adopted: false,
-            spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo,
-        };
-        deps.store.save(&overlay)?;
+        // jleechan-dljf skeptic: load existing overlay first to preserve
+        // metadata (state/attempt/etc.) from prior ticks; always set
+        // the resolved target_repo on any existing overlay.
+        let existing = deps.store.load(bead_id)?;
+        let fresh = existing
+            .map(|mut o| {
+                o.target_repo = target_repo.clone();
+                o
+            })
+            .unwrap_or_else(|| BeadOverlay {
+                bead_id: bead_id.clone(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo,
+            });
+        deps.store.save(&fresh)?;
         summary.beads_created += 1;
+        let overlay = fresh;
 
         // jleechan-dljf (issue #271): probe for an existing PR AFTER
         // persisting the overlay. If found, update pr_number on the
@@ -1021,8 +1027,14 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
         }
         if let Some(num) = pr_number {
+            let target = overlay.target_repo.clone();
             let mut updated = deps.store.load(bead_id)?.unwrap_or(overlay);
             updated.pr_number = Some(num);
+            // jleechan-dljf skeptic: always ensure target_repo is set on
+            // the existing overlay without resetting any other state.
+            if updated.target_repo.is_none() {
+                updated.target_repo = target;
+            }
             deps.store.save(&updated)?;
         }
         emit(
@@ -1464,6 +1476,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     "sessionId": success.session_id.as_str(),
                     // jleechan-35y4: resolved repo now visible in daemon.jsonl.
                     "target_repo": success.target_repo.as_str(),
+                    // jleechan-dljf skeptic: structured durable routing
+                    // provenance (explicit|global_target|derived).
+                    "routing_source": success.routing_source.as_str(),
                 }),
             )?;
             let comment_body = format!(

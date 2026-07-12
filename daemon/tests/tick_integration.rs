@@ -7602,6 +7602,7 @@ fn same_pr_number_different_repos_persist_target_repo_before_probe_and_each_uses
     let _env_guard = EnvVarGuard::set(&[("PATH", &new_path)]);
 
     let mut scm = FakeScm::new();
+    // Two issues from DIFFERENT repos but SAME PR number (#52).
     scm.issues.push(Issue {
         number: 52,
         title: "PR in worldarchitect".into(),
@@ -7609,16 +7610,20 @@ fn same_pr_number_different_repos_persist_target_repo_before_probe_and_each_uses
         author_login: "alice".into(),
         external_ref: "jleechanorg/worldarchitect.ai#52".into(),
     });
+    scm.issues.push(Issue {
+        number: 52,
+        title: "PR in ez-gh-actions".into(),
+        body: "target_repo: jleechanorg/ez-gh-actions".into(),
+        author_login: "alice".into(),
+        external_ref: "jleechanorg/ez-gh-actions#52".into(),
+    });
     scm.permissions.insert("alice".into(), Permission::Write);
 
     let tracker = FakeTracker::new();
-    tracker.candidates.borrow_mut().push(Bead {
-        id: "bead-ez-52".into(),
-        title: "PR in ez-gh-actions".into(),
-        description: "target_repo: jleechanorg/ez-gh-actions".into(),
-        file_tree_summary: String::new(),
-        external_ref: Some("jleechanorg/ez-gh-actions#52".into()),
-    });
+    // jleechan-dljf: sequential IDs so both beads get distinct ids through
+    // the full intake pipeline.
+    tracker.create_bead_seq_ids.borrow_mut().push("bead-ez-52".into());
+    tracker.create_bead_seq_ids.borrow_mut().push("bead-wa-52".into());
 
     let sessions = FakeSessions::new();
     let llm = RealLlmForRepoProbe {
@@ -7627,26 +7632,8 @@ fn same_pr_number_different_repos_persist_target_repo_before_probe_and_each_uses
         ))),
     };
     let store = FakeStateStore::new();
-    store
-        .save(&BeadOverlay {
-            bead_id: "bead-ez-52".into(),
-            state: OverlayState::Queued,
-            attempt: 1,
-            reroll_count: 0,
-            autonomy_secs: 0,
-            spend_usd: 0.0,
-            pr_number: None,
-            branch: None,
-            session_id: None,
-            is_adopted: false,
-            spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: Some("jleechanorg/ez-gh-actions".to_string()),
-        })
-        .unwrap();
 
-    let cfg = test_cfg();
+    let cfg = test_cfg(); // target_repo == "owner/repo"
     let vcs = FakeVcs::new();
     let telemetry_log = std::env::temp_dir().join(format!(
         "afd_dljf_two_repo_same_pr_{}.jsonl",
@@ -7670,40 +7657,37 @@ fn same_pr_number_different_repos_persist_target_repo_before_probe_and_each_uses
     )
     .expect("tick should succeed");
 
-    assert!(summary.beads_created >= 1, "at least one bead should be created via intake");
+    assert_eq!(summary.beads_created, 2, "two beads should be created via intake");
 
-    let tracker_candidates = tracker.candidates.borrow();
-    let wa_bead = tracker_candidates
-        .iter()
-        .find(|b| b.external_ref.as_deref() == Some("jleechanorg/worldarchitect.ai#52"))
-        .expect("worldarchitect bead must exist");
+    // Both overlays must exist and carry their own target_repo.
+    let wa_overlay = store.load("bead-wa-52").unwrap()
+        .expect("worldarchitect overlay must exist");
+    let ez_overlay = store.load("bead-ez-52").unwrap()
+        .expect("ez-gh-actions overlay must exist");
 
-    let wa_overlay = store.load(&wa_bead.id).unwrap().expect("worldarchitect overlay must exist");
     assert_eq!(
         wa_overlay.target_repo.as_deref(),
         Some("jleechanorg/worldarchitect.ai"),
-        "worldarchitect bead must have its own target_repo persisted before gh probe"
+        "worldarchitect bead must have its own target_repo persisted"
     );
-
-    let ez_overlay = store.load("bead-ez-52").unwrap().expect("ez-gh-actions overlay must exist");
     assert_eq!(
         ez_overlay.target_repo.as_deref(),
         Some("jleechanorg/ez-gh-actions"),
         "ez-gh-actions bead must have its own target_repo persisted"
     );
-
     assert_ne!(
         wa_overlay.target_repo, ez_overlay.target_repo,
         "SAME PR number (#52) in different repos must resolve to DIFFERENT target_repos"
     );
 
+    // The fake gh captured --repo args for BOTH beads.
     let captured = std::fs::read_to_string(&capture_file).unwrap_or_else(|e| {
         panic!(
             "expected the fake gh to have recorded --repo args; reading {capture_file:?} failed: {e}"
         )
     });
     let lines: Vec<&str> = captured.trim().lines().collect();
-    assert!(lines.len() >= 1, "at least one gh pr view probe expected");
+    assert_eq!(lines.len(), 2, "two gh pr view probes expected, one per bead, got {lines:?}");
 
     let pr_repos: Vec<(&str, &str)> = lines
         .iter()
@@ -7714,13 +7698,22 @@ fn same_pr_number_different_repos_persist_target_repo_before_probe_and_each_uses
         .collect();
 
     assert!(
-        pr_repos.iter().any(|(num, repo)| *num == "52" && *repo == "jleechanorg/worldarchitect.ai"),
+        pr_repos.contains(&("52", "jleechanorg/worldarchitect.ai")),
         "one probe must use --repo jleechanorg/worldarchitect.ai for PR #52, got: {pr_repos:?}"
     );
+    assert!(
+        pr_repos.contains(&("52", "jleechanorg/ez-gh-actions")),
+        "one probe must use --repo jleechanorg/ez-gh-actions for PR #52, got: {pr_repos:?}"
+    );
+    assert_ne!(
+        pr_repos[0].1, pr_repos[1].1,
+        "PR #52 in two different repos must probe DIFFERENT --repo values"
+    );
 
+    // Neither probe used cfg.target_repo ("owner/repo").
     assert!(
         !pr_repos.iter().any(|(_, repo)| *repo == "owner/repo"),
-        "no probe must use cfg.target_repo (owner/repo); must use bead's own target_repo"
+        "no probe must use cfg.target_repo; must use bead's own target_repo"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

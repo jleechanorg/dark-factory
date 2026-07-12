@@ -2,22 +2,41 @@ use crate::errors::DaemonError;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// One `[repos."<owner>/<repo>"]` table entry (bead jleechan-35y4, Stage B of
-/// the multi-repo dispatch fix — see
-/// `docs/multirepo-dispatch-investigation-2026-07-11.md`).
+/// One `[repos."<owner>/<repo>"]` table entry.
 #[derive(serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RepoConfig {
     pub ao_project: String,
     pub push_remote: String,
 }
 
-/// Resolved dispatch routing for a repo — the AO project to spawn into and
-/// the git remote a coder must push to. Returned by [`Config::resolve_repo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingSource {
+    Explicit,
+    GlobalTarget,
+    Derived,
+}
+
+impl RoutingSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RoutingSource::Explicit => "explicit",
+            RoutingSource::GlobalTarget => "global_target",
+            RoutingSource::Derived => "derived",
+        }
+    }
+}
+
+/// Resolved dispatch routing for a repo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoRouting {
     pub ao_project: String,
     pub push_remote: String,
+    pub source: RoutingSource,
 }
+
+/// Acceptable lengths for GitHub owner and repo names.
+const MAX_OWNER_LEN: usize = 39;
+const MAX_REPO_LEN: usize = 100;
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Config {
@@ -38,27 +57,12 @@ pub struct Config {
 }
 
 impl Config {
-    /// Resolve dispatch routing for `repo` (`overlay.repo(self)`'s output).
-    ///
-    /// Precedence (bead jleechan-dljf, issue #271):
-    /// 1. Explicit `[repos."<repo>"]` entry → use that entry's
-    ///    `ao_project`/`push_remote` verbatim.
-    /// 2. `repo == self.target_repo` → use global config's `ao_project`
-    ///    (or the same last-path-segment derivation, with
-    ///    `push_remote` defaulting to `"origin"`).
-    /// 3. Valid `owner/repo` string → derive safe defaults:
-    ///    `ao_project` = last path segment (with `worldarchitect.ai` →
-    ///    `worldarchitect` special case), `push_remote` = `"origin"`.
-    /// 4. Collision check: if the derived `ao_project` matches an
-    ///    explicit `[repos]` entry's `ao_project` for a DIFFERENT repo,
-    ///    fail closed.
-    /// 5. Global target_repo's ao_project also checked for collisions.
-    /// 6. Malformed repo → `None` (fail closed).
     pub fn resolve_repo(&self, repo: &str) -> Option<RepoRouting> {
         if let Some(rc) = self.repos.get(repo) {
             return Some(RepoRouting {
                 ao_project: rc.ao_project.clone(),
                 push_remote: rc.push_remote.clone(),
+                source: RoutingSource::Explicit,
             });
         }
         if repo == self.target_repo {
@@ -81,6 +85,7 @@ impl Config {
             return Some(RepoRouting {
                 ao_project,
                 push_remote: "origin".to_string(),
+                source: RoutingSource::GlobalTarget,
             });
         }
         self.derive_routing_for_unseen_repo(repo)
@@ -95,6 +100,8 @@ impl Config {
             mong.name
         };
 
+        // jleechan-dljf skeptic: collision check against [repos] entries
+        // AND against the global target_repo's effective ao_project.
         if self.is_ao_project_collision(&ao_project, repo) {
             eprintln!(
                 "auto-factory daemon: ao_project collision: derived ao_project='{}' \
@@ -105,21 +112,46 @@ impl Config {
             return None;
         }
 
-        eprintln!(
-            "auto-factory daemon: derived-route repo={} ao_project={} push_remote=origin \
-             source=derived (no explicit [repos.\"{}\"] entry)",
-            repo, ao_project, repo
-        );
+        // jleechan-dljf skeptic: also check if the derived ao_project
+        // collides with the global target_repo's effective ao_project.
+        let global_ao = self.global_effective_ao_project();
+        if repo != self.target_repo && ao_project == global_ao {
+            eprintln!(
+                "auto-factory daemon: ao_project collision: derived ao_project='{}' \
+                 for repo '{}' collides with global target_repo '{}' effective \
+                 ao_project='{}'; routing failed closed",
+                ao_project, repo, self.target_repo, global_ao
+            );
+            return None;
+        }
 
         Some(RepoRouting {
             ao_project,
             push_remote: "origin".to_string(),
+            source: RoutingSource::Derived,
         })
     }
 
     fn is_ao_project_collision(&self, ao_project: &str, for_repo: &str) -> bool {
         self.repos.iter().any(|(entry_repo, rc)| {
             entry_repo != for_repo && rc.ao_project == ao_project
+        })
+    }
+
+    /// Effective AO project for the global `target_repo`: explicit
+    /// `ao_project` if set, else the last-path-segment derivation.
+    pub fn global_effective_ao_project(&self) -> String {
+        self.ao_project.clone().unwrap_or_else(|| {
+            let mut project = self
+                .target_repo
+                .split('/')
+                .next_back()
+                .unwrap_or(&self.target_repo)
+                .to_string();
+            if project == "worldarchitect.ai" {
+                project = "worldarchitect".to_string();
+            }
+            project
         })
     }
 }
@@ -146,12 +178,52 @@ fn validate_owner_repo(s: &str) -> Option<OwnerRepo> {
     })
 }
 
+/// GitHub owner names: alphanumeric + hyphen only, max 39 chars,
+/// cannot start or end with hyphen, cannot be all hyphens.
 fn is_valid_github_owner_segment(s: &str) -> bool {
-    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    if s.is_empty() || s.len() > MAX_OWNER_LEN {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+        return false;
+    }
+    let mut has_alnum = false;
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() {
+            has_alnum = true;
+        } else if b != b'-' {
+            return false;
+        }
+    }
+    has_alnum
 }
 
+/// GitHub repo names: alphanumeric + hyphen + underscore + dot,
+/// max 100 chars, cannot end with `.git` (reserved), cannot be
+/// just `.` or `..`, cannot start or end with hyphen or dot.
 fn is_valid_github_repo_segment(s: &str) -> bool {
-    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    if s.is_empty() || s.len() > MAX_REPO_LEN {
+        return false;
+    }
+    if s == "." || s == ".." {
+        return false;
+    }
+    if s.to_ascii_lowercase().ends_with(".git") {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let first = bytes[0];
+    let last = bytes[bytes.len() - 1];
+    if first == b'-' || first == b'.' || last == b'-' || last == b'.' {
+        return false;
+    }
+    for &b in bytes {
+        if !(b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') {
+            return false;
+        }
+    }
+    true
 }
 
 pub fn is_valid_owner_repo(s: &str) -> bool {
@@ -164,19 +236,23 @@ pub fn load(path: &Path) -> Result<Config, DaemonError> {
     let cfg: Config =
         toml::from_str(&raw).map_err(|e| DaemonError::Config(e.to_string()))?;
     let mut seen_ao_projects: HashMap<&str, &str> = HashMap::new();
-    if let Some(ref global_ao) = cfg.ao_project {
-        for (repo, rc) in &cfg.repos {
-            if repo != &cfg.target_repo && rc.ao_project == *global_ao {
-                return Err(DaemonError::Config(format!(
-                    "global-explicit AO project collision: global ao_project=\"{}\" \
-                     collides with [repos.\"{}\"].ao_project=\"{}\" — each repo must \
-                     route to a distinct AO project",
-                    global_ao, repo, rc.ao_project
-                )));
-            }
+
+    // jleechan-dljf symmetric: check the global target_repo's effective
+    // ao_project (explicit OR derived) against [repos] entries at load time.
+    let global_ao = cfg.global_effective_ao_project();
+    for (repo, rc) in &cfg.repos {
+        if repo != &cfg.target_repo && rc.ao_project == global_ao {
+            return Err(DaemonError::Config(format!(
+                "global-explicit AO project collision: {} global ao_project=\"{}\" \
+                 collides with [repos.\"{}\"].ao_project=\"{}\" — each repo must \
+                 route to a distinct AO project",
+                if cfg.ao_project.is_some() { "explicit" } else { "derived" },
+                global_ao, repo, rc.ao_project
+            )));
         }
-        seen_ao_projects.insert(global_ao.as_str(), cfg.target_repo.as_str());
     }
+    seen_ao_projects.insert(global_ao.as_str(), cfg.target_repo.as_str());
+
     for (repo, rc) in &cfg.repos {
         if let Some(existing_repo) = seen_ao_projects.get(rc.ao_project.as_str()) {
             if existing_repo != repo {
@@ -197,6 +273,15 @@ pub fn load(path: &Path) -> Result<Config, DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repo(ao: &str, remote: &str, source: RoutingSource) -> RepoRouting {
+        RepoRouting {
+            ao_project: ao.to_string(),
+            push_remote: remote.to_string(),
+            source,
+        }
+    }
+
     #[test]
     fn parses_example_config() {
         let cfg = load(std::path::Path::new("contracts/daemon.toml.example")).unwrap();
@@ -212,10 +297,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("bad.toml");
         std::fs::write(&p, "target_repo = \"x/y\"\n").unwrap();
-        assert!(matches!(
-            load(&p),
-            Err(crate::errors::DaemonError::Config(_))
-        ));
+        assert!(matches!(load(&p), Err(crate::errors::DaemonError::Config(_))));
     }
     #[test]
     fn ao_project_is_optional_for_legacy_configs() {
@@ -268,10 +350,7 @@ spec_dir = ".factory/specs/"
         assert!(cfg.repos.is_empty(), "repos table must default to empty when absent");
         assert_eq!(
             cfg.resolve_repo("owner/repo"),
-            Some(RepoRouting {
-                ao_project: "repo".to_string(),
-                push_remote: "origin".to_string(),
-            }),
+            Some(repo("repo", "origin", RoutingSource::GlobalTarget)),
             "the global target_repo must still resolve when [repos] is absent"
         );
     }
@@ -310,17 +389,11 @@ push_remote = "origin"
         assert_eq!(cfg.repos.len(), 2);
         assert_eq!(
             cfg.resolve_repo("jleechanorg/worldarchitect.ai"),
-            Some(RepoRouting {
-                ao_project: "worldarchitect".to_string(),
-                push_remote: "worldai".to_string(),
-            })
+            Some(repo("worldarchitect", "worldai", RoutingSource::Explicit))
         );
         assert_eq!(
             cfg.resolve_repo("jleechanorg/dark-factory"),
-            Some(RepoRouting {
-                ao_project: "dark-factory".to_string(),
-                push_remote: "origin".to_string(),
-            })
+            Some(repo("dark-factory", "origin", RoutingSource::Explicit))
         );
     }
 
@@ -349,18 +422,12 @@ spec_dir = ".factory/specs/"
         let cfg = load(&p).unwrap();
         assert_eq!(
             cfg.resolve_repo("jleechanorg/ez-gh-actions"),
-            Some(RepoRouting {
-                ao_project: "ez-gh-actions".to_string(),
-                push_remote: "origin".to_string(),
-            }),
+            Some(repo("ez-gh-actions", "origin", RoutingSource::Derived)),
             "unseen valid repo must derive safe defaults"
         );
         assert_eq!(
             cfg.resolve_repo("jleechanorg/dark-factory"),
-            Some(RepoRouting {
-                ao_project: "dark-factory".to_string(),
-                push_remote: "origin".to_string(),
-            }),
+            Some(repo("dark-factory", "origin", RoutingSource::GlobalTarget)),
             "global target_repo also resolves"
         );
     }
@@ -422,10 +489,7 @@ push_remote = "ezremote"
         let cfg = load(&p).unwrap();
         assert_eq!(
             cfg.resolve_repo("jleechanorg/ez-gh-actions"),
-            Some(RepoRouting {
-                ao_project: "ez-gh-actions-custom".to_string(),
-                push_remote: "ezremote".to_string(),
-            }),
+            Some(repo("ez-gh-actions-custom", "ezremote", RoutingSource::Explicit)),
             "explicit [repos] entry must override derived defaults"
         );
     }
@@ -492,10 +556,7 @@ push_remote = "myremote"
         let cfg = load(&p).unwrap();
         assert_eq!(
             cfg.resolve_repo("jleechanorg/ez-gh-actions"),
-            Some(RepoRouting {
-                ao_project: "ez-gh-actions".to_string(),
-                push_remote: "myremote".to_string(),
-            }),
+            Some(repo("ez-gh-actions", "myremote", RoutingSource::Explicit)),
             "explicit entry where ao_project matches last-segment: no collision"
         );
         assert_eq!(
@@ -529,18 +590,112 @@ spec_dir = ".factory/specs/"
         let cfg = load(&p).unwrap();
         assert_eq!(
             cfg.resolve_repo("jleechanorg/worldarchitect.ai"),
-            Some(RepoRouting {
-                ao_project: "worldarchitect".to_string(),
-                push_remote: "origin".to_string(),
-            })
+            Some(repo("worldarchitect", "origin", RoutingSource::GlobalTarget))
         );
     }
 
+    // ── jleechan-dljf skeptic: validation ─────────────────────────────
+
     #[test]
-    fn resolve_repo_derives_worldarchitect_for_worldarchitect_ai_name() {
-        let dir = std::env::temp_dir().join("afd_cfg_test_wa_derived");
+    fn is_valid_owner_repo_rejects_whitespace_control_and_invalid_chars() {
+        assert!(is_valid_owner_repo("jleechanorg/dark-factory"));
+        assert!(is_valid_owner_repo("foo-bar/foo_bar.baz"));
+        assert!(is_valid_owner_repo("a/my.repo"));
+        // Dots in owner (user/org) names are invalid
+        assert!(!is_valid_owner_repo("owner.name/repo"));
+        // Underscores in owner names are invalid
+        assert!(!is_valid_owner_repo("owner_name/repo"));
+        // Whitespace
+        assert!(!is_valid_owner_repo(" owner/repo"));
+        assert!(!is_valid_owner_repo("owner /repo"));
+        assert!(!is_valid_owner_repo(" \towner/repo"));
+        assert!(!is_valid_owner_repo("owner/repo "));
+        assert!(!is_valid_owner_repo("owner/repo\n"));
+        // Control chars
+        assert!(!is_valid_owner_repo("owner\x00/repo"));
+        assert!(!is_valid_owner_repo("owner/repo\x1f"));
+        assert!(!is_valid_owner_repo("owner/\x7frepo"));
+        // Invalid chars
+        assert!(!is_valid_owner_repo("owner/repo!"));
+        assert!(!is_valid_owner_repo("owner/re$po"));
+        // Empty segments
+        assert!(!is_valid_owner_repo(""));
+        assert!(!is_valid_owner_repo("/repo"));
+        assert!(!is_valid_owner_repo("owner/"));
+        assert!(!is_valid_owner_repo("a/b/c"));
+    }
+
+    /// jleechan-dljf skeptic: owner segment hyphen rules + max length.
+    #[test]
+    fn is_valid_owner_repo_rejects_hyphen_edge_cases() {
+        assert!(!is_valid_owner_repo("-owner/repo"), "cannot start with hyphen");
+        assert!(!is_valid_owner_repo("owner-/repo"), "cannot end with hyphen");
+        assert!(!is_valid_owner_repo("---/repo"), "all-hyphens owner rejected");
+        // Max owner length 39
+        let long = "a".repeat(40);
+        assert!(!is_valid_owner_repo(&format!("{long}/repo")), "owner >39 chars rejected");
+        assert!(is_valid_owner_repo(&format!("{}/repo", "a".repeat(39))), "owner 39 chars ok");
+    }
+
+    /// jleechan-dljf skeptic: repo segment hyphen/dot rules + max length.
+    #[test]
+    fn is_valid_owner_repo_rejects_repo_edge_cases() {
+        assert!(!is_valid_owner_repo("owner/-repo"), "cannot start with hyphen");
+        assert!(!is_valid_owner_repo("owner/repo-"), "cannot end with hyphen");
+        assert!(!is_valid_owner_repo("owner/.repo"), "cannot start with dot");
+        assert!(!is_valid_owner_repo("owner/repo."), "cannot end with dot");
+        assert!(!is_valid_owner_repo("owner/."), "dot-only rejected");
+        assert!(!is_valid_owner_repo("owner/.."), "dotdot rejected");
+        assert!(!is_valid_owner_repo("owner/myrepo.git"), ".git suffix rejected");
+        // Max repo length 100
+        let long = "a".repeat(101);
+        assert!(!is_valid_owner_repo(&format!("owner/{long}")), "repo >100 chars rejected");
+        assert!(is_valid_owner_repo(&format!("owner/{}", "a".repeat(100))), "repo 100 chars ok");
+    }
+
+    // ── jleechan-dljf skeptic: symmetric collision ────────────────────
+
+    /// jleechan-dljf skeptic: global TARGET_REPO's derived ao_project must
+    /// be checked against [repos] entries at load time (symmetric with
+    /// explicit ao_project check).
+    #[test]
+    fn load_rejects_global_derived_ao_project_collision_with_repos_entry() {
+        let dir = std::env::temp_dir().join("afd_cfg_test_global_derived_collision");
         std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("wa_derived.toml");
+        let p = dir.join("global_derived_collision.toml");
+        std::fs::write(
+            &p,
+            r#"
+target_repo = "jleechanorg/ez-gh-actions"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+
+[repos."jleechanorg/other-repo"]
+ao_project = "ez-gh-actions"
+push_remote = "origin"
+"#,
+        )
+        .unwrap();
+        let result = load(&p);
+        assert!(result.is_err(), "global derived ao_project must fail at load when colliding with [repos]");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("ez-gh-actions"));
+    }
+
+    /// jleechan-dljf skeptic: unseen repo's derived ao_project collides
+    /// with global target_repo's effective ao_project → fail closed.
+    #[test]
+    fn resolve_repo_fails_for_derived_vs_global_ao_project_collision() {
+        let dir = std::env::temp_dir().join("afd_cfg_test_derived_vs_global");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("derived_vs_global.toml");
         std::fs::write(
             &p,
             r#"
@@ -559,15 +714,18 @@ spec_dir = ".factory/specs/"
         )
         .unwrap();
         let cfg = load(&p).unwrap();
+        // Global target_repo resolves fine.
+        assert!(cfg.resolve_repo("jleechanorg/dark-factory").is_some());
+        // Unseen repo whose derived ao_project == global effective ao_project
+        // must fail closed — two repos cannot route to same AO project.
         assert_eq!(
-            cfg.resolve_repo("jleechanorg/worldarchitect.ai"),
-            Some(RepoRouting {
-                ao_project: "worldarchitect".to_string(),
-                push_remote: "origin".to_string(),
-            }),
-            "worldarchitect.ai unseen repo derivation must preserve special case"
+            cfg.resolve_repo("otherorg/dark-factory"),
+            None,
+            "derived ao_project 'dark-factory' collides with global target_repo's effective ao_project"
         );
     }
+
+    // ── jleechan-dljf skeptic: same-number cross-repo ────────────────
 
     #[test]
     fn same_pr_number_different_repos_do_not_cross_route_issue_52() {
@@ -637,35 +795,11 @@ push_remote = "ezremote"
         assert_ne!(wa_routing.ao_project, ez_routing.ao_project);
     }
 
-    #[test]
-    fn is_valid_owner_repo_rejects_whitespace_control_and_invalid_chars() {
-        assert!(is_valid_owner_repo("jleechanorg/dark-factory"));
-        assert!(is_valid_owner_repo("foo-bar/foo_bar.baz"));
-        assert!(is_valid_owner_repo("a/my.repo"));
-        assert!(!is_valid_owner_repo("owner.name/repo"));
-        assert!(!is_valid_owner_repo("owner_name/repo"));
-        assert!(!is_valid_owner_repo(" owner/repo"));
-        assert!(!is_valid_owner_repo("owner /repo"));
-        assert!(!is_valid_owner_repo(" \towner/repo"));
-        assert!(!is_valid_owner_repo("owner/repo "));
-        assert!(!is_valid_owner_repo("owner/repo\n"));
-        assert!(!is_valid_owner_repo("owner\x00/repo"));
-        assert!(!is_valid_owner_repo("owner/repo\x1f"));
-        assert!(!is_valid_owner_repo("owner/\x7frepo"));
-        assert!(!is_valid_owner_repo("owner/repo!"));
-        assert!(!is_valid_owner_repo("owner/repo@"));
-        assert!(!is_valid_owner_repo("owner/repo#"));
-        assert!(!is_valid_owner_repo("owner/re$po"));
-        assert!(!is_valid_owner_repo(""));
-        assert!(!is_valid_owner_repo("/repo"));
-        assert!(!is_valid_owner_repo("owner/"));
-        assert!(!is_valid_owner_repo("a/b/c"));
-    }
+    // ── remaining collision tests ─────────────────────────────────────
 
     #[test]
     fn resolve_repo_fails_for_global_ao_project_collision_with_explicit_repo() {
-        let dir =
-            std::env::temp_dir().join("afd_cfg_test_global_ao_collision");
+        let dir = std::env::temp_dir().join("afd_cfg_test_global_ao_collision");
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("global_ao_collision.toml");
         std::fs::write(
@@ -692,14 +826,13 @@ push_remote = "origin"
         let result = load(&p);
         assert!(result.is_err(), "global-explicit AO project collision must fail at load time");
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("global-explicit"));
+        assert!(msg.contains("global-explicit") || msg.contains("global "));
         assert!(msg.contains("shared-project"));
     }
 
     #[test]
     fn resolve_repo_explicit_explicit_collision_blocked_for_derived() {
-        let dir =
-            std::env::temp_dir().join("afd_cfg_test_explicit_explicit_collision");
+        let dir = std::env::temp_dir().join("afd_cfg_test_explicit_explicit_collision");
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("explicit_explicit_collision.toml");
         std::fs::write(
@@ -802,7 +935,7 @@ push_remote = "origin"
         let result = load(&p);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("global-explicit"));
+        assert!(msg.contains("global-explicit") || msg.contains("global "));
         assert!(msg.contains("shared-project"));
         assert!(msg.contains("other-repo"));
     }

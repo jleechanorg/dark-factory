@@ -49,10 +49,10 @@ pub struct DispatchSuccess {
     pub attempt: u32,
     pub branch: String,
     pub session_id: String,
-    /// `overlay.repo(cfg)` at dispatch time (bead jleechan-35y4 Stage A/B):
-    /// surfaced so `tick.rs`'s `TASK_DISPATCHED` telemetry makes the
-    /// resolved repo visible in daemon.jsonl.
     pub target_repo: String,
+    /// jleechan-dljf skeptic: routing provenance for structured JSONL
+    /// telemetry (Explicit/GlobalTarget/Derived).
+    pub routing_source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,6 +471,7 @@ pub fn dispatch_ready(
             branch,
             session_id: session_id.0,
             target_repo: repo,
+            routing_source: routing.source.as_str().to_string(),
         });
     }
 
