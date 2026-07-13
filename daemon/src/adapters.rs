@@ -1346,6 +1346,76 @@ fn resolve_worktree_path(ao_project: &str, branch: &str) -> std::path::PathBuf {
         .join(worktree_display_name(branch))
 }
 
+/// AO v0.1.3 accepts the task prompt positionally but does not expose its
+/// core `branch` field as a CLI flag. The preload bridge keeps the public CLI
+/// argv valid while passing the exact factory branch to AO core before the
+/// workspace or worker is created. `CARGO_MANIFEST_DIR` is embedded by the
+/// build, so the systemd-installed binary resolves the bridge from the same
+/// checkout it was built from rather than assuming a user-specific AO path.
+fn ao_spawn_bridge_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("ao-spawn-v013-bridge.mjs")
+}
+
+fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonError> {
+    let bridge = ao_spawn_bridge_path();
+    if !bridge.is_file() {
+        return Err(DaemonError::Config(format!(
+            "AO v0.1.3 spawn bridge is missing at {}; rebuild/reinstall the daemon from a complete checkout",
+            bridge.display()
+        )));
+    }
+    let bridge_arg = format!("--import={}", bridge.display());
+    if bridge_arg.chars().any(char::is_whitespace) {
+        return Err(DaemonError::Config(format!(
+            "AO v0.1.3 spawn bridge path contains whitespace and cannot be represented safely in NODE_OPTIONS: {}",
+            bridge.display()
+        )));
+    }
+
+    let mut cmd = if std::env::consts::OS == "macos" {
+        let holdouts = resolve_holdouts_path_or_fail()?;
+        let profile = format!(
+            "(version 1)\n(allow default)\n(deny file-read* (subpath \"{}\"))\n(deny file-write* (subpath \"{}\"))\n",
+            holdouts, holdouts
+        );
+        let mut command = Command::new("sandbox-exec");
+        command.arg("-p").arg(&profile).arg("ao");
+        command
+    } else {
+        Command::new("ao")
+    };
+
+    // This is the complete AO v0.1.3 public spawn argv: no --prompt,
+    // --name, or --branch. The preload validates this shape independently.
+    cmd.arg("spawn")
+        .arg("--project")
+        .arg(&spec.ao_project)
+        .arg("--agent")
+        .arg(agent)
+        .arg(&spec.prompt)
+        .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+        .env("DARK_FACTORY_AO_SPAWN_BRANCH", &spec.branch);
+
+    let node_options = std::env::var("NODE_OPTIONS").unwrap_or_default();
+    let bridged_node_options = if node_options.trim().is_empty() {
+        bridge_arg
+    } else {
+        format!("{node_options} {bridge_arg}")
+    };
+    cmd.env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", &node_options)
+        .env("NODE_OPTIONS", bridged_node_options);
+
+    for (key, _) in std::env::vars() {
+        if key == "DARK_FACTORY_HOLDOUTS" || key.to_uppercase().contains("HOLDOUT") {
+            cmd.env_remove(key);
+        }
+    }
+
+    Ok(cmd)
+}
+
 pub struct CliSessions {
     pub project: String,
     pub agent: String,
@@ -1364,21 +1434,6 @@ impl CliSessions {
     }
 
     fn run_spawn_process(&self, agent: &str, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
-        let mut cmd = if std::env::consts::OS == "macos" {
-            let holdouts = resolve_holdouts_path_or_fail()?;
-            let profile = format!(
-                "(version 1)\n(allow default)\n(deny file-read* (subpath \"{}\"))\n(deny file-write* (subpath \"{}\"))\n",
-                holdouts, holdouts
-            );
-            let mut c = Command::new("sandbox-exec");
-            c.arg("-p").arg(&profile);
-            c.arg("ao");
-            c
-        } else {
-            Command::new("ao")
-        };
-        let display_name = worktree_display_name(&spec.branch);
-
         // jleechan-bqdv Stage C: spawn into `spec.ao_project` (resolved per
         // bead by `Config::resolve_repo`, Stage B), not `self.project` (the
         // daemon's single global project bound once at `CliSessions::new`
@@ -1390,25 +1445,8 @@ impl CliSessions {
         // `target_repo` names a DIFFERENT `[repos.*]` entry spawn into ITS
         // project instead of silently landing in the global one (the
         // jleechan-9sh5 root cause).
-        cmd.arg("spawn")
-            .arg("--prompt")
-            .arg(&spec.prompt)
-            .arg("--project")
-            .arg(&spec.ao_project)
-            .arg("--agent")
-            .arg(agent)
-            .arg("--name")
-            .arg(display_name)
-            .arg("--branch")
-            .arg(&spec.branch)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        for (k, _) in std::env::vars() {
-            if k == "DARK_FACTORY_HOLDOUTS" || k.to_uppercase().contains("HOLDOUT") {
-                cmd.env_remove(k);
-            }
-        }
+        let mut cmd = ao_spawn_command(agent, spec)?;
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = cmd.output().map_err(|e| DaemonError::Tool {
             tool: if std::env::consts::OS == "macos" { "sandbox-exec".to_string() } else { "ao".to_string() },
@@ -1767,6 +1805,169 @@ mod spawn_classification_tests {
     }
 }
 
+#[cfg(test)]
+mod ao_spawn_contract_tests {
+    use super::{gh_env_test_lock, CliSessions};
+    use crate::tools::{Sessions, SpawnSpec};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn spec(prompt: &str, branch: &str) -> SpawnSpec {
+        SpawnSpec {
+            bead_id: "jleechan-contract-test".to_string(),
+            branch: branch.to_string(),
+            prompt: prompt.to_string(),
+            repo: "jleechanorg/dark-factory".to_string(),
+            ao_project: "dark-factory".to_string(),
+            remote: "origin".to_string(),
+        }
+    }
+
+    fn fake_ao_dir(test_name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "afd_ao_spawn_contract_{test_name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("ao");
+        std::fs::write(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+assert len(args) == 6, args
+assert args[:5] == ["spawn", "--project", "dark-factory", "--agent", "minimax"], args
+assert not {"--prompt", "--name", "--branch"}.intersection(args), args
+prompt = args[5]
+bindings = json.loads(os.environ["AO_FAKE_EXPECTED_BINDINGS"])
+assert bindings[prompt] == os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"]
+assert os.environ["DARK_FACTORY_AO_V013_BRIDGE"] == "1"
+assert "ao-spawn-v013-bridge.mjs" in os.environ["NODE_OPTIONS"]
+with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"args": args, "branch": os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"]}) + "\n")
+print("SESSION=fake-" + str(abs(hash(prompt))))
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+        dir
+    }
+
+    fn with_fake_ao<T>(
+        test_name: &str,
+        bindings: serde_json::Value,
+        run: impl FnOnce(&std::path::Path) -> T,
+    ) -> T {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = fake_ao_dir(test_name);
+        let log = dir.join("calls.jsonl");
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_bindings = std::env::var("AO_FAKE_EXPECTED_BINDINGS").ok();
+        let old_log = std::env::var("AO_FAKE_LOG").ok();
+        std::env::set_var("PATH", format!("{}:{old_path}", dir.display()));
+        std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", bindings.to_string());
+        std::env::set_var("AO_FAKE_LOG", &log);
+
+        let result = run(&log);
+
+        std::env::set_var("PATH", old_path);
+        match old_bindings {
+            Some(value) => std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", value),
+            None => std::env::remove_var("AO_FAKE_EXPECTED_BINDINGS"),
+        }
+        match old_log {
+            Some(value) => std::env::set_var("AO_FAKE_LOG", value),
+            None => std::env::remove_var("AO_FAKE_LOG"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+        result
+    }
+
+    #[test]
+    fn single_spawn_uses_v013_positional_prompt_and_exact_branch_binding() {
+        let prompt = "single prompt with spaces\nand a second line";
+        let branch = "factory/jleechan-contract-single-r1";
+        let bindings = serde_json::json!({ prompt: branch });
+
+        let (spawn_result, calls) = with_fake_ao("single", bindings, |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.spawn(&spec(prompt, branch));
+            let calls = std::fs::read_to_string(log).unwrap_or_default();
+            (result, calls)
+        });
+
+        assert!(
+            spawn_result.is_ok(),
+            "single spawn failed: {spawn_result:?}"
+        );
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1, "expected exactly one AO invocation: {calls}");
+        assert_eq!(rows[0]["args"][5], prompt);
+        assert_eq!(rows[0]["branch"], branch);
+    }
+
+    #[test]
+    fn batch_spawn_uses_v013_contract_for_every_item() {
+        let first = spec(
+            "batch prompt alpha",
+            "factory/jleechan-contract-batch-alpha-r1",
+        );
+        let second = spec(
+            "batch prompt beta",
+            "factory/jleechan-contract-batch-beta-r1",
+        );
+        let bindings = serde_json::json!({
+            first.prompt.clone(): first.branch.clone(),
+            second.prompt.clone(): second.branch.clone(),
+        });
+
+        let (spawn_result, calls) = with_fake_ao("batch", bindings, |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.spawn_batch(&[first.clone(), second.clone()]);
+            let calls = std::fs::read_to_string(log).unwrap_or_default();
+            (result, calls)
+        });
+
+        assert!(spawn_result.is_ok(), "batch spawn failed: {spawn_result:?}");
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected one AO invocation per spec: {calls}"
+        );
+        let observed: std::collections::HashMap<&str, &str> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["args"][5].as_str().unwrap(),
+                    row["branch"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            observed.get(first.prompt.as_str()),
+            Some(&first.branch.as_str())
+        );
+        assert_eq!(
+            observed.get(second.prompt.as_str()),
+            Some(&second.branch.as_str())
+        );
+    }
+}
+
 impl Sessions for CliSessions {
     fn active_count(&self) -> Result<usize, DaemonError> {
         let out = run_tool("ao", &["status", "--json"], 30)?;
@@ -1814,19 +2015,6 @@ impl Sessions for CliSessions {
             }
         }
 
-        // Resolved once, outside the per-spec loop below: same env var, same
-        // filesystem state for every item in the batch, so there is no need
-        // (and no benefit) to re-resolve or re-validate it per iteration.
-        let sandbox_profile: Option<String> = if std::env::consts::OS == "macos" {
-            let holdouts = resolve_holdouts_path_or_fail()?;
-            Some(format!(
-                "(version 1)\n(allow default)\n(deny file-read* (subpath \"{}\"))\n(deny file-write* (subpath \"{}\"))\n",
-                holdouts, holdouts
-            ))
-        } else {
-            None
-        };
-
         let mut results = vec![None; specs.len()];
         let mut active_indices: Vec<usize> = (0..specs.len()).collect();
 
@@ -1838,40 +2026,8 @@ impl Sessions for CliSessions {
             let mut children = Vec::new();
             for &idx in &active_indices {
                 let spec = &specs[idx];
-                let mut cmd = if let Some(profile) = &sandbox_profile {
-                    let mut c = Command::new("sandbox-exec");
-                    c.arg("-p").arg(profile);
-                    c.arg("ao");
-                    c
-                } else {
-                    Command::new("ao")
-                };
-                // jleechan-pqip follow-up (PR#163 finding 3): mirror
-                // `run_spawn_process`'s argv exactly — omitting `--name`/
-                // `--branch` here previously meant every batch-spawned
-                // session landed on whatever branch `ao spawn` defaults to
-                // instead of `spec.branch`, and `spec.bead_id` was never
-                // read at all.
-                let display_name = spec.branch.strip_prefix("factory/").unwrap_or(&spec.branch);
-                cmd.arg("spawn")
-                    .arg("--prompt")
-                    .arg(&spec.prompt)
-                    .arg("--project")
-                    .arg(&self.project)
-                    .arg("--agent")
-                    .arg(agent)
-                    .arg("--name")
-                    .arg(display_name)
-                    .arg("--branch")
-                    .arg(&spec.branch)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-
-                for (k, _) in std::env::vars() {
-                    if k == "DARK_FACTORY_HOLDOUTS" || k.to_uppercase().contains("HOLDOUT") {
-                        cmd.env_remove(k);
-                    }
-                }
+                let mut cmd = ao_spawn_command(agent, spec)?;
+                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
                 if let Ok(child) = cmd.spawn() {
                     children.push((idx, child, agent.clone()));
