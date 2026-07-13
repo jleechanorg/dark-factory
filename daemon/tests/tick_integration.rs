@@ -7905,8 +7905,33 @@ fn populated_overlay_through_real_intake_only_target_repo_differs() {
         r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
     ));
     let store = FakeStateStore::new();
+
+    // Pre-save fake-bead-1 with distinct non-default values for every
+    // field that intake is NOT expected to change. target_repo is set
+    // to a repo different from the one explicit in the issue body so
+    // the assertion after the tick can prove it was overwritten.
+    store
+        .save(&BeadOverlay {
+            bead_id: "fake-bead-1".to_string(),
+            state: OverlayState::Queued,
+            attempt: 7,
+            reroll_count: 4,
+            autonomy_secs: 3600,
+            spend_usd: 12.75,
+            pr_number: Some(99),
+            branch: Some("non-default".to_string()),
+            session_id: Some("non-default-session".to_string()),
+            is_adopted: true,
+            spawn_failure_count: 3,
+            pre_session_head_sha: Some("abc123def".to_string()),
+            park_reason: Some("pre-existing-park".to_string()),
+            target_repo: Some("jleechanorg/dark-factory".to_string()),
+        })
+        .expect("pre-save should succeed");
+
     let mut cfg = test_cfg();
     cfg.target_repo = "jleechanorg/dark-factory".to_string();
+    cfg.max_workers = 0; // prevent dispatch from mutating overlay fields
     cfg.repos.insert(
         "jleechanorg/ez-gh-actions".to_string(),
         daemon::config::RepoConfig {
@@ -7942,7 +7967,9 @@ fn populated_overlay_through_real_intake_only_target_repo_differs() {
         "one bead should be created from the intake issue"
     );
 
-    let overlay = store.load("fake-bead-1").unwrap()
+    let overlay = store
+        .load("fake-bead-1")
+        .unwrap()
         .expect("overlay must exist after intake");
 
     assert_eq!(
@@ -7953,20 +7980,20 @@ fn populated_overlay_through_real_intake_only_target_repo_differs() {
         target_repo = cfg.target_repo,
     );
 
-    // Every other field must match the fresh-overlay default — only
-    // target_repo was set by intake resolution.
-    assert_eq!(overlay.state, OverlayState::Dispatched);
-    assert_eq!(overlay.attempt, 1);
-    assert_eq!(overlay.reroll_count, 0);
-    assert_eq!(overlay.autonomy_secs, 0);
-    assert!((overlay.spend_usd - 0.0).abs() < f64::EPSILON);
-    assert_eq!(overlay.pr_number, None);
-    assert!(overlay.branch.is_some(), "dispatch must set a branch");
-    assert!(overlay.session_id.is_some(), "dispatch must set session_id");
-    assert!(!overlay.is_adopted);
-    assert_eq!(overlay.spawn_failure_count, 0);
-    assert_eq!(overlay.pre_session_head_sha, None);
-    assert_eq!(overlay.park_reason, None);
+    // Every other field must match the pre-saved non-default value —
+    // only target_repo was set by intake resolution.
+    assert_eq!(overlay.state, OverlayState::Queued);
+    assert_eq!(overlay.attempt, 7);
+    assert_eq!(overlay.reroll_count, 4);
+    assert_eq!(overlay.autonomy_secs, 3600);
+    assert!((overlay.spend_usd - 12.75).abs() < f64::EPSILON);
+    assert_eq!(overlay.pr_number, Some(99));
+    assert_eq!(overlay.branch.as_deref(), Some("non-default"));
+    assert_eq!(overlay.session_id.as_deref(), Some("non-default-session"));
+    assert!(overlay.is_adopted);
+    assert_eq!(overlay.spawn_failure_count, 3);
+    assert_eq!(overlay.pre_session_head_sha.as_deref(), Some("abc123def"));
+    assert_eq!(overlay.park_reason.as_deref(), Some("pre-existing-park"));
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
