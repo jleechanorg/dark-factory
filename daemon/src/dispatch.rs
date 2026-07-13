@@ -16,7 +16,6 @@ fn record_spawn_cleanup_failure(
     store: &dyn StateStore,
     overlay: &mut BeadOverlay,
     session_id: &crate::tools::SessionId,
-    park_reason: &str,
     root_error: DaemonError,
     cleanup_error: DaemonError,
 ) -> DaemonError {
@@ -25,7 +24,7 @@ fn record_spawn_cleanup_failure(
     // startup reconciliation would blindly requeue.
     overlay.state = OverlayState::HumanHeld;
     overlay.session_id = Some(session_id.0.clone());
-    overlay.park_reason = Some(park_reason.to_string());
+    overlay.park_reason = Some(SPAWN_CLEANUP_FAILED_PARK_REASON.to_string());
     let cleanup_error = match store.save(overlay) {
         Ok(()) => cleanup_error,
         Err(state_error) => DaemonError::Config(format!(
@@ -430,14 +429,13 @@ pub fn dispatch_ready(
                         store,
                         &mut overlay,
                         &session_id,
-                        phase,
                         branch_error,
                         cleanup_error,
                     ));
                 }
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
-                overlay.park_reason = Some(phase.to_string());
+                overlay.park_reason = Some("spawn_branch_mismatch".to_string());
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
@@ -483,7 +481,6 @@ pub fn dispatch_ready(
                         store,
                         &mut overlay,
                         &session_id,
-                        SPAWN_CLEANUP_FAILED_PARK_REASON,
                         error,
                         cleanup_error,
                     ));
@@ -526,14 +523,13 @@ pub fn dispatch_ready(
                     store,
                     &mut overlay,
                     &session_id,
-                    phase,
                     remote_error,
                     cleanup_error,
                 ));
             }
             overlay.state = OverlayState::HumanHeld;
             overlay.session_id = None;
-            overlay.park_reason = Some(phase.to_string());
+            overlay.park_reason = Some("worktree_remote_mismatch".to_string());
             store.save(&overlay)?;
             report.failures.push(failure(
                 bead,
@@ -564,7 +560,6 @@ pub fn dispatch_ready(
                     store,
                     &mut overlay,
                     &session_id,
-                    SPAWN_CLEANUP_FAILED_PARK_REASON,
                     save_err,
                     cleanup_error,
                 ));
@@ -1606,7 +1601,10 @@ mod tests {
         assert_eq!(overlay.state, OverlayState::HumanHeld);
         assert_eq!(overlay.session_id.as_deref(), Some("fake-session-1"));
         assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
-        assert_eq!(overlay.park_reason.as_deref(), Some("spawn_branch_mismatch"));
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
+        );
         assert!(
             !sessions
                 .calls
@@ -2471,7 +2469,7 @@ mod tests {
         assert_eq!(overlay.session_id.as_deref(), Some("fake-session-1"));
         assert_eq!(
             overlay.park_reason.as_deref(),
-            Some("worktree_remote_mismatch")
+            Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
         );
     }
 

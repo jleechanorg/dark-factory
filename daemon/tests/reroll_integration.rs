@@ -31,6 +31,25 @@ fn test_cfg() -> Config {
     }
 }
 
+fn adopted_overlay(bead_id: &str) -> BeadOverlay {
+    BeadOverlay {
+        bead_id: bead_id.into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 5,
+        spend_usd: 0.0,
+        pr_number: Some(777),
+        branch: Some("alice/my-cool-feature".into()),
+        session_id: None,
+        is_adopted: true,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+    }
+}
+
 #[test]
 fn test_constraints_redact_and_extract() {
     let reply = r#"
@@ -631,6 +650,94 @@ fn test_reroll_adopted_spawn_failure_parks_human_held() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn adopted_spawn_failures_never_leave_an_untracked_or_recoverable_live_worker() {
+    for case in ["typed-cleanup", "save-stop-ok", "save-stop-fails"] {
+        let bead_id = format!("adopted-{case}");
+        let scm = FakeScm::new();
+        let sessions = FakeSessions::new();
+        if case == "typed-cleanup" {
+            sessions.fail_spawn_cleanup_for(&bead_id);
+        } else {
+            sessions.fail_stop_for("fake-session-1");
+            if case == "save-stop-ok" {
+                sessions.fail_stop_for.borrow_mut().clear();
+            }
+        }
+        let mut vcs = FakeVcs::new();
+        vcs.heads.insert(
+            "alice/my-cool-feature".into(),
+            "pre-session-sha-abc123".into(),
+        );
+        let store = FakeStateStore::new();
+        if case != "typed-cleanup" {
+            store.fail_save_for(&bead_id, OverlayState::Dispatched);
+        }
+        let llm = FakeLlm::new();
+        let cfg = test_cfg();
+        let telemetry_log =
+            std::env::temp_dir().join(format!("afd_reroll_{case}_{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&telemetry_log);
+        let mut bead = adopted_overlay(&bead_id);
+        store.save(&bead).unwrap();
+
+        let result = reroll::execute(
+            &RerollDeps {
+                scm: &scm,
+                sessions: &sessions,
+                vcs: &vcs,
+                store: &store,
+                llm: &llm,
+                cfg: &cfg,
+                telemetry_log: &telemetry_log,
+                reviewer: "verifier".into(),
+                review_text: "red gate".into(),
+            },
+            &mut bead,
+        );
+        assert!(result.is_err(), "{case} must surface a non-success result");
+
+        let held = store.load(&bead_id).unwrap().unwrap();
+        assert_eq!(held.state, OverlayState::HumanHeld, "case {case}");
+        match case {
+            "typed-cleanup" => {
+                assert_eq!(
+                    held.session_id.as_deref(),
+                    Some(format!("leaked-{bead_id}").as_str())
+                );
+                assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })));
+            }
+            "save-stop-ok" => {
+                assert_eq!(held.session_id, None);
+                assert!(sessions
+                    .calls
+                    .borrow()
+                    .iter()
+                    .any(|call| call == "stop(fake-session-1)"));
+            }
+            "save-stop-fails" => {
+                assert_eq!(held.session_id.as_deref(), Some("fake-session-1"));
+                assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })));
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            held.park_reason.as_deref(),
+            Some("spawn_cleanup_failed" | "adopted_spawn_failed")
+        ));
+
+        let calls_before_recovery = sessions.calls.borrow().len();
+        assert!(store.recover_human_held(10).unwrap().is_empty());
+        let after_recovery = store.load(&bead_id).unwrap().unwrap();
+        assert_eq!(after_recovery.state, held.state);
+        assert_eq!(after_recovery.attempt, held.attempt);
+        assert_eq!(after_recovery.session_id, held.session_id);
+        assert_eq!(after_recovery.park_reason, held.park_reason);
+        assert_eq!(calls_before_recovery, sessions.calls.borrow().len());
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
 }
 
 #[test]

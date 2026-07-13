@@ -3125,16 +3125,7 @@ impl Sessions for CliSessions {
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
         })?;
-        if let Some(arr) = data.as_array() {
-            for entry in arr {
-                if entry.get("name").and_then(|v| v.as_str()) == Some(&id.0) {
-                    if let Some(activity) = entry.get("activity").and_then(|v| v.as_str()) {
-                        return Ok(activity == "ready" || activity == "exited" || activity == "missing");
-                    }
-                }
-            }
-        }
-        Ok(true)
+        session_is_quiescent(&data, id)
     }
 
     /// jleechan-5ia2: `ao status --json` already reports each session's
@@ -3234,6 +3225,26 @@ impl Sessions for CliSessions {
 /// terminal `exited` activity. Explicit orchestrator rows do not consume the
 /// worker budget; missing/unknown role or state fails closed as an active
 /// worker.
+fn is_terminal_ao_session(entry: &serde_json::Value) -> bool {
+    matches!(
+        entry.get("status").and_then(|value| value.as_str()),
+        Some("killed" | "terminated" | "done" | "cleanup" | "errored" | "merged")
+    ) || entry.get("activity").and_then(|value| value.as_str()) == Some("exited")
+}
+
+fn session_is_quiescent(
+    data: &serde_json::Value,
+    id: &SessionId,
+) -> Result<bool, DaemonError> {
+    let sessions = data
+        .as_array()
+        .ok_or_else(|| DaemonError::Parse("ao status JSON must be an array".to_string()))?;
+    Ok(sessions
+        .iter()
+        .find(|entry| entry.get("name").and_then(|value| value.as_str()) == Some(&id.0))
+        .is_some_and(is_terminal_ao_session))
+}
+
 fn active_session_count(data: &serde_json::Value) -> Result<usize, DaemonError> {
     let sessions = data
         .as_array()
@@ -3243,20 +3254,15 @@ fn active_session_count(data: &serde_json::Value) -> Result<usize, DaemonError> 
         .filter(|entry| {
             let is_orchestrator = entry.get("role").and_then(|value| value.as_str())
                 == Some("orchestrator");
-            let terminal_status = matches!(
-                entry.get("status").and_then(|value| value.as_str()),
-                Some("killed" | "terminated" | "done" | "cleanup" | "errored" | "merged")
-            );
-            let terminal_activity =
-                entry.get("activity").and_then(|value| value.as_str()) == Some("exited");
-            !is_orchestrator && !terminal_status && !terminal_activity
+            !is_orchestrator && !is_terminal_ao_session(entry)
         })
         .count())
 }
 
 #[cfg(test)]
 mod active_session_count_tests {
-    use super::active_session_count;
+    use super::{active_session_count, session_is_quiescent};
+    use crate::tools::SessionId;
 
     #[test]
     fn global_cap_counts_active_sessions_across_projects_and_unknown_activity() {
@@ -3275,6 +3281,23 @@ mod active_session_count_tests {
     #[test]
     fn malformed_non_array_status_fails_closed() {
         assert!(active_session_count(&serde_json::json!({"sessions": []})).is_err());
+    }
+
+    #[test]
+    fn quiescence_uses_the_same_positive_terminal_contract_as_worker_accounting() {
+        let status = serde_json::json!([
+            {"name": "ready", "status": "working", "activity": "ready"},
+            {"name": "unknown", "status": "mystery", "activity": "missing"},
+            {"name": "exited", "status": "working", "activity": "exited"},
+            {"name": "done", "status": "done", "activity": "ready"}
+        ]);
+
+        assert!(!session_is_quiescent(&status, &SessionId("ready".into())).unwrap());
+        assert!(!session_is_quiescent(&status, &SessionId("unknown".into())).unwrap());
+        assert!(!session_is_quiescent(&status, &SessionId("not-found".into())).unwrap());
+        assert!(session_is_quiescent(&status, &SessionId("exited".into())).unwrap());
+        assert!(session_is_quiescent(&status, &SessionId("done".into())).unwrap());
+        assert!(session_is_quiescent(&serde_json::json!({}), &SessionId("x".into())).is_err());
     }
 }
 

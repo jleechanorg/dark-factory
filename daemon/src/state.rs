@@ -116,14 +116,10 @@ pub struct BeadOverlay {
     /// rejected fix in 30 minutes). Set alongside every `state =
     /// HumanHeld` write (`reroll::execute`/`execute_adopted`,
     /// `dispatch::dispatch_ready`, `tick::run_tick`/`run_recovery_step`).
-    /// `recover_human_held` filters on this column to exclude
-    /// circuit-breaker parks (`"circuit-breaker..."` prefix) from
-    /// automatic requeue — those exist specifically to STOP retrying, and
-    /// requeuing them defeats their purpose. Other park reasons
-    /// (`session_stalled`, `autonomy_timebox_exceeded`, etc.) are
-    /// unaffected and keep their existing auto-recovery behavior. `None`
-    /// for beads that have never been parked, and cleared back to `None`
-    /// by `recover_human_held` on successful requeue.
+    /// `recover_human_held` uses a canonical allow-list: only explicitly
+    /// retry-safe reasons with `session_id = NULL` requeue. Unknown, legacy
+    /// NULL, configuration, circuit-breaker, and possibly-live-session
+    /// reasons remain held. Cleared back to `None` after a safe requeue.
     pub park_reason: Option<String>,
     /// Per-bead repo identity (bead jleechan-35y4 / Stage A of the
     /// multi-repo dispatch fix, see
@@ -274,19 +270,67 @@ fn now_iso8601() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-fn is_permanent_human_hold_reason(reason: Option<&str>) -> bool {
-    reason.is_some_and(|reason| {
-        reason.starts_with("circuit-breaker")
-            || matches!(
-                reason,
-                "unmapped_target_repo"
-                    | "worktree_remote_mismatch"
-                    | "worktree_remote_unverifiable"
-                    | "spawn_cleanup_failed"
-                    | "spawn_branch_mismatch"
-                    | "ambiguous_dispatching_recovery"
-            )
-    })
+const RECOVERABLE_HUMAN_HOLD_REASONS: &[&str] = &[
+    "transient_spawn_retry_cap_exceeded",
+    "adopted_pre_session_sha_capture_failed",
+    "session_stalled",
+    "gate assessment not all-green (stage 1: recorded, not executed)",
+    "spec file validation failed in recovery",
+];
+
+const PERMANENT_HUMAN_HOLD_REASONS: &[&str] = &[
+    "unmapped_target_repo",
+    "worktree_remote_mismatch",
+    "worktree_remote_unverifiable",
+    "spawn_cleanup_failed",
+    "spawn_branch_mismatch",
+    "ambiguous_dispatching_recovery",
+    "autonomy_timebox_exceeded",
+    "adopted_branch_history_rewrite_detected",
+    "adopted_branch_append_only_check_failed",
+    "session_branch_mismatch",
+    "coder_silent",
+    "reroll_session_attach_failed",
+    "reroll_session_stop_failed",
+    "reroll_quiescence_check_failed",
+    "reroll_quiescence_timeout",
+    "adopted_missing_branch",
+    "adopted_quiescence_check_failed",
+    "adopted_spawn_failed",
+    "unknown_only_gate_report_with_er_runner_capped",
+];
+
+/// Human-held recovery is an allow-list, not a best-effort retry policy.
+/// Unknown and legacy NULL reasons fail closed. Even a declared recoverable
+/// reason is requeued only when its durable overlay carries no session handle;
+/// the park transition must clear that handle in the same save after positive
+/// no-spawn/terminal evidence.
+pub fn is_permanent_human_hold_reason(reason: Option<&str>) -> bool {
+    match reason {
+        Some(reason)
+            if RECOVERABLE_HUMAN_HOLD_REASONS.contains(&reason)
+                || reason.starts_with("router_parse_error:") =>
+        {
+            false
+        }
+        Some(reason)
+            if PERMANENT_HUMAN_HOLD_REASONS.contains(&reason)
+                || reason.starts_with("circuit-breaker")
+                || reason.starts_with("escalation_local_fallback:") =>
+        {
+            true
+        }
+        Some(_) | None => true,
+    }
+}
+
+#[cfg(test)]
+fn is_known_human_hold_reason(reason: &str) -> bool {
+    RECOVERABLE_HUMAN_HOLD_REASONS.contains(&reason)
+        || PERMANENT_HUMAN_HOLD_REASONS.contains(&reason)
+        || reason.starts_with("router_parse_error:")
+        || reason.starts_with("circuit-breaker")
+        || reason.starts_with("escalation_local_fallback:")
 }
 
 /// Howard Hinnant's civil_from_days algorithm (public domain), days since epoch -> (y, m, d).
@@ -766,13 +810,12 @@ impl StateStore for SqliteStateStore {
         // rows are EXCLUDED from automatic requeue. The circuit breaker
         // (reroll.rs) parks a bead HUMAN_HELD specifically to STOP retrying
         // after the same reviewer rejects the same underlying issue twice
-        // in a row — treating that park identically to a transient one
-        // (`session_stalled`, `autonomy_timebox_exceeded`) caused a 769x
+        // in a row — treating that park identically to a retry-safe one
+        // caused a 769x
         // re-trigger loop of the same rejected fix in 30 minutes in
-        // production. `park_reason IS NULL` rows (pre-migration data, or
-        // any park site that hasn't been updated to set a reason) keep the
-        // pre-existing auto-recovery behavior — the exclusion is opt-in via
-        // the `circuit-breaker` prefix, not opt-out via NULL.
+        // production. Recovery is now fail closed: only declared retry-safe
+        // reasons with a durably cleared session handle may requeue. NULL,
+        // unknown, and possibly-live-session rows remain HUMAN_HELD.
         //
         // bead jleechan-35y4 (adversarial review of PR #245): `park_reason =
         // 'unmapped_target_repo'` rows are EXCLUDED for the same reason —
@@ -808,7 +851,7 @@ impl StateStore for SqliteStateStore {
         let mut id_stmt = self
             .conn
             .prepare(
-                "SELECT bead_id, park_reason FROM bead_overlay \
+                "SELECT bead_id, park_reason, session_id FROM bead_overlay \
                  WHERE state = 'HUMAN_HELD' AND attempt < ?1",
             )
             .map_err(|e| tool_err("recover_human_held id select prepare", e))?;
@@ -817,12 +860,15 @@ impl StateStore for SqliteStateStore {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
                 ))
             })
             .map_err(|e| tool_err("recover_human_held id select query", e))?
             .filter_map(|row| row.ok())
-            .filter_map(|(bead_id, park_reason)| {
-                (!is_permanent_human_hold_reason(park_reason.as_deref())).then_some(bead_id)
+            .filter_map(|(bead_id, park_reason, session_id)| {
+                (!is_permanent_human_hold_reason(park_reason.as_deref())
+                    && session_id.is_none())
+                .then_some(bead_id)
             })
             .collect();
         if recovered_ids.is_empty() {
@@ -1076,6 +1122,51 @@ mod tests {
     fn store() -> SqliteStateStore {
         SqliteStateStore::open_in_memory_with_schema(include_str!("../contracts/schema.sql"))
             .unwrap()
+    }
+
+    #[test]
+    fn every_production_park_reason_is_declared_in_the_recovery_policy() {
+        for (file, source) in [
+            ("dispatch.rs", include_str!("dispatch.rs")),
+            ("reroll.rs", include_str!("reroll.rs")),
+            ("tick.rs", include_str!("tick.rs")),
+            ("state.rs", include_str!("state.rs")),
+        ] {
+            let mut remainder = source
+                .split("\n#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or(source);
+            while let Some(index) = remainder.find(".park_reason =") {
+                remainder = &remainder[index + ".park_reason =".len()..];
+                let assignment = remainder.split(';').next().unwrap_or(remainder).trim();
+                if assignment.starts_with("None") {
+                    continue;
+                }
+                let reason = if assignment.contains("CIRCUIT_BREAKER_PARK_REASON") {
+                    crate::reroll::CIRCUIT_BREAKER_PARK_REASON
+                } else if assignment.contains("SPAWN_CLEANUP_FAILED_PARK_REASON") {
+                    "spawn_cleanup_failed"
+                } else if assignment.contains("ESCALATION_LOCAL_FALLBACK_PARK_REASON_PREFIX") {
+                    "escalation_local_fallback:"
+                } else {
+                    let start = assignment.find('"').unwrap_or_else(|| {
+                        panic!("{file}: unaudited dynamic park_reason assignment: {assignment}")
+                    }) + 1;
+                    let tail = &assignment[start..];
+                    let end = tail.find('"').unwrap_or_else(|| {
+                        panic!("{file}: unterminated park_reason assignment: {assignment}")
+                    });
+                    &tail[..end]
+                };
+                assert!(
+                    is_known_human_hold_reason(reason),
+                    "{file}: park_reason {reason:?} is missing from the canonical recovery policy"
+                );
+            }
+        }
+
+        assert!(is_permanent_human_hold_reason(None));
+        assert!(is_permanent_human_hold_reason(Some("future_unknown_reason")));
     }
 
     #[test]
@@ -1470,7 +1561,7 @@ mod tests {
                 is_adopted: false,
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
-            park_reason: None,
+            park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
             target_repo: None,
             },
         );
@@ -1512,6 +1603,39 @@ mod tests {
             target_repo: None,
             },
         );
+        for (bead_id, session_id, park_reason) in [
+            ("legacy-null", None, None),
+            (
+                "recoverable-reason-live-session",
+                Some("possibly-live".to_string()),
+                Some("session_stalled".to_string()),
+            ),
+            (
+                "unknown-reason",
+                None,
+                Some("future_unknown_reason".to_string()),
+            ),
+        ] {
+            overlays.insert(
+                bead_id.to_string(),
+                BeadOverlay {
+                    bead_id: bead_id.to_string(),
+                    state: OverlayState::HumanHeld,
+                    attempt: 2,
+                    reroll_count: 0,
+                    autonomy_secs: 100,
+                    spend_usd: 0.0,
+                    pr_number: None,
+                    branch: Some(format!("factory/{bead_id}-r2")),
+                    session_id,
+                    is_adopted: false,
+                    spawn_failure_count: 0,
+                    pre_session_head_sha: None,
+                    park_reason,
+                    target_repo: None,
+                },
+            );
+        }
         // Non-HUMAN_HELD rows must never be touched.
         overlays.insert(
             "dispatched".to_string(),
@@ -1597,6 +1721,16 @@ mod tests {
         assert!(capped_ids.contains("at-cap"));
         assert!(capped_ids.contains("over-cap"));
 
+        for bead_id in [
+            "legacy-null",
+            "recoverable-reason-live-session",
+            "unknown-reason",
+        ] {
+            let held = store.load(bead_id).unwrap().unwrap();
+            assert_eq!(held.state, OverlayState::HumanHeld, "{bead_id}");
+            assert_eq!(held.attempt, 2, "{bead_id}");
+        }
+
         // Non-HUMAN_HELD rows are untouched
         let dispatched = store.load("dispatched").unwrap().unwrap();
         assert_eq!(dispatched.state, OverlayState::Dispatched);
@@ -1653,7 +1787,7 @@ mod tests {
                 spend_usd: 0.0,
                 pr_number: Some(99),
                 branch: Some("factory/transient-stalled-r2".into()),
-                session_id: Some("session-abc".into()),
+                session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -1750,7 +1884,7 @@ mod tests {
                 spend_usd: 0.0,
                 pr_number: Some(99),
                 branch: Some("factory/transient-stalled-r2".into()),
-                session_id: Some("session-abc".into()),
+                session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -1831,7 +1965,7 @@ mod tests {
                 spend_usd: 0.0,
                 pr_number: Some(99),
                 branch: Some("factory/transient-stalled-2-r2".into()),
-                session_id: Some("session-abc".into()),
+                session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2007,11 +2141,11 @@ mod tests {
                 spend_usd: 0.0,
                 pr_number: Some(7777),
                 branch: Some("factory/held-only-r1".into()),
-                session_id: Some("session-xyz".into()),
+                session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
-            park_reason: None,
+            park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
             target_repo: None,
             })
             .unwrap();

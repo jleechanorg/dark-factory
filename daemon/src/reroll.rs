@@ -7,6 +7,8 @@ use crate::constraints;
 use std::path::Path;
 use std::hash::{Hash, Hasher};
 
+const SPAWN_CLEANUP_FAILED_PARK_REASON: &str = "spawn_cleanup_failed";
+
 pub struct RerollDeps<'a> {
     pub scm: &'a dyn Scm,
     pub sessions: &'a dyn Sessions,
@@ -340,6 +342,12 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
             return Ok(RerollOutcome::Held("quiescence timeout exceeded (60s)".into()));
         }
 
+        // The old worker is positively terminal and its branch HEAD was
+        // stable across two observations. Clear the durable handle in the
+        // same save before any later step can create a recoverable hold.
+        bead.session_id = None;
+        deps.store.save(bead)?;
+
         emit_telemetry(
             deps.telemetry_log,
             &bead.bead_id,
@@ -590,6 +598,10 @@ fn execute_adopted(
         Ok(sha) => sha,
         Err(e) => {
             bead.state = OverlayState::HumanHeld;
+            // Any existing attached remediation session was positively
+            // quiescent above; persist that no-live-session proof with the
+            // recoverable pre-spawn hold.
+            bead.session_id = None;
             bead.park_reason = Some("adopted_pre_session_sha_capture_failed".to_string());
             deps.store.save(bead)?;
             emit_telemetry(
@@ -648,7 +660,30 @@ fn execute_adopted(
             // back to verification after the coder session finishes.
             bead.state = OverlayState::Dispatched;
             bead.pre_session_head_sha = Some(pre_session_sha);
-            deps.store.save(bead)?;
+            if let Err(save_error) = deps.store.save(bead) {
+                if let Err(cleanup_error) = deps.sessions.stop(&session_id) {
+                    bead.state = OverlayState::HumanHeld;
+                    bead.session_id = Some(session_id.0.clone());
+                    bead.park_reason = Some(SPAWN_CLEANUP_FAILED_PARK_REASON.to_string());
+                    let cleanup_error = match deps.store.save(bead) {
+                        Ok(()) => cleanup_error,
+                        Err(state_error) => DaemonError::Config(format!(
+                            "session cleanup failed: {cleanup_error}; additionally failed to persist the HUMAN_HELD cleanup record: {state_error}"
+                        )),
+                    };
+                    return Err(DaemonError::SpawnCleanupFailed {
+                        session: session_id.0,
+                        spawn_error: Box::new(save_error),
+                        cleanup_error: Box::new(cleanup_error),
+                    });
+                }
+
+                bead.state = OverlayState::HumanHeld;
+                bead.session_id = None;
+                bead.park_reason = Some("adopted_spawn_failed".to_string());
+                deps.store.save(bead)?;
+                return Err(save_error);
+            }
             emit_telemetry(
                 deps.telemetry_log,
                 &bead.bead_id,
@@ -662,8 +697,28 @@ fn execute_adopted(
             )?;
             Ok(RerollOutcome::Rerolled { new_branch: branch })
         }
+        Err(error @ DaemonError::SpawnCleanupFailed { .. }) => {
+            let session = match &error {
+                DaemonError::SpawnCleanupFailed { session, .. } => session.clone(),
+                _ => unreachable!(),
+            };
+            bead.state = OverlayState::HumanHeld;
+            bead.session_id = Some(session.clone());
+            bead.park_reason = Some(SPAWN_CLEANUP_FAILED_PARK_REASON.to_string());
+            if let Err(state_error) = deps.store.save(bead) {
+                return Err(DaemonError::SpawnCleanupFailed {
+                    session,
+                    spawn_error: Box::new(error),
+                    cleanup_error: Box::new(DaemonError::Config(format!(
+                        "failed to persist HUMAN_HELD cleanup record: {state_error}"
+                    ))),
+                });
+            }
+            Err(error)
+        }
         Err(e) => {
             bead.state = OverlayState::HumanHeld;
+            bead.session_id = None;
             bead.park_reason = Some("adopted_spawn_failed".to_string());
             deps.store.save(bead)?;
             emit_telemetry(

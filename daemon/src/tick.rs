@@ -679,6 +679,11 @@ pub fn run_tick(
                             }
 
                             overlay.state = OverlayState::HumanHeld;
+                            // `is_quiescent` positively reported a canonical
+                            // AO terminal state above. Persist the cleared
+                            // handle with the recoverable hold so recovery
+                            // cannot overlap a live worker.
+                            overlay.session_id = None;
                             overlay.park_reason = Some("session_stalled".to_string());
                             deps.store.save(&overlay)?;
                             emit(
@@ -732,9 +737,10 @@ pub fn run_tick(
 }
 
 /// jleechan-gib: automated HUMAN_HELD exit (Rust port of shell
-/// `recover-held`). Requeues every `HUMAN_HELD` bead whose `attempt` is
-/// below `MAX_HUMAN_HELD_RECOVERY_ATTEMPT` back to `QUEUED`, increments
-/// `attempt`, and zeros `autonomy_secs`. Must run BEFORE the
+/// `recover-held`). Requeues only allow-listed retry-safe `HUMAN_HELD`
+/// beads below `MAX_HUMAN_HELD_RECOVERY_ATTEMPT` whose durable overlay has
+/// no session handle, increments `attempt`, and zeros `autonomy_secs`.
+/// Unknown/possibly-live holds fail closed. Must run BEFORE the
 /// active-overlay wedge-detection loop in `run_tick` so a freshly-QUEUED
 /// bead is not immediately re-parked by the timebox/wedge checks in the
 /// same tick.
@@ -2444,6 +2450,9 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({"stage": deps.cfg.stage}),
                 )?;
                 overlay.state = OverlayState::HumanHeld;
+                // ATTESTED is reached only after positive worker quiescence;
+                // make that no-live-session proof durable in this same save.
+                overlay.session_id = None;
                 overlay.park_reason =
                     Some("gate assessment not all-green (stage 1: recorded, not executed)".to_string());
                 deps.store.save(&overlay)?;

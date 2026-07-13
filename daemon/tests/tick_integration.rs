@@ -779,6 +779,28 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
         logs
     );
 
+    let recovery = run_tick(&deps, 2, 0).unwrap();
+    assert_eq!(
+        recovery.beads_recovered_from_held, 0,
+        "a branch-mismatch hold retaining a live session must never auto-requeue"
+    );
+    let held = store.load("jleechan-vj89").unwrap().unwrap();
+    assert_eq!(held.state, OverlayState::HumanHeld);
+    assert_eq!(held.session_id.as_deref(), Some("wa-3004"));
+    assert_eq!(
+        held.park_reason.as_deref(),
+        Some("session_branch_mismatch")
+    );
+    assert!(
+        !sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.starts_with("spawn(")),
+        "recovery must not create an overlapping worker: {:?}",
+        sessions.calls.borrow()
+    );
+
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -1083,6 +1105,10 @@ fn test_wedge_detection_attested_session_stalled() {
 
     let o = store.load("bead-stalled").unwrap().unwrap();
     assert_eq!(o.state, OverlayState::HumanHeld);
+    assert_eq!(
+        o.session_id, None,
+        "positive terminal proof must be persisted with the recoverable hold"
+    );
 
     let logs = std::fs::read_to_string(&telemetry_log).unwrap();
     assert!(logs.contains("session_stalled"), "logs: {}", logs);
@@ -2794,7 +2820,7 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
-            park_reason: None,
+            park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
             target_repo: None,
         },
     );
@@ -3980,7 +4006,9 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
-            park_reason: None,
+            park_reason: Some(
+                "gate assessment not all-green (stage 1: recorded, not executed)".into(),
+            ),
             target_repo: None,
         },
     );

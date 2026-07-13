@@ -97,6 +97,8 @@ fn fake_sessions_spawn_attach_stop_quiescent_roundtrip() {
         next_session_id: "sess-9".into(),
         quiescent: true,
         fail_spawn_for: Default::default(),
+        fail_spawn_cleanup_for: Default::default(),
+        fail_stop_for: Default::default(),
         fail_spawn_deferred_for: Default::default(),
         spawn_prompts: Default::default(),
         calls: Default::default(),
