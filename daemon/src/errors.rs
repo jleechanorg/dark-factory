@@ -59,6 +59,28 @@ pub enum DaemonError {
     /// `PARKED_HUMAN_HELD` telemetry) always shows the whole chain.
     #[error("all {} fallback vendor(s) failed: {}", .0.len(), format_spawn_attempts(.0))]
     SpawnFallbackExhausted(Vec<(String, DaemonError)>),
+    /// AO reported a live session but returned unusable spawn metadata, and
+    /// the compensating session kill also failed. This is deliberately
+    /// fatal and must never advance to another fallback vendor.
+    #[error(
+        "spawn returned invalid output for session {session}: {spawn_error}; cleanup also failed: {cleanup_error}"
+    )]
+    SpawnCleanupFailed {
+        session: String,
+        spawn_error: Box<DaemonError>,
+        cleanup_error: Box<DaemonError>,
+    },
+    /// A later item in a serialized batch failed after earlier items had
+    /// spawned, and at least one compensating session kill failed.
+    #[error(
+        "batch spawn failed: {spawn_error}; cleanup also failed for {} session(s): {}",
+        .cleanup_errors.len(),
+        format_cleanup_errors(.cleanup_errors)
+    )]
+    SpawnBatchCleanupFailed {
+        spawn_error: Box<DaemonError>,
+        cleanup_errors: Vec<(String, DaemonError)>,
+    },
 }
 
 /// Renders every `(vendor, error)` pair collected by
@@ -73,6 +95,14 @@ fn format_spawn_attempts(attempts: &[(String, DaemonError)]) -> String {
     attempts
         .iter()
         .map(|(vendor, err)| format!("{vendor}: {err}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn format_cleanup_errors(errors: &[(String, DaemonError)]) -> String {
+    errors
+        .iter()
+        .map(|(session, err)| format!("{session}: {err}"))
         .collect::<Vec<_>>()
         .join("; ")
 }

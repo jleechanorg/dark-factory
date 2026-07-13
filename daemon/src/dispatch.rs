@@ -398,16 +398,10 @@ pub fn dispatch_ready(
         // almost pushed wa-3086 to jleechanclaw instead of dark-factory.
         // A missing/unreadable workspace is fail-closed: this session was
         // just created, so accepting it without checking the actual AO path
-        // would bypass the wrong-repository gate. `remote_url_matches_repo`
-        // still returns `None` for a URL form it can't parse (a different
-        // host, GitHub Enterprise, or an unusual scheme); that remains
-        // distinct from failing to inspect the workspace at all.
-        //
-        // Only `Some(false)` from URL comparison — a recognized github.com
-        // URL naming a different repo — is a confirmed mismatch. `None`
-        // from URL comparison trusts the inspected remote's unrecognized
-        // format; unlike a missing workspace/remote result, it does not mean
-        // the inspection itself was skipped.
+        // would bypass the wrong-repository gate. A URL comparison must be
+        // positively `Some(true)`: local paths, different hosts, and unusual
+        // schemes are not evidence that this canonical github.com target
+        // matches.
         let verified_remote = sessions
             .worktree_remote_url(&routing.ao_project, &branch, &routing.push_remote)
             .and_then(|url| {
@@ -436,20 +430,32 @@ pub fn dispatch_ready(
                 continue;
             }
         };
-        if remote_url_matches_repo(&remote_url, &repo) == Some(false) {
+        let remote_match = remote_url_matches_repo(&remote_url, &repo);
+        if remote_match != Some(true) {
             sessions.stop(&session_id)?;
             overlay.state = OverlayState::HumanHeld;
             overlay.session_id = None;
-            overlay.park_reason = Some("worktree_remote_mismatch".to_string());
+            let (phase, detail) = if remote_match == Some(false) {
+                (
+                    "worktree_remote_mismatch",
+                    format!("does not match the bead's resolved repo {repo:?}"),
+                )
+            } else {
+                (
+                    "worktree_remote_unverifiable",
+                    format!("is not a recognized canonical github.com URL for the bead's resolved repo {repo:?}"),
+                )
+            };
+            overlay.park_reason = Some(phase.to_string());
             store.save(&overlay)?;
             report.failures.push(failure(
                 bead,
                 overlay.attempt,
                 Some(branch.clone()),
-                "worktree_remote_mismatch",
+                phase,
                 DaemonError::Config(format!(
                     "spawned worktree for bead {} (branch {branch:?}) has remote {:?} pointing at \
-                     {remote_url:?}, which does not match the bead's resolved repo {repo:?}. \
+                     {remote_url:?}, which {detail}. \
                      Killed the session and parked HUMAN_HELD rather than risk the coder pushing to \
                      the wrong repo (jleechan-9sh5 discipline).",
                     bead.id, routing.push_remote
@@ -2271,43 +2277,35 @@ mod tests {
         );
     }
 
-    /// Adversarial review finding (independent Claude review of this PR):
-    /// a remote URL in a form `remote_url_matches_repo` cannot recognize
-    /// (e.g. a different git host, GitHub Enterprise) returns `None`
-    /// ("cannot determine") — the dispatch-time check must not treat an
-    /// unrecognized format as a confirmed mismatch. Before this fix,
-    /// `remote_url_matches_repo` returned a bare `false` for both "confirmed
-    /// wrong repo" AND "couldn't parse this URL", which would have killed a
-    /// perfectly correct session merely for using an unrecognized URL
-    /// flavor.
+    /// A remote URL that cannot be positively tied to the canonical
+    /// github.com target is not verification. Fail closed so local paths,
+    /// alternate hosts, and unusual schemes cannot bypass the wrong-repo
+    /// gate.
     #[test]
-    fn worktree_remote_unrecognized_url_format_does_not_block_dispatch() {
-        let sessions = FakeSessions::new(0);
-        // A real, live github.com URL, but for a GitHub Enterprise-style
-        // host `remote_url_matches_repo` doesn't parse — NOT a recognized
-        // mismatch, just unparseable.
-        sessions.set_worktree_remote(
-            "repo",
+    fn worktree_remote_unrecognized_url_kills_session_and_parks() {
+        for remote_url in [
             "https://github.enterprise.example.com/owner/repo.git",
-        );
-        let store = FakeStateStore::new();
-        let cfg = cfg();
-        let ready = beads(1);
+            "https://gitlab.example.com/owner/repo.git",
+            "/tmp/local-clone-of-owner-repo",
+        ] {
+            let sessions = FakeSessions::new(0);
+            sessions.set_worktree_remote("repo", remote_url);
+            let store = FakeStateStore::new();
+            let cfg = cfg();
+            let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+            let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
-        assert_eq!(
-            report.success_count(),
-            1,
-            "an unrecognized (unparseable) URL format must never be treated as a confirmed mismatch"
-        );
-        assert!(report.failures.is_empty());
-        let calls = sessions.calls.borrow();
-        assert!(
-            !calls.iter().any(|c| c.starts_with("stop(")),
-            "an indeterminate remote-url comparison must never kill the session: {calls:?}"
-        );
-        let overlay = store.load("bead-0").unwrap().unwrap();
-        assert_eq!(overlay.state, OverlayState::Dispatched);
+            assert_eq!(report.success_count(), 0, "remote={remote_url}");
+            assert_eq!(report.failures[0].phase, "worktree_remote_unverifiable", "remote={remote_url}");
+            let calls = sessions.calls.borrow();
+            assert!(
+                calls.iter().any(|c| c == "stop(fake-session-1)"),
+                "an indeterminate remote-url comparison must kill the new session: remote={remote_url}; calls={calls:?}"
+            );
+            let overlay = store.load("bead-0").unwrap().unwrap();
+            assert_eq!(overlay.state, OverlayState::HumanHeld);
+            assert_eq!(overlay.park_reason.as_deref(), Some("worktree_remote_unverifiable"));
+        }
     }
 }

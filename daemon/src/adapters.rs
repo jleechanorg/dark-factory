@@ -1436,13 +1436,18 @@ impl CliSessions {
             &err_msg,
         )?;
         let Some(workspace) = Self::spawn_workspace_path(&out) else {
-            let cleanup = run_tool("ao", &["session", "kill", &session.0], 30)
-                .map(|_| "session stopped".to_string())
-                .unwrap_or_else(|error| format!("WARNING: failed to stop session: {error}"));
-            return Err(DaemonError::Parse(format!(
-                "ao spawn --agent {agent} returned session {} without an absolute Worktree path; refusing to dispatch without remote verification ({cleanup}): {out}",
+            let spawn_error = DaemonError::Parse(format!(
+                "ao spawn --agent {agent} returned session {} without an absolute Worktree path; refusing to dispatch without remote verification: {out}",
                 session.0
-            )));
+            ));
+            return match run_tool("ao", &["session", "kill", &session.0], 30) {
+                Ok(_) => Err(spawn_error),
+                Err(cleanup_error) => Err(DaemonError::SpawnCleanupFailed {
+                    session: session.0,
+                    spawn_error: Box::new(spawn_error),
+                    cleanup_error: Box::new(cleanup_error),
+                }),
+            };
         };
         self.spawned_worktrees
             .lock()
@@ -1602,6 +1607,7 @@ where
     for agent in agents {
         match attempt_spawn(agent) {
             Ok(sess) => return Ok(sess),
+            Err(error @ DaemonError::SpawnCleanupFailed { .. }) => return Err(error),
             Err(e) => {
                 attempts.push((agent.clone(), e));
             }
@@ -1811,6 +1817,7 @@ mod spawn_classification_tests {
 #[cfg(test)]
 mod ao_spawn_contract_tests {
     use super::{ao_spawn_bridge_path, gh_env_test_lock, CliSessions};
+    use crate::errors::DaemonError;
     use crate::tools::{Sessions, SpawnSpec};
     use std::os::unix::fs::PermissionsExt;
 
@@ -1854,6 +1861,13 @@ import os
 import sys
 
 args = sys.argv[1:]
+if args[:2] == ["session", "kill"] and len(args) == 3:
+    with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"kind": "kill", "args": args, "session": args[2]}) + "\n")
+    if os.environ.get("AO_FAKE_KILL_FAIL") == "1":
+        print("scripted batch cleanup failure", file=sys.stderr)
+        raise SystemExit(8)
+    raise SystemExit(0)
 assert len(args) == 7, args
 assert args[:5] == ["spawn", "--project", "dark-factory", "--agent", "minimax"], args
 assert not {"--prompt", "--name", "--branch"}.intersection(args), args
@@ -1864,7 +1878,10 @@ assert bindings[prompt] == os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"]
 assert os.environ["DARK_FACTORY_AO_V013_BRIDGE"] == "1"
 assert "ao-spawn-v013-bridge.mjs" in os.environ["NODE_OPTIONS"]
 with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
-    handle.write(json.dumps({"args": args, "branch": os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"]}) + "\n")
+    handle.write(json.dumps({"kind": "spawn", "args": args, "branch": os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"]}) + "\n")
+if prompt == os.environ.get("AO_FAKE_FAIL_PROMPT"):
+    print("scripted second spawn failure", file=sys.stderr)
+    raise SystemExit(7)
 print("SESSION=fake-" + str(abs(hash(prompt))))
 print("  Worktree: " + os.environ.get("AO_FAKE_WORKTREE", "/tmp/fake-ao-worktree"))
 "#,
@@ -1987,6 +2004,111 @@ print("  Worktree: " + os.environ.get("AO_FAKE_WORKTREE", "/tmp/fake-ao-worktree
     }
 
     #[test]
+    fn batch_spawn_failure_kills_every_prior_session() {
+        let first = spec(
+            "batch succeeds first",
+            "factory/jleechan-contract-batch-cleanup-first-r1",
+        );
+        let second = spec(
+            "batch fails second",
+            "factory/jleechan-contract-batch-cleanup-second-r1",
+        );
+        let bindings = serde_json::json!({
+            first.prompt.clone(): first.branch.clone(),
+            second.prompt.clone(): second.branch.clone(),
+        });
+
+        let (batch_result, calls) = with_fake_ao("batch_cleanup", bindings, |log| {
+            let old_fail_prompt = std::env::var("AO_FAKE_FAIL_PROMPT").ok();
+            let old_fallback = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+            std::env::set_var("AO_FAKE_FAIL_PROMPT", &second.prompt);
+            std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax");
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.spawn_batch(&[first.clone(), second.clone()]);
+            match old_fail_prompt {
+                Some(value) => std::env::set_var("AO_FAKE_FAIL_PROMPT", value),
+                None => std::env::remove_var("AO_FAKE_FAIL_PROMPT"),
+            }
+            match old_fallback {
+                Some(value) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", value),
+                None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
+            }
+            let calls = std::fs::read_to_string(log).unwrap_or_default();
+            (result, calls)
+        });
+
+        assert!(batch_result.is_err(), "second spawn must fail");
+        let rows: Vec<serde_json::Value> = calls.lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let successful_spawns: Vec<&serde_json::Value> = rows.iter()
+            .filter(|row| row["kind"] == "spawn" && row["args"][6] == first.prompt)
+            .collect();
+        let kills: Vec<&serde_json::Value> = rows.iter()
+            .filter(|row| row["kind"] == "kill")
+            .collect();
+        assert_eq!(successful_spawns.len(), 1, "calls={calls}");
+        assert_eq!(kills.len(), successful_spawns.len(), "calls={calls}");
+        assert_eq!(
+            kills[0]["args"],
+            serde_json::json!(["session", "kill", kills[0]["session"]])
+        );
+    }
+
+    #[test]
+    fn batch_spawn_reports_root_and_cleanup_failures() {
+        let first = spec(
+            "batch cleanup failure first",
+            "factory/jleechan-contract-batch-cleanup-error-first-r1",
+        );
+        let second = spec(
+            "batch cleanup failure second",
+            "factory/jleechan-contract-batch-cleanup-error-second-r1",
+        );
+        let bindings = serde_json::json!({
+            first.prompt.clone(): first.branch.clone(),
+            second.prompt.clone(): second.branch.clone(),
+        });
+
+        let (batch_result, calls) = with_fake_ao("batch_cleanup_error", bindings, |log| {
+            let old_fail_prompt = std::env::var("AO_FAKE_FAIL_PROMPT").ok();
+            let old_kill_fail = std::env::var("AO_FAKE_KILL_FAIL").ok();
+            let old_fallback = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+            std::env::set_var("AO_FAKE_FAIL_PROMPT", &second.prompt);
+            std::env::set_var("AO_FAKE_KILL_FAIL", "1");
+            std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax");
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.spawn_batch(&[first.clone(), second.clone()]);
+            for (key, old) in [
+                ("AO_FAKE_FAIL_PROMPT", old_fail_prompt),
+                ("AO_FAKE_KILL_FAIL", old_kill_fail),
+                ("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", old_fallback),
+            ] {
+                match old {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let calls = std::fs::read_to_string(log).unwrap_or_default();
+            (result, calls)
+        });
+
+        let error = batch_result.expect_err("second spawn and cleanup must fail");
+        let rendered = error.to_string();
+        assert!(matches!(error, DaemonError::SpawnBatchCleanupFailed { .. }), "error={rendered}");
+        assert!(rendered.contains("scripted second spawn failure"), "{rendered}");
+        assert!(rendered.contains("scripted batch cleanup failure"), "{rendered}");
+        let rows: Vec<serde_json::Value> = calls.lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows.iter().filter(|row| row["kind"] == "kill").count(),
+            1,
+            "calls={calls}"
+        );
+    }
+
+    #[test]
     fn prompt_beginning_with_dash_remains_positional() {
         let prompt = "--not-an-ao-option preserve this prompt verbatim";
         let branch = "factory/jleechan-contract-dash-prompt-r1";
@@ -2073,6 +2195,77 @@ raise SystemExit(9)
             &serde_json::json!(["session", "kill", "missing-worktree-session"])
         );
         assert!(!calls.iter().any(|call| call == &serde_json::json!(["stop", "missing-worktree-session"])));
+    }
+
+    #[test]
+    fn missing_worktree_kill_failure_does_not_spawn_fallback_vendor() {
+        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_missing_worktree_kill_failure_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("calls.jsonl");
+        let fake_ao = root.join("ao");
+        std::fs::write(
+            &fake_ao,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+with open(os.environ["AO_FAKE_CLEANUP_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(sys.argv[1:]) + "\n")
+if sys.argv[1] == "spawn":
+    print("SESSION=untracked-session")
+    raise SystemExit(0)
+if sys.argv[1:] == ["session", "kill", "untracked-session"]:
+    print("scripted kill failure", file=sys.stderr)
+    raise SystemExit(8)
+raise SystemExit(9)
+"#,
+        ).unwrap();
+        let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_ao, permissions).unwrap();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_log = std::env::var("AO_FAKE_CLEANUP_LOG").ok();
+        let old_fallback = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+        std::env::set_var("PATH", format!("{}:{old_path}", root.display()));
+        std::env::set_var("AO_FAKE_CLEANUP_LOG", &log);
+        std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax->claude-code");
+
+        let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+        let result = sessions.spawn(&spec(
+            "missing workspace kill failure",
+            "factory/missing-worktree-kill-failure-r1",
+        ));
+        std::env::set_var("PATH", old_path);
+        match old_log {
+            Some(value) => std::env::set_var("AO_FAKE_CLEANUP_LOG", value),
+            None => std::env::remove_var("AO_FAKE_CLEANUP_LOG"),
+        }
+        match old_fallback {
+            Some(value) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", value),
+            None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
+        }
+        let calls: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })));
+        assert_eq!(
+            calls.iter().filter(|call| call[0] == "spawn").count(),
+            1,
+            "cleanup failure must stop fallback dispatch: {calls:?}"
+        );
+        assert_eq!(
+            calls.last().unwrap(),
+            &serde_json::json!(["session", "kill", "untracked-session"])
+        );
     }
 
     #[test]
@@ -2661,10 +2854,28 @@ impl Sessions for CliSessions {
         // the single path's REQUEST=/Worktree classification. Reuse the
         // complete single-spawn path so every batch item preserves the same
         // admission, fallback, workspace, and error semantics.
-        specs
-            .iter()
-            .map(|spec| self.spawn_with_fallback(spec))
-            .collect()
+        let mut spawned = Vec::with_capacity(specs.len());
+        for spec in specs {
+            match self.spawn_with_fallback(spec) {
+                Ok(session) => spawned.push(session),
+                Err(spawn_error) => {
+                    let mut cleanup_errors = Vec::new();
+                    for session in spawned.iter().rev() {
+                        if let Err(cleanup_error) = self.stop(session) {
+                            cleanup_errors.push((session.0.clone(), cleanup_error));
+                        }
+                    }
+                    if cleanup_errors.is_empty() {
+                        return Err(spawn_error);
+                    }
+                    return Err(DaemonError::SpawnBatchCleanupFailed {
+                        spawn_error: Box::new(spawn_error),
+                        cleanup_errors,
+                    });
+                }
+            }
+        }
+        Ok(spawned)
     }
 
     /// jleechan-hna3: reverse lookup of the AO session CURRENTLY associated
