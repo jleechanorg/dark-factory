@@ -274,6 +274,21 @@ fn now_iso8601() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
+fn is_permanent_human_hold_reason(reason: Option<&str>) -> bool {
+    reason.is_some_and(|reason| {
+        reason.starts_with("circuit-breaker")
+            || matches!(
+                reason,
+                "unmapped_target_repo"
+                    | "worktree_remote_mismatch"
+                    | "worktree_remote_unverifiable"
+                    | "spawn_cleanup_failed"
+                    | "spawn_branch_mismatch"
+                    | "ambiguous_dispatching_recovery"
+            )
+    })
+}
+
 /// Howard Hinnant's civil_from_days algorithm (public domain), days since epoch -> (y, m, d).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
@@ -793,21 +808,22 @@ impl StateStore for SqliteStateStore {
         let mut id_stmt = self
             .conn
             .prepare(
-                "SELECT bead_id FROM bead_overlay \
-                 WHERE state = 'HUMAN_HELD' AND attempt < ?1 \
-                 AND (park_reason IS NULL \
-                      OR (park_reason NOT LIKE 'circuit-breaker%' \
-                          AND park_reason != 'unmapped_target_repo' \
-                          AND park_reason != 'worktree_remote_mismatch' \
-                          AND park_reason != 'worktree_remote_unverifiable' \
-                          AND park_reason != 'spawn_cleanup_failed' \
-                          AND park_reason != 'ambiguous_dispatching_recovery'))",
+                "SELECT bead_id, park_reason FROM bead_overlay \
+                 WHERE state = 'HUMAN_HELD' AND attempt < ?1",
             )
             .map_err(|e| tool_err("recover_human_held id select prepare", e))?;
         let recovered_ids: Vec<String> = id_stmt
-            .query_map(params![max_attempt as i64], |row| row.get::<_, String>(0))
+            .query_map(params![max_attempt as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
             .map_err(|e| tool_err("recover_human_held id select query", e))?
-            .filter_map(|r| r.ok())
+            .filter_map(|row| row.ok())
+            .filter_map(|(bead_id, park_reason)| {
+                (!is_permanent_human_hold_reason(park_reason.as_deref())).then_some(bead_id)
+            })
             .collect();
         if recovered_ids.is_empty() {
             return Ok(Vec::new());
@@ -1861,6 +1877,25 @@ mod tests {
                 target_repo: None,
             },
         );
+        overlays.insert(
+            "branch-mismatch-cleanup-failed".to_string(),
+            BeadOverlay {
+                bead_id: "branch-mismatch-cleanup-failed".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 2,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: Some("factory/branch-mismatch-cleanup-failed-r2".into()),
+                session_id: Some("still-live-wrong-branch-session".into()),
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some("spawn_branch_mismatch".to_string()),
+                target_repo: None,
+            },
+        );
         for overlay in overlays.values() {
             store.save(overlay).unwrap();
         }
@@ -1903,6 +1938,20 @@ mod tests {
         assert_eq!(
             remote_unverifiable.park_reason.as_deref(),
             Some("worktree_remote_unverifiable")
+        );
+
+        let branch_mismatch = store
+            .load("branch-mismatch-cleanup-failed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(branch_mismatch.state, OverlayState::HumanHeld);
+        assert_eq!(
+            branch_mismatch.session_id.as_deref(),
+            Some("still-live-wrong-branch-session")
+        );
+        assert_eq!(
+            branch_mismatch.park_reason.as_deref(),
+            Some("spawn_branch_mismatch")
         );
 
         let transient = store.load("transient-stalled-2").unwrap().unwrap();
