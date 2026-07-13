@@ -435,17 +435,16 @@ pub fn dispatch_ready(
             sessions.stop(&session_id)?;
             overlay.state = OverlayState::HumanHeld;
             overlay.session_id = None;
-            let (phase, detail) = if remote_match == Some(false) {
-                (
-                    "worktree_remote_mismatch",
-                    format!("does not match the bead's resolved repo {repo:?}"),
-                )
+            let detail = if remote_match == Some(false) {
+                format!("does not match the bead's resolved repo {repo:?}")
             } else {
-                (
-                    "worktree_remote_unverifiable",
-                    format!("is not a recognized canonical github.com URL for the bead's resolved repo {repo:?}"),
-                )
+                format!("is not a recognized canonical github.com URL for the bead's resolved repo {repo:?}")
             };
+            // Both a positive mismatch and an indeterminate URL are durable
+            // wrong-remote safety violations, not transient inspection
+            // failures. Use the permanent mismatch park so recovery cannot
+            // silently requeue the same unsafe workspace next tick.
+            let phase = "worktree_remote_mismatch";
             overlay.park_reason = Some(phase.to_string());
             store.save(&overlay)?;
             report.failures.push(failure(
@@ -2297,7 +2296,7 @@ mod tests {
             let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
             assert_eq!(report.success_count(), 0, "remote={remote_url}");
-            assert_eq!(report.failures[0].phase, "worktree_remote_unverifiable", "remote={remote_url}");
+            assert_eq!(report.failures[0].phase, "worktree_remote_mismatch", "remote={remote_url}");
             let calls = sessions.calls.borrow();
             assert!(
                 calls.iter().any(|c| c == "stop(fake-session-1)"),
@@ -2305,7 +2304,7 @@ mod tests {
             );
             let overlay = store.load("bead-0").unwrap().unwrap();
             assert_eq!(overlay.state, OverlayState::HumanHeld);
-            assert_eq!(overlay.park_reason.as_deref(), Some("worktree_remote_unverifiable"));
+            assert_eq!(overlay.park_reason.as_deref(), Some("worktree_remote_mismatch"));
         }
     }
 }
