@@ -272,6 +272,20 @@ pub fn dispatch_ready(
                     ));
                     continue;
                 }
+            } else {
+                overlay.state = OverlayState::Queued;
+                store.save(&overlay)?;
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    None,
+                    "derived_route_telemetry",
+                    DaemonError::Config(format!(
+                        "telemetry_log required for derived route dispatch for bead {} (repo {repo:?}): telemetry_log is None",
+                        bead.id
+                    )),
+                ));
+                continue;
             }
         }
 
@@ -2600,5 +2614,61 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&unwritable_dir);
+    }
+
+    /// `telemetry_log` is `None` — a derived route must NOT silently dispatch
+    /// without a durable DERIVED_ROUTE_RESOLVED provenance record (jleechan-ntzj
+    /// correction: the None-success path was a gap in the original fail-closed
+    /// design; the production caller always passes Some, but the public API
+    /// must enforce the invariant). Regression: no branch register, no spawn,
+    /// no dispatch state.
+    #[test]
+    fn derived_route_none_telemetry_log_blocks_dispatch() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("jleechanorg/ez-gh-actions".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
+
+        assert_eq!(report.success_count(), 0, "derived route must not dispatch when telemetry_log is None");
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| f.phase == "derived_route_telemetry"),
+            "fail-closed: derived route must fail with derived_route_telemetry phase when telemetry_log is None: {:?}",
+            report.failures
+        );
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Queued, "bead must stay Queued");
+
+        let branches = store.owned_branches().unwrap();
+        assert!(branches.is_empty(), "no branch must be registered");
+
+        let calls = sessions.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("spawn(")),
+            "no spawn must have been attempted: {calls:?}"
+        );
     }
 }
