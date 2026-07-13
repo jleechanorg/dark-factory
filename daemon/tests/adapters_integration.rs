@@ -1,5 +1,5 @@
 use daemon::adapters::{ChainLlm, CliScm, CliSessions, CliTracker, CliVcs};
-use daemon::tools::{Llm, Scm, Sessions, Tracker, Vcs};
+use daemon::tools::{Llm, Scm, Sessions, SpawnSpec, Tracker, Vcs};
 
 /// Guard for setting environment variables during tests.
 /// SAFETY: must be used with a mutex lock to prevent concurrent test interference.
@@ -89,6 +89,44 @@ fn test_cli_sessions_real_ao() {
     let sessions = CliSessions::new("dark-factory", "claude-code");
     let count = sessions.active_count();
     assert!(count.is_ok(), "active_count failed: {:?}", count);
+}
+
+#[test]
+#[ignore] // Creates one real AO worker; run explicitly with --ignored --exact.
+fn test_cli_sessions_real_spawn_v013_contract() {
+    if std::env::var("GITHUB_ACTIONS").is_ok() {
+        return;
+    }
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    );
+    let branch = format!("factory/uald-real-spawn-{nonce}");
+    let prompt = format!(
+        "UALD_REAL_SPAWN_PROBE_{nonce}: This is a benign adapter integration probe. Do not edit files, commit, push, open a PR, or run product commands. Print the probe marker and current git branch, then exit."
+    );
+    let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+    let session = sessions
+        .spawn(&SpawnSpec {
+            bead_id: format!("uald-real-spawn-{nonce}"),
+            branch: branch.clone(),
+            prompt,
+            repo: "jleechanorg/dark-factory".to_string(),
+            ao_project: "dark-factory".to_string(),
+            remote: "origin".to_string(),
+        })
+        .expect("real AO v0.1.3 adapter spawn failed");
+
+    let observed_branch = sessions
+        .session_branch(&session)
+        .expect("AO branch lookup failed after spawn");
+    assert_eq!(observed_branch.as_deref(), Some(branch.as_str()));
+    println!("REAL_AO_SESSION={}", session.0);
+    println!("REAL_AO_BRANCH={branch}");
 }
 
 #[test]
