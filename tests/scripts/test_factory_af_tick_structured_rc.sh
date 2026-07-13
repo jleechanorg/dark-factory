@@ -83,7 +83,7 @@ set -e
 assert "factory-af-tick AFD_BEAD_FILTER rejects trailing comma (rc=2)" "2" "$rc"
 
 set +e
-( cd /tmp && AFD_BEAD_FILTER='jleechan-1,' bash "$TICK" ) 2>&1 | rg -q "comma\|empty\|allowlist" && echo "good error message"
+( cd /tmp && AFD_BEAD_FILTER='jleechan-1,' bash "$TICK" ) 2>&1 | grep -qE "comma|empty|allowlist" && echo "good error message"
 set -e
 
 set +e
