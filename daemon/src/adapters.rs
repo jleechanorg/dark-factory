@@ -1514,11 +1514,22 @@ impl CliSessions {
             &out,
             &err_msg,
         )?;
-        let Some(workspace) = Self::spawn_workspace_path(&out) else {
-            let spawn_error = DaemonError::Parse(format!(
-                "ao spawn --agent {agent} returned session {} without an absolute Worktree path; refusing to dispatch without remote verification: {out}",
+        let workspace = Self::spawn_workspace_path(&out);
+        let observed_branch = Self::spawn_branch(&out);
+        let spawn_error = if workspace.is_none() {
+            Some(DaemonError::Parse(format!(
+                "ao spawn --agent {agent} returned session {} without an absolute Worktree path; refusing to dispatch without remote verification",
                 session.0
-            ));
+            )))
+        } else if observed_branch.as_deref() != Some(spec.branch.as_str()) {
+            Some(DaemonError::Parse(format!(
+                "ao spawn --agent {agent} returned session {} with branch {:?}, expected {:?}; refusing to dispatch a branch-mismatched worker",
+                session.0, observed_branch, spec.branch
+            )))
+        } else {
+            None
+        };
+        if let Some(spawn_error) = spawn_error {
             return match run_tool("ao", &["session", "kill", &session.0], 30) {
                 Ok(_) => Err(spawn_error),
                 Err(cleanup_error) => Err(DaemonError::SpawnCleanupFailed {
@@ -1527,7 +1538,8 @@ impl CliSessions {
                     cleanup_error: Box::new(cleanup_error),
                 }),
             };
-        };
+        }
+        let workspace = workspace.expect("validated absolute workspace");
         self.spawned_worktrees
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1543,6 +1555,13 @@ impl CliSessions {
             let value = line.trim().strip_prefix("Worktree:")?.trim();
             let path = std::path::PathBuf::from(value);
             (path.is_absolute() && value != "-").then_some(path)
+        })
+    }
+
+    fn spawn_branch(out: &str) -> Option<String> {
+        out.lines().find_map(|line| {
+            let value = line.trim().strip_prefix("Branch:")?.trim();
+            (!value.is_empty() && value != "-").then(|| value.to_string())
         })
     }
 
@@ -1984,6 +2003,7 @@ if prompt == os.environ.get("AO_FAKE_FAIL_PROMPT"):
     raise SystemExit(7)
 print("SESSION=fake-" + str(abs(hash(prompt))))
 print("  Worktree: " + os.environ.get("AO_FAKE_WORKTREE", "/tmp/fake-ao-worktree"))
+print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"]))
 "#,
         )
         .unwrap();
@@ -2050,6 +2070,50 @@ print("  Worktree: " + os.environ.get("AO_FAKE_WORKTREE", "/tmp/fake-ao-worktree
         assert_eq!(rows[0]["args"][5], "--");
         assert_eq!(rows[0]["args"][6], prompt);
         assert_eq!(rows[0]["branch"], branch);
+    }
+
+    #[test]
+    fn bridge_branch_mismatch_is_killed_and_never_returned_as_a_session() {
+        let prompt = "branch mismatch prompt";
+        let branch = "factory/jleechan-contract-branch-mismatch-r1";
+        let bindings = serde_json::json!({ prompt: branch });
+
+        let (spawn_result, calls) = with_fake_ao("branch_mismatch", bindings, |log| {
+            let saved = [
+                ("AO_FAKE_RETURN_BRANCH", std::env::var("AO_FAKE_RETURN_BRANCH").ok()),
+                (
+                    "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
+                    std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok(),
+                ),
+            ];
+            std::env::set_var("AO_FAKE_RETURN_BRANCH", "factory/unexpected-r1");
+            std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax");
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.spawn(&spec(prompt, branch));
+            for (key, value) in saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let calls = std::fs::read_to_string(log).unwrap_or_default();
+            (result, calls)
+        });
+
+        let error = spawn_result.expect_err("a mismatched Branch echo must fail closed");
+        assert!(error.to_string().contains("branch-mismatched worker"));
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows.iter().filter(|row| row["kind"] == "spawn").count(),
+            1
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row["kind"] == "kill").count(),
+            1
+        );
     }
 
     #[test]

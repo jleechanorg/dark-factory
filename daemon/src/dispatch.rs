@@ -412,30 +412,39 @@ pub fn dispatch_ready(
         // completely unrelated, pre-existing task (different branch,
         // different prompt) — this defensively verifies AO's own live view
         // of the just-returned session before ever trusting/persisting it.
-        // `Ok(None)` means "cannot verify" (adapter/fake doesn't implement
-        // the check, or `ao status` failed/raced) and is intentionally
-        // treated as trust-it, matching `Sessions::session_branch`'s
-        // documented contract — this check only ever *rejects* on a
-        // positively confirmed mismatch, never on absence of information.
-        // We deliberately do NOT call `sessions.stop(&session_id)` here: on
-        // a mismatch this session_id is not provably ours to kill (it may
-        // be someone else's live, legitimate work, exactly like the
-        // wa-3004 case that motivated this check) — we only refuse to
-        // adopt it.
+        // Production `CliSessions::spawn` already requires AO bridge stdout
+        // to echo the exact requested `Branch:` and an absolute `Worktree:`.
+        // This second trait-level check catches adapters/fakes that return a
+        // newly-created id whose live status contradicts that contract. The
+        // id came directly from this spawn call, so it is owned by this
+        // dispatch and must be stopped rather than leaked and requeued.
         if let Ok(Some(actual_branch)) = sessions.session_branch(&session_id) {
             if actual_branch != branch {
-                overlay.state = OverlayState::Queued;
+                let phase = "spawn_branch_mismatch";
+                let branch_error = DaemonError::Parse(format!(
+                    "ao spawn returned session {} but its live branch is {actual_branch:?}, expected {branch:?} — refusing to record as DISPATCHED",
+                    session_id.0
+                ));
+                if let Err(cleanup_error) = sessions.stop(&session_id) {
+                    return Err(record_spawn_cleanup_failure(
+                        store,
+                        &mut overlay,
+                        &session_id,
+                        phase,
+                        branch_error,
+                        cleanup_error,
+                    ));
+                }
+                overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.park_reason = Some(phase.to_string());
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
                     overlay.attempt,
                     Some(branch.clone()),
-                    "spawn_branch_mismatch",
-                    DaemonError::Parse(format!(
-                        "ao spawn returned session {} but its live branch is {actual_branch:?}, expected {branch:?} — refusing to record as DISPATCHED",
-                        session_id.0
-                    )),
+                    phase,
+                    branch_error,
                 ));
                 continue;
             }
@@ -1542,7 +1551,7 @@ mod tests {
     /// match the branch this dispatch actually requested — the daemon must
     /// refuse to record this as a successful dispatch, must NOT persist
     /// state=Dispatched/session_id, and must requeue the bead for a real
-    /// retry instead of silently trusting a mismatched session forever.
+    /// park instead of silently trusting or duplicating a mismatched session.
     #[test]
     fn spawn_returning_session_with_mismatched_live_branch_is_never_recorded_as_dispatched() {
         let sessions = FakeSessions::new(0);
@@ -1566,21 +1575,46 @@ mod tests {
         assert_eq!(report.failures[0].bead_id, "bead-0");
         assert_eq!(report.failures[0].phase, "spawn_branch_mismatch");
 
-        // The session must NOT be killed — it may be someone else's live,
-        // legitimate work (exactly the wa-3004 case). We only refuse to
-        // adopt it.
         let calls = sessions.calls.borrow();
         assert!(
-            !calls.iter().any(|c| c.starts_with("stop(")),
-            "a foreign/mismatched session must never be stopped by dispatch: {calls:?}"
+            calls.iter().any(|c| c == "stop(fake-session-1)"),
+            "the just-created branch-mismatched worker must be stopped: {calls:?}"
         );
 
-        // The overlay must be back at QUEUED with no session_id — never
-        // left claiming DISPATCHED with a session that isn't actually
-        // working on this bead's branch.
+        // Never auto-requeue a dispatch whose returned metadata contradicted
+        // the requested branch; preserve the requested branch for diagnosis.
         let overlay = store.load("bead-0").unwrap().unwrap();
-        assert_eq!(overlay.state, OverlayState::Queued);
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
         assert_eq!(overlay.session_id, None);
+        assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(overlay.park_reason.as_deref(), Some("spawn_branch_mismatch"));
+    }
+
+    #[test]
+    fn spawn_branch_mismatch_cleanup_failure_retains_session_and_stops_batch() {
+        let sessions = FakeSessions::new(0);
+        sessions.set_session_branch("fake-session-1", "feat/unexpected-branch");
+        sessions.fail_stop_for("fake-session-1");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(overlay.session_id.as_deref(), Some("fake-session-1"));
+        assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(overlay.park_reason.as_deref(), Some("spawn_branch_mismatch"));
+        assert!(
+            !sessions
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == "spawn(bead-1)"),
+            "cleanup failure must stop the batch before another spawn"
+        );
     }
 
     #[test]
