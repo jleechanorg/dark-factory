@@ -47,6 +47,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
 
+      - name: Fix Python 3.13 shared-library path (self-hosted runners)
+        # actions/setup-python installs Python 3.13 under _tool/ but does NOT
+        # add its lib/ dir to LD_LIBRARY_PATH. When tests spawn python as a
+        # subprocess (e.g. test_preflight.py, test_structural_preflight.py),
+        # the dynamic linker cannot find libpython3.13.so.1.0 and returns rc=127.
+        # This step appends the toolcache lib dir to LD_LIBRARY_PATH so that
+        # subprocess invocations of the same python binary find the shared lib.
+        run: |
+          PY_LIB="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"
+          if [ -n "$PY_LIB" ] && [ -d "$PY_LIB" ]; then
+            echo "LD_LIBRARY_PATH=${PY_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+            echo "Appended $PY_LIB to LD_LIBRARY_PATH"
+          else
+            echo "::warning::Could not determine Python LIBDIR — subprocess python may fail to load libpython3.13"
+          fi
+
       - name: Detect runner platform (Linux-only isolation tests)
         # tests/security/test_agent_isolation.py uses @linux_only markers
         # and will SKIP on macOS runners. This step surfaces that fact
@@ -114,6 +130,7 @@ jobs:
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1 (stable)
         with:
           toolchain: stable
+          components: clippy  # required for `cargo clippy` in the lint step
 
       - name: Cache cargo registry/target for daemon crate
         uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc  # v2.9.1
