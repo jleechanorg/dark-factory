@@ -56,7 +56,9 @@ impl OverlayState {
             "REDISPATCHED" => Ok(OverlayState::Redispatched),
             "BUDGET_HELD" => Ok(OverlayState::BudgetHeld),
             "HUMAN_HELD" => Ok(OverlayState::HumanHeld),
-            other => Err(DaemonError::Parse(format!("unknown overlay state: {other}"))),
+            other => Err(DaemonError::Parse(format!(
+                "unknown overlay state: {other}"
+            ))),
         }
     }
 }
@@ -65,7 +67,7 @@ impl OverlayState {
 pub struct BeadOverlay {
     pub bead_id: String,
     pub state: OverlayState,
-    pub attempt: u32,       // r<n> counter
+    pub attempt: u32, // r<n> counter
     pub reroll_count: u32,
     pub autonomy_secs: u64, // cumulative — nothing on the automated path resets it
     pub spend_usd: f64,     // monitoring-only metric (spec §4.2.8)
@@ -179,7 +181,10 @@ pub trait StateStore {
     /// list all active overlays AND bump their autonomy_secs by
     /// `elapsed_secs` in one call. Equivalent to `list_active_overlays`
     /// followed by `bump_autonomy_secs` for every returned row.
-    fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError> {
+    fn increment_active_autonomy(
+        &self,
+        elapsed_secs: u64,
+    ) -> Result<Vec<BeadOverlay>, DaemonError> {
         let overlays = self.list_active_overlays()?;
         for overlay in &overlays {
             if elapsed_secs > 0 {
@@ -211,8 +216,19 @@ pub trait StateStore {
         &self,
         max_attempt: u32,
     ) -> Result<Vec<BeadOverlay>, DaemonError>;
-    fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, feedback_text: &str) -> Result<(), DaemonError>;
-    fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError>;
+    fn save_rejection(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+        reviewer: &str,
+        feedback_hash: &str,
+        feedback_text: &str,
+    ) -> Result<(), DaemonError>;
+    fn load_rejection(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+    ) -> Result<Option<(String, String)>, DaemonError>;
     /// Read back the raw feedback text for a stored rejection (companion to
     /// `load_rejection`, which only returns `(reviewer, feedback_hash)`). The
     /// reroll circuit-breaker's semantic comparison (spec §4.2.6) needs the
@@ -221,7 +237,11 @@ pub trait StateStore {
     /// predate this feature (or fakes that don't need reroll's circuit-breaker
     /// exercised) don't need to implement it; `None` means the circuit-breaker
     /// safely no-ops (never fires) rather than erroring or guessing.
-    fn load_rejection_text(&self, _bead_id: &str, _attempt: u32) -> Result<Option<String>, DaemonError> {
+    fn load_rejection_text(
+        &self,
+        _bead_id: &str,
+        _attempt: u32,
+    ) -> Result<Option<String>, DaemonError> {
         Ok(None)
     }
     /// Read the `(attempt_count, last_attempt_epoch_secs)` pair for the
@@ -327,12 +347,8 @@ impl HumanHoldReason {
             Self::SpawnBranchMismatch => "spawn_branch_mismatch",
             Self::AmbiguousDispatchingRecovery => "ambiguous_dispatching_recovery",
             Self::AutonomyTimeboxExceeded => "autonomy_timebox_exceeded",
-            Self::AdoptedBranchHistoryRewriteDetected => {
-                "adopted_branch_history_rewrite_detected"
-            }
-            Self::AdoptedBranchAppendOnlyCheckFailed => {
-                "adopted_branch_append_only_check_failed"
-            }
+            Self::AdoptedBranchHistoryRewriteDetected => "adopted_branch_history_rewrite_detected",
+            Self::AdoptedBranchAppendOnlyCheckFailed => "adopted_branch_append_only_check_failed",
             Self::SessionBranchMismatch => "session_branch_mismatch",
             Self::CoderSilent => "coder_silent",
             Self::RerollSessionAttachFailed => "reroll_session_attach_failed",
@@ -652,8 +668,22 @@ impl SqliteStateStore {
             .map_err(|e| tool_err(&format!("{op} query"), e))?;
         let mut out = Vec::new();
         for r in rows {
-            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, park_reason, target_repo) =
-                r.map_err(|e| tool_err(&format!("{op} row"), e))?;
+            let (
+                bead_id,
+                state_str,
+                attempt,
+                reroll_count,
+                autonomy_secs,
+                spend_usd,
+                pr_number,
+                branch,
+                session_id,
+                is_adopted,
+                spawn_failure_count,
+                pre_session_head_sha,
+                park_reason,
+                target_repo,
+            ) = r.map_err(|e| tool_err(&format!("{op} row"), e))?;
             out.push(BeadOverlay {
                 bead_id,
                 state: OverlayState::from_str(&state_str)?,
@@ -816,17 +846,22 @@ impl StateStore for SqliteStateStore {
         }
     }
 
-    fn increment_active_autonomy(&self, elapsed_secs: u64) -> Result<Vec<BeadOverlay>, DaemonError> {
+    fn increment_active_autonomy(
+        &self,
+        elapsed_secs: u64,
+    ) -> Result<Vec<BeadOverlay>, DaemonError> {
         // Default-method wiring in the trait calls list_active_overlays +
         // bump_autonomy_secs; we still need to override here so the bump
         // happens via the existing single-UPDATE path (cheaper than
         // per-row updates when no caller asks for the ci_pending skip).
         if elapsed_secs > 0 {
-            self.conn.execute(
-                "UPDATE bead_overlay SET autonomy_secs = autonomy_secs + ?1, updated_at = ?2 \
+            self.conn
+                .execute(
+                    "UPDATE bead_overlay SET autonomy_secs = autonomy_secs + ?1, updated_at = ?2 \
                  WHERE state IN ('DISPATCHED', 'ATTESTED')",
-                params![elapsed_secs, now_iso8601()],
-            ).map_err(|e| tool_err("increment_active_autonomy update", e))?;
+                    params![elapsed_secs, now_iso8601()],
+                )
+                .map_err(|e| tool_err("increment_active_autonomy update", e))?;
         }
         self.list_active_overlays()
     }
@@ -1031,8 +1066,22 @@ impl StateStore for SqliteStateStore {
             .map_err(|e| tool_err("human_held_at_or_above_attempt query", e))?;
         let mut out = Vec::new();
         for r in rows {
-            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, park_reason, target_repo) =
-                r.map_err(|e| tool_err("human_held_at_or_above_attempt row", e))?;
+            let (
+                bead_id,
+                state_str,
+                attempt,
+                reroll_count,
+                autonomy_secs,
+                spend_usd,
+                pr_number,
+                branch,
+                session_id,
+                is_adopted,
+                spawn_failure_count,
+                pre_session_head_sha,
+                park_reason,
+                target_repo,
+            ) = r.map_err(|e| tool_err("human_held_at_or_above_attempt row", e))?;
             out.push(BeadOverlay {
                 bead_id,
                 state: OverlayState::from_str(&state_str)?,
@@ -1053,7 +1102,14 @@ impl StateStore for SqliteStateStore {
         Ok(out)
     }
 
-    fn save_rejection(&self, bead_id: &str, attempt: u32, reviewer: &str, feedback_hash: &str, feedback_text: &str) -> Result<(), DaemonError> {
+    fn save_rejection(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+        reviewer: &str,
+        feedback_hash: &str,
+        feedback_text: &str,
+    ) -> Result<(), DaemonError> {
         self.conn
             .execute(
                 "INSERT INTO review_rejection (bead_id, attempt, reviewer, feedback_hash, feedback_text, created_at) \
@@ -1074,7 +1130,11 @@ impl StateStore for SqliteStateStore {
         Ok(())
     }
 
-    fn load_rejection(&self, bead_id: &str, attempt: u32) -> Result<Option<(String, String)>, DaemonError> {
+    fn load_rejection(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+    ) -> Result<Option<(String, String)>, DaemonError> {
         self.conn
             .query_row(
                 "SELECT reviewer, feedback_hash FROM review_rejection WHERE bead_id = ?1 AND attempt = ?2",
@@ -1089,7 +1149,11 @@ impl StateStore for SqliteStateStore {
             .map_err(|e| tool_err("load_rejection", e))
     }
 
-    fn load_rejection_text(&self, bead_id: &str, attempt: u32) -> Result<Option<String>, DaemonError> {
+    fn load_rejection_text(
+        &self,
+        bead_id: &str,
+        attempt: u32,
+    ) -> Result<Option<String>, DaemonError> {
         self.conn
             .query_row(
                 "SELECT feedback_text FROM review_rejection WHERE bead_id = ?1 AND attempt = ?2",
@@ -1176,7 +1240,7 @@ mod tests {
             ("reroll.rs", include_str!("reroll.rs")),
             ("tick.rs", include_str!("tick.rs")),
             ("state.rs", include_str!("state.rs")),
-            ] {
+        ] {
             let production = source
                 .split("\n#[cfg(test)]\nmod tests")
                 .next()
@@ -1206,7 +1270,9 @@ mod tests {
             "production SQL must bind typed policy values"
         );
         assert!(is_permanent_human_hold_reason(None));
-        assert!(is_permanent_human_hold_reason(Some("future_unknown_reason")));
+        assert!(is_permanent_human_hold_reason(Some(
+            "future_unknown_reason"
+        )));
     }
 
     #[test]
@@ -1382,9 +1448,9 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             };
             s.save(&o).unwrap();
             let got = s.load(&o.bead_id).unwrap().unwrap();
@@ -1396,7 +1462,10 @@ mod tests {
     fn owned_branches_lists_only_registered() {
         let s = store();
         s.register_branch("b1", "factory/b1-r1").unwrap();
-        assert_eq!(s.owned_branches().unwrap(), vec!["factory/b1-r1".to_string()]);
+        assert_eq!(
+            s.owned_branches().unwrap(),
+            vec!["factory/b1-r1".to_string()]
+        );
     }
 
     #[test]
@@ -1425,7 +1494,10 @@ mod tests {
         };
         s.save(&o).unwrap();
         s.register_branch("b1", "factory/b1-r1").unwrap();
-        assert_eq!(s.owned_branches().unwrap(), vec!["factory/b1-r1".to_string()]);
+        assert_eq!(
+            s.owned_branches().unwrap(),
+            vec!["factory/b1-r1".to_string()]
+        );
 
         // Delete the overlay row directly (simulates a bead being purged/reset).
         s.conn
@@ -1598,9 +1670,9 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
+                target_repo: None,
             },
         );
         overlays.insert(
@@ -1617,9 +1689,9 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             },
         );
         overlays.insert(
@@ -1636,9 +1708,9 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             },
         );
         for (bead_id, session_id, park_reason) in [
@@ -1689,9 +1761,9 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             },
         );
         overlays.insert(
@@ -1708,9 +1780,9 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             },
         );
         for overlay in overlays.values() {
@@ -1753,8 +1825,10 @@ mod tests {
         assert_eq!(over_cap.state, OverlayState::HumanHeld);
         assert_eq!(over_cap.attempt, 12);
         let capped = store.human_held_at_or_above_attempt(10).unwrap();
-        let capped_ids: std::collections::HashSet<_> =
-            capped.iter().map(|overlay| overlay.bead_id.as_str()).collect();
+        let capped_ids: std::collections::HashSet<_> = capped
+            .iter()
+            .map(|overlay| overlay.bead_id.as_str())
+            .collect();
         assert_eq!(capped_ids.len(), 2);
         assert!(capped_ids.contains("at-cap"));
         assert!(capped_ids.contains("over-cap"));
@@ -2161,9 +2235,9 @@ mod tests {
                     session_id: None,
                     is_adopted: false,
                     spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                    pre_session_head_sha: None,
+                    park_reason: None,
+                    target_repo: None,
                 })
                 .unwrap();
         }
@@ -2182,9 +2256,9 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
+                target_repo: None,
             })
             .unwrap();
 
@@ -2327,9 +2401,9 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             })
             .unwrap();
         store
@@ -2345,9 +2419,9 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             })
             .unwrap();
         store
@@ -2363,9 +2437,9 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             })
             .unwrap();
 
