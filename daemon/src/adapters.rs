@@ -1,6 +1,5 @@
 use crate::errors::DaemonError;
 use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
-use std::io::Read;
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -1437,7 +1436,7 @@ impl CliSessions {
             &err_msg,
         )?;
         let Some(workspace) = Self::spawn_workspace_path(&out) else {
-            let cleanup = run_tool("ao", &["stop", &session.0], 30)
+            let cleanup = run_tool("ao", &["session", "kill", &session.0], 30)
                 .map(|_| "session stopped".to_string())
                 .unwrap_or_else(|error| format!("WARNING: failed to stop session: {error}"));
             return Err(DaemonError::Parse(format!(
@@ -2005,6 +2004,75 @@ print("  Worktree: " + os.environ.get("AO_FAKE_WORKTREE", "/tmp/fake-ao-worktree
     }
 
     #[test]
+    fn missing_worktree_uses_session_kill_cleanup_contract() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_missing_worktree_cleanup_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("calls.jsonl");
+        let fake_ao = root.join("ao");
+        std::fs::write(
+            &fake_ao,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+with open(os.environ["AO_FAKE_CLEANUP_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(sys.argv[1:]) + "\n")
+if sys.argv[1] == "spawn":
+    print("SESSION=missing-worktree-session")
+    raise SystemExit(0)
+if sys.argv[1:] == ["session", "kill", "missing-worktree-session"]:
+    raise SystemExit(0)
+raise SystemExit(9)
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_ao, permissions).unwrap();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_log = std::env::var("AO_FAKE_CLEANUP_LOG").ok();
+        let old_fallback = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+        std::env::set_var("PATH", format!("{}:{old_path}", root.display()));
+        std::env::set_var("AO_FAKE_CLEANUP_LOG", &log);
+        std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax");
+
+        let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+        let result = sessions.spawn(&spec(
+            "missing workspace cleanup",
+            "factory/missing-worktree-cleanup-r1",
+        ));
+        std::env::set_var("PATH", old_path);
+        match old_log {
+            Some(value) => std::env::set_var("AO_FAKE_CLEANUP_LOG", value),
+            None => std::env::remove_var("AO_FAKE_CLEANUP_LOG"),
+        }
+        match old_fallback {
+            Some(value) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", value),
+            None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
+        }
+        let calls: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.is_err(), "missing Worktree must fail closed");
+        assert_eq!(
+            calls.last().unwrap(),
+            &serde_json::json!(["session", "kill", "missing-worktree-session"])
+        );
+        assert!(!calls.iter().any(|call| call == &serde_json::json!(["stop", "missing-worktree-session"])));
+    }
+
+    #[test]
     fn spawned_opaque_workspace_is_used_for_remote_validation() {
         let prompt = "opaque workspace validation prompt";
         let branch = "factory/jleechan-contract-opaque-r1";
@@ -2376,6 +2444,175 @@ export const isTerminalSession = () => false;
         assert!(observed["parentNodeOptions"].is_null());
         assert_eq!(calls.lines().filter(|line| *line == "release").count(), 1);
     }
+
+    #[test]
+    fn bridge_backed_batch_serializes_lock_and_records_each_workspace() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_bridge_batch_semantics_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        let cli = root.join("node_modules/@jleechanorg/ao-cli");
+        let core = root.join("node_modules/@jleechanorg/ao-core");
+        let calls = root.join("calls.jsonl");
+        let lock = root.join("spawn.lock");
+        let first_workspace = root.join("df-batch-alpha");
+        let second_workspace = root.join("df-batch-beta");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
+        std::fs::create_dir_all(core.join("dist")).unwrap();
+        for workspace in [&first_workspace, &second_workspace] {
+            std::fs::create_dir_all(workspace).unwrap();
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace)
+                .status()
+                .unwrap();
+            std::process::Command::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/jleechanorg/dark-factory.git",
+                ])
+                .current_dir(workspace)
+                .status()
+                .unwrap();
+        }
+        std::fs::write(
+            cli.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
+            .unwrap();
+        std::fs::write(
+            core.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            core.join("dist/index.js"),
+            r#"import {appendFileSync, closeSync, openSync, rmSync} from 'node:fs';
+const log = (value) => appendFileSync(process.env.AO_FAKE_CALLS, JSON.stringify(value) + '\n');
+export const loadConfig = () => ({configPath: '/tmp/fake-ao.yaml', defaults: {runtime: 'tmux'}, projects: {'dark-factory': {path: '/tmp/fake-project'}}});
+export const createPluginRegistry = () => ({loadFromConfig: async () => {}});
+export const createSessionManager = () => ({
+  list: async () => [],
+  spawn: async (spec) => {
+    log({agent: spec.agent, branch: spec.branch, prompt: spec.prompt});
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const workspaces = JSON.parse(process.env.AO_FAKE_WORKSPACES);
+    return {id: 'session-' + spec.branch.split('/').pop(), branch: spec.branch, workspacePath: workspaces[spec.branch]};
+  },
+  kill: async () => {},
+});
+export const acquireSpawnLock = () => {
+  try {
+    closeSync(openSync(process.env.AO_FAKE_LOCK, 'wx'));
+    return {acquired: true, release() {rmSync(process.env.AO_FAKE_LOCK, {force: true});}};
+  } catch {
+    return {acquired: false};
+  }
+};
+export const resolveSpawnQueueConfig = () => ({enabled: true, maxActiveSessions: 10});
+export const isTerminalSession = () => false;
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/preflight.js"),
+            "export const preflight = {checkTmux: async () => {}, checkGhAuth: async () => {}};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/running-state.js"),
+            "export const getRunning = async () => ({projects: ['dark-factory']});\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/lifecycle-service.js"),
+            "export const ensureLifecycleWorker = async () => {};\n",
+        )
+        .unwrap();
+        let fake_ao = bin.join("ao");
+        std::fs::write(
+            &fake_ao,
+            r#"#!/usr/bin/env python3
+import os
+import sys
+os.execv(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["AO_FAKE_CLI_ENTRY"], *sys.argv[1:]])
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_ao, permissions).unwrap();
+
+        let first = spec("batch alpha", "factory/batch-alpha-r1");
+        let second = spec("batch beta", "factory/batch-beta-r1");
+        let saved = [
+            ("PATH", std::env::var("PATH").ok()),
+            ("AO_FAKE_NODE", std::env::var("AO_FAKE_NODE").ok()),
+            ("AO_FAKE_CLI_ENTRY", std::env::var("AO_FAKE_CLI_ENTRY").ok()),
+            ("AO_FAKE_CALLS", std::env::var("AO_FAKE_CALLS").ok()),
+            ("AO_FAKE_LOCK", std::env::var("AO_FAKE_LOCK").ok()),
+            ("AO_FAKE_WORKSPACES", std::env::var("AO_FAKE_WORKSPACES").ok()),
+            (
+                "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
+                std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok(),
+            ),
+        ];
+        let old_path = saved[0].1.clone().unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old_path}", bin.display()));
+        std::env::set_var("AO_FAKE_NODE", bridge_test_node());
+        std::env::set_var("AO_FAKE_CLI_ENTRY", cli.join("dist/index.js"));
+        std::env::set_var("AO_FAKE_CALLS", &calls);
+        std::env::set_var("AO_FAKE_LOCK", &lock);
+        std::env::set_var(
+            "AO_FAKE_WORKSPACES",
+            serde_json::json!({
+                first.branch.clone(): first_workspace,
+                second.branch.clone(): second_workspace,
+            })
+            .to_string(),
+        );
+        std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax->claude-code");
+
+        let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+        let batch_result = sessions.spawn_batch(&[first.clone(), second.clone()]);
+        let first_remote = sessions.worktree_remote_url("dark-factory", &first.branch, "origin");
+        let second_remote =
+            sessions.worktree_remote_url("dark-factory", &second.branch, "origin");
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(batch_result.is_ok(), "batch failed: {batch_result:?}; calls={calls}");
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2, "each spec must spawn exactly once: {calls}");
+        assert!(rows.iter().all(|row| row["agent"] == "minimax"), "{calls}");
+        assert_eq!(
+            first_remote.unwrap().as_deref(),
+            Some("https://github.com/jleechanorg/dark-factory.git")
+        );
+        assert_eq!(
+            second_remote.unwrap().as_deref(),
+            Some("https://github.com/jleechanorg/dark-factory.git")
+        );
+    }
 }
 
 impl Sessions for CliSessions {
@@ -2408,95 +2645,16 @@ impl Sessions for CliSessions {
     }
 
     fn spawn_batch(&self, specs: &[SpawnSpec]) -> Result<Vec<SessionId>, DaemonError> {
-        let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
-            .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
-        
-        let mut fallback_agents = Vec::new();
-        fallback_agents.push(self.agent.clone());
-        for part in fallback_str.split("->") {
-            let part_trimmed = part.trim().to_string();
-            let mapped_agent = if part_trimmed == "aow" {
-                "minimax".to_string()
-            } else {
-                part_trimmed
-            };
-            if !mapped_agent.is_empty() && !fallback_agents.contains(&mapped_agent) {
-                fallback_agents.push(mapped_agent);
-            }
-        }
-
-        let mut results = vec![None; specs.len()];
-        let mut active_indices: Vec<usize> = (0..specs.len()).collect();
-
-        for agent in &fallback_agents {
-            if active_indices.is_empty() {
-                break;
-            }
-
-            let mut children = Vec::new();
-            for &idx in &active_indices {
-                let spec = &specs[idx];
-                let mut cmd = ao_spawn_command(agent, spec)?;
-                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-                if let Ok(child) = cmd.spawn() {
-                    children.push((idx, child, agent.clone()));
-                }
-            }
-
-            let mut next_active_indices = Vec::new();
-            for (idx, mut child, _ag) in children {
-                let status = match child.wait() {
-                    Ok(st) => st,
-                    Err(_) => {
-                        next_active_indices.push(idx);
-                        continue;
-                    }
-                };
-
-                let mut stdout_buf = Vec::new();
-                if let Some(mut stdout) = child.stdout {
-                    let _ = stdout.read_to_end(&mut stdout_buf);
-                }
-                let out = String::from_utf8_lossy(&stdout_buf);
-
-                if !status.success() {
-                    next_active_indices.push(idx);
-                    continue;
-                }
-
-                let mut sess_name = None;
-                for line in out.lines() {
-                    if line.starts_with("SESSION=") {
-                        sess_name = Some(line.split('=').nth(1).unwrap_or("").trim().to_string());
-                    }
-                }
-
-                if let Some(name) = sess_name {
-                    results[idx] = Some(SessionId(name));
-                } else {
-                    next_active_indices.push(idx);
-                }
-            }
-
-            active_indices = next_active_indices;
-        }
-
-        let mut final_ids = Vec::new();
-        for (idx, res) in results.into_iter().enumerate() {
-            match res {
-                Some(id) => final_ids.push(id),
-                None => {
-                    return Err(DaemonError::Tool {
-                        tool: "ao spawn batch".to_string(),
-                        rc: -1,
-                        stderr: format!("Failed to spawn session for spec prompt: {}", specs[idx].prompt),
-                    });
-                }
-            }
-        }
-
-        Ok(final_ids)
+        // AO's v0.1.3 spawn lock is per project. Serializing here is not an
+        // optimization choice: concurrent bridge processes collide on that
+        // lock, spuriously shift later specs to fallback vendors, and bypass
+        // the single path's REQUEST=/Worktree classification. Reuse the
+        // complete single-spawn path so every batch item preserves the same
+        // admission, fallback, workspace, and error semantics.
+        specs
+            .iter()
+            .map(|spec| self.spawn_with_fallback(spec))
+            .collect()
     }
 
     /// jleechan-hna3: reverse lookup of the AO session CURRENTLY associated

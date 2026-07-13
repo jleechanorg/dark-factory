@@ -403,16 +403,11 @@ pub fn dispatch_ready(
         // host, GitHub Enterprise, or an unusual scheme); that remains
         // distinct from failing to inspect the workspace at all.
         //
-        // `remote_url_matches_repo` ALSO
-        // returns `None` for a URL form it can't parse (a different host,
-        // GitHub Enterprise, an unusual scheme) — adversarial review of this
-        // PR caught an earlier version collapsing that into the SAME `false`
-        // a confirmed-wrong-repo URL produces, which would have killed a
-        // perfectly correct session over a merely-unrecognized URL flavor.
-        // Only `Some(false)` — a RECOGNIZED github.com URL naming a
-        // different repo — is a positively confirmed mismatch; `None` (from
-        // either function) must trust-it exactly like the `session_branch`
-        // check above.
+        // Only `Some(false)` from URL comparison — a recognized github.com
+        // URL naming a different repo — is a confirmed mismatch. `None`
+        // from URL comparison trusts the inspected remote's unrecognized
+        // format; unlike a missing workspace/remote result, it does not mean
+        // the inspection itself was skipped.
         let verified_remote = sessions
             .worktree_remote_url(&routing.ao_project, &branch, &routing.push_remote)
             .and_then(|url| {
