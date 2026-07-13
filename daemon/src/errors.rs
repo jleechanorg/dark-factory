@@ -1,3 +1,11 @@
+#[derive(Debug)]
+pub struct SpawnBatchCleanupFailure {
+    pub session: String,
+    pub bead_id: String,
+    pub branch: String,
+    pub error: DaemonError,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum DaemonError {
     #[error("tool {tool} failed (rc={rc}): {stderr}")]
@@ -79,7 +87,7 @@ pub enum DaemonError {
     )]
     SpawnBatchCleanupFailed {
         spawn_error: Box<DaemonError>,
-        cleanup_errors: Vec<(String, DaemonError)>,
+        cleanup_errors: Vec<SpawnBatchCleanupFailure>,
     },
 }
 
@@ -99,10 +107,15 @@ fn format_spawn_attempts(attempts: &[(String, DaemonError)]) -> String {
         .join("; ")
 }
 
-fn format_cleanup_errors(errors: &[(String, DaemonError)]) -> String {
+fn format_cleanup_errors(errors: &[SpawnBatchCleanupFailure]) -> String {
     errors
         .iter()
-        .map(|(session, err)| format!("{session}: {err}"))
+        .map(|failure| {
+            format!(
+                "session {} for bead {} branch {:?}: {}",
+                failure.session, failure.bead_id, failure.branch, failure.error
+            )
+        })
         .collect::<Vec<_>>()
         .join("; ")
 }

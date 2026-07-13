@@ -1,4 +1,4 @@
-use crate::errors::DaemonError;
+use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
 use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
@@ -2259,9 +2259,20 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
 
         let error = batch_result.expect_err("second spawn and cleanup must fail");
         let rendered = error.to_string();
-        assert!(matches!(error, DaemonError::SpawnBatchCleanupFailed { .. }), "error={rendered}");
+        let cleanup_errors = match &error {
+            DaemonError::SpawnBatchCleanupFailed { cleanup_errors, .. } => cleanup_errors,
+            other => panic!("expected typed batch cleanup failure, got {other:?}"),
+        };
+        assert_eq!(cleanup_errors.len(), 1);
+        assert_eq!(cleanup_errors[0].bead_id, first.bead_id);
+        assert_eq!(cleanup_errors[0].branch, first.branch);
         assert!(rendered.contains("scripted second spawn failure"), "{rendered}");
         assert!(rendered.contains("scripted batch cleanup failure"), "{rendered}");
+        assert!(rendered.contains("jleechan-contract-test"), "{rendered}");
+        assert!(
+            rendered.contains("factory/jleechan-contract-batch-cleanup-error-first-r1"),
+            "{rendered}"
+        );
         let rows: Vec<serde_json::Value> = calls.lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
@@ -3034,12 +3045,17 @@ impl Sessions for CliSessions {
         let mut spawned = Vec::with_capacity(specs.len());
         for spec in specs {
             match self.spawn_with_fallback(spec) {
-                Ok(session) => spawned.push(session),
+                Ok(session) => spawned.push((session, spec)),
                 Err(spawn_error) => {
                     let mut cleanup_errors = Vec::new();
-                    for session in spawned.iter().rev() {
+                    for (session, spawned_spec) in spawned.iter().rev() {
                         if let Err(cleanup_error) = self.stop(session) {
-                            cleanup_errors.push((session.0.clone(), cleanup_error));
+                            cleanup_errors.push(SpawnBatchCleanupFailure {
+                                session: session.0.clone(),
+                                bead_id: spawned_spec.bead_id.clone(),
+                                branch: spawned_spec.branch.clone(),
+                                error: cleanup_error,
+                            });
                         }
                     }
                     if cleanup_errors.is_empty() {
@@ -3052,7 +3068,10 @@ impl Sessions for CliSessions {
                 }
             }
         }
-        Ok(spawned)
+        Ok(spawned
+            .into_iter()
+            .map(|(session, _)| session)
+            .collect())
     }
 
     /// jleechan-hna3: reverse lookup of the AO session CURRENTLY associated
@@ -3211,8 +3230,10 @@ impl Sessions for CliSessions {
 /// Multi-repo dispatch resolves `SpawnSpec.ao_project` per bead, so filtering
 /// status to `CliSessions::project` would undercount other configured projects
 /// and let the global `max_workers` cap be exceeded. A status row is counted
-/// unless AO positively reports a terminal activity; missing/unknown activity
-/// fails closed as active.
+/// unless AO positively reports one of its canonical terminal statuses or the
+/// terminal `exited` activity. Explicit orchestrator rows do not consume the
+/// worker budget; missing/unknown role or state fails closed as an active
+/// worker.
 fn active_session_count(data: &serde_json::Value) -> Result<usize, DaemonError> {
     let sessions = data
         .as_array()
@@ -3220,10 +3241,15 @@ fn active_session_count(data: &serde_json::Value) -> Result<usize, DaemonError> 
     Ok(sessions
         .iter()
         .filter(|entry| {
-            !matches!(
-                entry.get("activity").and_then(|value| value.as_str()),
-                Some("exited" | "missing")
-            )
+            let is_orchestrator = entry.get("role").and_then(|value| value.as_str())
+                == Some("orchestrator");
+            let terminal_status = matches!(
+                entry.get("status").and_then(|value| value.as_str()),
+                Some("killed" | "terminated" | "done" | "cleanup" | "errored" | "merged")
+            );
+            let terminal_activity =
+                entry.get("activity").and_then(|value| value.as_str()) == Some("exited");
+            !is_orchestrator && !terminal_status && !terminal_activity
         })
         .count())
 }
@@ -3235,11 +3261,12 @@ mod active_session_count_tests {
     #[test]
     fn global_cap_counts_active_sessions_across_projects_and_unknown_activity() {
         let status = serde_json::json!([
-            {"project": "dark-factory", "activity": "working"},
-            {"project": "worldarchitect", "activity": "ready"},
+            {"project": "dark-factory", "role": "worker", "status": "working", "activity": "working"},
+            {"project": "worldarchitect", "role": "worker", "status": "review_pending", "activity": "ready"},
             {"project": "third-repo"},
-            {"project": "dark-factory", "activity": "exited"},
-            {"project": "worldarchitect", "activity": "missing"}
+            {"project": "dark-factory", "role": "worker", "status": "working", "activity": "exited"},
+            {"project": "worldarchitect", "role": "worker", "status": "merged", "activity": "ready"},
+            {"project": "worldarchitect", "role": "orchestrator", "status": "working", "activity": "working"}
         ]);
 
         assert_eq!(active_session_count(&status).unwrap(), 3);
