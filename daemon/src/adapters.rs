@@ -1826,6 +1826,9 @@ mod ao_spawn_contract_tests {
     }
 
     fn bridge_test_node() -> std::path::PathBuf {
+        if let Ok(node) = std::env::var("DARK_FACTORY_AO_BRIDGE_TEST_NODE") {
+            return std::path::PathBuf::from(node);
+        }
         let node22 = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
             .join(".nvm/versions/node/v22.22.0/bin/node");
         if node22.is_file() {
@@ -2545,7 +2548,7 @@ export const isTerminalSession = () => false;
             r#"#!/usr/bin/env python3
 import os
 import sys
-os.execv(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["AO_FAKE_CLI_ENTRY"], *sys.argv[1:]])
+os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["AO_FAKE_CLI_ENTRY"], *sys.argv[1:]])
 "#,
         )
         .unwrap();
@@ -2566,6 +2569,11 @@ os.execv(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["AO
                 "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
                 std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok(),
             ),
+            ("NODE_ENV", std::env::var("NODE_ENV").ok()),
+            (
+                "DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE",
+                std::env::var("DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE").ok(),
+            ),
         ];
         let old_path = saved[0].1.clone().unwrap_or_default();
         std::env::set_var("PATH", format!("{}:{old_path}", bin.display()));
@@ -2582,6 +2590,8 @@ os.execv(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["AO
             .to_string(),
         );
         std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax->claude-code");
+        std::env::set_var("NODE_ENV", "test");
+        std::env::set_var("DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE", "1");
 
         let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
         let batch_result = sessions.spawn_batch(&[first.clone(), second.clone()]);
