@@ -3017,22 +3017,7 @@ impl Sessions for CliSessions {
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
         })?;
-        let mut count = 0;
-        if let Some(arr) = data.as_array() {
-            for entry in arr {
-                if let Some(project) = entry.get("project").and_then(|v| v.as_str()) {
-                    if project != self.project {
-                        continue;
-                    }
-                }
-                if let Some(activity) = entry.get("activity").and_then(|v| v.as_str()) {
-                    if activity != "exited" && activity != "missing" {
-                        count += 1;
-                    }
-                }
-            }
-        }
-        Ok(count)
+        active_session_count(&data)
     }
 
     fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
@@ -3219,6 +3204,50 @@ impl Sessions for CliSessions {
         } else {
             Ok(Some(trimmed.to_string()))
         }
+    }
+}
+
+/// Count the daemon's one global AO worker envelope across every project.
+/// Multi-repo dispatch resolves `SpawnSpec.ao_project` per bead, so filtering
+/// status to `CliSessions::project` would undercount other configured projects
+/// and let the global `max_workers` cap be exceeded. A status row is counted
+/// unless AO positively reports a terminal activity; missing/unknown activity
+/// fails closed as active.
+fn active_session_count(data: &serde_json::Value) -> Result<usize, DaemonError> {
+    let sessions = data
+        .as_array()
+        .ok_or_else(|| DaemonError::Parse("ao status JSON must be an array".to_string()))?;
+    Ok(sessions
+        .iter()
+        .filter(|entry| {
+            !matches!(
+                entry.get("activity").and_then(|value| value.as_str()),
+                Some("exited" | "missing")
+            )
+        })
+        .count())
+}
+
+#[cfg(test)]
+mod active_session_count_tests {
+    use super::active_session_count;
+
+    #[test]
+    fn global_cap_counts_active_sessions_across_projects_and_unknown_activity() {
+        let status = serde_json::json!([
+            {"project": "dark-factory", "activity": "working"},
+            {"project": "worldarchitect", "activity": "ready"},
+            {"project": "third-repo"},
+            {"project": "dark-factory", "activity": "exited"},
+            {"project": "worldarchitect", "activity": "missing"}
+        ]);
+
+        assert_eq!(active_session_count(&status).unwrap(), 3);
+    }
+
+    #[test]
+    fn malformed_non_array_status_fails_closed() {
+        assert!(active_session_count(&serde_json::json!({"sessions": []})).is_err());
     }
 }
 
