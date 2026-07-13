@@ -1362,6 +1362,7 @@ fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonErro
         .arg(&spec.ao_project)
         .arg("--agent")
         .arg(agent)
+        .arg("--")
         .arg(&spec.prompt)
         .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
         .env("DARK_FACTORY_AO_SPAWN_BRANCH", &spec.branch);
@@ -1825,6 +1826,16 @@ mod ao_spawn_contract_tests {
         }
     }
 
+    fn bridge_test_node() -> std::path::PathBuf {
+        let node22 = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+            .join(".nvm/versions/node/v22.22.0/bin/node");
+        if node22.is_file() {
+            node22
+        } else {
+            std::path::PathBuf::from("node")
+        }
+    }
+
     fn fake_ao_dir(test_name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "afd_ao_spawn_contract_{test_name}_{}",
@@ -1841,10 +1852,11 @@ import os
 import sys
 
 args = sys.argv[1:]
-assert len(args) == 6, args
+assert len(args) == 7, args
 assert args[:5] == ["spawn", "--project", "dark-factory", "--agent", "minimax"], args
 assert not {"--prompt", "--name", "--branch"}.intersection(args), args
-prompt = args[5]
+assert args[5] == "--", args
+prompt = args[6]
 bindings = json.loads(os.environ["AO_FAKE_EXPECTED_BINDINGS"])
 assert bindings[prompt] == os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"]
 assert os.environ["DARK_FACTORY_AO_V013_BRIDGE"] == "1"
@@ -1916,7 +1928,8 @@ print("  Worktree: " + os.environ.get("AO_FAKE_WORKTREE", "/tmp/fake-ao-worktree
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         assert_eq!(rows.len(), 1, "expected exactly one AO invocation: {calls}");
-        assert_eq!(rows[0]["args"][5], prompt);
+        assert_eq!(rows[0]["args"][5], "--");
+        assert_eq!(rows[0]["args"][6], prompt);
         assert_eq!(rows[0]["branch"], branch);
     }
 
@@ -1956,7 +1969,7 @@ print("  Worktree: " + os.environ.get("AO_FAKE_WORKTREE", "/tmp/fake-ao-worktree
             .iter()
             .map(|row| {
                 (
-                    row["args"][5].as_str().unwrap(),
+                    row["args"][6].as_str().unwrap(),
                     row["branch"].as_str().unwrap(),
                 )
             })
@@ -1969,6 +1982,26 @@ print("  Worktree: " + os.environ.get("AO_FAKE_WORKTREE", "/tmp/fake-ao-worktree
             observed.get(second.prompt.as_str()),
             Some(&second.branch.as_str())
         );
+    }
+
+    #[test]
+    fn prompt_beginning_with_dash_remains_positional() {
+        let prompt = "--not-an-ao-option preserve this prompt verbatim";
+        let branch = "factory/jleechan-contract-dash-prompt-r1";
+        let bindings = serde_json::json!({ prompt: branch });
+
+        let (spawn_result, calls) = with_fake_ao("dash_prompt", bindings, |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.spawn(&spec(prompt, branch));
+            let calls = std::fs::read_to_string(log).unwrap_or_default();
+            (result, calls)
+        });
+
+        assert!(spawn_result.is_ok(), "dash prompt failed: {spawn_result:?}");
+        let row: serde_json::Value = serde_json::from_str(calls.lines().next().unwrap()).unwrap();
+        assert_eq!(row["args"][5], "--");
+        assert_eq!(row["args"][6], prompt);
+        assert_eq!(row["branch"], branch);
     }
 
     #[test]
@@ -2068,10 +2101,7 @@ export const isTerminalSession = () => false;
         .unwrap();
 
         let bridge = ao_spawn_bridge_path();
-        let node = std::path::Path::new(&std::env::var("HOME").unwrap())
-            .join(".nvm/versions/node/v22.22.0/bin/node");
-        assert!(node.is_file(), "systemd's mandated Node 22 binary is missing");
-        let output = std::process::Command::new(node)
+        let output = std::process::Command::new(bridge_test_node())
             .arg(cli.join("dist/index.js"))
             .args([
                 "spawn",
@@ -2079,6 +2109,7 @@ export const isTerminalSession = () => false;
                 "dark-factory",
                 "--agent",
                 "minimax",
+                "--",
                 "hoisted resolution probe",
             ])
             .env(
@@ -2089,6 +2120,8 @@ export const isTerminalSession = () => false;
                 ),
             )
             .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env("NODE_ENV", "test")
+            .env("DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE", "1")
             .env("DARK_FACTORY_AO_BRIDGE_DIAGNOSTIC", "1")
             .env(
                 "DARK_FACTORY_AO_SPAWN_BRANCH",
@@ -2174,9 +2207,7 @@ export const ensureLifecycleWorker = async () => appendFileSync(process.env.AO_F
         .unwrap();
 
         let bridge = ao_spawn_bridge_path();
-        let node = std::path::Path::new(&std::env::var("HOME").unwrap())
-            .join(".nvm/versions/node/v22.22.0/bin/node");
-        let output = std::process::Command::new(node)
+        let output = std::process::Command::new(bridge_test_node())
             .arg(cli.join("dist/index.js"))
             .args([
                 "spawn",
@@ -2184,6 +2215,7 @@ export const ensureLifecycleWorker = async () => appendFileSync(process.env.AO_F
                 "dark-factory",
                 "--agent",
                 "minimax",
+                "--",
                 "admission probe",
             ])
             .env(
@@ -2195,6 +2227,8 @@ export const ensureLifecycleWorker = async () => appendFileSync(process.env.AO_F
             )
             .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "")
             .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env("NODE_ENV", "test")
+            .env("DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE", "1")
             .env(
                 "DARK_FACTORY_AO_SPAWN_BRANCH",
                 "factory/admission-probe-r1",
@@ -2288,9 +2322,7 @@ export const isTerminalSession = () => false;
         .unwrap();
 
         let bridge = ao_spawn_bridge_path();
-        let node = std::path::Path::new(&std::env::var("HOME").unwrap())
-            .join(".nvm/versions/node/v22.22.0/bin/node");
-        let output = std::process::Command::new(node)
+        let output = std::process::Command::new(bridge_test_node())
             .arg(cli.join("dist/index.js"))
             .args([
                 "spawn",
@@ -2298,6 +2330,7 @@ export const isTerminalSession = () => false;
                 "dark-factory",
                 "--agent",
                 "minimax",
+                "--",
                 "  hello\r\nworld  ",
             ])
             .env(
@@ -2309,6 +2342,8 @@ export const isTerminalSession = () => false;
             )
             .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "--trace-warnings")
             .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env("NODE_ENV", "test")
+            .env("DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE", "1")
             .env(
                 "DARK_FACTORY_AO_SPAWN_BRANCH",
                 "factory/spawn-semantics-r1",

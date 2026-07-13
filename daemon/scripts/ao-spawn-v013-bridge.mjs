@@ -9,7 +9,10 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
   };
 
   try {
-    if (process.versions.node.split(".")[0] !== "22") {
+    const testNodeOverride =
+      process.env.NODE_ENV === "test" &&
+      process.env.DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE === "1";
+    if (process.versions.node.split(".")[0] !== "22" && !testNodeOverride) {
       fail(`AO bridge requires Node 22, got ${process.versions.node}`);
     }
 
@@ -40,13 +43,16 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
     let project;
     let agent;
     let prompt;
+    let positionalOnly = false;
     for (let index = 1; index < argv.length; index += 1) {
       const value = argv[index];
-      if (value === "--project") {
+      if (!positionalOnly && value === "--") {
+        positionalOnly = true;
+      } else if (!positionalOnly && value === "--project") {
         project = argv[++index];
-      } else if (value === "--agent") {
+      } else if (!positionalOnly && value === "--agent") {
         agent = argv[++index];
-      } else if (value.startsWith("-")) {
+      } else if (!positionalOnly && value.startsWith("-")) {
         fail(`unsupported AO v0.1.3 spawn option: ${value}`);
       } else if (prompt === undefined) {
         prompt = value;

@@ -123,12 +123,13 @@ fn test_cli_sessions_real_spawn_v013_contract() {
         })
         .expect("real AO v0.1.3 adapter spawn failed");
 
-    let observed_branch = sessions
-        .session_branch(&session)
-        .expect("AO branch lookup failed after spawn");
-    assert_eq!(observed_branch.as_deref(), Some(branch.as_str()));
+    let observed_branch = sessions.session_branch(&session);
     println!("REAL_AO_SESSION={}", session.0);
     println!("REAL_AO_BRANCH={branch}");
+    let cleanup = sessions.stop(&session);
+    assert!(cleanup.is_ok(), "real AO probe cleanup failed: {cleanup:?}");
+    let observed_branch = observed_branch.expect("AO branch lookup failed after spawn");
+    assert_eq!(observed_branch.as_deref(), Some(branch.as_str()));
 }
 
 #[test]
