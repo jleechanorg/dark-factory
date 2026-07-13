@@ -1,6 +1,8 @@
 # dark-factory roadmap
 
 ## Recent activity (by day)
+- [2026-07-11](activity/2026-07-11.md) — pr228 /swarm review (4 blockers, 3 strong, 5 nit); 3-lens verify surfaced B4 circular import + refuted F-A3 delete-move; codex cross-model confirmed all 12 findings
+- [2026-07-10](activity/2026-07-10.md) — PR#7888 driven to mergeable_state=clean; 6 daemon infra bugs fixed; 4 new portability/structural gaps found (Gate-8 /smoke never auto-triggered, sealed-holdout security no-op, /green+/er not repo-resident)
 - [2026-07-06](activity/2026-07-06.md)
 - [2026-07-05](activity/2026-07-05.md)
 

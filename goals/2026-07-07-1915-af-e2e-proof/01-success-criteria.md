@@ -12,7 +12,7 @@ Strict mode: all criteria require concrete, independently-verifiable evidence.
 Closed jleechan-sniw.1 with evidence. Full 3-pass adversarial verdict chain in
 /tmp/dark-factory/sidekick/af-e2e/STATE.md.
 
-## C2 — Live /af labeled-PR E2E proven (jleechan-sniw.2) — DONE 2026-07-08T19:37
+## C2 — Live /af labeled-PR E2E proof (jleechan-sniw.2) — INSUFFICIENT 2026-07-10 audit
 - [x] Daemon running as durable service with live `systemctl --user status` (active/running) evidence
 - [x] ≥2 watchdog-fed tick intervals visible (9+ consecutive tick attempts logged; daemon has run
       continuously since 2026-07-07T15:53 PDT install)
@@ -28,6 +28,14 @@ Closed jleechan-sniw.1 with evidence. Full 3-pass adversarial verdict chain in
       +262 lines src/docker_backend.rs, 9/9 CI green, written by minimax-backed factory worker
 - [x] Evidence bundle written under /tmp/dark-factory/sidekick/af-e2e/evidence/ + full narrative in
       STATE.md; [ ] independent skeptic/evidence-review pass on the bundle NOT yet done
+
+The 2026-07-10 independent audit found no `.cast` or `.mp4`, no complete
+metadata/run/methodology bundle, and no single self-created resource proven across
+intake, AO completion, current-SHA gates, terminal outcome, and cleanup. The only
+READY chain found (`ez-gh-actions-u3w`, PR #32) records `all_green=false` before
+READY with no intervening `all_green=true` event. Under the Pipeline/PR-lifecycle
+E2E evidence matrix, the current verdict is **INSUFFICIENT** and this bead remains
+open.
 Along the way, found + fixed 2 real production bugs live: jleechan-u4gb (intake dedup TOCTOU race,
 fixed via PR #192, independently adversarially verified PASS) and an AO-not-running operational gap
 (worked around live via `ao start`, no code fix filed yet). This is strong, honest partial proof —

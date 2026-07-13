@@ -9,3 +9,15 @@ slow_tick_secs = 30
 autonomy_timebox_secs = 10800
 budget_warn_usd = 20.0
 spec_dir = ".factory/specs/"
+
+# Multi-repo dispatch (Stages A-D, jleechan-35y4/bqdv/9xrs, PRs #245/#249/#250).
+# push_remote for worldarchitect.ai is "worldai", NOT "origin" -- that clone's
+# origin remote points at jleechanclaw (a different repo entirely); pushing to
+# origin for a worldai bead is the exact wrong-repo bug this stack fixes.
+[repos."jleechanorg/worldarchitect.ai"]
+ao_project = "worldarchitect"
+push_remote = "worldai"
+
+[repos."jleechanorg/dark-factory"]
+ao_project = "dark-factory"
+push_remote = "origin"

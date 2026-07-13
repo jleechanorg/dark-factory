@@ -175,6 +175,12 @@ from .handler_audit import (
     _gate_audit,
 )
 
+from .handler_fallback import (
+    _agent_spawn,
+    _agent_watchdog,
+    _agent_swap,
+)
+
 # Registries + dispatcher live at the bottom of the shim so they pick up
 # every re-exported handler above.
 from .parser import Node, is_start_node, is_exit_node
@@ -211,7 +217,11 @@ TYPE_REGISTRY: "dict[str, Handler]" = {
     "parallel": _parallel_fanout,       # fan-out type (type=parallel)
     "join": _join_handler,              # fan-in type (type=join)
     "parallel_reviewer": _parallel_reviewer,
+    "agent_spawn": _agent_spawn,
+    "agent_watchdog": _agent_watchdog,
+    "agent_swap": _agent_swap,
 }
+
 
 
 def resolve(node) -> Handler:

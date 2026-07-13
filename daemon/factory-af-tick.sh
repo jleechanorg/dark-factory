@@ -49,21 +49,23 @@ while [ "$i" -le "$#" ]; do
     i=$((i + 1))
 done
 
-# ---------- validate --prs (numeric CSV; strict regex rejects empty/trailing) ----------
+# ---------- validate --prs (numeric CSV) ----------
 if [ -n "$TARGET_PRS" ]; then
-    case "$TARGET_PRS" in
-        ''|*[!0-9,]*)
-            echo "factory-af-tick: --prs must be comma-separated numeric PR ids (got: $TARGET_PRS)" >&2
+    # shellcheck disable=SC2206
+    # Intentionally splitting by comma for strict token validation.
+    IFS=',' read -r -a __target_prs_arr <<< "$TARGET_PRS"
+    for __target_pr in "${__target_prs_arr[@]}"; do
+        if [ -z "$__target_pr" ]; then
+            echo "factory-af-tick: --prs has empty token (got: $TARGET_PRS)" >&2
             exit 2
-            ;;
-    esac
-    # Reject empty tokens (",," or leading/trailing ",") — they would produce
-    # invalid SQL like "IN (,1,2)" or "IN (1,2,)".
-    case ",${TARGET_PRS}," in
-        *,,*) echo "factory-af-tick: --prs has empty token (got: $TARGET_PRS)" >&2; exit 2 ;;
-        *,)   echo "factory-af-tick: --prs has trailing comma (got: $TARGET_PRS)" >&2; exit 2 ;;
-        ,,*)  echo "factory-af-tick: --prs has leading comma (got: $TARGET_PRS)" >&2; exit 2 ;;
-    esac
+        fi
+        case "$__target_pr" in
+            *[!0-9]*)
+                echo "factory-af-tick: --prs must be comma-separated numeric PR ids (got: $TARGET_PRS)" >&2
+                exit 2
+                ;;
+        esac
+    done
 fi
 
 # ---------- validate AFD_BEAD_FILTER (strict allowlist, single bead_id only) ----------

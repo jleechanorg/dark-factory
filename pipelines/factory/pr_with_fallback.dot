@@ -1,0 +1,102 @@
+digraph pr_with_fallback {
+    graph [
+        goal="PR validation with agent fallback."
+        level5="true"
+        label="PR Fallback Gates"
+        skip_explore="true"
+        skip_plan="true"
+        skip_implement="true"
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    spawn_agent [
+        type="agent_spawn",
+        label="Spawn Agent",
+        agent_chain="minimax:MiniMax-M3,antigravity:claude-sonnet-4-5,antigravity:gemini-2.5-flash"
+    ]
+
+    work [
+        type="codergen",
+        label="Drive PR to green",
+        prompt="@prompts/slim/evidence_review.md",
+        backend="ao",
+        timeout=1800
+    ]
+
+    watchdog [
+        type="agent_watchdog",
+        label="Watchdog Check",
+        stuck_threshold=600
+    ]
+
+    agent_swap [
+        type="agent_swap",
+        label="Swap Agent",
+        max_swaps=2
+    ]
+
+    holdout [
+        type="holdout_eval",
+        label="Holdout Eval",
+        feature="${state.feature}",
+        timeout=600
+    ]
+
+    gate_skeptic [
+        type="gate_skeptic",
+        label="Skeptic",
+        backend_priority="codex,minimax,agy,claude-sonnet",
+        timeout=600
+    ]
+
+    gate_es [
+        type="gate_es",
+        label="/es Evidence Standards",
+        timeout=600
+    ]
+
+    gate_er [
+        type="gate_er",
+        label="/er Evidence Review",
+        timeout=600
+    ]
+
+    fix [
+        type="codergen",
+        label="Fix & Iterate",
+        class="fix",
+        prompt="@prompts/slim/evidence_review.md",
+        backend="ao",
+        timeout=1800
+    ]
+
+    start -> spawn_agent
+    spawn_agent -> work
+
+    work -> watchdog
+    
+    watchdog -> holdout          [condition="outcome=success"]
+    watchdog -> agent_swap      [condition="outcome=partial"]
+    watchdog -> fix             [condition="outcome=failure"]
+    watchdog -> exit            [condition="outcome=error"]
+
+    agent_swap -> work          [condition="outcome=success"]
+    agent_swap -> exit          [condition="outcome=exhausted"]
+
+    holdout -> gate_skeptic     [condition="outcome=success"]
+    holdout -> fix              [condition="outcome!=success"]
+
+    gate_skeptic -> gate_es     [condition="outcome=success"]
+    gate_skeptic -> fix         [condition="outcome!=success"]
+
+    gate_es -> gate_er          [condition="outcome=success"]
+    gate_es -> fix              [condition="outcome!=success"]
+
+    gate_er -> exit             [condition="outcome=success"]
+    gate_er -> fix              [condition="outcome!=success"]
+
+    fix -> watchdog
+}
