@@ -71,6 +71,10 @@ struct Args {
 #[derive(Debug, Clone)]
 enum CommandMode {
     Daemon(Args),
+    RecoverHeld {
+        db: PathBuf,
+        telemetry_log: PathBuf,
+    },
     GatesCompute {
         pr: u64,
         repo: Option<String>,
@@ -81,6 +85,36 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CommandMode, Str
     let _bin_name = argv.next();
     let next_arg = argv.next();
     match next_arg.as_deref() {
+        Some("recover-held") => {
+            let mut db = None;
+            let mut telemetry_log = None;
+            while let Some(arg) = argv.next() {
+                match arg.as_str() {
+                    "--db" => {
+                        db = Some(PathBuf::from(
+                            argv.next()
+                                .ok_or_else(|| "Missing value for --db".to_string())?,
+                        ));
+                    }
+                    "--telemetry-log" => {
+                        telemetry_log = Some(PathBuf::from(
+                            argv.next().ok_or_else(|| {
+                                "Missing value for --telemetry-log".to_string()
+                            })?,
+                        ));
+                    }
+                    other => {
+                        return Err(format!("Unknown argument for recover-held: {other}"));
+                    }
+                }
+            }
+            Ok(CommandMode::RecoverHeld {
+                db: db.ok_or_else(|| "Missing required argument --db".to_string())?,
+                telemetry_log: telemetry_log.ok_or_else(|| {
+                    "Missing required argument --telemetry-log".to_string()
+                })?,
+            })
+        }
         Some("gates-compute") => {
             let mut pr = None;
             let mut repo = None;
@@ -536,6 +570,33 @@ fn run(args: Args) -> Result<(), DaemonError> {
     }
 }
 
+fn run_recover_held(db: &Path, telemetry_log: &Path) -> Result<(), DaemonError> {
+    const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
+
+    let store = SqliteStateStore::open(db)?;
+    let recovered = store.recover_human_held(MAX_HUMAN_HELD_RECOVERY_ATTEMPT)?;
+    for overlay in &recovered {
+        daemon::telemetry::emit(
+            telemetry_log,
+            &daemon::telemetry::TelemetryEvent {
+                timestamp: daemon::state::now_iso8601(),
+                bead_id: overlay.bead_id.clone(),
+                attempt_id: overlay.attempt,
+                lifecycle_state: "QUEUED".to_string(),
+                event_type: "RECOVERED_FROM_HELD".to_string(),
+                metrics: serde_json::json!({}),
+                context: serde_json::json!({
+                    "prior_state": "HUMAN_HELD",
+                    "pr_number": overlay.pr_number,
+                    "branch": overlay.branch,
+                }),
+            },
+        )?;
+    }
+    println!("recovered={}", recovered.len());
+    Ok(())
+}
+
 fn main() {
     let mode = match parse_args(std::env::args()) {
         Ok(m) => m,
@@ -555,6 +616,12 @@ fn main() {
         CommandMode::GatesCompute { pr, repo } => {
             if let Err(e) = daemon::gates_compute::run_gates_compute(pr, repo) {
                 eprintln!("auto-factory daemon: gates-compute error: {e}");
+                std::process::exit(1);
+            }
+        }
+        CommandMode::RecoverHeld { db, telemetry_log } => {
+            if let Err(e) = run_recover_held(&db, &telemetry_log) {
+                eprintln!("auto-factory daemon: recover-held error: {e}");
                 std::process::exit(1);
             }
         }
@@ -711,6 +778,41 @@ mod tests {
                 assert_eq!(repo, None);
             }
             _ => panic!("Expected GatesCompute mode"),
+        }
+    }
+
+    #[test]
+    fn parse_args_recognizes_recover_held_paths() {
+        let argv = vec![
+            "daemon".to_string(),
+            "recover-held".to_string(),
+            "--db".to_string(),
+            "/tmp/recovery.sqlite".to_string(),
+            "--telemetry-log".to_string(),
+            "/tmp/recovery.jsonl".to_string(),
+        ];
+        let mode = parse_args(argv.into_iter()).unwrap();
+        match mode {
+            CommandMode::RecoverHeld { db, telemetry_log } => {
+                assert_eq!(db, PathBuf::from("/tmp/recovery.sqlite"));
+                assert_eq!(telemetry_log, PathBuf::from("/tmp/recovery.jsonl"));
+            }
+            _ => panic!("expected RecoverHeld mode"),
+        }
+    }
+
+    #[test]
+    fn parse_args_recover_held_requires_db_and_telemetry_paths() {
+        for argv in [
+            vec!["daemon".to_string(), "recover-held".to_string()],
+            vec![
+                "daemon".to_string(),
+                "recover-held".to_string(),
+                "--db".to_string(),
+                "/tmp/recovery.sqlite".to_string(),
+            ],
+        ] {
+            assert!(parse_args(argv.into_iter()).is_err());
         }
     }
 

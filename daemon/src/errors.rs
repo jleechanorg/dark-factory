@@ -16,6 +16,13 @@ pub enum DaemonError {
     Timeout(String),
     #[error("config: {0}")]
     Config(String),
+    #[error("no AO session currently tracks branch {branch:?} for bead {bead_id}")]
+    SessionNotFound { branch: String, bead_id: String },
+    #[error("AO session rows for branch {branch:?} are ambiguous: {sessions:?}")]
+    SessionAmbiguous {
+        branch: String,
+        sessions: Vec<String>,
+    },
     /// `ao spawn` declined to synchronously create a session and instead
     /// enqueued a deferred `SpawnRequest` (its own internal admission-control
     /// queue, hit when a project's active-session count is at/above AO's

@@ -8,8 +8,10 @@
 #![allow(dead_code)]
 
 use daemon::errors::DaemonError;
-use daemon::state::{BeadOverlay, OverlayState, StateStore};
-use daemon::state::is_permanent_human_hold_reason;
+use daemon::state::{
+    is_permanent_human_hold_reason, set_human_hold_reason, BeadOverlay, HumanHoldReason,
+    OverlayState, StateStore,
+};
 use daemon::tools::{
     Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec,
     Tracker, Vcs,
@@ -252,6 +254,7 @@ pub struct FakeSessions {
     pub next_session_id: String,
     pub quiescent: bool,
     pub fail_spawn_for: RefCell<Vec<String>>,
+    pub panic_after_spawn_for: RefCell<Vec<String>>,
     pub fail_spawn_cleanup_for: RefCell<Vec<String>>,
     pub fail_stop_for: RefCell<Vec<String>>,
     // jleechan-w28n: scripted `DaemonError::Deferred` spawn outcome — AO's
@@ -291,6 +294,7 @@ impl Default for FakeSessions {
             next_session_id: "fake-session-1".into(),
             quiescent: true,
             fail_spawn_for: RefCell::new(Vec::new()),
+            panic_after_spawn_for: RefCell::new(Vec::new()),
             fail_spawn_cleanup_for: RefCell::new(Vec::new()),
             fail_stop_for: RefCell::new(Vec::new()),
             fail_spawn_deferred_for: RefCell::new(Vec::new()),
@@ -311,6 +315,12 @@ impl FakeSessions {
 
     pub fn fail_spawn_for(&self, bead_id: &str) {
         self.fail_spawn_for.borrow_mut().push(bead_id.to_string());
+    }
+
+    pub fn panic_after_spawn_for(&self, bead_id: &str) {
+        self.panic_after_spawn_for
+            .borrow_mut()
+            .push(bead_id.to_string());
     }
 
     pub fn fail_spawn_cleanup_for(&self, bead_id: &str) {
@@ -372,6 +382,9 @@ impl Sessions for FakeSessions {
         self.calls
             .borrow_mut()
             .push(format!("spawn({})", spec.bead_id));
+        if self.panic_after_spawn_for.borrow().contains(&spec.bead_id) {
+            panic!("scripted process death after external spawn for {}", spec.bead_id);
+        }
         if self.fail_spawn_for.borrow().contains(&spec.bead_id) {
             return Err(DaemonError::Tool {
                 tool: "ao".into(),
@@ -721,6 +734,16 @@ impl FakeStateStore {
 }
 
 impl StateStore for FakeStateStore {
+    fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
+        for overlay in self.overlays.borrow_mut().values_mut() {
+            if overlay.state == OverlayState::Dispatching {
+                overlay.state = OverlayState::HumanHeld;
+                set_human_hold_reason(overlay, HumanHoldReason::AmbiguousDispatchingRecovery);
+            }
+        }
+        Ok(())
+    }
+
     fn load(&self, bead_id: &str) -> Result<Option<BeadOverlay>, DaemonError> {
         self.calls.borrow_mut().push(format!("load({bead_id})"));
         Ok(self.overlays.borrow().get(bead_id).cloned())

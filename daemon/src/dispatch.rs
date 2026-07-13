@@ -7,9 +7,12 @@
 use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::router::RoutingVerdict;
-use crate::state::{BeadOverlay, OverlayState, StateStore};
+use crate::state::{
+    set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
+};
 use crate::tools::{remote_url_for_display, remote_url_matches_repo, Bead, Sessions, SpawnSpec};
 
+#[cfg(test)]
 const SPAWN_CLEANUP_FAILED_PARK_REASON: &str = "spawn_cleanup_failed";
 
 fn record_spawn_cleanup_failure(
@@ -24,7 +27,7 @@ fn record_spawn_cleanup_failure(
     // startup reconciliation would blindly requeue.
     overlay.state = OverlayState::HumanHeld;
     overlay.session_id = Some(session_id.0.clone());
-    overlay.park_reason = Some(SPAWN_CLEANUP_FAILED_PARK_REASON.to_string());
+    set_human_hold_reason(overlay, HumanHoldReason::SpawnCleanupFailed);
     let cleanup_error = match store.save(overlay) {
         Ok(()) => cleanup_error,
         Err(state_error) => DaemonError::Config(format!(
@@ -207,7 +210,7 @@ pub fn dispatch_ready(
             Some(routing) => routing,
             None => {
                 overlay.state = OverlayState::HumanHeld;
-                overlay.park_reason = Some("unmapped_target_repo".to_string());
+                set_human_hold_reason(&mut overlay, HumanHoldReason::UnmappedTargetRepo);
                 if let Err(err) = store.save(&overlay) {
                     if err.is_transient() {
                         report.failures.push(failure(
@@ -318,7 +321,7 @@ pub fn dispatch_ready(
                 };
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = Some(session.clone());
-                overlay.park_reason = Some(SPAWN_CLEANUP_FAILED_PARK_REASON.to_string());
+                set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnCleanupFailed);
                 if let Err(state_error) = store.save(&overlay) {
                     return Err(DaemonError::SpawnCleanupFailed {
                         session,
@@ -381,7 +384,10 @@ pub fn dispatch_ready(
                     // has no `Tracker`/`Scm` access by design — see the
                     // module doc comment).
                     overlay.state = OverlayState::HumanHeld;
-                    overlay.park_reason = Some("transient_spawn_retry_cap_exceeded".to_string());
+                    set_human_hold_reason(
+                        &mut overlay,
+                        HumanHoldReason::TransientSpawnRetryCapExceeded,
+                    );
                     store.save(&overlay)?;
                     report.failures.push(failure(
                         bead,
@@ -435,7 +441,7 @@ pub fn dispatch_ready(
                 }
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
-                overlay.park_reason = Some("spawn_branch_mismatch".to_string());
+                set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnBranchMismatch);
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
@@ -487,7 +493,10 @@ pub fn dispatch_ready(
                 }
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
-                overlay.park_reason = Some("worktree_remote_unverifiable".to_string());
+                set_human_hold_reason(
+                    &mut overlay,
+                    HumanHoldReason::WorktreeRemoteUnverifiable,
+                );
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
@@ -529,7 +538,7 @@ pub fn dispatch_ready(
             }
             overlay.state = OverlayState::HumanHeld;
             overlay.session_id = None;
-            overlay.park_reason = Some("worktree_remote_mismatch".to_string());
+            set_human_hold_reason(&mut overlay, HumanHoldReason::WorktreeRemoteMismatch);
             store.save(&overlay)?;
             report.failures.push(failure(
                 bead,

@@ -191,8 +191,9 @@ pub trait StateStore {
         // loop depended on for the budget-warning crossing check.
         self.list_active_overlays()
     }
-    /// Requeue every `HUMAN_HELD` bead whose attempt is below `max_attempt`
-    /// back to `QUEUED`, incrementing `attempt` and zeroing `autonomy_secs`.
+    /// Requeue only explicitly retry-safe `HUMAN_HELD` beads below
+    /// `max_attempt` whose durable session handle is clear. Unknown, legacy,
+    /// permanent, and possibly-live-session holds fail closed.
     /// Returns the recovered overlays so the caller can emit telemetry.
     /// This is the Rust port of the shell overlay's `recover-held`
     /// (daemon/factory-overlay.sh:319), and the fix for jleechan-gib's
@@ -256,7 +257,7 @@ fn tool_err(op: &str, e: rusqlite::Error) -> DaemonError {
     }
 }
 
-fn now_iso8601() -> String {
+pub fn now_iso8601() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -270,35 +271,102 @@ fn now_iso8601() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-const RECOVERABLE_HUMAN_HOLD_REASONS: &[&str] = &[
-    "transient_spawn_retry_cap_exceeded",
-    "adopted_pre_session_sha_capture_failed",
-    "session_stalled",
-    "gate assessment not all-green (stage 1: recorded, not executed)",
-    "spec file validation failed in recovery",
-];
+pub const CIRCUIT_BREAKER_PARK_REASON: &str =
+    "circuit-breaker triggered: same reviewer and feedback hash as prior attempt";
 
-const PERMANENT_HUMAN_HOLD_REASONS: &[&str] = &[
-    "unmapped_target_repo",
-    "worktree_remote_mismatch",
-    "worktree_remote_unverifiable",
-    "spawn_cleanup_failed",
-    "spawn_branch_mismatch",
-    "ambiguous_dispatching_recovery",
-    "autonomy_timebox_exceeded",
-    "adopted_branch_history_rewrite_detected",
-    "adopted_branch_append_only_check_failed",
-    "session_branch_mismatch",
-    "coder_silent",
-    "reroll_session_attach_failed",
-    "reroll_session_stop_failed",
-    "reroll_quiescence_check_failed",
-    "reroll_quiescence_timeout",
-    "adopted_missing_branch",
-    "adopted_quiescence_check_failed",
-    "adopted_spawn_failed",
-    "unknown_only_gate_report_with_er_runner_capped",
-];
+pub enum HumanHoldReason {
+    TransientSpawnRetryCapExceeded,
+    AdoptedPreSessionShaCaptureFailed,
+    SessionStalled,
+    Stage1GateNotGreen,
+    SpecValidationFailed,
+    RouterParse(String),
+    UnmappedTargetRepo,
+    WorktreeRemoteMismatch,
+    WorktreeRemoteUnverifiable,
+    SpawnCleanupFailed,
+    SpawnBranchMismatch,
+    AmbiguousDispatchingRecovery,
+    AutonomyTimeboxExceeded,
+    AdoptedBranchHistoryRewriteDetected,
+    AdoptedBranchAppendOnlyCheckFailed,
+    SessionBranchMismatch,
+    CoderSilent,
+    RerollSessionAttachFailed,
+    RerollSessionStopFailed,
+    RerollQuiescenceCheckFailed,
+    RerollQuiescenceTimeout,
+    AdoptedMissingBranch,
+    AdoptedQuiescenceCheckFailed,
+    AdoptedSessionAttachFailed,
+    AdoptedSessionAlreadyActive,
+    AdoptedSpawnFailed,
+    UnknownOnlyGateCapped,
+    CircuitBreaker,
+    EscalationLocalFallback(String),
+}
+
+impl HumanHoldReason {
+    pub fn value(&self) -> String {
+        match self {
+            Self::TransientSpawnRetryCapExceeded => "transient_spawn_retry_cap_exceeded",
+            Self::AdoptedPreSessionShaCaptureFailed => "adopted_pre_session_sha_capture_failed",
+            Self::SessionStalled => "session_stalled",
+            Self::Stage1GateNotGreen => {
+                "gate assessment not all-green (stage 1: recorded, not executed)"
+            }
+            Self::SpecValidationFailed => "spec file validation failed in recovery",
+            Self::RouterParse(reason) => return format!("router_parse_error: {reason}"),
+            Self::UnmappedTargetRepo => "unmapped_target_repo",
+            Self::WorktreeRemoteMismatch => "worktree_remote_mismatch",
+            Self::WorktreeRemoteUnverifiable => "worktree_remote_unverifiable",
+            Self::SpawnCleanupFailed => "spawn_cleanup_failed",
+            Self::SpawnBranchMismatch => "spawn_branch_mismatch",
+            Self::AmbiguousDispatchingRecovery => "ambiguous_dispatching_recovery",
+            Self::AutonomyTimeboxExceeded => "autonomy_timebox_exceeded",
+            Self::AdoptedBranchHistoryRewriteDetected => {
+                "adopted_branch_history_rewrite_detected"
+            }
+            Self::AdoptedBranchAppendOnlyCheckFailed => {
+                "adopted_branch_append_only_check_failed"
+            }
+            Self::SessionBranchMismatch => "session_branch_mismatch",
+            Self::CoderSilent => "coder_silent",
+            Self::RerollSessionAttachFailed => "reroll_session_attach_failed",
+            Self::RerollSessionStopFailed => "reroll_session_stop_failed",
+            Self::RerollQuiescenceCheckFailed => "reroll_quiescence_check_failed",
+            Self::RerollQuiescenceTimeout => "reroll_quiescence_timeout",
+            Self::AdoptedMissingBranch => "adopted_missing_branch",
+            Self::AdoptedQuiescenceCheckFailed => "adopted_quiescence_check_failed",
+            Self::AdoptedSessionAttachFailed => "adopted_session_attach_failed",
+            Self::AdoptedSessionAlreadyActive => "adopted_session_already_active",
+            Self::AdoptedSpawnFailed => "adopted_spawn_failed",
+            Self::UnknownOnlyGateCapped => "unknown_only_gate_report_with_er_runner_capped",
+            Self::CircuitBreaker => CIRCUIT_BREAKER_PARK_REASON,
+            Self::EscalationLocalFallback(reason) => {
+                return format!("escalation_local_fallback:{reason}");
+            }
+        }
+        .to_string()
+    }
+
+    fn is_recoverable_value(reason: &str) -> bool {
+        [
+            Self::TransientSpawnRetryCapExceeded,
+            Self::AdoptedPreSessionShaCaptureFailed,
+            Self::SessionStalled,
+            Self::Stage1GateNotGreen,
+            Self::SpecValidationFailed,
+        ]
+        .iter()
+        .any(|candidate| candidate.value() == reason)
+            || reason.starts_with("router_parse_error:")
+    }
+}
+
+pub fn set_human_hold_reason(overlay: &mut BeadOverlay, reason: HumanHoldReason) {
+    overlay.park_reason = Some(reason.value());
+}
 
 /// Human-held recovery is an allow-list, not a best-effort retry policy.
 /// Unknown and legacy NULL reasons fail closed. Even a declared recoverable
@@ -306,31 +374,7 @@ const PERMANENT_HUMAN_HOLD_REASONS: &[&str] = &[
 /// the park transition must clear that handle in the same save after positive
 /// no-spawn/terminal evidence.
 pub fn is_permanent_human_hold_reason(reason: Option<&str>) -> bool {
-    match reason {
-        Some(reason)
-            if RECOVERABLE_HUMAN_HOLD_REASONS.contains(&reason)
-                || reason.starts_with("router_parse_error:") =>
-        {
-            false
-        }
-        Some(reason)
-            if PERMANENT_HUMAN_HOLD_REASONS.contains(&reason)
-                || reason.starts_with("circuit-breaker")
-                || reason.starts_with("escalation_local_fallback:") =>
-        {
-            true
-        }
-        Some(_) | None => true,
-    }
-}
-
-#[cfg(test)]
-fn is_known_human_hold_reason(reason: &str) -> bool {
-    RECOVERABLE_HUMAN_HOLD_REASONS.contains(&reason)
-        || PERMANENT_HUMAN_HOLD_REASONS.contains(&reason)
-        || reason.starts_with("router_parse_error:")
-        || reason.starts_with("circuit-breaker")
-        || reason.starts_with("escalation_local_fallback:")
+    !reason.is_some_and(HumanHoldReason::is_recoverable_value)
 }
 
 /// Howard Hinnant's civil_from_days algorithm (public domain), days since epoch -> (y, m, d).
@@ -625,12 +669,13 @@ impl SqliteStateStore {
 
 impl StateStore for SqliteStateStore {
     fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
+        let reason = HumanHoldReason::AmbiguousDispatchingRecovery.value();
         self.conn
             .execute(
                 "UPDATE bead_overlay \
-                 SET state = 'HUMAN_HELD', park_reason = 'ambiguous_dispatching_recovery' \
+                 SET state = 'HUMAN_HELD', park_reason = ?1 \
                  WHERE state = 'DISPATCHING'",
-                [],
+                params![reason],
             )
             .map_err(|e| tool_err("reconcile_dispatching", e))?;
         Ok(())
@@ -1125,46 +1170,42 @@ mod tests {
     }
 
     #[test]
-    fn every_production_park_reason_is_declared_in_the_recovery_policy() {
+    fn every_production_park_reason_flows_through_the_typed_policy() {
+        let mut production_code = String::new();
         for (file, source) in [
             ("dispatch.rs", include_str!("dispatch.rs")),
             ("reroll.rs", include_str!("reroll.rs")),
             ("tick.rs", include_str!("tick.rs")),
             ("state.rs", include_str!("state.rs")),
-        ] {
-            let mut remainder = source
+            ] {
+            let production = source
                 .split("\n#[cfg(test)]\nmod tests")
                 .next()
                 .unwrap_or(source);
-            while let Some(index) = remainder.find(".park_reason =") {
-                remainder = &remainder[index + ".park_reason =".len()..];
-                let assignment = remainder.split(';').next().unwrap_or(remainder).trim();
-                if assignment.starts_with("None") {
+            production_code.push_str(file);
+            for line in production.lines() {
+                if line.trim_start().starts_with("//") {
                     continue;
                 }
-                let reason = if assignment.contains("CIRCUIT_BREAKER_PARK_REASON") {
-                    crate::reroll::CIRCUIT_BREAKER_PARK_REASON
-                } else if assignment.contains("SPAWN_CLEANUP_FAILED_PARK_REASON") {
-                    "spawn_cleanup_failed"
-                } else if assignment.contains("ESCALATION_LOCAL_FALLBACK_PARK_REASON_PREFIX") {
-                    "escalation_local_fallback:"
-                } else {
-                    let start = assignment.find('"').unwrap_or_else(|| {
-                        panic!("{file}: unaudited dynamic park_reason assignment: {assignment}")
-                    }) + 1;
-                    let tail = &assignment[start..];
-                    let end = tail.find('"').unwrap_or_else(|| {
-                        panic!("{file}: unterminated park_reason assignment: {assignment}")
-                    });
-                    &tail[..end]
-                };
-                assert!(
-                    is_known_human_hold_reason(reason),
-                    "{file}: park_reason {reason:?} is missing from the canonical recovery policy"
-                );
+                production_code.extend(line.chars().filter(|character| !character.is_whitespace()));
             }
         }
 
+        assert_eq!(
+            production_code.matches(".park_reason=Some").count(),
+            1,
+            "only set_human_hold_reason may directly assign Some"
+        );
+        assert_eq!(
+            production_code.matches("park_reason:Some").count(),
+            0,
+            "production constructors must not bypass the typed policy"
+        );
+        assert_eq!(
+            production_code.matches("park_reason='").count(),
+            0,
+            "production SQL must bind typed policy values"
+        );
         assert!(is_permanent_human_hold_reason(None));
         assert!(is_permanent_human_hold_reason(Some("future_unknown_reason")));
     }
@@ -1535,11 +1576,9 @@ mod tests {
         assert_eq!(last_col, 1);
     }
 
-    /// jleechan-gib: the real-SQLite `recover_human_held` requeues every
-    /// HUMAN_HELD row under the cap and leaves HUMAN_HELD rows at/above the
-    /// cap alone. Mirrors the shell overlay's
-    /// `recover-held` (daemon/factory-overlay.sh:319-333) exactly so the
-    /// Rust tick can replace the shell caller.
+    /// The real-SQLite policy requeues only retry-safe no-session rows under
+    /// the cap and leaves capped or permanent rows held. The shell command
+    /// delegates to this implementation so there is one recovery policy.
     #[test]
     fn recover_human_held_requeues_below_cap_leaves_at_or_above_alone() {
         let schema = include_str!("../contracts/schema.sql");

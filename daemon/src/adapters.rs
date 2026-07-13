@@ -3099,19 +3099,7 @@ impl Sessions for CliSessions {
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
         })?;
-        if let Some(arr) = data.as_array() {
-            for entry in arr {
-                if entry.get("branch").and_then(|v| v.as_str()) == Some(branch) {
-                    if let Some(name) = entry.get("name").and_then(|v| v.as_str()) {
-                        return Ok(SessionId(name.to_string()));
-                    }
-                }
-            }
-        }
-        Err(DaemonError::Config(format!(
-            "attach: no ao session currently tracks branch '{branch}' (bead {bead_id}); \
-             it may have already exited, been reaped, or never been spawned"
-        )))
+        session_for_branch(&data, branch, bead_id)
     }
 
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
@@ -3245,6 +3233,70 @@ fn session_is_quiescent(
         .is_some_and(is_terminal_ao_session))
 }
 
+fn session_for_branch(
+    data: &serde_json::Value,
+    branch: &str,
+    bead_id: &str,
+) -> Result<SessionId, DaemonError> {
+    let sessions = data
+        .as_array()
+        .ok_or_else(|| DaemonError::Parse("ao status JSON must be an array".to_string()))?;
+    let matching: Vec<&serde_json::Value> = sessions
+        .iter()
+        .filter(|entry| entry.get("branch").and_then(|value| value.as_str()) == Some(branch))
+        .collect();
+    if matching
+        .iter()
+        .any(|entry| entry.get("name").and_then(|value| value.as_str()).is_none())
+    {
+        return Err(DaemonError::SessionAmbiguous {
+            branch: branch.to_string(),
+            sessions: vec!["<missing-name>".to_string()],
+        });
+    }
+    let active: Vec<String> = matching
+        .iter()
+        .filter(|entry| !is_terminal_ao_session(entry))
+        .filter_map(|entry| {
+            entry
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    match active.as_slice() {
+        [name] => return Ok(SessionId(name.clone())),
+        [] => {}
+        _ => {
+            return Err(DaemonError::SessionAmbiguous {
+                branch: branch.to_string(),
+                sessions: active,
+            });
+        }
+    }
+
+    let terminal: Vec<String> = matching
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    match terminal.as_slice() {
+        [name] => Ok(SessionId(name.clone())),
+        [] => Err(DaemonError::SessionNotFound {
+            branch: branch.to_string(),
+            bead_id: bead_id.to_string(),
+        }),
+        _ => Err(DaemonError::SessionAmbiguous {
+            branch: branch.to_string(),
+            sessions: terminal,
+        }),
+    }
+}
+
 fn active_session_count(data: &serde_json::Value) -> Result<usize, DaemonError> {
     let sessions = data
         .as_array()
@@ -3261,7 +3313,7 @@ fn active_session_count(data: &serde_json::Value) -> Result<usize, DaemonError> 
 
 #[cfg(test)]
 mod active_session_count_tests {
-    use super::{active_session_count, session_is_quiescent};
+    use super::{active_session_count, session_for_branch, session_is_quiescent};
     use crate::tools::SessionId;
 
     #[test]
@@ -3298,6 +3350,27 @@ mod active_session_count_tests {
         assert!(session_is_quiescent(&status, &SessionId("exited".into())).unwrap());
         assert!(session_is_quiescent(&status, &SessionId("done".into())).unwrap());
         assert!(session_is_quiescent(&serde_json::json!({}), &SessionId("x".into())).is_err());
+    }
+
+    #[test]
+    fn branch_lookup_prefers_the_unique_active_row_over_older_terminal_history() {
+        let status = serde_json::json!([
+            {"name": "old", "branch": "feat/shared", "status": "done", "activity": "exited"},
+            {"name": "current", "branch": "feat/shared", "status": "working", "activity": "ready"}
+        ]);
+        assert_eq!(
+            session_for_branch(&status, "feat/shared", "bead").unwrap().0,
+            "current"
+        );
+
+        let ambiguous = serde_json::json!([
+            {"name": "a", "branch": "feat/shared", "status": "working", "activity": "ready"},
+            {"name": "b", "branch": "feat/shared", "status": "working", "activity": "working"}
+        ]);
+        assert!(matches!(
+            session_for_branch(&ambiguous, "feat/shared", "bead"),
+            Err(crate::errors::DaemonError::SessionAmbiguous { .. })
+        ));
     }
 }
 
