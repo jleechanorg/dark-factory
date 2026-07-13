@@ -197,7 +197,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
                     let (owner, repo) = bead_repo
                         .split_once('/')
                         .unwrap_or(("unknown_owner", "unknown_repo"));
-                    let healer_scope = format!("{}:{}:{}", owner, repo, &bead.bead_id);
+                    let healer_scope = format!("{}:{}:{}", owner, repo, bead.bead_id);
 
                     let healer_report = format!(
                         "# Healer Report\n\n                     Circuit-breaker triggered for bead {} (scope: {}).\n                     Consecutive re-roll rejections by the same reviewer ({}) citing the same semantic reason:\n\n                     \"\"\"\n                     {}\n                     \"\"\"\n",

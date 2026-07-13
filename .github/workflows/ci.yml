@@ -52,15 +52,20 @@ jobs:
         # add its lib/ dir to LD_LIBRARY_PATH. When tests spawn python as a
         # subprocess (e.g. test_preflight.py, test_structural_preflight.py),
         # the dynamic linker cannot find libpython3.13.so.1.0 and returns rc=127.
-        # This step appends the toolcache lib dir to LD_LIBRARY_PATH so that
-        # subprocess invocations of the same python binary find the shared lib.
+        # This step locates the shared library under the Python prefix and adds
+        # its directory to LD_LIBRARY_PATH so subsequent subprocess invocations
+        # of the same python binary can find it.
         run: |
-          PY_LIB="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"
-          if [ -n "$PY_LIB" ] && [ -d "$PY_LIB" ]; then
-            echo "LD_LIBRARY_PATH=${PY_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-            echo "Appended $PY_LIB to LD_LIBRARY_PATH"
+          PY_PREFIX="$(python3 -c 'import sys; print(sys.prefix)')"
+          # Search for libpython*.so* under the prefix; take the first match's dir.
+          SO_PATH="$(find "$PY_PREFIX" -maxdepth 4 -name 'libpython*.so*' -not -name '*.py' 2>/dev/null | head -1)"
+          if [ -n "$SO_PATH" ]; then
+            SO_DIR="$(dirname "$SO_PATH")"
+            echo "Found $SO_PATH in $SO_DIR"
+            echo "LD_LIBRARY_PATH=${SO_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+            echo "Appended $SO_DIR to LD_LIBRARY_PATH"
           else
-            echo "::warning::Could not determine Python LIBDIR — subprocess python may fail to load libpython3.13"
+            echo "::warning::libpython*.so* not found under $PY_PREFIX — subprocess python may fail to load libpython3.13"
           fi
 
       - name: Detect runner platform (Linux-only isolation tests)
