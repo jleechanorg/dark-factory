@@ -73,11 +73,14 @@ jobs:
       - name: Set up Rust toolchain (pinned user-scope)
         # Self-hosted runners may not have cargo/rustup pre-installed.
         # Install rustup with stable toolchain user-scope (no sudo).
+        # GITHUB_PATH only affects subsequent steps; export PATH immediately
+        # so rustup/cargo/rustc are visible within this same step.
         # See bead jleechan-u2es.
         run: |
           if ! command -v rustup >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            source "$HOME/.cargo/env"
           fi
           rustup show
           cargo --version
