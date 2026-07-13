@@ -48,24 +48,35 @@ jobs:
           pip install -r requirements.txt pytest
 
       - name: Fix Python 3.13 shared-library path (self-hosted runners)
-        # actions/setup-python installs Python 3.13 under _tool/ but does NOT
-        # add its lib/ dir to LD_LIBRARY_PATH. When tests spawn python as a
-        # subprocess (e.g. test_preflight.py, test_structural_preflight.py),
-        # the dynamic linker cannot find libpython3.13.so.1.0 and returns rc=127.
-        # This step locates the shared library under the Python prefix and adds
-        # its directory to LD_LIBRARY_PATH so subsequent subprocess invocations
-        # of the same python binary can find it.
+        # actions/setup-python installs Python 3.13 under _tool/ but the
+        # toolcache build ships libpython3.13.so WITHOUT the versioned soname
+        # symlink (libpython3.13.so.1.0). The dynamic linker looks for the
+        # versioned soname and fails with rc=127 when tests spawn python as a
+        # subprocess (test_preflight.py, test_structural_preflight.py, etc.).
+        # Fix: locate the unversioned .so, add its dir to LD_LIBRARY_PATH,
+        # and create the missing versioned soname symlink in the same dir.
         run: |
           PY_PREFIX="$(python3 -c 'import sys; print(sys.prefix)')"
-          # Search for libpython*.so* under the prefix; take the first match's dir.
-          SO_PATH="$(find "$PY_PREFIX" -maxdepth 4 -name 'libpython*.so*' -not -name '*.py' 2>/dev/null | head -1)"
+          # Find the unversioned libpython3.13.so (not the .1.0 versioned one).
+          SO_PATH="$(find "$PY_PREFIX" -maxdepth 4 -name 'libpython*.so' -not -name '*.so.*' 2>/dev/null | head -1)"
           if [ -n "$SO_PATH" ]; then
             SO_DIR="$(dirname "$SO_PATH")"
-            echo "Found $SO_PATH in $SO_DIR"
+            SO_NAME="$(basename "$SO_PATH")"
+            # Add the dir to LD_LIBRARY_PATH for subprocess python invocations.
             echo "LD_LIBRARY_PATH=${SO_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-            echo "Appended $SO_DIR to LD_LIBRARY_PATH"
+            echo "Found $SO_PATH — LD_LIBRARY_PATH updated"
+            # Create the versioned soname symlink if it does not already exist.
+            # The dynamic linker uses the soname (libpython3.13.so.1.0) not the
+            # link-time name (libpython3.13.so), so both must be resolvable.
+            VERSIONED="${SO_NAME%.so}.so.1.0"
+            if [ ! -e "${SO_DIR}/${VERSIONED}" ]; then
+              ln -s "$SO_NAME" "${SO_DIR}/${VERSIONED}"
+              echo "Created symlink ${SO_DIR}/${VERSIONED} -> ${SO_NAME}"
+            else
+              echo "Versioned symlink ${SO_DIR}/${VERSIONED} already exists"
+            fi
           else
-            echo "::warning::libpython*.so* not found under $PY_PREFIX — subprocess python may fail to load libpython3.13"
+            echo "::warning::libpython3.13.so not found under $PY_PREFIX — subprocess python may fail with rc=127"
           fi
 
       - name: Detect runner platform (Linux-only isolation tests)
