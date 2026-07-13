@@ -306,6 +306,31 @@ pub fn dispatch_ready(
         };
         let session_id = match sessions.spawn(&spec) {
             Ok(session_id) => session_id,
+            // The adapter can discover a live session and then fail its own
+            // mandatory cleanup before it can return `Ok(SessionId)`. Unlike
+            // an ordinary fatal spawn error, this variant carries the known
+            // live session identity. Persist it immediately so startup's
+            // DISPATCHING reconciliation cannot erase it and requeue a
+            // duplicate worker.
+            Err(err @ DaemonError::SpawnCleanupFailed { .. }) => {
+                let session = match &err {
+                    DaemonError::SpawnCleanupFailed { session, .. } => session.clone(),
+                    _ => unreachable!(),
+                };
+                overlay.state = OverlayState::HumanHeld;
+                overlay.session_id = Some(session.clone());
+                overlay.park_reason = Some(SPAWN_CLEANUP_FAILED_PARK_REASON.to_string());
+                if let Err(state_error) = store.save(&overlay) {
+                    return Err(DaemonError::SpawnCleanupFailed {
+                        session,
+                        spawn_error: Box::new(err),
+                        cleanup_error: Box::new(DaemonError::Config(format!(
+                            "failed to persist HUMAN_HELD cleanup record: {state_error}"
+                        ))),
+                    });
+                }
+                return Err(err);
+            }
             // jleechan-w28n: AO's own admission-control queue (session-cap
             // backpressure — see `DaemonError::Deferred`'s doc comment) is
             // NOT a failure and must never share `spawn_failure_count` with
@@ -816,6 +841,7 @@ mod tests {
         // reflects what `CliSessions::spawn` actually returns once a
         // fallback chain is exhausted.
         fail_spawn_fallback_exhausted_deferred_for: RefCell<Vec<String>>,
+        fail_spawn_cleanup_for: RefCell<Vec<String>>,
         fail_stop_for: RefCell<Vec<String>>,
         // jleechan-5ia2: scripted `session_branch` override, keyed by
         // session id. Empty by default (matches the trait's `Ok(None)`
@@ -859,6 +885,7 @@ mod tests {
                 fail_spawn_fatal_for: RefCell::new(Vec::new()),
                 fail_spawn_deferred_for: RefCell::new(Vec::new()),
                 fail_spawn_fallback_exhausted_deferred_for: RefCell::new(Vec::new()),
+                fail_spawn_cleanup_for: RefCell::new(Vec::new()),
                 fail_stop_for: RefCell::new(Vec::new()),
                 scripted_branch: RefCell::new(HashMap::new()),
                 spawn_prompts: RefCell::new(Vec::new()),
@@ -884,6 +911,12 @@ mod tests {
 
         fn fail_spawn_fallback_exhausted_deferred_for(&self, bead_id: &str) {
             self.fail_spawn_fallback_exhausted_deferred_for
+                .borrow_mut()
+                .push(bead_id.to_string());
+        }
+
+        fn fail_spawn_cleanup_for(&self, bead_id: &str) {
+            self.fail_spawn_cleanup_for
                 .borrow_mut()
                 .push(bead_id.to_string());
         }
@@ -928,6 +961,19 @@ mod tests {
                     "scripted fatal spawn failure for {}",
                     spec.bead_id
                 )));
+            }
+            if self.fail_spawn_cleanup_for.borrow().contains(&spec.bead_id) {
+                return Err(DaemonError::SpawnCleanupFailed {
+                    session: "fake-leaked-session".to_string(),
+                    spawn_error: Box::new(DaemonError::Parse(
+                        "spawn returned SESSION without Worktree".to_string(),
+                    )),
+                    cleanup_error: Box::new(DaemonError::Tool {
+                        tool: "ao session kill".to_string(),
+                        rc: 8,
+                        stderr: "scripted kill failure".to_string(),
+                    }),
+                });
             }
             if self.fail_spawn_for.borrow().contains(&spec.bead_id) {
                 return Err(DaemonError::Tool {
@@ -1793,6 +1839,38 @@ mod tests {
         let calls = sessions.calls.borrow();
         assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
         assert!(!calls.iter().any(|c| c == "spawn(bead-1)"));
+    }
+
+    #[test]
+    fn adapter_cleanup_failure_persists_live_session_before_fatal_return() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_cleanup_for("bead-0");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        assert!(!err.is_transient());
+        let bead_0 = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(bead_0.state, OverlayState::HumanHeld);
+        assert_eq!(bead_0.session_id.as_deref(), Some("fake-leaked-session"));
+        assert_eq!(bead_0.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(
+            bead_0.park_reason.as_deref(),
+            Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
+        );
+        assert!(
+            store.load("bead-1").unwrap().is_none(),
+            "a second bead must not spawn after cleanup failure"
+        );
+        let calls = sessions.calls.borrow();
+        assert_eq!(
+            calls.iter().filter(|call| *call == "spawn(bead-0)").count(),
+            1
+        );
+        assert!(!calls.iter().any(|call| call == "spawn(bead-1)"));
     }
 
     #[test]

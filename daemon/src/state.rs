@@ -1152,6 +1152,36 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_dispatching_preserves_cleanup_failure_hold_and_live_session() {
+        let s = store();
+        let o = BeadOverlay {
+            bead_id: "cleanup-held".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/cleanup-held-r1".into()),
+            session_id: Some("known-live-session".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: Some("spawn_cleanup_failed".into()),
+            target_repo: None,
+        };
+
+        s.save(&o).unwrap();
+        s.reconcile_dispatching().unwrap();
+
+        let got = s.load("cleanup-held").unwrap().unwrap();
+        assert_eq!(got.state, OverlayState::HumanHeld);
+        assert_eq!(got.session_id.as_deref(), Some("known-live-session"));
+        assert_eq!(got.branch.as_deref(), Some("factory/cleanup-held-r1"));
+        assert_eq!(got.park_reason.as_deref(), Some("spawn_cleanup_failed"));
+    }
+
+    #[test]
     fn illegal_state_string_rejected_by_schema() {
         let s = store();
         let r = s.conn.execute(
