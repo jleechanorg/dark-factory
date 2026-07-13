@@ -396,9 +396,14 @@ pub fn dispatch_ready(
         // is fatal (propagated via `?`) rather than swallowed, because a live,
         // untracked, wrong-repo coder session is exactly the near-miss that
         // almost pushed wa-3086 to jleechanclaw instead of dark-factory.
-        // `Ok(None)` from `worktree_remote_url` ("cannot verify" — worktree
-        // not yet visible, adapter doesn't implement the check) is trust-it,
-        // matching its documented contract. `remote_url_matches_repo` ALSO
+        // A missing/unreadable workspace is fail-closed: this session was
+        // just created, so accepting it without checking the actual AO path
+        // would bypass the wrong-repository gate. `remote_url_matches_repo`
+        // still returns `None` for a URL form it can't parse (a different
+        // host, GitHub Enterprise, or an unusual scheme); that remains
+        // distinct from failing to inspect the workspace at all.
+        //
+        // `remote_url_matches_repo` ALSO
         // returns `None` for a URL form it can't parse (a different host,
         // GitHub Enterprise, an unusual scheme) — adversarial review of this
         // PR caught an earlier version collapsing that into the SAME `false`
@@ -408,30 +413,54 @@ pub fn dispatch_ready(
         // different repo — is a positively confirmed mismatch; `None` (from
         // either function) must trust-it exactly like the `session_branch`
         // check above.
-        if let Ok(Some(remote_url)) =
-            sessions.worktree_remote_url(&routing.ao_project, &branch, &routing.push_remote)
-        {
-            if remote_url_matches_repo(&remote_url, &repo) == Some(false) {
+        let verified_remote = sessions
+            .worktree_remote_url(&routing.ao_project, &branch, &routing.push_remote)
+            .and_then(|url| {
+                url.ok_or_else(|| {
+                    DaemonError::Config(format!(
+                        "spawned worktree for bead {} (branch {branch:?}) could not be inspected; refusing to dispatch without remote verification",
+                        bead.id
+                    ))
+                })
+            });
+        let remote_url = match verified_remote {
+            Ok(url) => url,
+            Err(error) => {
                 sessions.stop(&session_id)?;
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
-                overlay.park_reason = Some("worktree_remote_mismatch".to_string());
+                overlay.park_reason = Some("worktree_remote_unverifiable".to_string());
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
                     overlay.attempt,
                     Some(branch.clone()),
-                    "worktree_remote_mismatch",
-                    DaemonError::Config(format!(
-                        "spawned worktree for bead {} (branch {branch:?}) has remote {:?} pointing at \
-                         {remote_url:?}, which does not match the bead's resolved repo {repo:?}. \
-                         Killed the session and parked HUMAN_HELD rather than risk the coder pushing to \
-                         the wrong repo (jleechan-9sh5 discipline).",
-                        bead.id, routing.push_remote
-                    )),
+                    "worktree_remote_unverifiable",
+                    error,
                 ));
                 continue;
             }
+        };
+        if remote_url_matches_repo(&remote_url, &repo) == Some(false) {
+            sessions.stop(&session_id)?;
+            overlay.state = OverlayState::HumanHeld;
+            overlay.session_id = None;
+            overlay.park_reason = Some("worktree_remote_mismatch".to_string());
+            store.save(&overlay)?;
+            report.failures.push(failure(
+                bead,
+                overlay.attempt,
+                Some(branch.clone()),
+                "worktree_remote_mismatch",
+                DaemonError::Config(format!(
+                    "spawned worktree for bead {} (branch {branch:?}) has remote {:?} pointing at \
+                     {remote_url:?}, which does not match the bead's resolved repo {repo:?}. \
+                     Killed the session and parked HUMAN_HELD rather than risk the coder pushing to \
+                     the wrong repo (jleechan-9sh5 discipline).",
+                    bead.id, routing.push_remote
+                )),
+            ));
+            continue;
         }
 
         overlay.state = OverlayState::Dispatched;
@@ -757,6 +786,16 @@ mod tests {
 
     impl FakeSessions {
         fn new(active_count: usize) -> Self {
+            let scripted_worktree_remote = HashMap::from([
+                (
+                    "repo".to_string(),
+                    "https://github.com/owner/repo.git".to_string(),
+                ),
+                (
+                    "worldarchitect".to_string(),
+                    "https://github.com/jleechanorg/worldarchitect.ai.git".to_string(),
+                ),
+            ]);
             Self {
                 active_count,
                 calls: RefCell::new(Vec::new()),
@@ -767,7 +806,7 @@ mod tests {
                 fail_stop_for: RefCell::new(Vec::new()),
                 scripted_branch: RefCell::new(HashMap::new()),
                 spawn_prompts: RefCell::new(Vec::new()),
-                scripted_worktree_remote: RefCell::new(HashMap::new()),
+                scripted_worktree_remote: RefCell::new(scripted_worktree_remote),
             }
         }
 
@@ -2207,30 +2246,40 @@ mod tests {
         assert!(calls.iter().any(|c| c == "stop(fake-session-1)"));
     }
 
-    /// An adapter that cannot verify the worktree's remote (`Ok(None)` — the
-    /// default for every fake/impl predating this check) must never block a
-    /// dispatch: "cannot verify" is trust-it, matching `session_branch`'s
-    /// established contract for this class of post-spawn check.
+    /// An adapter that cannot inspect the just-created worktree must fail
+    /// closed: otherwise an opaque AO workspace name can bypass the
+    /// wrong-repository gate entirely.
     #[test]
-    fn worktree_remote_cannot_verify_does_not_block_dispatch() {
+    fn worktree_remote_cannot_verify_kills_session_and_parks_human_held() {
         let sessions = FakeSessions::new(0);
-        // No `set_worktree_remote` call: default is Ok(None) ("cannot verify").
+        sessions.scripted_worktree_remote.borrow_mut().clear();
         let store = FakeStateStore::new();
         let cfg = cfg();
         let ready = beads(1);
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
-        assert_eq!(report.success_count(), 1);
+        assert_eq!(report.success_count(), 0);
+        assert_eq!(report.failures[0].phase, "worktree_remote_unverifiable");
+        assert!(
+            sessions
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == "stop(fake-session-1)")
+        );
         let overlay = store.load("bead-0").unwrap().unwrap();
-        assert_eq!(overlay.state, OverlayState::Dispatched);
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("worktree_remote_unverifiable")
+        );
     }
 
     /// Adversarial review finding (independent Claude review of this PR):
     /// a remote URL in a form `remote_url_matches_repo` cannot recognize
     /// (e.g. a different git host, GitHub Enterprise) returns `None`
-    /// ("cannot determine") — the dispatch-time check must trust-it exactly
-    /// like the `Ok(None)` "worktree not visible yet" case, NEVER treat an
+    /// ("cannot determine") — the dispatch-time check must not treat an
     /// unrecognized format as a confirmed mismatch. Before this fix,
     /// `remote_url_matches_repo` returned a bare `false` for both "confirmed
     /// wrong repo" AND "couldn't parse this URL", which would have killed a

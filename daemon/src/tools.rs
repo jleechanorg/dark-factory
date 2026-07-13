@@ -432,12 +432,10 @@ pub trait Sessions {
     /// compares the returned URL against the bead's resolved repo
     /// (`owner/repo`) via `remote_url_matches_repo`.
     ///
-    /// `Ok(None)` covers both "worktree not found yet" and "adapter cannot
-    /// verify" — same "cannot verify never blocks" contract as
-    /// `session_branch`: the default impl (for fakes/impls that predate this
-    /// check) always returns `Ok(None)`, which callers treat as "cannot
-    /// verify, do not block". This method only ever *rejects* a dispatch on
-    /// a positively confirmed mismatch, never on absence of information.
+    /// The production adapter must fail closed when it cannot inspect the
+    /// exact workspace AO returned. The default remains `Ok(None)` so older
+    /// test adapters compile, but dispatch treats that absence as an
+    /// unverifiable workspace and refuses to adopt the new session.
     fn worktree_remote_url(
         &self,
         ao_project: &str,

@@ -94,9 +94,11 @@ fn test_cli_sessions_real_ao() {
 #[test]
 #[ignore] // Creates one real AO worker; run explicitly with --ignored --exact.
 fn test_cli_sessions_real_spawn_v013_contract() {
-    if std::env::var("GITHUB_ACTIONS").is_ok() {
-        return;
-    }
+    assert_eq!(
+        std::env::var("DARK_FACTORY_RUN_REAL_AO_SPAWN").as_deref(),
+        Ok("1"),
+        "set DARK_FACTORY_RUN_REAL_AO_SPAWN=1 to run this ignored real-service test"
+    );
     let nonce = format!(
         "{}-{}",
         std::process::id(),

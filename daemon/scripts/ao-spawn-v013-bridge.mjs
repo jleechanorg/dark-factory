@@ -1,4 +1,4 @@
-import { dirname, join, parse } from "node:path";
+import { dirname, isAbsolute, join, parse } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readFile } from "node:fs/promises";
 
@@ -57,35 +57,56 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
     if (!project || !agent || prompt === undefined) {
       fail("spawn requires --project, --agent, and one positional prompt");
     }
-    if (prompt.length > 4096) fail("prompt must be at most 4096 characters");
+    const sanitizedPrompt = prompt.replace(/[\r\n]/g, " ").trim();
+    if (!sanitizedPrompt) fail("prompt must not be empty after sanitization");
+    if (sanitizedPrompt.length > 4096) fail("prompt must be at most 4096 characters");
 
     const branch = process.env.DARK_FACTORY_AO_SPAWN_BRANCH;
     if (!branch) fail("DARK_FACTORY_AO_SPAWN_BRANCH is required");
 
-    // Resolve AO core and every configured plugin from the already-running
-    // CLI installation. This avoids hardcoded checkout paths and uses each
-    // package's declared ESM export rather than a private source path.
-    const resolveAoPackage = async (packageName) => {
-      const packagePath = join(packageDir, "node_modules", ...packageName.split("/"));
-      const manifest = JSON.parse(await readFile(join(packagePath, "package.json"), "utf8"));
-      const rootExport = manifest.exports?.["."];
-      const entry =
-        (typeof rootExport === "string" ? rootExport : rootExport?.import) ?? manifest.module ?? manifest.main;
-      if (!entry) fail(`AO dependency ${packageName} has no ESM root export`);
-      return pathToFileURL(join(packagePath, entry)).href;
-    };
-    const coreUrl = await resolveAoPackage("@jleechanorg/ao-core");
+    // Resolve AO dependencies with Node's ESM resolver anchored at the
+    // running CLI entry. This supports workspace symlinks, hoisted package
+    // managers, and ordinary nested installs without guessing node_modules.
+    const cliEntryUrl = pathToFileURL(cliEntry).href;
+    const resolveAoPackage = (packageName) => import.meta.resolve(packageName, cliEntryUrl);
+    const coreUrl = resolveAoPackage("@jleechanorg/ao-core");
     const core = await import(coreUrl);
-    for (const api of ["loadConfig", "createPluginRegistry", "createSessionManager", "acquireSpawnLock"]) {
+    for (const api of [
+      "loadConfig",
+      "createPluginRegistry",
+      "createSessionManager",
+      "acquireSpawnLock",
+      "resolveSpawnQueueConfig",
+      "isTerminalSession",
+    ]) {
       if (typeof core[api] !== "function") fail(`AO core is missing required public API ${api}`);
+    }
+
+    // AO v0.1.3 does not export these command-level guards from its package
+    // root. The exact-version check above makes their pinned locations a
+    // fail-closed compatibility boundary rather than an unversioned guess.
+    const { preflight } = await import(pathToFileURL(join(packageDir, "dist/lib/preflight.js")).href);
+    const { getRunning } = await import(
+      pathToFileURL(join(packageDir, "dist/lib/running-state.js")).href
+    );
+    const { ensureLifecycleWorker } = await import(
+      pathToFileURL(join(packageDir, "dist/lib/lifecycle-service.js")).href
+    );
+    if (
+      typeof preflight?.checkTmux !== "function" ||
+      typeof preflight?.checkGhAuth !== "function" ||
+      typeof getRunning !== "function" ||
+      typeof ensureLifecycleWorker !== "function"
+    ) {
+      fail("AO v0.1.3 command preflight/lifecycle API is incompatible");
     }
 
     const config = core.loadConfig();
     const projectConfig = config.projects[project];
     if (!projectConfig) fail(`unknown AO project ${project}`);
     const registry = core.createPluginRegistry();
-    await registry.loadFromConfig(config, (packageName) =>
-      resolveAoPackage(packageName).then((url) => import(url)),
+    await registry.loadFromConfig(config, async (packageName) =>
+      import(resolveAoPackage(packageName)),
     );
 
     // Read-only startup/deployment diagnostic: verifies the running Node,
@@ -99,11 +120,22 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
           project,
           agent,
           branch,
-          promptLength: prompt.length,
+          promptLength: sanitizedPrompt.length,
         })}`,
       );
       process.exit(0);
     }
+
+    const runtime = projectConfig.runtime ?? config.defaults?.runtime;
+    if (runtime === "tmux") await preflight.checkTmux();
+    if (projectConfig.tracker?.plugin === "github") await preflight.checkGhAuth();
+
+    const running = await getRunning();
+    if (!running) fail("AO is not running; run `ao start` before factory dispatch");
+    if (!running.projects.includes(project)) {
+      fail(`running AO instance is not polling project ${project}`);
+    }
+    await ensureLifecycleWorker(config, project);
 
     const lock = core.acquireSpawnLock(config.configPath, projectConfig.path ?? "");
     if (!lock.acquired) {
@@ -112,6 +144,28 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
 
     try {
       const sessions = core.createSessionManager({ config, registry });
+      const listed = await sessions.list(project);
+      const active = listed.filter((session) => !core.isTerminalSession(session));
+      const queue = core.resolveSpawnQueueConfig(projectConfig);
+      if (active.length >= queue.maxActiveSessions) {
+        if (!queue.enabled) {
+          lock.release();
+          fail(
+            `spawn rejected: ${active.length} active sessions >= cap (${queue.maxActiveSessions})`,
+          );
+        }
+        // AO's v0.1.3 persistent SpawnRequest cannot carry an explicit
+        // branch. The daemon overlay is already the durable queue, so return
+        // its established REQUEST= deferral signal instead of enqueueing a
+        // request that would later spawn on the wrong branch.
+        console.log(
+          `  Reason: ${active.length} active sessions >= cap ${queue.maxActiveSessions}; exact branch retained by daemon queue`,
+        );
+        console.log(`REQUEST=dark-factory-exact-branch-${project}`);
+        lock.release();
+        process.exit(0);
+      }
+
       // The preload is only for this AO process. Restore the parent's Node
       // options and remove bridge-only variables before AO launches the
       // worker so a Node-based agent CLI does not preload this adapter and
@@ -126,8 +180,18 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
         projectId: project,
         agent,
         branch,
-        prompt,
+        prompt: sanitizedPrompt,
       });
+      if (typeof session.workspacePath !== "string" || !isAbsolute(session.workspacePath)) {
+        try {
+          await sessions.kill(session.id);
+        } catch (cleanupError) {
+          fail(
+            `spawned session ${session.id} without an absolute workspacePath and cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+          );
+        }
+        fail(`spawned session ${session.id} without an absolute workspacePath; session killed`);
+      }
       console.log(`  Worktree: ${session.workspacePath ?? "-"}`);
       console.log(`  Branch:   ${session.branch ?? "-"}`);
       console.log(`SESSION=${session.id}`);

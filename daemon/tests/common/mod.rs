@@ -404,6 +404,23 @@ impl Sessions for FakeSessions {
             .push(format!("session_branch({})", id.0));
         Ok(self.branch_for.borrow().get(&id.0).cloned())
     }
+
+    fn worktree_remote_url(
+        &self,
+        ao_project: &str,
+        branch: &str,
+        remote_name: &str,
+    ) -> Result<Option<String>, DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "worktree_remote_url({ao_project},{branch},{remote_name})"
+        ));
+        let repo = if ao_project == "worldarchitect" {
+            "jleechanorg/worldarchitect.ai"
+        } else {
+            "owner/repo"
+        };
+        Ok(Some(format!("https://github.com/{repo}.git")))
+    }
 }
 
 /// Scripted `Vcs` fake: pre-seeded SHAs keyed by branch name.

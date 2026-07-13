@@ -1314,38 +1314,6 @@ mod resolve_holdouts_path_tests {
     }
 }
 
-/// The worktree directory name AO derives from a `factory/<bead>-r<n>`
-/// branch: the `factory/` prefix stripped. Shared by `run_spawn_process`'s
-/// `--name` argument and `resolve_worktree_path` below so the two can never
-/// drift apart (bead jleechan-bqdv Stage C).
-fn worktree_display_name(branch: &str) -> &str {
-    branch.strip_prefix("factory/").unwrap_or(branch)
-}
-
-/// Root directory AO clones per-session worktrees under. Matches the global
-/// `worktreeDir: ~/.worktrees` default in `~/.agent-orchestrator.yaml`;
-/// overridable via `DARK_FACTORY_AO_WORKTREE_DIR` for tests and non-standard
-/// installs. AO itself remains the sole source of truth for the actual path
-/// it created — this is the daemon's best-effort reconstruction used ONLY
-/// for the spawn-time remote assertion (bead jleechan-bqdv Stage C); every
-/// caller of `worktree_remote_url` treats "path doesn't exist" as "cannot
-/// verify", never as a positive mismatch.
-fn ao_worktree_root() -> String {
-    if let Ok(dir) = std::env::var("DARK_FACTORY_AO_WORKTREE_DIR") {
-        return dir;
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    format!("{home}/.worktrees")
-}
-
-/// `<worktree_root>/<ao_project>/<display_name>` — the path a just-spawned
-/// session's worktree is expected to live at.
-fn resolve_worktree_path(ao_project: &str, branch: &str) -> std::path::PathBuf {
-    std::path::Path::new(&ao_worktree_root())
-        .join(ao_project)
-        .join(worktree_display_name(branch))
-}
-
 /// AO v0.1.3 accepts the task prompt positionally but does not expose its
 /// core `branch` field as a CLI flag. The preload bridge keeps the public CLI
 /// argv valid while passing the exact factory branch to AO core before the
@@ -1399,10 +1367,11 @@ fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonErro
         .env("DARK_FACTORY_AO_SPAWN_BRANCH", &spec.branch);
 
     let node_options = std::env::var("NODE_OPTIONS").unwrap_or_default();
+    let bridge_options = format!("--experimental-import-meta-resolve {bridge_arg}");
     let bridged_node_options = if node_options.trim().is_empty() {
-        bridge_arg
+        bridge_options
     } else {
-        format!("{node_options} {bridge_arg}")
+        format!("{node_options} {bridge_options}")
     };
     cmd.env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", &node_options)
         .env("NODE_OPTIONS", bridged_node_options);
@@ -1419,6 +1388,8 @@ fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonErro
 pub struct CliSessions {
     pub project: String,
     pub agent: String,
+    spawned_worktrees:
+        std::sync::Mutex<std::collections::HashMap<(String, String), std::path::PathBuf>>,
 }
 
 impl CliSessions {
@@ -1430,6 +1401,7 @@ impl CliSessions {
         Self {
             project,
             agent: agent.to_string(),
+            spawned_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1456,7 +1428,38 @@ impl CliSessions {
 
         let out = String::from_utf8_lossy(&output.stdout).into_owned();
         let err_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-        Self::classify_spawn_output(agent, output.status.success(), output.status.code(), &out, &err_msg)
+        let session = Self::classify_spawn_output(
+            agent,
+            output.status.success(),
+            output.status.code(),
+            &out,
+            &err_msg,
+        )?;
+        let Some(workspace) = Self::spawn_workspace_path(&out) else {
+            let cleanup = run_tool("ao", &["stop", &session.0], 30)
+                .map(|_| "session stopped".to_string())
+                .unwrap_or_else(|error| format!("WARNING: failed to stop session: {error}"));
+            return Err(DaemonError::Parse(format!(
+                "ao spawn --agent {agent} returned session {} without an absolute Worktree path; refusing to dispatch without remote verification ({cleanup}): {out}",
+                session.0
+            )));
+        };
+        self.spawned_worktrees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (spec.ao_project.clone(), spec.branch.clone()),
+                workspace,
+            );
+        Ok(session)
+    }
+
+    fn spawn_workspace_path(out: &str) -> Option<std::path::PathBuf> {
+        out.lines().find_map(|line| {
+            let value = line.trim().strip_prefix("Worktree:")?.trim();
+            let path = std::path::PathBuf::from(value);
+            (path.is_absolute() && value != "-").then_some(path)
+        })
     }
 
     /// Pure classification of `ao spawn`'s exit status + stdout/stderr into a
@@ -1807,7 +1810,7 @@ mod spawn_classification_tests {
 
 #[cfg(test)]
 mod ao_spawn_contract_tests {
-    use super::{gh_env_test_lock, CliSessions};
+    use super::{ao_spawn_bridge_path, gh_env_test_lock, CliSessions};
     use crate::tools::{Sessions, SpawnSpec};
     use std::os::unix::fs::PermissionsExt;
 
@@ -1849,6 +1852,7 @@ assert "ao-spawn-v013-bridge.mjs" in os.environ["NODE_OPTIONS"]
 with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
     handle.write(json.dumps({"args": args, "branch": os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"]}) + "\n")
 print("SESSION=fake-" + str(abs(hash(prompt))))
+print("  Worktree: " + os.environ.get("AO_FAKE_WORKTREE", "/tmp/fake-ao-worktree"))
 "#,
         )
         .unwrap();
@@ -1965,6 +1969,377 @@ print("SESSION=fake-" + str(abs(hash(prompt))))
             observed.get(second.prompt.as_str()),
             Some(&second.branch.as_str())
         );
+    }
+
+    #[test]
+    fn spawned_opaque_workspace_is_used_for_remote_validation() {
+        let prompt = "opaque workspace validation prompt";
+        let branch = "factory/jleechan-contract-opaque-r1";
+        let bindings = serde_json::json!({ prompt: branch });
+        let (spawn_result, remote_result) = with_fake_ao("opaque", bindings, |log| {
+            let workspace = log.parent().unwrap().join("df-opaque-134");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&workspace)
+                .status()
+                .unwrap();
+            std::process::Command::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/wrong-owner/wrong-repo.git",
+                ])
+                .current_dir(&workspace)
+                .status()
+                .unwrap();
+            let previous_workspace = std::env::var("AO_FAKE_WORKTREE").ok();
+            std::env::set_var("AO_FAKE_WORKTREE", &workspace);
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let spawn_result = sessions.spawn(&spec(prompt, branch));
+            let remote_result =
+                sessions.worktree_remote_url("dark-factory", branch, "origin");
+            match previous_workspace {
+                Some(value) => std::env::set_var("AO_FAKE_WORKTREE", value),
+                None => std::env::remove_var("AO_FAKE_WORKTREE"),
+            }
+            (spawn_result, remote_result)
+        });
+
+        assert!(spawn_result.is_ok(), "spawn failed: {spawn_result:?}");
+        assert_eq!(
+            remote_result.unwrap().as_deref(),
+            Some("https://github.com/wrong-owner/wrong-repo.git")
+        );
+    }
+
+    #[test]
+    fn bridge_resolves_import_only_ao_core_from_hoisted_node_modules() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_bridge_hoisted_resolution_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cli = root.join("node_modules/@jleechanorg/ao-cli");
+        let core = root.join("node_modules/@jleechanorg/ao-core");
+        std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
+        std::fs::create_dir_all(core.join("dist")).unwrap();
+        std::fs::write(
+            cli.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
+            .unwrap();
+        std::fs::write(
+            core.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            core.join("dist/index.js"),
+            r#"export const loadConfig = () => ({configPath: "/tmp/fake-ao.yaml", projects: {"dark-factory": {path: "/tmp/fake-project"}}});
+export const createPluginRegistry = () => ({loadFromConfig: async () => {}});
+export const createSessionManager = () => ({});
+export const acquireSpawnLock = () => ({acquired: true, release() {}});
+export const resolveSpawnQueueConfig = () => ({enabled: true, maxActiveSessions: 20});
+export const isTerminalSession = () => false;
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/preflight.js"),
+            "export const preflight = {checkTmux: async () => {}, checkGhAuth: async () => {}};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/running-state.js"),
+            "export const getRunning = async () => ({projects: ['dark-factory']});\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/lifecycle-service.js"),
+            "export const ensureLifecycleWorker = async () => {};\n",
+        )
+        .unwrap();
+
+        let bridge = ao_spawn_bridge_path();
+        let node = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".nvm/versions/node/v22.22.0/bin/node");
+        assert!(node.is_file(), "systemd's mandated Node 22 binary is missing");
+        let output = std::process::Command::new(node)
+            .arg(cli.join("dist/index.js"))
+            .args([
+                "spawn",
+                "--project",
+                "dark-factory",
+                "--agent",
+                "minimax",
+                "hoisted resolution probe",
+            ])
+            .env(
+                "NODE_OPTIONS",
+                format!(
+                    "--experimental-import-meta-resolve --import={}",
+                    bridge.display()
+                ),
+            )
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env("DARK_FACTORY_AO_BRIDGE_DIAGNOSTIC", "1")
+            .env(
+                "DARK_FACTORY_AO_SPAWN_BRANCH",
+                "factory/hoisted-resolution-r1",
+            )
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            output.status.success(),
+            "bridge failed to resolve import-only hoisted AO core; stdout={stdout}; stderr={stderr}"
+        );
+        assert!(stdout.contains("AO_BRIDGE_DIAGNOSTIC="), "stdout={stdout}");
+    }
+
+    #[test]
+    fn bridge_runs_v013_guards_and_defers_at_active_cap_without_spawning() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_bridge_admission_semantics_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cli = root.join("node_modules/@jleechanorg/ao-cli");
+        let core = root.join("node_modules/@jleechanorg/ao-core");
+        let calls = root.join("calls.log");
+        std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
+        std::fs::create_dir_all(core.join("dist")).unwrap();
+        std::fs::write(
+            cli.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
+            .unwrap();
+        std::fs::write(
+            core.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            core.join("dist/index.js"),
+            r#"import {appendFileSync} from 'node:fs';
+const log = (value) => appendFileSync(process.env.AO_FAKE_CALLS, value + '\n');
+export const loadConfig = () => ({configPath: '/tmp/fake-ao.yaml', defaults: {runtime: 'tmux'}, projects: {'dark-factory': {path: '/tmp/fake-project', tracker: {plugin: 'github'}}}});
+export const createPluginRegistry = () => ({loadFromConfig: async () => {}});
+export const createSessionManager = () => ({
+  list: async () => {log('list'); return [{status: 'working'}];},
+  spawn: async () => {log('SPAWN_CALLED'); throw new Error('spawn must not run at cap');},
+});
+export const acquireSpawnLock = () => {log('lock'); return {acquired: true, release() {log('release');}}};
+export const resolveSpawnQueueConfig = () => ({enabled: true, maxActiveSessions: 1});
+export const isTerminalSession = () => false;
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/preflight.js"),
+            r#"import {appendFileSync} from 'node:fs';
+const log = (v) => appendFileSync(process.env.AO_FAKE_CALLS, v + '\n');
+export const preflight = {checkTmux: async () => log('tmux'), checkGhAuth: async () => log('gh')};
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/running-state.js"),
+            r#"import {appendFileSync} from 'node:fs';
+export const getRunning = async () => {appendFileSync(process.env.AO_FAKE_CALLS, 'running\n'); return {projects: ['dark-factory']}};
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/lifecycle-service.js"),
+            r#"import {appendFileSync} from 'node:fs';
+export const ensureLifecycleWorker = async () => appendFileSync(process.env.AO_FAKE_CALLS, 'lifecycle\n');
+"#,
+        )
+        .unwrap();
+
+        let bridge = ao_spawn_bridge_path();
+        let node = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".nvm/versions/node/v22.22.0/bin/node");
+        let output = std::process::Command::new(node)
+            .arg(cli.join("dist/index.js"))
+            .args([
+                "spawn",
+                "--project",
+                "dark-factory",
+                "--agent",
+                "minimax",
+                "admission probe",
+            ])
+            .env(
+                "NODE_OPTIONS",
+                format!(
+                    "--experimental-import-meta-resolve --import={}",
+                    bridge.display()
+                ),
+            )
+            .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "")
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env(
+                "DARK_FACTORY_AO_SPAWN_BRANCH",
+                "factory/admission-probe-r1",
+            )
+            .env("AO_FAKE_CALLS", &calls)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            output.status.success(),
+            "cap deferral failed; stdout={stdout}; stderr={stderr}; calls={calls}"
+        );
+        assert!(stdout.contains("REQUEST=dark-factory-exact-branch-dark-factory"));
+        for expected in ["tmux", "gh", "running", "lifecycle", "lock", "list", "release"] {
+            assert!(calls.lines().any(|line| line == expected), "missing {expected}: {calls}");
+        }
+        assert!(!calls.contains("SPAWN_CALLED"), "{calls}");
+    }
+
+    #[test]
+    fn bridge_sanitizes_prompt_preserves_branch_and_cleans_worker_environment() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_bridge_spawn_semantics_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cli = root.join("node_modules/@jleechanorg/ao-cli");
+        let core = root.join("node_modules/@jleechanorg/ao-core");
+        let calls = root.join("calls.log");
+        std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
+        std::fs::create_dir_all(core.join("dist")).unwrap();
+        std::fs::write(
+            cli.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
+            .unwrap();
+        std::fs::write(
+            core.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            core.join("dist/index.js"),
+            r#"import {appendFileSync} from 'node:fs';
+const log = (value) => appendFileSync(process.env.AO_FAKE_CALLS, value + '\n');
+export const loadConfig = () => ({configPath: '/tmp/fake-ao.yaml', defaults: {runtime: 'tmux'}, projects: {'dark-factory': {path: '/tmp/fake-project', tracker: {plugin: 'github'}}}});
+export const createPluginRegistry = () => ({loadFromConfig: async () => {}});
+export const createSessionManager = () => ({
+  list: async () => {log('list'); return [];},
+  spawn: async (spec) => {
+    log('spawn=' + JSON.stringify({
+      spec,
+      nodeOptions: process.env.NODE_OPTIONS ?? null,
+      bridge: process.env.DARK_FACTORY_AO_V013_BRIDGE ?? null,
+      branchEnv: process.env.DARK_FACTORY_AO_SPAWN_BRANCH ?? null,
+      parentNodeOptions: process.env.DARK_FACTORY_AO_PARENT_NODE_OPTIONS ?? null,
+    }));
+    return {id: 'spawn-semantic-session', branch: spec.branch, workspacePath: '/tmp/fake-worktree'};
+  },
+});
+export const acquireSpawnLock = () => {log('lock'); return {acquired: true, release() {log('release');}}};
+export const resolveSpawnQueueConfig = () => ({enabled: true, maxActiveSessions: 2});
+export const isTerminalSession = () => false;
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/preflight.js"),
+            r#"export const preflight = {checkTmux: async () => {}, checkGhAuth: async () => {}};
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/running-state.js"),
+            "export const getRunning = async () => ({projects: ['dark-factory']});\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/lifecycle-service.js"),
+            "export const ensureLifecycleWorker = async () => {};\n",
+        )
+        .unwrap();
+
+        let bridge = ao_spawn_bridge_path();
+        let node = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".nvm/versions/node/v22.22.0/bin/node");
+        let output = std::process::Command::new(node)
+            .arg(cli.join("dist/index.js"))
+            .args([
+                "spawn",
+                "--project",
+                "dark-factory",
+                "--agent",
+                "minimax",
+                "  hello\r\nworld  ",
+            ])
+            .env(
+                "NODE_OPTIONS",
+                format!(
+                    "--trace-warnings --experimental-import-meta-resolve --import={}",
+                    bridge.display()
+                ),
+            )
+            .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "--trace-warnings")
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env(
+                "DARK_FACTORY_AO_SPAWN_BRANCH",
+                "factory/spawn-semantics-r1",
+            )
+            .env("AO_FAKE_CALLS", &calls)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            output.status.success(),
+            "below-cap spawn failed; stdout={stdout}; stderr={stderr}; calls={calls}"
+        );
+        assert!(stdout.contains("SESSION=spawn-semantic-session"), "{stdout}");
+        let spawn_line = calls
+            .lines()
+            .find_map(|line| line.strip_prefix("spawn="))
+            .expect("spawn call was not recorded");
+        let observed: serde_json::Value = serde_json::from_str(spawn_line).unwrap();
+        assert_eq!(observed["spec"]["prompt"], "hello  world");
+        assert_eq!(observed["spec"]["branch"], "factory/spawn-semantics-r1");
+        assert_eq!(observed["spec"]["projectId"], "dark-factory");
+        assert_eq!(observed["spec"]["agent"], "minimax");
+        assert_eq!(observed["nodeOptions"], "--trace-warnings");
+        assert!(observed["bridge"].is_null());
+        assert!(observed["branchEnv"].is_null());
+        assert!(observed["parentNodeOptions"].is_null());
+        assert_eq!(calls.lines().filter(|line| *line == "release").count(), 1);
     }
 }
 
@@ -2183,15 +2558,12 @@ impl Sessions for CliSessions {
     }
 
     /// jleechan-bqdv Stage C: the spawn-time worktree remote assertion's data
-    /// source. Reconstructs the expected worktree path (`resolve_worktree_path`)
-    /// and reads back whatever `remote_name` would actually be pushed to
-    /// there via `git remote get-url --push`. Any failure to locate the
-    /// worktree, run `git`, or parse its output collapses to `Ok(None)`
-    /// ("cannot verify") rather than an `Err` — matching `session_branch`'s
-    /// contract that this class of check only ever *rejects* a dispatch on
-    /// a positively confirmed mismatch, never on an inability to check (a
-    /// worktree AO is still in the middle of cloning is a normal,
-    /// retry-safe race, not a violation).
+    /// source. Uses the exact absolute `workspacePath` AO returned during
+    /// spawn and reads back whatever `remote_name` would actually be pushed
+    /// to there via `git remote get-url --push`. Missing mapping, missing
+    /// directory, and git inspection failure are errors: after AO has
+    /// returned a session, accepting an unverifiable worktree would silently
+    /// bypass the wrong-repository safety gate.
     ///
     /// **Adversarial review finding (independent Claude review of this
     /// PR):** the original version used `git remote get-url <name>` (the
@@ -2207,86 +2579,76 @@ impl Sessions for CliSessions {
         branch: &str,
         remote_name: &str,
     ) -> Result<Option<String>, DaemonError> {
-        let path = resolve_worktree_path(ao_project, branch);
+        let key = (ao_project.to_string(), branch.to_string());
+        let path = self
+            .spawned_worktrees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| {
+                DaemonError::Config(format!(
+                    "no AO workspacePath recorded for project {ao_project:?} branch {branch:?}; refusing to skip remote verification"
+                ))
+            })?;
         if !path.is_dir() {
-            return Ok(None);
+            return Err(DaemonError::Config(format!(
+                "AO workspacePath {} for project {ao_project:?} branch {branch:?} is not a directory",
+                path.display()
+            )));
         }
         let cwd = path.to_string_lossy().into_owned();
-        match run_tool_in_dir("git", &["remote", "get-url", "--push", remote_name], &cwd, 10) {
-            Ok(out) => {
-                let trimmed = out.trim();
-                if trimmed.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(trimmed.to_string()))
-                }
-            }
-            Err(_) => Ok(None),
+        let out = run_tool_in_dir(
+            "git",
+            &["remote", "get-url", "--push", remote_name],
+            &cwd,
+            10,
+        )?;
+        let trimmed = out.trim();
+        if trimmed.is_empty() {
+            Err(DaemonError::Parse(format!(
+                "git returned an empty push URL for remote {remote_name:?} in AO workspace {}",
+                path.display()
+            )))
+        } else {
+            Ok(Some(trimmed.to_string()))
         }
     }
 }
 
 #[cfg(test)]
 mod worktree_remote_url_tests {
-    use super::{gh_env_test_lock, resolve_worktree_path, worktree_display_name, CliSessions};
+    use super::{gh_env_test_lock, CliSessions};
     use crate::tools::Sessions;
 
-    #[test]
-    fn worktree_display_name_strips_factory_prefix() {
-        assert_eq!(worktree_display_name("factory/jleechan-bqdv-r1"), "jleechan-bqdv-r1");
-    }
-
-    #[test]
-    fn worktree_display_name_passes_through_when_no_prefix() {
-        assert_eq!(worktree_display_name("some-other-branch"), "some-other-branch");
-    }
-
-    #[test]
-    fn resolve_worktree_path_respects_env_override() {
-        let _guard = gh_env_test_lock()
+    fn record_workspace(
+        sessions: &CliSessions,
+        project: &str,
+        branch: &str,
+        path: &std::path::Path,
+    ) {
+        sessions
+            .spawned_worktrees
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = std::env::var("DARK_FACTORY_AO_WORKTREE_DIR").ok();
-        std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", "/tmp/afd-worktree-root-test");
-
-        let path = resolve_worktree_path("dark-factory", "factory/jleechan-bqdv-r1");
-
-        match prev {
-            Some(v) => std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", v),
-            None => std::env::remove_var("DARK_FACTORY_AO_WORKTREE_DIR"),
-        }
-
-        assert_eq!(
-            path,
-            std::path::Path::new("/tmp/afd-worktree-root-test/dark-factory/jleechan-bqdv-r1")
-        );
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (project.to_string(), branch.to_string()),
+                path.to_path_buf(),
+            );
     }
 
     #[test]
-    fn worktree_remote_url_returns_none_when_worktree_missing() {
-        let _guard = gh_env_test_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = std::env::var("DARK_FACTORY_AO_WORKTREE_DIR").ok();
-        std::env::set_var(
-            "DARK_FACTORY_AO_WORKTREE_DIR",
-            "/definitely/does/not/exist/afd-worktree-root",
-        );
-
+    fn worktree_remote_url_fails_closed_without_spawned_workspace() {
         let sessions = CliSessions::new("owner/repo", "claude-code");
         let result = sessions.worktree_remote_url("dark-factory", "factory/missing-r1", "origin");
 
-        match prev {
-            Some(v) => std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", v),
-            None => std::env::remove_var("DARK_FACTORY_AO_WORKTREE_DIR"),
-        }
-
-        assert_eq!(result.unwrap(), None, "a missing worktree must be 'cannot verify', not an error");
+        let error = result.expect_err("missing AO workspace mapping must fail closed");
+        assert!(error.to_string().contains("no AO workspacePath recorded"));
     }
 
-    /// End-to-end (real `git`, no shim needed): create a throwaway git repo
-    /// at the exact path `resolve_worktree_path` computes, add a remote, and
-    /// confirm `worktree_remote_url` reads it back.
+    /// Real `git`, no shim: record an opaque AO workspace, add a remote, and
+    /// confirm validation reads that exact path rather than reconstructing
+    /// one from the factory branch.
     #[test]
     fn worktree_remote_url_reads_real_git_remote() {
         let _guard = gh_env_test_lock()
@@ -2297,10 +2659,7 @@ mod worktree_remote_url_tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let prev = std::env::var("DARK_FACTORY_AO_WORKTREE_DIR").ok();
-        std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", &root);
-
-        let worktree_path = resolve_worktree_path("dark-factory", "factory/jleechan-bqdv-r1");
+        let worktree_path = root.join("df-opaque-134");
         std::fs::create_dir_all(&worktree_path).unwrap();
         let cwd = worktree_path.to_string_lossy().into_owned();
         std::process::Command::new("git")
@@ -2320,13 +2679,15 @@ mod worktree_remote_url_tests {
             .unwrap();
 
         let sessions = CliSessions::new("owner/repo", "claude-code");
+        record_workspace(
+            &sessions,
+            "dark-factory",
+            "factory/jleechan-bqdv-r1",
+            &worktree_path,
+        );
         let result =
             sessions.worktree_remote_url("dark-factory", "factory/jleechan-bqdv-r1", "worldai");
 
-        match prev {
-            Some(v) => std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", v),
-            None => std::env::remove_var("DARK_FACTORY_AO_WORKTREE_DIR"),
-        }
         let _ = std::fs::remove_dir_all(&root);
 
         assert_eq!(
@@ -2351,10 +2712,7 @@ mod worktree_remote_url_tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let prev = std::env::var("DARK_FACTORY_AO_WORKTREE_DIR").ok();
-        std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", &root);
-
-        let worktree_path = resolve_worktree_path("dark-factory", "factory/jleechan-bqdv-r1");
+        let worktree_path = root.join("df-opaque-pushurl");
         std::fs::create_dir_all(&worktree_path).unwrap();
         let cwd = worktree_path.to_string_lossy().into_owned();
         std::process::Command::new("git")
@@ -2387,13 +2745,15 @@ mod worktree_remote_url_tests {
             .unwrap();
 
         let sessions = CliSessions::new("owner/repo", "claude-code");
+        record_workspace(
+            &sessions,
+            "dark-factory",
+            "factory/jleechan-bqdv-r1",
+            &worktree_path,
+        );
         let result =
             sessions.worktree_remote_url("dark-factory", "factory/jleechan-bqdv-r1", "worldai");
 
-        match prev {
-            Some(v) => std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", v),
-            None => std::env::remove_var("DARK_FACTORY_AO_WORKTREE_DIR"),
-        }
         let _ = std::fs::remove_dir_all(&root);
 
         assert_eq!(
@@ -2404,7 +2764,7 @@ mod worktree_remote_url_tests {
     }
 
     #[test]
-    fn worktree_remote_url_returns_none_for_unconfigured_remote_name() {
+    fn worktree_remote_url_fails_closed_for_unconfigured_remote_name() {
         let _guard = gh_env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2413,10 +2773,7 @@ mod worktree_remote_url_tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let prev = std::env::var("DARK_FACTORY_AO_WORKTREE_DIR").ok();
-        std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", &root);
-
-        let worktree_path = resolve_worktree_path("dark-factory", "factory/jleechan-bqdv-r1");
+        let worktree_path = root.join("df-opaque-no-remote");
         std::fs::create_dir_all(&worktree_path).unwrap();
         let cwd = worktree_path.to_string_lossy().into_owned();
         std::process::Command::new("git")
@@ -2426,20 +2783,18 @@ mod worktree_remote_url_tests {
             .unwrap();
 
         let sessions = CliSessions::new("owner/repo", "claude-code");
+        record_workspace(
+            &sessions,
+            "dark-factory",
+            "factory/jleechan-bqdv-r1",
+            &worktree_path,
+        );
         let result =
             sessions.worktree_remote_url("dark-factory", "factory/jleechan-bqdv-r1", "origin");
 
-        match prev {
-            Some(v) => std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", v),
-            None => std::env::remove_var("DARK_FACTORY_AO_WORKTREE_DIR"),
-        }
         let _ = std::fs::remove_dir_all(&root);
 
-        assert_eq!(
-            result.unwrap(),
-            None,
-            "a remote that isn't configured must be 'cannot verify', not an error"
-        );
+        assert!(result.is_err(), "an unconfigured push remote must fail closed");
     }
 }
 
