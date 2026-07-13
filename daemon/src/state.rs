@@ -944,7 +944,6 @@ impl StateStore for SqliteStateStore {
         // recovered-from telemetry still records what was being worked on;
         // dispatch will rewrite it on the next attempt.
         let recoverable = HumanHoldReason::recoverable_exact_values();
-        let router_prefix = format!("{ROUTER_PARSE_PARK_REASON_PREFIX}%");
         let now = now_iso8601();
         let mut stmt = self
             .conn
@@ -955,7 +954,8 @@ impl StateStore for SqliteStateStore {
              WHERE state = 'HUMAN_HELD' \
                AND attempt < ?2 \
                AND session_id IS NULL \
-               AND (park_reason IN (?3, ?4, ?5, ?6, ?7) OR park_reason LIKE ?8) \
+               AND (park_reason IN (?3, ?4, ?5, ?6, ?7) \
+                    OR substr(park_reason, 1, length(?8)) = ?8) \
              RETURNING bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, \
                  pre_session_head_sha, park_reason, target_repo",
@@ -971,7 +971,7 @@ impl StateStore for SqliteStateStore {
                     &recoverable[2],
                     &recoverable[3],
                     &recoverable[4],
-                    router_prefix,
+                    ROUTER_PARSE_PARK_REASON_PREFIX,
                 ],
                 |row| {
                     Ok((
@@ -2275,6 +2275,55 @@ mod tests {
             let o = store.load(id).unwrap().unwrap();
             assert_eq!(o.state, OverlayState::Queued, "{id} must stay QUEUED");
             assert_eq!(o.autonomy_secs, 0, "{id} autonomy_secs unchanged");
+        }
+    }
+
+    #[test]
+    fn recover_human_held_router_prefix_is_case_sensitive_and_not_a_like_pattern() {
+        let store = store();
+        for (bead_id, park_reason) in [
+            (
+                "valid-router-prefix",
+                HumanHoldReason::RouterParse("valid typed reason".into()).value(),
+            ),
+            (
+                "underscore-wildcard-lookalike",
+                "routerXparseYerror: not a typed reason".into(),
+            ),
+            (
+                "uppercase-lookalike",
+                "ROUTER_PARSE_ERROR: not a typed reason".into(),
+            ),
+        ] {
+            store
+                .save(&BeadOverlay {
+                    bead_id: bead_id.into(),
+                    state: OverlayState::HumanHeld,
+                    attempt: 2,
+                    reroll_count: 0,
+                    autonomy_secs: 10,
+                    spend_usd: 0.0,
+                    pr_number: None,
+                    branch: Some(format!("factory/{bead_id}-r2")),
+                    session_id: None,
+                    is_adopted: false,
+                    spawn_failure_count: 0,
+                    pre_session_head_sha: None,
+                    park_reason: Some(park_reason),
+                    target_repo: None,
+                })
+                .unwrap();
+        }
+
+        let recovered = store.recover_human_held(10).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].bead_id, "valid-router-prefix");
+
+        for bead_id in ["underscore-wildcard-lookalike", "uppercase-lookalike"] {
+            let held = store.load(bead_id).unwrap().unwrap();
+            assert_eq!(held.state, OverlayState::HumanHeld, "{bead_id}");
+            assert_eq!(held.attempt, 2, "{bead_id}");
+            assert_eq!(held.session_id, None, "{bead_id}");
         }
     }
 
