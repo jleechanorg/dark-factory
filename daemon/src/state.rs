@@ -568,7 +568,8 @@ impl StateStore for SqliteStateStore {
     fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
         self.conn
             .execute(
-                "UPDATE bead_overlay SET state = 'QUEUED', session_id = NULL, branch = NULL \
+                "UPDATE bead_overlay \
+                 SET state = 'HUMAN_HELD', park_reason = 'ambiguous_dispatching_recovery' \
                  WHERE state = 'DISPATCHING'",
                 [],
             )
@@ -785,6 +786,10 @@ impl StateStore for SqliteStateStore {
         // session may still be live because `ao session kill` failed. Auto-
         // requeueing that row would create a duplicate worker while erasing
         // the retained session identity needed for operator cleanup.
+        // `ambiguous_dispatching_recovery` is the startup fail-safe for a
+        // process crash or state-write failure after spawn may have begun.
+        // The retained branch/session fields are the operator's recovery
+        // handle; automatically requeueing would risk a duplicate worker.
         let mut id_stmt = self
             .conn
             .prepare(
@@ -795,7 +800,8 @@ impl StateStore for SqliteStateStore {
                           AND park_reason != 'unmapped_target_repo' \
                           AND park_reason != 'worktree_remote_mismatch' \
                           AND park_reason != 'worktree_remote_unverifiable' \
-                          AND park_reason != 'spawn_cleanup_failed'))",
+                          AND park_reason != 'spawn_cleanup_failed' \
+                          AND park_reason != 'ambiguous_dispatching_recovery'))",
             )
             .map_err(|e| tool_err("recover_human_held id select prepare", e))?;
         let recovered_ids: Vec<String> = id_stmt
@@ -1123,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_dispatching_requeues_and_clears_stale_session_and_branch() {
+    fn reconcile_dispatching_parks_ambiguity_and_preserves_recovery_handles() {
         let s = store();
         let o = BeadOverlay {
             bead_id: "b-stale".into(),
@@ -1146,9 +1152,17 @@ mod tests {
         s.reconcile_dispatching().unwrap();
 
         let got = s.load("b-stale").unwrap().unwrap();
-        assert_eq!(got.state, OverlayState::Queued);
-        assert_eq!(got.session_id, None);
-        assert_eq!(got.branch, None);
+        assert_eq!(got.state, OverlayState::HumanHeld);
+        assert_eq!(got.session_id.as_deref(), Some("stale-session-id"));
+        assert_eq!(got.branch.as_deref(), Some("stale-branch"));
+        assert_eq!(
+            got.park_reason.as_deref(),
+            Some("ambiguous_dispatching_recovery")
+        );
+        assert!(
+            s.recover_human_held(10).unwrap().is_empty(),
+            "ambiguous dispatch must never auto-requeue and spawn a duplicate"
+        );
     }
 
     #[test]

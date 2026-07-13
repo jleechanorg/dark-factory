@@ -1875,6 +1875,35 @@ mod tests {
     }
 
     #[test]
+    fn adapter_cleanup_hold_save_failure_leaves_branch_for_fail_closed_recovery() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_cleanup_for("bead-0");
+        let store = FakeStateStore::new();
+        store.fail_save_for("bead-0", OverlayState::HumanHeld);
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        assert!(err
+            .to_string()
+            .contains("failed to persist HUMAN_HELD cleanup record"));
+        let durable = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(durable.state, OverlayState::Dispatching);
+        assert_eq!(durable.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(durable.session_id, None);
+        assert!(
+            !sessions
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == "spawn(bead-1)"),
+            "a failed cleanup hold must stop the batch before another spawn"
+        );
+    }
+
+    #[test]
     fn save_failure_after_spawn_stops_session_and_continues_later_dispatch() {
         let sessions = FakeSessions::new(0);
         let store = FakeStateStore::new();
@@ -2409,6 +2438,39 @@ mod tests {
         assert_eq!(
             overlay.park_reason.as_deref(),
             Some("worktree_remote_mismatch")
+        );
+    }
+
+    #[test]
+    fn cleanup_wrapper_hold_save_failure_preserves_dispatching_branch() {
+        let sessions = FakeSessions::new(0);
+        sessions.set_worktree_remote(
+            "repo",
+            "https://github.com/wrong-owner/wrong-repo.git",
+        );
+        sessions.fail_stop_for("fake-session-1");
+        let store = FakeStateStore::new();
+        store.fail_save_for("bead-0", OverlayState::HumanHeld);
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        assert!(err
+            .to_string()
+            .contains("failed to persist the HUMAN_HELD cleanup record"));
+        let durable = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(durable.state, OverlayState::Dispatching);
+        assert_eq!(durable.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(durable.session_id, None);
+        assert!(
+            !sessions
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == "spawn(bead-1)"),
+            "a failed cleanup hold must stop the batch before another spawn"
         );
     }
 
