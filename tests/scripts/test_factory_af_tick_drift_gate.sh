@@ -95,18 +95,22 @@ run_drift_block() {
 }
 
 # Fixture: bare origin + working clone, both on main.
+# Seed origin with a deterministic initial main commit so clones never see
+# an empty repository (git-version-dependent warning/error on bare-origin
+# clone). This keeps the fixture deterministic across CI and local runs.
 ORIGIN="$SCRATCH_DIR/origin.git"
-git init -q --bare "$ORIGIN"
-WORK="$SCRATCH_DIR/work"
-git clone -q "$ORIGIN" "$WORK"
+git init -q --bare --initial-branch=main "$ORIGIN"
+
+SEED="$SCRATCH_DIR/seed"
+git init -q --initial-branch=main "$SEED"
 (
-    cd "$WORK"
+    cd "$SEED"
     git config user.email test@test.com
     git config user.name test
-    git checkout -q -b main 2>/dev/null || git checkout -q main
     echo x > f.txt
     git add f.txt
     git commit -q -m init
+    git remote add origin "$ORIGIN"
     git push -q origin main
 )
 # The bare origin's HEAD symref is set at `git init --bare` time from the
@@ -116,6 +120,11 @@ git clone -q "$ORIGIN" "$WORK"
 # branch instead of "main" -- explicitly repoint it so later clones (e.g.
 # $SECOND_CLONE below) always land on main regardless of host git config.
 git --git-dir="$ORIGIN" symbolic-ref HEAD refs/heads/main
+
+rm -rf "$SEED"
+
+WORK="$SCRATCH_DIR/work"
+git clone -q "$ORIGIN" "$WORK"
 
 # Case 1: clean checkout on main, in sync with origin -> gate passes.
 out="$(run_drift_block "$WORK")"

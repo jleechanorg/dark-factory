@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS) }}
     permissions:
       contents: read
     env:
@@ -28,6 +28,23 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
+
+      - name: Provision ripgrep (production scripts require rg)
+        # daemon/factory-af-tick.sh, daemon/factory-ao-remediate.sh, and
+        # tests/scripts/test_factory_af_tick_structured_rc.sh all use rg.
+        # Self-hosted runners must have it; fail loud if missing.
+        # See bead jleechan-kk0t.
+        run: |
+          if command -v rg >/dev/null 2>&1; then
+            echo "rg $(rg --version | head -1) available"
+          elif command -v brew >/dev/null 2>&1; then
+            brew install ripgrep
+          elif command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+          else
+            echo "::error::ripgrep (rg) not found and no package manager available"
+            exit 1
+          fi
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
@@ -51,7 +68,7 @@ jobs:
         run: python -m runner.graph_audit pipelines
 
   daemon-tests:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS) }}
     permissions:
       contents: read
     steps:
