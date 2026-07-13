@@ -27,6 +27,55 @@ jobs:
           echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
           echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
 
+      - name: Provision sqlite3 CLI
+        # Download pinned, architecture-aware sqlite3 CLI from sqlite.org.
+        # Checksum-verified (SHA3-256), user-scope (no sudo), placed on PATH
+        # before the bash integration test suite.  See bead jleechan-432s.
+        run: |
+          if command -v sqlite3 >/dev/null 2>&1 && sqlite3 ':memory:' 'SELECT 1;' >/dev/null 2>&1; then
+            echo "sqlite3 $(sqlite3 --version) already on PATH"
+            exit 0
+          fi
+          OS="$(uname -s)"
+          ARCH="$(uname -m)"
+          VER="3530300"
+          YEAR="2025"
+          case "${OS}-${ARCH}" in
+            Darwin-arm64)
+              URL="https://sqlite.org/${YEAR}/sqlite-tools-osx-arm64-${VER}.zip"
+              SHA3="b340969cf0e23a4c82c20319032c40cbc39264cb27b9cf71bf51875c24db4204"
+              ;;
+            Darwin-x86_64)
+              URL="https://sqlite.org/${YEAR}/sqlite-tools-osx-x64-${VER}.zip"
+              SHA3="84e04e0d57da6d4bfd2cd9aca97a5737e5da14c7a2576850638c48b946f37d12"
+              ;;
+            Linux-x86_64)
+              URL="https://sqlite.org/${YEAR}/sqlite-tools-linux-x64-${VER}.zip"
+              SHA3="83b43a9ef8b56f74ece1813161816133045ca834444bfa6bb34c6166328474f8"
+              ;;
+            *)
+              echo "::error::Unsupported platform: ${OS}-${ARCH}"; exit 1
+              ;;
+          esac
+          TOOLS_DIR="${RUNNER_TEMP}/sqlite-tools"
+          mkdir -p "${TOOLS_DIR}"
+          curl -fsSL -o "${TOOLS_DIR}/sqlite.zip" "${URL}"
+          ACTUAL="$(openssl dgst -sha3-256 "${TOOLS_DIR}/sqlite.zip" | awk '{print $NF}')"
+          if [ "${ACTUAL}" != "${SHA3}" ]; then
+            echo "::error::SHA3-256 mismatch! Expected ${SHA3}, got ${ACTUAL}"
+            exit 1
+          fi
+          unzip -qo "${TOOLS_DIR}/sqlite.zip" -d "${TOOLS_DIR}"
+          case "${OS}" in
+            Darwin)
+              xattr -d com.apple.quarantine "${TOOLS_DIR}"/sqlite-tools-*/sqlite3 2>/dev/null || true
+              ;;
+          esac
+          BIN_DIR="$(dirname "$(find "${TOOLS_DIR}" -name sqlite3 -type f | head -1)")"
+          echo "${BIN_DIR}" >> "${GITHUB_PATH}"
+          export PATH="${BIN_DIR}:${PATH}"
+          sqlite3 --version
+
       - name: Run tests
         run: .venv/bin/python -m pytest tests/ -v --tb=short
 
