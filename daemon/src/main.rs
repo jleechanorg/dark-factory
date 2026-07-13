@@ -383,17 +383,22 @@ type DaemonAdapters = (
     Box<dyn Vcs>,
 );
 
-fn ao_runtime_binding(cfg: &Config) -> (String, String) {
-    let ao_project = cfg.ao_project.clone().unwrap_or_else(|| {
-        cfg.target_repo
-            .split('/')
-            .next_back()
-            .unwrap_or(&cfg.target_repo)
-            .to_string()
-    });
+fn ao_runtime_binding(cfg: &Config) -> Result<(String, String), DaemonError> {
+    // Use the canonical routing path shared with dispatch, including legacy
+    // aliases such as worldarchitect.ai -> worldarchitect. Duplicating its
+    // derivation here would let startup reject a config that spawning accepts.
+    let ao_project = cfg
+        .resolve_repo(&cfg.target_repo)
+        .ok_or_else(|| {
+            DaemonError::Config(format!(
+                "target repository {:?} has no AO routing configuration",
+                cfg.target_repo
+            ))
+        })?
+        .ao_project;
     let default_agent = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT")
         .unwrap_or_else(|_| "minimax".to_string());
-    (ao_project, default_agent)
+    Ok((ao_project, default_agent))
 }
 
 fn verify_startup_ao_compatibility(
@@ -411,7 +416,7 @@ fn verify_startup_ao_compatibility(
 fn run(args: Args) -> Result<(), DaemonError> {
     let cfg_path = default_config_path();
     let cfg = load_config(&cfg_path)?;
-    let (ao_project, default_agent) = ao_runtime_binding(&cfg);
+    let (ao_project, default_agent) = ao_runtime_binding(&cfg)?;
     // Fail before opening/reconciling state, advertising READY, or polling a
     // healthy tick when the installed AO/Node adapter is incompatible. The
     // diagnostic exits before AO preflight, locking, workspace creation, or
@@ -591,6 +596,28 @@ mod tests {
             Some(("dark-factory".to_string(), "minimax".to_string()))
         );
         assert!(error.to_string().contains("incompatible AO runtime"));
+    }
+
+    #[test]
+    fn startup_binding_uses_canonical_legacy_worldarchitect_project_alias() {
+        let cfg = Config {
+            target_repo: "jleechanorg/worldarchitect.ai".to_string(),
+            ao_project: None,
+            base_branch: "main".to_string(),
+            stage: 1,
+            max_workers: 30,
+            max_batch: 15,
+            fast_tick_secs: 60,
+            slow_tick_secs: 600,
+            autonomy_timebox_secs: 10_800,
+            budget_warn_usd: 20.0,
+            spec_dir: ".factory/specs".to_string(),
+            repos: std::collections::HashMap::new(),
+        };
+
+        let (project, _) = ao_runtime_binding(&cfg).unwrap();
+
+        assert_eq!(project, "worldarchitect");
     }
 
     #[test]
