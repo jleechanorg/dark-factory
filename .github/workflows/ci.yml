@@ -29,23 +29,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
 
-      - name: Provision ripgrep (production scripts require rg)
-        # daemon/factory-af-tick.sh, daemon/factory-ao-remediate.sh, and
-        # tests/scripts/test_factory_af_tick_structured_rc.sh all use rg.
-        # Self-hosted runners must have it; fail loud if missing.
-        # See bead jleechan-kk0t.
-        run: |
-          if command -v rg >/dev/null 2>&1; then
-            echo "rg $(rg --version | head -1) available"
-          elif command -v brew >/dev/null 2>&1; then
-            brew install ripgrep
-          elif command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
-          else
-            echo "::error::ripgrep (rg) not found and no package manager available"
-            exit 1
-          fi
-
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
 
@@ -86,6 +69,19 @@ jobs:
         run: |
           git fetch origin main
           git show-ref --verify --quiet refs/heads/main || git branch main origin/main
+
+      - name: Set up Rust toolchain (pinned user-scope)
+        # Self-hosted runners may not have cargo/rustup pre-installed.
+        # Install rustup with stable toolchain user-scope (no sudo).
+        # See bead jleechan-u2es.
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          rustup show
+          cargo --version
+          rustc --version
 
       - name: cargo test (daemon crate)
         working-directory: daemon

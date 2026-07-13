@@ -176,7 +176,7 @@ fi
 # Park superseded duplicates. Generic query — no hardcoded bead IDs.
 # Picks up beads marked with the "superseded" label via the br CLI; if that
 # query yields nothing, this loop is a no-op.
-if br --help 2>/dev/null | rg -q 'list.*--label'; then
+if br --help 2>/dev/null | grep -q 'list.*--label'; then
     while IFS=$'\t' read -r dup_id; do
         [ -n "$dup_id" ] || continue
         cur_state="$(sqlite3 "$DB" "SELECT state FROM bead_overlay WHERE bead_id='$(printf '%s' "$dup_id" | sed "s/'/''/g")';" 2>/dev/null || true)"
@@ -237,9 +237,9 @@ try:
 except Exception:
     print(0)' 2>/dev/null || echo 0)"
     else
-        ao_active="$("$AO" session ls -p "$AO_PROJECT" 2>/dev/null | rg -c '\[(spawning|running|active|working|pr_open)\]' || echo 0)"
+        ao_active="$("$AO" session ls -p "$AO_PROJECT" 2>/dev/null | grep -Ec '\[(spawning|running|active|working|pr_open)\]' || echo 0)"
     fi
-    # Ensure ao_active is a non-negative integer (defensive: rg/race could leave empty)
+    # Ensure ao_active is a non-negative integer (defensive: grep/race could leave empty)
     case "${ao_active:-0}" in
         ''|*[!0-9]*) ao_active=0 ;;
     esac
@@ -341,7 +341,7 @@ PY
         continue
     fi
 
-    if [ -n "$AO" ] && "$AO" session ls -p "$proj" 2>/dev/null | rg "pulls/${pr}\\b" | rg -q '\[(spawning|running|active|working|pr_open)\]'; then
+    if [ -n "$AO" ] && "$AO" session ls -p "$proj" 2>/dev/null | grep "pulls/${pr}" | grep -qE '\[(spawning|running|active|working|pr_open)\]'; then
         echo "[af] skip $bead_id PR #$pr (active session exists in project $proj)" >&2
         continue
     fi

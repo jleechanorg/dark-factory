@@ -138,7 +138,7 @@ run_spawn_foreground() {
   # Returns "exit_code<TAB>output" so the caller can branch on rc.
   local out rc
   set +e
-  if "$AO" spawn --help 2>&1 | rg -q '\-\-name'; then
+  if "$AO" spawn --help 2>&1 | grep -q -e '--name'; then
     out="$(timeout "$SPAWN_TIMEOUT" "$AO" spawn --project "$AO_PROJECT" --name "$DISPLAY_NAME" --agent claude-code --claim-pr "$PR" --prompt "$PROMPT" 2>&1)"
   else
     out="$(timeout "$SPAWN_TIMEOUT" "$AO" spawn --project "$AO_PROJECT" --claim-pr "$PR" --agent claude-code "$PROMPT" 2>&1)"
@@ -152,10 +152,10 @@ classify_spawn_outcome() {
   # $1 = spawn rc, $2 = spawn output. Echoes 0 (success) or 1 (failure).
   local rc="$1" out="$2"
   if [ "$rc" -eq 0 ]; then return 0; fi
-  if echo "$out" | rg -q 'spawned session |Session [a-z0-9_-]+ created|✓ Session|pr_open|working|spawning|claimed https://'; then
+  if echo "$out" | grep -qE 'spawned session |Session [a-z0-9_-]+ created|✓ Session|pr_open|working|spawning|claimed https://'; then
     return 0
   fi
-  if "$AO" session ls 2>/dev/null | rg "pulls/${PR}\b" | rg -q "\[(spawning|running|active|working|pr_open)\]"; then
+  if "$AO" session ls 2>/dev/null | grep "pulls/${PR}" | grep -qE "\[(spawning|running|active|working|pr_open)\]"; then
     return 0
   fi
   return 1
