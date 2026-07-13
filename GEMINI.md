@@ -103,7 +103,26 @@ Before marking Gate 6 as PASS, you must answer explicitly what the evidence prov
 > [!CAUTION]
 > **NEVER** execute `gh pr merge` or merge any PR unprompted, even if all 9 gates are green (the 7 originals + `/code-standards` + `/zfc`). You **MUST** wait for the human user to explicitly type `MERGE APPROVED` in the chat before carrying out the merge.
 
+### Evidence Hosting Rule (`/es` — HARD RULE)
+
+> [!IMPORTANT]
+> **ALL evidence must be uploaded to a public GitHub Gist.** Never inline evidence (logs, JSON, test output, code dumps) directly in a PR description or comment.
+
+```bash
+# Upload evidence bundle to gist
+gh gist create --public --desc "Evidence for PR #<N> <branch>" <evidence-files>
+
+# Then update the PR description to reference the gist URL only:
+# **Evidence**: https://gist.github.com/jleechan2015/<gist-id>
+
+# Verify the PR body contains the gist link:
+gh pr view <N> --json body --jq '.body' | grep -i "gist\|evidence"
+```
+
+Workers that paste raw evidence into PR descriptions must remove it and replace with the gist URL. Committing evidence artifacts to git ≠ published.
+
 ---
+
 
 ## 7. Worktree Protection & Post-Task Self-Cleanup
 
