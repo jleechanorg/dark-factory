@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::router::RoutingVerdict;
 use crate::state::{BeadOverlay, OverlayState, StateStore};
-use crate::tools::{remote_url_matches_repo, Bead, Sessions, SpawnSpec};
+use crate::tools::{remote_url_for_display, remote_url_matches_repo, Bead, Sessions, SpawnSpec};
 
 const SPAWN_CLEANUP_FAILED_PARK_REASON: &str = "spawn_cleanup_failed";
 
@@ -505,9 +505,10 @@ pub fn dispatch_ready(
             // failures. Use the permanent mismatch park so recovery cannot
             // silently requeue the same unsafe workspace next tick.
             let phase = "worktree_remote_mismatch";
+            let displayed_remote = remote_url_for_display(&remote_url);
             let remote_error = DaemonError::Config(format!(
                 "spawned worktree for bead {} (branch {branch:?}) has remote {:?} pointing at \
-                 {remote_url:?}, which {detail}; refusing to dispatch to the unsafe workspace \
+                 {displayed_remote}, which {detail}; refusing to dispatch to the unsafe workspace \
                  (jleechan-9sh5 discipline).",
                 bead.id, routing.push_remote
             ));
@@ -2299,10 +2300,14 @@ mod tests {
     /// rather than silently trusting the dispatch.
     #[test]
     fn worktree_remote_mismatch_kills_session_and_parks_human_held() {
+        const SECRET: &str = "SYNTHETIC_REMOTE_CREDENTIAL_SENTINEL";
         let sessions = FakeSessions::new(0);
         // cfg().target_repo == "owner/repo" derives ao_project "repo" via
         // Config::resolve_repo's legacy fallback (no explicit ao_project).
-        sessions.set_worktree_remote("repo", "https://github.com/wrong-owner/wrong-repo.git");
+        sessions.set_worktree_remote(
+            "repo",
+            &format!("https://user:{SECRET}@github.com/wrong-owner/wrong-repo.git"),
+        );
         let store = FakeStateStore::new();
         let cfg = cfg();
         let ready = beads(1);
@@ -2318,10 +2323,10 @@ mod tests {
         assert_eq!(report.failures[0].bead_id, "bead-0");
         assert_eq!(report.failures[0].phase, "worktree_remote_mismatch");
         assert!(
-            report.failures[0].error.contains("wrong-owner/wrong-repo"),
-            "error should name the observed mismatched remote: {}",
-            report.failures[0].error
+            report.failures[0].error.contains("<redacted-git-remote>"),
+            "error must identify that the observed remote was redacted"
         );
+        assert!(!report.failures[0].error.contains(SECRET));
 
         let calls = sessions.calls.borrow();
         assert!(
@@ -2343,8 +2348,12 @@ mod tests {
     /// this check existed.
     #[test]
     fn worktree_remote_match_passes_through_cleanly() {
+        const SECRET: &str = "SYNTHETIC_REMOTE_CREDENTIAL_SENTINEL";
         let sessions = FakeSessions::new(0);
-        sessions.set_worktree_remote("repo", "https://github.com/owner/repo.git");
+        sessions.set_worktree_remote(
+            "repo",
+            &format!("https://user:{SECRET}@github.com/owner/repo.git"),
+        );
         let store = FakeStateStore::new();
         let cfg = cfg();
         let ready = beads(1);
@@ -2371,8 +2380,12 @@ mod tests {
     /// silently continue as if nothing happened.
     #[test]
     fn worktree_remote_mismatch_stop_failure_is_fatal() {
+        const SECRET: &str = "SYNTHETIC_REMOTE_CREDENTIAL_SENTINEL";
         let sessions = FakeSessions::new(0);
-        sessions.set_worktree_remote("repo", "https://github.com/wrong-owner/wrong-repo.git");
+        sessions.set_worktree_remote(
+            "repo",
+            &format!("https://user:{SECRET}@github.com/wrong-owner/wrong-repo.git"),
+        );
         sessions.fail_stop_for("fake-session-1");
         let store = FakeStateStore::new();
         let cfg = cfg();
@@ -2381,8 +2394,11 @@ mod tests {
         let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
         assert!(
             matches!(err, DaemonError::SpawnCleanupFailed { .. }),
-            "failure to kill a confirmed wrong-repo session must be fatal: {err:?}"
+            "failure to kill a confirmed wrong-repo session must be fatal"
         );
+        let rendered = err.to_string();
+        assert!(rendered.contains("<redacted-git-remote>"));
+        assert!(!rendered.contains(SECRET));
         assert!(!err.is_transient(), "cleanup failure must never be retried");
 
         let calls = sessions.calls.borrow();

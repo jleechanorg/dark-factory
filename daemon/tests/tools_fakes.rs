@@ -103,6 +103,7 @@ fn fake_sessions_spawn_attach_stop_quiescent_roundtrip() {
         branch_for: Default::default(),
         terminal_at: Default::default(),
         quiescence_check_error: Default::default(),
+        worktree_remote_override: Default::default(),
     };
 
     assert_eq!(fake.active_count().unwrap(), 3);

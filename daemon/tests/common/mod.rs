@@ -278,6 +278,7 @@ pub struct FakeSessions {
     /// Optional error to return from `is_quiescent` (models the "quiescence
     /// check failed" error path independent of the timeout path).
     pub quiescence_check_error: RefCell<Option<String>>,
+    pub worktree_remote_override: RefCell<Option<String>>,
 }
 
 impl Default for FakeSessions {
@@ -293,6 +294,7 @@ impl Default for FakeSessions {
             branch_for: RefCell::new(HashMap::new()),
             terminal_at: RefCell::new(None),
             quiescence_check_error: RefCell::new(None),
+            worktree_remote_override: RefCell::new(None),
         }
     }
 }
@@ -333,6 +335,10 @@ impl FakeSessions {
     /// AO status-query failure independent of the timeout path.
     pub fn fail_quiescence_check(&self, message: &str) {
         *self.quiescence_check_error.borrow_mut() = Some(message.to_string());
+    }
+
+    pub fn set_worktree_remote(&self, remote: &str) {
+        *self.worktree_remote_override.borrow_mut() = Some(remote.to_string());
     }
 }
 
@@ -414,6 +420,9 @@ impl Sessions for FakeSessions {
         self.calls.borrow_mut().push(format!(
             "worktree_remote_url({ao_project},{branch},{remote_name})"
         ));
+        if let Some(remote) = self.worktree_remote_override.borrow().clone() {
+            return Ok(Some(remote));
+        }
         let repo = if ao_project == "worldarchitect" {
             "jleechanorg/worldarchitect.ai"
         } else {

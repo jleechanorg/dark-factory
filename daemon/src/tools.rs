@@ -314,6 +314,15 @@ pub fn remote_url_matches_repo(url: &str, repo: &str) -> Option<bool> {
     None
 }
 
+/// Safe display value for a configured git remote URL.
+///
+/// Remote URLs may contain HTTP userinfo credentials. Keep the raw value
+/// available only to deterministic matching and never copy any part of it
+/// into errors, telemetry, or outward-facing escalation comments.
+pub fn remote_url_for_display(_url: &str) -> &'static str {
+    "<redacted-git-remote>"
+}
+
 /// `br` CLI. `fetch_candidates` == `br list --status open --label factory --json`.
 pub trait Tracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError>;
@@ -650,7 +659,7 @@ fn run_tool_with_cwd(
 
 #[cfg(test)]
 mod remote_url_matches_repo_tests {
-    use super::remote_url_matches_repo;
+    use super::{remote_url_for_display, remote_url_matches_repo};
 
     #[test]
     fn https_url_with_dot_git_suffix_matches() {
@@ -735,6 +744,17 @@ mod remote_url_matches_repo_tests {
             ),
             Some(true)
         );
+    }
+
+    #[test]
+    fn remote_display_never_exposes_embedded_credentials() {
+        const SECRET: &str = "SYNTHETIC_REMOTE_CREDENTIAL_SENTINEL";
+        let remote = format!("https://user:{SECRET}@github.com/owner/repo.git");
+
+        let displayed = remote_url_for_display(&remote);
+
+        assert_eq!(displayed, "<redacted-git-remote>");
+        assert!(!displayed.contains(SECRET));
     }
 
     #[test]
