@@ -273,6 +273,7 @@ pub fn now_iso8601() -> String {
 
 pub const CIRCUIT_BREAKER_PARK_REASON: &str =
     "circuit-breaker triggered: same reviewer and feedback hash as prior attempt";
+const ROUTER_PARSE_PARK_REASON_PREFIX: &str = "router_parse_error:";
 
 pub enum HumanHoldReason {
     TransientSpawnRetryCapExceeded,
@@ -316,7 +317,9 @@ impl HumanHoldReason {
                 "gate assessment not all-green (stage 1: recorded, not executed)"
             }
             Self::SpecValidationFailed => "spec file validation failed in recovery",
-            Self::RouterParse(reason) => return format!("router_parse_error: {reason}"),
+            Self::RouterParse(reason) => {
+                return format!("{ROUTER_PARSE_PARK_REASON_PREFIX} {reason}");
+            }
             Self::UnmappedTargetRepo => "unmapped_target_repo",
             Self::WorktreeRemoteMismatch => "worktree_remote_mismatch",
             Self::WorktreeRemoteUnverifiable => "worktree_remote_unverifiable",
@@ -351,6 +354,13 @@ impl HumanHoldReason {
     }
 
     fn is_recoverable_value(reason: &str) -> bool {
+        Self::recoverable_exact_values()
+            .iter()
+            .any(|candidate| candidate == reason)
+            || reason.starts_with(ROUTER_PARSE_PARK_REASON_PREFIX)
+    }
+
+    fn recoverable_exact_values() -> [String; 5] {
         [
             Self::TransientSpawnRetryCapExceeded,
             Self::AdoptedPreSessionShaCaptureFailed,
@@ -358,9 +368,7 @@ impl HumanHoldReason {
             Self::Stage1GateNotGreen,
             Self::SpecValidationFailed,
         ]
-        .iter()
-        .any(|candidate| candidate.value() == reason)
-            || reason.starts_with("router_parse_error:")
+        .map(|candidate| candidate.value())
     }
 }
 
@@ -842,13 +850,12 @@ impl StateStore for SqliteStateStore {
     }
 
     fn recover_human_held(&self, max_attempt: u32) -> Result<Vec<BeadOverlay>, DaemonError> {
-        // P2 fix (Codex review): the post-UPDATE SELECT must return ONLY the
-        // rows we just flipped — earlier versions matched every QUEUED bead
-        // with autonomy_secs=0 in the DB, polluting recovery telemetry with
-        // beads that were never HUMAN_HELD. Capture the bead_ids first, then
-        // SELECT WHERE bead_id IN (...). rusqlite has no clean RETURNING
-        // support, so two statements + an in-memory id list is the simplest
-        // fix.
+        // Recovery is a single atomic UPDATE ... RETURNING statement. The
+        // write-time predicate revalidates state, attempt cap, typed reason,
+        // and absence of a durable session handle immediately before the
+        // mutation. A prior SELECT-then-UPDATE-by-id implementation allowed
+        // another WAL connection to attach a live session between statements;
+        // recovery would then erase that handle and requeue a duplicate worker.
         //
         // bead jleechan-4jn1 (live incident jleechan-93ft / PR
         // worldarchitect.ai#7888): `park_reason LIKE 'circuit-breaker%'`
@@ -893,33 +900,7 @@ impl StateStore for SqliteStateStore {
         // process crash or state-write failure after spawn may have begun.
         // The retained branch/session fields are the operator's recovery
         // handle; automatically requeueing would risk a duplicate worker.
-        let mut id_stmt = self
-            .conn
-            .prepare(
-                "SELECT bead_id, park_reason, session_id FROM bead_overlay \
-                 WHERE state = 'HUMAN_HELD' AND attempt < ?1",
-            )
-            .map_err(|e| tool_err("recover_human_held id select prepare", e))?;
-        let recovered_ids: Vec<String> = id_stmt
-            .query_map(params![max_attempt as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .map_err(|e| tool_err("recover_human_held id select query", e))?
-            .filter_map(|row| row.ok())
-            .filter_map(|(bead_id, park_reason, session_id)| {
-                (!is_permanent_human_hold_reason(park_reason.as_deref())
-                    && session_id.is_none())
-                .then_some(bead_id)
-            })
-            .collect();
-        if recovered_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        // P2 fix (Codex review): clear stale PR metadata on requeue.
+        // Clear stale PR metadata on requeue.
         // `pr_number` and `session_id` belong to the prior (failed) attempt
         // and would otherwise be carried into the new dispatch — `dispatch_ready`
         // overwrites `branch` but leaves the other fields, so the fast tier
@@ -927,64 +908,74 @@ impl StateStore for SqliteStateStore {
         // the dead PR and re-park on the same gate. `branch` is kept so the
         // recovered-from telemetry still records what was being worked on;
         // dispatch will rewrite it on the next attempt.
-        let placeholders = std::iter::repeat_n("?", recovered_ids.len()).collect::<Vec<_>>().join(",");
-        let update_sql = format!(
-            "UPDATE bead_overlay \
-             SET state = 'QUEUED', attempt = attempt + 1, autonomy_secs = 0, \
-                 pr_number = NULL, session_id = NULL, park_reason = NULL, updated_at = ?1 \
-             WHERE bead_id IN ({})",
-            placeholders
-        );
+        let recoverable = HumanHoldReason::recoverable_exact_values();
+        let router_prefix = format!("{ROUTER_PARSE_PARK_REASON_PREFIX}%");
         let now = now_iso8601();
-        let mut update_params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(recovered_ids.len() + 1);
-        update_params.push(&now);
-        for id in &recovered_ids {
-            update_params.push(id as &dyn rusqlite::ToSql);
-        }
-        self.conn
-            .execute(&update_sql, &update_params[..])
-            .map_err(|e| tool_err("recover_human_held update", e))?;
-        // SELECT the exact rows we just flipped — bounded by the captured
-        // id list, not by state+autonomy heuristics that could match other rows.
-        let select_sql = format!(
-            "SELECT bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
-             pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, \
-             park_reason, target_repo \
-             FROM bead_overlay WHERE bead_id IN ({})",
-            placeholders
-        );
-        let mut select_params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(recovered_ids.len());
-        for id in &recovered_ids {
-            select_params.push(id as &dyn rusqlite::ToSql);
-        }
         let mut stmt = self
             .conn
-            .prepare(&select_sql)
+            .prepare(
+                "UPDATE bead_overlay \
+             SET state = 'QUEUED', attempt = attempt + 1, autonomy_secs = 0, \
+                 pr_number = NULL, session_id = NULL, park_reason = NULL, updated_at = ?1 \
+             WHERE state = 'HUMAN_HELD' \
+               AND attempt < ?2 \
+               AND session_id IS NULL \
+               AND (park_reason IN (?3, ?4, ?5, ?6, ?7) OR park_reason LIKE ?8) \
+             RETURNING bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
+                 pr_number, branch, session_id, is_adopted, spawn_failure_count, \
+                 pre_session_head_sha, park_reason, target_repo",
+            )
             .map_err(|e| tool_err("recover_human_held prepare", e))?;
         let rows = stmt
-            .query_map(&select_params[..], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, f64>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, i64>(10)?,
-                    row.get::<_, Option<String>>(11)?,
-                    row.get::<_, Option<String>>(12)?,
-                    row.get::<_, Option<String>>(13)?,
-                ))
-            })
+            .query_map(
+                params![
+                    now,
+                    max_attempt as i64,
+                    &recoverable[0],
+                    &recoverable[1],
+                    &recoverable[2],
+                    &recoverable[3],
+                    &recoverable[4],
+                    router_prefix,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, f64>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                    ))
+                },
+            )
             .map_err(|e| tool_err("recover_human_held query", e))?;
         let mut out = Vec::new();
         for r in rows {
-            let (bead_id, state_str, attempt, reroll_count, autonomy_secs, spend_usd, pr_number, branch, session_id, is_adopted, spawn_failure_count, pre_session_head_sha, park_reason, target_repo) =
-                r.map_err(|e| tool_err("recover_human_held row", e))?;
+            let (
+                bead_id,
+                state_str,
+                attempt,
+                reroll_count,
+                autonomy_secs,
+                spend_usd,
+                pr_number,
+                branch,
+                session_id,
+                is_adopted,
+                spawn_failure_count,
+                pre_session_head_sha,
+                park_reason,
+                target_repo,
+            ) = r.map_err(|e| tool_err("recover_human_held row", e))?;
             out.push(BeadOverlay {
                 bead_id,
                 state: OverlayState::from_str(&state_str)?,
@@ -1163,6 +1154,14 @@ fn no_such_column(err: &rusqlite::Error) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    static RECOVERY_BUSY_HANDLER_ENTERED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn signal_recovery_busy(_attempt: i32) -> bool {
+        RECOVERY_BUSY_HANDLER_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
 
     fn store() -> SqliteStateStore {
         SqliteStateStore::open_in_memory_with_schema(include_str!("../contracts/schema.sql"))
@@ -2203,6 +2202,105 @@ mod tests {
             assert_eq!(o.state, OverlayState::Queued, "{id} must stay QUEUED");
             assert_eq!(o.autonomy_secs, 0, "{id} autonomy_secs unchanged");
         }
+    }
+
+    #[test]
+    fn recover_human_held_revalidates_a_concurrent_live_session_at_write_time() {
+        let path = std::env::temp_dir().join(format!(
+            "afd_recovery_wal_race_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let recovery_store = SqliteStateStore::open(&path).unwrap();
+        let writer_store = SqliteStateStore::open(&path).unwrap();
+        let overlay = BeadOverlay {
+            bead_id: "wal-race".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 60,
+            spend_usd: 0.0,
+            pr_number: Some(293),
+            branch: Some("factory/wal-race-r2".into()),
+            session_id: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: Some("pre-spawn-sha".into()),
+            park_reason: Some(HumanHoldReason::SessionStalled.value()),
+            target_repo: Some("jleechanorg/dark-factory".into()),
+        };
+        recovery_store.save(&overlay).unwrap();
+
+        // Connection B commits the external fact recovery must not erase:
+        // an active session is now durably attached. Hold BEGIN IMMEDIATE
+        // open so connection A's atomic recovery reaches SQLite and blocks.
+        let journal_mode: String = writer_store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        writer_store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        writer_store
+            .conn
+            .execute(
+                "UPDATE bead_overlay \
+                 SET session_id = ?1, park_reason = ?2 \
+                 WHERE bead_id = 'wal-race'",
+                params![
+                    "live-session-from-connection-b",
+                    HumanHoldReason::AdoptedSessionAlreadyActive.value(),
+                ],
+            )
+            .unwrap();
+
+        RECOVERY_BUSY_HANDLER_ENTERED.store(false, std::sync::atomic::Ordering::SeqCst);
+        recovery_store
+            .conn
+            .busy_handler(Some(signal_recovery_busy))
+            .unwrap();
+        let recovery_thread = std::thread::spawn(move || {
+            let result = recovery_store.recover_human_held(10);
+            (recovery_store, result)
+        });
+
+        // The busy callback is the deterministic synchronization point: the
+        // recovery UPDATE has attempted to acquire the WAL writer lock while
+        // connection B's live-session write is still uncommitted.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !RECOVERY_BUSY_HANDLER_ENTERED.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(
+            RECOVERY_BUSY_HANDLER_ENTERED.load(std::sync::atomic::Ordering::SeqCst),
+            "recovery never contended on connection B's WAL writer lock"
+        );
+        writer_store.conn.execute_batch("COMMIT").unwrap();
+
+        let (recovery_store, recovered) = recovery_thread.join().unwrap();
+        let recovered = recovered.unwrap();
+        assert!(
+            recovered.is_empty(),
+            "the atomic write predicate must revalidate after the concurrent commit"
+        );
+        let held = recovery_store.load("wal-race").unwrap().unwrap();
+        assert_eq!(held.state, OverlayState::HumanHeld);
+        assert_eq!(held.attempt, 2);
+        assert_eq!(
+            held.session_id.as_deref(),
+            Some("live-session-from-connection-b")
+        );
+        assert_eq!(
+            held.park_reason.as_deref(),
+            Some("adopted_session_already_active")
+        );
+
+        drop(writer_store);
+        drop(recovery_store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     }
 
     /// jleechan-54ky: `list_active_overlays` returns the active set
