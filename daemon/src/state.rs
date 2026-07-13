@@ -778,6 +778,13 @@ impl StateStore for SqliteStateStore {
         // something a bare requeue alone fixes, and mirroring
         // `unmapped_target_repo`'s auto-requeue exclusion keeps the two
         // "spawn-time fail loud" park reasons behaviorally consistent.
+        // `worktree_remote_unverifiable` is the same safety class: absence
+        // of inspectable remote evidence must not become permission to
+        // respawn into the same opaque workspace on the next recovery pass.
+        // `spawn_cleanup_failed` is also permanent: the daemon knows a
+        // session may still be live because `ao session kill` failed. Auto-
+        // requeueing that row would create a duplicate worker while erasing
+        // the retained session identity needed for operator cleanup.
         let mut id_stmt = self
             .conn
             .prepare(
@@ -786,7 +793,9 @@ impl StateStore for SqliteStateStore {
                  AND (park_reason IS NULL \
                       OR (park_reason NOT LIKE 'circuit-breaker%' \
                           AND park_reason != 'unmapped_target_repo' \
-                          AND park_reason != 'worktree_remote_mismatch'))",
+                          AND park_reason != 'worktree_remote_mismatch' \
+                          AND park_reason != 'worktree_remote_unverifiable' \
+                          AND park_reason != 'spawn_cleanup_failed'))",
             )
             .map_err(|e| tool_err("recover_human_held id select prepare", e))?;
         let recovered_ids: Vec<String> = id_stmt
@@ -1770,6 +1779,44 @@ mod tests {
                 target_repo: None,
             },
         );
+        overlays.insert(
+            "cleanup-failed".to_string(),
+            BeadOverlay {
+                bead_id: "cleanup-failed".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 2,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: Some("factory/cleanup-failed-r2".into()),
+                session_id: Some("still-live-session".into()),
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some("spawn_cleanup_failed".to_string()),
+                target_repo: None,
+            },
+        );
+        overlays.insert(
+            "remote-unverifiable".to_string(),
+            BeadOverlay {
+                bead_id: "remote-unverifiable".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 2,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: Some("factory/remote-unverifiable-r2".into()),
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some("worktree_remote_unverifiable".to_string()),
+                target_repo: None,
+            },
+        );
         for overlay in overlays.values() {
             store.save(overlay).unwrap();
         }
@@ -1778,7 +1825,7 @@ mod tests {
         assert_eq!(
             recovered.len(),
             1,
-            "only the transient park should be recovered; the worktree-remote-mismatch park must be excluded"
+            "only the transient park should be recovered; permanent remote/cleanup safety parks must be excluded"
         );
         assert_eq!(recovered[0].bead_id, "transient-stalled-2");
 
@@ -1793,6 +1840,25 @@ mod tests {
             wrong_remote.park_reason.as_deref(),
             Some("worktree_remote_mismatch"),
             "park_reason must survive an excluded recovery pass"
+        );
+
+        let cleanup_failed = store.load("cleanup-failed").unwrap().unwrap();
+        assert_eq!(cleanup_failed.state, OverlayState::HumanHeld);
+        assert_eq!(
+            cleanup_failed.session_id.as_deref(),
+            Some("still-live-session"),
+            "the known live session identity must survive recovery"
+        );
+        assert_eq!(
+            cleanup_failed.park_reason.as_deref(),
+            Some("spawn_cleanup_failed")
+        );
+
+        let remote_unverifiable = store.load("remote-unverifiable").unwrap().unwrap();
+        assert_eq!(remote_unverifiable.state, OverlayState::HumanHeld);
+        assert_eq!(
+            remote_unverifiable.park_reason.as_deref(),
+            Some("worktree_remote_unverifiable")
         );
 
         let transient = store.load("transient-stalled-2").unwrap().unwrap();

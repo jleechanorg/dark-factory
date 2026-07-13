@@ -10,6 +10,35 @@ use crate::router::RoutingVerdict;
 use crate::state::{BeadOverlay, OverlayState, StateStore};
 use crate::tools::{remote_url_matches_repo, Bead, Sessions, SpawnSpec};
 
+const SPAWN_CLEANUP_FAILED_PARK_REASON: &str = "spawn_cleanup_failed";
+
+fn record_spawn_cleanup_failure(
+    store: &dyn StateStore,
+    overlay: &mut BeadOverlay,
+    session_id: &crate::tools::SessionId,
+    park_reason: &str,
+    root_error: DaemonError,
+    cleanup_error: DaemonError,
+) -> DaemonError {
+    // The kill failed, so retain the known session identity durably instead
+    // of leaving a live worker untracked behind a DISPATCHING row that
+    // startup reconciliation would blindly requeue.
+    overlay.state = OverlayState::HumanHeld;
+    overlay.session_id = Some(session_id.0.clone());
+    overlay.park_reason = Some(park_reason.to_string());
+    let cleanup_error = match store.save(overlay) {
+        Ok(()) => cleanup_error,
+        Err(state_error) => DaemonError::Config(format!(
+            "session cleanup failed: {cleanup_error}; additionally failed to persist the HUMAN_HELD cleanup record: {state_error}"
+        )),
+    };
+    DaemonError::SpawnCleanupFailed {
+        session: session_id.0.clone(),
+        spawn_error: Box::new(root_error),
+        cleanup_error: Box::new(cleanup_error),
+    }
+}
+
 /// Coder-dispatch prompt preamble (bead jleechan-bqdv, Stage C of the
 /// multi-repo dispatch fix — see
 /// `docs/multirepo-dispatch-investigation-2026-07-11.md`; supersedes
@@ -415,7 +444,16 @@ pub fn dispatch_ready(
         let remote_url = match verified_remote {
             Ok(url) => url,
             Err(error) => {
-                sessions.stop(&session_id)?;
+                if let Err(cleanup_error) = sessions.stop(&session_id) {
+                    return Err(record_spawn_cleanup_failure(
+                        store,
+                        &mut overlay,
+                        &session_id,
+                        SPAWN_CLEANUP_FAILED_PARK_REASON,
+                        error,
+                        cleanup_error,
+                    ));
+                }
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
                 overlay.park_reason = Some("worktree_remote_unverifiable".to_string());
@@ -432,9 +470,6 @@ pub fn dispatch_ready(
         };
         let remote_match = remote_url_matches_repo(&remote_url, &repo);
         if remote_match != Some(true) {
-            sessions.stop(&session_id)?;
-            overlay.state = OverlayState::HumanHeld;
-            overlay.session_id = None;
             let detail = if remote_match == Some(false) {
                 format!("does not match the bead's resolved repo {repo:?}")
             } else {
@@ -445,6 +480,24 @@ pub fn dispatch_ready(
             // failures. Use the permanent mismatch park so recovery cannot
             // silently requeue the same unsafe workspace next tick.
             let phase = "worktree_remote_mismatch";
+            let remote_error = DaemonError::Config(format!(
+                "spawned worktree for bead {} (branch {branch:?}) has remote {:?} pointing at \
+                 {remote_url:?}, which {detail}; refusing to dispatch to the unsafe workspace \
+                 (jleechan-9sh5 discipline).",
+                bead.id, routing.push_remote
+            ));
+            if let Err(cleanup_error) = sessions.stop(&session_id) {
+                return Err(record_spawn_cleanup_failure(
+                    store,
+                    &mut overlay,
+                    &session_id,
+                    phase,
+                    remote_error,
+                    cleanup_error,
+                ));
+            }
+            overlay.state = OverlayState::HumanHeld;
+            overlay.session_id = None;
             overlay.park_reason = Some(phase.to_string());
             store.save(&overlay)?;
             report.failures.push(failure(
@@ -452,13 +505,7 @@ pub fn dispatch_ready(
                 overlay.attempt,
                 Some(branch.clone()),
                 phase,
-                DaemonError::Config(format!(
-                    "spawned worktree for bead {} (branch {branch:?}) has remote {:?} pointing at \
-                     {remote_url:?}, which {detail}. \
-                     Killed the session and parked HUMAN_HELD rather than risk the coder pushing to \
-                     the wrong repo (jleechan-9sh5 discipline).",
-                    bead.id, routing.push_remote
-                )),
+                remote_error,
             ));
             continue;
         }
@@ -477,7 +524,16 @@ pub fn dispatch_ready(
             // we now have an untracked live session we can't even kill —
             // that's a more urgent operator-facing failure than the original
             // save error, so it takes priority and is returned instead.
-            sessions.stop(&session_id)?;
+            if let Err(cleanup_error) = sessions.stop(&session_id) {
+                return Err(record_spawn_cleanup_failure(
+                    store,
+                    &mut overlay,
+                    &session_id,
+                    SPAWN_CLEANUP_FAILED_PARK_REASON,
+                    save_err,
+                    cleanup_error,
+                ));
+            }
             if save_err.is_transient() {
                 overlay.state = OverlayState::Queued;
                 overlay.session_id = None;
@@ -1805,9 +1861,10 @@ mod tests {
 
         let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
         assert!(
-            matches!(err, DaemonError::Tool { .. }),
+            matches!(err, DaemonError::SpawnCleanupFailed { .. }),
             "stop failure must remain fatal because a live untracked worker may remain: {err:?}"
         );
+        assert!(!err.is_transient(), "cleanup failure must never back off/retry");
 
         let calls = sessions.calls.borrow();
         assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
@@ -1815,6 +1872,13 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c == "spawn(bead-1)"),
             "later beads must not dispatch after failed rollback stop"
+        );
+        let bead_0 = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(bead_0.state, OverlayState::HumanHeld);
+        assert_eq!(bead_0.session_id.as_deref(), Some("fake-session-1"));
+        assert_eq!(
+            bead_0.park_reason.as_deref(),
+            Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
         );
     }
 
@@ -2238,12 +2302,20 @@ mod tests {
 
         let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
         assert!(
-            matches!(err, DaemonError::Tool { .. }),
+            matches!(err, DaemonError::SpawnCleanupFailed { .. }),
             "failure to kill a confirmed wrong-repo session must be fatal: {err:?}"
         );
+        assert!(!err.is_transient(), "cleanup failure must never be retried");
 
         let calls = sessions.calls.borrow();
         assert!(calls.iter().any(|c| c == "stop(fake-session-1)"));
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(overlay.session_id.as_deref(), Some("fake-session-1"));
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("worktree_remote_mismatch")
+        );
     }
 
     /// An adapter that cannot inspect the just-created worktree must fail
@@ -2273,6 +2345,28 @@ mod tests {
         assert_eq!(
             overlay.park_reason.as_deref(),
             Some("worktree_remote_unverifiable")
+        );
+    }
+
+    #[test]
+    fn worktree_remote_unverifiable_stop_failure_retains_session_and_is_fatal() {
+        let sessions = FakeSessions::new(0);
+        sessions.scripted_worktree_remote.borrow_mut().clear();
+        sessions.fail_stop_for("fake-session-1");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        assert!(!err.is_transient());
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(overlay.session_id.as_deref(), Some("fake-session-1"));
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
         );
     }
 
