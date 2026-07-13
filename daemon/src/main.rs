@@ -383,9 +383,42 @@ type DaemonAdapters = (
     Box<dyn Vcs>,
 );
 
+fn ao_runtime_binding(cfg: &Config) -> (String, String) {
+    let ao_project = cfg.ao_project.clone().unwrap_or_else(|| {
+        cfg.target_repo
+            .split('/')
+            .next_back()
+            .unwrap_or(&cfg.target_repo)
+            .to_string()
+    });
+    let default_agent = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT")
+        .unwrap_or_else(|_| "minimax".to_string());
+    (ao_project, default_agent)
+}
+
+fn verify_startup_ao_compatibility(
+    args: Args,
+    ao_project: &str,
+    agent: &str,
+    verify: impl FnOnce(&str, &str) -> Result<(), DaemonError>,
+) -> Result<(), DaemonError> {
+    if args.dry_run {
+        return Ok(());
+    }
+    verify(ao_project, agent)
+}
+
 fn run(args: Args) -> Result<(), DaemonError> {
     let cfg_path = default_config_path();
     let cfg = load_config(&cfg_path)?;
+    let (ao_project, default_agent) = ao_runtime_binding(&cfg);
+    // Fail before opening/reconciling state, advertising READY, or polling a
+    // healthy tick when the installed AO/Node adapter is incompatible. The
+    // diagnostic exits before AO preflight, locking, workspace creation, or
+    // worker launch.
+    verify_startup_ao_compatibility(args, &ao_project, &default_agent, |project, agent| {
+        daemon::adapters::verify_ao_bridge_compatibility(project, agent)
+    })?;
     let telemetry_log = default_telemetry_log();
     let db_path = default_state_db_path();
 
@@ -418,15 +451,6 @@ fn run(args: Args) -> Result<(), DaemonError> {
         }
     } else {
         use daemon::adapters::{CliScm, CliSessions, CliTracker, ChainLlm, CliVcs};
-        let ao_project = cfg.ao_project.clone().unwrap_or_else(|| {
-            cfg.target_repo
-                .split('/')
-                .next_back()
-                .unwrap_or(&cfg.target_repo)
-                .to_string()
-        });
-        let default_agent = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT")
-            .unwrap_or_else(|_| "minimax".to_string());
         (
             Box::new(CliScm::new(cfg.target_repo.clone())),
             Box::new(CliTracker),
@@ -546,6 +570,47 @@ mod tests {
     fn scaffold_compiles() {
         let ok = true;
         assert!(ok);
+    }
+
+    #[test]
+    fn production_startup_runs_ao_compatibility_check_and_propagates_failure() {
+        let mut observed = None;
+        let error = verify_startup_ao_compatibility(
+            Args::default(),
+            "dark-factory",
+            "minimax",
+            |project, agent| {
+                observed = Some((project.to_string(), agent.to_string()));
+                Err(DaemonError::Config("incompatible AO runtime".to_string()))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            observed,
+            Some(("dark-factory".to_string(), "minimax".to_string()))
+        );
+        assert!(error.to_string().contains("incompatible AO runtime"));
+    }
+
+    #[test]
+    fn dry_run_startup_skips_production_ao_compatibility_check() {
+        let mut called = false;
+        let result = verify_startup_ao_compatibility(
+            Args {
+                once: true,
+                dry_run: true,
+            },
+            "dark-factory",
+            "minimax",
+            |_, _| {
+                called = true;
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(!called);
     }
 
     #[test]

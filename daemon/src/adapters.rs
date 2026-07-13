@@ -1325,7 +1325,11 @@ fn ao_spawn_bridge_path() -> std::path::PathBuf {
         .join("ao-spawn-v013-bridge.mjs")
 }
 
-fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonError> {
+fn ao_spawn_command_with_mode(
+    agent: &str,
+    spec: &SpawnSpec,
+    diagnostic: bool,
+) -> Result<Command, DaemonError> {
     let bridge = ao_spawn_bridge_path();
     if !bridge.is_file() {
         return Err(DaemonError::Config(format!(
@@ -1360,11 +1364,20 @@ fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonErro
         .arg("--project")
         .arg(&spec.ao_project)
         .arg("--agent")
-        .arg(agent)
-        .arg("--")
+        .arg(agent);
+    if diagnostic {
+        // If the preload fails to execute, AO v0.1.3 rejects this unknown
+        // option before dispatch. That makes the supposedly read-only probe
+        // fail safe instead of accidentally creating a worker.
+        cmd.arg("--dark-factory-read-only-diagnostic");
+    }
+    cmd.arg("--")
         .arg(&spec.prompt)
         .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
         .env("DARK_FACTORY_AO_SPAWN_BRANCH", &spec.branch);
+    if diagnostic {
+        cmd.env("DARK_FACTORY_AO_BRIDGE_DIAGNOSTIC", "1");
+    }
 
     let node_options = std::env::var("NODE_OPTIONS").unwrap_or_default();
     let bridge_options = format!("--experimental-import-meta-resolve {bridge_arg}");
@@ -1383,6 +1396,72 @@ fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonErro
     }
 
     Ok(cmd)
+}
+
+fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonError> {
+    ao_spawn_command_with_mode(agent, spec, false)
+}
+
+/// Runs the AO v0.1.3 preload in its read-only diagnostic mode. This checks
+/// the actual `ao` executable selected by the daemon's production PATH, its
+/// Node major version, package version, core APIs, configured project, and
+/// plugin resolution without performing preflight side effects, acquiring a
+/// spawn lock, creating a workspace, or launching a worker.
+pub fn verify_ao_bridge_compatibility(
+    ao_project: &str,
+    agent: &str,
+) -> Result<(), DaemonError> {
+    let spec = SpawnSpec {
+        bead_id: "daemon-startup-diagnostic".to_string(),
+        branch: "factory/daemon-startup-diagnostic".to_string(),
+        prompt: "dark-factory AO v0.1.3 read-only compatibility diagnostic".to_string(),
+        repo: String::new(),
+        ao_project: ao_project.to_string(),
+        remote: String::new(),
+    };
+    let mut command = ao_spawn_command_with_mode(agent, &spec, true)?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = command.output().map_err(|error| DaemonError::Tool {
+        tool: "ao bridge compatibility diagnostic".to_string(),
+        rc: -1,
+        stderr: format!("execution failed: {error}"),
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() {
+        return Err(DaemonError::Tool {
+            tool: "ao bridge compatibility diagnostic".to_string(),
+            rc: output.status.code().unwrap_or(-1),
+            stderr,
+        });
+    }
+    let payload = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("AO_BRIDGE_DIAGNOSTIC="))
+        .ok_or_else(|| {
+            DaemonError::Parse(format!(
+                "AO bridge compatibility diagnostic returned success without its marker: {stdout}"
+            ))
+        })?;
+    let diagnostic: serde_json::Value = serde_json::from_str(payload).map_err(|error| {
+        DaemonError::Parse(format!(
+            "AO bridge compatibility diagnostic marker was invalid JSON: {error}"
+        ))
+    })?;
+    if diagnostic.get("cliVersion").and_then(|value| value.as_str()) != Some("0.1.3")
+        || !diagnostic
+            .get("nodeVersion")
+            .and_then(|value| value.as_str())
+            .is_some_and(|version| version.starts_with("22."))
+    {
+        return Err(DaemonError::Config(format!(
+            "AO bridge compatibility diagnostic reported an incompatible runtime: {diagnostic}"
+        )));
+    }
+    Ok(())
 }
 
 pub struct CliSessions {
@@ -1843,6 +1922,27 @@ mod ao_spawn_contract_tests {
         } else {
             std::path::PathBuf::from("node")
         }
+    }
+
+    #[test]
+    fn bridge_rejects_non_node22_even_with_legacy_test_bypass_environment() {
+        let bridge = ao_spawn_bridge_path();
+        let output = std::process::Command::new(bridge_test_node())
+            .args([
+                "--input-type=module",
+                "--eval",
+                "Object.defineProperty(process.versions, 'node', {value: '24.15.0'}); const {pathToFileURL} = await import('node:url'); await import(pathToFileURL(process.argv[1]).href);",
+            ])
+            .arg(&bridge)
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env("NODE_ENV", "test")
+            .env("DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE", "1")
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "legacy bypass unexpectedly worked");
+        assert!(stderr.contains("requires Node 22, got 24.15.0"), "{stderr}");
     }
 
     fn fake_ao_dir(test_name: &str) -> std::path::PathBuf {
@@ -2373,6 +2473,7 @@ export const isTerminalSession = () => false;
                 "dark-factory",
                 "--agent",
                 "minimax",
+                "--dark-factory-read-only-diagnostic",
                 "--",
                 "hoisted resolution probe",
             ])
@@ -2384,8 +2485,6 @@ export const isTerminalSession = () => false;
                 ),
             )
             .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
-            .env("NODE_ENV", "test")
-            .env("DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE", "1")
             .env("DARK_FACTORY_AO_BRIDGE_DIAGNOSTIC", "1")
             .env(
                 "DARK_FACTORY_AO_SPAWN_BRANCH",
@@ -2491,8 +2590,6 @@ export const ensureLifecycleWorker = async () => appendFileSync(process.env.AO_F
             )
             .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "")
             .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
-            .env("NODE_ENV", "test")
-            .env("DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE", "1")
             .env(
                 "DARK_FACTORY_AO_SPAWN_BRANCH",
                 "factory/admission-probe-r1",
@@ -2606,8 +2703,6 @@ export const isTerminalSession = () => false;
             )
             .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "--trace-warnings")
             .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
-            .env("NODE_ENV", "test")
-            .env("DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE", "1")
             .env(
                 "DARK_FACTORY_AO_SPAWN_BRANCH",
                 "factory/spawn-semantics-r1",
@@ -2642,7 +2737,7 @@ export const isTerminalSession = () => false;
     }
 
     #[test]
-    fn bridge_backed_batch_serializes_lock_and_records_each_workspace() {
+    fn bridge_backed_batch_and_invalid_workspace_cleanup_are_fail_closed() {
         let _guard = gh_env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2700,10 +2795,13 @@ export const createPluginRegistry = () => ({loadFromConfig: async () => {}});
 export const createSessionManager = () => ({
   list: async () => [],
   spawn: async (spec) => {
-    log({agent: spec.agent, branch: spec.branch, prompt: spec.prompt});
+    log({kind: 'spawn', agent: spec.agent, branch: spec.branch, prompt: spec.prompt});
     await new Promise((resolve) => setTimeout(resolve, 200));
     const workspaces = JSON.parse(process.env.AO_FAKE_WORKSPACES);
-    return {id: 'session-' + spec.branch.split('/').pop(), branch: spec.branch, workspacePath: workspaces[spec.branch]};
+    const workspacePath = spec.prompt === process.env.AO_FAKE_INVALID_WORKSPACE_PROMPT
+      ? 'relative-worktree'
+      : workspaces[spec.branch];
+    return {id: 'session-' + spec.branch.split('/').pop(), branch: spec.branch, workspacePath};
   },
   kill: async () => {},
 });
@@ -2739,8 +2837,14 @@ export const isTerminalSession = () => false;
         std::fs::write(
             &fake_ao,
             r#"#!/usr/bin/env python3
+import json
 import os
 import sys
+if sys.argv[1:3] == ["session", "kill"]:
+    with open(os.environ["AO_FAKE_CALLS"], "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"kind": "kill", "args": sys.argv[1:]}) + "\n")
+    print("scripted bridge-backed kill failure", file=sys.stderr)
+    raise SystemExit(8)
 os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["AO_FAKE_CLI_ENTRY"], *sys.argv[1:]])
 "#,
         )
@@ -2751,6 +2855,10 @@ os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["A
 
         let first = spec("batch alpha", "factory/batch-alpha-r1");
         let second = spec("batch beta", "factory/batch-beta-r1");
+        let invalid = spec(
+            "bridge invalid workspace",
+            "factory/bridge-invalid-workspace-r1",
+        );
         let saved = [
             ("PATH", std::env::var("PATH").ok()),
             ("AO_FAKE_NODE", std::env::var("AO_FAKE_NODE").ok()),
@@ -2759,13 +2867,12 @@ os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["A
             ("AO_FAKE_LOCK", std::env::var("AO_FAKE_LOCK").ok()),
             ("AO_FAKE_WORKSPACES", std::env::var("AO_FAKE_WORKSPACES").ok()),
             (
+                "AO_FAKE_INVALID_WORKSPACE_PROMPT",
+                std::env::var("AO_FAKE_INVALID_WORKSPACE_PROMPT").ok(),
+            ),
+            (
                 "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
                 std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok(),
-            ),
-            ("NODE_ENV", std::env::var("NODE_ENV").ok()),
-            (
-                "DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE",
-                std::env::var("DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE").ok(),
             ),
         ];
         let old_path = saved[0].1.clone().unwrap_or_default();
@@ -2783,14 +2890,14 @@ os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["A
             .to_string(),
         );
         std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax->claude-code");
-        std::env::set_var("NODE_ENV", "test");
-        std::env::set_var("DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE", "1");
 
         let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
         let batch_result = sessions.spawn_batch(&[first.clone(), second.clone()]);
         let first_remote = sessions.worktree_remote_url("dark-factory", &first.branch, "origin");
         let second_remote =
             sessions.worktree_remote_url("dark-factory", &second.branch, "origin");
+        std::env::set_var("AO_FAKE_INVALID_WORKSPACE_PROMPT", &invalid.prompt);
+        let cleanup_failure = sessions.spawn(&invalid);
         for (key, value) in saved {
             match value {
                 Some(value) => std::env::set_var(key, value),
@@ -2805,8 +2912,29 @@ os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["A
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(rows.len(), 2, "each spec must spawn exactly once: {calls}");
-        assert!(rows.iter().all(|row| row["agent"] == "minimax"), "{calls}");
+        let spawn_rows: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|row| row["kind"] == "spawn")
+            .collect();
+        assert_eq!(spawn_rows.len(), 3, "each spec must spawn exactly once: {calls}");
+        assert!(spawn_rows.iter().all(|row| row["agent"] == "minimax"), "{calls}");
+        assert_eq!(
+            spawn_rows
+                .iter()
+                .filter(|row| row["prompt"] == invalid.prompt)
+                .count(),
+            1,
+            "fatal cleanup failure must not advance to a fallback vendor: {calls}"
+        );
+        assert!(
+            matches!(cleanup_failure, Err(DaemonError::SpawnCleanupFailed { .. })),
+            "cleanup_failure={cleanup_failure:?}; calls={calls}"
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row["kind"] == "kill").count(),
+            1,
+            "calls={calls}"
+        );
         assert_eq!(
             first_remote.unwrap().as_deref(),
             Some("https://github.com/jleechanorg/dark-factory.git")

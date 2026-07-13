@@ -1,4 +1,4 @@
-import { dirname, isAbsolute, join, parse } from "node:path";
+import { dirname, join, parse } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readFile } from "node:fs/promises";
 
@@ -9,10 +9,10 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
   };
 
   try {
-    const testNodeOverride =
-      process.env.NODE_ENV === "test" &&
-      process.env.DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE === "1";
-    if (process.versions.node.split(".")[0] !== "22" && !testNodeOverride) {
+    // This bridge is part of the production dispatch boundary. Never allow
+    // inherited environment variables to weaken its runtime contract; test
+    // harnesses must execute it with a real Node 22 binary instead.
+    if (process.versions.node.split(".")[0] !== "22") {
       fail(`AO bridge requires Node 22, got ${process.versions.node}`);
     }
 
@@ -44,6 +44,7 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
     let agent;
     let prompt;
     let positionalOnly = false;
+    let diagnosticFlag = false;
     for (let index = 1; index < argv.length; index += 1) {
       const value = argv[index];
       if (!positionalOnly && value === "--") {
@@ -52,6 +53,8 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
         project = argv[++index];
       } else if (!positionalOnly && value === "--agent") {
         agent = argv[++index];
+      } else if (!positionalOnly && value === "--dark-factory-read-only-diagnostic") {
+        diagnosticFlag = true;
       } else if (!positionalOnly && value.startsWith("-")) {
         fail(`unsupported AO v0.1.3 spawn option: ${value}`);
       } else if (prompt === undefined) {
@@ -62,6 +65,10 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
     }
     if (!project || !agent || prompt === undefined) {
       fail("spawn requires --project, --agent, and one positional prompt");
+    }
+    const diagnosticMode = process.env.DARK_FACTORY_AO_BRIDGE_DIAGNOSTIC === "1";
+    if (diagnosticFlag !== diagnosticMode) {
+      fail("read-only diagnostic flag and environment marker must be supplied together");
     }
     const sanitizedPrompt = prompt.replace(/[\r\n]/g, " ").trim();
     if (!sanitizedPrompt) fail("prompt must not be empty after sanitization");
@@ -118,7 +125,7 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
     // Read-only startup/deployment diagnostic: verifies the running Node,
     // AO package version, public core API, config, and plugin resolution
     // without creating a workspace or worker.
-    if (process.env.DARK_FACTORY_AO_BRIDGE_DIAGNOSTIC === "1") {
+    if (diagnosticMode) {
       console.log(
         `AO_BRIDGE_DIAGNOSTIC=${JSON.stringify({
           cliVersion: packageJson.version,
@@ -188,16 +195,11 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
         branch,
         prompt: sanitizedPrompt,
       });
-      if (typeof session.workspacePath !== "string" || !isAbsolute(session.workspacePath)) {
-        try {
-          await sessions.kill(session.id);
-        } catch (cleanupError) {
-          fail(
-            `spawned session ${session.id} without an absolute workspacePath and cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
-          );
-        }
-        fail(`spawned session ${session.id} without an absolute workspacePath; session killed`);
-      }
+      // Always return the session identity to Rust, even when AO supplies an
+      // invalid workspace path. `CliSessions::run_spawn_process` owns the
+      // compensating `ao session kill` and its fatal cleanup-failure
+      // classification; killing here would hide the session id behind an
+      // ordinary nonzero exit and let vendor fallback launch a second worker.
       console.log(`  Worktree: ${session.workspacePath ?? "-"}`);
       console.log(`  Branch:   ${session.branch ?? "-"}`);
       console.log(`SESSION=${session.id}`);

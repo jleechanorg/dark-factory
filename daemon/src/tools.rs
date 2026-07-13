@@ -248,19 +248,12 @@ pub fn iso8601_to_epoch(s: &str) -> Option<u64> {
 /// form this normalizer does not recognize (a different host — including
 /// GitHub Enterprise — an unusual scheme, or malformed input).
 ///
-/// **Adversarial review finding (independent Claude review of this PR):**
-/// the original version of this function returned a bare `bool`, and its
-/// caller (`dispatch::dispatch_ready`) treated `false` as a POSITIVELY
-/// CONFIRMED mismatch — but `false` was also what an unrecognized URL form
-/// produced. That conflates "confirmed wrong repo" with "cannot parse this
-/// URL", which directly violates the surrounding contract (`Sessions::
-/// worktree_remote_url`'s doc comment: "only ever *rejects* on a positively
-/// confirmed mismatch, never on absence of information") and would kill a
-/// perfectly correct session merely for using an unrecognized URL flavor
-/// (GitHub Enterprise, a credential-embedded URL, an explicit SSH port).
-/// `None` now means "cannot determine" and callers must treat it exactly
-/// like `Sessions::worktree_remote_url`'s own `Ok(None)` — trust-it, never
-/// kill on it.
+/// `None` means the URL cannot be tied positively to canonical github.com.
+/// Spawn-time dispatch is fail-closed for canonical GitHub targets: callers
+/// must reject both `Some(false)` and `None`, because a local path, different
+/// host, or unusual scheme is not evidence that the workspace can safely
+/// push to `repo`. Keeping indeterminate distinct from a parsed mismatch is
+/// still useful for precise telemetry.
 ///
 /// Bead jleechan-bqdv, Stage C spawn-time remote assertion: the worktree a
 /// coder session lands in may be cloned via either transport depending on
