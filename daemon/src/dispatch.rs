@@ -1384,10 +1384,29 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
+        let telemetry_log = std::env::temp_dir().join(format!(
+            "afd_derive_unseen_{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let report =
+            dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
 
         assert_eq!(report.success_count(), 1, "unseen valid repo must dispatch");
         assert_eq!(report.failures.len(), 0);
+
+        let log_content = std::fs::read_to_string(&telemetry_log).unwrap();
+        assert!(
+            log_content.contains("DERIVED_ROUTE_RESOLVED"),
+            "DERIVED_ROUTE_RESOLVED must be emitted for derived dispatch: {log_content}"
+        );
+        assert!(
+            log_content.contains("jleechanorg/ez-gh-actions"),
+            "telemetry context must carry the derived target_repo"
+        );
+
+        let _ = std::fs::remove_file(&telemetry_log);
 
         let overlay = store.load("bead-0").unwrap().unwrap();
         assert_eq!(overlay.state, OverlayState::Dispatched);
