@@ -188,10 +188,7 @@ fn fake_scm_seam_check_verifies_persisted_target_repo() {
     use common::FakeScm;
     use daemon::tools::Scm;
 
-    let dir = std::env::temp_dir().join(format!(
-        "afd_fake_scm_seam_{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("afd_fake_scm_seam_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let seam = dir.join("seam.txt");

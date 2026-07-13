@@ -528,9 +528,10 @@ pub fn run_tick(
                             // could never observe real progress and would
                             // eventually park a perfectly healthy, actively
                             // pushing coder as `coder_silent`.
-                            let last_commit_epoch = deps
-                                .scm
-                                .remote_branch_last_commit_for_repo(overlay.repo(deps.cfg), branch)?;
+                            let last_commit_epoch = deps.scm.remote_branch_last_commit_for_repo(
+                                overlay.repo(deps.cfg),
+                                branch,
+                            )?;
                             let now_epoch = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -909,9 +910,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 session_id: None,
                 is_adopted: true,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo,
             });
             overlay.state = OverlayState::Attested;
             overlay.pr_number = Some(adopted.pr_number);
@@ -959,8 +960,13 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             .cloned();
 
         let target_repo = intake::resolve_target_repo(
-            tracker_bead.as_ref().map(|b| b.description.as_str()).unwrap_or(""),
-            tracker_bead.as_ref().and_then(|b| b.external_ref.as_deref()),
+            tracker_bead
+                .as_ref()
+                .map(|b| b.description.as_str())
+                .unwrap_or(""),
+            tracker_bead
+                .as_ref()
+                .and_then(|b| b.external_ref.as_deref()),
         );
 
         // jleechan-dljf skeptic: load existing overlay first to preserve
@@ -1002,8 +1008,10 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 if let Some(ref ext_ref) = bead.external_ref {
                     if let Some((_, num_str)) = parse_external_ref(ext_ref) {
                         if let Ok(num) = num_str.parse::<u64>() {
-                            let probe_repo =
-                                overlay.target_repo.as_deref().unwrap_or(&deps.cfg.target_repo);
+                            let probe_repo = overlay
+                                .target_repo
+                                .as_deref()
+                                .unwrap_or(&deps.cfg.target_repo);
                             if crate::tools::run_tool(
                                 "gh",
                                 &[
@@ -1109,9 +1117,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     session_id: None,
                     is_adopted: false,
                     spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo,
+                    pre_session_head_sha: None,
+                    park_reason: None,
+                    target_repo,
                 };
                 deps.store.save(&o)?;
                 summary.beads_created += 1;
@@ -1181,8 +1189,13 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     }
 
     if !ready.is_empty() {
-        let dispatch_report =
-            dispatch::dispatch_ready(deps.sessions, deps.store, deps.cfg, &ready, Some(deps.telemetry_log))?;
+        let dispatch_report = dispatch::dispatch_ready(
+            deps.sessions,
+            deps.store,
+            deps.cfg,
+            &ready,
+            Some(deps.telemetry_log),
+        )?;
         summary.beads_dispatched += dispatch_report.success_count();
 
         for failure in &dispatch_report.failures {
@@ -1658,8 +1671,7 @@ fn skeptic_evidence(
     // bead's OWN resolved repo so a test-repo bead dispatched under a
     // non-test global `cfg.target_repo` (or vice versa) is classified
     // correctly instead of by the daemon-global repo.
-    let is_test_repo =
-        repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
+    let is_test_repo = repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
 
     let mut gha_verdict = "verdict: absent";
     let mut signoff_verdict = "verdict: absent";
@@ -2269,10 +2281,9 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             // jleechan-nplh: a verdict comment older than the current head
             // commit is stale evidence — gate 6 must not self-certify from
             // it (same staleness rule as `er_runner::maybe_run` step 2).
-            None => verifier::parse_er_verdict_since(
-                &snapshot.comments,
-                snapshot.head_committed_epoch,
-            ),
+            None => {
+                verifier::parse_er_verdict_since(&snapshot.comments, snapshot.head_committed_epoch)
+            }
         };
         evidence.is_production = verifier::classify_production(&snapshot.files);
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
@@ -2449,8 +2460,9 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({"stage": deps.cfg.stage}),
                 )?;
                 overlay.state = OverlayState::HumanHeld;
-                overlay.park_reason =
-                    Some("gate assessment not all-green (stage 1: recorded, not executed)".to_string());
+                overlay.park_reason = Some(
+                    "gate assessment not all-green (stage 1: recorded, not executed)".to_string(),
+                );
                 deps.store.save(&overlay)?;
                 summary.beads_parked_human_held += 1;
                 emit(

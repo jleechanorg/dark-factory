@@ -95,6 +95,31 @@ fn failure(
     }
 }
 
+fn now_iso8601() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (y, mo, d) = civil_from_days(days as i64);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 /// Dispatch as many `ready` beads as the safety envelope allows.
 ///
 /// Free slots = `min(max_workers - active_count, max_batch)` (spec §4.2.8).
@@ -126,32 +151,6 @@ fn failure(
 /// Returns a per-bead report. Never spawns past the cap; if zero slots are
 /// free, returns an empty report without calling `sessions.spawn` (verified by
 /// the fake's call log in tests — spec §4.2.8's caps are absolute).
-
-fn now_iso8601() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let days = secs / 86_400;
-    let rem = secs % 86_400;
-    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let (y, mo, d) = civil_from_days(days as i64);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
-}
-
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
 pub fn dispatch_ready(
     sessions: &dyn Sessions,
     store: &dyn StateStore,
@@ -183,9 +182,9 @@ pub fn dispatch_ready(
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             },
             Err(err) if err.is_transient() => {
                 report
@@ -940,10 +939,7 @@ mod tests {
                     ),
                     (
                         "agy".to_string(),
-                        DaemonError::Deferred(format!(
-                            "REQUEST=sq-scripted-{}",
-                            spec.bead_id
-                        )),
+                        DaemonError::Deferred(format!("REQUEST=sq-scripted-{}", spec.bead_id)),
                     ),
                 ]));
             }
@@ -1287,9 +1283,9 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -1384,14 +1380,11 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let telemetry_log = std::env::temp_dir().join(format!(
-            "afd_derive_unseen_{}.jsonl",
-            std::process::id()
-        ));
+        let telemetry_log =
+            std::env::temp_dir().join(format!("afd_derive_unseen_{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&telemetry_log);
 
-        let report =
-            dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
 
         assert_eq!(report.success_count(), 1, "unseen valid repo must dispatch");
         assert_eq!(report.failures.len(), 0);
@@ -1913,7 +1906,12 @@ mod tests {
             file_tree_summary: "src/\n  flux.rs\n  main.rs".into(),
             external_ref: Some("jleechanorg/delorean#42".into()),
         };
-        let prompt = build_coder_prompt(&bead, "factory/bead-x-r1", "jleechanorg/delorean", "worldai");
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/bead-x-r1",
+            "jleechanorg/delorean",
+            "worldai",
+        );
 
         assert!(prompt.contains("Fix the flux capacitor"), "title missing");
         assert!(
@@ -2177,7 +2175,10 @@ mod tests {
         let prompt = &prompts[0].1;
         assert!(prompt.contains("REPO: owner/repo"), "prompt: {prompt}");
         assert!(prompt.contains("REMOTE: origin"), "prompt: {prompt}");
-        assert!(prompt.contains("BRANCH: factory/bead-0-r1"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("BRANCH: factory/bead-0-r1"),
+            "prompt: {prompt}"
+        );
         assert!(
             prompt.contains("git push origin factory/bead-0-r1"),
             "prompt must state the literal push command verbatim: {prompt}"
@@ -2224,7 +2225,10 @@ mod tests {
 
         let prompts = sessions.spawn_prompts.borrow();
         let prompt = &prompts[0].1;
-        assert!(prompt.contains("REPO: jleechanorg/worldarchitect.ai"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("REPO: jleechanorg/worldarchitect.ai"),
+            "prompt: {prompt}"
+        );
         assert!(prompt.contains("REMOTE: worldai"), "prompt: {prompt}");
         assert!(
             prompt.contains("git push worldai factory/bead-0-r1"),
@@ -2425,8 +2429,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&telemetry_log);
 
-        let report =
-            dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
 
         assert_eq!(report.success_count(), 1, "derived route must dispatch");
         assert!(report.failures.is_empty());
@@ -2481,15 +2484,11 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&telemetry_log);
 
-        let report =
-            dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
 
         assert_eq!(report.success_count(), 0);
         assert!(
-            report
-                .failures
-                .iter()
-                .any(|f| f.phase == "spawn_deferred"),
+            report.failures.iter().any(|f| f.phase == "spawn_deferred"),
             "deferred spawn must be reported"
         );
 
@@ -2536,8 +2535,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&telemetry_log);
 
-        let report =
-            dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
 
         assert_eq!(report.success_count(), 0);
         assert!(
@@ -2587,24 +2585,20 @@ mod tests {
         let ready = beads(1);
 
         // A directory path where a file can't be opened (isdir error)
-        let unwritable_dir = std::env::temp_dir().join(format!(
-            "afd_derived_unwritable_{}",
-            std::process::id()
-        ));
+        let unwritable_dir =
+            std::env::temp_dir().join(format!("afd_derived_unwritable_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&unwritable_dir);
         std::fs::create_dir_all(&unwritable_dir).unwrap();
 
-        let report = dispatch_ready(
-            &sessions,
-            &store,
-            &cfg,
-            &ready,
-            Some(&unwritable_dir),
-        )
-        .unwrap();
+        let report =
+            dispatch_ready(&sessions, &store, &cfg, &ready, Some(&unwritable_dir)).unwrap();
 
         // The dispatch must NOT succeed for the derived bead
-        assert_eq!(report.success_count(), 0, "derived route must not dispatch on unwritable log");
+        assert_eq!(
+            report.success_count(),
+            0,
+            "derived route must not dispatch on unwritable log"
+        );
         assert!(
             report
                 .failures
@@ -2616,7 +2610,11 @@ mod tests {
 
         // The bead must remain Queued (NOT Dispatched)
         let overlay = store.load("bead-0").unwrap().unwrap();
-        assert_eq!(overlay.state, OverlayState::Queued, "bead must stay Queued after emit failure");
+        assert_eq!(
+            overlay.state,
+            OverlayState::Queued,
+            "bead must stay Queued after emit failure"
+        );
 
         // No branch must have been registered
         let branches = store.owned_branches().unwrap();
@@ -2668,7 +2666,11 @@ mod tests {
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
-        assert_eq!(report.success_count(), 0, "derived route must not dispatch when telemetry_log is None");
+        assert_eq!(
+            report.success_count(),
+            0,
+            "derived route must not dispatch when telemetry_log is None"
+        );
         assert!(
             report
                 .failures

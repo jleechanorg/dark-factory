@@ -1,8 +1,11 @@
 use crate::errors::DaemonError;
-use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
+use crate::tools::{
+    run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId,
+    Sessions, SpawnSpec, Tracker, Vcs,
+};
+use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
-use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -32,7 +35,6 @@ fn gh_env_test_lock() -> &'static Mutex<()> {
     GH_ENV_TEST_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-
 pub struct CliTracker;
 
 impl Tracker for CliTracker {
@@ -41,7 +43,9 @@ impl Tracker for CliTracker {
         // the queue once open beads exceed one page (jleechan-v09l).
         let out = run_tool(
             "br",
-            &["list", "--status", "open", "--label", "factory", "--json", "--limit", "0"],
+            &[
+                "list", "--status", "open", "--label", "factory", "--json", "--limit", "0",
+            ],
             30,
         )?;
         let json_start = out.find('{').unwrap_or(0);
@@ -58,9 +62,8 @@ impl Tracker for CliTracker {
             description: Option<String>,
             external_ref: Option<String>,
         }
-        let data: BrListOutput = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse br list JSON: {e}"))
-        })?;
+        let data: BrListOutput = serde_json::from_str(&out[json_start..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse br list JSON: {e}")))?;
         // Fail closed on truncated output: a partial candidate queue silently
         // starves beads beyond page one (jleechan-v09l).
         if data.has_more {
@@ -69,13 +72,17 @@ impl Tracker for CliTracker {
             ));
         }
         let file_tree_summary = crate::tools::summarize_file_tree(std::path::Path::new("."), 100);
-        let beads = data.issues.into_iter().map(|issue| Bead {
-            id: issue.id,
-            title: issue.title,
-            description: issue.description.unwrap_or_default(),
-            file_tree_summary: file_tree_summary.clone(),
-            external_ref: issue.external_ref,
-        }).collect();
+        let beads = data
+            .issues
+            .into_iter()
+            .map(|issue| Bead {
+                id: issue.id,
+                title: issue.title,
+                description: issue.description.unwrap_or_default(),
+                file_tree_summary: file_tree_summary.clone(),
+                external_ref: issue.external_ref,
+            })
+            .collect();
         Ok(beads)
     }
 
@@ -132,7 +139,11 @@ impl Tracker for CliTracker {
 
     fn comment_external(&self, external_ref: &str, body: &str) -> Result<(), DaemonError> {
         if let Some((repo, issue)) = canonicalize_external_ref_for_comment(external_ref) {
-            run_tool("gh", &["issue", "comment", &issue, "--repo", &repo, "--body", body], 30)?;
+            run_tool(
+                "gh",
+                &["issue", "comment", &issue, "--repo", &repo, "--body", body],
+                30,
+            )?;
             Ok(())
         } else {
             Err(DaemonError::Parse(format!(
@@ -157,9 +168,8 @@ pub(crate) fn parse_external_refs_from_br_list(
     struct BrIssue {
         external_ref: Option<String>,
     }
-    let data: BrListOutput = serde_json::from_str(&out[json_start..]).map_err(|e| {
-        DaemonError::Parse(format!("failed to parse br list JSON: {e}"))
-    })?;
+    let data: BrListOutput = serde_json::from_str(&out[json_start..])
+        .map_err(|e| DaemonError::Parse(format!("failed to parse br list JSON: {e}")))?;
     // Fail closed on truncated output: a partial dedup set means the daemon
     // re-creates beads for already-tracked issues (jleechan-v09l).
     if data.has_more {
@@ -245,12 +255,13 @@ fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
     }
 
     let json_start = gql_out.find('{').unwrap_or(0);
-    let gql: GhGqlResponse = serde_json::from_str(&gql_out[json_start..]).map_err(|e| {
-        DaemonError::Parse(format!("failed to parse gh graphql JSON: {e}"))
-    })?;
-    let pr_data = gql.data.repository.pull_request.ok_or_else(|| {
-        DaemonError::Parse("gh graphql response omitted pullRequest".into())
-    })?;
+    let gql: GhGqlResponse = serde_json::from_str(&gql_out[json_start..])
+        .map_err(|e| DaemonError::Parse(format!("failed to parse gh graphql JSON: {e}")))?;
+    let pr_data = gql
+        .data
+        .repository
+        .pull_request
+        .ok_or_else(|| DaemonError::Parse("gh graphql response omitted pullRequest".into()))?;
     Ok(pr_data
         .review_threads
         .nodes
@@ -341,7 +352,10 @@ impl CliScm {
         })?;
         let mut prs = Vec::new();
         let target_owner = self.repo.split('/').next().unwrap_or_default();
-        for issue in issues.into_iter().filter(|issue| issue.pull_request.is_some()) {
+        for issue in issues
+            .into_iter()
+            .filter(|issue| issue.pull_request.is_some())
+        {
             let pull_out = run_tool(
                 "gh",
                 &[
@@ -392,10 +406,10 @@ impl CliScm {
     }
 }
 
-
 impl Scm for CliScm {
     fn labeled_issues(&self, label: &str) -> Result<Vec<Issue>, DaemonError> {
-        let offline_path = std::path::Path::new(".beads/offline").join(format!("labeled_issues_{}.json", label));
+        let offline_path =
+            std::path::Path::new(".beads/offline").join(format!("labeled_issues_{}.json", label));
         if offline_path.exists() {
             if let Ok(raw) = std::fs::read_to_string(&offline_path) {
                 #[derive(serde::Deserialize)]
@@ -406,13 +420,16 @@ impl Scm for CliScm {
                     author_login: String,
                 }
                 if let Ok(issues_raw) = serde_json::from_str::<Vec<OfflineIssue>>(&raw) {
-                    let issues = issues_raw.into_iter().map(|issue| Issue {
-                        number: issue.number,
-                        title: issue.title,
-                        body: issue.body,
-                        author_login: issue.author_login,
-                        external_ref: format!("{}#{}", self.repo, issue.number),
-                    }).collect();
+                    let issues = issues_raw
+                        .into_iter()
+                        .map(|issue| Issue {
+                            number: issue.number,
+                            title: issue.title,
+                            body: issue.body,
+                            author_login: issue.author_login,
+                            external_ref: format!("{}#{}", self.repo, issue.number),
+                        })
+                        .collect();
                     return Ok(issues);
                 }
             }
@@ -473,13 +490,15 @@ impl Scm for CliScm {
             login: String,
         }
         let json_start_issues = out_issues.find('[').unwrap_or(0);
-        let gh_issues: Vec<GhIssue> = serde_json::from_str(&out_issues[json_start_issues..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse gh issue list: {e}"))
-        })?;
+        let gh_issues: Vec<GhIssue> = serde_json::from_str(&out_issues[json_start_issues..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse gh issue list: {e}")))?;
         let mut issues: Vec<Issue> = Vec::new();
         for item in gh_issues {
             if !issues.iter().any(|i| i.number == item.number) {
-                let author_login = item.author.as_ref().or(item.user.as_ref())
+                let author_login = item
+                    .author
+                    .as_ref()
+                    .or(item.user.as_ref())
                     .map(|a| a.login.clone())
                     .unwrap_or_default();
                 issues.push(Issue {
@@ -539,9 +558,8 @@ impl Scm for CliScm {
             login: String,
         }
         let json_start = out.find('[').unwrap_or(0);
-        let prs: Vec<GhPr> = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse gh pr list: {e}"))
-        })?;
+        let prs: Vec<GhPr> = serde_json::from_str(&out[json_start..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse gh pr list: {e}")))?;
         Ok(prs
             .into_iter()
             .map(|pr| LabeledPr {
@@ -558,9 +576,9 @@ impl Scm for CliScm {
             .collect())
     }
 
-
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError> {
-        let offline_path = std::path::Path::new(".beads/offline").join(format!("permission_{}.json", login));
+        let offline_path =
+            std::path::Path::new(".beads/offline").join(format!("permission_{}.json", login));
         if offline_path.exists() {
             if let Ok(raw) = std::fs::read_to_string(&offline_path) {
                 #[derive(serde::Deserialize)]
@@ -595,7 +613,9 @@ impl Scm for CliScm {
         }
         let json_start = out.find('{').unwrap_or(0);
         let resp: GhPermissionResponse = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse collaborator permission response: {e}"))
+            DaemonError::Parse(format!(
+                "failed to parse collaborator permission response: {e}"
+            ))
         })?;
         let perm = match resp.permission.as_str() {
             "admin" => Permission::Admin,
@@ -610,7 +630,6 @@ impl Scm for CliScm {
         }
         Ok(perm)
     }
-
 
     fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError> {
         let offline_path = std::path::Path::new(".beads/offline").join(format!("pr_{}.json", pr));
@@ -631,8 +650,16 @@ impl Scm for CliScm {
                     head_committed_epoch: Option<u64>,
                 }
                 if let Ok(snap) = serde_json::from_str::<OfflinePrSnapshot>(&raw) {
-                    let ci_status = if snap.ci_success { "green".to_string() } else { "red".to_string() };
-                    let coderabbit_status = if snap.coderabbit_approved { "green".to_string() } else { "red".to_string() };
+                    let ci_status = if snap.ci_success {
+                        "green".to_string()
+                    } else {
+                        "red".to_string()
+                    };
+                    let coderabbit_status = if snap.coderabbit_approved {
+                        "green".to_string()
+                    } else {
+                        "red".to_string()
+                    };
                     return Ok(PrSnapshot {
                         pr_number: pr,
                         ci_success: snap.ci_success,
@@ -723,7 +750,7 @@ impl Scm for CliScm {
                 // REST Fallback!
                 let pr_url = format!("repos/{}/pulls/{}", self.repo, pr);
                 let pr_json = run_tool("gh", &["api", &pr_url], 30)?;
-                
+
                 #[derive(serde::Deserialize)]
                 struct RestPr {
                     mergeable: Option<bool>,
@@ -740,7 +767,8 @@ impl Scm for CliScm {
                 })?;
 
                 let reviews_url = format!("repos/{}/pulls/{}/reviews", self.repo, pr);
-                let reviews_json = run_tool("gh", &["api", &reviews_url], 30).unwrap_or_else(|_| "[]".to_string());
+                let reviews_json =
+                    run_tool("gh", &["api", &reviews_url], 30).unwrap_or_else(|_| "[]".to_string());
                 #[derive(serde::Deserialize)]
                 struct RestReview {
                     user: Option<RestUser>,
@@ -750,10 +778,12 @@ impl Scm for CliScm {
                 struct RestUser {
                     login: String,
                 }
-                let rest_reviews: Vec<RestReview> = serde_json::from_str(&reviews_json).unwrap_or_default();
+                let rest_reviews: Vec<RestReview> =
+                    serde_json::from_str(&reviews_json).unwrap_or_default();
 
                 let comments_url = format!("repos/{}/issues/{}/comments", self.repo, pr);
-                let comments_json = run_tool("gh", &["api", &comments_url], 30).unwrap_or_else(|_| "[]".to_string());
+                let comments_json = run_tool("gh", &["api", &comments_url], 30)
+                    .unwrap_or_else(|_| "[]".to_string());
                 #[derive(serde::Deserialize)]
                 struct RestComment {
                     user: Option<RestUser>,
@@ -761,32 +791,65 @@ impl Scm for CliScm {
                     #[serde(default)]
                     created_at: String,
                 }
-                let rest_comments: Vec<RestComment> = serde_json::from_str(&comments_json).unwrap_or_default();
+                let rest_comments: Vec<RestComment> =
+                    serde_json::from_str(&comments_json).unwrap_or_default();
 
                 let files_url = format!("repos/{}/pulls/{}/files", self.repo, pr);
-                let files_json = run_tool("gh", &["api", &files_url], 30).unwrap_or_else(|_| "[]".to_string());
+                let files_json =
+                    run_tool("gh", &["api", &files_url], 30).unwrap_or_else(|_| "[]".to_string());
                 #[derive(serde::Deserialize)]
                 struct RestFile {
                     filename: String,
                     additions: u32,
                     deletions: u32,
                 }
-                let rest_files: Vec<RestFile> = serde_json::from_str(&files_json).unwrap_or_default();
+                let rest_files: Vec<RestFile> =
+                    serde_json::from_str(&files_json).unwrap_or_default();
 
                 GhPrView {
-                    mergeable: if rest_pr.mergeable.unwrap_or(false) { "MERGEABLE".to_string() } else { "CONFLICTING".to_string() },
-                    reviews: rest_reviews.into_iter().map(|r| GhReview { author: GhAuthor { login: r.user.map(|u| u.login).unwrap_or_default() }, state: r.state }).collect(),
+                    mergeable: if rest_pr.mergeable.unwrap_or(false) {
+                        "MERGEABLE".to_string()
+                    } else {
+                        "CONFLICTING".to_string()
+                    },
+                    reviews: rest_reviews
+                        .into_iter()
+                        .map(|r| GhReview {
+                            author: GhAuthor {
+                                login: r.user.map(|u| u.login).unwrap_or_default(),
+                            },
+                            state: r.state,
+                        })
+                        .collect(),
                     head_ref_oid: rest_pr.head.sha,
                     body: rest_pr.body.unwrap_or_default(),
-                    comments: rest_comments.into_iter().map(|c| GhComment { author: GhAuthor { login: c.user.map(|u| u.login).unwrap_or_default() }, body: c.body, created_at: c.created_at }).collect(),
-                    files: rest_files.into_iter().map(|f| GhFile { path: f.filename, additions: f.additions, deletions: f.deletions }).collect(),
+                    comments: rest_comments
+                        .into_iter()
+                        .map(|c| GhComment {
+                            author: GhAuthor {
+                                login: c.user.map(|u| u.login).unwrap_or_default(),
+                            },
+                            body: c.body,
+                            created_at: c.created_at,
+                        })
+                        .collect(),
+                    files: rest_files
+                        .into_iter()
+                        .map(|f| GhFile {
+                            path: f.filename,
+                            additions: f.additions,
+                            deletions: f.deletions,
+                        })
+                        .collect(),
                     updated_at: rest_pr.updated_at,
                 }
             }
         };
         let mergeable = view.mergeable == "MERGEABLE";
 
-        let last_coderabbit_review = view.reviews.iter()
+        let last_coderabbit_review = view
+            .reviews
+            .iter()
             .rfind(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED");
 
         let coderabbit_status = match last_coderabbit_review {
@@ -811,13 +874,24 @@ impl Scm for CliScm {
         }
         let checks_out = match run_tool(
             "gh",
-            &["pr", "checks", &pr_str, "--repo", &self.repo, "--json", "state,bucket,name"],
+            &[
+                "pr",
+                "checks",
+                &pr_str,
+                "--repo",
+                &self.repo,
+                "--json",
+                "state,bucket,name",
+            ],
             30,
         ) {
             Ok(out) => out,
             Err(primary_err) => {
                 // REST Fallback!
-                let ref_url = format!("repos/{}/commits/{}/check-runs", self.repo, view.head_ref_oid);
+                let ref_url = format!(
+                    "repos/{}/commits/{}/check-runs",
+                    self.repo, view.head_ref_oid
+                );
                 // jleechan-e7lp: the primary GraphQL `gh pr checks` call
                 // failed (commonly a GraphQL rate limit). If the REST
                 // fallback ALSO fails to execute, or returns a body that
@@ -869,32 +943,46 @@ impl Scm for CliScm {
                     }
                 })?;
 
-                let mut legacy_checks: Vec<GhCheck> = rest_cr.check_runs.into_iter().map(|cr| {
-                    let (state, bucket) = if cr.status == "completed" {
-                        match cr.conclusion.as_deref() {
-                            Some("success") | Some("neutral") => ("SUCCESS".to_string(), "pass".to_string()),
-                            Some("cancelled") => ("CANCELLED".to_string(), "cancel".to_string()),
-                            _ => ("FAILURE".to_string(), "fail".to_string()),
+                let mut legacy_checks: Vec<GhCheck> = rest_cr
+                    .check_runs
+                    .into_iter()
+                    .map(|cr| {
+                        let (state, bucket) = if cr.status == "completed" {
+                            match cr.conclusion.as_deref() {
+                                Some("success") | Some("neutral") => {
+                                    ("SUCCESS".to_string(), "pass".to_string())
+                                }
+                                Some("cancelled") => {
+                                    ("CANCELLED".to_string(), "cancel".to_string())
+                                }
+                                _ => ("FAILURE".to_string(), "fail".to_string()),
+                            }
+                        } else {
+                            ("PENDING".to_string(), "pending".to_string())
+                        };
+                        GhCheck {
+                            state,
+                            bucket,
+                            name: cr.name,
                         }
-                    } else {
-                        ("PENDING".to_string(), "pending".to_string())
-                    };
-                    GhCheck { state, bucket, name: cr.name }
-                }).collect();
+                    })
+                    .collect();
 
                 // Some third-party CI (and older GitHub Apps) still post via
                 // the legacy Commit Status API instead of the Checks API —
                 // merge `/commits/{sha}/statuses` in too so those don't
                 // silently vanish from `checks` when the GraphQL `gh pr
                 // checks` call is rate-limited.
-                let statuses_url = format!("repos/{}/commits/{}/statuses", self.repo, view.head_ref_oid);
+                let statuses_url =
+                    format!("repos/{}/commits/{}/statuses", self.repo, view.head_ref_oid);
                 if let Ok(statuses_json) = run_tool("gh", &["api", &statuses_url], 30) {
                     #[derive(serde::Deserialize)]
                     struct RestStatus {
                         context: String,
                         state: String,
                     }
-                    let rest_statuses: Vec<RestStatus> = serde_json::from_str(&statuses_json).unwrap_or_default();
+                    let rest_statuses: Vec<RestStatus> =
+                        serde_json::from_str(&statuses_json).unwrap_or_default();
                     for s in rest_statuses {
                         let bucket = match s.state.as_str() {
                             "success" => "pass",
@@ -912,9 +1000,8 @@ impl Scm for CliScm {
             }
         };
         let json_start_c = checks_out.find('[').unwrap_or(0);
-        let checks: Vec<GhCheck> = serde_json::from_str(&checks_out[json_start_c..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse gh pr checks JSON: {e}"))
-        })?;
+        let checks: Vec<GhCheck> = serde_json::from_str(&checks_out[json_start_c..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse gh pr checks JSON: {e}")))?;
         let mut any_pending = false;
         let mut any_failed = false;
         for c in &checks {
@@ -932,8 +1019,7 @@ impl Scm for CliScm {
             "green".to_string()
         };
 
-        let iteration_stub =
-            std::env::var("DARK_FACTORY_ITERATION_STUB").as_deref() == Ok("1");
+        let iteration_stub = std::env::var("DARK_FACTORY_ITERATION_STUB").as_deref() == Ok("1");
         let ci_success = ci_success_from_check_buckets(
             &checks.iter().map(|c| c.bucket.as_str()).collect::<Vec<_>>(),
             iteration_stub,
@@ -1014,11 +1100,15 @@ impl Scm for CliScm {
             }
         };
 
-        let mut pr_comments: Vec<crate::tools::PrComment> = view.comments.into_iter().map(|c| crate::tools::PrComment {
-            author: c.author.login,
-            body: c.body,
-            created_at_epoch: crate::tools::iso8601_to_epoch(&c.created_at).unwrap_or(0),
-        }).collect();
+        let mut pr_comments: Vec<crate::tools::PrComment> = view
+            .comments
+            .into_iter()
+            .map(|c| crate::tools::PrComment {
+                author: c.author.login,
+                body: c.body,
+                created_at_epoch: crate::tools::iso8601_to_epoch(&c.created_at).unwrap_or(0),
+            })
+            .collect();
 
         let updated_at_epoch = crate::tools::iso8601_to_epoch(&view.updated_at).unwrap_or(0);
 
@@ -1044,11 +1134,15 @@ impl Scm for CliScm {
             }
         }
 
-        let pr_files = view.files.into_iter().map(|f| crate::tools::PrFile {
-            path: f.path,
-            additions: f.additions,
-            deletions: f.deletions,
-        }).collect();
+        let pr_files = view
+            .files
+            .into_iter()
+            .map(|f| crate::tools::PrFile {
+                path: f.path,
+                additions: f.additions,
+                deletions: f.deletions,
+            })
+            .collect();
 
         // jleechan-nplh: the head commit's committer date is the freshness
         // floor for `/er` verdict comments. Failure tolerated (epoch 0 =
@@ -1141,7 +1235,8 @@ impl Scm for CliScm {
     }
 
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError> {
-        let offline_path = std::path::Path::new(".beads/offline").join(format!("branch_{}.json", branch));
+        let offline_path =
+            std::path::Path::new(".beads/offline").join(format!("branch_{}.json", branch));
         if offline_path.exists() {
             if let Ok(raw) = std::fs::read_to_string(&offline_path) {
                 #[derive(serde::Deserialize)]
@@ -1164,7 +1259,11 @@ impl Scm for CliScm {
         let path = format!("repos/{}/branches/{}", self.repo, branch);
         let out = match run_tool("gh", &["api", &path], 30) {
             Ok(o) => o,
-            Err(DaemonError::Tool { stderr, .. }) if stderr.contains("404") || stderr.contains("Not Found") || stderr.contains("not found") => {
+            Err(DaemonError::Tool { stderr, .. })
+                if stderr.contains("404")
+                    || stderr.contains("Not Found")
+                    || stderr.contains("not found") =>
+            {
                 {
                     let mut cache = self.branch_commit_cache.lock().unwrap();
                     cache.insert(branch.to_string(), (None, Instant::now()));
@@ -1193,9 +1292,14 @@ impl Scm for CliScm {
         let resp: GhBranch = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse branch commit response: {e}"))
         })?;
-        let epoch = crate::tools::iso8601_to_epoch(&resp.commit.commit.committer.date).ok_or_else(|| {
-            DaemonError::Parse(format!("failed to parse date: {}", resp.commit.commit.committer.date))
-        })?;
+        let epoch = crate::tools::iso8601_to_epoch(&resp.commit.commit.committer.date).ok_or_else(
+            || {
+                DaemonError::Parse(format!(
+                    "failed to parse date: {}",
+                    resp.commit.commit.committer.date
+                ))
+            },
+        )?;
         {
             let mut cache = self.branch_commit_cache.lock().unwrap();
             cache.insert(branch.to_string(), (Some(epoch), Instant::now()));
@@ -1411,14 +1515,24 @@ impl CliSessions {
         }
 
         let output = cmd.output().map_err(|e| DaemonError::Tool {
-            tool: if std::env::consts::OS == "macos" { "sandbox-exec".to_string() } else { "ao".to_string() },
+            tool: if std::env::consts::OS == "macos" {
+                "sandbox-exec".to_string()
+            } else {
+                "ao".to_string()
+            },
             rc: -1,
             stderr: format!("execution failed: {e}"),
         })?;
 
         let out = String::from_utf8_lossy(&output.stdout).into_owned();
         let err_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-        Self::classify_spawn_output(agent, output.status.success(), output.status.code(), &out, &err_msg)
+        Self::classify_spawn_output(
+            agent,
+            output.status.success(),
+            output.status.code(),
+            &out,
+            &err_msg,
+        )
     }
 
     /// Pure classification of `ao spawn`'s exit status + stdout/stderr into a
@@ -1462,7 +1576,10 @@ impl CliSessions {
             // failure whose stderr echoes the bare phrase to be misclassified
             // as retry-safe backpressure. The longer anchor still tolerates
             // the variable `'<project-id>'` in the AO-thrown message.
-            if err_msg.to_lowercase().contains("spawn queue is full for project") {
+            if err_msg
+                .to_lowercase()
+                .contains("spawn queue is full for project")
+            {
                 return Err(DaemonError::Deferred(format!(
                     "ao spawn --agent {agent} rejected: admission queue full ({})",
                     err_msg.trim()
@@ -1480,7 +1597,11 @@ impl CliSessions {
             if line.starts_with("SESSION=") {
                 sess_name = Some(line.split('=').nth(1).unwrap_or("").trim().to_string());
             } else if line.starts_with("spawned session ") {
-                let parts: Vec<&str> = line.strip_prefix("spawned session ").unwrap_or("").split_whitespace().collect();
+                let parts: Vec<&str> = line
+                    .strip_prefix("spawned session ")
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .collect();
                 if !parts.is_empty() {
                     sess_name = Some(parts[0].to_string());
                 }
@@ -1521,7 +1642,7 @@ impl CliSessions {
     fn spawn_with_fallback(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
         let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
             .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
-        
+
         let mut fallback_agents = Vec::new();
         fallback_agents.push(self.agent.clone());
         for part in fallback_str.split("->") {
@@ -1536,7 +1657,9 @@ impl CliSessions {
             }
         }
 
-        fallback_spawn(&fallback_agents, |agent| self.run_spawn_process(agent, spec))
+        fallback_spawn(&fallback_agents, |agent| {
+            self.run_spawn_process(agent, spec)
+        })
     }
 }
 
@@ -1771,9 +1894,8 @@ impl Sessions for CliSessions {
     fn active_count(&self) -> Result<usize, DaemonError> {
         let out = run_tool("ao", &["status", "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
+        let data: serde_json::Value = serde_json::from_str(&out[json_start..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse ao status: {e}")))?;
         let mut count = 0;
         if let Some(arr) = data.as_array() {
             for entry in arr {
@@ -1799,7 +1921,7 @@ impl Sessions for CliSessions {
     fn spawn_batch(&self, specs: &[SpawnSpec]) -> Result<Vec<SessionId>, DaemonError> {
         let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
             .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
-        
+
         let mut fallback_agents = Vec::new();
         fallback_agents.push(self.agent.clone());
         for part in fallback_str.split("->") {
@@ -1924,7 +2046,10 @@ impl Sessions for CliSessions {
                     return Err(DaemonError::Tool {
                         tool: "ao spawn batch".to_string(),
                         rc: -1,
-                        stderr: format!("Failed to spawn session for spec prompt: {}", specs[idx].prompt),
+                        stderr: format!(
+                            "Failed to spawn session for spec prompt: {}",
+                            specs[idx].prompt
+                        ),
                     });
                 }
             }
@@ -1955,9 +2080,8 @@ impl Sessions for CliSessions {
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
         let out = run_tool("ao", &["status", "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
+        let data: serde_json::Value = serde_json::from_str(&out[json_start..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse ao status: {e}")))?;
         if let Some(arr) = data.as_array() {
             for entry in arr {
                 if entry.get("branch").and_then(|v| v.as_str()) == Some(branch) {
@@ -1981,14 +2105,15 @@ impl Sessions for CliSessions {
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
         let out = run_tool("ao", &["status", "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
+        let data: serde_json::Value = serde_json::from_str(&out[json_start..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse ao status: {e}")))?;
         if let Some(arr) = data.as_array() {
             for entry in arr {
                 if entry.get("name").and_then(|v| v.as_str()) == Some(&id.0) {
                     if let Some(activity) = entry.get("activity").and_then(|v| v.as_str()) {
-                        return Ok(activity == "ready" || activity == "exited" || activity == "missing");
+                        return Ok(activity == "ready"
+                            || activity == "exited"
+                            || activity == "missing");
                     }
                 }
             }
@@ -2056,7 +2181,12 @@ impl Sessions for CliSessions {
             return Ok(None);
         }
         let cwd = path.to_string_lossy().into_owned();
-        match run_tool_in_dir("git", &["remote", "get-url", "--push", remote_name], &cwd, 10) {
+        match run_tool_in_dir(
+            "git",
+            &["remote", "get-url", "--push", remote_name],
+            &cwd,
+            10,
+        ) {
             Ok(out) => {
                 let trimmed = out.trim();
                 if trimmed.is_empty() {
@@ -2077,12 +2207,18 @@ mod worktree_remote_url_tests {
 
     #[test]
     fn worktree_display_name_strips_factory_prefix() {
-        assert_eq!(worktree_display_name("factory/jleechan-bqdv-r1"), "jleechan-bqdv-r1");
+        assert_eq!(
+            worktree_display_name("factory/jleechan-bqdv-r1"),
+            "jleechan-bqdv-r1"
+        );
     }
 
     #[test]
     fn worktree_display_name_passes_through_when_no_prefix() {
-        assert_eq!(worktree_display_name("some-other-branch"), "some-other-branch");
+        assert_eq!(
+            worktree_display_name("some-other-branch"),
+            "some-other-branch"
+        );
     }
 
     #[test]
@@ -2091,7 +2227,10 @@ mod worktree_remote_url_tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::var("DARK_FACTORY_AO_WORKTREE_DIR").ok();
-        std::env::set_var("DARK_FACTORY_AO_WORKTREE_DIR", "/tmp/afd-worktree-root-test");
+        std::env::set_var(
+            "DARK_FACTORY_AO_WORKTREE_DIR",
+            "/tmp/afd-worktree-root-test",
+        );
 
         let path = resolve_worktree_path("dark-factory", "factory/jleechan-bqdv-r1");
 
@@ -2125,7 +2264,11 @@ mod worktree_remote_url_tests {
             None => std::env::remove_var("DARK_FACTORY_AO_WORKTREE_DIR"),
         }
 
-        assert_eq!(result.unwrap(), None, "a missing worktree must be 'cannot verify', not an error");
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "a missing worktree must be 'cannot verify', not an error"
+        );
     }
 
     /// End-to-end (real `git`, no shim needed): create a throwaway git repo
@@ -2441,9 +2584,7 @@ impl Vcs for CliVcs {
             other => Err(DaemonError::Tool {
                 tool: "gh".to_string(),
                 rc: 0,
-                stderr: format!(
-                    "gh api {path} returned unrecognized compare status '{other}'"
-                ),
+                stderr: format!("gh api {path} returned unrecognized compare status '{other}'"),
             }),
         }
     }
@@ -2497,20 +2638,24 @@ const FALLBACK_CWD: &str = ".";
 /// does (bead `jleechan-g1k`) — MiniMax is still driving the `claude` CLI, so
 /// it still reads AGENTS.md / `.claude/` from the invocation cwd.
 fn run_minimax_judge(claude_bin: &str, prompt: &str) -> Result<String, DaemonError> {
-    let minimax_key = std::env::var("MINIMAX_API_KEY").map_err(|e| {
-        DaemonError::Tool {
-            tool: "minimax".into(),
-            rc: -1,
-            stderr: format!("MINIMAX_API_KEY not set: {e}"),
-        }
+    let minimax_key = std::env::var("MINIMAX_API_KEY").map_err(|e| DaemonError::Tool {
+        tool: "minimax".into(),
+        rc: -1,
+        stderr: format!("MINIMAX_API_KEY not set: {e}"),
     })?;
 
     let mut cmd = std::process::Command::new(claude_bin);
-    cmd.args(["--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt])
-        .current_dir(FALLBACK_CWD)
-        .stdin(std::process::Stdio::null())
-        .env("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
-        .env("ANTHROPIC_API_KEY", minimax_key);
+    cmd.args([
+        "--print",
+        "--dangerously-skip-permissions",
+        "--setting-sources",
+        "",
+        prompt,
+    ])
+    .current_dir(FALLBACK_CWD)
+    .stdin(std::process::Stdio::null())
+    .env("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
+    .env("ANTHROPIC_API_KEY", minimax_key);
 
     let output = cmd.output().map_err(|e| DaemonError::Tool {
         tool: "minimax".into(),
@@ -2665,7 +2810,10 @@ mod external_ref_tests {
         let corrupted = "jleechanorg/worldarchitect.ai#7888#local-8dyu";
         assert_eq!(
             canonicalize_external_ref_for_comment(corrupted),
-            Some(("jleechanorg/worldarchitect.ai".to_string(), "7888".to_string())),
+            Some((
+                "jleechanorg/worldarchitect.ai".to_string(),
+                "7888".to_string()
+            )),
             "expected the real repo#PR target to be recovered from the double-suffix corruption"
         );
     }
@@ -2884,11 +3032,8 @@ mod chain_llm_fallback_argv_tests {
              done\n",
         )
         .unwrap();
-        std::fs::set_permissions(
-            path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
     }
 
     /// Prepare a temp directory containing a single executable named
@@ -2897,7 +3042,8 @@ mod chain_llm_fallback_argv_tests {
     /// `ChainLlm::judge`. The directory layout matches what `ChainLlm`
     /// expects for the daemon's own cwd (`FALLBACK_CWD = "."`).
     fn make_argv_dump_dir(prefix: &str, bin_name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("afd_chain_llm_{}_{}", prefix, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("afd_chain_llm_{}_{}", prefix, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         write_argv_dump_shim(&dir.join("bin").join(bin_name));
@@ -2973,9 +3119,7 @@ mod chain_llm_fallback_argv_tests {
         // line per remaining argv slot (argv[1..]). Strip the marker and
         // compare against the expected argv (argv[1..]).
         let mut lines = captured.lines();
-        let argv0_line = lines
-            .next()
-            .expect("argv0 marker present in shim output");
+        let argv0_line = lines.next().expect("argv0 marker present in shim output");
         assert!(
             argv0_line.starts_with("argv0="),
             "shim output must start with the argv0 marker; got {argv0_line:?}"
@@ -2983,7 +3127,12 @@ mod chain_llm_fallback_argv_tests {
 
         let actual_args: Vec<&str> = lines.collect();
 
-        let expected = &["exec", "--yolo", "--skip-git-repo-check", "hello-router-prompt"];
+        let expected = &[
+            "exec",
+            "--yolo",
+            "--skip-git-repo-check",
+            "hello-router-prompt",
+        ];
         assert_eq!(
             actual_args, expected,
             "codex fallback argv mismatch — got {actual_args:?}, expected {expected:?}"
@@ -3042,9 +3191,7 @@ mod chain_llm_fallback_argv_tests {
 
         let captured = result.expect("codex shim should succeed");
         let mut lines = captured.lines();
-        let argv0_line = lines
-            .next()
-            .expect("argv0 marker present in shim output");
+        let argv0_line = lines.next().expect("argv0 marker present in shim output");
         assert!(
             argv0_line.starts_with("argv0="),
             "shim output must start with the argv0 marker; got {argv0_line:?}"
@@ -3698,10 +3845,8 @@ exit 1
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let empty_dir = std::env::temp_dir().join(format!(
-            "afd_cli_vcs_no_gh_{}_{nanos}",
-            std::process::id()
-        ));
+        let empty_dir =
+            std::env::temp_dir().join(format!("afd_cli_vcs_no_gh_{}_{nanos}", std::process::id()));
         std::fs::create_dir_all(&empty_dir).unwrap();
 
         let prior_path = std::env::var_os("PATH");

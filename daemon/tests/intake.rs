@@ -510,15 +510,20 @@ fn every_create_bead_call_across_both_intake_paths_carries_nonempty_external_ref
     let cfg = test_cfg();
 
     let (created_issues, _issue_outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
-    let (adopted_prs, _pr_outcomes) =
-        intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+    let (adopted_prs, _pr_outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
 
-    assert_eq!(created_issues.len(), 2, "expected both new issues to create beads");
+    assert_eq!(
+        created_issues.len(),
+        2,
+        "expected both new issues to create beads"
+    );
     assert_eq!(adopted_prs.len(), 2, "expected both new PRs to be adopted");
 
     let calls = tracker.calls.borrow();
-    let create_calls: Vec<&String> =
-        calls.iter().filter(|c| c.starts_with("create_bead(")).collect();
+    let create_calls: Vec<&String> = calls
+        .iter()
+        .filter(|c| c.starts_with("create_bead("))
+        .collect();
     assert_eq!(
         create_calls.len(),
         4,

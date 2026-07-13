@@ -133,9 +133,9 @@ impl Config {
     }
 
     fn is_ao_project_collision(&self, ao_project: &str, for_repo: &str) -> bool {
-        self.repos.iter().any(|(entry_repo, rc)| {
-            entry_repo != for_repo && rc.ao_project == ao_project
-        })
+        self.repos
+            .iter()
+            .any(|(entry_repo, rc)| entry_repo != for_repo && rc.ao_project == ao_project)
     }
 
     /// Effective AO project for the global `target_repo`: explicit
@@ -164,9 +164,7 @@ fn validate_owner_repo(s: &str) -> Option<OwnerRepo> {
     if s.len() != s.trim().len() {
         return None;
     }
-    let mut parts = s.splitn(2, '/');
-    let owner = parts.next()?;
-    let name = parts.next()?;
+    let (owner, name) = s.split_once('/')?;
     if owner.is_empty() || name.is_empty() || name.contains('/') {
         return None;
     }
@@ -233,8 +231,7 @@ pub fn is_valid_owner_repo(s: &str) -> bool {
 pub fn load(path: &Path) -> Result<Config, DaemonError> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| DaemonError::Config(format!("{}: {e}", path.display())))?;
-    let cfg: Config =
-        toml::from_str(&raw).map_err(|e| DaemonError::Config(e.to_string()))?;
+    let cfg: Config = toml::from_str(&raw).map_err(|e| DaemonError::Config(e.to_string()))?;
 
     if !is_valid_owner_repo(&cfg.target_repo) {
         return Err(DaemonError::Config(format!(
@@ -276,8 +273,14 @@ pub fn load(path: &Path) -> Result<Config, DaemonError> {
                 "global-explicit AO project collision: {} global ao_project=\"{}\" \
                  collides with [repos.\"{}\"].ao_project=\"{}\" — each repo must \
                  route to a distinct AO project",
-                if cfg.ao_project.is_some() { "explicit" } else { "derived" },
-                global_ao, repo, rc.ao_project
+                if cfg.ao_project.is_some() {
+                    "explicit"
+                } else {
+                    "derived"
+                },
+                global_ao,
+                repo,
+                rc.ao_project
             )));
         }
     }
@@ -327,7 +330,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("bad.toml");
         std::fs::write(&p, "target_repo = \"x/y\"\n").unwrap();
-        assert!(matches!(load(&p), Err(crate::errors::DaemonError::Config(_))));
+        assert!(matches!(
+            load(&p),
+            Err(crate::errors::DaemonError::Config(_))
+        ));
     }
     #[test]
     fn ao_project_is_optional_for_legacy_configs() {
@@ -377,7 +383,10 @@ spec_dir = ".factory/specs/"
         )
         .unwrap();
         let cfg = load(&p).unwrap();
-        assert!(cfg.repos.is_empty(), "repos table must default to empty when absent");
+        assert!(
+            cfg.repos.is_empty(),
+            "repos table must default to empty when absent"
+        );
         assert_eq!(
             cfg.resolve_repo("owner/repo"),
             Some(repo("repo", "origin", RoutingSource::GlobalTarget)),
@@ -519,7 +528,11 @@ push_remote = "ezremote"
         let cfg = load(&p).unwrap();
         assert_eq!(
             cfg.resolve_repo("jleechanorg/ez-gh-actions"),
-            Some(repo("ez-gh-actions-custom", "ezremote", RoutingSource::Explicit)),
+            Some(repo(
+                "ez-gh-actions-custom",
+                "ezremote",
+                RoutingSource::Explicit
+            )),
             "explicit [repos] entry must override derived defaults"
         );
     }
@@ -620,7 +633,11 @@ spec_dir = ".factory/specs/"
         let cfg = load(&p).unwrap();
         assert_eq!(
             cfg.resolve_repo("jleechanorg/worldarchitect.ai"),
-            Some(repo("worldarchitect", "origin", RoutingSource::GlobalTarget))
+            Some(repo(
+                "worldarchitect",
+                "origin",
+                RoutingSource::GlobalTarget
+            ))
         );
     }
 
@@ -658,29 +675,59 @@ spec_dir = ".factory/specs/"
     /// jleechan-dljf skeptic: owner segment hyphen rules + max length.
     #[test]
     fn is_valid_owner_repo_rejects_hyphen_edge_cases() {
-        assert!(!is_valid_owner_repo("-owner/repo"), "cannot start with hyphen");
-        assert!(!is_valid_owner_repo("owner-/repo"), "cannot end with hyphen");
-        assert!(!is_valid_owner_repo("---/repo"), "all-hyphens owner rejected");
+        assert!(
+            !is_valid_owner_repo("-owner/repo"),
+            "cannot start with hyphen"
+        );
+        assert!(
+            !is_valid_owner_repo("owner-/repo"),
+            "cannot end with hyphen"
+        );
+        assert!(
+            !is_valid_owner_repo("---/repo"),
+            "all-hyphens owner rejected"
+        );
         // Max owner length 39
         let long = "a".repeat(40);
-        assert!(!is_valid_owner_repo(&format!("{long}/repo")), "owner >39 chars rejected");
-        assert!(is_valid_owner_repo(&format!("{}/repo", "a".repeat(39))), "owner 39 chars ok");
+        assert!(
+            !is_valid_owner_repo(&format!("{long}/repo")),
+            "owner >39 chars rejected"
+        );
+        assert!(
+            is_valid_owner_repo(&format!("{}/repo", "a".repeat(39))),
+            "owner 39 chars ok"
+        );
     }
 
     /// jleechan-dljf skeptic: repo segment hyphen/dot rules + max length.
     #[test]
     fn is_valid_owner_repo_rejects_repo_edge_cases() {
-        assert!(!is_valid_owner_repo("owner/-repo"), "cannot start with hyphen");
-        assert!(!is_valid_owner_repo("owner/repo-"), "cannot end with hyphen");
+        assert!(
+            !is_valid_owner_repo("owner/-repo"),
+            "cannot start with hyphen"
+        );
+        assert!(
+            !is_valid_owner_repo("owner/repo-"),
+            "cannot end with hyphen"
+        );
         assert!(!is_valid_owner_repo("owner/.repo"), "cannot start with dot");
         assert!(!is_valid_owner_repo("owner/repo."), "cannot end with dot");
         assert!(!is_valid_owner_repo("owner/."), "dot-only rejected");
         assert!(!is_valid_owner_repo("owner/.."), "dotdot rejected");
-        assert!(!is_valid_owner_repo("owner/myrepo.git"), ".git suffix rejected");
+        assert!(
+            !is_valid_owner_repo("owner/myrepo.git"),
+            ".git suffix rejected"
+        );
         // Max repo length 100
         let long = "a".repeat(101);
-        assert!(!is_valid_owner_repo(&format!("owner/{long}")), "repo >100 chars rejected");
-        assert!(is_valid_owner_repo(&format!("owner/{}", "a".repeat(100))), "repo 100 chars ok");
+        assert!(
+            !is_valid_owner_repo(&format!("owner/{long}")),
+            "repo >100 chars rejected"
+        );
+        assert!(
+            is_valid_owner_repo(&format!("owner/{}", "a".repeat(100))),
+            "repo 100 chars ok"
+        );
     }
 
     // ── jleechan-dljf skeptic: symmetric collision ────────────────────
@@ -714,7 +761,10 @@ push_remote = "origin"
         )
         .unwrap();
         let result = load(&p);
-        assert!(result.is_err(), "global derived ao_project must fail at load when colliding with [repos]");
+        assert!(
+            result.is_err(),
+            "global derived ao_project must fail at load when colliding with [repos]"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("ez-gh-actions"));
     }
@@ -854,7 +904,10 @@ push_remote = "origin"
         )
         .unwrap();
         let result = load(&p);
-        assert!(result.is_err(), "global-explicit AO project collision must fail at load time");
+        assert!(
+            result.is_err(),
+            "global-explicit AO project collision must fail at load time"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("global-explicit") || msg.contains("global "));
         assert!(msg.contains("shared-project"));
@@ -993,7 +1046,10 @@ spec_dir = ".factory/specs/"
         let result = load(&p);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("owner/repo format"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("owner/repo format"),
             "malformed target_repo must be rejected at load time"
         );
     }
@@ -1020,7 +1076,10 @@ spec_dir = ".factory/specs/"
         .unwrap();
         let result = load(&p);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("owner/repo format"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("owner/repo format"));
     }
 
     #[test]
@@ -1081,7 +1140,10 @@ push_remote = "origin"
         .unwrap();
         let result = load(&p);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("empty [repos] key"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("empty [repos] key"));
     }
 
     #[test]
@@ -1135,7 +1197,10 @@ spec_dir = ".factory/specs/"
         .unwrap();
         let result = load(&p);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("owner/repo format"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("owner/repo format"));
     }
 
     #[test]
@@ -1160,7 +1225,10 @@ spec_dir = ".factory/specs/"
         .unwrap();
         let result = load(&p);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("owner/repo format"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("owner/repo format"));
     }
 
     /// Duplicate repos keys: TOML parser rejects duplicate table keys at the

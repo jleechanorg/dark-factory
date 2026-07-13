@@ -1,11 +1,11 @@
 use crate::config::Config;
+use crate::constraints;
 use crate::errors::DaemonError;
 use crate::state::{BeadOverlay, OverlayState, StateStore};
-use crate::tools::{Llm, Scm, Sessions, SpawnSpec, Vcs};
 use crate::telemetry::{self, TelemetryEvent};
-use crate::constraints;
-use std::path::Path;
+use crate::tools::{Llm, Scm, Sessions, SpawnSpec, Vcs};
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 
 pub struct RerollDeps<'a> {
     pub scm: &'a dyn Scm,
@@ -93,7 +93,11 @@ fn emit_telemetry(
 /// hand-rolled as a scoring function) — mirrors the trailing-JSON-object
 /// parsing contract `constraints::extract` already uses against the same
 /// `Llm` trait.
-fn same_underlying_issue(llm: &dyn Llm, prior_text: &str, new_text: &str) -> Result<bool, DaemonError> {
+fn same_underlying_issue(
+    llm: &dyn Llm,
+    prior_text: &str,
+    new_text: &str,
+) -> Result<bool, DaemonError> {
     let prompt = format!(
         "You are the Circuit-Breaker Semantic Comparator for an autonomous coding factory (spec §4.2.6).\n\
           Two consecutive rejection review comments were left by the SAME reviewer on re-roll attempts of \
@@ -116,11 +120,15 @@ fn same_underlying_issue(llm: &dyn Llm, prior_text: &str, new_text: &str) -> Res
     // through this call site. `ComparatorUnparseable` is transient by
     // design -- see its doc comment in errors.rs.
     let last_close = reply.rfind('}').ok_or_else(|| {
-        DaemonError::ComparatorUnparseable(format!("no JSON object found in circuit-breaker comparator reply: {reply:?}"))
+        DaemonError::ComparatorUnparseable(format!(
+            "no JSON object found in circuit-breaker comparator reply: {reply:?}"
+        ))
     })?;
     let prefix = &reply[..=last_close];
     let last_open = prefix.rfind('{').ok_or_else(|| {
-        DaemonError::ComparatorUnparseable(format!("no JSON object found in circuit-breaker comparator reply: {reply:?}"))
+        DaemonError::ComparatorUnparseable(format!(
+            "no JSON object found in circuit-breaker comparator reply: {reply:?}"
+        ))
     })?;
     let candidate = &prefix[last_open..=last_close];
 
@@ -171,9 +179,13 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     };
 
     if bead.attempt > 1 {
-        if let Some((prev_reviewer, _prev_hash)) = deps.store.load_rejection(&bead.bead_id, bead.attempt - 1)? {
+        if let Some((prev_reviewer, _prev_hash)) =
+            deps.store.load_rejection(&bead.bead_id, bead.attempt - 1)?
+        {
             if prev_reviewer == deps.reviewer {
-                let prev_text = deps.store.load_rejection_text(&bead.bead_id, bead.attempt - 1)?;
+                let prev_text = deps
+                    .store
+                    .load_rejection_text(&bead.bead_id, bead.attempt - 1)?;
                 let same_issue = match prev_text {
                     Some(ref prev) if *prev == deps.review_text => true,
                     Some(ref prev) => same_underlying_issue(deps.llm, prev, &deps.review_text)?,
@@ -226,7 +238,13 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     }
 
     // Save current rejection for future circuit-breaker checks
-    deps.store.save_rejection(&bead.bead_id, bead.attempt, &deps.reviewer, &feedback_hash, &deps.review_text)?;
+    deps.store.save_rejection(
+        &bead.bead_id,
+        bead.attempt,
+        &deps.reviewer,
+        &feedback_hash,
+        &deps.review_text,
+    )?;
 
     // Adopted-PR remediation (bead jleechan-tfs1, Option A + hard safety
     // amendment): `bead.branch` for an adopted bead is the external
@@ -259,7 +277,9 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
                 bead.state = OverlayState::HumanHeld;
                 bead.park_reason = Some("reroll_session_attach_failed".to_string());
                 deps.store.save(bead)?;
-                return Ok(RerollOutcome::Held(format!("failed to attach to session: {e}")));
+                return Ok(RerollOutcome::Held(format!(
+                    "failed to attach to session: {e}"
+                )));
             }
         };
 
@@ -337,7 +357,9 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
             bead.state = OverlayState::HumanHeld;
             bead.park_reason = Some("reroll_quiescence_timeout".to_string());
             deps.store.save(bead)?;
-            return Ok(RerollOutcome::Held("quiescence timeout exceeded (60s)".into()));
+            return Ok(RerollOutcome::Held(
+                "quiescence timeout exceeded (60s)".into(),
+            ));
         }
 
         emit_telemetry(
@@ -618,17 +640,18 @@ fn execute_adopted(
     // keeps this path inert if that restriction is ever lifted before the
     // Stage C/D call-site sweep reaches this function.
     let adopted_repo = bead.repo(deps.cfg).to_string();
-    let adopted_routing = deps.cfg.resolve_repo(&adopted_repo).unwrap_or_else(|| {
-        crate::config::RepoRouting {
-            ao_project: deps
-                .cfg
-                .ao_project
-                .clone()
-                .unwrap_or_else(|| adopted_repo.clone()),
-            push_remote: "origin".to_string(),
-            source: crate::config::RoutingSource::GlobalTarget,
-        }
-    });
+    let adopted_routing =
+        deps.cfg
+            .resolve_repo(&adopted_repo)
+            .unwrap_or_else(|| crate::config::RepoRouting {
+                ao_project: deps
+                    .cfg
+                    .ao_project
+                    .clone()
+                    .unwrap_or_else(|| adopted_repo.clone()),
+                push_remote: "origin".to_string(),
+                source: crate::config::RoutingSource::GlobalTarget,
+            });
     let spec = SpawnSpec {
         bead_id: bead.bead_id.clone(),
         branch: branch.clone(),
