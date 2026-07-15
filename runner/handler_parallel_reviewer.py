@@ -16,8 +16,16 @@ import time
 import hashlib
 from typing import TYPE_CHECKING
 
-import runner.handlers as _handlers_shim
-
+# Import collaborators from their source modules directly. Importing
+# `runner.handlers` (the re-export shim) here would create a module-load
+# cycle: handlers.py imports this file at TYPE_REGISTRY registration time,
+# and at module-load that partial re-import would re-enter handlers before
+# `_parallel_reviewer` is bound. The shim still re-exports these names, so
+# downstream monkeypatching via `runner.handlers._render_prompt` etc. keeps
+# working unchanged.
+#
+# Symbols that tests monkeypatch via ``runner.handlers._X`` are looked up
+# lazily inside ``_parallel_reviewer`` via the shim — see the function body.
 from .handler_core import Result
 from .handler_core import _gate_strict_flag
 from .handler_dispatch import (
@@ -218,6 +226,7 @@ def _coalesce_parallel_outcome(primary: str, shadows: list[str]) -> str:
 
 def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
+    import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
     # Bug 2 fix: Check for stale spec artifacts before running review.
     # If stale artifacts are detected, record the warning in ctx.state and emit
     # a stale_artifact_warning event for observability; it does NOT modify the prompt.
