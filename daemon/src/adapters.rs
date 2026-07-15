@@ -1,5 +1,5 @@
 use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
-use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
+use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -55,14 +55,6 @@ impl Tracker for CliTracker {
             id: String,
             title: String,
             description: Option<String>,
-            // jleechan-0hqx (issue #338): operator-authored per-attempt
-            // guidance, set via `br update --notes`. Surfaced into the coder
-            // prompt as the higher-priority-than-description
-            // OPERATOR GUIDANCE section so attempt rN coders stop
-            // re-litigating scope the operator already settled on requeue.
-            // `Option` because beads predating this field, or with no notes
-            // set, omit it from the `br list --json` payload.
-            notes: Option<String>,
             external_ref: Option<String>,
         }
         let data: BrListOutput = serde_json::from_str(&out[json_start..]).map_err(|e| {
@@ -80,7 +72,6 @@ impl Tracker for CliTracker {
             id: issue.id,
             title: issue.title,
             description: issue.description.unwrap_or_default(),
-            notes: issue.notes.unwrap_or_default(),
             file_tree_summary: file_tree_summary.clone(),
             external_ref: issue.external_ref,
         }).collect();
@@ -187,16 +178,7 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
     if parts.len() == 2 {
         Some((parts[0].to_string(), parts[1].to_string()))
     } else {
-        let url_parts: Vec<&str> = external_ref
-            .strip_prefix("https://github.com/")?
-            .split('/')
-            .collect();
-        match url_parts.as_slice() {
-            [owner, repo, kind, number] if matches!(*kind, "pull" | "issues") => {
-                Some((format!("{owner}/{repo}"), number.to_string()))
-            }
-            _ => None,
-        }
+        None
     }
 }
 
@@ -212,15 +194,15 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
 /// `owner/repo#N` base, which already contains a `#`, producing 3
 /// `#`-delimited segments and a permanent `comment_external` parse failure.
 ///
-/// `parse_external_ref` intentionally stays strict for short-form refs
-/// (exactly one `#`) while also accepting exact GitHub pull/issue URLs, so
-/// this corrupted shape is still detected as invalid on its own. This helper
-/// is the single call site (escalation comment posting) that recognizes the
-/// specific `<repo>#<pr>#local-<token>` shape and strips the trailing
-/// disambiguation suffix to recover the real target, so already-corrupted
-/// stored data (which this PR does NOT bulk-repair) can still have its
-/// escalation comment posted. Any other malformed shape — including bare
-/// `local-<id>` refs — is left untouched.
+/// `parse_external_ref` intentionally stays strict (exactly one `#`) so
+/// this corrupted shape is still detected as invalid on its own; this
+/// helper is the single call site (escalation comment posting) that
+/// recognizes the specific `<repo>#<pr>#local-<token>` shape and strips
+/// the trailing disambiguation suffix to recover the real target, so
+/// already-corrupted stored data (which this PR does NOT bulk-repair) can
+/// still have its escalation comment posted. Any other malformed shape —
+/// bare `local-<id>` refs, full GitHub URLs — is left untouched; those are
+/// jleechan-twa0's territory (parser format acceptance), not this bug.
 fn canonicalize_external_ref_for_comment(external_ref: &str) -> Option<(String, String)> {
     if let Some(parsed) = parse_external_ref(external_ref) {
         return Some(parsed);
@@ -664,11 +646,8 @@ impl Scm for CliScm {
                         updated_at_epoch: snap.updated_at_epoch.unwrap_or(0),
                         ci_status,
                         coderabbit_status,
-                        bugbot_status: "green".to_string(),
                         ci_pending: false,
                         head_committed_epoch: snap.head_committed_epoch.unwrap_or(0),
-                        pending_check_names: vec![],
-                        check_names_and_buckets: vec![],
                     });
                 }
             }
@@ -944,20 +923,6 @@ impl Scm for CliScm {
                 any_failed = true;
             }
         }
-        // Task 2 (reviewer-outage-resilience): collect the pending
-        // check-run names and the full (name, bucket) list so the
-        // verification step's outage-aware CI-pending override can
-        // distinguish real CI from in-outage provider stale-pending
-        // statuses and recompute ci_success after waiving them.
-        let pending_check_names: Vec<String> = checks
-            .iter()
-            .filter(|c| c.bucket == "pending")
-            .map(|c| c.name.clone())
-            .collect();
-        let check_names_and_buckets: Vec<(String, String)> = checks
-            .iter()
-            .map(|c| (c.name.clone(), c.bucket.clone()))
-            .collect();
         let ci_status = if checks.is_empty() || any_pending {
             "unknown".to_string()
         } else if any_failed {
@@ -983,37 +948,6 @@ impl Scm for CliScm {
                 }
             }
         }
-
-        // Task 1 (reviewer-outage-resilience): derive bugbot_status from the
-        // check-runs list, parallel to coderabbit_status. Any check-run whose
-        // `name` (case-insensitive) contains "bugbot" or "cursor" that is
-        // pending -> "unknown"; all completed-success -> "green"; any
-        // completed-failure -> "red". If NO bugbot/cursor check-runs exist at
-        // all, status stays "unknown" (absence is NOT success — fail-closed
-        // discipline matching coderabbit_status's `None => "unknown"` arm).
-        let bugbot_status = {
-            let mut any_pending = false;
-            let mut any_failed = false;
-            let mut any_present = false;
-            for c in &checks {
-                let name_lower = c.name.to_lowercase();
-                if name_lower.contains("bugbot") || name_lower.contains("cursor") {
-                    any_present = true;
-                    if c.bucket == "pending" {
-                        any_pending = true;
-                    } else if c.bucket == "fail" || c.bucket == "cancel" {
-                        any_failed = true;
-                    }
-                }
-            }
-            if !any_present || any_pending {
-                "unknown".to_string()
-            } else if any_failed {
-                "red".to_string()
-            } else {
-                "green".to_string()
-            }
-        };
 
         let owner = self.repo.split('/').next().unwrap_or("").to_string();
         let repo = self.repo.split('/').nth(1).unwrap_or("").to_string();
@@ -1155,11 +1089,8 @@ impl Scm for CliScm {
             updated_at_epoch,
             ci_status,
             coderabbit_status,
-            bugbot_status,
             ci_pending,
             head_committed_epoch,
-            pending_check_names,
-            check_names_and_buckets,
         };
         {
             let mut cache = self.pr_snapshot_cache.lock().unwrap();
@@ -1179,21 +1110,6 @@ impl Scm for CliScm {
     /// `pr_snapshot_cache` entry under a colliding PR-number key.
     fn pr_snapshot_for_repo(&self, repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
         self.with_repo(repo).pr_snapshot(pr)
-    }
-
-    /// jleechan-drive-pr-branch-binding-pcpr: single REST lookup
-    /// (`repos/{repo}/pulls/{pr}`) used at dispatch time to decide whether
-    /// a bead's `external_ref` names a live, SAME-REPO open PR that
-    /// dispatch must bind to instead of fabricating
-    /// `factory/<bead>-r<attempt>`. Parsing is delegated to
-    /// `parse_open_pr_head_ref` (a pure, unit-testable seam) so the fork
-    /// guard can be exercised directly without a `gh` subprocess.
-    fn open_pr_head_ref_for_repo(&self, repo: &str, pr: u64) -> Result<PrHeadBranch, DaemonError> {
-        let out = match run_tool("gh", &["api", &format!("repos/{repo}/pulls/{pr}")], 15) {
-            Ok(out) => out,
-            Err(_) => return Ok(PrHeadBranch::NotFound),
-        };
-        Ok(parse_open_pr_head_ref(&out, repo))
     }
 
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
@@ -1221,22 +1137,6 @@ impl Scm for CliScm {
             issues_cache.clear();
         }
         Ok(())
-    }
-
-    /// jleechan-v6ud / issue #340: retarget `gh pr close` at `repo` via
-    /// `with_repo` instead of always closing against `self.repo` (the
-    /// daemon's global `cfg.target_repo`, bound at construction time in
-    /// `main.rs`). Without this override, a same-numbered PR that already
-    /// merged in the default repo (beads 8jxr and 9rkz: the same `#315`
-    /// and `#314` had ALREADY merged in `jleechanorg/worldarchitect.ai` at
-    /// the moment the reroll closed them) makes `gh pr close` error with
-    /// "can't be closed because it was already merged", wedging the bead
-    /// on a transient tool error instead of mutating the bead's actual
-    /// repo's PR. Fresh `with_repo` instance (not a cache-sharing clone)
-    /// so a cross-repo call can never evict another repo's cached
-    /// `pr_snapshot_cache` entry under a colliding PR-number key.
-    fn close_pr_for_repo(&self, repo: &str, pr: u64, comment: &str) -> Result<(), DaemonError> {
-        self.with_repo(repo).close_pr(pr, comment)
     }
 
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError> {
@@ -1314,112 +1214,6 @@ impl Scm for CliScm {
         branch: &str,
     ) -> Result<Option<u64>, DaemonError> {
         self.with_repo(repo).remote_branch_last_commit(branch)
-    }
-}
-
-/// Pure parser behind [`Scm::open_pr_head_ref_for_repo`] (unit-testable
-/// seam — no `gh` subprocess needed to exercise the fork guard).
-///
-/// Fork guard (codex cross-model review of PR #305): binding to a FORK PR's
-/// head branch name and then pushing to the queried repo creates an
-/// unrelated same-named branch there and never touches the actual PR —
-/// silent wrong behavior. A fork head (`head.repo.full_name != repo`), or a
-/// missing/deleted head repo (`head.repo: null` — GitHub omits it once the
-/// fork has been deleted), therefore resolves to `PrHeadBranch::Fork`, not
-/// `SameRepo`, mirroring the intake-side cross-repository guard
-/// (`intake::same_repo_pr`).
-pub(crate) fn parse_open_pr_head_ref(out: &str, repo: &str) -> PrHeadBranch {
-    #[derive(serde::Deserialize)]
-    struct RestPullView {
-        state: String,
-        head: RestPullViewHead,
-    }
-    #[derive(serde::Deserialize)]
-    struct RestPullViewHead {
-        #[serde(rename = "ref")]
-        ref_name: String,
-        repo: Option<RestPullViewHeadRepo>,
-    }
-    #[derive(serde::Deserialize)]
-    struct RestPullViewHeadRepo {
-        full_name: Option<String>,
-    }
-    let json_start = out.find('{').unwrap_or(0);
-    let parsed: RestPullView = match serde_json::from_str(&out[json_start..]) {
-        Ok(p) => p,
-        Err(_) => return PrHeadBranch::NotFound,
-    };
-    if !parsed.state.eq_ignore_ascii_case("open") {
-        return PrHeadBranch::NotFound;
-    }
-    let same_repo = parsed
-        .head
-        .repo
-        .as_ref()
-        .and_then(|r| r.full_name.as_deref())
-        .map(|full| full.eq_ignore_ascii_case(repo))
-        .unwrap_or(false);
-    if same_repo {
-        PrHeadBranch::SameRepo(parsed.head.ref_name)
-    } else {
-        PrHeadBranch::Fork
-    }
-}
-
-#[cfg(test)]
-mod open_pr_head_ref_tests {
-    // Codex cross-model review of PR #305: direct unit coverage of the pure
-    // REST-parsing seam, using real GitHub REST PR-view JSON shapes — the
-    // fake-Scm-level tests in dispatch.rs/tick_integration.rs prove the
-    // CONTRACT (fork PR -> ForkFallback -> generated branch); these prove
-    // the actual `gh api repos/{repo}/pulls/{pr}` JSON parsing that feeds it.
-    use super::parse_open_pr_head_ref;
-    use crate::tools::PrHeadBranch;
-
-    #[test]
-    fn open_same_repo_pr_resolves_same_repo_with_head_ref() {
-        let json = r#"{"state":"open","head":{"ref":"factory/jleechan-xa99-r1","repo":{"full_name":"owner/repo"}}}"#;
-        assert_eq!(
-            parse_open_pr_head_ref(json, "owner/repo"),
-            PrHeadBranch::SameRepo("factory/jleechan-xa99-r1".to_string())
-        );
-    }
-
-    #[test]
-    fn open_fork_pr_resolves_fork_not_same_repo_head_ref() {
-        // The fork's OWN branch happens to be named identically to what a
-        // generated branch would look like — proving the guard checks
-        // `head.repo.full_name`, not just PR openness or the ref string.
-        let json = r#"{"state":"open","head":{"ref":"factory/jleechan-xa99-r1","repo":{"full_name":"someone-else/repo"}}}"#;
-        assert_eq!(parse_open_pr_head_ref(json, "owner/repo"), PrHeadBranch::Fork);
-    }
-
-    #[test]
-    fn open_pr_with_case_different_same_repo_name_still_matches() {
-        let json = r#"{"state":"OPEN","head":{"ref":"factory/x","repo":{"full_name":"Owner/Repo"}}}"#;
-        assert_eq!(
-            parse_open_pr_head_ref(json, "owner/repo"),
-            PrHeadBranch::SameRepo("factory/x".to_string())
-        );
-    }
-
-    #[test]
-    fn open_pr_with_deleted_fork_head_repo_resolves_fork_not_same_repo() {
-        // GitHub omits `head.repo` entirely once the source fork has been
-        // deleted — must NOT default to "assume same repo".
-        let json = r#"{"state":"open","head":{"ref":"factory/x","repo":null}}"#;
-        assert_eq!(parse_open_pr_head_ref(json, "owner/repo"), PrHeadBranch::Fork);
-    }
-
-    #[test]
-    fn closed_same_repo_pr_resolves_not_found() {
-        let json = r#"{"state":"closed","head":{"ref":"factory/x","repo":{"full_name":"owner/repo"}}}"#;
-        assert_eq!(parse_open_pr_head_ref(json, "owner/repo"), PrHeadBranch::NotFound);
-    }
-
-    #[test]
-    fn malformed_json_resolves_not_found() {
-        assert_eq!(parse_open_pr_head_ref("not json", "owner/repo"), PrHeadBranch::NotFound);
     }
 }
 
@@ -3300,20 +3094,7 @@ impl Sessions for CliSessions {
     /// verbatim in telemetry a human reads, so the message names the branch
     /// and bead explicitly instead of a generic "not found".
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
-        self.attach_within(branch, bead_id, 30)
-    }
-
-    /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded `attach` — the
-    /// re-roll poll passes the time remaining until its window deadline so a
-    /// single poll cannot block for multiples of the window on stacked ~30s
-    /// `ao status` timeouts.
-    fn attach_within(
-        &self,
-        branch: &str,
-        bead_id: &str,
-        timeout_secs: u64,
-    ) -> Result<SessionId, DaemonError> {
-        let out = run_tool("ao", &["status", "--json"], timeout_secs)?;
+        let out = run_tool("ao", &["status", "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -3333,34 +3114,6 @@ impl Sessions for CliSessions {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
         })?;
         session_is_quiescent(&data, id)
-    }
-
-    /// Bead jleechan-zeij / issue #322 r2: read AO's per-session `activity`
-    /// field directly so the re-roll proceed predicate can tell an idle
-    /// worker (`status=spawning, activity=idle` — safe to supersede jointly
-    /// with a stable HEAD) apart from a running one (never safe). Same
-    /// `ao status --json` parsing shape as `is_quiescent` above; a session
-    /// with no matching status row classifies as `NotFound` (fully reaped).
-    fn session_activity(
-        &self,
-        id: &SessionId,
-    ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        self.session_activity_within(id, 30)
-    }
-
-    /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded
-    /// `session_activity` — same rationale as `attach_within`.
-    fn session_activity_within(
-        &self,
-        id: &SessionId,
-        timeout_secs: u64,
-    ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        let out = run_tool("ao", &["status", "--json"], timeout_secs)?;
-        let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
-        session_activity(&data, id)
     }
 
     /// jleechan-5ia2: `ao status --json` already reports each session's
@@ -3450,68 +3203,6 @@ impl Sessions for CliSessions {
             Ok(Some(trimmed.to_string()))
         }
     }
-
-    /// Bead jleechan-coder-silent-false-parks-h92r: unlike
-    /// `worktree_remote_url` (a spawn-time-only assertion that fails closed
-    /// on a missing mapping), this is an advisory liveness signal consulted
-    /// on every tick a bead sits DISPATCHED — a missing AO workspace
-    /// mapping, missing `$HOME`, or missing transcript directory are all
-    /// "no evidence", not an error, so the coder-silence sweep can fall back
-    /// to its other signal instead of hard-failing the whole tick.
-    fn worktree_transcript_last_activity_epoch(
-        &self,
-        ao_project: &str,
-        branch: &str,
-    ) -> Result<Option<u64>, DaemonError> {
-        let key = (ao_project.to_string(), branch.to_string());
-        let path = self
-            .spawned_worktrees
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            .cloned();
-        let Some(path) = path else {
-            return Ok(None);
-        };
-        let home = std::env::var("HOME").unwrap_or_default();
-        if home.is_empty() {
-            return Ok(None);
-        }
-        let slug = crate::tools::claude_project_slug(&path);
-        let transcript_dir = std::path::Path::new(&home)
-            .join(".claude")
-            .join("projects")
-            .join(slug);
-        Ok(latest_jsonl_mtime_epoch(&transcript_dir))
-    }
-}
-
-/// Most recent modification time (unix epoch seconds) across every
-/// `*.jsonl` file directly inside `dir`, or `None` when `dir` doesn't exist,
-/// isn't readable, or contains no `.jsonl` files. A single unreadable entry
-/// is skipped rather than failing the whole scan — this is a best-effort
-/// liveness signal, not a correctness-critical read.
-fn latest_jsonl_mtime_epoch(dir: &std::path::Path) -> Option<u64> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut latest: Option<u64> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) else {
-            continue;
-        };
-        let epoch = dur.as_secs();
-        latest = Some(latest.map_or(epoch, |l: u64| l.max(epoch)));
-    }
-    latest
 }
 
 /// Count the daemon's one global AO worker envelope across every project.
@@ -3540,36 +3231,6 @@ fn session_is_quiescent(
         .iter()
         .find(|entry| entry.get("name").and_then(|value| value.as_str()) == Some(&id.0))
         .is_some_and(is_terminal_ao_session))
-}
-
-/// Bead jleechan-zeij / issue #322 r2: classify a session's liveness into
-/// [`SessionActivity`]. Ordering matters — a terminal status wins over the
-/// `activity` field (a `killed` session may still carry a stale
-/// `activity=idle`), then `activity=="idle"` distinguishes an alive-but-idle
-/// worker (the #322 signature) from an actively-running one. A session with
-/// no matching row is `NotFound`. Same `ao status --json` shape as
-/// `session_is_quiescent`.
-fn session_activity(
-    data: &serde_json::Value,
-    id: &SessionId,
-) -> Result<crate::tools::SessionActivity, DaemonError> {
-    use crate::tools::SessionActivity;
-    let sessions = data
-        .as_array()
-        .ok_or_else(|| DaemonError::Parse("ao status JSON must be an array".to_string()))?;
-    let Some(entry) = sessions
-        .iter()
-        .find(|entry| entry.get("name").and_then(|value| value.as_str()) == Some(&id.0))
-    else {
-        return Ok(SessionActivity::NotFound);
-    };
-    if is_terminal_ao_session(entry) {
-        return Ok(SessionActivity::Terminal);
-    }
-    if entry.get("activity").and_then(|value| value.as_str()) == Some("idle") {
-        return Ok(SessionActivity::Idle);
-    }
-    Ok(SessionActivity::Running)
 }
 
 fn session_for_branch(
@@ -3652,49 +3313,8 @@ fn active_session_count(data: &serde_json::Value) -> Result<usize, DaemonError> 
 
 #[cfg(test)]
 mod active_session_count_tests {
-    use super::{active_session_count, session_activity, session_for_branch, session_is_quiescent};
-    use crate::tools::{SessionActivity, SessionId};
-
-    #[test]
-    fn activity_probe_distinguishes_idle_running_terminal_and_missing() {
-        // The #322 live signature is the `idle` row: NOT terminal (so
-        // `is_quiescent` returns false and the r1 loop stalled), but distinct
-        // from a genuinely running worker. A terminal status wins even when a
-        // stale `activity` lingers.
-        let status = serde_json::json!([
-            {"name": "idle-spawning", "status": "spawning", "activity": "idle"},
-            {"name": "running", "status": "working", "activity": "working"},
-            {"name": "killed-stale-idle", "status": "killed", "activity": "idle"},
-            {"name": "exited", "status": "working", "activity": "exited"},
-            {"name": "done", "status": "done", "activity": "ready"}
-        ]);
-
-        assert_eq!(
-            session_activity(&status, &SessionId("idle-spawning".into())).unwrap(),
-            SessionActivity::Idle
-        );
-        assert_eq!(
-            session_activity(&status, &SessionId("running".into())).unwrap(),
-            SessionActivity::Running
-        );
-        assert_eq!(
-            session_activity(&status, &SessionId("killed-stale-idle".into())).unwrap(),
-            SessionActivity::Terminal
-        );
-        assert_eq!(
-            session_activity(&status, &SessionId("exited".into())).unwrap(),
-            SessionActivity::Terminal
-        );
-        assert_eq!(
-            session_activity(&status, &SessionId("done".into())).unwrap(),
-            SessionActivity::Terminal
-        );
-        assert_eq!(
-            session_activity(&status, &SessionId("gone".into())).unwrap(),
-            SessionActivity::NotFound
-        );
-        assert!(session_activity(&serde_json::json!({}), &SessionId("x".into())).is_err());
-    }
+    use super::{active_session_count, session_for_branch, session_is_quiescent};
+    use crate::tools::SessionId;
 
     #[test]
     fn global_cap_counts_active_sessions_across_projects_and_unknown_activity() {
@@ -3936,129 +3556,6 @@ mod worktree_remote_url_tests {
     }
 }
 
-#[cfg(test)]
-mod worktree_transcript_last_activity_epoch_tests {
-    use super::{gh_env_test_lock, CliSessions};
-    use crate::tools::Sessions;
-
-    fn record_workspace(
-        sessions: &CliSessions,
-        project: &str,
-        branch: &str,
-        path: &std::path::Path,
-    ) {
-        sessions
-            .spawned_worktrees
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                (project.to_string(), branch.to_string()),
-                path.to_path_buf(),
-            );
-    }
-
-    /// Bead jleechan-coder-silent-false-parks-h92r: no `spawned_worktrees`
-    /// entry for the (project, branch) key must be "no evidence"
-    /// (`Ok(None)`), never an error and never treated as proof of silence —
-    /// this signal is advisory, unlike the spawn-time-only
-    /// `worktree_remote_url` fail-closed check.
-    #[test]
-    fn no_evidence_without_spawned_workspace() {
-        let sessions = CliSessions::new("owner/repo", "claude-code");
-        let result = sessions
-            .worktree_transcript_last_activity_epoch("dark-factory", "factory/missing-r1");
-
-        assert_eq!(result.unwrap(), None);
-    }
-
-    /// Reproduces the 2026-07-17 false-park scenario: a real worktree with a
-    /// transcript directory whose `.jsonl` file was modified moments ago
-    /// must report a recent epoch, even though nothing was pushed to the
-    /// remote branch.
-    #[test]
-    fn reports_latest_jsonl_mtime_from_derived_transcript_dir() {
-        let _guard = gh_env_test_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = std::env::temp_dir().join(format!(
-            "afd_transcript_activity_test_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let fake_home = root.join("home");
-        let worktree_path = root.join("worktrees").join("dark-factory").join("df-100");
-        std::fs::create_dir_all(&worktree_path).unwrap();
-
-        let slug = crate::tools::claude_project_slug(&worktree_path);
-        let transcript_dir = fake_home.join(".claude").join("projects").join(&slug);
-        std::fs::create_dir_all(&transcript_dir).unwrap();
-        std::fs::write(transcript_dir.join("session-1.jsonl"), "{}\n").unwrap();
-        std::fs::write(transcript_dir.join("not-a-transcript.txt"), "ignore me").unwrap();
-
-        let before = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &fake_home);
-
-        let sessions = CliSessions::new("owner/repo", "claude-code");
-        record_workspace(&sessions, "dark-factory", "factory/df-100-r1", &worktree_path);
-        let result =
-            sessions.worktree_transcript_last_activity_epoch("dark-factory", "factory/df-100-r1");
-
-        if let Some(v) = prev_home {
-            std::env::set_var("HOME", v);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = std::fs::remove_dir_all(&root);
-
-        let epoch = result.unwrap().expect("must find the .jsonl file's mtime");
-        assert!(
-            epoch >= before,
-            "reported epoch {epoch} must be >= test-start epoch {before}"
-        );
-    }
-
-    /// A resolvable worktree whose transcript directory doesn't exist yet
-    /// (e.g. the coder session hasn't written any transcript file yet, or
-    /// the naming convention drifted) is "no evidence", not an error.
-    #[test]
-    fn no_evidence_when_transcript_dir_missing() {
-        let _guard = gh_env_test_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = std::env::temp_dir().join(format!(
-            "afd_transcript_activity_missing_dir_test_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let fake_home = root.join("home");
-        let worktree_path = root.join("worktrees").join("dark-factory").join("df-101");
-        std::fs::create_dir_all(&worktree_path).unwrap();
-        std::fs::create_dir_all(&fake_home).unwrap();
-
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &fake_home);
-
-        let sessions = CliSessions::new("owner/repo", "claude-code");
-        record_workspace(&sessions, "dark-factory", "factory/df-101-r1", &worktree_path);
-        let result =
-            sessions.worktree_transcript_last_activity_epoch("dark-factory", "factory/df-101-r1");
-
-        if let Some(v) = prev_home {
-            std::env::set_var("HOME", v);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = std::fs::remove_dir_all(&root);
-
-        assert_eq!(result.unwrap(), None);
-    }
-}
-
 /// `target_repo` is the "<owner>/<repo>" the daemon automates (`cfg.target_repo`,
 /// e.g. `jleechanorg/worldarchitect.ai`) -- NOT the daemon's own source repo.
 /// jleechan-9sl1: `remote_head_sha`/`is_ancestor` used to shell out to the
@@ -4100,95 +3597,13 @@ impl Vcs for CliVcs {
         Ok(out.trim().to_string())
     }
 
-    /// jleechan-wuts / issue #349: routed-repo variant of [`base_head`].
-    /// `gh api repos/<repo>/git/ref/heads/<branch>` returns the SHA at
-    /// the HEAD of `<branch>` in `<repo>`. Equivalent in shape to
-    /// `remote_head_sha` (`repos/<repo>/commits/<branch>` returns the
-    /// same SHA, but `git/ref/heads/<branch>` is the Git Data API's
-    /// canonical "branch HEAD" lookup and is what `gh` itself uses
-    /// internally for branch refs). Decoupled from the daemon's own
-    /// cwd (its systemd `WorkingDirectory`, the daemon's own source-repo
-    /// checkout), so a bead whose `overlay.repo(cfg)` names a DIFFERENT
-    /// repo from `cfg.target_repo` resolves the baseline against the
-    /// routed repo instead of the daemon's own repo's same-named branch.
-    ///
-    /// Branches containing `/` (e.g. `release/2026-q3`) survive intact:
-    /// the `git/ref/heads/` prefix accepts embedded slashes the same
-    /// way `commits/<branch>` already does (cf. the doc comment on
-    /// `remote_head_sha`).
-    fn base_head_for_repo(&self, repo: &str, base_branch: &str) -> Result<String, DaemonError> {
-        let path = format!("repos/{}/git/ref/heads/{}", repo, base_branch);
-        let out = run_tool("gh", &["api", &path, "--jq", ".object.sha"], 30)?;
-        let sha = out.trim();
-        // `gh api ... --jq .object.sha` exits 0 with the literal string
-        // `null` when the branch doesn't exist in the target repo --
-        // treat that as an error rather than a valid SHA, mirroring the
-        // `remote_head_sha` policy above.
-        if sha.is_empty() || sha == "null" {
-            return Err(DaemonError::Tool {
-                tool: "gh".to_string(),
-                rc: 0,
-                stderr: format!(
-                    "gh api {path} returned no sha for branch '{base_branch}' in {repo}"
-                ),
-            });
-        }
-        Ok(sha.to_string())
-    }
-
     fn create_branch_at(&self, name: &str, sha: &str) -> Result<(), DaemonError> {
         run_tool("git", &["branch", name, sha], 30)?;
         Ok(())
     }
 
-    /// jleechan-wuts / issue #349: routed-repo variant of
-    /// [`create_branch_at`]. POSTs a `refs/heads/<name>` ref via the
-    /// Git Data API at `repos/<repo>/git/refs`. Decoupled from the
-    /// daemon's own cwd (its systemd `WorkingDirectory`, the daemon's
-    /// own source-repo checkout), so the new attempt's
-    /// `factory/<bead>-r<n>` branch lands in the routed target repo
-    /// where the worker will actually push -- not in the daemon's own
-    /// source-repo checkout, where the old CWD-bound `git branch
-    /// <name> <sha>` would have silently created it (and where the
-    /// worker's first `git push` would then race or be rejected).
-    ///
-    /// The endpoint rejects a ref that already exists in `<repo>`
-    /// with HTTP 422 -- the reroll path always passes a freshly
-    /// formatted `factory/<bead>-r<attempt>` branch (incremented per
-    /// attempt), so a collision in the routed repo is structurally
-    /// impossible absent a stale `register_branch`/gh-state mismatch;
-    /// the underlying `DaemonError::Tool` with the HTTP body as
-    /// stderr surfaces that case to the operator for the same reason
-    /// the old CWD-bound `git branch <name> <sha>` did.
-    fn create_branch_at_for_repo(&self, repo: &str, name: &str, sha: &str) -> Result<(), DaemonError> {
-        let path = format!("repos/{}/git/refs", repo);
-        let ref_path = format!("refs/heads/{name}");
-        let out = run_tool(
-            "gh",
-            &[
-                "api",
-                "--method",
-                "POST",
-                &path,
-                "-f",
-                &format!("ref={ref_path}"),
-                "-f",
-                &format!("sha={sha}"),
-            ],
-            30,
-        )?;
-        let _ = out; // POST success returns the created ref object; we don't need its body.
-        Ok(())
-    }
-
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError> {
-        self.head_sha_within(branch, 30)
-    }
-
-    /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded `head_sha` — the
-    /// re-roll poll caps this `git rev-parse` at the remaining window budget.
-    fn head_sha_within(&self, branch: &str, timeout_secs: u64) -> Result<String, DaemonError> {
-        let out = run_tool("git", &["rev-parse", branch], timeout_secs)?;
+        let out = run_tool("git", &["rev-parse", branch], 30)?;
         Ok(out.trim().to_string())
     }
 
@@ -4498,8 +3913,8 @@ mod with_repo_tests {
 #[cfg(test)]
 mod external_ref_tests {
     use super::{
-        canonicalize_external_ref_for_comment, parse_external_ref,
-        parse_external_refs_from_br_list, unresolved_thread_count_from_gql,
+        canonicalize_external_ref_for_comment, parse_external_refs_from_br_list,
+        unresolved_thread_count_from_gql,
     };
 
     /// jleechan-mdgr: reproduces the exact 2026-07-11T00:05:15Z corruption —
@@ -4549,38 +3964,6 @@ mod external_ref_tests {
         assert_eq!(
             canonicalize_external_ref_for_comment("owner/repo#42#weird-suffix"),
             None
-        );
-    }
-
-    #[test]
-    fn parse_external_ref_preserves_short_form() {
-        assert_eq!(
-            parse_external_ref("owner/repo#42"),
-            Some(("owner/repo".to_string(), "42".to_string()))
-        );
-    }
-
-    #[test]
-    fn parse_external_ref_accepts_github_pull_url() {
-        assert_eq!(
-            parse_external_ref(
-                "https://github.com/jleechanorg/worldarchitect.ai/pull/8064"
-            ),
-            Some((
-                "jleechanorg/worldarchitect.ai".to_string(),
-                "8064".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn parse_external_ref_accepts_github_issue_url() {
-        assert_eq!(
-            parse_external_ref("https://github.com/jleechanorg/dark-factory/issues/238"),
-            Some((
-                "jleechanorg/dark-factory".to_string(),
-                "238".to_string()
-            ))
         );
     }
 

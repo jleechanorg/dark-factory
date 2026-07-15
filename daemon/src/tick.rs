@@ -27,7 +27,7 @@ use crate::state::{
     set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
 };
 use crate::telemetry::{self, TelemetryEvent};
-use crate::tools::{Bead, Llm, PrHeadBranch, Scm, SessionId, Sessions, Tracker, Vcs};
+use crate::tools::{Bead, Llm, Scm, SessionId, Sessions, Tracker, Vcs};
 use crate::verifier::{self, PrEvidence};
 use std::collections::HashSet;
 use std::path::Path;
@@ -73,17 +73,6 @@ pub struct TickSummary {
     /// query `bead_overlay` yourself" (2026-07-09 live incident: 45 beads
     /// silently lost with no durable trace anywhere).
     pub beads_escalated_locally: usize,
-    /// jleechan-zaga / issue #348: beads held at `DISPOSITION_REQUIRED`
-    /// because every red gate is structural (re-rolling would be no-op
-    /// churn). The fast tier keeps assessing on each tick; this counter
-    /// just records the holds placed this tick.
-    pub beads_held_disposition_required: usize,
-    /// Bead jleechan-rouf (worldarchitect.ai #8428 / #8420 / #8421): an
-    /// escalation event that the dedup ledger suppressed within the
-    /// `escalation_refire_secs` window because the same `(branch, reason)`
-    /// had already emitted. Distinct from `beads_escalated` so operators
-    /// can see the dedup work without it being mistaken for new alerts.
-    pub escalations_suppressed: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -96,37 +85,6 @@ const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
 const ESCALATION_REVIEWER: &str = "dark-factory-escalation";
 const ESCALATION_SENTINEL_ATTEMPT: u32 = u32::MAX;
 
-/// Task 1 (reviewer-outage-resilience): N consecutive pending assessments
-/// before a provider is marked in-outage in the `vendor_health` ledger.
-const VENDOR_OUTAGE_CONSECUTIVE_PENDING_THRESHOLD: u32 = 3;
-
-/// Task 2 (reviewer-outage-resilience): grace period (seconds) measured from
-/// the PR head commit's committer epoch after which an in-outage provider's
-/// stale pending check-run status is waived so the verification step can
-/// proceed and report the true CI result. 15 minutes.
-const OUTAGE_GRACE_PERIOD_SECS: u64 = 900;
-
-/// Bead jleechan-msmq: an ATTESTED bead with `reroll_count > 0` is in the
-/// reroll pipeline. The OLD PR's gate verdict cannot advance the bead
-/// (the reroll branch IS the advancement); re-assessing it on every
-/// subsequent tick is pure churn that races with two breakers:
-///
-///   * the autonomy timebox — `autonomy_secs` keeps bumping, and once it
-///     crosses `autonomy_timebox_secs`, the timebox-park branch calls
-///     `kill_session_and_clear_handle`, killing the fresh coder lane
-///     that was just fabricated by the reroll before it has a chance to
-///     push a fix. Symptom: bead goes HumanHeld → recover-held → QUEUED,
-///     dispatched session dead, bead ping-pongs forever.
-///   * the circuit-breaker — same reviewer citing the same red gate on
-///     identical evidence trips on attempt 2 and parks HUMAN_HELD, even
-///     though the fresh lane was about to land a fix.
-///
-/// The fix: skip the per-tick gate assessment for ATTESTED beads whose
-/// `reroll_count > 0`. The reroll branch (which runs below this guard in
-/// `run_fast_tier`) is the ONLY consumer of the fresh lane's progress;
-/// the OLD PR's gates are not relevant once reroll has been initiated.
-/// Emitting `VERIFIER_SKIPPED_REROLL_IN_PROGRESS` lets an operator tell
-/// the skip from a transient snapshot error or a circuit-breaker trip.
 /// Result of looking up CI-pending state for an active overlay (used by the
 /// autonomy/timebox bookkeeping in `run_tick`'s active-overlay loop).
 ///
@@ -281,73 +239,6 @@ fn emit_intake_outcome(telemetry_log: &Path, outcome: &IntakeOutcome) -> Result<
 ///
 /// Stage gate: `deps.cfg.stage` must be `1` — this function only implements
 /// the Stage-1 substitution rule (re-roll verdicts recorded, never executed).
-///
-/// jleechan-park-leaves-zombie-session-mh9o: best-effort terminate the live
-/// AO session bound to `overlay` and clear the durable session handle, so
-/// every PARKED_* transition (a) does not leave a zombie session listed as
-/// `[spawning]` in AO's state — which the AO dedup guard rejects as a
-/// "Duplicate session detected" on the next `ao spawn` for the same bead —
-/// and (b) lets the automated HUMAN_HELD exit (`recover_human_held`'s
-/// `session_id IS NULL` predicate) requeue the bead if its
-/// `park_reason` is in the recoverable set.
-///
-/// Fail-soft by design, with an important asymmetry: the durable handle is
-/// cleared ONLY on a successful `stop()` (the session is provably dead) or
-/// when there is no handle to begin with. On a `stop()` failure the
-/// session may still be live, so the handle is RETAINED on disk — this
-/// (i) prevents `recover_human_held` from requeueing a bead whose live
-/// worker could overlap a freshly-spawned replacement, and (ii) gives
-/// operators the durable evidence they need to retry cleanup or kill the
-/// session manually. The `BEAD_SESSION_KILL_FAILED` telemetry event
-/// preserves visibility into the still-leaked session.
-fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
-    let Some(session_id_str) = overlay.session_id.clone() else {
-        return;
-    };
-    let session_id = SessionId(session_id_str.clone());
-    match deps.sessions.stop(&session_id) {
-        Ok(()) => {
-            let _ = emit(
-                deps.telemetry_log,
-                &overlay.bead_id,
-                overlay.attempt,
-                OverlayState::HumanHeld.as_str(),
-                "BEAD_SESSION_KILLED",
-                serde_json::json!({}),
-                serde_json::json!({
-                    "session_id": session_id_str,
-                    "phase": "park_transition",
-                }),
-            );
-            // Proven dead — safe to clear the handle. Unblocks both
-            // recover_human_held and any operator-driven requeue without
-            // risking a duplicate worker or AO dedup collision.
-            overlay.session_id = None;
-        }
-        Err(stop_err) => {
-            // Stop failed: the session may still be live. RETAIN the handle
-            // so (a) recover_human_held cannot requeue and dispatch a second
-            // worker that would overlap the existing live one and (b) the
-            // operator retains the durable session_id needed to retry
-            // `ao session kill <id>` once AO recovers. Failure is logged
-            // but never escalated — the park itself stands.
-            let _ = emit(
-                deps.telemetry_log,
-                &overlay.bead_id,
-                overlay.attempt,
-                OverlayState::HumanHeld.as_str(),
-                "BEAD_SESSION_KILL_FAILED",
-                serde_json::json!({}),
-                serde_json::json!({
-                    "session_id": session_id_str,
-                    "error": format!("{stop_err:?}"),
-                    "phase": "park_transition",
-                }),
-            );
-        }
-    }
-}
-
 pub fn run_tick(
     deps: &TickDeps,
     tick_index: u64,
@@ -422,14 +313,6 @@ pub fn run_tick(
         // 1. Time-box envelope check
         if overlay.autonomy_secs >= deps.cfg.autonomy_timebox_secs {
             overlay.state = OverlayState::HumanHeld;
-            // jleechan-park-leaves-zombie-session-mh9o: kill the live AO
-            // session and clear the durable handle BEFORE save, so the bead
-            // is not stranded with a live session_id that (a) the AO dedup
-            // guard still reports as [spawning] and (b) recover_human_held's
-            // `session_id IS NULL` predicate cannot requeue through. Without
-            // this, every autonomy_timebox_exceeded park leaks its session
-            // and poisons the next redispatch of the same bead.
-            kill_session_and_clear_handle(deps, &mut overlay);
             set_human_hold_reason(&mut overlay, HumanHoldReason::AutonomyTimeboxExceeded);
             deps.store.save(&overlay)?;
             emit(
@@ -502,12 +385,6 @@ pub fn run_tick(
                             Ok((true, _)) => {}
                             Ok((false, post_sha)) => {
                                 overlay.state = OverlayState::HumanHeld;
-                                // jleechan-park-leaves-zombie-session-mh9o:
-                                // adopted-branch remediation parks also leak
-                                // their session if we don't terminate it.
-                                // Wire the same cleanup helper as the other
-                                // PARKED_* sites.
-                                kill_session_and_clear_handle(deps, &mut overlay);
                                 set_human_hold_reason(
                                     &mut overlay,
                                     HumanHoldReason::AdoptedBranchHistoryRewriteDetected,
@@ -548,12 +425,6 @@ pub fn run_tick(
                             }
                             Err(e) => {
                                 overlay.state = OverlayState::HumanHeld;
-                                // jleechan-park-leaves-zombie-session-mh9o:
-                                // adopted-branch append-only check failure
-                                // also leaks its session. Wire the same
-                                // cleanup helper as the other PARKED_*
-                                // sites.
-                                kill_session_and_clear_handle(deps, &mut overlay);
                                 set_human_hold_reason(
                                     &mut overlay,
                                     HumanHoldReason::AdoptedBranchAppendOnlyCheckFailed,
@@ -620,19 +491,6 @@ pub fn run_tick(
                         let expected_branch = overlay.branch.clone().unwrap_or_default();
                         if actual_branch != expected_branch {
                             overlay.state = OverlayState::HumanHeld;
-                            // jleechan-park-leaves-zombie-session-mh9o:
-                            // `session_branch` just proved the live session
-                            // belongs to a DIFFERENT bead/branch (the
-                            // `jleechan-5ia2` corruption case), so we MUST
-                            // NOT call `sessions.stop()` here — that would
-                            // terminate another bead's legitimate worker.
-                            // The right fix is to drop OUR overlay's bad
-                            // handle (the durable record pointing at a
-                            // session that was never ours to own) without
-                            // touching AO. The leaked overlay can then
-                            // never poison a future redispatch of THIS
-                            // bead via the AO dedup guard.
-                            overlay.session_id = None;
                             set_human_hold_reason(
                                 &mut overlay,
                                 HumanHoldReason::SessionBranchMismatch,
@@ -687,63 +545,13 @@ pub fn run_tick(
                                 .unwrap_or_default()
                                 .as_secs();
 
-                            let branch_is_silent = match last_commit_epoch {
+                            let is_silent = match last_commit_epoch {
                                 None => true,
                                 Some(commit_time) => now_epoch.saturating_sub(commit_time) >= 1800,
                             };
 
-                            // Bead jleechan-coder-silent-false-parks-h92r:
-                            // 2026-07-17 all 6 active lanes were parked
-                            // `coder_silent` while their coders were
-                            // demonstrably working — a coder can iterate
-                            // locally (edit/test/edit) for well over 30
-                            // minutes before its next push, so "no remote
-                            // commit in 30 minutes" alone is not evidence of
-                            // silence. Consult the coder's own transcript
-                            // mtime as a second, independent liveness
-                            // signal before parking; only park when NEITHER
-                            // signal shows recent activity (fail-closed
-                            // preserved: missing/unresolvable transcript
-                            // evidence does not by itself save a bead from
-                            // parking).
-                            let transcript_epoch = deps
-                                .cfg
-                                .resolve_repo(overlay.repo(deps.cfg))
-                                .and_then(|routing| {
-                                    deps.sessions
-                                        .worktree_transcript_last_activity_epoch(
-                                            &routing.ao_project,
-                                            branch,
-                                        )
-                                        .ok()
-                                        .flatten()
-                                });
-                            let transcript_is_active = transcript_epoch
-                                .is_some_and(|t| now_epoch.saturating_sub(t) < 1800);
-
-                            if branch_is_silent && transcript_is_active {
-                                emit(
-                                    deps.telemetry_log,
-                                    &overlay.bead_id,
-                                    overlay.attempt,
-                                    overlay.state.as_str(),
-                                    "CODER_ACTIVE_GRACE",
-                                    serde_json::json!({}),
-                                    serde_json::json!({
-                                        "reason": "coder_active_grace",
-                                        "branch": branch,
-                                        "last_commit_epoch": last_commit_epoch,
-                                        "transcript_epoch": transcript_epoch,
-                                    }),
-                                )?;
-                            } else if branch_is_silent {
+                            if is_silent {
                                 overlay.state = OverlayState::HumanHeld;
-                                // jleechan-park-leaves-zombie-session-mh9o:
-                                // mirror the autonomy_timebox fix above —
-                                // the wedge-detection sweep also leaks its
-                                // session if we save() without first calling
-                                // `ao session kill` and clearing the handle.
-                                kill_session_and_clear_handle(deps, &mut overlay);
                                 set_human_hold_reason(&mut overlay, HumanHoldReason::CoderSilent);
                                 deps.store.save(&overlay)?;
                                 emit(
@@ -930,7 +738,6 @@ pub fn run_tick(
             "beadsRecoveredFromHeld": summary.beads_recovered_from_held,
             "beadsEscalated": summary.beads_escalated,
             "beadsEscalatedLocally": summary.beads_escalated_locally,
-            "beadsHeldDispositionRequired": summary.beads_held_disposition_required,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
@@ -1065,32 +872,6 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         if let Some(owner) = deps.store.bead_id_for_branch(&adopted.head_ref_name)? {
             if owner != adopted.bead_id {
                 let owner_live = deps.store.load(&owner)?.is_some();
-                let ctx = serde_json::json!({
-                    "reason": "adoption_branch_collision",
-                    "branch": adopted.head_ref_name,
-                    "registered_bead": owner,
-                    "registered_bead_live": owner_live,
-                    "external_ref": adopted.external_ref,
-                });
-                let now_epoch = now_epoch_secs();
-                // Bug jleechan-rouf (worldarchitect.ai#8428 / #8420 / #8421):
-                // each tick produces a NEW `adopted.bead_id` for the same
-                // colliding branch, so the historical dedup key (adopted.bead_id)
-                // never matched across ticks and the comment spammed every tick.
-                // Key the dedup on the stable branch instead — every colliding
-                // bead for the same branch collapses to one ledger row, and
-                // `cfg.escalation_refire_secs` (default 1h) gates the noise.
-                let (should_emit, ctx_hash) = escalation_dedup_should_emit(
-                    deps,
-                    &adopted.head_ref_name,
-                    "adoption_branch_collision",
-                    &ctx,
-                    now_epoch,
-                )?;
-                if !should_emit {
-                    summary.escalations_suppressed += 1;
-                    continue;
-                }
                 let comment_body = format!(
                     "🤖 **[dark-factory]** Escalation required: refusing factory PR adoption for branch `{}` because it is already registered to bead `{}`. Branch-key stealing is not allowed; please use a unique same-repo branch.",
                     adopted.head_ref_name, owner
@@ -1106,14 +887,13 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     OverlayState::HumanHeld.as_str(),
                     "ESCALATION_REQUIRED",
                     serde_json::json!({}),
-                    ctx,
-                )?;
-                record_escalation_emit_dedup(
-                    deps,
-                    &adopted.head_ref_name,
-                    "adoption_branch_collision",
-                    &ctx_hash,
-                    now_epoch,
+                    serde_json::json!({
+                        "reason": "adoption_branch_collision",
+                        "branch": adopted.head_ref_name,
+                        "registered_bead": owner,
+                        "registered_bead_live": owner_live,
+                        "external_ref": adopted.external_ref,
+                    }),
                 )?;
                 continue;
             }
@@ -1294,7 +1074,6 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             id: bead_id.clone(),
             title: bead_id.clone(),
             description: String::new(),
-            notes: String::new(),
             file_tree_summary: String::new(),
             external_ref: None,
         }));
@@ -1313,7 +1092,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         }
     }
 
-    let mut ready: Vec<(Bead, RoutingVerdict, dispatch::DriveBranchDecision)> = Vec::new();
+    let mut ready: Vec<(Bead, RoutingVerdict)> = Vec::new();
     for bead in &routing_candidates {
         let overlay = match deps.store.load(&bead.id)? {
             Some(o) => {
@@ -1383,19 +1162,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     // (null == legacy/global cfg.target_repo).
                     serde_json::json!({"routingVerdict": verdict_str, "target_repo": overlay.target_repo}),
                 )?;
-                // jleechan-drive-pr-branch-binding-pcpr: resolved here (not
-                // in `dispatch.rs`, which intentionally has no `Scm`
-                // access) so a bead whose `external_ref` names a currently
-                // OPEN PR in its OWN resolved repo dispatches onto that
-                // PR's head branch instead of a freshly fabricated one.
-                // Recomputed on every tick this bead is `ready` (fresh
-                // dispatch AND every redispatch/park-recovery cycle) — the
-                // live 2026-07-17 incident this closes happened on a
-                // redispatch, not just the first attempt.
-                let resolved_repo = overlay.repo(deps.cfg).to_string();
-                let drive_branch =
-                    resolve_drive_pr_head_branch(deps.scm, deps.cfg, bead, &resolved_repo);
-                ready.push((bead.clone(), verdict, drive_branch));
+                ready.push((bead.clone(), verdict));
             }
             Err(DaemonError::Parse(reason)) => {
                 // ZFC: an unparseable routing verdict is never guessed at —
@@ -1518,96 +1285,6 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         "max_transient_spawn_retry": MAX_TRANSIENT_SPAWN_RETRY,
                         "branch": failure.branch.as_deref(),
                     }),
-                )?;
-                continue;
-            }
-
-            if failure.phase == "unmapped_repo" {
-                // jleechan-8jxr r3 (review follow-up, chatgpt-codex-connector
-                // P2 @ daemon/src/dispatch.rs:287): mirror the
-                // `unmapped_target_repo` idiom below. `dispatch_ready`
-                // already parked the bead HUMAN_HELD with reason
-                // `unmapped_repo` (jleechan-8jxr r2) — distinct from
-                // `unmapped_target_repo` ("I resolved a repo and it's not
-                // in [repos]") so operators can tell which remediation
-                // applies: add a `[repos.*]` entry vs. add a
-                // `target_repo:`/`external_ref` field on the bead body or
-                // label the source issue `factory` so intake can resolve
-                // it. Without this branch, the fall-through at the bottom
-                // of this loop labels a genuinely permanent,
-                // operator-action-required park as retryable, emits
-                // `BEAD_DISPATCH_TRANSIENT_ERROR` (not `PARKED_HUMAN_HELD`),
-                // never increments `summary.beads_parked_human_held`, and
-                // posts no escalation comment — exactly the anti-pattern
-                // the `unmapped_target_repo` and `worktree_remote_mismatch`
-                // branches were added to fix.
-                summary.beads_parked_human_held += 1;
-                emit(
-                    deps.telemetry_log,
-                    &failure.bead_id,
-                    failure.attempt,
-                    OverlayState::HumanHeld.as_str(),
-                    "PARKED_HUMAN_HELD",
-                    serde_json::json!({}),
-                    serde_json::json!({
-                        "reason": "unmapped_repo",
-                        "error": failure.error.as_str(),
-                    }),
-                )?;
-                if escalation_already_recorded(deps, &failure.bead_id)? {
-                    continue;
-                }
-                let comment_body = format!(
-                    "🤖 **[dark-factory]** Escalation required: bead `{}` had no resolvable repo identity at dispatch time (no `target_repo:` body field, no `external_ref` with a parseable `owner/repo#N` prefix, no adopted-PR context, and no other intake-side repo signal). Automation parked it HUMAN_HELD rather than silently defaulting to the daemon's global `target_repo` (which would have routed it to a wrong repo — confirmed 5x on 2026-07-18: yvfe/vmy2/46dk/s9ba/txtd). Operator action: supply an explicit `target_repo: <owner>/<repo>` line in the bead body, set `external_ref = \"<owner>/<repo>#NNN\"`, or file under an issue/PR labeled `factory` so intake can resolve the repo from the GitHub external_ref.",
-                    failure.bead_id
-                );
-                if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
-                {
-                    if is_missing_scm_target_error(&err) {
-                        record_local_escalation_fallback(
-                            deps,
-                            &failure.bead_id,
-                            "unmapped_repo",
-                        )?;
-                        summary.beads_escalated_locally += 1;
-                        emit(
-                            deps.telemetry_log,
-                            &failure.bead_id,
-                            failure.attempt,
-                            OverlayState::HumanHeld.as_str(),
-                            "ESCALATED_LOCALLY",
-                            serde_json::json!({}),
-                            serde_json::json!({
-                                "reason": "unmapped_repo",
-                                "scm_error": err.to_string(),
-                            }),
-                        )?;
-                        continue;
-                    }
-                    emit(
-                        deps.telemetry_log,
-                        &failure.bead_id,
-                        failure.attempt,
-                        OverlayState::HumanHeld.as_str(),
-                        "ESCALATION_NOTIFICATION_FAILED",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "reason": "unmapped_repo",
-                            "error": err.to_string(),
-                        }),
-                    )?;
-                    continue;
-                }
-                record_escalation(deps, &failure.bead_id, "unmapped_repo")?;
-                summary.beads_escalated += 1;
-                emit(
-                    deps.telemetry_log,
-                    &failure.bead_id,
-                    failure.attempt,
-                    OverlayState::HumanHeld.as_str(),
-                    "ESCALATION_REQUIRED",
-                    serde_json::json!({}),
-                    serde_json::json!({"reason": "unmapped_repo"}),
                 )?;
                 continue;
             }
@@ -1816,9 +1493,6 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     "sessionId": success.session_id.as_str(),
                     // jleechan-35y4: resolved repo now visible in daemon.jsonl.
                     "target_repo": success.target_repo.as_str(),
-                    // jleechan-drive-pr-branch-binding-pcpr: "pr_head" vs
-                    // "generated" — which branch-binding mode this dispatch used.
-                    "branch_mode": success.branch_mode,
                 }),
             )?;
             let comment_body = format!(
@@ -1827,8 +1501,8 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             );
             if let Some(ext_ref) = ready
                 .iter()
-                .find(|(bead, _, _)| bead.id == success.bead_id)
-                .and_then(|(bead, _, _)| bead.external_ref.as_ref())
+                .find(|(bead, _)| bead.id == success.bead_id)
+                .and_then(|(bead, _)| bead.external_ref.as_ref())
             {
                 let _ = deps.tracker.comment_external(ext_ref, &comment_body);
             }
@@ -1957,43 +1631,6 @@ fn skeptic_evidence(
     // `er_runner::build_er_prompt` — makes the reviewer query the RIGHT repo
     // regardless of daemon cwd, instead of silently reviewing PR #{pr} in
     // whatever repo happened to be checked out.
-    //
-    // Task 3 (reviewer-outage-resilience): tell the skeptic reviewer which
-    // review providers are currently in outage so its completeness check can
-    // account for the missing signals (their gates have been waived). Only
-    // append the note when at least one vendor is in outage; the healthy path
-    // keeps the prompt byte-identical to before.
-    let outage_note = {
-        let mut waived: Vec<&str> = Vec::new();
-        if deps
-            .store
-            .vendor_health("coderabbit")
-            .ok()
-            .flatten()
-            .is_some_and(|h| h.in_outage)
-        {
-            waived.push("coderabbit");
-        }
-        if deps
-            .store
-            .vendor_health("bugbot")
-            .ok()
-            .flatten()
-            .is_some_and(|h| h.in_outage)
-        {
-            waived.push("bugbot");
-        }
-        if waived.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\nNote: the following review providers are currently in \
-                 outage and their gates have been waived: {}. Account for \
-                 this in your completeness check.",
-                waived.join(", ")
-            )
-        }
-    };
     let prompt = format!(
         "You are the Stage-1 Skeptic gate for an autonomous coding factory.\n\
          Review bead {bead_id}'s PR #{pr} in repo {repo} end-to-end (diff, \
@@ -2002,7 +1639,7 @@ fn skeptic_evidence(
            gh pr view {pr} --repo {repo} --json body,comments\n\
            gh pr checks {pr} --repo {repo}\n\
          Respond with exactly one line of the form:\n\
-         pass|warn <note>|fail <reason>{outage_note}",
+         pass|warn <note>|fail <reason>",
     );
 
     let coder_agent = std::env::var("DARK_FACTORY_CODER_DEFAULT")
@@ -2472,43 +2109,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
         }
 
-        let now_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // jleechan-zaga / issue #348: a `DISPOSITION_REQUIRED` bead must
-        // KEEP being re-assessed — otherwise it is a terminal hold (the fast
-        // tier's ATTESTED-only filter would never look at it again, so the
-        // chain could never resume when the structural condition clears).
-        //
-        // r3 residual 2 (cooldown): a structural condition can persist for
-        // hours; re-fetching the PR snapshot every fast tick would hammer the
-        // SCM API. Skip re-assessment until the durable per-bead
-        // `held_recheck_after` cooldown elapses, and stamp the NEXT recheck now
-        // (before any SCM fetch) so the cooldown holds regardless of how this
-        // re-assessment exits (resume / reroll / re-hold / transient error).
-        //
-        // r3 residual 3 (provenance): the promotion back to ATTESTED is
-        // IN-MEMORY only and is NOT persisted here. The stored state stays
-        // DISPOSITION_REQUIRED until assessment reaches a terminal decision
-        // (READY / reroll / re-hold), so an early-exit (snapshot fetch failure,
-        // ci_pending, transient) leaves hold provenance intact and does not
-        // let the next re-hold double-emit the counter/telemetry/comment. The
-        // reroll branch persists the ATTESTED promotion just before calling
-        // `reroll::execute` (whose freshness guard requires ATTESTED/RE_ROLL).
-        let entered_as_disposition = overlay.state == OverlayState::DispositionRequired;
-        if entered_as_disposition {
-            if let Some(recheck_after) = deps.store.held_recheck_after(bead_id)? {
-                if now_epoch < recheck_after {
-                    continue; // still in cooldown — do not touch the SCM API.
-                }
-            }
-            deps.store.set_held_recheck_after(
-                bead_id,
-                now_epoch.saturating_add(deps.cfg.held_recheck_cooldown_secs),
-            )?;
-            overlay.state = OverlayState::Attested; // in-memory only (NOT saved)
-        }
         if overlay.state != OverlayState::Attested {
             continue;
         }
@@ -2539,137 +2139,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 continue;
             }
         };
-        // Task 2 (reviewer-outage-resilience): outage-aware CI-pending
-        // override. When `ci_pending` is true ONLY because of stale pending
-        // check-runs from in-outage review-bot providers (and every real CI
-        // check has completed), waive those pending statuses after a 15-minute
-        // grace period (measured from the head commit's committer epoch) so
-        // the assessment can proceed and report the true CI result. All real
-        // CI failures still fail the assessment exactly as before — the
-        // override never waives a FAILED check, only a stale PENDING status.
-        if snapshot.ci_pending {
-            // Build the set of in-outage provider name-match patterns from
-            // the vendor_health ledger. "coderabbit" -> ["coderabbit"];
-            // "bugbot" -> ["bugbot", "cursor"] (matching the bugbot_status
-            // derivation in adapters.rs).
-            let mut outage_patterns: Vec<&str> = Vec::new();
-            let mut outage_vendors: Vec<&str> = Vec::new();
-            if deps
-                .store
-                .vendor_health("coderabbit")
-                .ok()
-                .flatten()
-                .is_some_and(|h| h.in_outage)
-            {
-                outage_patterns.push("coderabbit");
-                outage_vendors.push("coderabbit");
-            }
-            if deps
-                .store
-                .vendor_health("bugbot")
-                .ok()
-                .flatten()
-                .is_some_and(|h| h.in_outage)
-            {
-                outage_patterns.push("bugbot");
-                outage_patterns.push("cursor");
-                outage_vendors.push("bugbot");
-            }
-
-            // Partition pending check names: those matching an in-outage
-            // provider pattern (case-insensitive substring) vs. real CI.
-            let matches_outage = |name: &str| {
-                let lower = name.to_lowercase();
-                outage_patterns.iter().any(|p| lower.contains(p))
-            };
-            let waived: Vec<String> = snapshot
-                .pending_check_names
-                .iter()
-                .filter(|n| matches_outage(n))
-                .cloned()
-                .collect();
-            let real_pending: Vec<String> = snapshot
-                .pending_check_names
-                .iter()
-                .filter(|n| !matches_outage(n))
-                .cloned()
-                .collect();
-
-            // Only override when ALL pending check-runs belong to in-outage
-            // providers. Any real CI still pending => keep waiting.
-            if real_pending.is_empty() && !outage_patterns.is_empty() {
-                let now_epoch_ovr = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let elapsed = now_epoch_ovr.saturating_sub(snapshot.head_committed_epoch);
-                if elapsed >= OUTAGE_GRACE_PERIOD_SECS {
-                    // Recompute ci_success/ci_status from the full check-run
-                    // list, EXCLUDING in-outage provider checks. Real CI
-                    // failures remain failures; an all-outage-provider PR
-                    // (no remaining checks) is treated as green (waived).
-                    let remaining: Vec<&(String, String)> = snapshot
-                        .check_names_and_buckets
-                        .iter()
-                        .filter(|(name, _)| !matches_outage(name))
-                        .collect();
-                    let any_real_fail = remaining
-                        .iter()
-                        .any(|(_, b)| b == "fail" || b == "cancel");
-                    let any_real_pending = remaining
-                        .iter()
-                        .any(|(_, b)| b == "pending");
-                    let (ci_success, ci_status) = if remaining.is_empty() {
-                        (true, "green".to_string())
-                    } else if any_real_fail {
-                        (false, "red".to_string())
-                    } else if any_real_pending {
-                        // Should not happen (real_pending was empty), but
-                        // fail-closed: keep pending rather than false-green.
-                        (snapshot.ci_success, snapshot.ci_status.clone())
-                    } else {
-                        (true, "green".to_string())
-                    };
-                    snapshot.ci_pending = false;
-                    snapshot.ci_success = ci_success;
-                    snapshot.ci_status = ci_status;
-                    let _ = emit(
-                        deps.telemetry_log,
-                        bead_id,
-                        overlay.attempt,
-                        OverlayState::Attested.as_str(),
-                        "VERIFICATION_OUTAGE_GRACE_PERIOD",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "vendor": outage_vendors,
-                            "head_sha": snapshot.head_sha,
-                            "head_committed_epoch": snapshot.head_committed_epoch,
-                            "grace_period_secs": OUTAGE_GRACE_PERIOD_SECS,
-                            "pending_checks_waived": waived,
-                            "real_ci_result": if snapshot.ci_success { "green" } else { "red" },
-                        }),
-                    );
-                } else {
-                    // Grace period not yet elapsed — keep waiting.
-                    let _ = emit(
-                        deps.telemetry_log,
-                        bead_id,
-                        overlay.attempt,
-                        OverlayState::Attested.as_str(),
-                        "VERIFICATION_OUTAGE_GRACE_WAIT",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "vendor": outage_vendors,
-                            "head_sha": snapshot.head_sha,
-                            "head_committed_epoch": snapshot.head_committed_epoch,
-                            "elapsed_secs": elapsed,
-                            "grace_period_secs": OUTAGE_GRACE_PERIOD_SECS,
-                            "pending_checks_waived": waived,
-                        }),
-                    );
-                }
-            }
-        }
         if snapshot.ci_pending {
             emit(
                 deps.telemetry_log,
@@ -2707,89 +2176,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // Task 1 (reviewer-outage-resilience): record vendor health
-        // observations for BOTH external review-bot providers from the
-        // fetched PrSnapshot, BEFORE verifier::assess. Outage marker if the
-        // provider's status is "unknown" (pending/unavailable); success if
-        // the provider approved / is clean. Emit VENDOR_WAIVED / VENDOR_RECOVERED
-        // telemetry ONLY on state transitions (0→1 for waived, 1→0 for recovered).
-        {
-            let vendors: [(&str, bool, bool); 2] = [
-                (
-                    "coderabbit",
-                    snapshot.coderabbit_status == "unknown",
-                    snapshot.coderabbit_approved,
-                ),
-                (
-                    "bugbot",
-                    snapshot.bugbot_status == "unknown",
-                    snapshot.bugbot_status == "green",
-                ),
-            ];
-            for (vendor, is_outage_marker, is_success) in vendors {
-                let prior = deps.store.vendor_health(vendor).ok().flatten();
-                let row = match deps.store.record_vendor_observation(
-                    vendor,
-                    is_outage_marker,
-                    is_success,
-                    &snapshot.head_sha,
-                    now_epoch,
-                    VENDOR_OUTAGE_CONSECUTIVE_PENDING_THRESHOLD,
-                ) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = emit(
-                            deps.telemetry_log,
-                            bead_id,
-                            overlay.attempt,
-                            OverlayState::Attested.as_str(),
-                            "VENDOR_HEALTH_RECORD_ERROR",
-                            serde_json::json!({}),
-                            serde_json::json!({
-                                "vendor": vendor,
-                                "error": format!("{e:?}"),
-                            }),
-                        );
-                        continue;
-                    }
-                };
-                let was_in_outage = prior.as_ref().is_some_and(|p| p.in_outage);
-                if row.in_outage && !was_in_outage {
-                    let _ = emit(
-                        deps.telemetry_log,
-                        bead_id,
-                        overlay.attempt,
-                        OverlayState::Attested.as_str(),
-                        "VENDOR_WAIVED",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "vendor": vendor,
-                            "consecutive_pending": row.consecutive_pending,
-                            "head_sha": snapshot.head_sha,
-                            "reason": format!(
-                                "provider marked in-outage after {} consecutive pending assessments",
-                                row.consecutive_pending
-                            ),
-                        }),
-                    );
-                } else if !row.in_outage && was_in_outage {
-                    let _ = emit(
-                        deps.telemetry_log,
-                        bead_id,
-                        overlay.attempt,
-                        OverlayState::Attested.as_str(),
-                        "VENDOR_RECOVERED",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "vendor": vendor,
-                            "last_success_head": row.last_success_head.clone().unwrap_or_default(),
-                            "outage_observations": row.outage_observations,
-                            "success_observations": row.success_observations,
-                        }),
-                    );
-                }
-            }
-        }
         let runner_outcome = match crate::er_runner::maybe_run(deps, bead_id, pr, now_epoch) {
             Ok(out) => out,
             Err(e) => {
@@ -2913,42 +2299,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // `verifier::assess`'s own serialization, so this can't drift from
         // what was actually computed, and `evidence.skeptic_reviewers`
         // names the vendor(s) that produced this tick's skeptic verdict.
-        //
-        // Task 3 (reviewer-outage-resilience): annotate in-outage provider
-        // gates with the canonical "waived_vendor_unavailable" token. Build
-        // the in-outage vendor list from the `vendor_health` ledger for both
-        // review providers, then pass it to `to_json_with_outage` so the
-        // provider's OWN gate key (coderabbit / bugbot) carries the waiver
-        // token instead of its real verdict. All other gates keep their real
-        // verdict and remain fully enforced/blocking.
-        let mut in_outage_vendors: Vec<&str> = Vec::new();
-        if deps
-            .store
-            .vendor_health("coderabbit")
-            .ok()
-            .flatten()
-            .is_some_and(|h| h.in_outage)
-        {
-            in_outage_vendors.push("coderabbit");
-        }
-        if deps
-            .store
-            .vendor_health("bugbot")
-            .ok()
-            .flatten()
-            .is_some_and(|h| h.in_outage)
-        {
-            in_outage_vendors.push("bugbot");
-        }
-        let mut gate_assessment_context = report.to_json_with_outage(&in_outage_vendors);
+        let mut gate_assessment_context = report.to_json();
         if let Some(obj) = gate_assessment_context.as_object_mut() {
-            // Task 3: surface the list of vendors whose gates were waived so
-            // the merge authority and operators can see which gates carried
-            // "waived_vendor_unavailable" without re-deriving it.
-            obj.insert(
-                "waived_vendors".to_string(),
-                serde_json::json!(in_outage_vendors),
-            );
             obj.insert(
                 "skeptic_reviewers".to_string(),
                 serde_json::json!(evidence.skeptic_reviewers),
@@ -2998,76 +2350,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 })
                 .collect();
             if red_reasons.is_empty() {
-                // jleechan-zaga / issue #348: no coder-fixable RED gate, but
-                // is the chain blocked by a STRUCTURAL-pending gate (an
-                // external verifier a coder cannot drive — CodeRabbit
-                // unavailable, Bugbot absent)? If so, hold
-                // DISPOSITION_REQUIRED and keep re-assessing, rather than
-                // silently churning the ATTESTED transient path forever (which
-                // eventually cap-parks HUMAN_HELD — the exact regression #348
-                // documents). A purely TRANSIENT report (CI still running,
-                // unverifiable thread count) falls through to the existing
-                // transient handling below.
-                if deps.cfg.stage == 2
-                    && matches!(
-                        verifier::classify_chain(&report),
-                        verifier::ChainDisposition::HoldDisposition
-                    )
-                {
-                    let structural_gates: Vec<serde_json::Value> =
-                        verifier::structural_pending_gates(&report)
-                            .into_iter()
-                            .map(|(gate_name, reason)| {
-                                serde_json::json!({
-                                    "gate": gate_name.as_str(),
-                                    "reason": reason,
-                                    "disposition": "structural",
-                                })
-                            })
-                            .collect();
-                    overlay.state = OverlayState::DispositionRequired;
-                    deps.store.save(&overlay)?;
-                    // Only a NEW hold (not a re-hold of an already-held bead)
-                    // increments the operator counter, emits the telemetry
-                    // event, and posts the comment — a bead re-assessed and
-                    // still structural must not spam the PR every tick.
-                    if !entered_as_disposition {
-                        // A first hold starts the re-assessment cooldown (a
-                        // re-hold already stamped it at re-assessment start).
-                        deps.store.set_held_recheck_after(
-                            bead_id,
-                            now_epoch.saturating_add(deps.cfg.held_recheck_cooldown_secs),
-                        )?;
-                        summary.beads_held_disposition_required += 1;
-                        emit(
-                            deps.telemetry_log,
-                            bead_id,
-                            overlay.attempt,
-                            OverlayState::DispositionRequired.as_str(),
-                            "DISPOSITION_REQUIRED",
-                            serde_json::json!({}),
-                            serde_json::json!({
-                                "reason": "chain blocked only by structural-pending gate(s) (external verifier the coder cannot drive); reroll would be no-op churn",
-                                "structural_gates": structural_gates,
-                                "pr_number": pr,
-                            }),
-                        )?;
-                        let gate_lines: Vec<String> = structural_gates
-                            .iter()
-                            .filter_map(|g| {
-                                let gate = g.get("gate")?.as_str()?;
-                                let reason = g.get("reason")?.as_str()?;
-                                Some(format!("- `{gate}`: {reason}"))
-                            })
-                            .collect();
-                        let comment_body = format!(
-                            "🤖 **[dark-factory]** Disposition required for bead `{bead_id}`: the only remaining blockers are structural (an external verifier the coder cannot drive — re-rolling cannot clear them). Daemon held at `DISPOSITION_REQUIRED` rather than superseding. Per-gate disposition needs:\n\n{}\n\nThe fast tier will continue to assess on each tick; the bead resumes the moment any gate becomes coder-fixable or green.",
-                            gate_lines.join("\n")
-                        );
-                        let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
-                    }
-                    continue;
-                }
                 if let Some(count) = er_runner_capped_count {
                     if escalation_already_recorded(deps, bead_id)? {
                         continue;
@@ -3215,19 +2497,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 };
                 let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
             } else {
-                // Stage 2: execute re-roll engine (there is at least one
-                // coder-fixable RED gate; the structural-only hold is handled
-                // in the no-red branch above, before the transient path).
-                //
-                // r3 residual 3: if this bead was held DISPOSITION_REQUIRED,
-                // its stored state is still DISPOSITION_REQUIRED (the promotion
-                // above was in-memory only). Persist the ATTESTED promotion now
-                // — assessment has completed and produced a coder-fixable red —
-                // so `reroll::execute`'s ATTESTED/RE_ROLL freshness guard
-                // accepts it instead of aborting.
-                if entered_as_disposition {
-                    deps.store.save(&overlay)?;
-                }
+                // Stage 2: execute re-roll engine
                 let mut reviewer = "verifier".to_string();
                 for (gate_name, result) in &report.results {
                     if let verifier::GateResult::Red(_) = result {
@@ -3345,34 +2615,13 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): re-roll held. Reason: {}", reason);
                         let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                     }
-                    Ok(crate::reroll::RerollOutcome::Deferred(reason)) => {
-                        // Bead jleechan-zeij / issue #322 r2: the fail-closed
-                        // proceed predicate could not confirm the previous
-                        // worker was safe to supersede this tick (active
-                        // session, moving HEAD, or failed stop()). `execute`
-                        // left the bead ATTESTED (no fresh branch, PR
-                        // untouched, session_id preserved) so this loop
-                        // re-selects and re-evaluates it next tick. This is
-                        // NOT a park — do not count it toward
-                        // beads_parked_human_held and do not post an
-                        // escalation comment.
-                        emit(
-                            deps.telemetry_log,
-                            bead_id,
-                            overlay.attempt,
-                            OverlayState::Attested.as_str(),
-                            "REROLL_DEFERRED",
-                            serde_json::json!({}),
-                            serde_json::json!({"reason": reason}),
-                        )?;
-                    }
                     Ok(crate::reroll::RerollOutcome::Aborted(_)) => {}
-                    Err(e) if e.is_transient() => {
+                    Err(e) => {
                         // jleechan-cq8r: per-bead isolation, matching the
                         // jleechan-qdw pattern used elsewhere in this same
                         // loop (BEAD_SNAPSHOT_TRANSIENT_ERROR /
                         // BEAD_PROCESSING_TRANSIENT_ERROR above). A single
-                        // bead's TRANSIENT re-roll engine failure -- e.g. the
+                        // bead's re-roll engine failure -- e.g. the
                         // circuit-breaker comparator's LLM call hitting a
                         // rate limit or returning a malformed reply -- must
                         // not abort processing for every OTHER in-flight
@@ -3380,9 +2629,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         // persisted this bead as `ReRoll` before the
                         // failure; emit telemetry and move on to the next
                         // bead rather than propagating with `return Err`,
-                        // which used to abort the entire fast tier. The bead is
-                        // re-selected next tick once it returns to ATTESTED (or
-                        // via the transient's own retry path).
+                        // which used to abort the entire fast tier.
                         let _ = emit(
                             deps.telemetry_log,
                             bead_id,
@@ -3392,38 +2639,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             serde_json::json!({}),
                             serde_json::json!({"phase": "reroll_execute", "error": format!("{e:?}")}),
                         );
-                        continue;
-                    }
-                    Err(e) => {
-                        // Bead jleechan-zeij / issue #322 r4 P1: a PERMANENT
-                        // re-roll error must NOT be swallowed as transient.
-                        // `reroll::execute` persisted this bead as RE_ROLL
-                        // before returning, and the fast tier only re-selects
-                        // ATTESTED overlays (see the `overlay.state != Attested`
-                        // guard at the top of run_fast_tier), so logging-and-
-                        // continuing would strand it in RE_ROLL forever,
-                        // invisible to recovery. Park it HUMAN_HELD with a
-                        // distinct, operator-visible reason instead.
-                        overlay.state = OverlayState::HumanHeld;
-                        set_human_hold_reason(
-                            &mut overlay,
-                            HumanHoldReason::RerollPermanentError,
-                        );
-                        deps.store.save(&overlay)?;
-                        summary.beads_parked_human_held += 1;
-                        emit(
-                            deps.telemetry_log,
-                            bead_id,
-                            overlay.attempt,
-                            OverlayState::HumanHeld.as_str(),
-                            "PARKED_HUMAN_HELD",
-                            serde_json::json!({}),
-                            serde_json::json!({"reason": "reroll_permanent_error", "error": format!("{e:?}")}),
-                        )?;
-                        let comment_body = format!(
-                            "🤖 **[dark-factory]** Coder session parked (human held): the re-roll engine hit a permanent (non-transient) error and cannot self-recover. Error: {e}"
-                        );
-                        let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                         continue;
                     }
                 }
@@ -3518,59 +2733,6 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
     }
 }
 
-/// jleechan-drive-pr-branch-binding-pcpr: resolve whether `bead` should
-/// dispatch onto an existing PR's own head branch instead of a freshly
-/// generated `factory/<bead>-r<attempt>` one. Fires only when ALL of:
-/// * `bead.external_ref` parses to `owner/repo#N`,
-/// * that `owner/repo` matches the bead's OWN already-resolved repo
-///   (`resolved_repo`, `overlay.repo(cfg)`) — a bead whose `external_ref`
-///   happens to name a DIFFERENT repo than its resolved `target_repo` (a
-///   stray/contradictory `target_repo:` body field) must never bind to
-///   that other repo's PR,
-/// * `owner/repo` is a configured repo (`cfg.resolve_repo`), and
-/// * `Scm::open_pr_head_ref_for_repo` positively confirms PR `N` is OPEN
-///   AND same-repo (`PrHeadBranch::SameRepo`) -> `DriveBranchDecision::PrHead`.
-///
-/// An OPEN PR whose head lives on a fork (`PrHeadBranch::Fork`) resolves to
-/// `DriveBranchDecision::ForkFallback` — the fail-closed guard mirroring
-/// `intake::same_repo_pr`; dispatch still falls back to the generated
-/// branch, but telemetry records WHY (`branch_mode:
-/// "generated_fork_fallback"`) instead of conflating it with "no drive-PR
-/// signal at all".
-///
-/// Every other case — closed/merged/missing PR, malformed `external_ref`,
-/// unconfigured repo, repo mismatch, or a transient lookup failure — is
-/// `DriveBranchDecision::Generated` (fail-safe: dispatch falls back to the
-/// generated-branch path exactly as before this bead).
-fn resolve_drive_pr_head_branch(
-    scm: &dyn Scm,
-    cfg: &Config,
-    bead: &Bead,
-    resolved_repo: &str,
-) -> dispatch::DriveBranchDecision {
-    use dispatch::DriveBranchDecision;
-    let Some(ext_ref) = bead.external_ref.as_deref() else {
-        return DriveBranchDecision::Generated;
-    };
-    let Some((owner_repo, num_str)) = parse_external_ref(ext_ref) else {
-        return DriveBranchDecision::Generated;
-    };
-    if owner_repo != resolved_repo {
-        return DriveBranchDecision::Generated;
-    }
-    if cfg.resolve_repo(&owner_repo).is_none() {
-        return DriveBranchDecision::Generated;
-    }
-    let Ok(pr_num) = num_str.parse::<u64>() else {
-        return DriveBranchDecision::Generated;
-    };
-    match scm.open_pr_head_ref_for_repo(&owner_repo, pr_num) {
-        Ok(PrHeadBranch::SameRepo(head_ref)) => DriveBranchDecision::PrHead(head_ref),
-        Ok(PrHeadBranch::Fork) => DriveBranchDecision::ForkFallback,
-        Ok(PrHeadBranch::NotFound) | Err(_) => DriveBranchDecision::Generated,
-    }
-}
-
 fn post_scm_comment_by_bead_id(
     deps: &TickDeps,
     bead_id: &str,
@@ -3598,280 +2760,4 @@ fn post_scm_comment_by_bead_id(
     Err(DaemonError::Config(format!(
         "no SCM comment target found for bead {bead_id}"
     )))
-}
-// === jleechan-rouf dedup helpers (added by clean replay of PR #470 / cb2136ffe) ===
-// PR #472 (origin/main) removed the FNV-1a hash helpers and the
-// `escalation_dedup_should_emit` / `record_escalation_emit_dedup` wrappers
-// during the vendor-outage refactor. The clean replay re-introduces them
-// in their `bc6ef0c36` shape so the `adoption_branch_collision` call-site
-// can re-key dedup on the branch (cb2136ffe's fix).
-//
-// Pinned by `mod escalation_context_hash_tests` at the bottom of this file
-// (FNV-1a reference-charter constants + cross-process determinism contract).
-
-/// FNV-1a 64-bit hash per the FNV reference charter.
-/// OFFSET_BASIS = 0xcbf29ce484222325, PRIME = 0x100000001b3.
-/// Non-cryptographic, intentionally cheap; needs to be deterministic
-/// across processes and Rust versions, which `std::hash::DefaultHasher`
-/// is NOT (per-process random `RandomState` seed).
-pub fn fnv1a_64(bytes: &[u8]) -> u64 {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET_BASIS;
-    for &byte in bytes {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
-}
-
-/// Canonical-JSON byte form per RFC 8789 (JCS-lite): keys at every
-/// nesting level sorted lexicographically. `serde_json::to_string`
-/// preserves `serde_json::json!` macro insertion order, so without this
-/// sort, two structurally-identical JSON values built with different
-/// field declaration orders produce different hashes.
-pub fn canonical_json_bytes(value: &serde_json::Value) -> Vec<u8> {
-    use serde_json::Value;
-    match value {
-        Value::Null => b"null".to_vec(),
-        Value::Bool(b) => b.to_string().into_bytes(),
-        Value::Number(n) => n.to_string().into_bytes(),
-        Value::String(s) => serde_json::to_string(s).unwrap_or_default().into_bytes(),
-        Value::Array(items) => {
-            let mut out = Vec::with_capacity(items.len() * 8);
-            out.push(b'[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                out.extend_from_slice(&canonical_json_bytes(item));
-            }
-            out.push(b']');
-            out
-        }
-        Value::Object(map) => {
-            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
-            let mut out = Vec::with_capacity(entries.len() * 16);
-            out.push(b'{');
-            for (i, (key, val)) in entries.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                out.extend_from_slice(&serde_json::to_string(key).unwrap_or_default().into_bytes());
-                out.push(b':');
-                out.extend_from_slice(&canonical_json_bytes(val));
-            }
-            out.push(b'}');
-            out
-        }
-    }
-}
-
-/// Stable 16-char lowercase-hex context hash for the escalation dedup
-/// ledger. `format!("{:016x}", fnv1a_64(&canonical_json_bytes(value)))`.
-/// Same format as the legacy `DefaultHasher`-based impl (also 16 hex
-/// chars) so callers comparing against pre-fix ledger rows keep working.
-pub fn escalation_context_hash(context: &serde_json::Value) -> String {
-    let canonical = canonical_json_bytes(context);
-    format!("{:016x}", fnv1a_64(&canonical))
-}
-
-/// Wall-clock epoch in seconds. Duplicates the helper in `crate::reroll`
-/// (where it is private) so `tick.rs` can compute `now_epoch` without
-/// widening the cross-module surface.
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-/// Wrap `StateStore::escalation_should_emit` with the context-hash
-/// computation the call-site needs. Returns `(should_emit, ctx_hash)` so
-/// the caller can pass `ctx_hash` straight into
-/// `record_escalation_emit_dedup` without re-computing it (and risking
-/// drift between the dedup check and the ledger write).
-///
-/// Bead jleechan-rouf: the production caller passes the BRANCH as
-/// `bead_id` so all colliding beads for the same branch collapse to one
-/// ledger row.
-fn escalation_dedup_should_emit(
-    deps: &TickDeps,
-    bead_id: &str,
-    reason: &str,
-    context: &serde_json::Value,
-    now_epoch: u64,
-) -> Result<(bool, String), DaemonError> {
-    let context_hash = escalation_context_hash(context);
-    let should = deps.store.escalation_should_emit(
-        bead_id,
-        reason,
-        &context_hash,
-        now_epoch,
-        deps.cfg.escalation_refire_secs,
-    )?;
-    Ok((should, context_hash))
-}
-
-/// Wrap `StateStore::record_escalation_emit` with the same `(bead_id,
-/// reason, context_hash, now_epoch)` shape so the call-site stays
-/// symmetric with `escalation_dedup_should_emit` above.
-fn record_escalation_emit_dedup(
-    deps: &TickDeps,
-    bead_id: &str,
-    reason: &str,
-    context_hash: &str,
-    now_epoch: u64,
-) -> Result<(), DaemonError> {
-    deps.store
-        .record_escalation_emit(bead_id, reason, context_hash, now_epoch)
-}
-
-#[cfg(test)]
-mod adoption_branch_collision_dedup_tests {
-    //! Regression tests for bead jleechan-rouf (worldarchitect.ai#8428 / #8420 /
-    //! #8421: 5,334 duplicate `🤖 [dark-factory] Escalation required: refusing
-    //! factory PR adoption` comments posted in 32h — each slow-tick
-    //! `normalize_labeled_prs` pass produced a NEW `adopted.bead_id` for the
-    //! SAME colliding branch, so the historical dedup key
-    //! `escalation_ledger(bead_id, reason)` never matched across ticks and the
-    //! comment + ESCALATION_REQUIRED event spammed every slow tick.
-    //!
-    //! The fix re-keys dedup on the stable branch
-    //! (`escalation_ledger(branch, reason)`) so all colliding beads for the
-    //! same branch collapse to one ledger row, and
-    //! `cfg.escalation_refire_secs` (default 3600s) gates the noise.
-    //!
-    //! These tests pin the dedup contract against the real `SqliteStateStore`
-    //! (not the trait default) so a future schema migration that drops or
-    //! renames the column can't silently break the gate. Every test opens a
-    //! fresh in-memory DB so they can run in parallel without isolation
-    //! friction.
-
-    use crate::state::{SqliteStateStore, StateStore};
-
-    fn fresh_store() -> SqliteStateStore {
-        SqliteStateStore::open_in_memory_with_schema(include_str!("../contracts/schema.sql"))
-            .expect("open_in_memory_with_schema must succeed for fresh_db tests")
-    }
-
-    /// (a) Single colliding bead → first call returns `true` (allow emit),
-    /// second call within the backoff window returns `false` (suppress).
-    /// Replays the dedup contract on the bead_id-keyed path so a future
-    /// regression that breaks dedup entirely is caught here even if no
-    /// collision occurs.
-    #[test]
-    fn first_emit_allowed_second_within_window_suppressed_bead_key() {
-        let s = fresh_store();
-        let ctx = serde_json::json!({
-            "reason": "adoption_branch_collision",
-            "branch": "factory/collide-r1",
-            "registered_bead": "bead-owner",
-        });
-        let (first, h1) = (s.escalation_should_emit(
-            "bead-owner",
-            "adoption_branch_collision",
-            &crate::tick::escalation_context_hash(&ctx),
-            1_000,
-            3_600,
-        ).unwrap(), crate::tick::escalation_context_hash(&ctx));
-        assert!(first, "first emit must be allowed (no prior ledger row)");
-        s.record_escalation_emit(
-            "bead-owner",
-            "adoption_branch_collision",
-            &h1,
-            1_000,
-        ).unwrap();
-        let second = s.escalation_should_emit(
-            "bead-owner",
-            "adoption_branch_collision",
-            &h1,
-            1_100,
-            3_600,
-        ).unwrap();
-        assert!(!second, "second emit within backoff window must be suppressed");
-    }
-
-    /// (b) The bug class jleechan-rouf was the WRONG key — verifying that
-    /// when every colliding bead uses a DIFFERENT bead_id (the actual
-    /// production pattern: a fresh bead per tick), the bead-keyed dedup does
-    /// NOT suppress across beads. This pins the failure mode so a future
-    /// "let me revert to bead_key" refactor gets caught at code-review time.
-    #[test]
-    fn bead_key_dedup_does_not_suppress_across_different_bead_ids() {
-        let s = fresh_store();
-        let ctx = serde_json::json!({
-            "reason": "adoption_branch_collision",
-            "branch": "factory/collide-r1",
-            "registered_bead": "bead-owner",
-        });
-        let h = crate::tick::escalation_context_hash(&ctx);
-        // First colliding bead records the emit under ITS bead_id.
-        assert!(s.escalation_should_emit("bead-attacker-1", "adoption_branch_collision", &h, 1_000, 3_600).unwrap());
-        s.record_escalation_emit("bead-attacker-1", "adoption_branch_collision", &h, 1_000).unwrap();
-        // Second colliding bead has a DIFFERENT bead_id but the SAME
-        // (branch, reason) — bead-keyed dedup does NOT suppress.
-        assert!(
-            s.escalation_should_emit("bead-attacker-2", "adoption_branch_collision", &h, 1_100, 3_600).unwrap(),
-            "bead-keyed dedup is the BUG; second colliding bead's emit must NOT be suppressed under the broken key"
-        );
-    }
-
-    /// (c) The fix: re-key on the branch. Every colliding bead that uses the
-    /// SAME branch as the dedup key collapses to one ledger row, and the
-    /// second emit within the backoff window is suppressed. The bead_id
-    /// passed to `escalation_should_emit` is the branch string in
-    /// production — this test mirrors that pattern.
-    #[test]
-    fn branch_key_dedup_suppresses_across_colliding_beads() {
-        let s = fresh_store();
-        let ctx = serde_json::json!({
-            "reason": "adoption_branch_collision",
-            "branch": "factory/collide-r1",
-            "registered_bead": "bead-owner",
-        });
-        let h = crate::tick::escalation_context_hash(&ctx);
-        // First colliding bead's emit keys on the BRANCH, not the bead_id.
-        assert!(s.escalation_should_emit("factory/collide-r1", "adoption_branch_collision", &h, 1_000, 3_600).unwrap());
-        s.record_escalation_emit("factory/collide-r1", "adoption_branch_collision", &h, 1_000).unwrap();
-        // Second colliding bead — different bead_id but SAME branch — must
-        // be suppressed under the branch-keyed ledger.
-        assert!(
-            !s.escalation_should_emit("factory/collide-r1", "adoption_branch_collision", &h, 1_100, 3_600).unwrap(),
-            "branch-keyed dedup must suppress the second colliding bead's emit within the backoff window"
-        );
-        // After the backoff window elapses, the third colliding bead's emit
-        // must be allowed again (cooldown is per-branch, not one-shot).
-        assert!(
-            s.escalation_should_emit("factory/collide-r1", "adoption_branch_collision", &h, 5_000, 3_600).unwrap(),
-            "branch-keyed dedup must re-allow emit after escalation_refire_secs elapses"
-        );
-    }
-
-    /// (d) Different branches must not collide in the ledger — a fix that
-    /// accidentally keying on a too-coarse grain (e.g. just `reason`) would
-    /// silently suppress legitimate escalations on unrelated branches.
-    #[test]
-    fn branch_key_dedup_does_not_collide_across_different_branches() {
-        let s = fresh_store();
-        let h1 = crate::tick::escalation_context_hash(&serde_json::json!({
-            "reason": "adoption_branch_collision",
-            "branch": "factory/branch-a-r1",
-            "registered_bead": "bead-owner-a",
-        }));
-        let h2 = crate::tick::escalation_context_hash(&serde_json::json!({
-            "reason": "adoption_branch_collision",
-            "branch": "factory/branch-b-r1",
-            "registered_bead": "bead-owner-b",
-        }));
-        assert!(s.escalation_should_emit("factory/branch-a-r1", "adoption_branch_collision", &h1, 1_000, 3_600).unwrap());
-        s.record_escalation_emit("factory/branch-a-r1", "adoption_branch_collision", &h1, 1_000).unwrap();
-        // branch-b has its own ledger row — must not be suppressed by
-        // branch-a's recent emit.
-        assert!(
-            s.escalation_should_emit("factory/branch-b-r1", "adoption_branch_collision", &h2, 1_050, 3_600).unwrap(),
-            "different branches must NOT share a ledger row"
-        );
-    }
 }
