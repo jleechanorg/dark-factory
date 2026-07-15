@@ -783,6 +783,28 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
         logs
     );
 
+    let recovery = run_tick(&deps, 2, 0).unwrap();
+    assert_eq!(
+        recovery.beads_recovered_from_held, 0,
+        "a branch-mismatch hold retaining a live session must never auto-requeue"
+    );
+    let held = store.load("jleechan-vj89").unwrap().unwrap();
+    assert_eq!(held.state, OverlayState::HumanHeld);
+    assert_eq!(held.session_id.as_deref(), Some("wa-3004"));
+    assert_eq!(
+        held.park_reason.as_deref(),
+        Some("session_branch_mismatch")
+    );
+    assert!(
+        !sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.starts_with("spawn(")),
+        "recovery must not create an overlapping worker: {:?}",
+        sessions.calls.borrow()
+    );
+
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -1091,6 +1113,10 @@ fn test_wedge_detection_attested_session_stalled() {
 
     let o = store.load("bead-stalled").unwrap().unwrap();
     assert_eq!(o.state, OverlayState::HumanHeld);
+    assert_eq!(
+        o.session_id, None,
+        "positive terminal proof must be persisted with the recoverable hold"
+    );
 
     let logs = std::fs::read_to_string(&telemetry_log).unwrap();
     assert!(logs.contains("session_stalled"), "logs: {}", logs);
@@ -2372,6 +2398,80 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+#[test]
+fn remote_credentials_never_reach_tick_telemetry_or_escalation_comments() {
+    const SECRET: &str = "SYNTHETIC_REMOTE_CREDENTIAL_SENTINEL";
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "credential-redaction-bead".into(),
+        title: "Verify remote credential redaction".into(),
+        description: "synthetic integration fixture".into(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#291".into()),
+    });
+    let sessions = FakeSessions::new();
+    sessions.set_worktree_remote(&format!(
+        "https://user:{SECRET}@github.com/wrong-owner/wrong-repo.git"
+    ));
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log =
+        std::env::temp_dir().join(format!("afd_remote_redaction_{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("remote mismatch should park safely without failing the tick");
+
+    assert_eq!(summary.beads_dispatched, 0);
+    assert_eq!(summary.beads_parked_human_held, 1);
+    assert_eq!(summary.beads_escalated, 1);
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(telemetry.contains("<redacted-git-remote>"));
+    assert!(!telemetry.contains(SECRET));
+
+    let tracker_calls = tracker.calls.borrow();
+    let comment = tracker_calls
+        .iter()
+        .find(|call| call.starts_with("comment_external(owner/repo#291,"))
+        .expect("remote mismatch must post an escalation comment");
+    assert!(comment.contains("<redacted-git-remote>"));
+    assert!(!comment.contains(SECRET));
+
+    let overlay = store.load("credential-redaction-bead").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("worktree_remote_mismatch")
+    );
+    assert!(sessions
+        .calls
+        .borrow()
+        .iter()
+        .any(|call| call == "stop(fake-session-1)"));
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// jleechan-3wh0: file:line-cited regression guard for the *actual* root
 /// cause of the 15-orphan-bead defect. This is not a bug in `create_bead`
 /// (that trait method has always required a non-optional `external_ref: &str`
@@ -2752,7 +2852,7 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
-            park_reason: None,
+            park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
             target_repo: None,
         },
     );
@@ -3950,7 +4050,9 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
-            park_reason: None,
+            park_reason: Some(
+                "gate assessment not all-green (stage 1: recorded, not executed)".into(),
+            ),
             target_repo: None,
         },
     );

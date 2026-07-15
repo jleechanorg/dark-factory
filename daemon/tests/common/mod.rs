@@ -10,7 +10,8 @@
 use daemon::errors::DaemonError;
 use daemon::state::{
     BeadOverlay,
-    OverlayState, StateStore, VendorHealth,
+    HumanHoldReason, OverlayState, StateStore, VendorHealth,
+    is_permanent_human_hold_reason, set_human_hold_reason,
 };
 use daemon::tools::{
     Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec,
@@ -254,6 +255,9 @@ pub struct FakeSessions {
     pub next_session_id: String,
     pub quiescent: bool,
     pub fail_spawn_for: RefCell<Vec<String>>,
+    pub panic_after_spawn_for: RefCell<Vec<String>>,
+    pub fail_spawn_cleanup_for: RefCell<Vec<String>>,
+    pub fail_stop_for: RefCell<Vec<String>>,
     // jleechan-w28n: scripted `DaemonError::Deferred` spawn outcome — AO's
     // own admission-control queue at the target project's session cap, NOT a
     // failure. Distinct from `fail_spawn_for` (`DaemonError::Tool`) so
@@ -281,6 +285,7 @@ pub struct FakeSessions {
     /// Optional error to return from `is_quiescent` (models the "quiescence
     /// check failed" error path independent of the timeout path).
     pub quiescence_check_error: RefCell<Option<String>>,
+    pub worktree_remote_override: RefCell<Option<String>>,
 }
 
 impl Default for FakeSessions {
@@ -290,12 +295,16 @@ impl Default for FakeSessions {
             next_session_id: "fake-session-1".into(),
             quiescent: true,
             fail_spawn_for: RefCell::new(Vec::new()),
+            panic_after_spawn_for: RefCell::new(Vec::new()),
+            fail_spawn_cleanup_for: RefCell::new(Vec::new()),
+            fail_stop_for: RefCell::new(Vec::new()),
             fail_spawn_deferred_for: RefCell::new(Vec::new()),
             spawn_prompts: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
             branch_for: RefCell::new(HashMap::new()),
             terminal_at: RefCell::new(None),
             quiescence_check_error: RefCell::new(None),
+            worktree_remote_override: RefCell::new(None),
         }
     }
 }
@@ -307,6 +316,24 @@ impl FakeSessions {
 
     pub fn fail_spawn_for(&self, bead_id: &str) {
         self.fail_spawn_for.borrow_mut().push(bead_id.to_string());
+    }
+
+    pub fn panic_after_spawn_for(&self, bead_id: &str) {
+        self.panic_after_spawn_for
+            .borrow_mut()
+            .push(bead_id.to_string());
+    }
+
+    pub fn fail_spawn_cleanup_for(&self, bead_id: &str) {
+        self.fail_spawn_cleanup_for
+            .borrow_mut()
+            .push(bead_id.to_string());
+    }
+
+    pub fn fail_stop_for(&self, session_id: &str) {
+        self.fail_stop_for
+            .borrow_mut()
+            .push(session_id.to_string());
     }
 
     pub fn fail_spawn_deferred_for(&self, bead_id: &str) {
@@ -337,6 +364,10 @@ impl FakeSessions {
     pub fn fail_quiescence_check(&self, message: &str) {
         *self.quiescence_check_error.borrow_mut() = Some(message.to_string());
     }
+
+    pub fn set_worktree_remote(&self, remote: &str) {
+        *self.worktree_remote_override.borrow_mut() = Some(remote.to_string());
+    }
 }
 
 impl Sessions for FakeSessions {
@@ -352,11 +383,31 @@ impl Sessions for FakeSessions {
         self.calls
             .borrow_mut()
             .push(format!("spawn({})", spec.bead_id));
+        if self.panic_after_spawn_for.borrow().contains(&spec.bead_id) {
+            panic!("scripted process death after external spawn for {}", spec.bead_id);
+        }
         if self.fail_spawn_for.borrow().contains(&spec.bead_id) {
             return Err(DaemonError::Tool {
                 tool: "ao".into(),
                 rc: 1,
                 stderr: format!("scripted spawn failure for {}", spec.bead_id),
+            });
+        }
+        if self
+            .fail_spawn_cleanup_for
+            .borrow()
+            .contains(&spec.bead_id)
+        {
+            return Err(DaemonError::SpawnCleanupFailed {
+                session: format!("leaked-{}", spec.bead_id),
+                spawn_error: Box::new(DaemonError::Parse(
+                    "scripted invalid spawn metadata".into(),
+                )),
+                cleanup_error: Box::new(DaemonError::Tool {
+                    tool: "ao".into(),
+                    rc: 1,
+                    stderr: "scripted cleanup failure".into(),
+                }),
             });
         }
         if self
@@ -381,6 +432,13 @@ impl Sessions for FakeSessions {
 
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
         self.calls.borrow_mut().push(format!("stop({})", id.0));
+        if self.fail_stop_for.borrow().contains(&id.0) {
+            return Err(DaemonError::Tool {
+                tool: "ao".into(),
+                rc: 1,
+                stderr: format!("scripted stop failure for {}", id.0),
+            });
+        }
         Ok(())
     }
 
@@ -406,6 +464,26 @@ impl Sessions for FakeSessions {
             .borrow_mut()
             .push(format!("session_branch({})", id.0));
         Ok(self.branch_for.borrow().get(&id.0).cloned())
+    }
+
+    fn worktree_remote_url(
+        &self,
+        ao_project: &str,
+        branch: &str,
+        remote_name: &str,
+    ) -> Result<Option<String>, DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "worktree_remote_url({ao_project},{branch},{remote_name})"
+        ));
+        if let Some(remote) = self.worktree_remote_override.borrow().clone() {
+            return Ok(Some(remote));
+        }
+        let repo = if ao_project == "worldarchitect" {
+            "jleechanorg/worldarchitect.ai"
+        } else {
+            "owner/repo"
+        };
+        Ok(Some(format!("https://github.com/{repo}.git")))
     }
 }
 
@@ -681,6 +759,16 @@ impl FakeStateStore {
 }
 
 impl StateStore for FakeStateStore {
+    fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
+        for overlay in self.overlays.borrow_mut().values_mut() {
+            if overlay.state == OverlayState::Dispatching {
+                overlay.state = OverlayState::HumanHeld;
+                set_human_hold_reason(overlay, HumanHoldReason::AmbiguousDispatchingRecovery);
+            }
+        }
+        Ok(())
+    }
+
     fn load(&self, bead_id: &str) -> Result<Option<BeadOverlay>, DaemonError> {
         self.calls.borrow_mut().push(format!("load({bead_id})"));
         Ok(self.overlays.borrow().get(bead_id).cloned())
@@ -786,18 +874,14 @@ impl StateStore for FakeStateStore {
             .push(format!("recover_human_held({max_attempt})"));
         let mut recovered = Vec::new();
         for overlay in self.overlays.borrow_mut().values_mut() {
-            // bead jleechan-4jn1: mirrors `SqliteStateStore::recover_human_held`
-            // — circuit-breaker parks (`park_reason` starting with
-            // "circuit-breaker") are excluded from automatic requeue so
-            // fakes exercising `tick::run_recovery_step` don't silently
-            // diverge from production behavior.
-            let is_circuit_breaker = overlay
-                .park_reason
-                .as_deref()
-                .is_some_and(|r| r.starts_with("circuit-breaker"));
+            // Mirror the production allow-list and its durable no-session
+            // proof so integration fakes cannot hide duplicate-spawn bugs.
+            let is_permanent =
+                is_permanent_human_hold_reason(overlay.park_reason.as_deref());
             if overlay.state == OverlayState::HumanHeld
                 && overlay.attempt < max_attempt
-                && !is_circuit_breaker
+                && !is_permanent
+                && overlay.session_id.is_none()
             {
                 overlay.state = OverlayState::Queued;
                 overlay.attempt += 1;

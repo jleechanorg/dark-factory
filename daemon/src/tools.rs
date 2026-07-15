@@ -267,19 +267,12 @@ pub fn iso8601_to_epoch(s: &str) -> Option<u64> {
 /// form this normalizer does not recognize (a different host — including
 /// GitHub Enterprise — an unusual scheme, or malformed input).
 ///
-/// **Adversarial review finding (independent Claude review of this PR):**
-/// the original version of this function returned a bare `bool`, and its
-/// caller (`dispatch::dispatch_ready`) treated `false` as a POSITIVELY
-/// CONFIRMED mismatch — but `false` was also what an unrecognized URL form
-/// produced. That conflates "confirmed wrong repo" with "cannot parse this
-/// URL", which directly violates the surrounding contract (`Sessions::
-/// worktree_remote_url`'s doc comment: "only ever *rejects* on a positively
-/// confirmed mismatch, never on absence of information") and would kill a
-/// perfectly correct session merely for using an unrecognized URL flavor
-/// (GitHub Enterprise, a credential-embedded URL, an explicit SSH port).
-/// `None` now means "cannot determine" and callers must treat it exactly
-/// like `Sessions::worktree_remote_url`'s own `Ok(None)` — trust-it, never
-/// kill on it.
+/// `None` means the URL cannot be tied positively to canonical github.com.
+/// Spawn-time dispatch is fail-closed for canonical GitHub targets: callers
+/// must reject both `Some(false)` and `None`, because a local path, different
+/// host, or unusual scheme is not evidence that the workspace can safely
+/// push to `repo`. Keeping indeterminate distinct from a parsed mismatch is
+/// still useful for precise telemetry.
 ///
 /// Bead jleechan-bqdv, Stage C spawn-time remote assertion: the worktree a
 /// coder session lands in may be cloned via either transport depending on
@@ -338,6 +331,15 @@ pub fn remote_url_matches_repo(url: &str, repo: &str) -> Option<bool> {
     }
 
     None
+}
+
+/// Safe display value for a configured git remote URL.
+///
+/// Remote URLs may contain HTTP userinfo credentials. Keep the raw value
+/// available only to deterministic matching and never copy any part of it
+/// into errors, telemetry, or outward-facing escalation comments.
+pub fn remote_url_for_display(_url: &str) -> &'static str {
+    "<redacted-git-remote>"
 }
 
 /// `br` CLI. `fetch_candidates` == `br list --status open --label factory --json`.
@@ -451,12 +453,10 @@ pub trait Sessions {
     /// compares the returned URL against the bead's resolved repo
     /// (`owner/repo`) via `remote_url_matches_repo`.
     ///
-    /// `Ok(None)` covers both "worktree not found yet" and "adapter cannot
-    /// verify" — same "cannot verify never blocks" contract as
-    /// `session_branch`: the default impl (for fakes/impls that predate this
-    /// check) always returns `Ok(None)`, which callers treat as "cannot
-    /// verify, do not block". This method only ever *rejects* a dispatch on
-    /// a positively confirmed mismatch, never on absence of information.
+    /// The production adapter must fail closed when it cannot inspect the
+    /// exact workspace AO returned. The default remains `Ok(None)` so older
+    /// test adapters compile, but dispatch treats that absence as an
+    /// unverifiable workspace and refuses to adopt the new session.
     fn worktree_remote_url(
         &self,
         ao_project: &str,
@@ -678,7 +678,7 @@ fn run_tool_with_cwd(
 
 #[cfg(test)]
 mod remote_url_matches_repo_tests {
-    use super::remote_url_matches_repo;
+    use super::{remote_url_for_display, remote_url_matches_repo};
 
     #[test]
     fn https_url_with_dot_git_suffix_matches() {
@@ -763,6 +763,17 @@ mod remote_url_matches_repo_tests {
             ),
             Some(true)
         );
+    }
+
+    #[test]
+    fn remote_display_never_exposes_embedded_credentials() {
+        const SECRET: &str = "SYNTHETIC_REMOTE_CREDENTIAL_SENTINEL";
+        let remote = format!("https://user:{SECRET}@github.com/owner/repo.git");
+
+        let displayed = remote_url_for_display(&remote);
+
+        assert_eq!(displayed, "<redacted-git-remote>");
+        assert!(!displayed.contains(SECRET));
     }
 
     #[test]
