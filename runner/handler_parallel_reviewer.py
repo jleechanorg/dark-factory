@@ -174,6 +174,28 @@ def _coalesce_parallel_outcome(primary: str, shadows: list[str]) -> str:
 def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
+<<<<<<< HEAD
+=======
+    # Bug 2 fix: Check for stale spec artifacts before running review.
+    # If stale artifacts are detected, record the warning in ctx.state and emit
+    # a stale_artifact_warning event for observability; it does NOT modify the prompt.
+    stale_warnings = _check_stale_artifacts(ctx.workdir, ctx)
+    if stale_warnings:
+        # Store warnings in state for downstream nodes and emit observability event
+        ctx.state["_stale_artifact_warnings"] = "\n".join(stale_warnings)
+        try:
+            from . import engine_observability as _obs
+            seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
+            _obs._emit_event(
+                ctx,
+                "stale_artifact_warning",
+                {"node": node.name, "warnings": stale_warnings},
+                seq,
+            )
+        except Exception:
+            pass
+
+>>>>>>> 7784052 (claude/fable: fix(runner): break handler_parallel_reviewer circular import (jleechan-ujt1) (#301))
     prompt = _handlers_shim._render_prompt(node, ctx)
     if ctx.backend in ("echo", "mock_llm"):
         hint = ctx.state.get(f"{node.name}.outcome", "success")

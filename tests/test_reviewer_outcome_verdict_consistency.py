@@ -14,6 +14,7 @@ extended cases``.
 
 from __future__ import annotations
 
+<<<<<<< HEAD
 import pathlib
 
 import pytest
@@ -28,6 +29,10 @@ from runner.handler_verdict import (  # noqa: E402
     _enforce_outcome_verdict_consistency,
     _VERDICT_NORMALIZE,
 )
+=======
+from runner.handler_core import Result
+from runner.handler_parallel_reviewer import _enforce_outcome_verdict_consistency
+>>>>>>> 7784052 (claude/fable: fix(runner): break handler_parallel_reviewer circular import (jleechan-ujt1) (#301))
 
 
 class TestEnforceOutcomeVerdictConsistency:
