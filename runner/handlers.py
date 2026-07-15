@@ -93,7 +93,7 @@ from .handler_metrics import (
     _claude_json_result,
 )
 
-# Verdict parsing + SHA binding.
+# Verdict parsing + SHA binding + outcome/verdict consistency.
 from .handler_verdict import (
     _VERDICT_NORMALIZE,
     _HEAD_SHA_ECHO_RE,
@@ -104,6 +104,7 @@ from .handler_verdict import (
     _MARKER_PRESENT_RE,
     _STANDALONE_RE,
     _parse_verdict,
+    _enforce_outcome_verdict_consistency,
 )
 
 # Gate subprocess + adversarial priority queue + execute-gate fallback.
