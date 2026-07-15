@@ -11,9 +11,6 @@ behavior is aligned with existing lanes (`_resolve_gate_backend`,
 from __future__ import annotations
 
 import json
-import pathlib
-import time
-import hashlib
 from typing import TYPE_CHECKING
 
 # Import collaborators from their source modules directly. Importing
@@ -67,60 +64,6 @@ def _parse_shadow_backends(ctx: "Context") -> list[str]:
     if not isinstance(raw, str):
         raw = str(raw)
     return _parse_priority_env(raw)
-
-
-def _check_stale_artifacts(workdir: pathlib.Path, ctx: "Context") -> list[str]:
-    """Check for stale spec artifacts from prior runs and return warning messages.
-
-    This defends against Bug 2: a prior errored run can leave stale spec.md or
-    explore-*.md files that cause the reviewer to emit a verdict contradicting
-    the current run's outcome.
-    """
-    warnings = []
-    current_run_id = getattr(ctx, "run_id", None) or ""
-
-    # Check spec.md files for run_id annotation
-    spec_paths = [
-        workdir / "spec.md",
-        workdir / ".dark-factory" / "spec.md",
-    ]
-    for spec_path in spec_paths:
-        if spec_path.exists():
-            try:
-                content = spec_path.read_text()
-                # Check if spec has a run_id annotation (written by plan node)
-                run_id_marker = "<!-- run_id: "
-                if run_id_marker in content:
-                    # Extract run_id from annotation
-                    start = content.find(run_id_marker) + len(run_id_marker)
-                    end = content.find(" -->", start)
-                    if end > start:
-                        spec_run_id = content[start:end]
-                        if spec_run_id != current_run_id and current_run_id:
-                            warnings.append(
-                                f"STALE spec at {spec_path.name}: created by run {spec_run_id}, "
-                                f"current run is {current_run_id}"
-                            )
-                else:
-                    # No run_id annotation - could be stale from before this fix
-                    content_hash = hashlib.sha256(content.encode()).hexdigest()[:8]
-                    warnings.append(f"spec at {spec_path.name} has no run_id annotation (hash: {content_hash})")
-            except Exception:
-                pass
-
-    # Check for stale explore-*.md files (modified in last 5 minutes = likely stale)
-    df_dir = workdir / ".dark-factory"
-    if df_dir.exists():
-        for md_file in df_dir.glob("explore-*.md"):
-            try:
-                mtime = md_file.stat().st_mtime
-                age_seconds = time.time() - mtime
-                if age_seconds < 300:  # Less than 5 minutes old - could be stale
-                    warnings.append(f"recent explore artifact: {md_file.name} ({age_seconds:.0f}s old)")
-            except Exception:
-                pass
-
-    return warnings
 
 
 def _run_primary_review(
@@ -231,25 +174,6 @@ def _coalesce_parallel_outcome(primary: str, shadows: list[str]) -> str:
 def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
-    # Bug 2 fix: Check for stale spec artifacts before running review.
-    # If stale artifacts are detected, record the warning in ctx.state and emit
-    # a stale_artifact_warning event for observability; it does NOT modify the prompt.
-    stale_warnings = _check_stale_artifacts(ctx.workdir, ctx)
-    if stale_warnings:
-        # Store warnings in state for downstream nodes and emit observability event
-        ctx.state["_stale_artifact_warnings"] = "\n".join(stale_warnings)
-        try:
-            from . import engine_observability as _obs
-            seq = int(getattr(ctx, "_df_current_seq", getattr(ctx, "last_completed_seq", 0)))
-            _obs._emit_event(
-                ctx,
-                "stale_artifact_warning",
-                {"node": node.name, "warnings": stale_warnings},
-                seq,
-            )
-        except Exception:
-            pass
-
     prompt = _handlers_shim._render_prompt(node, ctx)
     if ctx.backend in ("echo", "mock_llm"):
         hint = ctx.state.get(f"{node.name}.outcome", "success")
