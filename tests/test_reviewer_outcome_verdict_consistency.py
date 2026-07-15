@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 from runner.handler_core import Result  # noqa: E402
 # Import via handlers first to avoid circular import at test collection time
 import runner.handlers  # noqa: F401 - forces full module init before handler_parallel_reviewer
-from runner.handler_parallel_reviewer import _enforce_outcome_verdict_consistency  # noqa: E402
+from runner.handler_verdict import _enforce_outcome_verdict_consistency  # noqa: E402
 
 
 class TestEnforceOutcomeVerdictConsistency:
@@ -57,18 +57,23 @@ class TestEnforceOutcomeVerdictConsistency:
         assert "verdict_adjusted_for_consistency" not in adjusted.metadata
         assert adjusted.outcome == "success"
 
-    def test_error_outcome_with_pass_verdict_unchanged(self):
-        """outcome=error is infra state, not a verdict disagreement → unchanged."""
+    def test_error_outcome_with_unknown_verdict_unchanged(self):
+        """outcome=error with verdict='unknown' (sentinel) → unchanged.
+
+        'unknown' is not in the recognized verdict vocabulary, so the override
+        cannot reason about it and leaves it untouched. This guards the infra
+        path when the reviewer emitted no parseable verdict at all.
+        """
         result = Result(
             outcome="error",
             output="some error occurred",
-            metadata={"verdict": "pass"},
+            metadata={"verdict": "unknown"},
         )
 
         adjusted = _enforce_outcome_verdict_consistency(result, gate_strict=False)
 
-        # Should be unchanged - error is infra state, not a verdict contradiction
-        assert adjusted.metadata["verdict"] == "pass"
+        # Should be unchanged - 'unknown' is a sentinel, not a vocabulary token
+        assert adjusted.metadata["verdict"] == "unknown"
         assert "verdict_adjusted_for_consistency" not in adjusted.metadata
         assert adjusted.outcome == "error"
 
@@ -323,3 +328,120 @@ class TestEnforceOutcomeVerdictConsistency:
 
         assert adjusted.metadata["verdict"] == "echo:success"
         assert "verdict_adjusted_for_consistency" not in adjusted.metadata
+
+    # B1 judo: extended truth table covers all 5 verdict values emitted by production.
+    # Previously the rewrite only knew "pass" / "fail". Now: success→pass,
+    # failure→fail, error→infra_failure, partial→fail, warn→pass.
+
+    def test_error_outcome_with_fail_verdict_rewritten_to_infra_failure(self):
+        """outcome=error with verdict=fail is contradictory → rewritten to infra_failure.
+
+        'error' is an infra state (rc!=0 / unknown verdict). The canonical verdict
+        token for an error outcome is 'infra_failure', not 'fail' (which means
+        "the reviewer found real problems"). This distinction lets the Healer
+        cluster infra crashes separately from real review failures.
+        """
+        result = Result(
+            outcome="error",
+            output="reviewer crashed",
+            metadata={"verdict": "fail"},
+        )
+
+        adjusted = _enforce_outcome_verdict_consistency(result, gate_strict=False)
+
+        assert adjusted.metadata["verdict"] == "infra_failure"
+        assert adjusted.metadata["verdict_adjusted_for_consistency"] == "true"
+        assert adjusted.metadata["original_verdict"] == "fail"
+        assert adjusted.outcome == "error"
+
+    def test_partial_outcome_with_pass_verdict_rewritten_to_fail(self):
+        """outcome=partial with verdict=pass is contradictory → rewritten to fail.
+
+        A 'partial' outcome means the reviewer returned mixed results; the
+        canonical verdict for partial is 'fail' (not 'pass'), so downstream
+        routing treats it as a failed review.
+        """
+        result = Result(
+            outcome="partial",
+            output="mixed review",
+            metadata={"verdict": "pass"},
+        )
+
+        adjusted = _enforce_outcome_verdict_consistency(result, gate_strict=False)
+
+        assert adjusted.metadata["verdict"] == "fail"
+        assert adjusted.metadata["verdict_adjusted_for_consistency"] == "true"
+        assert adjusted.metadata["original_verdict"] == "pass"
+        assert adjusted.outcome == "partial"
+
+    def test_warn_outcome_with_fail_verdict_rewritten_to_pass(self):
+        """outcome=warn with verdict=fail is contradictory → rewritten to pass.
+
+        A 'warn' outcome means the reviewer raised non-blocking concerns;
+        the canonical verdict for warn is 'pass'. Without this rewrite,
+        warn outcomes would inherit a 'fail' verdict that misroutes the gate.
+        """
+        result = Result(
+            outcome="warn",
+            output="warned review",
+            metadata={"verdict": "fail"},
+        )
+
+        adjusted = _enforce_outcome_verdict_consistency(result, gate_strict=False)
+
+        assert adjusted.metadata["verdict"] == "pass"
+        assert adjusted.metadata["verdict_adjusted_for_consistency"] == "true"
+        assert adjusted.metadata["original_verdict"] == "fail"
+        assert adjusted.outcome == "warn"
+
+    def test_error_outcome_with_pass_verdict_rewritten_to_infra_failure(self):
+        """outcome=error with verdict=pass → rewritten to infra_failure (NOT pass).
+
+        Previously outcome=error was passed through unchanged. Now error outcome
+        with a recognized verdict token gets rewritten to its canonical token
+        'infra_failure', preserving the original for audit.
+        """
+        result = Result(
+            outcome="error",
+            output="crashed",
+            metadata={"verdict": "pass"},
+        )
+
+        adjusted = _enforce_outcome_verdict_consistency(result, gate_strict=False)
+
+        assert adjusted.metadata["verdict"] == "infra_failure"
+        assert adjusted.metadata["verdict_adjusted_for_consistency"] == "true"
+        assert adjusted.metadata["original_verdict"] == "pass"
+        assert adjusted.outcome == "error"
+
+    def test_partial_outcome_consistent_with_fail_verdict_unchanged(self):
+        """outcome=partial with verdict=fail (both map to 'failure') → unchanged.
+
+        partial→fail is already consistent with the partial→failure mapping,
+        so the override leaves the verdict intact.
+        """
+        result = Result(
+            outcome="partial",
+            output="partial review",
+            metadata={"verdict": "fail"},
+        )
+
+        adjusted = _enforce_outcome_verdict_consistency(result, gate_strict=False)
+
+        assert adjusted.metadata["verdict"] == "fail"
+        assert "verdict_adjusted_for_consistency" not in adjusted.metadata
+        assert adjusted.outcome == "partial"
+
+    def test_warn_outcome_consistent_with_warn_verdict_unchanged(self):
+        """outcome=warn with verdict=warn → unchanged (self-consistent)."""
+        result = Result(
+            outcome="warn",
+            output="warned review",
+            metadata={"verdict": "warn"},
+        )
+
+        adjusted = _enforce_outcome_verdict_consistency(result, gate_strict=False)
+
+        assert adjusted.metadata["verdict"] == "warn"
+        assert "verdict_adjusted_for_consistency" not in adjusted.metadata
+        assert adjusted.outcome == "warn"

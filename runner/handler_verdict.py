@@ -2,6 +2,11 @@
 
 Owns:
   * `_VERDICT_NORMALIZE` — map raw verdict token → success/failure.
+  * `_OUTCOME_VERDICT_CANONICAL` — canonical verdict token per outcome value
+    (used by ``_enforce_outcome_verdict_consistency`` to rewrite contradicted
+    verdicts across the full production vocabulary).
+  * `_enforce_outcome_verdict_consistency` — rewrite verdict when it
+    GENUINELY contradicts its outcome; leaves sentinels untouched.
   * `_HEAD_SHA_ECHO_RE` — ``head_sha: <40-hex>`` extractor.
   * `_worktree_head_sha` — full 40-char HEAD SHA via ``_git_rev_parse``.
     Heavily monkeypatched by tests via
@@ -166,3 +171,110 @@ def _normalize_outcome(raw_verdict: str, *, gate_strict: bool) -> str:
     if gate_strict and raw_verdict == "warn":
         return "failure"
     return _VERDICT_NORMALIZE.get(raw_verdict, "failure")
+
+
+# Canonical verdict token for each outcome value. Used by
+# `_enforce_outcome_verdict_consistency` to detect genuine contradictions
+# and to choose the canonical verdict token for a rewrite.
+_OUTCOME_VERDICT_CANONICAL = {
+    "success": "pass",          # clean pass
+    "failure": "fail",          # real review failure
+    "error": "infra_failure",   # infra crash — distinct so the Healer
+                                # clusters it separately from real fails
+    "partial": "fail",          # mixed review → treat as failed
+    "warn": "pass",             # non-blocking concerns → still a pass
+}
+
+# Outcome → success/failure equivalence class for contradiction detection.
+# Lets us answer "does this verdict agree with this outcome?" using the
+# same success/failure axis that `_normalize_outcome` produces.
+# `gate_strict=True` flips warn from success to failure.
+_OUTCOME_EQUIV = {
+    "success": "success",
+    "failure": "failure",
+    "error": "failure",         # error ≈ infra failure on the s/f axis
+    "partial": "failure",       # partial ≈ real review failure
+    "warn": "success",          # default; gate_strict=True flips this
+}
+
+
+def _enforce_outcome_verdict_consistency(result, *, gate_strict: bool = False):
+    """Enforce that the verdict matches the outcome to prevent contradictory reporting.
+
+    Bug 2: When stale spec artifacts from a prior errored run cause the reviewer
+    to read outdated content, it can emit ``outcome=failure`` with ``verdict=pass``
+    (or vice versa). This function uses real normalization via
+    ``_normalize_outcome`` and only rewrites on a GENUINE disagreement between
+    outcome and the verdict's normalized class.
+
+    The rewrite uses the full production-outcome vocabulary
+    (``_OUTCOME_VERDICT_CANONICAL``) — not just the two ``pass``/``fail`` tokens —
+    so infra crashes (error), mixed reviews (partial), and non-blocking
+    concerns (warn) each map to their canonical verdict token.
+
+    Sentinels and unparseable verdict tokens (``""``, ``"unknown"``,
+    ``"echo:success"``, ``"infra_failure"``, …) are NOT in ``_VERDICT_NORMALIZE``
+    and therefore are left untouched — we cannot judge a contradiction we
+    cannot normalize.
+    """
+    # Local import keeps the canonical home of this function next to its
+    # vocabulary peers (no cross-module cycle: Result lives in handler_core).
+    from .handler_core import Result
+
+    md = result.metadata or {}
+    raw_original = str(md.get("verdict", ""))
+    raw = raw_original.strip().lower()
+    # Only reason about RECOGNIZED verdict tokens. Sentinels / unparseable / echo
+    # verdicts leave the metadata untouched.
+    if raw not in _VERDICT_NORMALIZE:
+        return result
+    outcome = result.outcome
+    # Outcomes outside the production vocabulary → leave untouched.
+    if outcome not in _OUTCOME_EQUIV:
+        return result
+
+    # Special case: outcome=error with a RECOGNIZED verdict token is a
+    # contradiction in disguise. The reviewer returned SOMETHING parseable,
+    # yet the outcome says infra crashed. Both land on the "failure" axis,
+    # but they mean different things to the Healer — cluster infra crashes
+    # separately by rewriting to "infra_failure".
+    if outcome == "error":
+        new_verdict = _OUTCOME_VERDICT_CANONICAL["error"]
+        new_md = dict(md)
+        new_md["verdict"] = new_verdict
+        new_md["verdict_adjusted_for_consistency"] = "true"
+        new_md["original_verdict"] = raw_original
+        return Result(
+            outcome=result.outcome,
+            output=result.output,
+            metadata=new_md,
+            preferred_label=result.preferred_label,
+            suggested_next_ids=result.suggested_next_ids,
+            context_updates=result.context_updates,
+        )
+
+    outcome_class = _OUTCOME_EQUIV[outcome]
+    if gate_strict and outcome == "warn":
+        outcome_class = "failure"
+    verdict_class = _normalize_outcome(raw, gate_strict=gate_strict)
+    if verdict_class == outcome_class:
+        # Verdict is CONSISTENT with outcome (e.g. warn→success on success/warn
+        # outcome, partial→failure on failure/partial outcome). Preserve the
+        # raw token EXACTLY — no adjustment.
+        return result
+
+    # Genuine contradiction. Rewrite to the canonical verdict token for this
+    # outcome, preserving the original for audit.
+    new_verdict = _OUTCOME_VERDICT_CANONICAL[outcome]
+    new_md = dict(md)
+    new_md["verdict"] = new_verdict
+    new_md["verdict_adjusted_for_consistency"] = "true"
+    new_md["original_verdict"] = raw_original
+    return Result(
+        outcome=result.outcome,
+        output=result.output,
+        metadata=new_md,
+        preferred_label=result.preferred_label,
+        suggested_next_ids=result.suggested_next_ids,
+        context_updates=result.context_updates,
+    )
