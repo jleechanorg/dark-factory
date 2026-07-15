@@ -28,6 +28,10 @@ from typing import TYPE_CHECKING
 # lazily inside ``_parallel_reviewer`` via the shim — see the function body.
 from .handler_core import Result
 from .handler_core import _gate_strict_flag
+# Canonical implementation lives in handler_verdict (pr228 B1 relocation).
+# Re-exported here for backward compatibility: handler_verdict is a leaf
+# module (imports nothing from handlers), so this creates no import cycle.
+from .handler_verdict import _enforce_outcome_verdict_consistency  # noqa: F401
 from .handler_dispatch import (
     _finish_shadow_gate_review,
     _is_gate_infra_failure,

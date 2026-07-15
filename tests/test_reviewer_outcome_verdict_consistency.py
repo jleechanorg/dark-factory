@@ -15,12 +15,10 @@ extended cases``.
 from __future__ import annotations
 
 import pathlib
-import sys
 
 import pytest
 
 ROOT = pathlib.Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT))
 
 from runner.handler_core import Result  # noqa: E402
 # Import the canonical location. ``runner.handlers`` re-exports the same
