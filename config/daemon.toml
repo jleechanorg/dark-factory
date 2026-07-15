@@ -9,3 +9,15 @@ slow_tick_secs = 30
 autonomy_timebox_secs = 10800
 budget_warn_usd = 20.0
 spec_dir = ".factory/specs/"
+
+# Multi-repo dispatch routing (bead jleechan-35y4 Stage B, PRs #245/#249/#250;
+# consumer merged; entries added live 2026-07-15 after unmapped_target_repo parks).
+# push_remote for worldarchitect.ai is "worldai", NOT "origin" -- that clone's
+# origin remote points at jleechanclaw (a different repo entirely).
+[repos."jleechanorg/worldarchitect.ai"]
+ao_project = "worldarchitect"
+push_remote = "worldai"
+
+[repos."jleechanorg/dark-factory"]
+ao_project = "dark-factory"
+push_remote = "origin"
