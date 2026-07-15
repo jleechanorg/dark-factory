@@ -23,7 +23,9 @@ use crate::dispatch::{self, MAX_TRANSIENT_SPAWN_RETRY};
 use crate::errors::DaemonError;
 use crate::intake::{self, IntakeOutcome, IntakeVerdict};
 use crate::router::{self, RoutingVerdict};
-use crate::state::{BeadOverlay, OverlayState, StateStore};
+use crate::state::{
+    set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
+};
 use crate::telemetry::{self, TelemetryEvent};
 use crate::tools::{Bead, Llm, Scm, SessionId, Sessions, Tracker, Vcs};
 use crate::verifier::{self, PrEvidence};
@@ -311,7 +313,7 @@ pub fn run_tick(
         // 1. Time-box envelope check
         if overlay.autonomy_secs >= deps.cfg.autonomy_timebox_secs {
             overlay.state = OverlayState::HumanHeld;
-            overlay.park_reason = Some("autonomy_timebox_exceeded".to_string());
+            set_human_hold_reason(&mut overlay, HumanHoldReason::AutonomyTimeboxExceeded);
             deps.store.save(&overlay)?;
             emit(
                 deps.telemetry_log,
@@ -383,8 +385,10 @@ pub fn run_tick(
                             Ok((true, _)) => {}
                             Ok((false, post_sha)) => {
                                 overlay.state = OverlayState::HumanHeld;
-                                overlay.park_reason =
-                                    Some("adopted_branch_history_rewrite_detected".to_string());
+                                set_human_hold_reason(
+                                    &mut overlay,
+                                    HumanHoldReason::AdoptedBranchHistoryRewriteDetected,
+                                );
                                 deps.store.save(&overlay)?;
                                 emit(
                                     deps.telemetry_log,
@@ -421,8 +425,10 @@ pub fn run_tick(
                             }
                             Err(e) => {
                                 overlay.state = OverlayState::HumanHeld;
-                                overlay.park_reason =
-                                    Some("adopted_branch_append_only_check_failed".to_string());
+                                set_human_hold_reason(
+                                    &mut overlay,
+                                    HumanHoldReason::AdoptedBranchAppendOnlyCheckFailed,
+                                );
                                 deps.store.save(&overlay)?;
                                 emit(
                                     deps.telemetry_log,
@@ -479,13 +485,16 @@ pub fn run_tick(
                 // `Ok(None)` ("cannot verify") is intentionally NOT
                 // treated as a violation — only a positively confirmed
                 // mismatch (or a confirmed-dead session) parks the bead.
-                if let Some(ref session_id_str) = overlay.session_id {
+                if let Some(session_id_str) = overlay.session_id.clone() {
                     let session_id = SessionId(session_id_str.clone());
                     if let Ok(Some(actual_branch)) = deps.sessions.session_branch(&session_id) {
                         let expected_branch = overlay.branch.clone().unwrap_or_default();
                         if actual_branch != expected_branch {
                             overlay.state = OverlayState::HumanHeld;
-                            overlay.park_reason = Some("session_branch_mismatch".to_string());
+                            set_human_hold_reason(
+                                &mut overlay,
+                                HumanHoldReason::SessionBranchMismatch,
+                            );
                             deps.store.save(&overlay)?;
                             emit(
                                 deps.telemetry_log,
@@ -543,7 +552,7 @@ pub fn run_tick(
 
                             if is_silent {
                                 overlay.state = OverlayState::HumanHeld;
-                                overlay.park_reason = Some("coder_silent".to_string());
+                                set_human_hold_reason(&mut overlay, HumanHoldReason::CoderSilent);
                                 deps.store.save(&overlay)?;
                                 emit(
                                     deps.telemetry_log,
@@ -679,7 +688,12 @@ pub fn run_tick(
                             }
 
                             overlay.state = OverlayState::HumanHeld;
-                            overlay.park_reason = Some("session_stalled".to_string());
+                            // `is_quiescent` positively reported a canonical
+                            // AO terminal state above. Persist the cleared
+                            // handle with the recoverable hold so recovery
+                            // cannot overlap a live worker.
+                            overlay.session_id = None;
+                            set_human_hold_reason(&mut overlay, HumanHoldReason::SessionStalled);
                             deps.store.save(&overlay)?;
                             emit(
                                 deps.telemetry_log,
@@ -732,9 +746,10 @@ pub fn run_tick(
 }
 
 /// jleechan-gib: automated HUMAN_HELD exit (Rust port of shell
-/// `recover-held`). Requeues every `HUMAN_HELD` bead whose `attempt` is
-/// below `MAX_HUMAN_HELD_RECOVERY_ATTEMPT` back to `QUEUED`, increments
-/// `attempt`, and zeros `autonomy_secs`. Must run BEFORE the
+/// `recover-held`). Requeues only allow-listed retry-safe `HUMAN_HELD`
+/// beads below `MAX_HUMAN_HELD_RECOVERY_ATTEMPT` whose durable overlay has
+/// no session handle, increments `attempt`, and zeros `autonomy_secs`.
+/// Unknown/possibly-live holds fail closed. Must run BEFORE the
 /// active-overlay wedge-detection loop in `run_tick` so a freshly-QUEUED
 /// bead is not immediately re-parked by the timebox/wedge checks in the
 /// same tick.
@@ -1155,7 +1170,10 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // silent default" discipline router.rs already enforces.
                 let mut held = overlay;
                 held.state = OverlayState::HumanHeld;
-                held.park_reason = Some(format!("router_parse_error: {reason}"));
+                set_human_hold_reason(
+                    &mut held,
+                    HumanHoldReason::RouterParse(reason.clone()),
+                );
                 deps.store.save(&held)?;
                 summary.beads_parked_human_held += 1;
                 emit(
@@ -2352,6 +2370,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             // forever.
                             overlay.state = OverlayState::HumanHeld;
                             overlay.attempt = MAX_HUMAN_HELD_RECOVERY_ATTEMPT;
+                            set_human_hold_reason(
+                                &mut overlay,
+                                HumanHoldReason::UnknownOnlyGateCapped,
+                            );
                             deps.store.save(&overlay)?;
                             record_local_escalation_fallback(
                                 deps,
@@ -2394,8 +2416,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     }
                     overlay.state = OverlayState::HumanHeld;
                     overlay.attempt = MAX_HUMAN_HELD_RECOVERY_ATTEMPT;
-                    overlay.park_reason =
-                        Some("unknown_only_gate_report_with_er_runner_capped".to_string());
+                    set_human_hold_reason(
+                        &mut overlay,
+                        HumanHoldReason::UnknownOnlyGateCapped,
+                    );
                     deps.store.save(&overlay)?;
                     record_escalation(
                         deps,
@@ -2444,8 +2468,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({"stage": deps.cfg.stage}),
                 )?;
                 overlay.state = OverlayState::HumanHeld;
-                overlay.park_reason =
-                    Some("gate assessment not all-green (stage 1: recorded, not executed)".to_string());
+                // ATTESTED is reached only after positive worker quiescence;
+                // make that no-live-session proof durable in this same save.
+                overlay.session_id = None;
+                set_human_hold_reason(&mut overlay, HumanHoldReason::Stage1GateNotGreen);
                 deps.store.save(&overlay)?;
                 summary.beads_parked_human_held += 1;
                 emit(
@@ -2553,8 +2579,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                         } else {
                             overlay.state = OverlayState::HumanHeld;
-                            overlay.park_reason =
-                                Some("spec file validation failed in recovery".to_string());
+                            set_human_hold_reason(
+                                &mut overlay,
+                                HumanHoldReason::SpecValidationFailed,
+                            );
                             deps.store.save(&overlay)?;
                             summary.beads_parked_human_held += 1;
                             emit(
@@ -2668,8 +2696,6 @@ fn is_missing_scm_target_error(err: &DaemonError) -> bool {
 /// beads reaching this path are already at/above
 /// `MAX_HUMAN_HELD_RECOVERY_ATTEMPT` and therefore already excluded from
 /// requeue by attempt count regardless of `park_reason`.
-const ESCALATION_LOCAL_FALLBACK_PARK_REASON_PREFIX: &str = "escalation_local_fallback";
-
 /// Fallback for the HUMAN_HELD recovery-cap escalation idiom (used by
 /// `run_recovery_step`, the dispatch spawn-retry-cap path, and the
 /// unknown-only-gate-report cap path) when `post_scm_comment_by_bead_id`
@@ -2689,9 +2715,10 @@ fn record_local_escalation_fallback(
     reason: &str,
 ) -> Result<(), DaemonError> {
     if let Some(mut overlay) = deps.store.load(bead_id)? {
-        overlay.park_reason = Some(format!(
-            "{ESCALATION_LOCAL_FALLBACK_PARK_REASON_PREFIX}:{reason}"
-        ));
+        set_human_hold_reason(
+            &mut overlay,
+            HumanHoldReason::EscalationLocalFallback(reason.to_string()),
+        );
         deps.store.save(&overlay)?;
     }
     record_escalation(deps, bead_id, reason)

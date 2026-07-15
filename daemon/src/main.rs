@@ -71,6 +71,10 @@ struct Args {
 #[derive(Debug, Clone)]
 enum CommandMode {
     Daemon(Args),
+    RecoverHeld {
+        db: PathBuf,
+        telemetry_log: PathBuf,
+    },
     GatesCompute {
         pr: u64,
         repo: Option<String>,
@@ -81,6 +85,36 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CommandMode, Str
     let _bin_name = argv.next();
     let next_arg = argv.next();
     match next_arg.as_deref() {
+        Some("recover-held") => {
+            let mut db = None;
+            let mut telemetry_log = None;
+            while let Some(arg) = argv.next() {
+                match arg.as_str() {
+                    "--db" => {
+                        db = Some(PathBuf::from(
+                            argv.next()
+                                .ok_or_else(|| "Missing value for --db".to_string())?,
+                        ));
+                    }
+                    "--telemetry-log" => {
+                        telemetry_log = Some(PathBuf::from(
+                            argv.next().ok_or_else(|| {
+                                "Missing value for --telemetry-log".to_string()
+                            })?,
+                        ));
+                    }
+                    other => {
+                        return Err(format!("Unknown argument for recover-held: {other}"));
+                    }
+                }
+            }
+            Ok(CommandMode::RecoverHeld {
+                db: db.ok_or_else(|| "Missing required argument --db".to_string())?,
+                telemetry_log: telemetry_log.ok_or_else(|| {
+                    "Missing required argument --telemetry-log".to_string()
+                })?,
+            })
+        }
         Some("gates-compute") => {
             let mut pr = None;
             let mut repo = None;
@@ -383,9 +417,47 @@ type DaemonAdapters = (
     Box<dyn Vcs>,
 );
 
+fn ao_runtime_binding(cfg: &Config) -> Result<(String, String), DaemonError> {
+    // Use the canonical routing path shared with dispatch, including legacy
+    // aliases such as worldarchitect.ai -> worldarchitect. Duplicating its
+    // derivation here would let startup reject a config that spawning accepts.
+    let ao_project = cfg
+        .resolve_repo(&cfg.target_repo)
+        .ok_or_else(|| {
+            DaemonError::Config(format!(
+                "target repository {:?} has no AO routing configuration",
+                cfg.target_repo
+            ))
+        })?
+        .ao_project;
+    let default_agent = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT")
+        .unwrap_or_else(|_| "minimax".to_string());
+    Ok((ao_project, default_agent))
+}
+
+fn verify_startup_ao_compatibility(
+    args: Args,
+    ao_project: &str,
+    agent: &str,
+    verify: impl FnOnce(&str, &str) -> Result<(), DaemonError>,
+) -> Result<(), DaemonError> {
+    if args.dry_run {
+        return Ok(());
+    }
+    verify(ao_project, agent)
+}
+
 fn run(args: Args) -> Result<(), DaemonError> {
     let cfg_path = default_config_path();
     let cfg = load_config(&cfg_path)?;
+    let (ao_project, default_agent) = ao_runtime_binding(&cfg)?;
+    // Fail before opening/reconciling state, advertising READY, or polling a
+    // healthy tick when the installed AO/Node adapter is incompatible. The
+    // diagnostic exits before AO preflight, locking, workspace creation, or
+    // worker launch.
+    verify_startup_ao_compatibility(args, &ao_project, &default_agent, |project, agent| {
+        daemon::adapters::verify_ao_bridge_compatibility(project, agent)
+    })?;
     let telemetry_log = default_telemetry_log();
     let db_path = default_state_db_path();
 
@@ -418,15 +490,6 @@ fn run(args: Args) -> Result<(), DaemonError> {
         }
     } else {
         use daemon::adapters::{CliScm, CliSessions, CliTracker, ChainLlm, CliVcs};
-        let ao_project = cfg.ao_project.clone().unwrap_or_else(|| {
-            cfg.target_repo
-                .split('/')
-                .next_back()
-                .unwrap_or(&cfg.target_repo)
-                .to_string()
-        });
-        let default_agent = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT")
-            .unwrap_or_else(|_| "minimax".to_string());
         (
             Box::new(CliScm::new(cfg.target_repo.clone())),
             Box::new(CliTracker),
@@ -507,6 +570,33 @@ fn run(args: Args) -> Result<(), DaemonError> {
     }
 }
 
+fn run_recover_held(db: &Path, telemetry_log: &Path) -> Result<(), DaemonError> {
+    const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
+
+    let store = SqliteStateStore::open(db)?;
+    let recovered = store.recover_human_held(MAX_HUMAN_HELD_RECOVERY_ATTEMPT)?;
+    for overlay in &recovered {
+        daemon::telemetry::emit(
+            telemetry_log,
+            &daemon::telemetry::TelemetryEvent {
+                timestamp: daemon::state::now_iso8601(),
+                bead_id: overlay.bead_id.clone(),
+                attempt_id: overlay.attempt,
+                lifecycle_state: "QUEUED".to_string(),
+                event_type: "RECOVERED_FROM_HELD".to_string(),
+                metrics: serde_json::json!({}),
+                context: serde_json::json!({
+                    "prior_state": "HUMAN_HELD",
+                    "pr_number": overlay.pr_number,
+                    "branch": overlay.branch,
+                }),
+            },
+        )?;
+    }
+    println!("recovered={}", recovered.len());
+    Ok(())
+}
+
 fn main() {
     let mode = match parse_args(std::env::args()) {
         Ok(m) => m,
@@ -529,6 +619,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        CommandMode::RecoverHeld { db, telemetry_log } => {
+            if let Err(e) = run_recover_held(&db, &telemetry_log) {
+                eprintln!("auto-factory daemon: recover-held error: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -546,6 +642,69 @@ mod tests {
     fn scaffold_compiles() {
         let ok = true;
         assert!(ok);
+    }
+
+    #[test]
+    fn production_startup_runs_ao_compatibility_check_and_propagates_failure() {
+        let mut observed = None;
+        let error = verify_startup_ao_compatibility(
+            Args::default(),
+            "dark-factory",
+            "minimax",
+            |project, agent| {
+                observed = Some((project.to_string(), agent.to_string()));
+                Err(DaemonError::Config("incompatible AO runtime".to_string()))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            observed,
+            Some(("dark-factory".to_string(), "minimax".to_string()))
+        );
+        assert!(error.to_string().contains("incompatible AO runtime"));
+    }
+
+    #[test]
+    fn startup_binding_uses_canonical_legacy_worldarchitect_project_alias() {
+        let cfg = Config {
+            target_repo: "jleechanorg/worldarchitect.ai".to_string(),
+            ao_project: None,
+            base_branch: "main".to_string(),
+            stage: 1,
+            max_workers: 30,
+            max_batch: 15,
+            fast_tick_secs: 60,
+            slow_tick_secs: 600,
+            autonomy_timebox_secs: 10_800,
+            budget_warn_usd: 20.0,
+            spec_dir: ".factory/specs".to_string(),
+            repos: std::collections::HashMap::new(),
+        };
+
+        let (project, _) = ao_runtime_binding(&cfg).unwrap();
+
+        assert_eq!(project, "worldarchitect");
+    }
+
+    #[test]
+    fn dry_run_startup_skips_production_ao_compatibility_check() {
+        let mut called = false;
+        let result = verify_startup_ao_compatibility(
+            Args {
+                once: true,
+                dry_run: true,
+            },
+            "dark-factory",
+            "minimax",
+            |_, _| {
+                called = true;
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(!called);
     }
 
     #[test]
@@ -619,6 +778,41 @@ mod tests {
                 assert_eq!(repo, None);
             }
             _ => panic!("Expected GatesCompute mode"),
+        }
+    }
+
+    #[test]
+    fn parse_args_recognizes_recover_held_paths() {
+        let argv = vec![
+            "daemon".to_string(),
+            "recover-held".to_string(),
+            "--db".to_string(),
+            "/tmp/recovery.sqlite".to_string(),
+            "--telemetry-log".to_string(),
+            "/tmp/recovery.jsonl".to_string(),
+        ];
+        let mode = parse_args(argv.into_iter()).unwrap();
+        match mode {
+            CommandMode::RecoverHeld { db, telemetry_log } => {
+                assert_eq!(db, PathBuf::from("/tmp/recovery.sqlite"));
+                assert_eq!(telemetry_log, PathBuf::from("/tmp/recovery.jsonl"));
+            }
+            _ => panic!("expected RecoverHeld mode"),
+        }
+    }
+
+    #[test]
+    fn parse_args_recover_held_requires_db_and_telemetry_paths() {
+        for argv in [
+            vec!["daemon".to_string(), "recover-held".to_string()],
+            vec![
+                "daemon".to_string(),
+                "recover-held".to_string(),
+                "--db".to_string(),
+                "/tmp/recovery.sqlite".to_string(),
+            ],
+        ] {
+            assert!(parse_args(argv.into_iter()).is_err());
         }
     }
 

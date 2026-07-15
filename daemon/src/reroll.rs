@@ -1,6 +1,8 @@
 use crate::config::Config;
 use crate::errors::DaemonError;
-use crate::state::{BeadOverlay, OverlayState, StateStore};
+use crate::state::{
+    set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
+};
 use crate::tools::{Llm, Scm, Sessions, SpawnSpec, Vcs};
 use crate::telemetry::{self, TelemetryEvent};
 use crate::constraints;
@@ -34,8 +36,7 @@ pub enum RerollOutcome {
 /// after the same reviewer rejects the same underlying issue twice in a
 /// row. Shared as a constant so the park_reason write and the
 /// `RerollOutcome::Held` message can never drift apart.
-pub const CIRCUIT_BREAKER_PARK_REASON: &str =
-    "circuit-breaker triggered: same reviewer and feedback hash as prior attempt";
+pub const CIRCUIT_BREAKER_PARK_REASON: &str = crate::state::CIRCUIT_BREAKER_PARK_REASON;
 
 fn now_iso8601() -> String {
     let secs = std::time::SystemTime::now()
@@ -181,7 +182,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
                 };
                 if same_issue {
                     bead.state = OverlayState::HumanHeld;
-                    bead.park_reason = Some(CIRCUIT_BREAKER_PARK_REASON.to_string());
+                    set_human_hold_reason(bead, HumanHoldReason::CircuitBreaker);
                     deps.store.save(bead)?;
 
                     // jleechan-9xrs Stage D: was `deps.cfg.target_repo` —
@@ -257,7 +258,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
             Ok(id) => id,
             Err(e) => {
                 bead.state = OverlayState::HumanHeld;
-                bead.park_reason = Some("reroll_session_attach_failed".to_string());
+                set_human_hold_reason(bead, HumanHoldReason::RerollSessionAttachFailed);
                 deps.store.save(bead)?;
                 return Ok(RerollOutcome::Held(format!("failed to attach to session: {e}")));
             }
@@ -265,7 +266,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
 
         if let Err(e) = deps.sessions.stop(&session_id) {
             bead.state = OverlayState::HumanHeld;
-            bead.park_reason = Some("reroll_session_stop_failed".to_string());
+            set_human_hold_reason(bead, HumanHoldReason::RerollSessionStopFailed);
             deps.store.save(bead)?;
             return Ok(RerollOutcome::Held(format!("failed to stop session: {e}")));
         }
@@ -294,7 +295,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
                 Ok(v) => v,
                 Err(e) => {
                     bead.state = OverlayState::HumanHeld;
-                    bead.park_reason = Some("reroll_quiescence_check_failed".to_string());
+                    set_human_hold_reason(bead, HumanHoldReason::RerollQuiescenceCheckFailed);
                     deps.store.save(bead)?;
                     return Ok(RerollOutcome::Held(format!("quiescence check failed: {e}")));
                 }
@@ -305,7 +306,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
                     Ok(h) => h,
                     Err(e) => {
                         bead.state = OverlayState::HumanHeld;
-                        bead.park_reason = Some("reroll_quiescence_check_failed".to_string());
+                        set_human_hold_reason(bead, HumanHoldReason::RerollQuiescenceCheckFailed);
                         deps.store.save(bead)?;
                         return Ok(RerollOutcome::Held(format!("quiescence check failed: {e}")));
                     }
@@ -335,10 +336,16 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
 
         if !confirmed {
             bead.state = OverlayState::HumanHeld;
-            bead.park_reason = Some("reroll_quiescence_timeout".to_string());
+            set_human_hold_reason(bead, HumanHoldReason::RerollQuiescenceTimeout);
             deps.store.save(bead)?;
             return Ok(RerollOutcome::Held("quiescence timeout exceeded (60s)".into()));
         }
+
+        // The old worker is positively terminal and its branch HEAD was
+        // stable across two observations. Clear the durable handle in the
+        // same save before any later step can create a recoverable hold.
+        bead.session_id = None;
+        deps.store.save(bead)?;
 
         emit_telemetry(
             deps.telemetry_log,
@@ -498,7 +505,7 @@ fn execute_adopted(
             // Should not happen: adoption always sets `branch` to the
             // contributor's head_ref_name. Park rather than guess.
             bead.state = OverlayState::HumanHeld;
-            bead.park_reason = Some("adopted_missing_branch".to_string());
+            set_human_hold_reason(bead, HumanHoldReason::AdoptedMissingBranch);
             deps.store.save(bead)?;
             emit_telemetry(
                 deps.telemetry_log,
@@ -529,9 +536,13 @@ fn execute_adopted(
     // when the bead's freshest stored state is ATTESTED or RE_ROLL. This is
     // a second line of defense against two coder sessions racing commits
     // onto the same contributor-owned branch.
-    if let Ok(existing_session) = deps.sessions.attach(&branch, &bead.bead_id) {
-        match deps.sessions.is_quiescent(&existing_session) {
+    match deps.sessions.attach(&branch, &bead.bead_id) {
+        Ok(existing_session) => match deps.sessions.is_quiescent(&existing_session) {
             Ok(false) => {
+                bead.state = OverlayState::HumanHeld;
+                bead.session_id = Some(existing_session.0.clone());
+                set_human_hold_reason(bead, HumanHoldReason::AdoptedSessionAlreadyActive);
+                deps.store.save(bead)?;
                 emit_telemetry(
                     deps.telemetry_log,
                     &bead.bead_id,
@@ -541,12 +552,16 @@ fn execute_adopted(
                     serde_json::json!({}),
                     serde_json::json!({"branch": branch, "sessionId": existing_session.0}),
                 )?;
-                return Ok(RerollOutcome::Rerolled { new_branch: branch });
+                return Ok(RerollOutcome::Held(format!(
+                    "an AO session is already active on adopted branch {branch}; retained session {} for reconciliation",
+                    existing_session.0
+                )));
             }
             Ok(true) => {}
             Err(e) => {
                 bead.state = OverlayState::HumanHeld;
-                bead.park_reason = Some("adopted_quiescence_check_failed".to_string());
+                bead.session_id = Some(existing_session.0.clone());
+                set_human_hold_reason(bead, HumanHoldReason::AdoptedQuiescenceCheckFailed);
                 deps.store.save(bead)?;
                 emit_telemetry(
                     deps.telemetry_log,
@@ -561,6 +576,15 @@ fn execute_adopted(
                     "failed to check whether an existing remediation session on adopted branch {branch} is still active: {e}"
                 )));
             }
+        },
+        Err(DaemonError::SessionNotFound { .. }) => {}
+        Err(e) => {
+            bead.state = OverlayState::HumanHeld;
+            set_human_hold_reason(bead, HumanHoldReason::AdoptedSessionAttachFailed);
+            deps.store.save(bead)?;
+            return Ok(RerollOutcome::Held(format!(
+                "could not uniquely reconcile AO sessions on adopted branch {branch}: {e}"
+            )));
         }
     }
 
@@ -590,7 +614,14 @@ fn execute_adopted(
         Ok(sha) => sha,
         Err(e) => {
             bead.state = OverlayState::HumanHeld;
-            bead.park_reason = Some("adopted_pre_session_sha_capture_failed".to_string());
+            // Any existing attached remediation session was positively
+            // quiescent above; persist that no-live-session proof with the
+            // recoverable pre-spawn hold.
+            bead.session_id = None;
+            set_human_hold_reason(
+                bead,
+                HumanHoldReason::AdoptedPreSessionShaCaptureFailed,
+            );
             deps.store.save(bead)?;
             emit_telemetry(
                 deps.telemetry_log,
@@ -637,6 +668,15 @@ fn execute_adopted(
         remote: adopted_routing.push_remote,
     };
 
+    // Persist an ambiguous pre-spawn intent before crossing the external AO
+    // boundary. A process death after AO creates the worker but before its
+    // session id is saved leaves DISPATCHING on disk; startup reconciliation
+    // converts that to a permanent human hold instead of spawning a duplicate.
+    bead.state = OverlayState::Dispatching;
+    bead.session_id = None;
+    bead.pre_session_head_sha = Some(pre_session_sha.clone());
+    deps.store.save(bead)?;
+
     match deps.sessions.spawn(&spec) {
         Ok(session_id) => {
             bead.attempt = next_attempt;
@@ -648,7 +688,30 @@ fn execute_adopted(
             // back to verification after the coder session finishes.
             bead.state = OverlayState::Dispatched;
             bead.pre_session_head_sha = Some(pre_session_sha);
-            deps.store.save(bead)?;
+            if let Err(save_error) = deps.store.save(bead) {
+                if let Err(cleanup_error) = deps.sessions.stop(&session_id) {
+                    bead.state = OverlayState::HumanHeld;
+                    bead.session_id = Some(session_id.0.clone());
+                    set_human_hold_reason(bead, HumanHoldReason::SpawnCleanupFailed);
+                    let cleanup_error = match deps.store.save(bead) {
+                        Ok(()) => cleanup_error,
+                        Err(state_error) => DaemonError::Config(format!(
+                            "session cleanup failed: {cleanup_error}; additionally failed to persist the HUMAN_HELD cleanup record: {state_error}"
+                        )),
+                    };
+                    return Err(DaemonError::SpawnCleanupFailed {
+                        session: session_id.0,
+                        spawn_error: Box::new(save_error),
+                        cleanup_error: Box::new(cleanup_error),
+                    });
+                }
+
+                bead.state = OverlayState::HumanHeld;
+                bead.session_id = None;
+                set_human_hold_reason(bead, HumanHoldReason::AdoptedSpawnFailed);
+                deps.store.save(bead)?;
+                return Err(save_error);
+            }
             emit_telemetry(
                 deps.telemetry_log,
                 &bead.bead_id,
@@ -662,9 +725,29 @@ fn execute_adopted(
             )?;
             Ok(RerollOutcome::Rerolled { new_branch: branch })
         }
+        Err(error @ DaemonError::SpawnCleanupFailed { .. }) => {
+            let session = match &error {
+                DaemonError::SpawnCleanupFailed { session, .. } => session.clone(),
+                _ => unreachable!(),
+            };
+            bead.state = OverlayState::HumanHeld;
+            bead.session_id = Some(session.clone());
+            set_human_hold_reason(bead, HumanHoldReason::SpawnCleanupFailed);
+            if let Err(state_error) = deps.store.save(bead) {
+                return Err(DaemonError::SpawnCleanupFailed {
+                    session,
+                    spawn_error: Box::new(error),
+                    cleanup_error: Box::new(DaemonError::Config(format!(
+                        "failed to persist HUMAN_HELD cleanup record: {state_error}"
+                    ))),
+                });
+            }
+            Err(error)
+        }
         Err(e) => {
             bead.state = OverlayState::HumanHeld;
-            bead.park_reason = Some("adopted_spawn_failed".to_string());
+            bead.session_id = None;
+            set_human_hold_reason(bead, HumanHoldReason::AdoptedSpawnFailed);
             deps.store.save(bead)?;
             emit_telemetry(
                 deps.telemetry_log,

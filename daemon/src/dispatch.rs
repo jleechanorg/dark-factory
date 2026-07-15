@@ -7,8 +7,39 @@
 use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::router::RoutingVerdict;
-use crate::state::{BeadOverlay, OverlayState, StateStore};
-use crate::tools::{remote_url_matches_repo, Bead, Sessions, SpawnSpec};
+use crate::state::{
+    set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
+};
+use crate::tools::{remote_url_for_display, remote_url_matches_repo, Bead, Sessions, SpawnSpec};
+
+#[cfg(test)]
+const SPAWN_CLEANUP_FAILED_PARK_REASON: &str = "spawn_cleanup_failed";
+
+fn record_spawn_cleanup_failure(
+    store: &dyn StateStore,
+    overlay: &mut BeadOverlay,
+    session_id: &crate::tools::SessionId,
+    root_error: DaemonError,
+    cleanup_error: DaemonError,
+) -> DaemonError {
+    // The kill failed, so retain the known session identity durably instead
+    // of leaving a live worker untracked behind a DISPATCHING row that
+    // startup reconciliation would blindly requeue.
+    overlay.state = OverlayState::HumanHeld;
+    overlay.session_id = Some(session_id.0.clone());
+    set_human_hold_reason(overlay, HumanHoldReason::SpawnCleanupFailed);
+    let cleanup_error = match store.save(overlay) {
+        Ok(()) => cleanup_error,
+        Err(state_error) => DaemonError::Config(format!(
+            "session cleanup failed: {cleanup_error}; additionally failed to persist the HUMAN_HELD cleanup record: {state_error}"
+        )),
+    };
+    DaemonError::SpawnCleanupFailed {
+        session: session_id.0.clone(),
+        spawn_error: Box::new(root_error),
+        cleanup_error: Box::new(cleanup_error),
+    }
+}
 
 /// Coder-dispatch prompt preamble (bead jleechan-bqdv, Stage C of the
 /// multi-repo dispatch fix — see
@@ -179,7 +210,7 @@ pub fn dispatch_ready(
             Some(routing) => routing,
             None => {
                 overlay.state = OverlayState::HumanHeld;
-                overlay.park_reason = Some("unmapped_target_repo".to_string());
+                set_human_hold_reason(&mut overlay, HumanHoldReason::UnmappedTargetRepo);
                 if let Err(err) = store.save(&overlay) {
                     if err.is_transient() {
                         report.failures.push(failure(
@@ -277,6 +308,31 @@ pub fn dispatch_ready(
         };
         let session_id = match sessions.spawn(&spec) {
             Ok(session_id) => session_id,
+            // The adapter can discover a live session and then fail its own
+            // mandatory cleanup before it can return `Ok(SessionId)`. Unlike
+            // an ordinary fatal spawn error, this variant carries the known
+            // live session identity. Persist it immediately so startup's
+            // DISPATCHING reconciliation cannot erase it and requeue a
+            // duplicate worker.
+            Err(err @ DaemonError::SpawnCleanupFailed { .. }) => {
+                let session = match &err {
+                    DaemonError::SpawnCleanupFailed { session, .. } => session.clone(),
+                    _ => unreachable!(),
+                };
+                overlay.state = OverlayState::HumanHeld;
+                overlay.session_id = Some(session.clone());
+                set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnCleanupFailed);
+                if let Err(state_error) = store.save(&overlay) {
+                    return Err(DaemonError::SpawnCleanupFailed {
+                        session,
+                        spawn_error: Box::new(err),
+                        cleanup_error: Box::new(DaemonError::Config(format!(
+                            "failed to persist HUMAN_HELD cleanup record: {state_error}"
+                        ))),
+                    });
+                }
+                return Err(err);
+            }
             // jleechan-w28n: AO's own admission-control queue (session-cap
             // backpressure — see `DaemonError::Deferred`'s doc comment) is
             // NOT a failure and must never share `spawn_failure_count` with
@@ -328,7 +384,10 @@ pub fn dispatch_ready(
                     // has no `Tracker`/`Scm` access by design — see the
                     // module doc comment).
                     overlay.state = OverlayState::HumanHeld;
-                    overlay.park_reason = Some("transient_spawn_retry_cap_exceeded".to_string());
+                    set_human_hold_reason(
+                        &mut overlay,
+                        HumanHoldReason::TransientSpawnRetryCapExceeded,
+                    );
                     store.save(&overlay)?;
                     report.failures.push(failure(
                         bead,
@@ -358,30 +417,38 @@ pub fn dispatch_ready(
         // completely unrelated, pre-existing task (different branch,
         // different prompt) — this defensively verifies AO's own live view
         // of the just-returned session before ever trusting/persisting it.
-        // `Ok(None)` means "cannot verify" (adapter/fake doesn't implement
-        // the check, or `ao status` failed/raced) and is intentionally
-        // treated as trust-it, matching `Sessions::session_branch`'s
-        // documented contract — this check only ever *rejects* on a
-        // positively confirmed mismatch, never on absence of information.
-        // We deliberately do NOT call `sessions.stop(&session_id)` here: on
-        // a mismatch this session_id is not provably ours to kill (it may
-        // be someone else's live, legitimate work, exactly like the
-        // wa-3004 case that motivated this check) — we only refuse to
-        // adopt it.
+        // Production `CliSessions::spawn` already requires AO bridge stdout
+        // to echo the exact requested `Branch:` and an absolute `Worktree:`.
+        // This second trait-level check catches adapters/fakes that return a
+        // newly-created id whose live status contradicts that contract. The
+        // id came directly from this spawn call, so it is owned by this
+        // dispatch and must be stopped rather than leaked and requeued.
         if let Ok(Some(actual_branch)) = sessions.session_branch(&session_id) {
             if actual_branch != branch {
-                overlay.state = OverlayState::Queued;
+                let phase = "spawn_branch_mismatch";
+                let branch_error = DaemonError::Parse(format!(
+                    "ao spawn returned session {} but its live branch is {actual_branch:?}, expected {branch:?} — refusing to record as DISPATCHED",
+                    session_id.0
+                ));
+                if let Err(cleanup_error) = sessions.stop(&session_id) {
+                    return Err(record_spawn_cleanup_failure(
+                        store,
+                        &mut overlay,
+                        &session_id,
+                        branch_error,
+                        cleanup_error,
+                    ));
+                }
+                overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnBranchMismatch);
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
                     overlay.attempt,
                     Some(branch.clone()),
-                    "spawn_branch_mismatch",
-                    DaemonError::Parse(format!(
-                        "ao spawn returned session {} but its live branch is {actual_branch:?}, expected {branch:?} — refusing to record as DISPATCHED",
-                        session_id.0
-                    )),
+                    phase,
+                    branch_error,
                 ));
                 continue;
             }
@@ -396,42 +463,91 @@ pub fn dispatch_ready(
         // is fatal (propagated via `?`) rather than swallowed, because a live,
         // untracked, wrong-repo coder session is exactly the near-miss that
         // almost pushed wa-3086 to jleechanclaw instead of dark-factory.
-        // `Ok(None)` from `worktree_remote_url` ("cannot verify" — worktree
-        // not yet visible, adapter doesn't implement the check) is trust-it,
-        // matching its documented contract. `remote_url_matches_repo` ALSO
-        // returns `None` for a URL form it can't parse (a different host,
-        // GitHub Enterprise, an unusual scheme) — adversarial review of this
-        // PR caught an earlier version collapsing that into the SAME `false`
-        // a confirmed-wrong-repo URL produces, which would have killed a
-        // perfectly correct session over a merely-unrecognized URL flavor.
-        // Only `Some(false)` — a RECOGNIZED github.com URL naming a
-        // different repo — is a positively confirmed mismatch; `None` (from
-        // either function) must trust-it exactly like the `session_branch`
-        // check above.
-        if let Ok(Some(remote_url)) =
-            sessions.worktree_remote_url(&routing.ao_project, &branch, &routing.push_remote)
-        {
-            if remote_url_matches_repo(&remote_url, &repo) == Some(false) {
-                sessions.stop(&session_id)?;
+        // A missing/unreadable workspace is fail-closed: this session was
+        // just created, so accepting it without checking the actual AO path
+        // would bypass the wrong-repository gate. A URL comparison must be
+        // positively `Some(true)`: local paths, different hosts, and unusual
+        // schemes are not evidence that this canonical github.com target
+        // matches.
+        let verified_remote = sessions
+            .worktree_remote_url(&routing.ao_project, &branch, &routing.push_remote)
+            .and_then(|url| {
+                url.ok_or_else(|| {
+                    DaemonError::Config(format!(
+                        "spawned worktree for bead {} (branch {branch:?}) could not be inspected; refusing to dispatch without remote verification",
+                        bead.id
+                    ))
+                })
+            });
+        let remote_url = match verified_remote {
+            Ok(url) => url,
+            Err(error) => {
+                if let Err(cleanup_error) = sessions.stop(&session_id) {
+                    return Err(record_spawn_cleanup_failure(
+                        store,
+                        &mut overlay,
+                        &session_id,
+                        error,
+                        cleanup_error,
+                    ));
+                }
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
-                overlay.park_reason = Some("worktree_remote_mismatch".to_string());
+                set_human_hold_reason(
+                    &mut overlay,
+                    HumanHoldReason::WorktreeRemoteUnverifiable,
+                );
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
                     overlay.attempt,
                     Some(branch.clone()),
-                    "worktree_remote_mismatch",
-                    DaemonError::Config(format!(
-                        "spawned worktree for bead {} (branch {branch:?}) has remote {:?} pointing at \
-                         {remote_url:?}, which does not match the bead's resolved repo {repo:?}. \
-                         Killed the session and parked HUMAN_HELD rather than risk the coder pushing to \
-                         the wrong repo (jleechan-9sh5 discipline).",
-                        bead.id, routing.push_remote
-                    )),
+                    "worktree_remote_unverifiable",
+                    error,
                 ));
                 continue;
             }
+        };
+        let remote_match = remote_url_matches_repo(&remote_url, &repo);
+        if remote_match != Some(true) {
+            let detail = if remote_match == Some(false) {
+                format!("does not match the bead's resolved repo {repo:?}")
+            } else {
+                format!("is not a recognized canonical github.com URL for the bead's resolved repo {repo:?}")
+            };
+            // Both a positive mismatch and an indeterminate URL are durable
+            // wrong-remote safety violations, not transient inspection
+            // failures. Use the permanent mismatch park so recovery cannot
+            // silently requeue the same unsafe workspace next tick.
+            let phase = "worktree_remote_mismatch";
+            let displayed_remote = remote_url_for_display(&remote_url);
+            let remote_error = DaemonError::Config(format!(
+                "spawned worktree for bead {} (branch {branch:?}) has remote {:?} pointing at \
+                 {displayed_remote}, which {detail}; refusing to dispatch to the unsafe workspace \
+                 (jleechan-9sh5 discipline).",
+                bead.id, routing.push_remote
+            ));
+            if let Err(cleanup_error) = sessions.stop(&session_id) {
+                return Err(record_spawn_cleanup_failure(
+                    store,
+                    &mut overlay,
+                    &session_id,
+                    remote_error,
+                    cleanup_error,
+                ));
+            }
+            overlay.state = OverlayState::HumanHeld;
+            overlay.session_id = None;
+            set_human_hold_reason(&mut overlay, HumanHoldReason::WorktreeRemoteMismatch);
+            store.save(&overlay)?;
+            report.failures.push(failure(
+                bead,
+                overlay.attempt,
+                Some(branch.clone()),
+                phase,
+                remote_error,
+            ));
+            continue;
         }
 
         overlay.state = OverlayState::Dispatched;
@@ -448,7 +564,15 @@ pub fn dispatch_ready(
             // we now have an untracked live session we can't even kill —
             // that's a more urgent operator-facing failure than the original
             // save error, so it takes priority and is returned instead.
-            sessions.stop(&session_id)?;
+            if let Err(cleanup_error) = sessions.stop(&session_id) {
+                return Err(record_spawn_cleanup_failure(
+                    store,
+                    &mut overlay,
+                    &session_id,
+                    save_err,
+                    cleanup_error,
+                ));
+            }
             if save_err.is_transient() {
                 overlay.state = OverlayState::Queued;
                 overlay.session_id = None;
@@ -731,6 +855,7 @@ mod tests {
         // reflects what `CliSessions::spawn` actually returns once a
         // fallback chain is exhausted.
         fail_spawn_fallback_exhausted_deferred_for: RefCell<Vec<String>>,
+        fail_spawn_cleanup_for: RefCell<Vec<String>>,
         fail_stop_for: RefCell<Vec<String>>,
         // jleechan-5ia2: scripted `session_branch` override, keyed by
         // session id. Empty by default (matches the trait's `Ok(None)`
@@ -757,6 +882,16 @@ mod tests {
 
     impl FakeSessions {
         fn new(active_count: usize) -> Self {
+            let scripted_worktree_remote = HashMap::from([
+                (
+                    "repo".to_string(),
+                    "https://github.com/owner/repo.git".to_string(),
+                ),
+                (
+                    "worldarchitect".to_string(),
+                    "https://github.com/jleechanorg/worldarchitect.ai.git".to_string(),
+                ),
+            ]);
             Self {
                 active_count,
                 calls: RefCell::new(Vec::new()),
@@ -764,10 +899,11 @@ mod tests {
                 fail_spawn_fatal_for: RefCell::new(Vec::new()),
                 fail_spawn_deferred_for: RefCell::new(Vec::new()),
                 fail_spawn_fallback_exhausted_deferred_for: RefCell::new(Vec::new()),
+                fail_spawn_cleanup_for: RefCell::new(Vec::new()),
                 fail_stop_for: RefCell::new(Vec::new()),
                 scripted_branch: RefCell::new(HashMap::new()),
                 spawn_prompts: RefCell::new(Vec::new()),
-                scripted_worktree_remote: RefCell::new(HashMap::new()),
+                scripted_worktree_remote: RefCell::new(scripted_worktree_remote),
             }
         }
 
@@ -789,6 +925,12 @@ mod tests {
 
         fn fail_spawn_fallback_exhausted_deferred_for(&self, bead_id: &str) {
             self.fail_spawn_fallback_exhausted_deferred_for
+                .borrow_mut()
+                .push(bead_id.to_string());
+        }
+
+        fn fail_spawn_cleanup_for(&self, bead_id: &str) {
+            self.fail_spawn_cleanup_for
                 .borrow_mut()
                 .push(bead_id.to_string());
         }
@@ -833,6 +975,19 @@ mod tests {
                     "scripted fatal spawn failure for {}",
                     spec.bead_id
                 )));
+            }
+            if self.fail_spawn_cleanup_for.borrow().contains(&spec.bead_id) {
+                return Err(DaemonError::SpawnCleanupFailed {
+                    session: "fake-leaked-session".to_string(),
+                    spawn_error: Box::new(DaemonError::Parse(
+                        "spawn returned SESSION without Worktree".to_string(),
+                    )),
+                    cleanup_error: Box::new(DaemonError::Tool {
+                        tool: "ao session kill".to_string(),
+                        rc: 8,
+                        stderr: "scripted kill failure".to_string(),
+                    }),
+                });
             }
             if self.fail_spawn_for.borrow().contains(&spec.bead_id) {
                 return Err(DaemonError::Tool {
@@ -1400,7 +1555,7 @@ mod tests {
     /// match the branch this dispatch actually requested — the daemon must
     /// refuse to record this as a successful dispatch, must NOT persist
     /// state=Dispatched/session_id, and must requeue the bead for a real
-    /// retry instead of silently trusting a mismatched session forever.
+    /// park instead of silently trusting or duplicating a mismatched session.
     #[test]
     fn spawn_returning_session_with_mismatched_live_branch_is_never_recorded_as_dispatched() {
         let sessions = FakeSessions::new(0);
@@ -1424,21 +1579,49 @@ mod tests {
         assert_eq!(report.failures[0].bead_id, "bead-0");
         assert_eq!(report.failures[0].phase, "spawn_branch_mismatch");
 
-        // The session must NOT be killed — it may be someone else's live,
-        // legitimate work (exactly the wa-3004 case). We only refuse to
-        // adopt it.
         let calls = sessions.calls.borrow();
         assert!(
-            !calls.iter().any(|c| c.starts_with("stop(")),
-            "a foreign/mismatched session must never be stopped by dispatch: {calls:?}"
+            calls.iter().any(|c| c == "stop(fake-session-1)"),
+            "the just-created branch-mismatched worker must be stopped: {calls:?}"
         );
 
-        // The overlay must be back at QUEUED with no session_id — never
-        // left claiming DISPATCHED with a session that isn't actually
-        // working on this bead's branch.
+        // Never auto-requeue a dispatch whose returned metadata contradicted
+        // the requested branch; preserve the requested branch for diagnosis.
         let overlay = store.load("bead-0").unwrap().unwrap();
-        assert_eq!(overlay.state, OverlayState::Queued);
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
         assert_eq!(overlay.session_id, None);
+        assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(overlay.park_reason.as_deref(), Some("spawn_branch_mismatch"));
+    }
+
+    #[test]
+    fn spawn_branch_mismatch_cleanup_failure_retains_session_and_stops_batch() {
+        let sessions = FakeSessions::new(0);
+        sessions.set_session_branch("fake-session-1", "feat/unexpected-branch");
+        sessions.fail_stop_for("fake-session-1");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(overlay.session_id.as_deref(), Some("fake-session-1"));
+        assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
+        );
+        assert!(
+            !sessions
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == "spawn(bead-1)"),
+            "cleanup failure must stop the batch before another spawn"
+        );
     }
 
     #[test]
@@ -1701,6 +1884,67 @@ mod tests {
     }
 
     #[test]
+    fn adapter_cleanup_failure_persists_live_session_before_fatal_return() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_cleanup_for("bead-0");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        assert!(!err.is_transient());
+        let bead_0 = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(bead_0.state, OverlayState::HumanHeld);
+        assert_eq!(bead_0.session_id.as_deref(), Some("fake-leaked-session"));
+        assert_eq!(bead_0.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(
+            bead_0.park_reason.as_deref(),
+            Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
+        );
+        assert!(
+            store.load("bead-1").unwrap().is_none(),
+            "a second bead must not spawn after cleanup failure"
+        );
+        let calls = sessions.calls.borrow();
+        assert_eq!(
+            calls.iter().filter(|call| *call == "spawn(bead-0)").count(),
+            1
+        );
+        assert!(!calls.iter().any(|call| call == "spawn(bead-1)"));
+    }
+
+    #[test]
+    fn adapter_cleanup_hold_save_failure_leaves_branch_for_fail_closed_recovery() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_cleanup_for("bead-0");
+        let store = FakeStateStore::new();
+        store.fail_save_for("bead-0", OverlayState::HumanHeld);
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        assert!(err
+            .to_string()
+            .contains("failed to persist HUMAN_HELD cleanup record"));
+        let durable = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(durable.state, OverlayState::Dispatching);
+        assert_eq!(durable.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(durable.session_id, None);
+        assert!(
+            !sessions
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == "spawn(bead-1)"),
+            "a failed cleanup hold must stop the batch before another spawn"
+        );
+    }
+
+    #[test]
     fn save_failure_after_spawn_stops_session_and_continues_later_dispatch() {
         let sessions = FakeSessions::new(0);
         let store = FakeStateStore::new();
@@ -1766,9 +2010,10 @@ mod tests {
 
         let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
         assert!(
-            matches!(err, DaemonError::Tool { .. }),
+            matches!(err, DaemonError::SpawnCleanupFailed { .. }),
             "stop failure must remain fatal because a live untracked worker may remain: {err:?}"
         );
+        assert!(!err.is_transient(), "cleanup failure must never back off/retry");
 
         let calls = sessions.calls.borrow();
         assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
@@ -1776,6 +2021,13 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c == "spawn(bead-1)"),
             "later beads must not dispatch after failed rollback stop"
+        );
+        let bead_0 = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(bead_0.state, OverlayState::HumanHeld);
+        assert_eq!(bead_0.session_id.as_deref(), Some("fake-session-1"));
+        assert_eq!(
+            bead_0.park_reason.as_deref(),
+            Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
         );
     }
 
@@ -2118,10 +2370,14 @@ mod tests {
     /// rather than silently trusting the dispatch.
     #[test]
     fn worktree_remote_mismatch_kills_session_and_parks_human_held() {
+        const SECRET: &str = "SYNTHETIC_REMOTE_CREDENTIAL_SENTINEL";
         let sessions = FakeSessions::new(0);
         // cfg().target_repo == "owner/repo" derives ao_project "repo" via
         // Config::resolve_repo's legacy fallback (no explicit ao_project).
-        sessions.set_worktree_remote("repo", "https://github.com/wrong-owner/wrong-repo.git");
+        sessions.set_worktree_remote(
+            "repo",
+            &format!("https://user:{SECRET}@github.com/wrong-owner/wrong-repo.git"),
+        );
         let store = FakeStateStore::new();
         let cfg = cfg();
         let ready = beads(1);
@@ -2137,10 +2393,10 @@ mod tests {
         assert_eq!(report.failures[0].bead_id, "bead-0");
         assert_eq!(report.failures[0].phase, "worktree_remote_mismatch");
         assert!(
-            report.failures[0].error.contains("wrong-owner/wrong-repo"),
-            "error should name the observed mismatched remote: {}",
-            report.failures[0].error
+            report.failures[0].error.contains("<redacted-git-remote>"),
+            "error must identify that the observed remote was redacted"
         );
+        assert!(!report.failures[0].error.contains(SECRET));
 
         let calls = sessions.calls.borrow();
         assert!(
@@ -2162,8 +2418,12 @@ mod tests {
     /// this check existed.
     #[test]
     fn worktree_remote_match_passes_through_cleanly() {
+        const SECRET: &str = "SYNTHETIC_REMOTE_CREDENTIAL_SENTINEL";
         let sessions = FakeSessions::new(0);
-        sessions.set_worktree_remote("repo", "https://github.com/owner/repo.git");
+        sessions.set_worktree_remote(
+            "repo",
+            &format!("https://user:{SECRET}@github.com/owner/repo.git"),
+        );
         let store = FakeStateStore::new();
         let cfg = cfg();
         let ready = beads(1);
@@ -2190,8 +2450,12 @@ mod tests {
     /// silently continue as if nothing happened.
     #[test]
     fn worktree_remote_mismatch_stop_failure_is_fatal() {
+        const SECRET: &str = "SYNTHETIC_REMOTE_CREDENTIAL_SENTINEL";
         let sessions = FakeSessions::new(0);
-        sessions.set_worktree_remote("repo", "https://github.com/wrong-owner/wrong-repo.git");
+        sessions.set_worktree_remote(
+            "repo",
+            &format!("https://user:{SECRET}@github.com/wrong-owner/wrong-repo.git"),
+        );
         sessions.fail_stop_for("fake-session-1");
         let store = FakeStateStore::new();
         let cfg = cfg();
@@ -2199,71 +2463,139 @@ mod tests {
 
         let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
         assert!(
-            matches!(err, DaemonError::Tool { .. }),
-            "failure to kill a confirmed wrong-repo session must be fatal: {err:?}"
+            matches!(err, DaemonError::SpawnCleanupFailed { .. }),
+            "failure to kill a confirmed wrong-repo session must be fatal"
         );
+        let rendered = err.to_string();
+        assert!(rendered.contains("<redacted-git-remote>"));
+        assert!(!rendered.contains(SECRET));
+        assert!(!err.is_transient(), "cleanup failure must never be retried");
 
         let calls = sessions.calls.borrow();
         assert!(calls.iter().any(|c| c == "stop(fake-session-1)"));
-    }
-
-    /// An adapter that cannot verify the worktree's remote (`Ok(None)` — the
-    /// default for every fake/impl predating this check) must never block a
-    /// dispatch: "cannot verify" is trust-it, matching `session_branch`'s
-    /// established contract for this class of post-spawn check.
-    #[test]
-    fn worktree_remote_cannot_verify_does_not_block_dispatch() {
-        let sessions = FakeSessions::new(0);
-        // No `set_worktree_remote` call: default is Ok(None) ("cannot verify").
-        let store = FakeStateStore::new();
-        let cfg = cfg();
-        let ready = beads(1);
-
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
-
-        assert_eq!(report.success_count(), 1);
         let overlay = store.load("bead-0").unwrap().unwrap();
-        assert_eq!(overlay.state, OverlayState::Dispatched);
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(overlay.session_id.as_deref(), Some("fake-session-1"));
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
+        );
     }
 
-    /// Adversarial review finding (independent Claude review of this PR):
-    /// a remote URL in a form `remote_url_matches_repo` cannot recognize
-    /// (e.g. a different git host, GitHub Enterprise) returns `None`
-    /// ("cannot determine") — the dispatch-time check must trust-it exactly
-    /// like the `Ok(None)` "worktree not visible yet" case, NEVER treat an
-    /// unrecognized format as a confirmed mismatch. Before this fix,
-    /// `remote_url_matches_repo` returned a bare `false` for both "confirmed
-    /// wrong repo" AND "couldn't parse this URL", which would have killed a
-    /// perfectly correct session merely for using an unrecognized URL
-    /// flavor.
     #[test]
-    fn worktree_remote_unrecognized_url_format_does_not_block_dispatch() {
+    fn cleanup_wrapper_hold_save_failure_preserves_dispatching_branch() {
         let sessions = FakeSessions::new(0);
-        // A real, live github.com URL, but for a GitHub Enterprise-style
-        // host `remote_url_matches_repo` doesn't parse — NOT a recognized
-        // mismatch, just unparseable.
         sessions.set_worktree_remote(
             "repo",
-            "https://github.enterprise.example.com/owner/repo.git",
+            "https://github.com/wrong-owner/wrong-repo.git",
         );
+        sessions.fail_stop_for("fake-session-1");
+        let store = FakeStateStore::new();
+        store.fail_save_for("bead-0", OverlayState::HumanHeld);
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        assert!(err
+            .to_string()
+            .contains("failed to persist the HUMAN_HELD cleanup record"));
+        let durable = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(durable.state, OverlayState::Dispatching);
+        assert_eq!(durable.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(durable.session_id, None);
+        assert!(
+            !sessions
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == "spawn(bead-1)"),
+            "a failed cleanup hold must stop the batch before another spawn"
+        );
+    }
+
+    /// An adapter that cannot inspect the just-created worktree must fail
+    /// closed: otherwise an opaque AO workspace name can bypass the
+    /// wrong-repository gate entirely.
+    #[test]
+    fn worktree_remote_cannot_verify_kills_session_and_parks_human_held() {
+        let sessions = FakeSessions::new(0);
+        sessions.scripted_worktree_remote.borrow_mut().clear();
         let store = FakeStateStore::new();
         let cfg = cfg();
         let ready = beads(1);
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
-        assert_eq!(
-            report.success_count(),
-            1,
-            "an unrecognized (unparseable) URL format must never be treated as a confirmed mismatch"
-        );
-        assert!(report.failures.is_empty());
-        let calls = sessions.calls.borrow();
+        assert_eq!(report.success_count(), 0);
+        assert_eq!(report.failures[0].phase, "worktree_remote_unverifiable");
         assert!(
-            !calls.iter().any(|c| c.starts_with("stop(")),
-            "an indeterminate remote-url comparison must never kill the session: {calls:?}"
+            sessions
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == "stop(fake-session-1)")
         );
         let overlay = store.load("bead-0").unwrap().unwrap();
-        assert_eq!(overlay.state, OverlayState::Dispatched);
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("worktree_remote_unverifiable")
+        );
+    }
+
+    #[test]
+    fn worktree_remote_unverifiable_stop_failure_retains_session_and_is_fatal() {
+        let sessions = FakeSessions::new(0);
+        sessions.scripted_worktree_remote.borrow_mut().clear();
+        sessions.fail_stop_for("fake-session-1");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        assert!(!err.is_transient());
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(overlay.session_id.as_deref(), Some("fake-session-1"));
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some(SPAWN_CLEANUP_FAILED_PARK_REASON)
+        );
+    }
+
+    /// A remote URL that cannot be positively tied to the canonical
+    /// github.com target is not verification. Fail closed so local paths,
+    /// alternate hosts, and unusual schemes cannot bypass the wrong-repo
+    /// gate.
+    #[test]
+    fn worktree_remote_unrecognized_url_kills_session_and_parks() {
+        for remote_url in [
+            "https://github.enterprise.example.com/owner/repo.git",
+            "https://gitlab.example.com/owner/repo.git",
+            "/tmp/local-clone-of-owner-repo",
+        ] {
+            let sessions = FakeSessions::new(0);
+            sessions.set_worktree_remote("repo", remote_url);
+            let store = FakeStateStore::new();
+            let cfg = cfg();
+            let ready = beads(1);
+
+            let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+            assert_eq!(report.success_count(), 0, "remote={remote_url}");
+            assert_eq!(report.failures[0].phase, "worktree_remote_mismatch", "remote={remote_url}");
+            let calls = sessions.calls.borrow();
+            assert!(
+                calls.iter().any(|c| c == "stop(fake-session-1)"),
+                "an indeterminate remote-url comparison must kill the new session: remote={remote_url}; calls={calls:?}"
+            );
+            let overlay = store.load("bead-0").unwrap().unwrap();
+            assert_eq!(overlay.state, OverlayState::HumanHeld);
+            assert_eq!(overlay.park_reason.as_deref(), Some("worktree_remote_mismatch"));
+        }
     }
 }
