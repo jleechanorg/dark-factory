@@ -1,62 +1,43 @@
 ---
 name: auto-factory
-description: Guide for running and monitoring the auto-factory (Level 5 DOT pipeline runner). Instructs on how to make the factory adopt PRs via the 'factory' label and monitor its background daemon and tmux remediation panes.
+description: Use when a request requires creating or editing code, tests, configuration, CI, or a pull request in any repository.
 ---
 
-# Auto-Factory (/af) Guide
+# Auto-Factory (`/af`)
 
-The `dark-factory` auto-factory is a Level 5 DOT pipeline runner that automatically drives pull requests to green, runs safety gates, and prepares them for merge. 
+All coding LLM work enters through `/af`. Interactive sessions define intent,
+create or update tracker artifacts, add PR feedback, and monitor. The factory
+owns implementation, worker dispatch, verification, and PR convergence.
 
-## How to Trigger the Auto-Factory
+## Target contract
 
-To make the auto-factory pick up and process a task:
+1. Resolve the exact target repository from the supplied issue/PR URL or the
+   current repository. Never default to `worldarchitect.ai`, and never match a
+   same-number issue or PR in another repository.
+2. For an existing PR, add or preserve its `factory` label in that repository.
+   For a new goal, create or update a factory-labeled GitHub issue or local bead
+   in the target repository.
+3. Verify adoption in daemon telemetry and verify any spawned worker metadata
+   names the exact repository, issue/PR, requested runtime, and agent.
+4. If the factory cannot route that repository, record a precise routing
+   blocker against the target artifact and report `BLOCKED`. Do not fall back
+   to inline coding or direct AO/Codex/Claude dispatch outside `/af`.
 
-1. **For existing Pull Requests (PRs)**:
-   Add the `factory` label to the GitHub PR. The background daemon will automatically intake and adopt it.
-   
-2. **For new tasks (larger features/bugs)**:
-   Create or update a GitHub issue in the target repository with the `factory` label.
-   
-3. **For smaller tasks**:
-   Create a local bead with the `factory` label:
-   ```bash
-   br create "My task title" --body "My task description" --label factory
-   ```
+## Drive loop
 
----
+- Run or wake the repository-aware factory intake, then monitor rather than
+  replacing it with an interactive coding session.
+- Treat implementation agents, AO workers, Codex, Claude, and reviewers as
+  factory internals. Preserve requested worker/runtime parameters exactly.
+- Continue through implementation, tests, review remediation, and exact-head
+  evidence until the PR is `READY` or merged. Respect repository-specific merge
+  authorization; when merge is not authorized, stop at verified `READY`.
+- A daemon that is running is not proof of adoption. Require target-specific
+  telemetry, worker metadata, or PR activity before claiming progress.
 
-## How to Monitor the Auto-Factory
+## Monitoring
 
-Once a task or PR is labeled, the background daemon handles the state transitions and remediation autonomously. You do not need to run commands; instead, monitor the progress:
-
-### 1. Check Daemon Status
-Check if the daemon is running and check its current tick:
-```bash
-systemctl --user status ai.dark-factory.daemon.service
-```
-
-### 2. Tail Daemon Telemetry Logs
-Filter and monitor real-time lifecycle transitions (excluding verification loop spam):
-```bash
-tail -f ~/Library/Logs/dark-factory/daemon.jsonl | grep -v VERIFICATION_PENDING
-```
-
-### 3. Track Remediation Workers
-If verification fails, the daemon automatically dispatches remediation workers (AO sessions) in background tmux panes. 
-* List active sessions:
-  ```bash
-  tmux list-sessions
-  ```
-* Inspect a worker's console output in real-time:
-  ```bash
-  tmux capture-pane -t <session_name> -p
-  ```
-
----
-
-## Key States
-* **`ATTESTED`**: The PR/bead has been adopted and is undergoing safety gate checks.
-* **`READY`**: The PR passed all gates and is green (ready for merge approval).
-* **`DISPATCHED`**: The PR failed verification and an autonomous worker has been spawned in a tmux session to fix it.
-* **`HUMAN_HELD`**: Parked for human intervention (e.g. branch conflicts or recovery limits reached).
-
+Use the platform supervisor (`launchctl` on macOS, `systemctl --user` on Linux),
+the daemon JSONL telemetry under `~/Library/Logs/dark-factory/`, and the exact
+worker session output. Report the target artifact URL, factory state, current
+head SHA, gates, and any actionable blocker.
