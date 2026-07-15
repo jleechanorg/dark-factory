@@ -47,6 +47,13 @@ git clone -q "$ORIGIN" "$WORK"
     git commit -q -m init
     git push -q origin main
 )
+# The bare origin's HEAD symref is set at `git init --bare` time from the
+# host's init.defaultBranch (defaulting to "master" when unset). It is NOT
+# automatically repointed by a later push of a "main" branch, so any
+# subsequent `git clone` of $ORIGIN lands on a dangling/wrong-named unborn
+# branch instead of "main" -- explicitly repoint it so later clones (e.g.
+# $SECOND below) always land on main regardless of host git config.
+git --git-dir="$ORIGIN" symbolic-ref HEAD refs/heads/main
 DEPLOY_LOG="$SCRATCH_DIR/deploy.jsonl"
 
 # ---------------------------------------------------------------------------
@@ -119,7 +126,9 @@ git clone -q "$ORIGIN" "$SECOND"
     echo b >> f.txt
     git add f.txt
     git commit -q -m second
-    git push -q origin main
+    # Push via HEAD:main (not a bare "main" refspec) so this works even if
+    # the clone's local branch name ever diverges from "main" for any reason.
+    git push -q origin HEAD:main
 )
 before_sha="$(cd "$WORK" && git rev-parse HEAD)"
 set +e
@@ -153,7 +162,7 @@ assert "real advance JSONL new_sha matches post-deploy HEAD" "$after_sha" "$logg
     echo c >> f.txt
     git add f.txt
     git commit -q -m third
-    git push -q origin main
+    git push -q origin HEAD:main
 )
 before_sha="$(cd "$WORK" && git rev-parse HEAD)"
 bash "$DEPLOY" --target-dir "$WORK" --dry-run >/dev/null 2>&1
