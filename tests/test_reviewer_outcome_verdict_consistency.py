@@ -6,18 +6,8 @@ via _normalize_outcome and only rewrites on a genuine outcome/verdict contradict
 
 from __future__ import annotations
 
-import pathlib
-import sys
-
-import pytest
-
-ROOT = pathlib.Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT))
-
-from runner.handler_core import Result  # noqa: E402
-# Import via handlers first to avoid circular import at test collection time
-import runner.handlers  # noqa: F401 - forces full module init before handler_parallel_reviewer
-from runner.handler_parallel_reviewer import _enforce_outcome_verdict_consistency  # noqa: E402
+from runner.handler_core import Result
+from runner.handler_parallel_reviewer import _enforce_outcome_verdict_consistency
 
 
 class TestEnforceOutcomeVerdictConsistency:
