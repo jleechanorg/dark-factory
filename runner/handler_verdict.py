@@ -1,4 +1,8 @@
-"""Verdict parsing + worktree SHA binding for reviewer gates.
+"""Verdict parsing + worktree SHA binding + outcome/verdict consistency.
+
+Canonical owner of reviewer verdict semantics. Runtime callers and reviewer
+handlers must go through this module — never inline-copy a verdict token map
+or a verdict/consistency helper next to a handler.
 
 Owns:
   * `_VERDICT_NORMALIZE` — map raw verdict token → success/failure.
@@ -14,15 +18,22 @@ Owns:
     anchored marker regex + bare-marker detector + standalone-line fallback.
   * `_parse_verdict` — ``(raw_verdict, normalized_outcome)``; rejects
     misclassification attempts.
+  * `_enforce_outcome_verdict_consistency` — canonical ownership of the
+    "verdict must match outcome" rule. Moved here from
+    ``runner/handler_parallel_reviewer`` so the verdict module owns verdict
+    semantics end-to-end (parse → normalize → consistency enforce).
 """
 
 from __future__ import annotations
 
 import pathlib
 import re
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from ._git import _SHA_RE, _git_rev_parse
+
+if TYPE_CHECKING:  # pragma: no cover — import only used for type checkers
+    from .handler_core import Result
 
 
 _VERDICT_NORMALIZE = {
@@ -166,3 +177,67 @@ def _normalize_outcome(raw_verdict: str, *, gate_strict: bool) -> str:
     if gate_strict and raw_verdict == "warn":
         return "failure"
     return _VERDICT_NORMALIZE.get(raw_verdict, "failure")
+
+
+def _enforce_outcome_verdict_consistency(result: "Result", *, gate_strict: bool = False) -> "Result":
+    """Enforce that verdict matches outcome to prevent contradictory reporting.
+
+    Canonical owner of the outcome/verdict consistency rule. Previously
+    lived in ``runner/handler_parallel_reviewer``; relocated here so all
+    verdict semantics (token map → normalization → consistency enforcement)
+    live in one module. Direct imports from this module are cycle-free.
+
+    Bug 2: When stale spec artifacts from a prior errored run cause the
+    reviewer to read outdated content, it can emit ``outcome=failure`` with
+    ``verdict=pass`` (or vice versa). This function uses real normalization
+    via ``_normalize_outcome`` and only rewrites on a GENUINE disagreement
+    between outcome and normalized verdict.
+
+    Contract (preserved exactly from the prior location):
+      * Sentinel / unparseable / echo verdicts
+        (``""``, ``"unknown"``, ``"echo:success"``, ``"infra_failure"``, …)
+        are NOT in the verdict vocabulary — leave them untouched; we cannot
+        judge a contradiction we cannot normalize.
+      * ``"error"`` outcome is an infra state, not a verdict disagreement —
+        never rewrite on an error outcome.
+      * On a genuine contradiction, rewrite verdict to the canonical token
+        matching the outcome (``pass`` / ``fail``) and record audit fields:
+        ``verdict_adjusted_for_consistency`` → ``"true"``,
+        ``original_verdict`` → unchanged raw value (preserved for audit).
+      * On consistency (e.g. warn→success with ``gate_strict=False``, or
+        approve→success, partial→failure), preserve the raw token EXACTLY —
+        no adjustment fields are written.
+    """
+    # Lazy import to keep this module's load graph independent of handler_core;
+    # callers always go through the canonical name exported here.
+    from .handler_core import Result as _Result
+
+    md = result.metadata or {}
+    raw_original = str(md.get("verdict", ""))
+    raw = raw_original.strip().lower()
+    # Only reason about RECOGNIZED verdict tokens.
+    if raw not in _VERDICT_NORMALIZE:
+        return result
+    outcome = result.outcome
+    # "error" is an infra state, not a verdict disagreement.
+    if outcome not in ("success", "failure"):
+        return result
+    normalized = _normalize_outcome(raw, gate_strict=gate_strict)
+    if normalized == outcome:
+        # verdict is CONSISTENT with outcome — preserve the raw token EXACTLY.
+        return result
+    # Genuine contradiction: rewrite to a canonical token matching the outcome,
+    # preserving the original for audit.
+    new_verdict = "pass" if outcome == "success" else "fail"
+    new_md = dict(md)
+    new_md["verdict"] = new_verdict
+    new_md["verdict_adjusted_for_consistency"] = "true"
+    new_md["original_verdict"] = raw_original
+    return _Result(
+        outcome=result.outcome,
+        output=result.output,
+        metadata=new_md,
+        preferred_label=result.preferred_label,
+        suggested_next_ids=result.suggested_next_ids,
+        context_updates=result.context_updates,
+    )
