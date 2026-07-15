@@ -175,6 +175,7 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
     # Bug 2 fix: Check for stale spec artifacts before running review.
     # If stale artifacts are detected, record the warning in ctx.state and emit
@@ -196,6 +197,8 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             pass
 
 >>>>>>> 7784052 (claude/fable: fix(runner): break handler_parallel_reviewer circular import (jleechan-ujt1) (#301))
+=======
+>>>>>>> 891a7c5 ([agento] [antig] fix(runner): delete nonfunctional stale-artifact detector (jleechan-6ug2) (#300))
     prompt = _handlers_shim._render_prompt(node, ctx)
     if ctx.backend in ("echo", "mock_llm"):
         hint = ctx.state.get(f"{node.name}.outcome", "success")
