@@ -16,7 +16,6 @@ fn fake_tracker_records_calls_and_returns_scripted_response() {
             id: "b1".into(),
             title: "t".into(),
             description: String::new(),
-            notes: String::new(),
             file_tree_summary: String::new(),
             external_ref: Some("owner/repo#5".into()),
         }]),
@@ -107,17 +106,7 @@ fn fake_sessions_spawn_attach_stop_quiescent_roundtrip() {
         branch_for: Default::default(),
         terminal_at: Default::default(),
         quiescence_check_error: Default::default(),
-        attach_not_found_for: Default::default(),
-        fail_attach_permanent_for: Default::default(),
-        fail_attach_transient_for: Default::default(),
-        orphan_after_stop: Default::default(),
-        stop_succeeded: Default::default(),
-        fail_stop_permanent_for: Default::default(),
-        activity: Default::default(),
-        activity_permanent_error: Default::default(),
-        activity_sequence: Default::default(),
         worktree_remote_override: Default::default(),
-        transcript_activity_for: Default::default(),
     };
 
     assert_eq!(fake.active_count().unwrap(), 3);

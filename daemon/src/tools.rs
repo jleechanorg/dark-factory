@@ -10,19 +10,12 @@ use std::time::{Duration, Instant};
 
 /// A `br` bead candidate (design doc §4, spec §4.2.3).
 ///
-/// `description`, `notes`, and `file_tree_summary` exist so the router's
-/// rendered prompt (router.rs `render_prompt`) can judge routing complexity
-/// from more than just the one-line title (spec Appendix C item 1 says
-/// routing must be based on "the whole shape of the task" — a bare title is
-/// not that):
+/// `description` and `file_tree_summary` exist so the router's rendered
+/// prompt (router.rs `render_prompt`) can judge routing complexity from more
+/// than just the one-line title (spec Appendix C item 1 says routing must be
+/// based on "the whole shape of the task" — a bare title is not that):
 /// * `description` — the bead's full body text as returned by
 ///   `br list --json` (that JSON shape's `description` field); "" if absent.
-/// * `notes` — the bead's `br list --json` `notes` field (operator-authored
-///   per-attempt guidance; populated via `br update --notes`, e.g. when
-///   requeueing with refined scope instructions). "" if absent. Surfaced
-///   into the coder prompt as a distinct, higher-priority-than-description
-///   section (bead jleechan-0hqx, issue #338) so attempt rN coders don't
-///   re-litigate scope that was settled when the bead was requeued.
 /// * `file_tree_summary` — a short, pre-rendered listing of the repo paths
 ///   the bead is expected to touch (see `tools::summarize_file_tree`), so the
 ///   router can weigh blast radius without the LLM having to browse the repo
@@ -32,7 +25,6 @@ pub struct Bead {
     pub id: String,
     pub title: String,
     pub description: String, // full body/description from `br list --json`; "" if absent
-    pub notes: String, // operator-authored `br update --notes` text; "" if absent
     pub file_tree_summary: String, // pre-rendered file-tree text; "" if unavailable
     pub external_ref: Option<String>, // "<owner>/<repo>#<issue_number>", None = manual bead
 }
@@ -331,47 +323,6 @@ pub fn remote_url_for_display(_url: &str) -> &'static str {
     "<redacted-git-remote>"
 }
 
-/// Pure syntax transform (no judgment call, ZFC-exempt), bead
-/// jleechan-coder-silent-false-parks-h92r: Claude Code CLI names each
-/// session's transcript directory under `~/.claude/projects/` after the
-/// absolute cwd it was launched in, with every `/` and `.` replaced by `-`
-/// (observed convention, e.g. `/home/jleechan/.worktrees/dark-factory/df-100`
-/// -> `-home-jleechan--worktrees-dark-factory-df-100`). This lets the
-/// coder-silence watcher locate a dispatched coder's own transcript
-/// directory from the absolute worktree path AO already reports at spawn
-/// time, without guessing at session identity.
-pub fn claude_project_slug(worktree_path: &std::path::Path) -> String {
-    worktree_path
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c == '/' || c == '.' { '-' } else { c })
-        .collect()
-}
-
-#[cfg(test)]
-mod claude_project_slug_tests {
-    use super::claude_project_slug;
-    use std::path::Path;
-
-    #[test]
-    fn replaces_slashes_and_dots_with_dashes() {
-        let path = Path::new("/home/jleechan/.worktrees/dark-factory/df-100");
-        assert_eq!(
-            claude_project_slug(path),
-            "-home-jleechan--worktrees-dark-factory-df-100"
-        );
-    }
-
-    #[test]
-    fn handles_plain_projects_path_without_leading_dotdir() {
-        let path = Path::new("/home/jleechan/projects/dark-factory");
-        assert_eq!(
-            claude_project_slug(path),
-            "-home-jleechan-projects-dark-factory"
-        );
-    }
-}
-
 /// `br` CLI. `fetch_candidates` == `br list --status open --label factory --json`.
 pub trait Tracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError>;
@@ -411,27 +362,6 @@ pub trait Scm {
         self.pr_snapshot(pr)
     }
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError>;
-    /// Repo-scoped variant of [`close_pr`](Scm::close_pr) (bead jleechan-v6ud
-    /// / issue #340). The factory-fabricated re-roll path
-    /// (`reroll::execute` step 7) used to close the superseded PR via
-    /// `close_pr(pr_number, comment)` — which is bound at `main.rs`
-    /// construction time to `cfg.target_repo`. When a bead's resolved
-    /// `overlay.repo(cfg)` names a DIFFERENT repo (Stage A intake), `gh pr
-    /// close <n> --repo <default>` silently targets the DEFAULT repo's
-    /// PR with the same numeric ID — and if that PR is already merged
-    /// (the live failure for beads 8jxr and 9rkz: a same-numbered PR in
-    /// `jleechanorg/worldarchitect.ai` was already merged at the moment
-    /// the daemon tried to close it against the default repo), `gh` errors
-    /// out with "can't be closed because it was already merged" and the
-    /// bead wedges on a transient tool error. `repo` should always be
-    /// `overlay.repo(cfg)`, not `cfg.target_repo`. Default impl ignores
-    /// `repo` and delegates to `close_pr` so existing test fakes and any
-    /// impl that predates this method keep their original (single-repo)
-    /// behavior; `CliScm` overrides it to retarget via `with_repo`.
-    fn close_pr_for_repo(&self, repo: &str, pr: u64, comment: &str) -> Result<(), DaemonError> {
-        let _ = repo;
-        self.close_pr(pr, comment)
-    }
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError>;
     /// Repo-scoped variant of [`remote_branch_last_commit`](Scm::remote_branch_last_commit)
     /// (bead jleechan-bqdv, Stage C of the multi-repo dispatch fix — see
@@ -455,139 +385,6 @@ pub trait Scm {
         let _ = repo;
         self.remote_branch_last_commit(branch)
     }
-    /// Resolve the head branch of PR `pr` in `repo`, but ONLY when that PR
-    /// is currently OPEN AND its head lives in the SAME repo
-    /// (bead jleechan-drive-pr-branch-binding-pcpr). Used at dispatch time
-    /// to distinguish "drive an existing open PR" beads (whose
-    /// `external_ref` names a live, same-repo PR — the coder MUST land work
-    /// on the PR's own head branch, or AO's fail-closed branch validation
-    /// parks the bead `session_branch_mismatch` when it reuses the session
-    /// already bound to that branch) from ordinary create-new-work beads
-    /// (which always get a fresh generated `factory/<bead>-r<attempt>`
-    /// branch).
-    ///
-    /// `PrHeadBranch::Fork` is the fail-closed guard mirroring
-    /// `intake::same_repo_pr`: a PR whose head lives on a FORK must never
-    /// be bound to by name — the base repo has no such branch, so binding
-    /// would create an unrelated same-named branch there and silently never
-    /// touch the actual PR. `PrHeadBranch::NotFound` is the fail-safe
-    /// default for every case that must fall back to the generated-branch
-    /// path: a closed/merged/missing PR, an `external_ref` number that
-    /// isn't actually a pull request, or any lookup failure (transient
-    /// `gh` error, malformed response). Neither variant lets an
-    /// inconclusive lookup fabricate a branch binding it can't positively
-    /// confirm — see `CliScm`'s override for the real `gh api` lookup.
-    /// Default impl returns `Ok(PrHeadBranch::NotFound)` unconditionally so
-    /// every existing test fake and any impl that predates this method
-    /// keeps behaving exactly as before (always the generated-branch path)
-    /// without needing to implement it.
-    fn open_pr_head_ref_for_repo(&self, repo: &str, pr: u64) -> Result<PrHeadBranch, DaemonError> {
-        let _ = (repo, pr);
-        Ok(PrHeadBranch::NotFound)
-    }
-    /// Resolve the CURRENT open PR whose head ref is `branch` in `repo`
-    /// (bead jleechan-t40t, issue #326 branch-mismatch stale-state defect).
-    /// Returns `Ok(Some(pr))` when a single open PR is bound to `branch`,
-    /// `Ok(None)` when no such PR exists (or the lookup cannot positively
-    /// confirm one), or `Err` on a hard tool failure. Used by the slow-tier
-    /// DISPATCHED re-resolution path to detect drift between a bead's
-    /// recorded `pr_number` and the PR actually bound to its branch right
-    /// now — without this check, a stale `pr_number` (e.g. set from an AO
-    /// session that has since been superseded by a later PR on the same
-    /// branch) can keep a bead wedged DISPATCHED indefinitely: every tick
-    /// queries the wrong PR and the real PR is never gate-assessed.
-    /// `repo` should be `overlay.repo(cfg)`, not `cfg.target_repo`, so
-    /// cross-repo beads are observable. Default impl returns `Ok(None)`
-    /// unconditionally so existing test fakes and any impl that predates
-    /// this method keep their original behavior; `CliScm` overrides it to
-    /// actually call `gh pr list --head <branch>`.
-    fn pr_number_for_branch(
-        &self,
-        repo: &str,
-        branch: &str,
-    ) -> Result<Option<u64>, DaemonError> {
-        let _ = (repo, branch);
-        Ok(None)
-    }
-    /// Bead jleechan-yoqy / issue #323: verify a gist for the evidence gate.
-    ///
-    /// - `Ok(Some(true))` — fetchable AND non-empty (evidence Verified).
-    /// - `Ok(Some(false))` — fetchable but EMPTY (definitive Failed).
-    /// - `Ok(None)` — DEFINITIVELY not found: 404 / deleted / private (Failed).
-    /// - `Err(..)` — TRANSIENT (gh outage / network): the gate waits (Unknown),
-    ///   it does NOT churn a reroll (r5 finding 3).
-    ///
-    /// Default impl is `Err` ("unverifiable") so fakes and impls that predate
-    /// this method never accidentally pass the gate; `CliScm` overrides it to
-    /// run `gh api gists/<id>`.
-    fn gist_nonempty(&self, gist_id: &str) -> Result<Option<bool>, DaemonError> {
-        Err(DaemonError::Tool {
-            tool: "gh".into(),
-            rc: -1,
-            stderr: format!("gist_nonempty not implemented for this adapter (gist {gist_id})"),
-        })
-    }
-}
-
-/// Bead jleechan-yoqy / issue #323: the ONE canonical evidence marker literal.
-/// The coder-dispatch prompt requires the coder to put
-/// `**Evidence**: <gist-url> (head <sha>)` in the PR body; the `/er` reviewer
-/// contract references this same constant; and the verifier parser matches it
-/// (case-insensitive, with the `**` bold markers optional). Defining it once
-/// here — the shared low-level module every layer imports — guarantees the
-/// prompt, the reviewer contract, and the parser can never drift apart.
-pub const EVIDENCE_MARKER: &str = "**Evidence**:";
-
-/// Resolution of an [`Scm::open_pr_head_ref_for_repo`] lookup (bead
-/// jleechan-drive-pr-branch-binding-pcpr). A three-way result rather than
-/// `Option<String>` so callers can tell "confirmed open PR, but its head is
-/// on a fork — fail-closed, do not bind" apart from "no open PR found at
-/// all" — the two have the same fallback (generated branch) but very
-/// different causes, and dispatch-time telemetry needs to distinguish them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PrHeadBranch {
-    /// PR `pr` is OPEN and its head repo matches the queried `repo` —
-    /// safe to bind the coder branch to this ref.
-    SameRepo(String),
-    /// PR `pr` is OPEN but its head lives in a DIFFERENT repo (a fork, or
-    /// a deleted-fork PR whose `head.repo` GitHub no longer reports).
-    /// Binding to this branch name in the queried repo would create an
-    /// unrelated same-named branch there and never touch the actual PR —
-    /// mirrors the fail-closed fork guard `intake::same_repo_pr` already
-    /// applies to PR adoption.
-    Fork,
-    /// Closed/merged/missing PR, a `pr` number that isn't a pull request,
-    /// or a lookup/parse failure.
-    NotFound,
-}
-
-/// Liveness classification of a single AO session (bead jleechan-zeij /
-/// issue #322 r2). `is_quiescent` collapses everything into a single
-/// terminal-or-not boolean, which cannot tell "the worker exited" apart from
-/// "the worker finished its task and went back to idle without an explicit
-/// kill" — the exact `status=spawning, activity=idle` state that made the r1
-/// quiescence loop stall. The re-roll fail-closed proceed predicate
-/// (`reroll::execute`) needs that distinction: an `Idle` worker with a stable
-/// branch HEAD is safe to supersede (predicate (c)), a `Running` worker is
-/// NOT (it may still be pushing), so they must be joined with head-stability
-/// in the same poll rather than treated identically.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionActivity {
-    /// AO reports the session is actively doing work (any non-idle,
-    /// non-terminal `activity`). Never safe to supersede — the worker may be
-    /// mid-`git push`.
-    Running,
-    /// AO reports the session is alive but idle (`activity == "idle"`) — the
-    /// #322 live signature. Safe to supersede ONLY jointly with a stable
-    /// branch HEAD.
-    Idle,
-    /// AO reports one of its terminal statuses (`killed`/`done`/…) or
-    /// `activity == "exited"` — equivalent to `is_quiescent == true`.
-    Terminal,
-    /// No AO status row currently names this session — the worker has been
-    /// fully reaped. Equivalent to a `SessionNotFound` attach for supersede
-    /// purposes (nothing live left to guard against).
-    NotFound,
 }
 
 /// `ao` / `aow` CLIs.
@@ -597,48 +394,6 @@ pub trait Sessions {
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError>;
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError>;
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError>;
-    /// Budget-bounded `attach` (bead jleechan-zeij / issue #322 r4 P2). The
-    /// re-roll proceed poll caps each probe at the time remaining until its
-    /// window deadline so a single poll cannot block for multiples of the
-    /// window on stacked ~30s subprocess timeouts. The default ignores the
-    /// budget and delegates to [`attach`](Sessions::attach) (fakes are
-    /// instant); the real `CliSessions` overrides it to pass `timeout_secs`
-    /// down to `ao status`.
-    fn attach_within(
-        &self,
-        branch: &str,
-        bead_id: &str,
-        timeout_secs: u64,
-    ) -> Result<SessionId, DaemonError> {
-        let _ = timeout_secs;
-        self.attach(branch, bead_id)
-    }
-    /// Budget-bounded [`session_activity`](Sessions::session_activity) (bead
-    /// jleechan-zeij / issue #322 r4 P2). Default delegates to the unbounded
-    /// method; `CliSessions` overrides to pass `timeout_secs` to `ao status`.
-    fn session_activity_within(
-        &self,
-        id: &SessionId,
-        timeout_secs: u64,
-    ) -> Result<SessionActivity, DaemonError> {
-        let _ = timeout_secs;
-        self.session_activity(id)
-    }
-    /// Activity probe distinguishing idle vs running vs terminal (bead
-    /// jleechan-zeij / issue #322 r2 — see [`SessionActivity`]). The default
-    /// derives from `is_quiescent`: a quiescent session maps to `Terminal`,
-    /// a non-quiescent one to `Running`. That default deliberately CANNOT
-    /// report `Idle` — it fails closed toward "still running", so any adapter
-    /// that does not override this treats an idle worker as live and defers
-    /// rather than superseding it. The real adapter (`CliSessions`) overrides
-    /// this to read AO's `activity` field directly and surface `Idle`.
-    fn session_activity(&self, id: &SessionId) -> Result<SessionActivity, DaemonError> {
-        if self.is_quiescent(id)? {
-            Ok(SessionActivity::Terminal)
-        } else {
-            Ok(SessionActivity::Running)
-        }
-    }
     /// Returns the live branch AO reports for a given session, if known.
     ///
     /// jleechan-5ia2: a `bead_overlay` row was found with
@@ -692,38 +447,6 @@ pub trait Sessions {
         let _ = (ao_project, branch, remote_name);
         Ok(None)
     }
-    /// Most recent modification time (unix epoch seconds) observed across
-    /// the coder's own Claude Code transcript directory for the worktree
-    /// backing `ao_project`/`branch`, or `None` when it cannot be
-    /// determined (bead jleechan-coder-silent-false-parks-h92r).
-    ///
-    /// 2026-07-17: all 6 active dispatch lanes were parked
-    /// `PARKED_HUMAN_HELD reason=coder_silent` by `tick.rs`'s wedge-detection
-    /// sweep while their coders were demonstrably working — transcripts
-    /// growing, commits landing — because that sweep's only liveness signal
-    /// was "has the branch received a REMOTE commit in the last 30
-    /// minutes". A coder can spend well over 30 minutes editing, running
-    /// tests, and iterating locally before its next push; silence on the
-    /// remote branch is not evidence the coder is silent. This method gives
-    /// the sweep a second, independent liveness signal sourced from the
-    /// coder's own transcript activity, which updates continuously
-    /// regardless of push cadence.
-    ///
-    /// `Ok(None)` means "no evidence" (missing worktree mapping, missing
-    /// transcript directory, unreadable files, no `$HOME`) — callers MUST
-    /// NOT treat that as proof the coder is silent, only as "this signal
-    /// could not corroborate liveness". The default impl (for fakes/older
-    /// adapters) always returns `Ok(None)`, which preserves today's
-    /// branch-only fail-closed behavior for any caller that doesn't opt
-    /// into the combined check.
-    fn worktree_transcript_last_activity_epoch(
-        &self,
-        ao_project: &str,
-        branch: &str,
-    ) -> Result<Option<u64>, DaemonError> {
-        let _ = (ao_project, branch);
-        Ok(None)
-    }
     fn spawn_batch(&self, specs: &[SpawnSpec]) -> Result<Vec<SessionId>, DaemonError> {
         let mut ids = Vec::new();
         for spec in specs {
@@ -737,80 +460,7 @@ pub trait Sessions {
 pub trait Vcs {
     fn base_head(&self, base_branch: &str) -> Result<String, DaemonError>;
     fn create_branch_at(&self, name: &str, sha: &str) -> Result<(), DaemonError>;
-    /// Repo-scoped variant of [`base_head`](Vcs::base_head) (bead
-    /// jleechan-wuts / issue #349). The factory-fabricated re-roll path
-    /// (`reroll::execute` step 4) used to compute the new attempt's
-    /// base SHA via `base_head(base_branch)` — which is bound at
-    /// `main.rs` construction time to the daemon process's CWD
-    /// (its systemd `WorkingDirectory`, the daemon's own source-repo
-    /// checkout). When a bead's resolved `overlay.repo(cfg)` names a
-    /// DIFFERENT repo (Stage A intake — the live failure for the 8jxr /
-    /// 9rkz class), `git rev-parse <branch>` runs against the daemon's
-    /// own repo's same-named branch (or fails outright), never against
-    /// the routed target repo — silently wrong for any cross-repo
-    /// bead. `repo` should always be `overlay.repo(cfg)`, not
-    /// `cfg.target_repo` directly. Default impl ignores `repo` and
-    /// delegates to `base_head` so existing test fakes and any impl that
-    /// predates this method keep their original (single-repo) behavior;
-    /// `CliVcs` overrides it to retarget via `gh api
-    /// repos/<repo>/git/ref/heads/<branch>` (the same `gh api` plumbing
-    /// `remote_head_sha` already uses).
-    fn base_head_for_repo(&self, repo: &str, base_branch: &str) -> Result<String, DaemonError> {
-        let _ = repo;
-        self.base_head(base_branch)
-    }
-    /// Repo-scoped variant of [`create_branch_at`](Vcs::create_branch_at)
-    /// (bead jleechan-wuts / issue #349). The factory-fabricated re-roll
-    /// path (`reroll::execute` step 5) used to create the new attempt's
-    /// branch via `create_branch_at(name, sha)` — which shells out to
-    /// LOCAL `git branch <name> <sha>` in the daemon process's CWD
-    /// (the daemon's own source-repo checkout). When a bead's resolved
-    /// `overlay.repo(cfg)` names a DIFFERENT repo (the live failure
-    /// for the 8jxr / 9rkz class), the new `factory/<bead>-r<n>` branch
-    /// is created in the daemon's own repo, never in the routed target
-    /// repo where the worker will actually push — meaning the worker's
-    /// first `git push` either lands on a branch the daemon never made,
-    /// or is forced to create its own branch out-of-band, depending on
-    /// the branch-protection rules. `repo` should always be
-    /// `overlay.repo(cfg)`, not `cfg.target_repo` directly. Default
-    /// impl ignores `repo` and delegates to `create_branch_at` so
-    /// existing test fakes and any impl that predates this method keep
-    /// their original (single-repo) behavior; `CliVcs` overrides it to
-    /// POST a `refs/heads/<name>` ref via `gh api repos/<repo>/git/refs`
-    /// (cross-repo ref creation that does NOT depend on the daemon's
-    /// local checkout at all).
-    fn create_branch_at_for_repo(&self, repo: &str, name: &str, sha: &str) -> Result<(), DaemonError> {
-        let _ = repo;
-        self.create_branch_at(name, sha)
-    }
-    /// Repo-scoped variant of ref deletion (bead jleechan-znmh / issue #341,
-    /// reroll idempotency on stale local `-rN` branches). When the daemon's
-    /// routed-repo `create_branch_at_for_repo` POST fails with HTTP 422
-    /// "Reference already exists" — meaning a PRIOR failed reroll attempt
-    /// left a `factory/<bead>-r<n>` ref behind in the routed repo, even
-    /// though the daemon's local checkout never created it — the reroll
-    /// must delete that stale ref via this entry point and retry the
-    /// create. Like `create_branch_at_for_repo`, this is a cross-repo
-    /// `gh api` operation decoupled from the daemon's own cwd (the same
-    /// shape as #349). Default impl is a no-op so existing single-repo
-    /// test fakes keep their original behaviour transparently; `CliVcs`
-    /// overrides it to `DELETE repos/<repo>/git/refs/heads/<name>`.
-    fn delete_branch_at_for_repo(
-        &self,
-        repo: &str,
-        name: &str,
-    ) -> Result<(), DaemonError> {
-        let _ = (repo, name);
-        Ok(())
-    }
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError>;
-    /// Budget-bounded [`head_sha`](Vcs::head_sha) (bead jleechan-zeij / issue
-    /// #322 r4 P2). Default delegates to the unbounded method; the real
-    /// `CliVcs` overrides to pass `timeout_secs` down to `git`.
-    fn head_sha_within(&self, branch: &str, timeout_secs: u64) -> Result<String, DaemonError> {
-        let _ = timeout_secs;
-        self.head_sha(branch)
-    }
     /// `true` iff `local_head` (the local branch's SHA) is a strict ancestor of
     /// `remote_sha` — i.e. the remote PR head contains every local commit AND
     /// has at least one extra commit the local checkout has not seen yet. Returns

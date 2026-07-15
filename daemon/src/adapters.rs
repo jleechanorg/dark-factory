@@ -1,5 +1,5 @@
 use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
-use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
+use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -55,14 +55,6 @@ impl Tracker for CliTracker {
             id: String,
             title: String,
             description: Option<String>,
-            // jleechan-0hqx (issue #338): operator-authored per-attempt
-            // guidance, set via `br update --notes`. Surfaced into the coder
-            // prompt as the higher-priority-than-description
-            // OPERATOR GUIDANCE section so attempt rN coders stop
-            // re-litigating scope the operator already settled on requeue.
-            // `Option` because beads predating this field, or with no notes
-            // set, omit it from the `br list --json` payload.
-            notes: Option<String>,
             external_ref: Option<String>,
         }
         let data: BrListOutput = serde_json::from_str(&out[json_start..]).map_err(|e| {
@@ -80,7 +72,6 @@ impl Tracker for CliTracker {
             id: issue.id,
             title: issue.title,
             description: issue.description.unwrap_or_default(),
-            notes: issue.notes.unwrap_or_default(),
             file_tree_summary: file_tree_summary.clone(),
             external_ref: issue.external_ref,
         }).collect();
@@ -187,16 +178,7 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
     if parts.len() == 2 {
         Some((parts[0].to_string(), parts[1].to_string()))
     } else {
-        let url_parts: Vec<&str> = external_ref
-            .strip_prefix("https://github.com/")?
-            .split('/')
-            .collect();
-        match url_parts.as_slice() {
-            [owner, repo, kind, number] if matches!(*kind, "pull" | "issues") => {
-                Some((format!("{owner}/{repo}"), number.to_string()))
-            }
-            _ => None,
-        }
+        None
     }
 }
 
@@ -212,15 +194,15 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
 /// `owner/repo#N` base, which already contains a `#`, producing 3
 /// `#`-delimited segments and a permanent `comment_external` parse failure.
 ///
-/// `parse_external_ref` intentionally stays strict for short-form refs
-/// (exactly one `#`) while also accepting exact GitHub pull/issue URLs, so
-/// this corrupted shape is still detected as invalid on its own. This helper
-/// is the single call site (escalation comment posting) that recognizes the
-/// specific `<repo>#<pr>#local-<token>` shape and strips the trailing
-/// disambiguation suffix to recover the real target, so already-corrupted
-/// stored data (which this PR does NOT bulk-repair) can still have its
-/// escalation comment posted. Any other malformed shape — including bare
-/// `local-<id>` refs — is left untouched.
+/// `parse_external_ref` intentionally stays strict (exactly one `#`) so
+/// this corrupted shape is still detected as invalid on its own; this
+/// helper is the single call site (escalation comment posting) that
+/// recognizes the specific `<repo>#<pr>#local-<token>` shape and strips
+/// the trailing disambiguation suffix to recover the real target, so
+/// already-corrupted stored data (which this PR does NOT bulk-repair) can
+/// still have its escalation comment posted. Any other malformed shape —
+/// bare `local-<id>` refs, full GitHub URLs — is left untouched; those are
+/// jleechan-twa0's territory (parser format acceptance), not this bug.
 fn canonicalize_external_ref_for_comment(external_ref: &str) -> Option<(String, String)> {
     if let Some(parsed) = parse_external_ref(external_ref) {
         return Some(parsed);
@@ -1130,116 +1112,6 @@ impl Scm for CliScm {
         self.with_repo(repo).pr_snapshot(pr)
     }
 
-    /// jleechan-drive-pr-branch-binding-pcpr: single REST lookup
-    /// (`repos/{repo}/pulls/{pr}`) used at dispatch time to decide whether
-    /// a bead's `external_ref` names a live, SAME-REPO open PR that
-    /// dispatch must bind to instead of fabricating
-    /// `factory/<bead>-r<attempt>`. Parsing is delegated to
-    /// `parse_open_pr_head_ref` (a pure, unit-testable seam) so the fork
-    /// guard can be exercised directly without a `gh` subprocess.
-    fn open_pr_head_ref_for_repo(&self, repo: &str, pr: u64) -> Result<PrHeadBranch, DaemonError> {
-        let out = match run_tool("gh", &["api", &format!("repos/{repo}/pulls/{pr}")], 15) {
-            Ok(out) => out,
-            Err(_) => return Ok(PrHeadBranch::NotFound),
-        };
-        Ok(parse_open_pr_head_ref(&out, repo))
-    }
-
-    /// Bead jleechan-t40t (issue #326): resolve the CURRENT open PR whose
-    /// head ref is `branch` in `repo`. Implementation issues
-    /// `gh pr list --head <branch> --repo <repo> --json number --jq '.[0].number'`
-    /// and parses the trimmed stdout as a `u64`. Mirrors the
-    /// slow-tier DISPATCHED re-resolution path in `tick.rs::run_slow_tier`
-    /// — both have to agree on the same branch→PR contract. `Err(_)` is
-    /// returned only on a hard `gh` failure; "no such PR" is `Ok(None)` so
-    /// callers can distinguish "transient tool error" (retry next tick)
-    /// from "the branch really has no open PR right now" (legitimate —
-    /// keep using the existing `pr_number` until one appears).
-    fn pr_number_for_branch(
-        &self,
-        repo: &str,
-        branch: &str,
-    ) -> Result<Option<u64>, DaemonError> {
-        // jleechan-t40t (issue #326) r6: filter the lookup to SAME-REPO
-        // PRs only. `--repo owner/repo` scopes the LIST to that repo, but
-        // `--head <branch>` matches against `headRefName` which can
-        // collide with a fork PR's head branch name (r6 lesson from
-        // PR #305 — `gh pr list --head X --repo owner/repo` may surface
-        // a fork PR whose `headRefName == X` because the JSON payload
-        // includes `headRepository.nameWithOwner`). The jq filter
-        // selects only entries whose headRepository matches the queried
-        // repo, mirroring the same-repo guard `intake::same_repo_pr`
-        // already applies to PR adoption.
-        let jq_filter = format!(
-            ".[] | select(.headRepository.nameWithOwner == \"{repo}\") | .number"
-        );
-        let out = match run_tool(
-            "gh",
-            &[
-                "pr",
-                "list",
-                "--head",
-                branch,
-                "--repo",
-                repo,
-                "--json",
-                "number,headRepository",
-                "--jq",
-                &jq_filter,
-            ],
-            30,
-        ) {
-            Ok(o) => o,
-            Err(DaemonError::Tool { stderr, .. })
-                if stderr.contains("404")
-                    || stderr.contains("Not Found")
-                    || stderr.contains("not found") =>
-            {
-                return Ok(None);
-            }
-            Err(e) => return Err(e),
-        };
-        let trimmed = out.trim();
-        if trimmed.is_empty() || trimmed == "null" {
-            return Ok(None);
-        }
-        match trimmed.parse::<u64>() {
-            Ok(pr) => Ok(Some(pr)),
-            Err(_) => Ok(None),
-        }
-    }
-
-    /// Bead jleechan-yoqy / issue #323 (r5): `gh api gists/<id>` and report the
-    /// gist's verification state. A 404 (deleted / private / never existed) is
-    /// `Ok(None)` — a DEFINITIVE miss the evidence gate fails on. Any other gh
-    /// error is TRANSIENT (`Err`) — the gate waits rather than churning a
-    /// reroll on gh noise. A fetchable gist reports `Ok(Some(total_size > 0))`.
-    fn gist_nonempty(&self, gist_id: &str) -> Result<Option<bool>, DaemonError> {
-        // Sum the `size` of every file in the gist via jq; empty -> 0.
-        let out = match run_tool(
-            "gh",
-            &[
-                "api",
-                &format!("gists/{gist_id}"),
-                "--jq",
-                "[.files[].size] | add // 0",
-            ],
-            30,
-        ) {
-            Ok(out) => out,
-            Err(DaemonError::Tool { stderr, .. })
-                if stderr.contains("404")
-                    || stderr.contains("Not Found")
-                    || stderr.contains("not found") =>
-            {
-                return Ok(None); // definitively missing
-            }
-            Err(e) => return Err(e), // transient — the gate waits
-        };
-        let total: u64 = out.trim().parse().unwrap_or(0);
-        Ok(Some(total > 0))
-    }
-
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
         let offline_path = std::path::Path::new(".beads/offline").join(format!("pr_{}.json", pr));
         if offline_path.exists() {
@@ -1265,22 +1137,6 @@ impl Scm for CliScm {
             issues_cache.clear();
         }
         Ok(())
-    }
-
-    /// jleechan-v6ud / issue #340: retarget `gh pr close` at `repo` via
-    /// `with_repo` instead of always closing against `self.repo` (the
-    /// daemon's global `cfg.target_repo`, bound at construction time in
-    /// `main.rs`). Without this override, a same-numbered PR that already
-    /// merged in the default repo (beads 8jxr and 9rkz: the same `#315`
-    /// and `#314` had ALREADY merged in `jleechanorg/worldarchitect.ai` at
-    /// the moment the reroll closed them) makes `gh pr close` error with
-    /// "can't be closed because it was already merged", wedging the bead
-    /// on a transient tool error instead of mutating the bead's actual
-    /// repo's PR. Fresh `with_repo` instance (not a cache-sharing clone)
-    /// so a cross-repo call can never evict another repo's cached
-    /// `pr_snapshot_cache` entry under a colliding PR-number key.
-    fn close_pr_for_repo(&self, repo: &str, pr: u64, comment: &str) -> Result<(), DaemonError> {
-        self.with_repo(repo).close_pr(pr, comment)
     }
 
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError> {
@@ -1358,112 +1214,6 @@ impl Scm for CliScm {
         branch: &str,
     ) -> Result<Option<u64>, DaemonError> {
         self.with_repo(repo).remote_branch_last_commit(branch)
-    }
-}
-
-/// Pure parser behind [`Scm::open_pr_head_ref_for_repo`] (unit-testable
-/// seam — no `gh` subprocess needed to exercise the fork guard).
-///
-/// Fork guard (codex cross-model review of PR #305): binding to a FORK PR's
-/// head branch name and then pushing to the queried repo creates an
-/// unrelated same-named branch there and never touches the actual PR —
-/// silent wrong behavior. A fork head (`head.repo.full_name != repo`), or a
-/// missing/deleted head repo (`head.repo: null` — GitHub omits it once the
-/// fork has been deleted), therefore resolves to `PrHeadBranch::Fork`, not
-/// `SameRepo`, mirroring the intake-side cross-repository guard
-/// (`intake::same_repo_pr`).
-pub(crate) fn parse_open_pr_head_ref(out: &str, repo: &str) -> PrHeadBranch {
-    #[derive(serde::Deserialize)]
-    struct RestPullView {
-        state: String,
-        head: RestPullViewHead,
-    }
-    #[derive(serde::Deserialize)]
-    struct RestPullViewHead {
-        #[serde(rename = "ref")]
-        ref_name: String,
-        repo: Option<RestPullViewHeadRepo>,
-    }
-    #[derive(serde::Deserialize)]
-    struct RestPullViewHeadRepo {
-        full_name: Option<String>,
-    }
-    let json_start = out.find('{').unwrap_or(0);
-    let parsed: RestPullView = match serde_json::from_str(&out[json_start..]) {
-        Ok(p) => p,
-        Err(_) => return PrHeadBranch::NotFound,
-    };
-    if !parsed.state.eq_ignore_ascii_case("open") {
-        return PrHeadBranch::NotFound;
-    }
-    let same_repo = parsed
-        .head
-        .repo
-        .as_ref()
-        .and_then(|r| r.full_name.as_deref())
-        .map(|full| full.eq_ignore_ascii_case(repo))
-        .unwrap_or(false);
-    if same_repo {
-        PrHeadBranch::SameRepo(parsed.head.ref_name)
-    } else {
-        PrHeadBranch::Fork
-    }
-}
-
-#[cfg(test)]
-mod open_pr_head_ref_tests {
-    // Codex cross-model review of PR #305: direct unit coverage of the pure
-    // REST-parsing seam, using real GitHub REST PR-view JSON shapes — the
-    // fake-Scm-level tests in dispatch.rs/tick_integration.rs prove the
-    // CONTRACT (fork PR -> ForkFallback -> generated branch); these prove
-    // the actual `gh api repos/{repo}/pulls/{pr}` JSON parsing that feeds it.
-    use super::parse_open_pr_head_ref;
-    use crate::tools::PrHeadBranch;
-
-    #[test]
-    fn open_same_repo_pr_resolves_same_repo_with_head_ref() {
-        let json = r#"{"state":"open","head":{"ref":"factory/jleechan-xa99-r1","repo":{"full_name":"owner/repo"}}}"#;
-        assert_eq!(
-            parse_open_pr_head_ref(json, "owner/repo"),
-            PrHeadBranch::SameRepo("factory/jleechan-xa99-r1".to_string())
-        );
-    }
-
-    #[test]
-    fn open_fork_pr_resolves_fork_not_same_repo_head_ref() {
-        // The fork's OWN branch happens to be named identically to what a
-        // generated branch would look like — proving the guard checks
-        // `head.repo.full_name`, not just PR openness or the ref string.
-        let json = r#"{"state":"open","head":{"ref":"factory/jleechan-xa99-r1","repo":{"full_name":"someone-else/repo"}}}"#;
-        assert_eq!(parse_open_pr_head_ref(json, "owner/repo"), PrHeadBranch::Fork);
-    }
-
-    #[test]
-    fn open_pr_with_case_different_same_repo_name_still_matches() {
-        let json = r#"{"state":"OPEN","head":{"ref":"factory/x","repo":{"full_name":"Owner/Repo"}}}"#;
-        assert_eq!(
-            parse_open_pr_head_ref(json, "owner/repo"),
-            PrHeadBranch::SameRepo("factory/x".to_string())
-        );
-    }
-
-    #[test]
-    fn open_pr_with_deleted_fork_head_repo_resolves_fork_not_same_repo() {
-        // GitHub omits `head.repo` entirely once the source fork has been
-        // deleted — must NOT default to "assume same repo".
-        let json = r#"{"state":"open","head":{"ref":"factory/x","repo":null}}"#;
-        assert_eq!(parse_open_pr_head_ref(json, "owner/repo"), PrHeadBranch::Fork);
-    }
-
-    #[test]
-    fn closed_same_repo_pr_resolves_not_found() {
-        let json = r#"{"state":"closed","head":{"ref":"factory/x","repo":{"full_name":"owner/repo"}}}"#;
-        assert_eq!(parse_open_pr_head_ref(json, "owner/repo"), PrHeadBranch::NotFound);
-    }
-
-    #[test]
-    fn malformed_json_resolves_not_found() {
-        assert_eq!(parse_open_pr_head_ref("not json", "owner/repo"), PrHeadBranch::NotFound);
     }
 }
 
@@ -1652,100 +1402,14 @@ fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonErro
     ao_spawn_command_with_mode(agent, spec, false)
 }
 
-/// Maps legacy vendor aliases onto their canonical AO plugin names. The
-/// runtime and startup paths consult this single source so a renamed plugin
-/// never silently disappears from `--agent` argv or preflight checks.
-///
-/// `aow -> minimax` predates this PR (legacy minimax-by-AO alias).
-/// `agy -> antigravity` covers AO main's 2026-07-18 rename of the
-/// antigravity plugin; lane 222 burned a full spawn cycle before the
-/// jleechan-agy-vendor-name-drift-9lvs regression exposed the mismatch.
-pub fn canonical_for_alias(vendor: &str) -> Option<&'static str> {
-    match vendor {
-        "aow" => Some("minimax"),
-        "agy" => Some("antigravity"),
-        _ => None,
-    }
-}
-
-/// Fail-closed preflight over the daemon's configured vendor set against
-/// the bridge-reported AO plugin registry. This runs on EVERY startup —
-/// skipping it because the registry is empty/missing/malformed is what let
-/// the jleechan-9lvs drift class reach a per-bead spawn cycle in the first
-/// place. Distinct error messages keep triage cheap:
-///
-/// * registry error → `VendorRegistryError` (registry reachable, list broken)
-/// * empty registry → `VendorRegistryEmpty` (registry reachable, no plugins)
-/// * missing canonical vendor → `VendorNotInstalled` (each missing name listed)
-pub fn validate_configured_vendors(
-    installed_plugins: Result<&[String], &str>,
-    configured_vendors: &[String],
-) -> Result<(), DaemonError> {
-    let installed = match installed_plugins {
-        Ok(list) => list,
-        Err(message) => {
-            return Err(DaemonError::Config(format!(
-                "AO bridge reported a registry error while enumerating agent plugins ({}); refusing to start because the daemon cannot prove any configured vendor is installed",
-                message
-            )));
-        }
-    };
-    if installed.is_empty() {
-        return Err(DaemonError::Config(format!(
-            "AO bridge reported zero installed agent plugins (configured vendors: {}); refusing to start because a factory with zero coder plugins cannot dispatch",
-            configured_vendors.join(", ")
-        )));
-    }
-
-    // Dedup configured_vendors by their canonical form so that e.g.
-    // ['agy', 'antigravity'] is treated as a single vendor before we
-    // ask the registry whether it's installed.
-    let mut seen = std::collections::HashSet::new();
-    let mut canonical_chain: Vec<String> = Vec::new();
-    for vendor in configured_vendors {
-        let canonical = canonical_for_alias(vendor)
-            .map(str::to_string)
-            .unwrap_or_else(|| vendor.clone());
-        if canonical.is_empty() {
-            continue;
-        }
-        if seen.insert(canonical.clone()) {
-            canonical_chain.push(canonical);
-        }
-    }
-
-    let mut missing: Vec<String> = Vec::new();
-    for canonical in &canonical_chain {
-        if !installed.iter().any(|name| name == canonical) {
-            missing.push(canonical.clone());
-        }
-    }
-    if !missing.is_empty() {
-        return Err(DaemonError::Config(format!(
-            "AO plugin registry is missing configured vendor(s) {} (installed: {}); refusing to start so a renamed plugin cannot burn a full spawn cycle",
-            missing.join(", "),
-            installed.join(", ")
-        )));
-    }
-    Ok(())
-}
-
 /// Runs the AO v0.1.3 preload in its read-only diagnostic mode. This checks
 /// the actual `ao` executable selected by the daemon's production PATH, its
 /// Node major version, package version, core APIs, configured project, and
 /// plugin resolution without performing preflight side effects, acquiring a
 /// spawn lock, creating a workspace, or launching a worker.
-///
-/// `configured_vendors` is the daemon's full deduped canonical vendor list
-/// (default + fallback chain, after alias resolution). The bridge diagnostic
-/// payload distinguishes three registry states via distinct JSON keys:
-/// `agentPlugins` (sorted array of installed plugin names) when the registry
-/// answered, `agentPluginsError` (string message) when the registry threw.
-/// An absent key is treated as a malformed payload and rejected.
 pub fn verify_ao_bridge_compatibility(
     ao_project: &str,
     agent: &str,
-    configured_vendors: &[String],
 ) -> Result<(), DaemonError> {
     let spec = SpawnSpec {
         bead_id: "daemon-startup-diagnostic".to_string(),
@@ -1797,55 +1461,6 @@ pub fn verify_ao_bridge_compatibility(
             "AO bridge compatibility diagnostic reported an incompatible runtime: {diagnostic}"
         )));
     }
-    // Three mutually-exclusive registry states, distinguished by separate
-    // JSON keys so the daemon cannot confuse "registry reachable but empty"
-    // (hard failure: factory cannot dispatch) with "registry threw" (also a
-    // hard failure, but the message names the underlying exception so the
-    // operator knows to fix the AO install, not the daemon config).
-    let registry_state: Result<Vec<String>, String> = match (
-        diagnostic.get("agentPlugins"),
-        diagnostic.get("agentPluginsError"),
-    ) {
-        (Some(_), Some(_)) => Err(
-            "AO bridge diagnostic carried BOTH agentPlugins and agentPluginsError; payload is malformed"
-                .to_string(),
-        ),
-        (Some(value), None) => match value.as_array() {
-            Some(array) => {
-                let mut names: Vec<String> = array
-                    .iter()
-                    .filter_map(|entry| entry.as_str().map(str::to_string))
-                    .collect();
-                names.sort();
-                names.dedup();
-                Ok(names)
-            }
-            None => Err(
-                "AO bridge diagnostic agentPlugins is not a JSON array".to_string(),
-            ),
-        },
-        (None, Some(value)) => Err(value
-            .as_str()
-            .unwrap_or("non-string agentPluginsError in bridge diagnostic")
-            .to_string()),
-        (None, None) => Err(
-            "AO bridge diagnostic payload omitted both agentPlugins and agentPluginsError; \
-             refusing to start because the daemon cannot prove any configured vendor is installed"
-                .to_string(),
-        ),
-    };
-    let installed_slice: Result<&[String], &str> = match &registry_state {
-        Ok(list) => Ok(list.as_slice()),
-        Err(message) => Err(message.as_str()),
-    };
-    validate_configured_vendors(installed_slice, configured_vendors).map_err(|error| {
-        match error {
-            DaemonError::Config(message) => DaemonError::Config(format!(
-                "AO bridge compatibility preflight failed: {message}"
-            )),
-            other => other,
-        }
-    })?;
     Ok(())
 }
 
@@ -2050,38 +1665,23 @@ impl CliSessions {
     fn spawn_with_fallback(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
         let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
             .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
-        let fallback_agents = build_runtime_fallback_chain(&self.agent, &fallback_str);
+        
+        let mut fallback_agents = Vec::new();
+        fallback_agents.push(self.agent.clone());
+        for part in fallback_str.split("->") {
+            let part_trimmed = part.trim().to_string();
+            let mapped_agent = if part_trimmed == "aow" {
+                "minimax".to_string()
+            } else {
+                part_trimmed
+            };
+            if !mapped_agent.is_empty() && !fallback_agents.contains(&mapped_agent) {
+                fallback_agents.push(mapped_agent);
+            }
+        }
+
         fallback_spawn(&fallback_agents, |agent| self.run_spawn_process(agent, spec))
     }
-}
-
-/// Pure helper used by `CliSessions::spawn_with_fallback` (and unit-tested
-/// directly) that canonicalizes the runtime vendor chain through the same
-/// `canonical_for_alias` map the startup preflight uses. Dedup is by
-/// canonical form so a config that names both `agy` and `antigravity`
-/// doesn't try the same plugin twice.
-fn build_runtime_fallback_chain(default_agent: &str, fallback_str: &str) -> Vec<String> {
-    let canonicalize = |vendor: &str| -> String {
-        canonical_for_alias(vendor)
-            .map(str::to_string)
-            .unwrap_or_else(|| vendor.to_string())
-    };
-    let mut chain: Vec<String> = Vec::new();
-    let default_canonical = canonicalize(default_agent);
-    if !default_canonical.is_empty() {
-        chain.push(default_canonical);
-    }
-    for part in fallback_str.split("->") {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let canonical = canonicalize(trimmed);
-        if !canonical.is_empty() && !chain.contains(&canonical) {
-            chain.push(canonical);
-        }
-    }
-    chain
 }
 
 /// Walks `agents` in order, calling `attempt_spawn` for each until one
@@ -2121,54 +1721,8 @@ where
 
 #[cfg(test)]
 mod spawn_fallback_tests {
-    use super::{build_runtime_fallback_chain, fallback_spawn};
+    use super::fallback_spawn;
     use crate::errors::DaemonError;
-
-    // jleechan-9lvs r2 (CodeRabbit blocker on PR #362): the runtime --agent
-    // argv must canonicalize through the SAME alias map the startup
-    // preflight uses, otherwise preflight passes for `agy`->`antigravity`
-    // and runtime still spawns `--agent agy` and reproduces the failure
-    // mode this PR is meant to eliminate. This test exercises the helper
-    // directly so we never have to spin up a subprocess to assert
-    // argv-shape behavior.
-    #[test]
-    fn runtime_fallback_chain_never_emits_legacy_alias_after_agy_rename() {
-        // Default `agy` (legacy alias) plus a fallback chain that names
-        // both `agy` and `antigravity`. After canonicalization + dedup the
-        // chain must contain ONLY canonical plugin names; no literal
-        // `agy` or `aow` may survive.
-        let chain = build_runtime_fallback_chain("agy", "antigravity->agy->aow->minimax");
-
-        assert!(
-            !chain.iter().any(|v| v == "agy"),
-            "legacy alias `agy` must be canonicalized to `antigravity`; got: {chain:?}"
-        );
-        assert!(
-            !chain.iter().any(|v| v == "aow"),
-            "legacy alias `aow` must be canonicalized to `minimax`; got: {chain:?}"
-        );
-        // Both canonical plugins appear, order preserved (default first).
-        assert_eq!(
-            chain,
-            vec!["antigravity".to_string(), "minimax".to_string()]
-        );
-    }
-
-    #[test]
-    fn runtime_fallback_chain_preserves_passthrough_when_no_alias_matches() {
-        let chain = build_runtime_fallback_chain(
-            "minimax",
-            "claude-code->antigravity->agy",
-        );
-        assert_eq!(
-            chain,
-            vec![
-                "minimax".to_string(),
-                "claude-code".to_string(),
-                "antigravity".to_string(),
-            ]
-        );
-    }
 
     /// jleechan-r56m red proof: simulate all 3 vendors in a fallback chain
     /// failing with DIFFERENT, distinguishable errors. Today's aggregation
@@ -3540,20 +3094,7 @@ impl Sessions for CliSessions {
     /// verbatim in telemetry a human reads, so the message names the branch
     /// and bead explicitly instead of a generic "not found".
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
-        self.attach_within(branch, bead_id, 30)
-    }
-
-    /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded `attach` — the
-    /// re-roll poll passes the time remaining until its window deadline so a
-    /// single poll cannot block for multiples of the window on stacked ~30s
-    /// `ao status` timeouts.
-    fn attach_within(
-        &self,
-        branch: &str,
-        bead_id: &str,
-        timeout_secs: u64,
-    ) -> Result<SessionId, DaemonError> {
-        let out = run_tool("ao", &["status", "--json"], timeout_secs)?;
+        let out = run_tool("ao", &["status", "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -3573,34 +3114,6 @@ impl Sessions for CliSessions {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
         })?;
         session_is_quiescent(&data, id)
-    }
-
-    /// Bead jleechan-zeij / issue #322 r2: read AO's per-session `activity`
-    /// field directly so the re-roll proceed predicate can tell an idle
-    /// worker (`status=spawning, activity=idle` — safe to supersede jointly
-    /// with a stable HEAD) apart from a running one (never safe). Same
-    /// `ao status --json` parsing shape as `is_quiescent` above; a session
-    /// with no matching status row classifies as `NotFound` (fully reaped).
-    fn session_activity(
-        &self,
-        id: &SessionId,
-    ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        self.session_activity_within(id, 30)
-    }
-
-    /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded
-    /// `session_activity` — same rationale as `attach_within`.
-    fn session_activity_within(
-        &self,
-        id: &SessionId,
-        timeout_secs: u64,
-    ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        let out = run_tool("ao", &["status", "--json"], timeout_secs)?;
-        let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
-        session_activity(&data, id)
     }
 
     /// jleechan-5ia2: `ao status --json` already reports each session's
@@ -3690,68 +3203,6 @@ impl Sessions for CliSessions {
             Ok(Some(trimmed.to_string()))
         }
     }
-
-    /// Bead jleechan-coder-silent-false-parks-h92r: unlike
-    /// `worktree_remote_url` (a spawn-time-only assertion that fails closed
-    /// on a missing mapping), this is an advisory liveness signal consulted
-    /// on every tick a bead sits DISPATCHED — a missing AO workspace
-    /// mapping, missing `$HOME`, or missing transcript directory are all
-    /// "no evidence", not an error, so the coder-silence sweep can fall back
-    /// to its other signal instead of hard-failing the whole tick.
-    fn worktree_transcript_last_activity_epoch(
-        &self,
-        ao_project: &str,
-        branch: &str,
-    ) -> Result<Option<u64>, DaemonError> {
-        let key = (ao_project.to_string(), branch.to_string());
-        let path = self
-            .spawned_worktrees
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            .cloned();
-        let Some(path) = path else {
-            return Ok(None);
-        };
-        let home = std::env::var("HOME").unwrap_or_default();
-        if home.is_empty() {
-            return Ok(None);
-        }
-        let slug = crate::tools::claude_project_slug(&path);
-        let transcript_dir = std::path::Path::new(&home)
-            .join(".claude")
-            .join("projects")
-            .join(slug);
-        Ok(latest_jsonl_mtime_epoch(&transcript_dir))
-    }
-}
-
-/// Most recent modification time (unix epoch seconds) across every
-/// `*.jsonl` file directly inside `dir`, or `None` when `dir` doesn't exist,
-/// isn't readable, or contains no `.jsonl` files. A single unreadable entry
-/// is skipped rather than failing the whole scan — this is a best-effort
-/// liveness signal, not a correctness-critical read.
-fn latest_jsonl_mtime_epoch(dir: &std::path::Path) -> Option<u64> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut latest: Option<u64> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) else {
-            continue;
-        };
-        let epoch = dur.as_secs();
-        latest = Some(latest.map_or(epoch, |l: u64| l.max(epoch)));
-    }
-    latest
 }
 
 /// Count the daemon's one global AO worker envelope across every project.
@@ -3780,36 +3231,6 @@ fn session_is_quiescent(
         .iter()
         .find(|entry| entry.get("name").and_then(|value| value.as_str()) == Some(&id.0))
         .is_some_and(is_terminal_ao_session))
-}
-
-/// Bead jleechan-zeij / issue #322 r2: classify a session's liveness into
-/// [`SessionActivity`]. Ordering matters — a terminal status wins over the
-/// `activity` field (a `killed` session may still carry a stale
-/// `activity=idle`), then `activity=="idle"` distinguishes an alive-but-idle
-/// worker (the #322 signature) from an actively-running one. A session with
-/// no matching row is `NotFound`. Same `ao status --json` shape as
-/// `session_is_quiescent`.
-fn session_activity(
-    data: &serde_json::Value,
-    id: &SessionId,
-) -> Result<crate::tools::SessionActivity, DaemonError> {
-    use crate::tools::SessionActivity;
-    let sessions = data
-        .as_array()
-        .ok_or_else(|| DaemonError::Parse("ao status JSON must be an array".to_string()))?;
-    let Some(entry) = sessions
-        .iter()
-        .find(|entry| entry.get("name").and_then(|value| value.as_str()) == Some(&id.0))
-    else {
-        return Ok(SessionActivity::NotFound);
-    };
-    if is_terminal_ao_session(entry) {
-        return Ok(SessionActivity::Terminal);
-    }
-    if entry.get("activity").and_then(|value| value.as_str()) == Some("idle") {
-        return Ok(SessionActivity::Idle);
-    }
-    Ok(SessionActivity::Running)
 }
 
 fn session_for_branch(
@@ -3892,49 +3313,8 @@ fn active_session_count(data: &serde_json::Value) -> Result<usize, DaemonError> 
 
 #[cfg(test)]
 mod active_session_count_tests {
-    use super::{active_session_count, session_activity, session_for_branch, session_is_quiescent};
-    use crate::tools::{SessionActivity, SessionId};
-
-    #[test]
-    fn activity_probe_distinguishes_idle_running_terminal_and_missing() {
-        // The #322 live signature is the `idle` row: NOT terminal (so
-        // `is_quiescent` returns false and the r1 loop stalled), but distinct
-        // from a genuinely running worker. A terminal status wins even when a
-        // stale `activity` lingers.
-        let status = serde_json::json!([
-            {"name": "idle-spawning", "status": "spawning", "activity": "idle"},
-            {"name": "running", "status": "working", "activity": "working"},
-            {"name": "killed-stale-idle", "status": "killed", "activity": "idle"},
-            {"name": "exited", "status": "working", "activity": "exited"},
-            {"name": "done", "status": "done", "activity": "ready"}
-        ]);
-
-        assert_eq!(
-            session_activity(&status, &SessionId("idle-spawning".into())).unwrap(),
-            SessionActivity::Idle
-        );
-        assert_eq!(
-            session_activity(&status, &SessionId("running".into())).unwrap(),
-            SessionActivity::Running
-        );
-        assert_eq!(
-            session_activity(&status, &SessionId("killed-stale-idle".into())).unwrap(),
-            SessionActivity::Terminal
-        );
-        assert_eq!(
-            session_activity(&status, &SessionId("exited".into())).unwrap(),
-            SessionActivity::Terminal
-        );
-        assert_eq!(
-            session_activity(&status, &SessionId("done".into())).unwrap(),
-            SessionActivity::Terminal
-        );
-        assert_eq!(
-            session_activity(&status, &SessionId("gone".into())).unwrap(),
-            SessionActivity::NotFound
-        );
-        assert!(session_activity(&serde_json::json!({}), &SessionId("x".into())).is_err());
-    }
+    use super::{active_session_count, session_for_branch, session_is_quiescent};
+    use crate::tools::SessionId;
 
     #[test]
     fn global_cap_counts_active_sessions_across_projects_and_unknown_activity() {
@@ -4176,129 +3556,6 @@ mod worktree_remote_url_tests {
     }
 }
 
-#[cfg(test)]
-mod worktree_transcript_last_activity_epoch_tests {
-    use super::{gh_env_test_lock, CliSessions};
-    use crate::tools::Sessions;
-
-    fn record_workspace(
-        sessions: &CliSessions,
-        project: &str,
-        branch: &str,
-        path: &std::path::Path,
-    ) {
-        sessions
-            .spawned_worktrees
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                (project.to_string(), branch.to_string()),
-                path.to_path_buf(),
-            );
-    }
-
-    /// Bead jleechan-coder-silent-false-parks-h92r: no `spawned_worktrees`
-    /// entry for the (project, branch) key must be "no evidence"
-    /// (`Ok(None)`), never an error and never treated as proof of silence —
-    /// this signal is advisory, unlike the spawn-time-only
-    /// `worktree_remote_url` fail-closed check.
-    #[test]
-    fn no_evidence_without_spawned_workspace() {
-        let sessions = CliSessions::new("owner/repo", "claude-code");
-        let result = sessions
-            .worktree_transcript_last_activity_epoch("dark-factory", "factory/missing-r1");
-
-        assert_eq!(result.unwrap(), None);
-    }
-
-    /// Reproduces the 2026-07-17 false-park scenario: a real worktree with a
-    /// transcript directory whose `.jsonl` file was modified moments ago
-    /// must report a recent epoch, even though nothing was pushed to the
-    /// remote branch.
-    #[test]
-    fn reports_latest_jsonl_mtime_from_derived_transcript_dir() {
-        let _guard = gh_env_test_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = std::env::temp_dir().join(format!(
-            "afd_transcript_activity_test_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let fake_home = root.join("home");
-        let worktree_path = root.join("worktrees").join("dark-factory").join("df-100");
-        std::fs::create_dir_all(&worktree_path).unwrap();
-
-        let slug = crate::tools::claude_project_slug(&worktree_path);
-        let transcript_dir = fake_home.join(".claude").join("projects").join(&slug);
-        std::fs::create_dir_all(&transcript_dir).unwrap();
-        std::fs::write(transcript_dir.join("session-1.jsonl"), "{}\n").unwrap();
-        std::fs::write(transcript_dir.join("not-a-transcript.txt"), "ignore me").unwrap();
-
-        let before = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &fake_home);
-
-        let sessions = CliSessions::new("owner/repo", "claude-code");
-        record_workspace(&sessions, "dark-factory", "factory/df-100-r1", &worktree_path);
-        let result =
-            sessions.worktree_transcript_last_activity_epoch("dark-factory", "factory/df-100-r1");
-
-        if let Some(v) = prev_home {
-            std::env::set_var("HOME", v);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = std::fs::remove_dir_all(&root);
-
-        let epoch = result.unwrap().expect("must find the .jsonl file's mtime");
-        assert!(
-            epoch >= before,
-            "reported epoch {epoch} must be >= test-start epoch {before}"
-        );
-    }
-
-    /// A resolvable worktree whose transcript directory doesn't exist yet
-    /// (e.g. the coder session hasn't written any transcript file yet, or
-    /// the naming convention drifted) is "no evidence", not an error.
-    #[test]
-    fn no_evidence_when_transcript_dir_missing() {
-        let _guard = gh_env_test_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = std::env::temp_dir().join(format!(
-            "afd_transcript_activity_missing_dir_test_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let fake_home = root.join("home");
-        let worktree_path = root.join("worktrees").join("dark-factory").join("df-101");
-        std::fs::create_dir_all(&worktree_path).unwrap();
-        std::fs::create_dir_all(&fake_home).unwrap();
-
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &fake_home);
-
-        let sessions = CliSessions::new("owner/repo", "claude-code");
-        record_workspace(&sessions, "dark-factory", "factory/df-101-r1", &worktree_path);
-        let result =
-            sessions.worktree_transcript_last_activity_epoch("dark-factory", "factory/df-101-r1");
-
-        if let Some(v) = prev_home {
-            std::env::set_var("HOME", v);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = std::fs::remove_dir_all(&root);
-
-        assert_eq!(result.unwrap(), None);
-    }
-}
-
 /// `target_repo` is the "<owner>/<repo>" the daemon automates (`cfg.target_repo`,
 /// e.g. `jleechanorg/worldarchitect.ai`) -- NOT the daemon's own source repo.
 /// jleechan-9sl1: `remote_head_sha`/`is_ancestor` used to shell out to the
@@ -4340,117 +3597,13 @@ impl Vcs for CliVcs {
         Ok(out.trim().to_string())
     }
 
-    /// jleechan-wuts / issue #349: routed-repo variant of [`base_head`].
-    /// `gh api repos/<repo>/git/ref/heads/<branch>` returns the SHA at
-    /// the HEAD of `<branch>` in `<repo>`. Equivalent in shape to
-    /// `remote_head_sha` (`repos/<repo>/commits/<branch>` returns the
-    /// same SHA, but `git/ref/heads/<branch>` is the Git Data API's
-    /// canonical "branch HEAD" lookup and is what `gh` itself uses
-    /// internally for branch refs). Decoupled from the daemon's own
-    /// cwd (its systemd `WorkingDirectory`, the daemon's own source-repo
-    /// checkout), so a bead whose `overlay.repo(cfg)` names a DIFFERENT
-    /// repo from `cfg.target_repo` resolves the baseline against the
-    /// routed repo instead of the daemon's own repo's same-named branch.
-    ///
-    /// Branches containing `/` (e.g. `release/2026-q3`) survive intact:
-    /// the `git/ref/heads/` prefix accepts embedded slashes the same
-    /// way `commits/<branch>` already does (cf. the doc comment on
-    /// `remote_head_sha`).
-    fn base_head_for_repo(&self, repo: &str, base_branch: &str) -> Result<String, DaemonError> {
-        let path = format!("repos/{}/git/ref/heads/{}", repo, base_branch);
-        let out = run_tool("gh", &["api", &path, "--jq", ".object.sha"], 30)?;
-        let sha = out.trim();
-        // `gh api ... --jq .object.sha` exits 0 with the literal string
-        // `null` when the branch doesn't exist in the target repo --
-        // treat that as an error rather than a valid SHA, mirroring the
-        // `remote_head_sha` policy above.
-        if sha.is_empty() || sha == "null" {
-            return Err(DaemonError::Tool {
-                tool: "gh".to_string(),
-                rc: 0,
-                stderr: format!(
-                    "gh api {path} returned no sha for branch '{base_branch}' in {repo}"
-                ),
-            });
-        }
-        Ok(sha.to_string())
-    }
-
     fn create_branch_at(&self, name: &str, sha: &str) -> Result<(), DaemonError> {
         run_tool("git", &["branch", name, sha], 30)?;
         Ok(())
     }
 
-    /// jleechan-wuts / issue #349: routed-repo variant of
-    /// [`create_branch_at`]. POSTs a `refs/heads/<name>` ref via the
-    /// Git Data API at `repos/<repo>/git/refs`. Decoupled from the
-    /// daemon's own cwd (its systemd `WorkingDirectory`, the daemon's
-    /// own source-repo checkout), so the new attempt's
-    /// `factory/<bead>-r<n>` branch lands in the routed target repo
-    /// where the worker will actually push -- not in the daemon's own
-    /// source-repo checkout, where the old CWD-bound `git branch
-    /// <name> <sha>` would have silently created it (and where the
-    /// worker's first `git push` would then race or be rejected).
-    ///
-    /// The endpoint rejects a ref that already exists in `<repo>`
-    /// with HTTP 422 -- the reroll path always passes a freshly
-    /// formatted `factory/<bead>-r<attempt>` branch (incremented per
-    /// attempt), so a collision in the routed repo is structurally
-    /// impossible absent a stale `register_branch`/gh-state mismatch;
-    /// the underlying `DaemonError::Tool` with the HTTP body as
-    /// stderr surfaces that case to the operator for the same reason
-    /// the old CWD-bound `git branch <name> <sha>` did.
-    fn create_branch_at_for_repo(&self, repo: &str, name: &str, sha: &str) -> Result<(), DaemonError> {
-        let path = format!("repos/{}/git/refs", repo);
-        let ref_path = format!("refs/heads/{name}");
-        let out = run_tool(
-            "gh",
-            &[
-                "api",
-                "--method",
-                "POST",
-                &path,
-                "-f",
-                &format!("ref={ref_path}"),
-                "-f",
-                &format!("sha={sha}"),
-            ],
-            30,
-        )?;
-        let _ = out; // POST success returns the created ref object; we don't need its body.
-        Ok(())
-    }
-
-    /// Bead jleechan-znmh / issue #341: delete a ref via the routed-repo
-    /// Data API. Companion to [`create_branch_at_for_repo`](Self::create_branch_at_for_repo):
-    /// when a prior failed reroll left a stale `factory/<bead>-r<n>` ref
-    /// behind (HTTP 422 on the next POST), the reroll calls this to clear
-    /// it before retrying the create. Cross-repo, cwd-independent —
-    /// identical plumbing shape to the create, mirroring how
-    /// `create_branch_at_for_repo` was added for issue #349.
-    fn delete_branch_at_for_repo(
-        &self,
-        repo: &str,
-        name: &str,
-    ) -> Result<(), DaemonError> {
-        let path = format!("repos/{}/git/refs/heads/{}", repo, name);
-        let out = run_tool(
-            "gh",
-            &["api", "--method", "DELETE", &path],
-            30,
-        )?;
-        let _ = out; // DELETE success returns 204; we don't need the body.
-        Ok(())
-    }
-
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError> {
-        self.head_sha_within(branch, 30)
-    }
-
-    /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded `head_sha` — the
-    /// re-roll poll caps this `git rev-parse` at the remaining window budget.
-    fn head_sha_within(&self, branch: &str, timeout_secs: u64) -> Result<String, DaemonError> {
-        let out = run_tool("git", &["rev-parse", branch], timeout_secs)?;
+        let out = run_tool("git", &["rev-parse", branch], 30)?;
         Ok(out.trim().to_string())
     }
 
@@ -4760,8 +3913,8 @@ mod with_repo_tests {
 #[cfg(test)]
 mod external_ref_tests {
     use super::{
-        canonicalize_external_ref_for_comment, parse_external_ref,
-        parse_external_refs_from_br_list, unresolved_thread_count_from_gql,
+        canonicalize_external_ref_for_comment, parse_external_refs_from_br_list,
+        unresolved_thread_count_from_gql,
     };
 
     /// jleechan-mdgr: reproduces the exact 2026-07-11T00:05:15Z corruption —
@@ -4811,38 +3964,6 @@ mod external_ref_tests {
         assert_eq!(
             canonicalize_external_ref_for_comment("owner/repo#42#weird-suffix"),
             None
-        );
-    }
-
-    #[test]
-    fn parse_external_ref_preserves_short_form() {
-        assert_eq!(
-            parse_external_ref("owner/repo#42"),
-            Some(("owner/repo".to_string(), "42".to_string()))
-        );
-    }
-
-    #[test]
-    fn parse_external_ref_accepts_github_pull_url() {
-        assert_eq!(
-            parse_external_ref(
-                "https://github.com/jleechanorg/worldarchitect.ai/pull/8064"
-            ),
-            Some((
-                "jleechanorg/worldarchitect.ai".to_string(),
-                "8064".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn parse_external_ref_accepts_github_issue_url() {
-        assert_eq!(
-            parse_external_ref("https://github.com/jleechanorg/dark-factory/issues/238"),
-            Some((
-                "jleechanorg/dark-factory".to_string(),
-                "238".to_string()
-            ))
         );
     }
 
@@ -5877,134 +4998,5 @@ exit 1
             )),
             "ancestor_sha == descendant_sha must short-circuit to Ok(true)"
         );
-    }
-}
-
-// jleechan-agy-vendor-name-drift-9lvs (operator guidance, r2): the original
-// skeptic P1 from PR #321's head 7ade4ef2 was that
-// adapters.rs::verify_ao_bridge_compatibility skipped
-// validate_configured_vendors when `agentPlugins` was empty/missing/malformed
-// and the bridge deliberately emitted `[]` on registry errors, so startup
-// passed without proving resolved agents exist. r2 closes all three paths.
-#[cfg(test)]
-mod vendor_drift_preflight_r2_tests {
-    use super::{canonical_for_alias, validate_configured_vendors};
-
-    // jleechan-9lvs red proof #1: legacy `agy` must alias onto the renamed
-    // `antigravity` plugin name (AO main 2026-07-18 rename).
-    #[test]
-    fn legacy_agy_alias_resolves_to_canonical_antigravity_plugin() {
-        assert_eq!(canonical_for_alias("agy"), Some("antigravity"));
-    }
-
-    // Pre-existing legacy alias must still resolve.
-    #[test]
-    fn legacy_aow_alias_resolves_to_canonical_minimax_plugin() {
-        assert_eq!(canonical_for_alias("aow"), Some("minimax"));
-    }
-
-    // Non-legacy vendor names pass through unchanged so the bridge sees the
-    // exact plugin name the registry has.
-    #[test]
-    fn unknown_vendor_name_returns_no_alias() {
-        assert_eq!(canonical_for_alias("claude-code"), None);
-        assert_eq!(canonical_for_alias("antigravity"), None);
-        assert_eq!(canonical_for_alias(""), None);
-    }
-
-    // jleechan-9lvs acceptance: valid list with the agy alias resolves and
-    // the daemon accepts it as installed (the alias IS the configuration).
-    #[test]
-    fn valid_list_with_legacy_agy_alias_passes_preflight() {
-        let installed = vec!["antigravity".to_string(), "claude-code".to_string()];
-        let configured = vec!["agy".to_string(), "claude-code".to_string()];
-        assert!(validate_configured_vendors(Ok(&installed), &configured).is_ok());
-    }
-
-    // jleechan-9lvs r2 P1: genuine empty registry is a HARD failure. A
-    // factory with zero coder plugins cannot dispatch, so passing the
-    // preflight and only failing on the first bead is the exact bug class
-    // this PR is closing.
-    #[test]
-    fn empty_installed_plugin_list_fails_preflight_loud() {
-        let installed: Vec<String> = Vec::new();
-        let configured = vec!["minimax".to_string()];
-        let error = validate_configured_vendors(Ok(&installed), &configured)
-            .expect_err("empty registry must fail");
-        let message = error.to_string();
-        assert!(
-            message.contains("zero installed agent plugins"),
-            "empty-list error must name the registry state, got: {message}"
-        );
-        assert!(
-            message.contains("cannot dispatch"),
-            "empty-list error must call out that the factory cannot dispatch, got: {message}"
-        );
-    }
-
-    // jleechan-9lvs r2 P1: a registry error (list reachable but threw) is a
-    // distinct state from a genuinely-empty list. The error message must
-    // surface the underlying exception so the operator knows to fix the
-    // AO install (or restart AO), not the daemon config.
-    #[test]
-    fn registry_error_fails_preflight_with_distinct_message() {
-        let configured = vec!["minimax".to_string()];
-        let error = validate_configured_vendors(
-            Err("TypeError: registry.list is not a function"),
-            &configured,
-        )
-        .expect_err("registry error must fail");
-        let message = error.to_string();
-        assert!(
-            message.contains("registry error"),
-            "registry-error path must call out registry error, got: {message}"
-        );
-        assert!(
-            message.contains("TypeError"),
-            "registry-error path must propagate the underlying exception, got: {message}"
-        );
-        assert!(
-            !message.contains("zero installed agent plugins"),
-            "registry-error message must NOT be confused with empty-list, got: {message}"
-        );
-    }
-
-    // When the registry reports a non-empty list but the configured vendor
-    // (after alias) is missing, every missing name is reported in one error
-    // so a single fix covers every lane (jleechan-r56m aggregation property).
-    #[test]
-    fn missing_canonical_vendor_is_reported_alongside_installed_set() {
-        let installed = vec!["antigravity".to_string()];
-        let configured = vec!["agy".to_string(), "claude-code".to_string()];
-        let error = validate_configured_vendors(Ok(&installed), &configured)
-            .expect_err("missing claude-code must fail");
-        let message = error.to_string();
-        assert!(
-            message.contains("claude-code"),
-            "missing vendor must be named in the error, got: {message}"
-        );
-        assert!(
-            message.contains("antigravity"),
-            "installed set must be enumerated in the error, got: {message}"
-        );
-    }
-
-    // The configured vendor chain (default + fallback) is deduped by
-    // canonical form so a config that names both `agy` and `antigravity`
-    // does not double-list a vendor that aliases to the same plugin.
-    #[test]
-    fn duplicate_canonical_vendors_are_deduplicated_before_validation() {
-        // Both canonical targets must be installed for the dedup test —
-        // the assertion is that `agy`/`antigravity` collapse into ONE
-        // canonical entry, and `aow`/`minimax` collapse into ANOTHER, not
-        // that an incomplete installed set passes validation.
-        let installed = vec!["antigravity".to_string(), "minimax".to_string()];
-        let configured = vec![
-            "agy".to_string(),
-            "antigravity".to_string(),
-            "aow".to_string(),
-            "minimax".to_string(),
-        ];
-        assert!(validate_configured_vendors(Ok(&installed), &configured).is_ok());
     }
 }

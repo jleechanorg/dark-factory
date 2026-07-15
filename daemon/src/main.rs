@@ -435,63 +435,28 @@ fn ao_runtime_binding(cfg: &Config) -> Result<(String, String), DaemonError> {
     Ok((ao_project, default_agent))
 }
 
-/// Mirrors the runtime fallback chain (`CliSessions::spawn_with_fallback`)
-/// using the same `canonical_for_alias` mapping so the preflight and the
-/// `--agent` argv agree on every vendor name. This is the SINGLE source for
-/// the configured vendor list — startup and dispatch consult it so a renamed
-/// plugin cannot pass preflight while failing the runtime fallback chain
-/// (or vice versa).
-fn configured_vendor_list(default_agent: &str) -> Vec<String> {
-    let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
-        .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
-
-    let canonicalize = |vendor: &str| -> String {
-        daemon::adapters::canonical_for_alias(vendor)
-            .map(str::to_string)
-            .unwrap_or_else(|| vendor.to_string())
-    };
-
-    let mut chain: Vec<String> = Vec::new();
-    let default_canonical = canonicalize(default_agent);
-    if !default_canonical.is_empty() {
-        chain.push(default_canonical);
-    }
-    for part in fallback_str.split("->") {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let canonical = canonicalize(trimmed);
-        if !canonical.is_empty() && !chain.contains(&canonical) {
-            chain.push(canonical);
-        }
-    }
-    chain
-}
-
 fn verify_startup_ao_compatibility(
     args: Args,
     ao_project: &str,
-    configured_vendors: &[String],
-    verify: impl FnOnce(&str, &[String]) -> Result<(), DaemonError>,
+    agent: &str,
+    verify: impl FnOnce(&str, &str) -> Result<(), DaemonError>,
 ) -> Result<(), DaemonError> {
     if args.dry_run {
         return Ok(());
     }
-    verify(ao_project, configured_vendors)
+    verify(ao_project, agent)
 }
 
 fn run(args: Args) -> Result<(), DaemonError> {
     let cfg_path = default_config_path();
     let cfg = load_config(&cfg_path)?;
     let (ao_project, default_agent) = ao_runtime_binding(&cfg)?;
-    let configured_vendors = configured_vendor_list(&default_agent);
     // Fail before opening/reconciling state, advertising READY, or polling a
     // healthy tick when the installed AO/Node adapter is incompatible. The
     // diagnostic exits before AO preflight, locking, workspace creation, or
     // worker launch.
-    verify_startup_ao_compatibility(args, &ao_project, &configured_vendors, |project, vendors| {
-        daemon::adapters::verify_ao_bridge_compatibility(project, vendors.first().map(String::as_str).unwrap_or("minimax"), vendors)
+    verify_startup_ao_compatibility(args, &ao_project, &default_agent, |project, agent| {
+        daemon::adapters::verify_ao_bridge_compatibility(project, agent)
     })?;
     let telemetry_log = default_telemetry_log();
     let db_path = default_state_db_path();
@@ -682,13 +647,12 @@ mod tests {
     #[test]
     fn production_startup_runs_ao_compatibility_check_and_propagates_failure() {
         let mut observed = None;
-        let vendors = vec!["minimax".to_string()];
         let error = verify_startup_ao_compatibility(
             Args::default(),
             "dark-factory",
-            &vendors,
-            |project, list| {
-                observed = Some((project.to_string(), list.to_vec()));
+            "minimax",
+            |project, agent| {
+                observed = Some((project.to_string(), agent.to_string()));
                 Err(DaemonError::Config("incompatible AO runtime".to_string()))
             },
         )
@@ -696,7 +660,7 @@ mod tests {
 
         assert_eq!(
             observed,
-            Some(("dark-factory".to_string(), vendors.clone()))
+            Some(("dark-factory".to_string(), "minimax".to_string()))
         );
         assert!(error.to_string().contains("incompatible AO runtime"));
     }
@@ -715,11 +679,7 @@ mod tests {
             autonomy_timebox_secs: 10_800,
             budget_warn_usd: 20.0,
             spec_dir: ".factory/specs".to_string(),
-            reroll_head_stability_window_secs: 30,
-            reroll_death_confirm_secs: 5,
-            held_recheck_cooldown_secs: 900,
             repos: std::collections::HashMap::new(),
-            pre_gate_validation_enabled: false,
         };
 
         let (project, _) = ao_runtime_binding(&cfg).unwrap();
@@ -727,60 +687,16 @@ mod tests {
         assert_eq!(project, "worldarchitect");
     }
 
-    // jleechan-9lvs r2: the configured vendor chain must (a) include the
-    // default agent, (b) apply canonical_for_alias to every fallback entry,
-    // (c) dedupe by canonical form so that `agy` + `antigravity` (or
-    // `aow` + `minimax`) never appears twice, and (d) preserve order so the
-    // preflight sees the same vendor order the runtime fallback chain does.
-    #[test]
-    fn configured_vendor_list_resolves_aliases_and_dedupes() {
-        // Snapshot the existing env, mutate it for the test, restore after.
-        let prior_default = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT").ok();
-        let prior_chain = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
-
-        // SAFETY: env mutation is serialized by the test isolation rules;
-        // we set/remove only the keys this test owns.
-        unsafe {
-            std::env::set_var("DARK_FACTORY_REVIEWER_DEFAULT", "agy");
-            std::env::set_var(
-                "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
-                "antigravity->agy->aow->claude-code",
-            );
-        }
-
-        let vendors = configured_vendor_list("agy");
-
-        unsafe {
-            match prior_default {
-                Some(v) => std::env::set_var("DARK_FACTORY_REVIEWER_DEFAULT", v),
-                None => std::env::remove_var("DARK_FACTORY_REVIEWER_DEFAULT"),
-            }
-            match prior_chain {
-                Some(v) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", v),
-                None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
-            }
-        }
-
-        // Default + canonical fallback entries, deduped (agy->antigravity
-        // collapses with the literal antigravity; aow->minimax is the
-        // pre-existing alias).
-        assert_eq!(
-            vendors,
-            vec!["antigravity".to_string(), "minimax".to_string(), "claude-code".to_string()]
-        );
-    }
-
     #[test]
     fn dry_run_startup_skips_production_ao_compatibility_check() {
         let mut called = false;
-        let vendors = vec!["minimax".to_string()];
         let result = verify_startup_ao_compatibility(
             Args {
                 once: true,
                 dry_run: true,
             },
             "dark-factory",
-            &vendors,
+            "minimax",
             |_, _| {
                 called = true;
                 Ok(())

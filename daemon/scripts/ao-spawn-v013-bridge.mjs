@@ -122,35 +122,6 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
       import(resolveAoPackage(packageName)),
     );
 
-    // Enumerate installed agent plugins for the daemon's fail-closed vendor
-    // preflight. Three mutually-exclusive outcomes — the daemon rejects all
-    // three, but with distinct messages so triage can tell "registry
-    // reachable but empty" from "registry reachable, list threw" from
-    // "registry reachable, list was empty even though loadFromConfig just
-    // succeeded" (which is a separate state we surface as the empty-list
-    // key rather than the error key).
-    let agentPluginsPayload;
-    try {
-      const listResult = registry.list("agent");
-      if (Array.isArray(listResult)) {
-        const names = listResult
-          .map((entry) => (typeof entry === "string" ? entry : entry?.name))
-          .filter((name) => typeof name === "string" && name.length > 0);
-        agentPluginsPayload = { agentPlugins: [...new Set(names)].sort() };
-      } else {
-        agentPluginsPayload = {
-          agentPluginsError:
-            "AO registry.list returned a non-array value for kind 'agent'",
-        };
-      }
-    } catch (registryError) {
-      agentPluginsPayload = {
-        agentPluginsError: `AO registry.list threw: ${
-          registryError instanceof Error ? registryError.message : String(registryError)
-        }`,
-      };
-    }
-
     // Read-only startup/deployment diagnostic: verifies the running Node,
     // AO package version, public core API, config, and plugin resolution
     // without creating a workspace or worker.
@@ -163,7 +134,6 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
           agent,
           branch,
           promptLength: sanitizedPrompt.length,
-          ...agentPluginsPayload,
         })}`,
       );
       process.exit(0);

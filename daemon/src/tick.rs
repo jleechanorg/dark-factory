@@ -23,9 +23,11 @@ use crate::dispatch::{self, MAX_TRANSIENT_SPAWN_RETRY};
 use crate::errors::DaemonError;
 use crate::intake::{self, IntakeOutcome, IntakeVerdict};
 use crate::router::{self, RoutingVerdict};
-use crate::state::{set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore};
+use crate::state::{
+    set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
+};
 use crate::telemetry::{self, TelemetryEvent};
-use crate::tools::{Bead, Llm, PrHeadBranch, Scm, SessionId, Sessions, Tracker, Vcs};
+use crate::tools::{Bead, Llm, Scm, SessionId, Sessions, Tracker, Vcs};
 use crate::verifier::{self, PrEvidence};
 use std::collections::HashSet;
 use std::path::Path;
@@ -71,11 +73,6 @@ pub struct TickSummary {
     /// query `bead_overlay` yourself" (2026-07-09 live incident: 45 beads
     /// silently lost with no durable trace anywhere).
     pub beads_escalated_locally: usize,
-    /// jleechan-zaga / issue #348: beads held at `DISPOSITION_REQUIRED`
-    /// because every red gate is structural (re-rolling would be no-op
-    /// churn). The fast tier keeps assessing on each tick; this counter
-    /// just records the holds placed this tick.
-    pub beads_held_disposition_required: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -242,73 +239,6 @@ fn emit_intake_outcome(telemetry_log: &Path, outcome: &IntakeOutcome) -> Result<
 ///
 /// Stage gate: `deps.cfg.stage` must be `1` — this function only implements
 /// the Stage-1 substitution rule (re-roll verdicts recorded, never executed).
-///
-/// jleechan-park-leaves-zombie-session-mh9o: best-effort terminate the live
-/// AO session bound to `overlay` and clear the durable session handle, so
-/// every PARKED_* transition (a) does not leave a zombie session listed as
-/// `[spawning]` in AO's state — which the AO dedup guard rejects as a
-/// "Duplicate session detected" on the next `ao spawn` for the same bead —
-/// and (b) lets the automated HUMAN_HELD exit (`recover_human_held`'s
-/// `session_id IS NULL` predicate) requeue the bead if its
-/// `park_reason` is in the recoverable set.
-///
-/// Fail-soft by design, with an important asymmetry: the durable handle is
-/// cleared ONLY on a successful `stop()` (the session is provably dead) or
-/// when there is no handle to begin with. On a `stop()` failure the
-/// session may still be live, so the handle is RETAINED on disk — this
-/// (i) prevents `recover_human_held` from requeueing a bead whose live
-/// worker could overlap a freshly-spawned replacement, and (ii) gives
-/// operators the durable evidence they need to retry cleanup or kill the
-/// session manually. The `BEAD_SESSION_KILL_FAILED` telemetry event
-/// preserves visibility into the still-leaked session.
-fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
-    let Some(session_id_str) = overlay.session_id.clone() else {
-        return;
-    };
-    let session_id = SessionId(session_id_str.clone());
-    match deps.sessions.stop(&session_id) {
-        Ok(()) => {
-            let _ = emit(
-                deps.telemetry_log,
-                &overlay.bead_id,
-                overlay.attempt,
-                OverlayState::HumanHeld.as_str(),
-                "BEAD_SESSION_KILLED",
-                serde_json::json!({}),
-                serde_json::json!({
-                    "session_id": session_id_str,
-                    "phase": "park_transition",
-                }),
-            );
-            // Proven dead — safe to clear the handle. Unblocks both
-            // recover_human_held and any operator-driven requeue without
-            // risking a duplicate worker or AO dedup collision.
-            overlay.session_id = None;
-        }
-        Err(stop_err) => {
-            // Stop failed: the session may still be live. RETAIN the handle
-            // so (a) recover_human_held cannot requeue and dispatch a second
-            // worker that would overlap the existing live one and (b) the
-            // operator retains the durable session_id needed to retry
-            // `ao session kill <id>` once AO recovers. Failure is logged
-            // but never escalated — the park itself stands.
-            let _ = emit(
-                deps.telemetry_log,
-                &overlay.bead_id,
-                overlay.attempt,
-                OverlayState::HumanHeld.as_str(),
-                "BEAD_SESSION_KILL_FAILED",
-                serde_json::json!({}),
-                serde_json::json!({
-                    "session_id": session_id_str,
-                    "error": format!("{stop_err:?}"),
-                    "phase": "park_transition",
-                }),
-            );
-        }
-    }
-}
-
 pub fn run_tick(
     deps: &TickDeps,
     tick_index: u64,
@@ -383,14 +313,6 @@ pub fn run_tick(
         // 1. Time-box envelope check
         if overlay.autonomy_secs >= deps.cfg.autonomy_timebox_secs {
             overlay.state = OverlayState::HumanHeld;
-            // jleechan-park-leaves-zombie-session-mh9o: kill the live AO
-            // session and clear the durable handle BEFORE save, so the bead
-            // is not stranded with a live session_id that (a) the AO dedup
-            // guard still reports as [spawning] and (b) recover_human_held's
-            // `session_id IS NULL` predicate cannot requeue through. Without
-            // this, every autonomy_timebox_exceeded park leaks its session
-            // and poisons the next redispatch of the same bead.
-            kill_session_and_clear_handle(deps, &mut overlay);
             set_human_hold_reason(&mut overlay, HumanHoldReason::AutonomyTimeboxExceeded);
             deps.store.save(&overlay)?;
             emit(
@@ -463,12 +385,6 @@ pub fn run_tick(
                             Ok((true, _)) => {}
                             Ok((false, post_sha)) => {
                                 overlay.state = OverlayState::HumanHeld;
-                                // jleechan-park-leaves-zombie-session-mh9o:
-                                // adopted-branch remediation parks also leak
-                                // their session if we don't terminate it.
-                                // Wire the same cleanup helper as the other
-                                // PARKED_* sites.
-                                kill_session_and_clear_handle(deps, &mut overlay);
                                 set_human_hold_reason(
                                     &mut overlay,
                                     HumanHoldReason::AdoptedBranchHistoryRewriteDetected,
@@ -509,12 +425,6 @@ pub fn run_tick(
                             }
                             Err(e) => {
                                 overlay.state = OverlayState::HumanHeld;
-                                // jleechan-park-leaves-zombie-session-mh9o:
-                                // adopted-branch append-only check failure
-                                // also leaks its session. Wire the same
-                                // cleanup helper as the other PARKED_*
-                                // sites.
-                                kill_session_and_clear_handle(deps, &mut overlay);
                                 set_human_hold_reason(
                                     &mut overlay,
                                     HumanHoldReason::AdoptedBranchAppendOnlyCheckFailed,
@@ -581,19 +491,6 @@ pub fn run_tick(
                         let expected_branch = overlay.branch.clone().unwrap_or_default();
                         if actual_branch != expected_branch {
                             overlay.state = OverlayState::HumanHeld;
-                            // jleechan-park-leaves-zombie-session-mh9o:
-                            // `session_branch` just proved the live session
-                            // belongs to a DIFFERENT bead/branch (the
-                            // `jleechan-5ia2` corruption case), so we MUST
-                            // NOT call `sessions.stop()` here — that would
-                            // terminate another bead's legitimate worker.
-                            // The right fix is to drop OUR overlay's bad
-                            // handle (the durable record pointing at a
-                            // session that was never ours to own) without
-                            // touching AO. The leaked overlay can then
-                            // never poison a future redispatch of THIS
-                            // bead via the AO dedup guard.
-                            overlay.session_id = None;
                             set_human_hold_reason(
                                 &mut overlay,
                                 HumanHoldReason::SessionBranchMismatch,
@@ -640,72 +537,21 @@ pub fn run_tick(
                             // could never observe real progress and would
                             // eventually park a perfectly healthy, actively
                             // pushing coder as `coder_silent`.
-                            let last_commit_epoch = deps.scm.remote_branch_last_commit_for_repo(
-                                overlay.repo(deps.cfg),
-                                branch,
-                            )?;
+                            let last_commit_epoch = deps
+                                .scm
+                                .remote_branch_last_commit_for_repo(overlay.repo(deps.cfg), branch)?;
                             let now_epoch = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
 
-                            let branch_is_silent = match last_commit_epoch {
+                            let is_silent = match last_commit_epoch {
                                 None => true,
                                 Some(commit_time) => now_epoch.saturating_sub(commit_time) >= 1800,
                             };
 
-                            // Bead jleechan-coder-silent-false-parks-h92r:
-                            // 2026-07-17 all 6 active lanes were parked
-                            // `coder_silent` while their coders were
-                            // demonstrably working — a coder can iterate
-                            // locally (edit/test/edit) for well over 30
-                            // minutes before its next push, so "no remote
-                            // commit in 30 minutes" alone is not evidence of
-                            // silence. Consult the coder's own transcript
-                            // mtime as a second, independent liveness
-                            // signal before parking; only park when NEITHER
-                            // signal shows recent activity (fail-closed
-                            // preserved: missing/unresolvable transcript
-                            // evidence does not by itself save a bead from
-                            // parking).
-                            let transcript_epoch = deps
-                                .cfg
-                                .resolve_repo(overlay.repo(deps.cfg))
-                                .and_then(|routing| {
-                                    deps.sessions
-                                        .worktree_transcript_last_activity_epoch(
-                                            &routing.ao_project,
-                                            branch,
-                                        )
-                                        .ok()
-                                        .flatten()
-                                });
-                            let transcript_is_active = transcript_epoch
-                                .is_some_and(|t| now_epoch.saturating_sub(t) < 1800);
-
-                            if branch_is_silent && transcript_is_active {
-                                emit(
-                                    deps.telemetry_log,
-                                    &overlay.bead_id,
-                                    overlay.attempt,
-                                    overlay.state.as_str(),
-                                    "CODER_ACTIVE_GRACE",
-                                    serde_json::json!({}),
-                                    serde_json::json!({
-                                        "reason": "coder_active_grace",
-                                        "branch": branch,
-                                        "last_commit_epoch": last_commit_epoch,
-                                        "transcript_epoch": transcript_epoch,
-                                    }),
-                                )?;
-                            } else if branch_is_silent {
+                            if is_silent {
                                 overlay.state = OverlayState::HumanHeld;
-                                // jleechan-park-leaves-zombie-session-mh9o:
-                                // mirror the autonomy_timebox fix above —
-                                // the wedge-detection sweep also leaks its
-                                // session if we save() without first calling
-                                // `ao session kill` and clearing the handle.
-                                kill_session_and_clear_handle(deps, &mut overlay);
                                 set_human_hold_reason(&mut overlay, HumanHoldReason::CoderSilent);
                                 deps.store.save(&overlay)?;
                                 emit(
@@ -892,7 +738,6 @@ pub fn run_tick(
             "beadsRecoveredFromHeld": summary.beads_recovered_from_held,
             "beadsEscalated": summary.beads_escalated,
             "beadsEscalatedLocally": summary.beads_escalated_locally,
-            "beadsHeldDispositionRequired": summary.beads_held_disposition_required,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
@@ -1069,7 +914,8 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             // owner/repo today. Still resolved from `external_ref` (not
             // left `None`) so it stays correct once Stage C/D lift the
             // same-repo-only restriction for adopted PRs.
-            let target_repo = intake::resolve_target_repo("", Some(adopted.external_ref.as_str()));
+            let target_repo =
+                intake::resolve_target_repo("", Some(adopted.external_ref.as_str()));
             let mut overlay = existing.unwrap_or(BeadOverlay {
                 bead_id: adopted.bead_id.clone(),
                 state: OverlayState::Attested,
@@ -1082,9 +928,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 session_id: None,
                 is_adopted: true,
                 spawn_failure_count: 0,
-                pre_session_head_sha: None,
-                park_reason: None,
-                target_repo,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo,
             });
             overlay.state = OverlayState::Attested;
             overlay.pr_number = Some(adopted.pr_number);
@@ -1139,13 +985,8 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // the bead's OWN resolved repo instead of unconditionally
         // `cfg.target_repo`.
         let target_repo = intake::resolve_target_repo(
-            tracker_bead
-                .as_ref()
-                .map(|b| b.description.as_str())
-                .unwrap_or(""),
-            tracker_bead
-                .as_ref()
-                .and_then(|b| b.external_ref.as_deref()),
+            tracker_bead.as_ref().map(|b| b.description.as_str()).unwrap_or(""),
+            tracker_bead.as_ref().and_then(|b| b.external_ref.as_deref()),
         );
 
         if deps.llm.is_real() {
@@ -1233,7 +1074,6 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             id: bead_id.clone(),
             title: bead_id.clone(),
             description: String::new(),
-            notes: String::new(),
             file_tree_summary: String::new(),
             external_ref: None,
         }));
@@ -1252,7 +1092,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         }
     }
 
-    let mut ready: Vec<(Bead, RoutingVerdict, dispatch::DriveBranchDecision)> = Vec::new();
+    let mut ready: Vec<(Bead, RoutingVerdict)> = Vec::new();
     for bead in &routing_candidates {
         let overlay = match deps.store.load(&bead.id)? {
             Some(o) => {
@@ -1283,9 +1123,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     session_id: None,
                     is_adopted: false,
                     spawn_failure_count: 0,
-                    pre_session_head_sha: None,
-                    park_reason: None,
-                    target_repo,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo,
                 };
                 deps.store.save(&o)?;
                 summary.beads_created += 1;
@@ -1322,19 +1162,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     // (null == legacy/global cfg.target_repo).
                     serde_json::json!({"routingVerdict": verdict_str, "target_repo": overlay.target_repo}),
                 )?;
-                // jleechan-drive-pr-branch-binding-pcpr: resolved here (not
-                // in `dispatch.rs`, which intentionally has no `Scm`
-                // access) so a bead whose `external_ref` names a currently
-                // OPEN PR in its OWN resolved repo dispatches onto that
-                // PR's head branch instead of a freshly fabricated one.
-                // Recomputed on every tick this bead is `ready` (fresh
-                // dispatch AND every redispatch/park-recovery cycle) — the
-                // live 2026-07-17 incident this closes happened on a
-                // redispatch, not just the first attempt.
-                let resolved_repo = overlay.repo(deps.cfg).to_string();
-                let drive_branch =
-                    resolve_drive_pr_head_branch(deps.scm, deps.cfg, bead, &resolved_repo);
-                ready.push((bead.clone(), verdict, drive_branch));
+                ready.push((bead.clone(), verdict));
             }
             Err(DaemonError::Parse(reason)) => {
                 // ZFC: an unparseable routing verdict is never guessed at —
@@ -1342,7 +1170,10 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // silent default" discipline router.rs already enforces.
                 let mut held = overlay;
                 held.state = OverlayState::HumanHeld;
-                set_human_hold_reason(&mut held, HumanHoldReason::RouterParse(reason.clone()));
+                set_human_hold_reason(
+                    &mut held,
+                    HumanHoldReason::RouterParse(reason.clone()),
+                );
                 deps.store.save(&held)?;
                 summary.beads_parked_human_held += 1;
                 emit(
@@ -1454,92 +1285,6 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         "max_transient_spawn_retry": MAX_TRANSIENT_SPAWN_RETRY,
                         "branch": failure.branch.as_deref(),
                     }),
-                )?;
-                continue;
-            }
-
-            if failure.phase == "unmapped_repo" {
-                // jleechan-8jxr r3 (review follow-up, chatgpt-codex-connector
-                // P2 @ daemon/src/dispatch.rs:287): mirror the
-                // `unmapped_target_repo` idiom below. `dispatch_ready`
-                // already parked the bead HUMAN_HELD with reason
-                // `unmapped_repo` (jleechan-8jxr r2) — distinct from
-                // `unmapped_target_repo` ("I resolved a repo and it's not
-                // in [repos]") so operators can tell which remediation
-                // applies: add a `[repos.*]` entry vs. add a
-                // `target_repo:`/`external_ref` field on the bead body or
-                // label the source issue `factory` so intake can resolve
-                // it. Without this branch, the fall-through at the bottom
-                // of this loop labels a genuinely permanent,
-                // operator-action-required park as retryable, emits
-                // `BEAD_DISPATCH_TRANSIENT_ERROR` (not `PARKED_HUMAN_HELD`),
-                // never increments `summary.beads_parked_human_held`, and
-                // posts no escalation comment — exactly the anti-pattern
-                // the `unmapped_target_repo` and `worktree_remote_mismatch`
-                // branches were added to fix.
-                summary.beads_parked_human_held += 1;
-                emit(
-                    deps.telemetry_log,
-                    &failure.bead_id,
-                    failure.attempt,
-                    OverlayState::HumanHeld.as_str(),
-                    "PARKED_HUMAN_HELD",
-                    serde_json::json!({}),
-                    serde_json::json!({
-                        "reason": "unmapped_repo",
-                        "error": failure.error.as_str(),
-                    }),
-                )?;
-                if escalation_already_recorded(deps, &failure.bead_id)? {
-                    continue;
-                }
-                let comment_body = format!(
-                    "🤖 **[dark-factory]** Escalation required: bead `{}` had no resolvable repo identity at dispatch time (no `target_repo:` body field, no `external_ref` with a parseable `owner/repo#N` prefix, no adopted-PR context, and no other intake-side repo signal). Automation parked it HUMAN_HELD rather than silently defaulting to the daemon's global `target_repo` (which would have routed it to a wrong repo — confirmed 5x on 2026-07-18: yvfe/vmy2/46dk/s9ba/txtd). Operator action: supply an explicit `target_repo: <owner>/<repo>` line in the bead body, set `external_ref = \"<owner>/<repo>#NNN\"`, or file under an issue/PR labeled `factory` so intake can resolve the repo from the GitHub external_ref.",
-                    failure.bead_id
-                );
-                if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
-                {
-                    if is_missing_scm_target_error(&err) {
-                        record_local_escalation_fallback(deps, &failure.bead_id, "unmapped_repo")?;
-                        summary.beads_escalated_locally += 1;
-                        emit(
-                            deps.telemetry_log,
-                            &failure.bead_id,
-                            failure.attempt,
-                            OverlayState::HumanHeld.as_str(),
-                            "ESCALATED_LOCALLY",
-                            serde_json::json!({}),
-                            serde_json::json!({
-                                "reason": "unmapped_repo",
-                                "scm_error": err.to_string(),
-                            }),
-                        )?;
-                        continue;
-                    }
-                    emit(
-                        deps.telemetry_log,
-                        &failure.bead_id,
-                        failure.attempt,
-                        OverlayState::HumanHeld.as_str(),
-                        "ESCALATION_NOTIFICATION_FAILED",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "reason": "unmapped_repo",
-                            "error": err.to_string(),
-                        }),
-                    )?;
-                    continue;
-                }
-                record_escalation(deps, &failure.bead_id, "unmapped_repo")?;
-                summary.beads_escalated += 1;
-                emit(
-                    deps.telemetry_log,
-                    &failure.bead_id,
-                    failure.attempt,
-                    OverlayState::HumanHeld.as_str(),
-                    "ESCALATION_REQUIRED",
-                    serde_json::json!({}),
-                    serde_json::json!({"reason": "unmapped_repo"}),
                 )?;
                 continue;
             }
@@ -1748,9 +1493,6 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     "sessionId": success.session_id.as_str(),
                     // jleechan-35y4: resolved repo now visible in daemon.jsonl.
                     "target_repo": success.target_repo.as_str(),
-                    // jleechan-drive-pr-branch-binding-pcpr: "pr_head" vs
-                    // "generated" — which branch-binding mode this dispatch used.
-                    "branch_mode": success.branch_mode,
                 }),
             )?;
             let comment_body = format!(
@@ -1759,8 +1501,8 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             );
             if let Some(ext_ref) = ready
                 .iter()
-                .find(|(bead, _, _)| bead.id == success.bead_id)
-                .and_then(|(bead, _, _)| bead.external_ref.as_ref())
+                .find(|(bead, _)| bead.id == success.bead_id)
+                .and_then(|(bead, _)| bead.external_ref.as_ref())
             {
                 let _ = deps.tracker.comment_external(ext_ref, &comment_body);
             }
@@ -1853,24 +1595,6 @@ fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> 
             &["-p", prompt, "--yolo", "--skip-trust"],
             REVIEWER_TIMEOUT_SECS,
         ),
-        // jleechan-984e / issue #385: 5th reviewer vendor (Cursor CLI,
-        // `cursor-agent`). Invoked as `cursor-agent -f <prompt>` (headless
-        // non-interactive mode) — the `-f` flag is the documented
-        // equivalent of `claude --print` / `agy --print` / `gemini -p`
-        // and is required so the tool reads the prompt from argv instead
-        // of trying to open an interactive TUI. Cursor's model family is
-        // distinct from claude/codex/agy/gemini/minimax (see
-        // `verifier::vendor_model_family`), so dispatching it as a
-        // fallback (priority[4] in `skeptic_evidence`) is what makes the
-        // gate-7 reviewer set cross-model instead of single-family. Both
-        // `cursor-agent` and the bare `cursor` alias are accepted so
-        // `skeptic_reviewers` telemetry is stable regardless of which name
-        // the priority list uses.
-        "cursor-agent" | "cursor" => run_tool(
-            "cursor-agent",
-            &["-f", prompt],
-            REVIEWER_TIMEOUT_SECS,
-        ),
         other => Err(DaemonError::Tool {
             tool: other.to_string(),
             rc: -1,
@@ -1938,20 +1662,7 @@ fn skeptic_evidence(
     // reordered ahead of them — codex/claude/agy's current outage is a
     // point-in-time incident (quotas reset), not a permanent property of
     // those vendors.
-    //
-    // jleechan-984e / issue #385: 5th reviewer vendor (`cursor-agent`).
-    // Appended after `gemini` so the existing codex/claude/agy/gemini
-    // dispatch order is unchanged for the common case where those vendors
-    // are healthy; cursor-agent is reached only when the four earlier
-    // vendors all fail to parse. cursor-agent is the FIRST cross-model
-    // vendor in the priority list whose model family (`cursor`, see
-    // `verifier::vendor_model_family`) is distinct from claude/codex/agy/
-    // gemini/minimax — adding it is what makes the gate-7 assessment
-    // produce two distinct model families on a normal run, satisfying
-    // `compute_review_degraded(reviewers) == false` so strict merge policy
-    // (#328) treats the assessment as strict-green instead of
-    // `review_degraded=true`.
-    let mut priority = vec!["codex", "claude", "agy", "gemini", "cursor-agent"];
+    let mut priority = vec!["codex", "claude", "agy", "gemini"];
     if !coder_vendor.is_empty() {
         priority.retain(|&v| v != coder_vendor);
     }
@@ -1960,7 +1671,8 @@ fn skeptic_evidence(
     // bead's OWN resolved repo so a test-repo bead dispatched under a
     // non-test global `cfg.target_repo` (or vice versa) is classified
     // correctly instead of by the daemon-global repo.
-    let is_test_repo = repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
+    let is_test_repo =
+        repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
 
     let mut gha_verdict = "verdict: absent";
     let mut signoff_verdict = "verdict: absent";
@@ -2184,23 +1896,13 @@ fn skeptic_evidence(
         }
     };
 
-    // jleechan-984e / issue #385: compute the cross-model degraded flag
-    // BEFORE moving `used_vendors` into `PrEvidence` so we can still
-    // borrow it. `compute_review_degraded` returns false for the
-    // empty / single-entry / `mock_llm`-only paths so the Stage-1
-    // test-repo lane stays non-degraded even though its single mock
-    // judge has no cross-model sibling.
-    let review_degraded = verifier::compute_review_degraded(&used_vendors);
-
     Ok(PrEvidence {
         is_production: false,
         non_test_changed_loc: 0,
+        has_integration_evidence_marker: false,
         er_verdict: verifier::ErVerdict::Absent,
         skeptic_verdict,
         skeptic_reviewers: used_vendors,
-        review_degraded,
-        // Set in the fast tier from the canonical evidence marker (#323).
-        evidence_gist_status: verifier::EvidenceGistStatus::NotProvided,
     })
 }
 
@@ -2329,127 +2031,28 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         }
 
         // Promote DISPATCHED -> ATTESTED once a PR is open (spec §4.2.7).
-        // jleechan-t40t r6: `pr_number_reresolved_this_tick` is set whenever
-        // the dispatch→attested re-resolution path above mutates
-        // `overlay.pr_number` (drift detection, stale-clear, or transient
-        // error). Pre-gate validation below uses it to skip the redundant
-        // `open_pr_head_ref_for_repo` re-check on freshly-resolved PRs,
-        // which would otherwise emit a false-positive
-        // `PR_PRE_GATE_VALIDATION_MISMATCH` on every healthy bead.
-        let mut pr_number_reresolved_this_tick = false;
         if overlay.state == OverlayState::Dispatched {
-            if let Some(ref branch) = overlay.branch {
-                // jleechan-t40t (issue #326): re-resolve `pr_number` from the
-                // bead's CURRENT branch every slow-tier tick (not just when
-                // it's `None`). The pre-fix code only ran this lookup when
-                // `pr_number.is_none()`, which meant a stale `pr_number` —
-                // e.g. set from an AO session that was later superseded by
-                // a different PR on the same branch, or written out-of-band
-                // — kept the bead DISPATCHED indefinitely against the wrong
-                // PR (every gate-assessment query targeted a PR the bead's
-                // branch was no longer bound to).
-                //
-                // r6 contract: `Ok(Some(discovered))` either fills in the
-                // missing `pr_number` (first-discovery) or supersedes a
-                // stale one (drift detection), emitting `PR_NUMBER_REREZOLVED`
-                // so the transition is auditable from the daemon log alone.
-                // `Ok(None)` is FAIL-CLOSED: when a stale `pr_number` was
-                // recorded against a now-merged/closed PR and the branch has
-                // no live PR, the stale number MUST be cleared so the bead
-                // does NOT promote to ATTESTED against a dead PR
-                // (jleechan-t8fd / PR #316 wedge); the bead stays DISPATCHED
-                // and waits for the next live PR. The clear is audited via
-                // `PR_NUMBER_REREZOLVED_NO_OPEN_PR` with
-                // reason=`branch_mismatch_no_open_pr`. A hard `Err` is logged
-                // via `PR_NUMBER_REREZOLVE_TRANSIENT_ERROR` and skipped —
-                // the next tick re-attempts the lookup.
-                match deps.scm.pr_number_for_branch(&repo, branch) {
-                    Ok(Some(discovered)) if Some(discovered) != overlay.pr_number => {
-                        let previous = overlay.pr_number;
-                        overlay.pr_number = Some(discovered);
-                        deps.store.save(&overlay)?;
-                        pr_number_reresolved_this_tick = true;
-                        emit(
-                            deps.telemetry_log,
-                            bead_id,
-                            overlay.attempt,
-                            OverlayState::Dispatched.as_str(),
-                            "PR_NUMBER_REREZOLVED",
-                            serde_json::json!({}),
-                            serde_json::json!({
-                                "branch": branch,
-                                "previous_pr_number": previous,
-                                "current_pr_number": discovered,
-                                "reason": "branch_mismatch_stale_state",
-                            }),
-                        )?;
-                    }
-                    Ok(None) if overlay.pr_number.is_some() && !overlay.is_adopted => {
-                        // Fail-closed: a stale `pr_number` points at a PR
-                        // that is no longer open for this branch (e.g. it
-                        // merged and the bead was re-cut with a fresh -rN
-                        // branch, or the prior PR was closed out-of-band).
-                        // Clearing it keeps the bead DISPATCHED and prevents
-                        // promotion to ATTESTED against a dead PR. The
-                        // next tick (or the same tick's later blocks) will
-                        // see `pr_number.is_none()` and short-circuit out
-                        // of any gate-assessment path until a new PR
-                        // appears.
-                        //
-                        // NOT applied to adopted beads: an adopted PR's
-                        // `pr_number` was set from a positively-confirmed
-                        // external contributor's `external_ref` lookup
-                        // at adoption time (see `intake::normalize_labeled_prs`),
-                        // not from a branch→PR re-resolution. Clearing
-                        // it here would erase the adoption guarantee —
-                        // adopted beads rely on the stored `pr_number`
-                        // surviving until the contributor's PR is
-                        // closed/merged by them, NOT until our branch
-                        // lookup happens to agree.
-                        let previous = overlay.pr_number;
-                        overlay.pr_number = None;
-                        deps.store.save(&overlay)?;
-                        pr_number_reresolved_this_tick = true;
-                        emit(
-                            deps.telemetry_log,
-                            bead_id,
-                            overlay.attempt,
-                            OverlayState::Dispatched.as_str(),
-                            "PR_NUMBER_REREZOLVED_NO_OPEN_PR",
-                            serde_json::json!({}),
-                            serde_json::json!({
-                                "branch": branch,
-                                "previous_pr_number": previous,
-                                "current_pr_number": serde_json::Value::Null,
-                                "reason": "branch_mismatch_no_open_pr",
-                            }),
-                        )?;
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        // jleechan-t40t r12 (issue #326): FAIL CLOSED. A
-                        // transient branch→PR resolution error leaves the
-                        // stored `pr_number` UNVALIDATED this tick. The pre-fix
-                        // code merely logged and fell through to the promotion
-                        // block below, which would promote DISPATCHED→ATTESTED
-                        // against a possibly-stale number (gate-assessing a PR
-                        // the branch may no longer be bound to). Keep the bead
-                        // DISPATCHED and retry the resolution next tick — never
-                        // promote on an unvalidated number.
-                        let _ = emit(
-                            deps.telemetry_log,
-                            bead_id,
-                            overlay.attempt,
-                            OverlayState::Dispatched.as_str(),
-                            "PR_NUMBER_REREZOLVE_TRANSIENT_ERROR",
-                            serde_json::json!({}),
-                            serde_json::json!({
-                                "branch": branch,
-                                "error": format!("{e:?}"),
-                                "action": "kept_dispatched_no_promotion",
-                            }),
-                        );
-                        continue;
+            if overlay.pr_number.is_none() {
+                if let Some(ref branch) = overlay.branch {
+                    if let Ok(out) = crate::tools::run_tool(
+                        "gh",
+                        &[
+                            "pr",
+                            "list",
+                            "--head",
+                            branch,
+                            "--repo",
+                            &repo,
+                            "--json",
+                            "number",
+                            "--jq",
+                            ".[0].number",
+                        ],
+                        30,
+                    ) {
+                        if let Ok(pr) = out.trim().parse::<u64>() {
+                            overlay.pr_number = Some(pr);
+                        }
                     }
                 }
             }
@@ -2506,43 +2109,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
         }
 
-        let now_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // jleechan-zaga / issue #348: a `DISPOSITION_REQUIRED` bead must
-        // KEEP being re-assessed — otherwise it is a terminal hold (the fast
-        // tier's ATTESTED-only filter would never look at it again, so the
-        // chain could never resume when the structural condition clears).
-        //
-        // r3 residual 2 (cooldown): a structural condition can persist for
-        // hours; re-fetching the PR snapshot every fast tick would hammer the
-        // SCM API. Skip re-assessment until the durable per-bead
-        // `held_recheck_after` cooldown elapses, and stamp the NEXT recheck now
-        // (before any SCM fetch) so the cooldown holds regardless of how this
-        // re-assessment exits (resume / reroll / re-hold / transient error).
-        //
-        // r3 residual 3 (provenance): the promotion back to ATTESTED is
-        // IN-MEMORY only and is NOT persisted here. The stored state stays
-        // DISPOSITION_REQUIRED until assessment reaches a terminal decision
-        // (READY / reroll / re-hold), so an early-exit (snapshot fetch failure,
-        // ci_pending, transient) leaves hold provenance intact and does not
-        // let the next re-hold double-emit the counter/telemetry/comment. The
-        // reroll branch persists the ATTESTED promotion just before calling
-        // `reroll::execute` (whose freshness guard requires ATTESTED/RE_ROLL).
-        let entered_as_disposition = overlay.state == OverlayState::DispositionRequired;
-        if entered_as_disposition {
-            if let Some(recheck_after) = deps.store.held_recheck_after(bead_id)? {
-                if now_epoch < recheck_after {
-                    continue; // still in cooldown — do not touch the SCM API.
-                }
-            }
-            deps.store.set_held_recheck_after(
-                bead_id,
-                now_epoch.saturating_add(deps.cfg.held_recheck_cooldown_secs),
-            )?;
-            overlay.state = OverlayState::Attested; // in-memory only (NOT saved)
-        }
         if overlay.state != OverlayState::Attested {
             continue;
         }
@@ -2550,233 +2116,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             Some(pr) => pr,
             None => continue,
         };
-
-        // jleechan-t40t r6: pre-gate validation. Before any gate assessment,
-        // the stored `pr_number` MUST (a) be a real OPEN PR and (b) have its
-        // head ref equal to `overlay.branch` — otherwise every gate query
-        // targets a PR the bead's branch is no longer bound to (jleechan-t8fd
-        // / PR #316 wedge). Closed/missing/not-same-branch PRs are
-        // re-resolved by head branch; an inconclusive re-resolution DEFERs
-        // (no fast-tier assessment this tick) instead of gate-assessing a
-        // stale PR.
-        //
-        // Skipped when the slow-tier re-resolution path above JUST set the
-        // `pr_number` from the branch this same tick (the dispatch→ATTESTED
-        // promotion block already verified the branch→PR live lookup, so
-        // re-validating the freshly-resolved value is redundant and would
-        // emit a false-positive `PR_PRE_GATE_VALIDATION_MISMATCH` on every
-        // healthy bead).
-        let pre_gate_pr = if pr_number_reresolved_this_tick {
-            // Slow-tier re-resolution path already verified the branch→PR
-            // live lookup this tick; skip the redundant pre-gate check.
-            pr
-        } else if !deps.cfg.pre_gate_validation_enabled {
-            // Pre-gate validation is operator-gated (default false) so
-            // legacy deployments and integration tests that don't script
-            // `open_pr_head_refs` for ATTESTED beads aren't disturbed.
-            // Production deployments with the flag enabled get full
-            // drift coverage for ATTESTED beads whose stored `pr_number`
-            // wasn't re-resolved by the dispatch→attested path this tick.
-            pr
-        } else {
-            match deps.scm.open_pr_head_ref_for_repo(&repo, pr) {
-                Ok(PrHeadBranch::SameRepo(head)) => {
-                    if Some(head.as_str()) == overlay.branch.as_deref() {
-                        pr
-                    } else {
-                        // Stored pr is OPEN but its head ref has drifted
-                        // off the bead's recorded branch — re-resolve by
-                        // head branch; defer if the branch has no live PR.
-                        let _ = emit(
-                            deps.telemetry_log,
-                            bead_id,
-                            overlay.attempt,
-                            OverlayState::Attested.as_str(),
-                            "PR_PRE_GATE_VALIDATION_MISMATCH",
-                            serde_json::json!({}),
-                            serde_json::json!({
-                                "branch": overlay.branch,
-                                "stored_pr_number": pr,
-                                "open_pr_head_ref_resolution": format!("SameRepo({head})"),
-                                "reason": "stored_pr_head_ref_drifted",
-                            }),
-                        );
-                        match deps
-                            .scm
-                            .pr_number_for_branch(&repo, overlay.branch.as_deref().unwrap_or(""))
-                        {
-                            Ok(Some(discovered)) => {
-                                overlay.pr_number = Some(discovered);
-                                deps.store.save(&overlay)?;
-                                emit(
-                                    deps.telemetry_log,
-                                    bead_id,
-                                    overlay.attempt,
-                                    OverlayState::Attested.as_str(),
-                                    "PR_NUMBER_REREZOLVED",
-                                    serde_json::json!({}),
-                                    serde_json::json!({
-                                        "branch": overlay.branch,
-                                        "previous_pr_number": pr,
-                                        "current_pr_number": discovered,
-                                        "reason": "pre_gate_validation_drift",
-                                    }),
-                                )?;
-                                discovered
-                            }
-                            Ok(None) => {
-                                // jleechan-t40t r12 (issue #326): the stored PR
-                                // drifted off the branch AND the branch has no
-                                // live PR. Clearing `pr_number` alone would
-                                // strand the bead ATTESTED forever — the
-                                // ATTESTED gate path needs a `pr_number` and the
-                                // branch→PR re-resolution only runs for
-                                // DISPATCHED beads. DEMOTE to DISPATCHED so the
-                                // next tick's re-resolution picks it up and
-                                // re-promotes once a live PR appears.
-                                overlay.pr_number = None;
-                                overlay.state = OverlayState::Dispatched;
-                                deps.store.save(&overlay)?;
-                                let _ = emit(
-                                    deps.telemetry_log,
-                                    bead_id,
-                                    overlay.attempt,
-                                    OverlayState::Dispatched.as_str(),
-                                    "PR_NUMBER_REREZOLVED_NO_OPEN_PR",
-                                    serde_json::json!({}),
-                                    serde_json::json!({
-                                        "branch": overlay.branch,
-                                        "previous_pr_number": pr,
-                                        "current_pr_number": serde_json::Value::Null,
-                                        "reason": "pre_gate_validation_no_open_pr",
-                                        "action": "demoted_attested_to_dispatched_for_rerezolve",
-                                    }),
-                                );
-                                continue;
-                            }
-                            Err(e) => {
-                                let _ = emit(
-                                    deps.telemetry_log,
-                                    bead_id,
-                                    overlay.attempt,
-                                    OverlayState::Attested.as_str(),
-                                    "PR_NUMBER_REREZOLVE_TRANSIENT_ERROR",
-                                    serde_json::json!({}),
-                                    serde_json::json!({
-                                        "branch": overlay.branch,
-                                        "phase": "pre_gate_validation",
-                                        "error": format!("{e:?}"),
-                                    }),
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                }
-                Ok(other) => {
-                    // Closed/missing/fork — emit mismatch, re-resolve by
-                    // head branch; defer if no live PR.
-                    let _ = emit(
-                        deps.telemetry_log,
-                        bead_id,
-                        overlay.attempt,
-                        OverlayState::Attested.as_str(),
-                        "PR_PRE_GATE_VALIDATION_MISMATCH",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "branch": overlay.branch,
-                            "stored_pr_number": pr,
-                            "open_pr_head_ref_resolution": format!("{other:?}"),
-                            "reason": "stored_pr_no_longer_open_or_branch_mismatch",
-                        }),
-                    );
-                    match deps
-                        .scm
-                        .pr_number_for_branch(&repo, overlay.branch.as_deref().unwrap_or(""))
-                    {
-                        Ok(Some(discovered)) => {
-                            overlay.pr_number = Some(discovered);
-                            deps.store.save(&overlay)?;
-                            emit(
-                                deps.telemetry_log,
-                                bead_id,
-                                overlay.attempt,
-                                OverlayState::Attested.as_str(),
-                                "PR_NUMBER_REREZOLVED",
-                                serde_json::json!({}),
-                                serde_json::json!({
-                                    "branch": overlay.branch,
-                                    "previous_pr_number": pr,
-                                    "current_pr_number": discovered,
-                                    "reason": "pre_gate_validation_drift",
-                                }),
-                            )?;
-                            discovered
-                        }
-                        Ok(None) => {
-                            // jleechan-t40t r12 (issue #326): stored PR is
-                            // closed/missing and the branch has no live PR.
-                            // Demote ATTESTED→DISPATCHED (rather than leaving it
-                            // ATTESTED with a null pr_number, which strands it)
-                            // so the DISPATCHED re-resolution path re-promotes
-                            // it when a live PR appears.
-                            overlay.pr_number = None;
-                            overlay.state = OverlayState::Dispatched;
-                            deps.store.save(&overlay)?;
-                            let _ = emit(
-                                deps.telemetry_log,
-                                bead_id,
-                                overlay.attempt,
-                                OverlayState::Dispatched.as_str(),
-                                "PR_NUMBER_REREZOLVED_NO_OPEN_PR",
-                                serde_json::json!({}),
-                                serde_json::json!({
-                                    "branch": overlay.branch,
-                                    "previous_pr_number": pr,
-                                    "current_pr_number": serde_json::Value::Null,
-                                    "reason": "pre_gate_validation_no_open_pr",
-                                    "action": "demoted_attested_to_dispatched_for_rerezolve",
-                                }),
-                            );
-                            continue;
-                        }
-                        Err(e) => {
-                            let _ = emit(
-                                deps.telemetry_log,
-                                bead_id,
-                                overlay.attempt,
-                                OverlayState::Attested.as_str(),
-                                "PR_NUMBER_REREZOLVE_TRANSIENT_ERROR",
-                                serde_json::json!({}),
-                                serde_json::json!({
-                                    "branch": overlay.branch,
-                                    "phase": "pre_gate_validation",
-                                    "error": format!("{e:?}"),
-                                }),
-                            );
-                            continue;
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = emit(
-                        deps.telemetry_log,
-                        bead_id,
-                        overlay.attempt,
-                        OverlayState::Attested.as_str(),
-                        "PR_PRE_GATE_VALIDATION_TRANSIENT_ERROR",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "branch": overlay.branch,
-                            "stored_pr_number": pr,
-                            "error": format!("{e:?}"),
-                        }),
-                    );
-                    continue;
-                }
-            }
-        };
-        let pr = pre_gate_pr;
 
         // jleechan-qdw: per-bead isolation. A transient `gh`/GraphQL/network
         // hiccup fetching THIS bead's PR snapshot must not abort the fast
@@ -2943,60 +2282,15 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             // jleechan-nplh: a verdict comment older than the current head
             // commit is stale evidence — gate 6 must not self-certify from
             // it (same staleness rule as `er_runner::maybe_run` step 2).
-            None => {
-                verifier::parse_er_verdict_since(&snapshot.comments, snapshot.head_committed_epoch)
-            }
+            None => verifier::parse_er_verdict_since(
+                &snapshot.comments,
+                snapshot.head_committed_epoch,
+            ),
         };
         evidence.is_production = verifier::classify_production(&snapshot.files);
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
-        // Bead jleechan-yoqy / issue #323 (r5): verify the canonical evidence
-        // contract fail-closed. A fully-parsed marker MUST reference the PR's
-        // current head AND point at a gist that is fetchable + non-empty. r5
-        // finding 2: a marker LINE present but incomplete (missing gist URL or
-        // `(head <sha>)`) is a definitive FAIL, not NotProvided — only a
-        // genuinely absent marker is NotProvided. r5 finding 3: a TRANSIENT
-        // gist-fetch error is Pending (Unknown/wait), never a Red that churns a
-        // reroll; only a definitive miss (empty / 404) is Failed. Only PRs
-        // carrying a marker incur the gist API call.
-        evidence.evidence_gist_status = match verifier::parse_evidence(&snapshot.body) {
-            Some(parsed) => {
-                let head_matches = {
-                    let want = snapshot.head_sha.to_ascii_lowercase();
-                    let got = parsed.head_sha.to_ascii_lowercase();
-                    !got.is_empty()
-                        && !want.is_empty()
-                        && (want.starts_with(&got) || got.starts_with(&want))
-                };
-                if !head_matches {
-                    verifier::EvidenceGistStatus::Failed(format!(
-                        "evidence head {} does not match PR head {}",
-                        parsed.head_sha, snapshot.head_sha
-                    ))
-                } else {
-                    match deps.scm.gist_nonempty(&parsed.gist_id) {
-                        Ok(Some(true)) => verifier::EvidenceGistStatus::Verified,
-                        Ok(Some(false)) => verifier::EvidenceGistStatus::Failed(format!(
-                            "evidence gist {} is empty",
-                            parsed.gist_id
-                        )),
-                        Ok(None) => verifier::EvidenceGistStatus::Failed(format!(
-                            "evidence gist {} not found",
-                            parsed.gist_id
-                        )),
-                        Err(e) => verifier::EvidenceGistStatus::Pending(format!(
-                            "evidence gist {} fetch failed transiently: {e}",
-                            parsed.gist_id
-                        )),
-                    }
-                }
-            }
-            None if verifier::has_evidence_marker(&snapshot.body) => {
-                verifier::EvidenceGistStatus::Failed(
-                    "evidence marker present but missing a gist URL or `(head <sha>)`".to_string(),
-                )
-            }
-            None => verifier::EvidenceGistStatus::NotProvided,
-        };
+        evidence.has_integration_evidence_marker =
+            verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
         let report = verifier::assess(deps.scm, pr, &repo, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
         // jleechan-wzgl: log the full per-gate breakdown (all 7 gates,
@@ -3010,18 +2304,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             obj.insert(
                 "skeptic_reviewers".to_string(),
                 serde_json::json!(evidence.skeptic_reviewers),
-            );
-            // jleechan-984e / issue #385: surface the cross-model degraded
-            // flag in GATE_ASSESSMENT telemetry so strict merge policy
-            // (#328) — and any downstream operator dashboards / alerts —
-            // can read it without re-deriving the family count from
-            // `skeptic_reviewers`. `true` means the gate-7 verdict came
-            // from a single model family (e.g. only `claude` because
-            // codex is quota-dead and agy/gemini/cursor-agent errored),
-            // which strict merge policy MUST treat as NOT strict-green.
-            obj.insert(
-                "review_degraded".to_string(),
-                serde_json::json!(evidence.review_degraded),
             );
             // jleechan-wzgl (PR #239 review round 1): `auto-merge-guard.sh`'s
             // `latest_assessment_no_red` greps GATE_ASSESSMENT lines by
@@ -3068,76 +2350,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 })
                 .collect();
             if red_reasons.is_empty() {
-                // jleechan-zaga / issue #348: no coder-fixable RED gate, but
-                // is the chain blocked by a STRUCTURAL-pending gate (an
-                // external verifier a coder cannot drive — CodeRabbit
-                // unavailable, Bugbot absent)? If so, hold
-                // DISPOSITION_REQUIRED and keep re-assessing, rather than
-                // silently churning the ATTESTED transient path forever (which
-                // eventually cap-parks HUMAN_HELD — the exact regression #348
-                // documents). A purely TRANSIENT report (CI still running,
-                // unverifiable thread count) falls through to the existing
-                // transient handling below.
-                if deps.cfg.stage == 2
-                    && matches!(
-                        verifier::classify_chain(&report),
-                        verifier::ChainDisposition::HoldDisposition
-                    )
-                {
-                    let structural_gates: Vec<serde_json::Value> =
-                        verifier::structural_pending_gates(&report)
-                            .into_iter()
-                            .map(|(gate_name, reason)| {
-                                serde_json::json!({
-                                    "gate": gate_name.as_str(),
-                                    "reason": reason,
-                                    "disposition": "structural",
-                                })
-                            })
-                            .collect();
-                    overlay.state = OverlayState::DispositionRequired;
-                    deps.store.save(&overlay)?;
-                    // Only a NEW hold (not a re-hold of an already-held bead)
-                    // increments the operator counter, emits the telemetry
-                    // event, and posts the comment — a bead re-assessed and
-                    // still structural must not spam the PR every tick.
-                    if !entered_as_disposition {
-                        // A first hold starts the re-assessment cooldown (a
-                        // re-hold already stamped it at re-assessment start).
-                        deps.store.set_held_recheck_after(
-                            bead_id,
-                            now_epoch.saturating_add(deps.cfg.held_recheck_cooldown_secs),
-                        )?;
-                        summary.beads_held_disposition_required += 1;
-                        emit(
-                            deps.telemetry_log,
-                            bead_id,
-                            overlay.attempt,
-                            OverlayState::DispositionRequired.as_str(),
-                            "DISPOSITION_REQUIRED",
-                            serde_json::json!({}),
-                            serde_json::json!({
-                                "reason": "chain blocked only by structural-pending gate(s) (external verifier the coder cannot drive); reroll would be no-op churn",
-                                "structural_gates": structural_gates,
-                                "pr_number": pr,
-                            }),
-                        )?;
-                        let gate_lines: Vec<String> = structural_gates
-                            .iter()
-                            .filter_map(|g| {
-                                let gate = g.get("gate")?.as_str()?;
-                                let reason = g.get("reason")?.as_str()?;
-                                Some(format!("- `{gate}`: {reason}"))
-                            })
-                            .collect();
-                        let comment_body = format!(
-                            "🤖 **[dark-factory]** Disposition required for bead `{bead_id}`: the only remaining blockers are structural (an external verifier the coder cannot drive — re-rolling cannot clear them). Daemon held at `DISPOSITION_REQUIRED` rather than superseding. Per-gate disposition needs:\n\n{}\n\nThe fast tier will continue to assess on each tick; the bead resumes the moment any gate becomes coder-fixable or green.",
-                            gate_lines.join("\n")
-                        );
-                        let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
-                    }
-                    continue;
-                }
                 if let Some(count) = er_runner_capped_count {
                     if escalation_already_recorded(deps, bead_id)? {
                         continue;
@@ -3204,7 +2416,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     }
                     overlay.state = OverlayState::HumanHeld;
                     overlay.attempt = MAX_HUMAN_HELD_RECOVERY_ATTEMPT;
-                    set_human_hold_reason(&mut overlay, HumanHoldReason::UnknownOnlyGateCapped);
+                    set_human_hold_reason(
+                        &mut overlay,
+                        HumanHoldReason::UnknownOnlyGateCapped,
+                    );
                     deps.store.save(&overlay)?;
                     record_escalation(
                         deps,
@@ -3282,19 +2497,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 };
                 let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
             } else {
-                // Stage 2: execute re-roll engine (there is at least one
-                // coder-fixable RED gate; the structural-only hold is handled
-                // in the no-red branch above, before the transient path).
-                //
-                // r3 residual 3: if this bead was held DISPOSITION_REQUIRED,
-                // its stored state is still DISPOSITION_REQUIRED (the promotion
-                // above was in-memory only). Persist the ATTESTED promotion now
-                // — assessment has completed and produced a coder-fixable red —
-                // so `reroll::execute`'s ATTESTED/RE_ROLL freshness guard
-                // accepts it instead of aborting.
-                if entered_as_disposition {
-                    deps.store.save(&overlay)?;
-                }
+                // Stage 2: execute re-roll engine
                 let mut reviewer = "verifier".to_string();
                 for (gate_name, result) in &report.results {
                     if let verifier::GateResult::Red(_) = result {
@@ -3412,34 +2615,13 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): re-roll held. Reason: {}", reason);
                         let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                     }
-                    Ok(crate::reroll::RerollOutcome::Deferred(reason)) => {
-                        // Bead jleechan-zeij / issue #322 r2: the fail-closed
-                        // proceed predicate could not confirm the previous
-                        // worker was safe to supersede this tick (active
-                        // session, moving HEAD, or failed stop()). `execute`
-                        // left the bead ATTESTED (no fresh branch, PR
-                        // untouched, session_id preserved) so this loop
-                        // re-selects and re-evaluates it next tick. This is
-                        // NOT a park — do not count it toward
-                        // beads_parked_human_held and do not post an
-                        // escalation comment.
-                        emit(
-                            deps.telemetry_log,
-                            bead_id,
-                            overlay.attempt,
-                            OverlayState::Attested.as_str(),
-                            "REROLL_DEFERRED",
-                            serde_json::json!({}),
-                            serde_json::json!({"reason": reason}),
-                        )?;
-                    }
                     Ok(crate::reroll::RerollOutcome::Aborted(_)) => {}
-                    Err(e) if e.is_transient() => {
+                    Err(e) => {
                         // jleechan-cq8r: per-bead isolation, matching the
                         // jleechan-qdw pattern used elsewhere in this same
                         // loop (BEAD_SNAPSHOT_TRANSIENT_ERROR /
                         // BEAD_PROCESSING_TRANSIENT_ERROR above). A single
-                        // bead's TRANSIENT re-roll engine failure -- e.g. the
+                        // bead's re-roll engine failure -- e.g. the
                         // circuit-breaker comparator's LLM call hitting a
                         // rate limit or returning a malformed reply -- must
                         // not abort processing for every OTHER in-flight
@@ -3447,9 +2629,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         // persisted this bead as `ReRoll` before the
                         // failure; emit telemetry and move on to the next
                         // bead rather than propagating with `return Err`,
-                        // which used to abort the entire fast tier. The bead is
-                        // re-selected next tick once it returns to ATTESTED (or
-                        // via the transient's own retry path).
+                        // which used to abort the entire fast tier.
                         let _ = emit(
                             deps.telemetry_log,
                             bead_id,
@@ -3459,35 +2639,6 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             serde_json::json!({}),
                             serde_json::json!({"phase": "reroll_execute", "error": format!("{e:?}")}),
                         );
-                        continue;
-                    }
-                    Err(e) => {
-                        // Bead jleechan-zeij / issue #322 r4 P1: a PERMANENT
-                        // re-roll error must NOT be swallowed as transient.
-                        // `reroll::execute` persisted this bead as RE_ROLL
-                        // before returning, and the fast tier only re-selects
-                        // ATTESTED overlays (see the `overlay.state != Attested`
-                        // guard at the top of run_fast_tier), so logging-and-
-                        // continuing would strand it in RE_ROLL forever,
-                        // invisible to recovery. Park it HUMAN_HELD with a
-                        // distinct, operator-visible reason instead.
-                        overlay.state = OverlayState::HumanHeld;
-                        set_human_hold_reason(&mut overlay, HumanHoldReason::RerollPermanentError);
-                        deps.store.save(&overlay)?;
-                        summary.beads_parked_human_held += 1;
-                        emit(
-                            deps.telemetry_log,
-                            bead_id,
-                            overlay.attempt,
-                            OverlayState::HumanHeld.as_str(),
-                            "PARKED_HUMAN_HELD",
-                            serde_json::json!({}),
-                            serde_json::json!({"reason": "reroll_permanent_error", "error": format!("{e:?}")}),
-                        )?;
-                        let comment_body = format!(
-                            "🤖 **[dark-factory]** Coder session parked (human held): the re-roll engine hit a permanent (non-transient) error and cannot self-recover. Error: {e}"
-                        );
-                        let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                         continue;
                     }
                 }
@@ -3579,59 +2730,6 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
         Some((parts[0].to_string(), parts[1].to_string()))
     } else {
         None
-    }
-}
-
-/// jleechan-drive-pr-branch-binding-pcpr: resolve whether `bead` should
-/// dispatch onto an existing PR's own head branch instead of a freshly
-/// generated `factory/<bead>-r<attempt>` one. Fires only when ALL of:
-/// * `bead.external_ref` parses to `owner/repo#N`,
-/// * that `owner/repo` matches the bead's OWN already-resolved repo
-///   (`resolved_repo`, `overlay.repo(cfg)`) — a bead whose `external_ref`
-///   happens to name a DIFFERENT repo than its resolved `target_repo` (a
-///   stray/contradictory `target_repo:` body field) must never bind to
-///   that other repo's PR,
-/// * `owner/repo` is a configured repo (`cfg.resolve_repo`), and
-/// * `Scm::open_pr_head_ref_for_repo` positively confirms PR `N` is OPEN
-///   AND same-repo (`PrHeadBranch::SameRepo`) -> `DriveBranchDecision::PrHead`.
-///
-/// An OPEN PR whose head lives on a fork (`PrHeadBranch::Fork`) resolves to
-/// `DriveBranchDecision::ForkFallback` — the fail-closed guard mirroring
-/// `intake::same_repo_pr`; dispatch still falls back to the generated
-/// branch, but telemetry records WHY (`branch_mode:
-/// "generated_fork_fallback"`) instead of conflating it with "no drive-PR
-/// signal at all".
-///
-/// Every other case — closed/merged/missing PR, malformed `external_ref`,
-/// unconfigured repo, repo mismatch, or a transient lookup failure — is
-/// `DriveBranchDecision::Generated` (fail-safe: dispatch falls back to the
-/// generated-branch path exactly as before this bead).
-fn resolve_drive_pr_head_branch(
-    scm: &dyn Scm,
-    cfg: &Config,
-    bead: &Bead,
-    resolved_repo: &str,
-) -> dispatch::DriveBranchDecision {
-    use dispatch::DriveBranchDecision;
-    let Some(ext_ref) = bead.external_ref.as_deref() else {
-        return DriveBranchDecision::Generated;
-    };
-    let Some((owner_repo, num_str)) = parse_external_ref(ext_ref) else {
-        return DriveBranchDecision::Generated;
-    };
-    if owner_repo != resolved_repo {
-        return DriveBranchDecision::Generated;
-    }
-    if cfg.resolve_repo(&owner_repo).is_none() {
-        return DriveBranchDecision::Generated;
-    }
-    let Ok(pr_num) = num_str.parse::<u64>() else {
-        return DriveBranchDecision::Generated;
-    };
-    match scm.open_pr_head_ref_for_repo(&owner_repo, pr_num) {
-        Ok(PrHeadBranch::SameRepo(head_ref)) => DriveBranchDecision::PrHead(head_ref),
-        Ok(PrHeadBranch::Fork) => DriveBranchDecision::ForkFallback,
-        Ok(PrHeadBranch::NotFound) | Err(_) => DriveBranchDecision::Generated,
     }
 }
 
