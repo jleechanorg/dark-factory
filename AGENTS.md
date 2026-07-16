@@ -56,7 +56,7 @@ Operational rules:
    token budget on adversarial validation, it is probably under-testing.
 6. Treat `.dot` graphs as the durable process code. Runner code is disposable;
    graph shape, specs, holdouts, and scoring contracts are the important assets.
-7. **Deprecate human interactive hat**: Route ALL coding LLM work through `/af`. Do not code inline or substitute direct AO/Codex/Claude workers outside `/af`; humans and interactive sessions define intent, add PR feedback, and monitor while the factory drives implementation and verification.
+7. **Task-scoped auto-factory**: When the user explicitly invokes `/af` or `/auto-factory` for a task, keep all coding LLM work for that task inside `/af`; do not bypass it with inline coding or direct AO/Codex/Claude workers. Otherwise use the normal coding workflow.
 
 ## Setup
 

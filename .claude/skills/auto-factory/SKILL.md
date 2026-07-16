@@ -1,13 +1,14 @@
 ---
 name: auto-factory
-description: Use when a request requires creating or editing code, tests, configuration, CI, or a pull request in any repository.
+description: Use when the user explicitly invokes /af or /auto-factory for a coding task.
 ---
 
 # Auto-Factory (`/af`)
 
-All coding LLM work enters through `/af`. Interactive sessions define intent,
-create or update tracker artifacts, add PR feedback, and monitor. The factory
-owns implementation, worker dispatch, verification, and PR convergence.
+Use this skill only when the user explicitly invokes `/af` or `/auto-factory`.
+Once invoked, all coding LLM work for that task remains inside `/af`; interactive
+sessions must not bypass it with inline coding or direct worker dispatch. Requests
+that do not invoke `/af` follow the normal coding workflow.
 
 ## Target contract
 
