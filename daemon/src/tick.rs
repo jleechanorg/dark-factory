@@ -790,8 +790,7 @@ fn run_bead_reconciliation_step(
             Ok(None) => {
                 let prior_state = overlay.state;
                 overlay.state = OverlayState::HumanHeld;
-                overlay.park_reason =
-                    Some("bead_missing_from_tracker_fail_closed".to_string());
+                set_human_hold_reason(&mut overlay, HumanHoldReason::BeadMissingFromTracker);
                 deps.store.save(&overlay)?;
                 summary.beads_reconciled_bead_missing += 1;
                 summary.beads_parked_human_held += 1;
@@ -817,8 +816,7 @@ fn run_bead_reconciliation_step(
             Ok(Some(BeadStatus::Closed)) => {
                 let prior_state = overlay.state;
                 overlay.state = OverlayState::HumanHeld;
-                overlay.park_reason =
-                    Some("bead_closed_terminal_fail_closed".to_string());
+                set_human_hold_reason(&mut overlay, HumanHoldReason::BeadClosedTerminal);
                 deps.store.save(&overlay)?;
                 summary.beads_reconciled_bead_closed += 1;
                 summary.beads_parked_human_held += 1;
