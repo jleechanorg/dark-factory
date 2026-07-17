@@ -56,15 +56,26 @@ jobs:
               SHA3="83b43a9ef8b56f74ece1813161816133045ca834444bfa6bb34c6166328474f8"
               ;;
             Linux-aarch64)
-              # No upstream sqlite-tools binary for Linux arm64. If sqlite3
-              # is already available, use it; otherwise warn and continue
-              # (bash tests that need sqlite3 will fail loudly on their own).
-              # Unprivileged self-hosted runners can't apt-get install.
+              # No upstream sqlite-tools binary for Linux arm64.  Several
+              # bash integration tests (factory-overlay.sh, rollback) shell
+              # out to \`sqlite3\` directly and require a working binary,
+              # so we MUST install one even on unprivileged runners.  Try
+              # the unprivileged apt-get path first; fall back to
+              # \`sudo -n apt-get\` (no-interaction) which works on the
+              # dark-factory self-hosted fleet.
               if command -v sqlite3 >/dev/null 2>&1 && sqlite3 ':memory:' 'SELECT 1;' >/dev/null 2>&1; then
                 echo "sqlite3 $(sqlite3 --version) found on PATH (no provision needed)"
                 exit 0
               fi
-              echo "::warning::No sqlite3 binary for Linux-aarch64; bash integration tests that require sqlite3 will fail"
+              if command -v apt-get >/dev/null 2>&1; then
+                echo "::notice::Installing sqlite3 via apt-get (Linux-aarch64)"
+                (apt-get update -y && apt-get install -y sqlite3) \
+                  || (sudo -n apt-get update -y && sudo -n apt-get install -y sqlite3) \
+                  || echo "::warning::apt-get install sqlite3 failed; tests requiring sqlite3 will fail"
+              else
+                echo "::warning::No apt-get and no sqlite.org binary for Linux-aarch64; bash integration tests that require sqlite3 will fail"
+              fi
+              command -v sqlite3 >/dev/null 2>&1 && sqlite3 --version
               exit 0
               ;;
             *)
