@@ -285,6 +285,14 @@ pub struct FakeSessions {
     /// check failed" error path independent of the timeout path).
     pub quiescence_check_error: RefCell<Option<String>>,
     pub worktree_remote_override: RefCell<Option<String>>,
+    /// jleechan-coder-silent-false-parks-h92r: scripted
+    /// `worktree_transcript_last_activity_epoch` override, keyed by
+    /// `"ao_project,branch"`. Empty by default (matches the trait's
+    /// `Ok(None)` default — "no evidence") so pre-existing tests are
+    /// unaffected; tests that exercise the transcript-liveness grace path
+    /// populate this to simulate a coder whose transcript is still updating
+    /// even though the remote branch has been silent.
+    pub transcript_activity_for: RefCell<HashMap<String, u64>>,
 }
 
 impl Default for FakeSessions {
@@ -304,6 +312,7 @@ impl Default for FakeSessions {
             terminal_at: RefCell::new(None),
             quiescence_check_error: RefCell::new(None),
             worktree_remote_override: RefCell::new(None),
+            transcript_activity_for: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -366,6 +375,15 @@ impl FakeSessions {
 
     pub fn set_worktree_remote(&self, remote: &str) {
         *self.worktree_remote_override.borrow_mut() = Some(remote.to_string());
+    }
+
+    /// Script `worktree_transcript_last_activity_epoch(ao_project, branch)`
+    /// to report `epoch` — simulates a coder transcript that was modified at
+    /// unix time `epoch`, independent of any remote branch commit activity.
+    pub fn set_transcript_activity(&self, ao_project: &str, branch: &str, epoch: u64) {
+        self.transcript_activity_for
+            .borrow_mut()
+            .insert(format!("{ao_project},{branch}"), epoch);
     }
 }
 
@@ -483,6 +501,21 @@ impl Sessions for FakeSessions {
             "owner/repo"
         };
         Ok(Some(format!("https://github.com/{repo}.git")))
+    }
+
+    fn worktree_transcript_last_activity_epoch(
+        &self,
+        ao_project: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "worktree_transcript_last_activity_epoch({ao_project},{branch})"
+        ));
+        Ok(self
+            .transcript_activity_for
+            .borrow()
+            .get(&format!("{ao_project},{branch}"))
+            .copied())
     }
 }
 
