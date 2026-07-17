@@ -353,6 +353,13 @@ pub enum HumanHoldReason {
     UnknownOnlyGateCapped,
     CircuitBreaker,
     EscalationLocalFallback(String),
+    /// jleechan-xsg4 (issue #270): bead was in active state but `br` no
+    /// longer has a record for the bead id. Fail-closed demotion path.
+    BeadMissingFromTracker,
+    /// jleechan-xsg4 (issue #270): bead is in a terminal state (`closed` /
+    /// `completed` / `done`) in `br` while the overlay is still active.
+    /// Fail-closed demotion path.
+    BeadClosedTerminal,
 }
 
 impl HumanHoldReason {
@@ -393,6 +400,8 @@ impl HumanHoldReason {
             Self::EscalationLocalFallback(reason) => {
                 return format!("escalation_local_fallback:{reason}");
             }
+            Self::BeadMissingFromTracker => "bead_missing_from_tracker_fail_closed",
+            Self::BeadClosedTerminal => "bead_closed_terminal_fail_closed",
         }
         .to_string()
     }
