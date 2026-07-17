@@ -27,6 +27,26 @@ fn test_cfg() -> Config {
             .join("afd_spec_dir_test")
             .to_string_lossy()
             .to_string(),
+        repos: std::collections::HashMap::new(),
+    }
+}
+
+fn adopted_overlay(bead_id: &str) -> BeadOverlay {
+    BeadOverlay {
+        bead_id: bead_id.into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 5,
+        spend_usd: 0.0,
+        pr_number: Some(777),
+        branch: Some("alice/my-cool-feature".into()),
+        session_id: None,
+        is_adopted: true,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
     }
 }
 
@@ -95,6 +115,7 @@ fn test_circuit_breaker() {
         spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
     };
     store.save(&bead).unwrap();
 
@@ -181,6 +202,7 @@ fn test_reroll_success() {
         spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
     };
     store.save(&bead).unwrap();
 
@@ -426,6 +448,7 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
         spawn_failure_count: 0,
         pre_session_head_sha: None,
         park_reason: None,
+        target_repo: None,
     };
     store.save(&bead).unwrap();
     store
@@ -566,6 +589,7 @@ fn test_reroll_adopted_spawn_failure_parks_human_held() {
         spawn_failure_count: 0,
         pre_session_head_sha: None,
         park_reason: None,
+        target_repo: None,
     };
     store.save(&bead).unwrap();
     store
@@ -629,6 +653,94 @@ fn test_reroll_adopted_spawn_failure_parks_human_held() {
 }
 
 #[test]
+fn adopted_spawn_failures_never_leave_an_untracked_or_recoverable_live_worker() {
+    for case in ["typed-cleanup", "save-stop-ok", "save-stop-fails"] {
+        let bead_id = format!("adopted-{case}");
+        let scm = FakeScm::new();
+        let sessions = FakeSessions::new();
+        if case == "typed-cleanup" {
+            sessions.fail_spawn_cleanup_for(&bead_id);
+        } else {
+            sessions.fail_stop_for("fake-session-1");
+            if case == "save-stop-ok" {
+                sessions.fail_stop_for.borrow_mut().clear();
+            }
+        }
+        let mut vcs = FakeVcs::new();
+        vcs.heads.insert(
+            "alice/my-cool-feature".into(),
+            "pre-session-sha-abc123".into(),
+        );
+        let store = FakeStateStore::new();
+        if case != "typed-cleanup" {
+            store.fail_save_for(&bead_id, OverlayState::Dispatched);
+        }
+        let llm = FakeLlm::new();
+        let cfg = test_cfg();
+        let telemetry_log =
+            std::env::temp_dir().join(format!("afd_reroll_{case}_{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&telemetry_log);
+        let mut bead = adopted_overlay(&bead_id);
+        store.save(&bead).unwrap();
+
+        let result = reroll::execute(
+            &RerollDeps {
+                scm: &scm,
+                sessions: &sessions,
+                vcs: &vcs,
+                store: &store,
+                llm: &llm,
+                cfg: &cfg,
+                telemetry_log: &telemetry_log,
+                reviewer: "verifier".into(),
+                review_text: "red gate".into(),
+            },
+            &mut bead,
+        );
+        assert!(result.is_err(), "{case} must surface a non-success result");
+
+        let held = store.load(&bead_id).unwrap().unwrap();
+        assert_eq!(held.state, OverlayState::HumanHeld, "case {case}");
+        match case {
+            "typed-cleanup" => {
+                assert_eq!(
+                    held.session_id.as_deref(),
+                    Some(format!("leaked-{bead_id}").as_str())
+                );
+                assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })));
+            }
+            "save-stop-ok" => {
+                assert_eq!(held.session_id, None);
+                assert!(sessions
+                    .calls
+                    .borrow()
+                    .iter()
+                    .any(|call| call == "stop(fake-session-1)"));
+            }
+            "save-stop-fails" => {
+                assert_eq!(held.session_id.as_deref(), Some("fake-session-1"));
+                assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })));
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            held.park_reason.as_deref(),
+            Some("spawn_cleanup_failed" | "adopted_spawn_failed")
+        ));
+
+        let calls_before_recovery = sessions.calls.borrow().len();
+        assert!(store.recover_human_held(10).unwrap().is_empty());
+        let after_recovery = store.load(&bead_id).unwrap().unwrap();
+        assert_eq!(after_recovery.state, held.state);
+        assert_eq!(after_recovery.attempt, held.attempt);
+        assert_eq!(after_recovery.session_id, held.session_id);
+        assert_eq!(after_recovery.park_reason, held.park_reason);
+        assert_eq!(calls_before_recovery, sessions.calls.borrow().len());
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+}
+
+#[test]
 fn test_reroll_adopted_skips_duplicate_spawn_when_session_already_active() {
     let scm = FakeScm::new();
     let mut sessions = FakeSessions::new();
@@ -654,6 +766,7 @@ fn test_reroll_adopted_skips_duplicate_spawn_when_session_already_active() {
         spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
     };
     store.save(&bead).unwrap();
     store
@@ -674,10 +787,8 @@ fn test_reroll_adopted_skips_duplicate_spawn_when_session_already_active() {
 
     let outcome = reroll::execute(&deps, &mut bead).unwrap();
     match outcome {
-        RerollOutcome::Rerolled { new_branch } => {
-            assert_eq!(new_branch, "alice/my-cool-feature");
-        }
-        other => panic!("expected RerollOutcome::Rerolled, got {:?}", other),
+        RerollOutcome::Held(reason) => assert!(reason.contains("already active")),
+        other => panic!("expected fail-closed RerollOutcome::Held, got {other:?}"),
     }
 
     let session_calls = sessions.calls.borrow();
@@ -695,9 +806,86 @@ fn test_reroll_adopted_skips_duplicate_spawn_when_session_already_active() {
     let updated = store.load("bead-adopted").unwrap().unwrap();
     assert_eq!(updated.attempt, 1);
     assert_eq!(updated.reroll_count, 0);
-    assert_eq!(updated.state, OverlayState::ReRoll);
+    assert_eq!(updated.state, OverlayState::HumanHeld);
     assert_eq!(updated.branch.as_deref(), Some("alice/my-cool-feature"));
     assert_eq!(updated.pr_number, Some(777));
+    assert_eq!(updated.session_id.as_deref(), Some("fake-session-1"));
+    assert_eq!(
+        updated.park_reason.as_deref(),
+        Some("adopted_session_already_active")
+    );
+    assert!(store.recover_human_held(10).unwrap().is_empty());
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn adopted_spawn_crash_is_reconciled_without_duplicate_redispatch() {
+    let bead_id = "adopted-crash-after-spawn";
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    sessions.panic_after_spawn_for(bead_id);
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert(
+        "alice/my-cool-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let cfg = test_cfg();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_reroll_adopted_crash_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+    let mut bead = adopted_overlay(bead_id);
+    store.save(&bead).unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = reroll::execute(
+            &RerollDeps {
+                scm: &scm,
+                sessions: &sessions,
+                vcs: &vcs,
+                store: &store,
+                llm: &llm,
+                cfg: &cfg,
+                telemetry_log: &telemetry_log,
+                reviewer: "verifier".into(),
+                review_text: "red gate".into(),
+            },
+            &mut bead,
+        );
+    }));
+    assert!(result.is_err(), "the fake must simulate process death after spawn");
+
+    let durable_intent = store.load(bead_id).unwrap().unwrap();
+    assert_eq!(durable_intent.state, OverlayState::Dispatching);
+    assert_eq!(durable_intent.session_id, None);
+    assert_eq!(
+        durable_intent.pre_session_head_sha.as_deref(),
+        Some("pre-session-sha-abc123")
+    );
+
+    store.reconcile_dispatching().unwrap();
+    let held = store.load(bead_id).unwrap().unwrap();
+    assert_eq!(held.state, OverlayState::HumanHeld);
+    assert_eq!(held.session_id, None);
+    assert_eq!(
+        held.park_reason.as_deref(),
+        Some("ambiguous_dispatching_recovery")
+    );
+    assert!(store.recover_human_held(10).unwrap().is_empty());
+    assert_eq!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| call.starts_with("spawn("))
+            .count(),
+        1,
+        "startup recovery must never create a second worker"
+    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
@@ -730,6 +918,7 @@ mod quiescence_timeout_races {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         }
     }
 
@@ -1095,6 +1284,7 @@ fn same_underlying_issue_malformed_reply_is_transient_not_fatal() {
         spawn_failure_count: 0,
         pre_session_head_sha: None,
         park_reason: None,
+        target_repo: None,
     };
     store.save(&bead).unwrap();
     store

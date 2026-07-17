@@ -66,9 +66,33 @@ def gh_issues():
             "number,title,body",
             "--limit",
             "50",
-        ]
+        ],
+        check=False
     )
-    return json.loads(p.stdout or "[]")
+    if p.returncode == 0:
+        return json.loads(p.stdout or "[]")
+    
+    # Fallback to REST API
+    print(f"[intake] GraphQL issues query failed, trying REST fallback...", file=sys.stderr)
+    p = run(
+        [
+            "gh",
+            "api",
+            f"repos/{target_repo}/issues?labels={factory_label}&state=open&per_page=50",
+        ],
+        check=False
+    )
+    if p.returncode == 0:
+        # Map REST format which already has number, title, body, but may include pull requests.
+        # GitHub Issues API returns both, so we filter out PRs to match gh issue list.
+        items = json.loads(p.stdout or "[]")
+        return [i for i in items if isinstance(i, dict) and "pull_request" not in i]
+    
+    # If fallback also fails, raise SystemExit with details
+    raise SystemExit(
+        f"GraphQL and REST fallback both failed.\nREST error: {p.stderr.strip()}"
+    )
+
 
 def br_issues():
     # Fetch BOTH open and closed beads so external_ref duplicate-detection can see
@@ -122,12 +146,27 @@ def pr_head_branch(pr_number):
         ],
         check=False,
     )
-    if p.returncode != 0:
-        return None
-    data = json.loads(p.stdout or "{}")
-    if data.get("state") != "OPEN":
-        return None
-    return data.get("headRefName")
+    if p.returncode == 0:
+        data = json.loads(p.stdout or "{}")
+        if data.get("state") == "OPEN":
+            return data.get("headRefName")
+    
+    # REST API fallback
+    print(f"[intake] GraphQL PR view failed or returned non-zero, trying REST: {pr_number}", file=sys.stderr)
+    p = run(
+        [
+            "gh",
+            "api",
+            f"repos/{target_repo}/pulls/{pr_number}",
+        ],
+        check=False,
+    )
+    if p.returncode == 0:
+        data = json.loads(p.stdout or "{}")
+        if data.get("state", "").upper() == "OPEN":
+            return data.get("head", {}).get("ref")
+    return None
+
 
 def ensure_drive_fields(body, pr_number, branch):
     lines = (body or "").splitlines()

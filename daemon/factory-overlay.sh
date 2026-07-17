@@ -36,6 +36,7 @@ export BR_DB="${BR_DB:-$ROOT/.beads/beads.db}"
 br() { command br --db "$BR_DB" "$@"; }
 DB="${AFD_DB:-$HOME/.dark-factory/daemon-cxdb.sqlite}"
 LOG="${AFD_LOG:-$HOME/Library/Logs/dark-factory/daemon.jsonl}"
+DAEMON_BIN="${AFD_DAEMON_BIN:-$ROOT/daemon/target/release/daemon}"
 BR_BIN="${AFD_BR_BIN:-${BR_BIN:-br}}"
 SCHEMA="$ROOT/daemon/contracts/schema.sql"
 CONFIG="${CONFIG:-$ROOT/config/daemon.toml}"
@@ -369,7 +370,7 @@ reroll-verdict)
   rat_json="$(js "$5")"
   emit "$2" "$cur_attempt" ATTESTED REROLL_VERDICT_RECORDED "{\"pr_number\":$3,\"verdict\":\"$4\",\"rationale\":$rat_json}"
   if [ "$4" = "reroll_worthy" ]; then
-    sql "UPDATE bead_overlay SET state='HUMAN_HELD', updated_at='$(now)' WHERE bead_id='$(q "$2")';"
+    sql "UPDATE bead_overlay SET state='HUMAN_HELD', session_id=NULL, park_reason='gate assessment not all-green (stage 1: recorded, not executed)', updated_at='$(now)' WHERE bead_id='$(q "$2")';"
     emit "$2" "$cur_attempt" HUMAN_HELD PARKED_HUMAN_HELD '{"reason":"reroll_worthy_stage1_disabled"}'
   fi
   echo "ok"
@@ -380,7 +381,7 @@ park)
   valid_bead_id "$2"
   cur_attempt="$(get_field "$2" attempt)"
   [[ "$cur_attempt" =~ ^[0-9]+$ ]] || cur_attempt=1
-  sql "UPDATE bead_overlay SET state='HUMAN_HELD', updated_at='$(now)' WHERE bead_id='$(q "$2")';"
+  sql "UPDATE bead_overlay SET state='HUMAN_HELD', park_reason='$(q "$3")', updated_at='$(now)' WHERE bead_id='$(q "$2")';"
   emit "$2" "$cur_attempt" HUMAN_HELD PARKED_HUMAN_HELD "{\"reason\":$(js "$3")}"
   echo "ok"
   ;;
@@ -390,7 +391,7 @@ park-duplicate)
   valid_bead_id "$2"
   cur_attempt="$(get_field "$2" attempt)"
   [[ "$cur_attempt" =~ ^[0-9]+$ ]] || cur_attempt=1
-  sql "UPDATE bead_overlay SET state='HUMAN_HELD', updated_at='$(now)' WHERE bead_id='$(q "$2")';"
+  sql "UPDATE bead_overlay SET state='HUMAN_HELD', park_reason='$(q "$3")', updated_at='$(now)' WHERE bead_id='$(q "$2")';"
   emit "$2" "$cur_attempt" HUMAN_HELD PARKED_DUPLICATE_BEAD "{\"reason\":$(js "$3")}"
   echo "parked $2"
   ;;
@@ -463,19 +464,10 @@ except Exception: print("{}")' 2>/dev/null || echo '{}')"
   ;;
 
 recover-held)
-  max_attempt=10
-  recovered=0
-  while IFS='|' read -r bead_id attempt pr; do
-    [ -n "$bead_id" ] || continue
-    [ "${attempt:-0}" -lt "$max_attempt" ] || continue
-    new_attempt=$(( attempt + 1 ))
-    new_state="QUEUED"
-    sql "UPDATE bead_overlay SET state='$new_state', attempt=$new_attempt, autonomy_secs=0, updated_at='$(now)' WHERE bead_id='$(q "$bead_id")';"
-    ctx="$(python3 -c 'import json,sys; v=sys.argv[1]; print(json.dumps({"prior_state":"HUMAN_HELD","pr_number":(int(v) if v not in ("","NULL") else None)}))' "$pr")"
-    emit "$bead_id" "$new_attempt" "$new_state" RECOVERED_FROM_HELD "$ctx"
-    recovered=$((recovered + 1))
-  done < <(sql -separator '|' "SELECT bead_id, attempt, coalesce(cast(pr_number as text),'') FROM bead_overlay WHERE state='HUMAN_HELD';")
-  echo "recovered=$recovered"
+  [ $# -eq 1 ] || die "usage: recover-held"
+  [ -x "$DAEMON_BIN" ] || die_code $EX_IO \
+    "canonical recovery binary unavailable: $DAEMON_BIN (refusing unsafe shell fallback)"
+  "$DAEMON_BIN" recover-held --db "$DB" --telemetry-log "$LOG"
   ;;
 
 unstick-dispatching)

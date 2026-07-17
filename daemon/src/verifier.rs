@@ -562,19 +562,27 @@ fn skeptic_gate(evidence: &PrEvidence) -> GateResult {
     }
 }
 
-/// Assess all 7 gates for `pr` (spec §4.2.5, design doc §5). `cfg` is accepted
-/// per the design-doc signature for future per-repo gate config (unused today
-/// — Stage 1 has no per-gate config knobs yet); `#[allow(unused_variables)]`
+/// Assess all 7 gates for `pr` (spec §4.2.5, design doc §5). `repo` (bead
+/// jleechan-9xrs, Stage D — see
+/// `docs/multirepo-dispatch-investigation-2026-07-11.md`) is the bead's OWN
+/// resolved repo (`overlay.repo(cfg)`), used to fetch the PR snapshot from
+/// the RIGHT repo instead of whichever repo `cfg.target_repo` names — a bead
+/// dispatched into a non-default `[repos.*]` entry used to have its gates
+/// silently assessed against the daemon-global repo's PR #N (or, worse,
+/// against no PR at all in that repo). `cfg` is accepted per the
+/// design-doc signature for future per-repo gate config (unused today —
+/// Stage 1 has no per-gate config knobs yet); `#[allow(unused_variables)]`
 /// documents that rather than dropping the parameter ahead of a design-doc
 /// revision.
 #[allow(unused_variables)]
 pub fn assess(
     scm: &dyn Scm,
     pr: u64,
+    repo: &str,
     cfg: &Config,
     evidence: &PrEvidence,
 ) -> Result<GateReport, crate::errors::DaemonError> {
-    let snapshot = match scm.pr_snapshot(pr) {
+    let snapshot = match scm.pr_snapshot_for_repo(repo, pr) {
         Ok(snapshot) => snapshot,
         Err(e) => {
             // The whole snapshot fetch failed (e.g. the GraphQL thread query
@@ -707,6 +715,24 @@ mod tests {
                 })
         }
 
+        /// jleechan-9xrs Stage D regression coverage: records the `repo`
+        /// argument distinctly from the plain `pr_snapshot({pr})` call log
+        /// entry so tests can assert `assess()` fetched the bead's OWN
+        /// resolved repo, not `cfg.target_repo`.
+        fn pr_snapshot_for_repo(&self, repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("pr_snapshot_for_repo({repo},{pr})"));
+            self.snapshots
+                .get(&pr)
+                .cloned()
+                .ok_or_else(|| DaemonError::Tool {
+                    tool: "gh".into(),
+                    rc: 1,
+                    stderr: format!("no scripted snapshot for pr {pr}"),
+                })
+        }
+
         fn close_pr(&self, _pr: u64, _comment: &str) -> Result<(), DaemonError> {
             Ok(())
         }
@@ -783,13 +809,76 @@ mod tests {
             .1
     }
 
+    /// jleechan-9xrs Stage D: `assess()` must fetch the PR snapshot from the
+    /// bead's OWN resolved repo (`repo` argument), not `cfg.target_repo`.
+    /// Regression for the multi-repo dispatch fix
+    /// (docs/multirepo-dispatch-investigation-2026-07-11.md) — before this
+    /// fix, gate assessment for a bead dispatched into a non-default
+    /// `[repos.*]` entry silently read the daemon-global repo's PR state
+    /// instead of the bead's own.
+    #[test]
+    fn assess_fetches_pr_snapshot_from_bead_repo_not_cfg_target_repo() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let mut cfg = test_cfg();
+        cfg.target_repo = "jleechanorg/wrong-global-repo".to_string();
+
+        let report = assess(
+            &scm,
+            7,
+            "otherorg/bead-owned-repo",
+            &cfg,
+            &all_green_evidence(),
+        )
+        .unwrap();
+
+        assert!(report.all_green, "expected all_green, got {report:?}");
+        let calls = scm.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "pr_snapshot_for_repo(otherorg/bead-owned-repo,7)"),
+            "expected assess() to fetch via pr_snapshot_for_repo with the bead's \
+             own repo, got calls: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("wrong-global-repo")),
+            "assess() must never leak cfg.target_repo into the snapshot fetch, \
+             got calls: {calls:?}"
+        );
+    }
+
+    /// Companion to the above: when the bead has no explicit repo (legacy —
+    /// mirrors `overlay.repo(cfg)`'s `None` fallback), passing
+    /// `&cfg.target_repo` as `repo` must behave identically to the
+    /// pre-Stage-D single-repo world. This is the "unchanged for legacy
+    /// beads" half of the acceptance criteria.
+    #[test]
+    fn assess_legacy_repo_equal_to_cfg_target_repo_is_unchanged() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+
+        assert!(report.all_green, "expected all_green, got {report:?}");
+        let calls = scm.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == &format!("pr_snapshot_for_repo({},7)", cfg.target_repo)),
+            "expected the legacy fallback repo (== cfg.target_repo) to reach \
+             pr_snapshot_for_repo unchanged, got calls: {calls:?}"
+        );
+    }
+
     #[test]
     fn all_green_snapshot_yields_all_green_report() {
         let mut scm = FakeScm::default();
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
 
-        let report = assess(&scm, 7, &cfg, &all_green_evidence()).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
 
         assert!(report.all_green, "expected all_green, got {report:?}");
         for (name, result) in &report.results {
@@ -805,7 +894,7 @@ mod tests {
         scm.snapshots.insert(7, snapshot);
         let cfg = test_cfg();
 
-        let report = assess(&scm, 7, &cfg, &all_green_evidence()).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
 
         assert!(!report.all_green);
         assert!(matches!(gate(&report, GateName::Ci), GateResult::Red(_)));
@@ -830,7 +919,7 @@ mod tests {
             .insert(7, snapshot_with_unknown_thread_count(7));
         let cfg = test_cfg();
 
-        let report = assess(&scm, 7, &cfg, &all_green_evidence()).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
 
         assert!(
             !report.all_green,
@@ -862,7 +951,7 @@ mod tests {
         let scm = FakeScm::default();
         let cfg = test_cfg();
 
-        let report = assess(&scm, 9, &cfg, &all_green_evidence()).unwrap();
+        let report = assess(&scm, 9, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
 
         assert!(!report.all_green);
         let gate5 = gate(&report, GateName::CommentsResolved);
@@ -888,7 +977,7 @@ mod tests {
         let scm = FakeScm::default(); // no snapshot -> every SCM gate Unknown
         let cfg = test_cfg();
 
-        let report = assess(&scm, 42, &cfg, &all_green_evidence()).unwrap();
+        let report = assess(&scm, 42, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
 
         assert!(!report.all_green);
     }
@@ -907,7 +996,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         match gate(&report, GateName::EvidenceFloor) {
@@ -930,7 +1019,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(gate(&report, GateName::EvidenceFloor).is_green());
         assert!(report.all_green);
@@ -950,7 +1039,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(gate(&report, GateName::EvidenceFloor).is_green());
         assert!(report.all_green);
@@ -970,7 +1059,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         match gate(&report, GateName::Skeptic) {
@@ -993,7 +1082,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(gate(&report, GateName::Skeptic).is_green());
         assert!(report.all_green);
@@ -1013,7 +1102,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         assert!(matches!(
@@ -1058,7 +1147,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         assert!(
@@ -1107,7 +1196,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         match gate(&report, GateName::EvidenceFloor) {
@@ -1130,7 +1219,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(gate(&report, GateName::EvidenceFloor).is_green());
         assert!(report.all_green);
@@ -1151,7 +1240,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         match gate(&report, GateName::EvidenceFloor) {
@@ -1174,7 +1263,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(gate(&report, GateName::EvidenceFloor).is_green());
         assert!(report.all_green);
@@ -1196,7 +1285,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         assert!(matches!(
@@ -1219,7 +1308,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         match gate(&report, GateName::EvidenceFloor) {

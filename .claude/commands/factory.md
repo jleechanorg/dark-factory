@@ -1,22 +1,17 @@
 ---
 description: "/factory — alias for /f; auto-routes to PR-mode when a PR is open, otherwise feature-mode"
-type: quality
+type: skill
 execution_mode: immediate
 aliases: [df]
 ---
 
 # /factory — Dark Factory DOT Pipeline Runner (alias for /f)
 
-Dispatches to the **`dark-factory` binary** (`./install.sh` →
-`~/.local/bin/dark-factory`). Single writer for the binary-first contract is
-`.claude/commands/f.md`; this file is a thin alias so the
-auto-detect behavior (PR-mode vs feature-mode) is identical for both
-entry points.
+Identical to `/f $ARGUMENTS`. Single writer for the binary-first contract is
+`.claude/commands/f.md`; read `.claude/skills/dark-factory/SKILL.md` and
+execute it as the source of truth.
 
-Unlike `/h` (in-Claude subagent dispatch), `/factory` runs the external
-`.dot`-driven pipeline. Install once; run from any target repo cwd.
-
-**Usage**:
+## Usage
 
 ```
 /factory <goal>                          # auto-detect: PR-mode or feature-mode; reviewer calibration on
@@ -26,17 +21,8 @@ Unlike `/h` (in-Claude subagent dispatch), `/factory` runs the external
 /factory --reviewer-calibration=false <goal>  # explicit opt-out; same as /f
 ```
 
-When `--pipeline` is omitted, the skill must run the same **Step 0
-detect context** logic as `/f` (see `.claude/commands/f.md`): if an
-open PR exists for the current branch and the goal relates to it, route
-to PR-mode; if no PR exists, route to feature-mode; if a PR exists but
-the goal is unrelated, ask the user. Do not default to `gates.dot`,
-`minimal_feature.dot`, or any single file for every run.
+## See also
 
-Equivalent to: `/f $ARGUMENTS`
-
-The final response must satisfy `/f`'s proof block: literal command run,
-Run ID, CXDB SHA, final outcome, exit code, wall-clock, logs, and evidence
-envelope. Reviewer calibration is also inherited from `/f`: default on,
-stored under `evidence/<run-id>/reviewer-calibration/`, and disabled only by
-an explicit `--reviewer-calibration=false` with a stated reason.
+- `/f` — same behavior, canonical entry point.
+- `.claude/skills/dark-factory/SKILL.md` — full contract (Step 0a/0b/0c,
+  reviewer calibration, proof-block output contract).
