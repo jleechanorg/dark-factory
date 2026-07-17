@@ -658,6 +658,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 body,
                 args.status_context,
                 f"diff capture failed: {str(exc)[:80]}",
+                pr_number=args.pr_number,
             )
         return 1
     # Defense-in-depth size check (also enforced inside get_pr_diff,
@@ -686,6 +687,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 body,
                 args.status_context,
                 f"diff capture failed: {str(exc)[:80]}",
+                pr_number=args.pr_number,
             )
         return 1
 
@@ -1037,11 +1039,23 @@ def _force_failure_status(
 
 
 def _publish_failure(
-    repo: str, head_sha: str, body: str, context: str, description: str
+    repo: str,
+    head_sha: str,
+    body: str,
+    context: str,
+    description: str,
+    pr_number: int = 0,
 ) -> None:
     """Best-effort publish of a failure (used for diff-capture / pre-flight
     failures). Always swallows secondary errors so the failure path itself
-    is observable."""
+    is observable.
+
+    `pr_number` is threaded from the caller (`args.pr_number`). Per the
+    E6 /swarm review (Strong A-F1), the previous implementation parsed
+    `"PR #N"` from `description` (which never contained it) and silently
+    routed the diagnostic comment to issue #0. Threading the explicit
+    PR number eliminates the silent-fallback failure mode.
+    """
     try:
         set_commit_status(
             repo, head_sha, state="failure", context=context, description=description
@@ -1049,20 +1063,9 @@ def _publish_failure(
     except Exception as exc:
         print(f"[skeptic-gate] set_commit_status failed: {exc}", file=sys.stderr)
     try:
-        post_or_update_comment(repo, _pr_number_for_desc(description), body)
+        post_or_update_comment(repo, pr_number, body)
     except Exception:
         pass
-
-
-def _pr_number_for_desc(description: str) -> int:
-    """Best-effort parse of PR number from a description string.
-
-    Used only to publish failure observations — never the source of
-    truth (the real PR number comes from the API call)."""
-    m = re.search(r"PR #(\d+)", description)
-    if m:
-        return int(m.group(1))
-    return 0
 
 
 # ---------------------------------------------------------------------------

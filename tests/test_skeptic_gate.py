@@ -21,6 +21,7 @@ hard precondition for claiming the gate is green.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -1856,3 +1857,144 @@ def test_status_overwritten_failure_never_becomes_success(monkeypatch, capsys):
     assert "failure" in states, (
         f"failure must overwrite pending on read-back failure; got {states}"
     )
+
+
+# ===========================================================================
+# E6 /swarm review follow-ups
+#   - C-F1/C-F2: workflow `runs-on` uses `fromJson(vars...)` and
+#     SELF_HOSTED_RUNNER_LABELS is exported in `env:`.
+#   - C-F3: a pull_request-triggered caller workflow exists in-tree.
+#   - A-F1: `_publish_failure` threads `args.pr_number` (no issue #0).
+# ===========================================================================
+
+
+def test_adversarial_workflow_runs_on_uses_from_json():
+    """E6 blocker C-F1: `runs-on` MUST use `fromJson(vars.SELF_HOSTED_RUNNER_LABELS)`
+    so a JSON-array string var becomes a list of labels GitHub can match.
+    Without `fromJson()` the runner label is one literal string and the
+    job never schedules."""
+    import re
+
+    workflow_path = os.path.join(
+        os.path.dirname(__file__),
+        os.pardir,
+        ".github",
+        "workflows",
+        "skeptic-gate.yml",
+    )
+    with open(workflow_path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    # Find the `runs-on:` line; the value must include fromJson().
+    m = re.search(r"^\s*runs-on:\s*(.+?)\s*$", text, re.MULTILINE)
+    assert m is not None, "skeptic-gate.yml must declare a `runs-on:` line"
+    runs_on = m.group(1)
+    assert "fromJson(" in runs_on, (
+        f"E6 blocker C-F1: runs-on must use fromJson() to parse the JSON-array "
+        f"label var; got: {runs_on!r}"
+    )
+    assert "vars.SELF_HOSTED_RUNNER_LABELS" in runs_on, (
+        f"runs-on must reference SELF_HOSTED_RUNNER_LABELS var; got: {runs_on!r}"
+    )
+
+
+def test_adversarial_workflow_runner_labels_in_env_block():
+    """E6 blocker C-F2: `SELF_HOSTED_RUNNER_LABELS` MUST be in the job `env:`
+    block. Otherwise the bash steps that reference it under `set -u`
+    crash with "unbound variable"."""
+    import re
+
+    workflow_path = os.path.join(
+        os.path.dirname(__file__),
+        os.pardir,
+        ".github",
+        "workflows",
+        "skeptic-gate.yml",
+    )
+    with open(workflow_path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    # Locate the `jobs.<name>.env:` block (top-level env, not step env).
+    jobs_match = re.search(
+        r"^\s*jobs:\s*\n([\s\S]*?)(?=^[a-zA-Z]|\Z)", text, re.MULTILINE
+    )
+    assert jobs_match is not None, "skeptic-gate.yml must declare `jobs:`"
+    jobs_text = jobs_match.group(1)
+    # Pull the first env: at indent level 4 (job-level env).
+    env_match = re.search(
+        r"^\s{4}env:\s*\n((?:\s{6,}[^\n]*\n)+)", jobs_text, re.MULTILINE
+    )
+    assert env_match is not None, "skeptic-gate.yml must declare a job-level `env:` block"
+    env_block = env_match.group(1)
+    assert "SELF_HOSTED_RUNNER_LABELS" in env_block, (
+        "E6 blocker C-F2: SELF_HOSTED_RUNNER_LABELS must be exported in the "
+        "job `env:` block so bash steps under `set -u` see it; not found"
+    )
+
+
+def test_adversarial_caller_workflow_exists_with_pull_request_trigger():
+    """E6 High C-F3: a same-target-repo caller workflow MUST exist and
+    trigger automatically on pull_request events. Without it the gate
+    is manual-only and violates automation-completeness."""
+    caller_path = os.path.join(
+        os.path.dirname(__file__),
+        os.pardir,
+        ".github",
+        "workflows",
+        "skeptic-gate-caller.yml",
+    )
+    assert os.path.isfile(caller_path), (
+        f"E6 High C-F3: caller workflow missing at {caller_path}"
+    )
+    with open(caller_path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    assert "pull_request_target:" in text or "pull_request:" in text, (
+        "caller workflow must declare a pull_request[|_target] trigger so the "
+        "gate fires automatically on PR open/synchronize"
+    )
+    # Must invoke the gate via workflow_call.
+    assert "skeptic-gate.yml" in text, (
+        "caller workflow must reference skeptic-gate.yml (workflow_call target)"
+    )
+    # Must forward a pinned trusted_code_sha.
+    assert "trusted_code_sha" in text, (
+        "caller workflow must pass inputs.trusted_code_sha to enforce the "
+        "immutable-code-ref invariant"
+    )
+
+
+def test_publish_failure_threads_pr_number_not_zero():
+    """E6 Strong A-F1: `_publish_failure` must post its diagnostic to
+    `args.pr_number`, not to issue #0. The previous implementation
+    parsed `"PR #N"` from the description string (which never contained
+    it) and silently routed the comment to issue #0."""
+    import runner.skeptic_gate_cli as cli_mod
+
+    captured = {}
+
+    def fake_set_commit_status(repo, head_sha, *, state, context, description):
+        captured["status"] = (repo, head_sha, state, context, description)
+
+    def fake_post(repo, pr_number, body):
+        captured["post"] = (repo, pr_number, body)
+        return 1
+
+    cli_mod.set_commit_status = fake_set_commit_status
+    cli_mod.post_or_update_comment = fake_post
+
+    # Call _publish_failure with pr_number=278 explicitly threaded.
+    cli_mod._publish_failure(
+        repo="jleechanorg/dark-factory",
+        head_sha="abcdef1234567890abcdef1234567890abcdef12",
+        body="**VERDICT: FAIL** ...",
+        context="skeptic",
+        description="diff capture failed: <truncated>",
+        pr_number=278,
+    )
+
+    assert "post" in captured, "post_or_update_comment must be called"
+    posted_repo, posted_pr, _ = captured["post"]
+    assert posted_repo == "jleechanorg/dark-factory"
+    assert posted_pr == 278, (
+        f"E6 Strong A-F1: _publish_failure must post to pr_number=278, not "
+        f"pr_number=0 (issue #0); got pr_number={posted_pr}"
+    )
+    assert posted_pr != 0, "must never post to issue #0"

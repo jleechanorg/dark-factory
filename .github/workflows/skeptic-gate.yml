@@ -115,7 +115,7 @@ permissions:
 jobs:
   skeptic:
     name: Skeptic (SHA-bound PASS/FAIL)
-    runs-on: ${{ vars.SELF_HOSTED_RUNNER_LABELS }}
+    runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS) }}
     timeout-minutes: 30
     env:
       SKEPTIC_REVIEWERS_JSON: '[["codex",""],["gemini","gemini-2.5-pro"]]'
@@ -131,6 +131,10 @@ jobs:
       SKEPTIC_GEMINI_SHA256: ${{ vars.SKEPTIC_GEMINI_SHA256 }}
       # Minimal PATH — only the bin dir containing the pinned binaries.
       SKEPTIC_REVIEWER_PATH: /opt/reviewers/codex:/opt/reviewers/gemini:/usr/bin:/bin
+      # Mirror the runner-label var so steps under `set -u` see it
+      # (E6 finding C-F2: it was referenced in a bash step but absent
+      # from `env:`, causing an unbound-variable crash).
+      SELF_HOSTED_RUNNER_LABELS: ${{ vars.SELF_HOSTED_RUNNER_LABELS }}
     steps:
       - name: Verify mandatory pin vars are set (no defaults)
         # Per post-audit comment 4953116428: pins were inactive because
