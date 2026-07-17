@@ -1,5 +1,6 @@
 use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
 use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};

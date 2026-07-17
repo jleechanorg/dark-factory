@@ -4,7 +4,6 @@ use crate::errors::DaemonError;
 use crate::state::{
     set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
 };
-use crate::tools::{Llm, Scm, Sessions, SpawnSpec, Vcs};
 use crate::telemetry::{self, TelemetryEvent};
 use crate::tools::{Llm, Scm, Sessions, SpawnSpec, Vcs};
 use std::hash::{Hash, Hasher};

@@ -2590,7 +2590,7 @@ mod tests {
         assert_eq!(got.pr_number, Some(271));
         assert_eq!(got.branch, Some("factory/b-full-r7".into()));
         assert_eq!(got.session_id, Some("ao-session-abc123".into()));
-        assert_eq!(got.is_adopted, true);
+        assert!(got.is_adopted);
         assert_eq!(got.spawn_failure_count, 2);
         assert_eq!(got.pre_session_head_sha, Some("abc123def456".into()));
         assert_eq!(got.park_reason, Some("session_stalled".into()));
@@ -2672,7 +2672,7 @@ mod tests {
             Some("ao-session-xyz789".into()),
             "session_id must not change"
         );
-        assert_eq!(got.is_adopted, true, "is_adopted must not change");
+        assert!(got.is_adopted, "is_adopted must not change");
         assert_eq!(
             got.spawn_failure_count, 1,
             "spawn_failure_count must not change"
@@ -2776,7 +2776,7 @@ mod tests {
             Some("ao-session-prod-001".into()),
             "session_id must not change"
         );
-        assert_eq!(got.is_adopted, true, "is_adopted must not change");
+        assert!(got.is_adopted, "is_adopted must not change");
         assert_eq!(
             got.spawn_failure_count, 3,
             "spawn_failure_count must not change"

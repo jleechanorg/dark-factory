@@ -10,6 +10,7 @@ use crate::router::RoutingVerdict;
 use crate::state::{
     set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
 };
+use crate::telemetry::TelemetryEvent;
 use crate::tools::{remote_url_for_display, remote_url_matches_repo, Bead, Sessions, SpawnSpec};
 
 #[cfg(test)]
@@ -1512,6 +1513,10 @@ mod tests {
     #[test]
     fn dispatch_ready_derives_defaults_for_unseen_valid_repo() {
         let sessions = FakeSessions::new(0);
+        sessions.set_worktree_remote(
+            "ez-gh-actions",
+            "https://github.com/jleechanorg/ez-gh-actions.git",
+        );
         let store = FakeStateStore::new();
         store
             .save(&BeadOverlay {
@@ -1716,7 +1721,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
 
         assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
         let overlay = store.load("bead-0").unwrap().unwrap();
@@ -2004,7 +2009,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
 
         assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
         assert!(!err.is_transient());
@@ -2037,7 +2042,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
 
         assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
         assert!(err
@@ -2619,7 +2624,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
 
         assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
         assert!(err
@@ -2678,7 +2683,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
 
         assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
         assert!(!err.is_transient());
@@ -2708,7 +2713,7 @@ mod tests {
             let cfg = cfg();
             let ready = beads(1);
 
-            let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+            let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
             assert_eq!(report.success_count(), 0, "remote={remote_url}");
             assert_eq!(report.failures[0].phase, "worktree_remote_mismatch", "remote={remote_url}");
@@ -2732,6 +2737,10 @@ mod tests {
     #[test]
     fn derived_route_telemetry_emitted_on_success() {
         let sessions = FakeSessions::new(0);
+        sessions.set_worktree_remote(
+            "ez-gh-actions",
+            "https://github.com/jleechanorg/ez-gh-actions.git",
+        );
         let store = FakeStateStore::new();
         store
             .save(&BeadOverlay {
