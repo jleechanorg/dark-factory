@@ -39,7 +39,7 @@ jobs:
           OS="$(uname -s)"
           ARCH="$(uname -m)"
           VER="3530300"
-          YEAR="2025"
+          YEAR="2026"
           case "${OS}-${ARCH}" in
             Darwin-arm64)
               URL="https://sqlite.org/${YEAR}/sqlite-tools-osx-arm64-${VER}.zip"
