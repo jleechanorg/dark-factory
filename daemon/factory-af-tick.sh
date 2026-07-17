@@ -40,6 +40,14 @@ CONFIG="${CONFIG:-$ROOT/config/daemon.toml}"
 [ -f "$CONFIG" ] || CONFIG="$ROOT/daemon/contracts/daemon.toml.example"
 TARGET_REPO="${TARGET_REPO:-}"
 
+# Slack notifications — libnotify-slack.sh is fail-soft (no-ops when env unset),
+# so this sourcing is safe even when neither HERMES_SLACK_BOT_TOKEN nor
+# FACTORY_SLACK_CHANNEL_ID is exported by the launching plist.
+if [ -r "$ROOT/daemon/scripts/libnotify-slack.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$ROOT/daemon/scripts/libnotify-slack.sh"
+fi
+
 # ---------- arg parsing ----------
 TARGET_PRS=""
 i=1
@@ -402,4 +410,9 @@ done < <(sqlite3 "$DB" -separator $'\t' \
    $order_clause;")
 
 echo "af_dispatched=$dispatched"
+# Per-tick status beacon — fires once per tick that ran the dispatch loop.
+# Discourages noisy per-error spam; this is just a heartbeat. ao_active is
+# only populated when AO is reachable; show "n/a" otherwise.
+_tick_active="${ao_active:-n/a}"
+slack_announce ":factory: /af tick — dispatched=${dispatched} ao_active=${_tick_active} ao_cap=${AO_CAP}" || true
 callpath run dark-factory ${1+"$@"} 2>/dev/null || true
