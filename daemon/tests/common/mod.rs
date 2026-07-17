@@ -162,6 +162,12 @@ pub struct FakeScm {
     pub permissions: HashMap<String, Permission>,
     pub pr_snapshots: HashMap<u64, PrSnapshot>,
     pub remote_branches: HashMap<String, Option<u64>>,
+    /// jleechan-drive-pr-branch-binding-pcpr: scripted open-PR head-ref
+    /// lookups, keyed by `(repo, pr_number)`. Presence of a key means "this
+    /// PR is confirmed OPEN with this head ref"; absence (the `Default`
+    /// case) means "not open/not found", matching the real `CliScm`
+    /// fail-safe default.
+    pub open_pr_head_refs: HashMap<(String, u64), String>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -244,6 +250,13 @@ impl Scm for FakeScm {
         } else {
             Ok(None)
         }
+    }
+
+    fn open_pr_head_ref_for_repo(&self, repo: &str, pr: u64) -> Result<Option<String>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("open_pr_head_ref_for_repo({repo},{pr})"));
+        Ok(self.open_pr_head_refs.get(&(repo.to_string(), pr)).cloned())
     }
 }
 

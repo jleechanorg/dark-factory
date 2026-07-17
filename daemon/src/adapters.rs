@@ -1121,6 +1121,43 @@ impl Scm for CliScm {
         self.with_repo(repo).pr_snapshot(pr)
     }
 
+    /// jleechan-drive-pr-branch-binding-pcpr: single REST lookup
+    /// (`repos/{repo}/pulls/{pr}`) used at dispatch time to decide whether
+    /// a bead's `external_ref` names a live open PR that dispatch must bind
+    /// to instead of fabricating `factory/<bead>-r<attempt>`. Every failure
+    /// mode here — tool error, unparseable body, closed/merged state, or a
+    /// `pr` number that isn't a pull request at all (the REST `pulls`
+    /// endpoint 404s for a plain issue number) — resolves to `Ok(None)`,
+    /// the fail-safe documented on the trait method: dispatch must never
+    /// guess a branch it could not positively confirm is an open PR's own
+    /// head.
+    fn open_pr_head_ref_for_repo(&self, repo: &str, pr: u64) -> Result<Option<String>, DaemonError> {
+        let out = match run_tool("gh", &["api", &format!("repos/{repo}/pulls/{pr}")], 15) {
+            Ok(out) => out,
+            Err(_) => return Ok(None),
+        };
+        #[derive(serde::Deserialize)]
+        struct RestPullView {
+            state: String,
+            head: RestPullViewHead,
+        }
+        #[derive(serde::Deserialize)]
+        struct RestPullViewHead {
+            #[serde(rename = "ref")]
+            ref_name: String,
+        }
+        let json_start = out.find('{').unwrap_or(0);
+        let parsed: RestPullView = match serde_json::from_str(&out[json_start..]) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        if parsed.state.eq_ignore_ascii_case("open") {
+            Ok(Some(parsed.head.ref_name))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
         let offline_path = std::path::Path::new(".beads/offline").join(format!("pr_{}.json", pr));
         if offline_path.exists() {

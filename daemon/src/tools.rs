@@ -385,6 +385,30 @@ pub trait Scm {
         let _ = repo;
         self.remote_branch_last_commit(branch)
     }
+    /// Resolve the head branch of PR `pr` in `repo`, but ONLY when that PR
+    /// is currently OPEN (bead jleechan-drive-pr-branch-binding-pcpr). Used
+    /// at dispatch time to distinguish "drive an existing open PR" beads
+    /// (whose `external_ref` names a live PR — the coder MUST land work on
+    /// the PR's own head branch, or AO's fail-closed branch validation
+    /// parks the bead `session_branch_mismatch` when it reuses the session
+    /// already bound to that branch) from ordinary create-new-work beads
+    /// (which always get a fresh generated `factory/<bead>-r<attempt>`
+    /// branch).
+    ///
+    /// `Ok(None)` is the fail-safe default for every case that must fall
+    /// back to the generated-branch path: a closed/merged/missing PR, an
+    /// `external_ref` number that isn't actually a pull request, or any
+    /// lookup failure (transient `gh` error, malformed response). This
+    /// call must never let an inconclusive lookup fabricate a branch
+    /// binding it can't positively confirm — see `CliScm`'s override for
+    /// the real `gh api` lookup. Default impl returns `Ok(None)`
+    /// unconditionally so every existing test fake and any impl that
+    /// predates this method keeps behaving exactly as before (always the
+    /// generated-branch path) without needing to implement it.
+    fn open_pr_head_ref_for_repo(&self, repo: &str, pr: u64) -> Result<Option<String>, DaemonError> {
+        let _ = (repo, pr);
+        Ok(None)
+    }
 }
 
 /// `ao` / `aow` CLIs.
