@@ -58,10 +58,10 @@ jobs:
             Linux-aarch64)
               # No upstream sqlite-tools binary for Linux arm64.  Several
               # bash integration tests (factory-overlay.sh, rollback) shell
-              # out to \`sqlite3\` directly and require a working binary,
+              # out to `sqlite3` directly and require a working binary,
               # so we MUST install one even on unprivileged runners.  Try
               # the unprivileged apt-get path first; fall back to
-              # \`sudo -n apt-get\` (no-interaction) which works on the
+              # `sudo -n apt-get` (no-interaction) which works on the
               # dark-factory self-hosted fleet.
               if command -v sqlite3 >/dev/null 2>&1 && sqlite3 ':memory:' 'SELECT 1;' >/dev/null 2>&1; then
                 echo "sqlite3 $(sqlite3 --version) found on PATH (no provision needed)"
