@@ -1,0 +1,21 @@
+# systemctl --user show dark-factory-merge-guard.service -p ExecMainStartTimestamp
+# Captured: 2026-07-10 ~19:43 PDT (well after the PR #228 merge at 13:48 PDT)
+#
+# NOTE ON SCOPE: ExecMainStartTimestamp/ExecMainExitTimestamp/ExecMainStatus reflect
+# only the MOST RECENT invocation of this oneshot service (it is re-triggered every
+# 60s by dark-factory-merge-guard.timer, and systemd does not retain per-invocation
+# history in `show` output — only journald does, per-line, forever subject to
+# retention). This file's purpose is narrow: it corroborates that
+# dark-factory-merge-guard.service is a live, systemd-supervised unit (not a
+# one-off manual script run) with Result=success on its most recent tick, run by
+# systemd itself (PID captured in journald), independent of anything the guard
+# script writes to its own log. The PER-TICK historical proof for the 13:48 PDT
+# merge window comes from journald (see journald-merge-guard-20260710-1340-1355.log
+# in this same directory), whose "Starting .../Finished ..." lines are written by
+# systemd[3285] (the user manager), not by auto-merge-guard.sh.
+
+ExecMainStartTimestamp=Fri 2026-07-10 19:39:03 PDT
+ExecMainExitTimestamp=Fri 2026-07-10 19:39:07 PDT
+ExecMainStatus=0
+Result=success
+ActiveState=inactive

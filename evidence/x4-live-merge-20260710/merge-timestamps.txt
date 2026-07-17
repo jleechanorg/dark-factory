@@ -1,0 +1,4 @@
+# ~/.dark-factory/merge-timestamps (epoch appended by guard line 89 on merge success):
+1783716480
+# decode:
+1783716480 -> Fri Jul 10 01:48:00 PM PDT 2026
