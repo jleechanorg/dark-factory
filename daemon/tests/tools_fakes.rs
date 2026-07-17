@@ -62,7 +62,7 @@ fn fake_scm_returns_scripted_permission_and_records_call() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "deadbeef".into(),
             body: "".into(),
             comments: vec![],
@@ -71,6 +71,7 @@ fn fake_scm_returns_scripted_permission_and_records_call() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+            head_committed_epoch: 0,
         },
     );
 
@@ -96,12 +97,16 @@ fn fake_sessions_spawn_attach_stop_quiescent_roundtrip() {
         next_session_id: "sess-9".into(),
         quiescent: true,
         fail_spawn_for: Default::default(),
+        panic_after_spawn_for: Default::default(),
+        fail_spawn_cleanup_for: Default::default(),
+        fail_stop_for: Default::default(),
         fail_spawn_deferred_for: Default::default(),
         spawn_prompts: Default::default(),
         calls: Default::default(),
         branch_for: Default::default(),
         terminal_at: Default::default(),
         quiescence_check_error: Default::default(),
+        worktree_remote_override: Default::default(),
     };
 
     assert_eq!(fake.active_count().unwrap(), 3);
@@ -110,6 +115,9 @@ fn fake_sessions_spawn_attach_stop_quiescent_roundtrip() {
         bead_id: "b1".into(),
         branch: "factory/b1-r1".into(),
         prompt: "do the thing".into(),
+        repo: "owner/repo".into(),
+        ao_project: "repo".into(),
+        remote: "origin".into(),
     };
     let id = fake.spawn(&spec).unwrap();
     assert_eq!(id, SessionId("sess-9".into()));

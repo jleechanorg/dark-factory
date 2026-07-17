@@ -82,13 +82,49 @@ BACKFILL_MAP: dict[str, tuple[str, str]] = {
         "gets the canonical form matching the batch-adoption convention.",
     ),
     "jleechan-8dyu": (
-        "jleechanorg/worldarchitect.ai#7888#local-8dyu",
+        # jleechan-mdgr root-cause fix: the ORIGINAL value here was
+        # "jleechanorg/worldarchitect.ai#7888#local-8dyu" -- appending the
+        # "#local-<id>" disambiguation suffix onto the SHORT canonical
+        # "owner/repo#N" base (which already contains a "#") instead of
+        # the "#"-free full-URL base every other duplicate-target entry in
+        # this map uses. That produced a ref with 2 "#" characters (3
+        # `parse_external_ref`-split segments), which
+        # `Tracker::comment_external` (daemon/src/adapters.rs) cannot
+        # parse -- this was live-fired against bead jleechan-8dyu on
+        # 2026-07-11T00:05:15Z as ESCALATION_NOTIFICATION_FAILED
+        # ("parse: invalid external_ref format for comment:
+        # jleechanorg/worldarchitect.ai#7888#local-8dyu"). This script
+        # already ran (this bead is no longer an orphan, so re-running is
+        # a no-op per the `before_orphans` guard below) -- corrected here
+        # so the value on record matches the convention actually used, and
+        # so no future reuse of this pattern repeats the mistake. The
+        # `_assert_no_double_hash_ambiguity` check below now fails loudly
+        # if this class of error is reintroduced.
+        "https://github.com/jleechanorg/worldarchitect.ai/pull/7888#local-8dyu",
         "title: '[daemon/verify] Post-merge smoke test for "
         "factory-lite-harness-restore PR + first real dispatch on PR "
         "#7888'; duplicate target of jleechan-93ft (created later), "
         "disambiguated.",
     ),
 }
+
+
+def _assert_no_double_hash_ambiguity(backfill_map: dict[str, tuple[str, str]]) -> None:
+    """jleechan-mdgr guard: fail loud, before any `br update` call, if any
+    mapped ref would double-append a `#local-<id>` disambiguation suffix
+    onto a base that already contains its own `#` (e.g. the SHORT canonical
+    `owner/repo#N` form). `parse_external_ref` in daemon/src/adapters.rs
+    only accepts exactly one `#`, so any entry with 2+ `#` characters is
+    guaranteed to break `comment_external` for that bead's escalation
+    comments -- catching that here, at data-authoring time, is cheaper than
+    an incident.
+    """
+    bad = {bead_id: ref for bead_id, (ref, _) in backfill_map.items() if ref.count("#") > 1}
+    if bad:
+        raise ValueError(
+            "backfill_external_ref: refusing to run -- these BACKFILL_MAP "
+            f"entries have more than one '#' (double-suffix corruption risk): {bad}"
+        )
 
 
 def run_br(args: list[str], db: str | None) -> subprocess.CompletedProcess:
@@ -116,6 +152,10 @@ def main() -> int:
     ap.add_argument("--db", default=None, help="beads.db path (default: auto-discover)")
     ap.add_argument("--dry-run", action="store_true", help="report only, do not call br update")
     args = ap.parse_args()
+
+    # jleechan-mdgr: fail loud before any br update if the map itself is
+    # shaped to corrupt an external_ref (see _assert_no_double_hash_ambiguity).
+    _assert_no_double_hash_ambiguity(BACKFILL_MAP)
 
     before = fetch_open_factory_beads(args.db)
     before_orphans = {i["id"] for i in before if not i.get("external_ref")}

@@ -13,6 +13,10 @@ OVERLAY="$ROOT/daemon/factory-overlay.sh"
 export AFD_DB="/tmp/test-overlay-$$-$$.sqlite"
 export AFD_LOG="/tmp/test-overlay-$$-$$.jsonl"
 export CONFIG="$ROOT/daemon/contracts/daemon.toml.example"
+export AFD_DAEMON_BIN="${AFD_DAEMON_BIN:-$ROOT/daemon/target/debug/daemon}"
+if [ ! -x "$AFD_DAEMON_BIN" ]; then
+  cargo build --quiet --manifest-path "$ROOT/daemon/Cargo.toml"
+fi
 # br needs a beads.db; point at a fresh temp one so bead-closed-check can run.
 export BR_DB="/tmp/test-overlay-$$-beads.db"
 touch "$BR_DB"
@@ -113,13 +117,13 @@ assert "state after pr-opened" "ATTESTED" "$state"
 pr="$(sqlite3 "$AFD_DB" "SELECT pr_number FROM bead_overlay WHERE bead_id='test-roundtrip';")"
 assert "pr_number after pr-opened" "7888" "$pr"
 
-# 11. gate-assessment ATTESTED, all-green (9-gate schema: 7 originals + code_standards + zfc)
+# 11. gate-assessment ATTESTED, all-green (7 required gates + optional code_standards/zfc)
 gates='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","code_standards":"green","zfc":"green"}'
 out="$("$OVERLAY" gate-assessment test-roundtrip 7888 "$gates")"
 assert "gate-assessment all-green → true" "true" "$(echo "$out" | head -1)"
 assert "gate-assessment cooldown=false" "cooldown_ready=false" "$(echo "$out" | tail -1)"
 
-# 11a. gate-assessment ATTESTED, 9-gate schema (with /code-standards + /zfc)
+# 11a. gate-assessment ATTESTED, 7-gate schema (code_standards/zfc now optional)
 # Pull the bead back to ATTESTED to re-run gate-assessment (was READY).
 "$OVERLAY" intake-upsert test-9gates 'nine gate test' >/dev/null
 "$OVERLAY" route-record test-9gates STANDARD_PATH >/dev/null
@@ -127,28 +131,25 @@ assert "gate-assessment cooldown=false" "cooldown_ready=false" "$(echo "$out" | 
 "$OVERLAY" pr-opened test-9gates 7889 https://github.com/jleechanorg/worldarchitect.ai/pull/7889 >/dev/null
 gates9='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","code_standards":"green","zfc":"green"}'
 out9="$("$OVERLAY" gate-assessment test-9gates 7889 "$gates9")"
-assert "gate-assessment 9-gate schema → true" "true" "$(echo "$out9" | head -1)"
+assert "gate-assessment 7-gate+optional schema → true" "true" "$(echo "$out9" | head -1)"
 
-# 11b. gate-assessment red on /zfc → false (verifies per-gate precedence)
+# 11b. gate-assessment with optional zfc=red → false (optional keys still count in all_green when present)
 "$OVERLAY" intake-upsert test-zfc-red 'zfc red test' >/dev/null
 "$OVERLAY" route-record test-zfc-red STANDARD_PATH >/dev/null
 "$OVERLAY" dispatch-record test-zfc-red fix/zfc-red >/dev/null
 "$OVERLAY" pr-opened test-zfc-red 7890 https://github.com/jleechanorg/worldarchitect.ai/pull/7890 >/dev/null
 gates_zfc_red='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","code_standards":"green","zfc":"red"}'
 out_zfc="$("$OVERLAY" gate-assessment test-zfc-red 7890 "$gates_zfc_red")"
-assert "gate-assessment 9-gate w/ zfc=red → false" "false" "$(echo "$out_zfc" | head -1)"
+assert "gate-assessment 7-gate+optional zfc=red → false (all keys count in all_green)" "false" "$(echo "$out_zfc" | head -1)"
 
-# 11c. gate-assessment rejects missing new keys (legacy 7-gate JSON should fail)
+# 11c. gate-assessment accepts legacy 7-gate JSON (now the canonical contract)
 "$OVERLAY" intake-upsert test-legacy 'legacy 7-gate test' >/dev/null
 "$OVERLAY" route-record test-legacy STANDARD_PATH >/dev/null
 "$OVERLAY" dispatch-record test-legacy fix/legacy-gates >/dev/null
 "$OVERLAY" pr-opened test-legacy 7891 https://github.com/jleechanorg/worldarchitect.ai/pull/7891 >/dev/null
 gates_legacy7='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green"}'
-set +e
-"$OVERLAY" gate-assessment test-legacy 7891 "$gates_legacy7" 2>&1
-rc_legacy=$?
-set -e
-assert "gate-assessment rejects legacy 7-gate schema" "1" "$rc_legacy"
+out_legacy="$("$OVERLAY" gate-assessment test-legacy 7891 "$gates_legacy7")"
+assert "gate-assessment accepts canonical 7-gate schema" "true" "$(echo "$out_legacy" | head -1)"
 
 # 11d. gate-assessment accepts pass/warn/fail (jleechan-240 expansion).
 # Warn is NON-blocking: a single warn still yields all_green=true so the
@@ -216,15 +217,36 @@ assert "state after ready" "READY" "$state"
 # 13. park (generic)
 "$OVERLAY" intake-upsert test-park 'park test' >/dev/null
 "$OVERLAY" route-record test-park SMALL_PATH >/dev/null
-out="$("$OVERLAY" park test-park 'manual hold')"
+out="$("$OVERLAY" park test-park session_stalled)"
 assert "park ok" "ok" "$out"
 state="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='test-park';")"
 assert "state after park" "HUMAN_HELD" "$state"
 
 # 14. recover-held HUMAN_HELD → QUEUED
+sqlite3 "$AFD_DB" <<'SQL'
+INSERT INTO bead_overlay (bead_id,state,attempt,branch,session_id,park_reason,updated_at)
+VALUES
+  ('held-permanent','HUMAN_HELD',2,'factory/held-permanent-r2','live-permanent','session_branch_mismatch','2026-07-13T00:00:00Z'),
+  ('held-unknown','HUMAN_HELD',2,'factory/held-unknown-r2',NULL,'future_reason','2026-07-13T00:00:00Z'),
+  ('held-null','HUMAN_HELD',2,'factory/held-null-r2',NULL,NULL,'2026-07-13T00:00:00Z'),
+  ('held-retryable-live','HUMAN_HELD',2,'factory/held-retryable-live-r2','live-retryable','session_stalled','2026-07-13T00:00:00Z');
+SQL
 out="$("$OVERLAY" recover-held)"
-[[ "$out" =~ recovered=1 ]] || { echo "FAIL: recover-held did not recover 1 (got $out)"; FAIL=$((FAIL+1)); }
-[ $? -eq 0 ] && echo "PASS: recover-held recovered 1" && PASS=$((PASS+1))
+assert "recover-held delegates to canonical policy" "recovered=1" "$out"
+assert "retry-safe no-session row requeued" "QUEUED|2||" \
+  "$(sqlite3 -separator '|' "$AFD_DB" "SELECT state,attempt,coalesce(session_id,''),coalesce(park_reason,'') FROM bead_overlay WHERE bead_id='test-park';")"
+assert "permanent live-session row preserved" \
+  "HUMAN_HELD|2|factory/held-permanent-r2|live-permanent|session_branch_mismatch" \
+  "$(sqlite3 -separator '|' "$AFD_DB" "SELECT state,attempt,branch,session_id,park_reason FROM bead_overlay WHERE bead_id='held-permanent';")"
+assert "unknown hold preserved" \
+  "HUMAN_HELD|2|factory/held-unknown-r2||future_reason" \
+  "$(sqlite3 -separator '|' "$AFD_DB" "SELECT state,attempt,branch,coalesce(session_id,''),park_reason FROM bead_overlay WHERE bead_id='held-unknown';")"
+assert "NULL-reason hold preserved" \
+  "HUMAN_HELD|2|factory/held-null-r2||" \
+  "$(sqlite3 -separator '|' "$AFD_DB" "SELECT state,attempt,branch,coalesce(session_id,''),coalesce(park_reason,'') FROM bead_overlay WHERE bead_id='held-null';")"
+assert "retry-safe reason with live session preserved" \
+  "HUMAN_HELD|2|factory/held-retryable-live-r2|live-retryable|session_stalled" \
+  "$(sqlite3 -separator '|' "$AFD_DB" "SELECT state,attempt,branch,session_id,park_reason FROM bead_overlay WHERE bead_id='held-retryable-live';")"
 
 # 15. tick-summary emits telemetry
 echo "tick" > /tmp/br-status  # doesn't matter for tick-summary

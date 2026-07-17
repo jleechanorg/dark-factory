@@ -4,12 +4,12 @@ mod common;
 
 use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker, FakeVcs};
 use daemon::config::Config;
-use daemon::state::{BeadOverlay, OverlayState, StateStore};
-use daemon::reroll::{self, RerollDeps, RerollOutcome};
 use daemon::constraints;
-use daemon::tick::{run_tick, TickDeps};
 use daemon::errors::DaemonError;
-use daemon::tools::{Issue, Permission, PrSnapshot, Llm};
+use daemon::reroll::{self, RerollDeps, RerollOutcome};
+use daemon::state::{BeadOverlay, OverlayState, StateStore};
+use daemon::tick::{run_tick, TickDeps};
+use daemon::tools::{Issue, Llm, Permission, PrSnapshot};
 
 fn test_cfg() -> Config {
     Config {
@@ -23,7 +23,30 @@ fn test_cfg() -> Config {
         slow_tick_secs: 60,
         autonomy_timebox_secs: 10_800,
         budget_warn_usd: 20.0,
-        spec_dir: std::env::temp_dir().join("afd_spec_dir_test").to_string_lossy().to_string(),
+        spec_dir: std::env::temp_dir()
+            .join("afd_spec_dir_test")
+            .to_string_lossy()
+            .to_string(),
+        repos: std::collections::HashMap::new(),
+    }
+}
+
+fn adopted_overlay(bead_id: &str) -> BeadOverlay {
+    BeadOverlay {
+        bead_id: bead_id.into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 5,
+        spend_usd: 0.0,
+        pr_number: Some(777),
+        branch: Some("alice/my-cool-feature".into()),
+        session_id: None,
+        is_adopted: true,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
     }
 }
 
@@ -53,7 +76,10 @@ fn test_spec_mutation_atomicity() {
     let _ = std::fs::remove_file(&spec_file);
 
     constraints::append_mutation(&spec_file, "initial = 1\n").unwrap();
-    assert_eq!(std::fs::read_to_string(&spec_file).unwrap(), "initial = 1\n");
+    assert_eq!(
+        std::fs::read_to_string(&spec_file).unwrap(),
+        "initial = 1\n"
+    );
 
     constraints::append_mutation(&spec_file, "append = 2\n").unwrap();
     assert_eq!(
@@ -87,6 +113,9 @@ fn test_circuit_breaker() {
         session_id: None,
         is_adopted: false,
         spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
     };
     store.save(&bead).unwrap();
 
@@ -97,7 +126,9 @@ fn test_circuit_breaker() {
     feedback.hash(&mut hasher);
     let feedback_hash = format!("{:016x}", hasher.finish());
 
-    store.save_rejection("bead-breaker", 1, "coderabbit", &feedback_hash, feedback).unwrap();
+    store
+        .save_rejection("bead-breaker", 1, "coderabbit", &feedback_hash, feedback)
+        .unwrap();
 
     // 2. Prepare dependencies for attempt 2, citing the exact same reviewer & feedback
     let deps = RerollDeps {
@@ -135,7 +166,8 @@ fn test_reroll_success() {
     sessions.quiescent = true;
     let mut vcs = FakeVcs::new();
     vcs.heads.insert("main".into(), "base-sha-123".into());
-    vcs.heads.insert("factory/bead-success-r1".into(), "head-sha-123".into());
+    vcs.heads
+        .insert("factory/bead-success-r1".into(), "head-sha-123".into());
     let store = FakeStateStore::new();
     let llm = FakeLlm::new();
     // mock LLM reply for constraint extraction
@@ -144,7 +176,10 @@ fn test_reroll_success() {
     ));
 
     let mut cfg = test_cfg();
-    cfg.spec_dir = std::env::temp_dir().join("afd_spec_dir_success_test").to_string_lossy().to_string();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_success_test")
+        .to_string_lossy()
+        .to_string();
     // Clean up spec directory
     let spec_dir = std::path::Path::new(&cfg.spec_dir);
     let _ = std::fs::remove_dir_all(spec_dir);
@@ -165,6 +200,9 @@ fn test_reroll_success() {
         session_id: None,
         is_adopted: false,
         spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
     };
     store.save(&bead).unwrap();
 
@@ -197,7 +235,10 @@ fn test_reroll_success() {
     assert_eq!(updated.pr_number, None); // Old PR number cleared
 
     // Verify branch registration
-    assert_eq!(store.branches.borrow().as_slice(), &["factory/bead-success-r2"]);
+    assert_eq!(
+        store.branches.borrow().as_slice(),
+        &["factory/bead-success-r2"]
+    );
 
     // Verify SCM PR close call
     let scm_calls = scm.calls.borrow();
@@ -246,8 +287,9 @@ fn test_tick_stage2_integration() {
     let sessions = FakeSessions::new();
     let mut vcs = FakeVcs::new();
     vcs.heads.insert("main".into(), "base-sha-abc".into());
-    vcs.heads.insert("factory/fake-bead-1-r1".into(), "head-sha-abc".into());
-    
+    vcs.heads
+        .insert("factory/fake-bead-1-r1".into(), "head-sha-abc".into());
+
     let llm = FakeLlm::new();
     // Mock router response
     *llm.response.borrow_mut() = Some(Ok(
@@ -256,7 +298,10 @@ fn test_tick_stage2_integration() {
 
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
-    cfg.spec_dir = std::env::temp_dir().join("afd_spec_dir_tick_test").to_string_lossy().to_string();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_tick_test")
+        .to_string_lossy()
+        .to_string();
     let spec_dir = std::path::Path::new(&cfg.spec_dir);
     let _ = std::fs::remove_dir_all(spec_dir);
     std::fs::create_dir_all(spec_dir).unwrap();
@@ -293,7 +338,7 @@ fn test_tick_stage2_integration() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "head-sha-abc".into(),
             body: "".into(),
             comments: vec![],
@@ -302,6 +347,7 @@ fn test_tick_stage2_integration() {
             ci_status: "red".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+            head_committed_epoch: 0,
         },
     );
 
@@ -332,7 +378,9 @@ fn test_tick_stage2_integration() {
             }
         }
     }
-    let smart_llm = SmartLlm { state: std::cell::RefCell::new(0) };
+    let smart_llm = SmartLlm {
+        state: std::cell::RefCell::new(0),
+    };
 
     let deps_smart = TickDeps {
         scm: &scm,
@@ -366,19 +414,17 @@ fn test_tick_stage2_integration() {
 }
 
 /// bead jleechan-tfs1, requirement (a) + (c): a red-gate reroll on an
-/// ADOPTED bead must push an append-only fix commit to the EXISTING
-/// contributor branch, must leave the original PR OPEN (no `close_pr`
-/// call), must never fabricate a replacement branch (no `create_branch_at`
-/// call, branch registry untouched), and must never force-push/rebase
-/// (asserted directly against the `FakeVcs` call log — the only method that
-/// can mutate the remote branch in this path is `push_fix_commit`, whose
-/// call arguments carry no `--force`/rebase semantics; `create_branch_at`
-/// and `close_pr` are asserted absent entirely).
+/// ADOPTED bead must spawn a real remediation coder session on the EXISTING
+/// contributor branch, briefed with the actual gate feedback. It must leave
+/// the original PR OPEN, must never fabricate a replacement branch, must
+/// never fabricate an empty fix commit in the daemon, and must never
+/// force-push/rebase.
 #[test]
-fn test_reroll_adopted_success_pushes_fix_commit_leaves_pr_open() {
+fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
     let scm = FakeScm::new();
     let sessions = FakeSessions::new();
-    let vcs = FakeVcs::new();
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("alice/my-cool-feature".into(), "pre-session-sha-abc123".into());
     let store = FakeStateStore::new();
     let llm = FakeLlm::new();
     let cfg = test_cfg();
@@ -400,9 +446,14 @@ fn test_reroll_adopted_success_pushes_fix_commit_leaves_pr_open() {
         session_id: None,
         is_adopted: true,
         spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
     };
     store.save(&bead).unwrap();
-    store.register_branch("bead-adopted", "alice/my-cool-feature").unwrap();
+    store
+        .register_branch("bead-adopted", "alice/my-cool-feature")
+        .unwrap();
 
     let deps = RerollDeps {
         scm: &scm,
@@ -427,10 +478,27 @@ fn test_reroll_adopted_success_pushes_fix_commit_leaves_pr_open() {
         other => panic!("expected RerollOutcome::Rerolled, got {:?}", other),
     }
 
-    // Overlay: attempt bumped, branch/pr_number UNCHANGED, back to ATTESTED
-    // (no factory session exists to redispatch to).
+    let spawn_prompts = sessions.spawn_prompts.borrow();
+    assert_eq!(
+        spawn_prompts.len(),
+        1,
+        "adopted remediation must spawn exactly one coder session with real feedback: {spawn_prompts:?}"
+    );
+    let (spawned_bead_id, prompt) = &spawn_prompts[0];
+    assert_eq!(spawned_bead_id, "bead-adopted");
+    assert!(
+        prompt.contains(&deps.review_text),
+        "spawn prompt must include the literal gate feedback text: {prompt}"
+    );
+    assert!(
+        prompt.contains("alice/my-cool-feature"),
+        "spawn prompt must target the existing adopted branch: {prompt}"
+    );
+
+    // Overlay: attempt bumped, branch/pr_number UNCHANGED, now DISPATCHED
+    // with the remediation session tracked until it quiesces.
     let updated = store.load("bead-adopted").unwrap().unwrap();
-    assert_eq!(updated.state, OverlayState::Attested);
+    assert_eq!(updated.state, OverlayState::Dispatched);
     assert_eq!(updated.attempt, 2);
     assert_eq!(updated.reroll_count, 1);
     assert_eq!(updated.branch.as_deref(), Some("alice/my-cool-feature"));
@@ -448,16 +516,27 @@ fn test_reroll_adopted_success_pushes_fix_commit_leaves_pr_open() {
         "adopted remediation must not register a fabricated replacement branch"
     );
 
-    // (c) Never force-pushes/rewrites history, never fabricates a branch:
+    assert!(
+        updated.session_id.is_some(),
+        "adopted remediation must track the spawned coder session"
+    );
+    assert_eq!(
+        updated.pre_session_head_sha.as_deref(),
+        Some("pre-session-sha-abc123"),
+        "adopted remediation must capture the pre-session HEAD SHA for later force-push detection"
+    );
+
+    // (c) Never force-pushes/rewrites history, never fabricates a branch or
+    // daemon-side placeholder commit:
     let vcs_calls = vcs.calls.borrow();
+    assert!(
+        vcs_calls.iter().all(|c| !c.starts_with("push_fix_commit(")),
+        "adopted remediation must never fabricate a daemon-side fix commit: {vcs_calls:?}"
+    );
     assert!(
         vcs_calls
             .iter()
-            .any(|c| c.starts_with("push_fix_commit(alice/my-cool-feature,")),
-        "adopted remediation must call push_fix_commit on the existing branch: {vcs_calls:?}"
-    );
-    assert!(
-        vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")),
+            .all(|c| !c.starts_with("create_branch_at(")),
         "adopted remediation must never fabricate a replacement branch: {vcs_calls:?}"
     );
     assert!(
@@ -477,20 +556,19 @@ fn test_reroll_adopted_success_pushes_fix_commit_leaves_pr_open() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
-/// bead jleechan-tfs1, requirement (d): when the append-only push genuinely
-/// can't land (e.g. the remote diverged, or a real conflict with base needs
-/// a rebase) `reroll::execute` must park the bead `HUMAN_HELD` rather than
-/// silently failing or falling back to a force-push. This is the direct
+/// bead jleechan-tfs1, requirement (d): when the remediation coder session
+/// cannot be spawned, `reroll::execute` must park the bead `HUMAN_HELD`
+/// rather than fabricating a placeholder commit. This is the direct
 /// `reroll::execute`-level proof; `tick_integration.rs` carries the
-/// full-pipeline proof that the escalation comment is actually posted on
-/// the PR (posting happens one layer up, in `tick::run_fast_tier`, which is
-/// the only layer with access to the `Tracker`/comment-posting path).
+/// full-pipeline proof that the escalation comment is actually posted on the
+/// PR.
 #[test]
-fn test_reroll_adopted_push_failure_parks_human_held() {
+fn test_reroll_adopted_spawn_failure_parks_human_held() {
     let scm = FakeScm::new();
     let sessions = FakeSessions::new();
-    let vcs = FakeVcs::new();
-    vcs.fail_push_fix_commit_for("alice/my-cool-feature");
+    sessions.fail_spawn_for("bead-adopted-conflict");
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("alice/my-cool-feature".into(), "pre-session-sha-abc123".into());
     let store = FakeStateStore::new();
     let llm = FakeLlm::new();
     let cfg = test_cfg();
@@ -509,9 +587,14 @@ fn test_reroll_adopted_push_failure_parks_human_held() {
         session_id: None,
         is_adopted: true,
         spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
     };
     store.save(&bead).unwrap();
-    store.register_branch("bead-adopted-conflict", "alice/my-cool-feature").unwrap();
+    store
+        .register_branch("bead-adopted-conflict", "alice/my-cool-feature")
+        .unwrap();
 
     let deps = RerollDeps {
         scm: &scm,
@@ -529,8 +612,8 @@ fn test_reroll_adopted_push_failure_parks_human_held() {
     match outcome {
         RerollOutcome::Held(reason) => {
             assert!(
-                reason.contains("append-only") || reason.contains("human"),
-                "Held reason should explain the append-only/needs-human situation: {reason}"
+                reason.contains("failed to spawn a remediation coder session"),
+                "Held reason should explain the session spawn failure: {reason}"
             );
         }
         other => panic!("expected RerollOutcome::Held, got {:?}", other),
@@ -545,8 +628,14 @@ fn test_reroll_adopted_push_failure_parks_human_held() {
 
     let vcs_calls = vcs.calls.borrow();
     assert!(
-        vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")),
+        vcs_calls
+            .iter()
+            .all(|c| !c.starts_with("create_branch_at(")),
         "a failed adopted remediation must never fall back to fabricating a branch: {vcs_calls:?}"
+    );
+    assert!(
+        vcs_calls.iter().all(|c| !c.starts_with("push_fix_commit(")),
+        "a failed adopted remediation must never fabricate a daemon-side fix commit: {vcs_calls:?}"
     );
     assert!(
         vcs_calls
@@ -558,6 +647,244 @@ fn test_reroll_adopted_push_failure_parks_human_held() {
     assert!(
         scm_calls.iter().all(|c| !c.starts_with("close_pr(")),
         "a failed adopted remediation must never close the contributor's PR: {scm_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn adopted_spawn_failures_never_leave_an_untracked_or_recoverable_live_worker() {
+    for case in ["typed-cleanup", "save-stop-ok", "save-stop-fails"] {
+        let bead_id = format!("adopted-{case}");
+        let scm = FakeScm::new();
+        let sessions = FakeSessions::new();
+        if case == "typed-cleanup" {
+            sessions.fail_spawn_cleanup_for(&bead_id);
+        } else {
+            sessions.fail_stop_for("fake-session-1");
+            if case == "save-stop-ok" {
+                sessions.fail_stop_for.borrow_mut().clear();
+            }
+        }
+        let mut vcs = FakeVcs::new();
+        vcs.heads.insert(
+            "alice/my-cool-feature".into(),
+            "pre-session-sha-abc123".into(),
+        );
+        let store = FakeStateStore::new();
+        if case != "typed-cleanup" {
+            store.fail_save_for(&bead_id, OverlayState::Dispatched);
+        }
+        let llm = FakeLlm::new();
+        let cfg = test_cfg();
+        let telemetry_log =
+            std::env::temp_dir().join(format!("afd_reroll_{case}_{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&telemetry_log);
+        let mut bead = adopted_overlay(&bead_id);
+        store.save(&bead).unwrap();
+
+        let result = reroll::execute(
+            &RerollDeps {
+                scm: &scm,
+                sessions: &sessions,
+                vcs: &vcs,
+                store: &store,
+                llm: &llm,
+                cfg: &cfg,
+                telemetry_log: &telemetry_log,
+                reviewer: "verifier".into(),
+                review_text: "red gate".into(),
+            },
+            &mut bead,
+        );
+        assert!(result.is_err(), "{case} must surface a non-success result");
+
+        let held = store.load(&bead_id).unwrap().unwrap();
+        assert_eq!(held.state, OverlayState::HumanHeld, "case {case}");
+        match case {
+            "typed-cleanup" => {
+                assert_eq!(
+                    held.session_id.as_deref(),
+                    Some(format!("leaked-{bead_id}").as_str())
+                );
+                assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })));
+            }
+            "save-stop-ok" => {
+                assert_eq!(held.session_id, None);
+                assert!(sessions
+                    .calls
+                    .borrow()
+                    .iter()
+                    .any(|call| call == "stop(fake-session-1)"));
+            }
+            "save-stop-fails" => {
+                assert_eq!(held.session_id.as_deref(), Some("fake-session-1"));
+                assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })));
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            held.park_reason.as_deref(),
+            Some("spawn_cleanup_failed" | "adopted_spawn_failed")
+        ));
+
+        let calls_before_recovery = sessions.calls.borrow().len();
+        assert!(store.recover_human_held(10).unwrap().is_empty());
+        let after_recovery = store.load(&bead_id).unwrap().unwrap();
+        assert_eq!(after_recovery.state, held.state);
+        assert_eq!(after_recovery.attempt, held.attempt);
+        assert_eq!(after_recovery.session_id, held.session_id);
+        assert_eq!(after_recovery.park_reason, held.park_reason);
+        assert_eq!(calls_before_recovery, sessions.calls.borrow().len());
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+}
+
+#[test]
+fn test_reroll_adopted_skips_duplicate_spawn_when_session_already_active() {
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    let vcs = FakeVcs::new();
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let cfg = test_cfg();
+    let telemetry_log = std::env::temp_dir().join("afd_reroll_adopted_duplicate_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-adopted".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 5,
+        spend_usd: 0.0,
+        pr_number: Some(777),
+        branch: Some("alice/my-cool-feature".into()),
+        session_id: None,
+        is_adopted: true,
+        spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+    };
+    store.save(&bead).unwrap();
+    store
+        .register_branch("bead-adopted", "alice/my-cool-feature")
+        .unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "verifier".into(),
+        review_text: "CI check-run(s) not all success".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    match outcome {
+        RerollOutcome::Held(reason) => assert!(reason.contains("already active")),
+        other => panic!("expected fail-closed RerollOutcome::Held, got {other:?}"),
+    }
+
+    let session_calls = sessions.calls.borrow();
+    assert!(
+        session_calls
+            .iter()
+            .any(|c| c == "attach(alice/my-cool-feature,bead-adopted)"),
+        "duplicate-spawn guard must attach to the branch before deciding: {session_calls:?}"
+    );
+    assert!(
+        session_calls.iter().all(|c| !c.starts_with("spawn(")),
+        "duplicate-spawn guard must not spawn another session: {session_calls:?}"
+    );
+
+    let updated = store.load("bead-adopted").unwrap().unwrap();
+    assert_eq!(updated.attempt, 1);
+    assert_eq!(updated.reroll_count, 0);
+    assert_eq!(updated.state, OverlayState::HumanHeld);
+    assert_eq!(updated.branch.as_deref(), Some("alice/my-cool-feature"));
+    assert_eq!(updated.pr_number, Some(777));
+    assert_eq!(updated.session_id.as_deref(), Some("fake-session-1"));
+    assert_eq!(
+        updated.park_reason.as_deref(),
+        Some("adopted_session_already_active")
+    );
+    assert!(store.recover_human_held(10).unwrap().is_empty());
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn adopted_spawn_crash_is_reconciled_without_duplicate_redispatch() {
+    let bead_id = "adopted-crash-after-spawn";
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    sessions.panic_after_spawn_for(bead_id);
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert(
+        "alice/my-cool-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    let cfg = test_cfg();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_reroll_adopted_crash_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+    let mut bead = adopted_overlay(bead_id);
+    store.save(&bead).unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = reroll::execute(
+            &RerollDeps {
+                scm: &scm,
+                sessions: &sessions,
+                vcs: &vcs,
+                store: &store,
+                llm: &llm,
+                cfg: &cfg,
+                telemetry_log: &telemetry_log,
+                reviewer: "verifier".into(),
+                review_text: "red gate".into(),
+            },
+            &mut bead,
+        );
+    }));
+    assert!(result.is_err(), "the fake must simulate process death after spawn");
+
+    let durable_intent = store.load(bead_id).unwrap().unwrap();
+    assert_eq!(durable_intent.state, OverlayState::Dispatching);
+    assert_eq!(durable_intent.session_id, None);
+    assert_eq!(
+        durable_intent.pre_session_head_sha.as_deref(),
+        Some("pre-session-sha-abc123")
+    );
+
+    store.reconcile_dispatching().unwrap();
+    let held = store.load(bead_id).unwrap().unwrap();
+    assert_eq!(held.state, OverlayState::HumanHeld);
+    assert_eq!(held.session_id, None);
+    assert_eq!(
+        held.park_reason.as_deref(),
+        Some("ambiguous_dispatching_recovery")
+    );
+    assert!(store.recover_human_held(10).unwrap().is_empty());
+    assert_eq!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| call.starts_with("spawn("))
+            .count(),
+        1,
+        "startup recovery must never create a second worker"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -589,6 +916,9 @@ mod quiescence_timeout_races {
             session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
         }
     }
 
@@ -657,7 +987,9 @@ mod quiescence_timeout_races {
         // Never proceeded past quiescence: no fresh branch, old PR untouched.
         let vcs_calls = vcs.calls.borrow();
         assert!(
-            vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")),
+            vcs_calls
+                .iter()
+                .all(|c| !c.starts_with("create_branch_at(")),
             "must not fabricate a branch when quiescence never confirmed: {vcs_calls:?}"
         );
         let scm_calls = scm.calls.borrow();
@@ -909,4 +1241,79 @@ mod quiescence_timeout_races {
         std::fs::remove_dir_all(spec_dir).ok();
         let _ = std::fs::remove_file(&telemetry_log);
     }
+}
+
+/// jleechan-cq8r: a malformed/unparseable reply from the circuit-breaker's
+/// semantic comparator LLM call must NOT crash the daemon. Before this fix,
+/// `same_underlying_issue` (reroll.rs) constructed `DaemonError::Parse` for
+/// this case, which `is_transient()` does not cover -- the exact
+/// jleechan-5ia2 crash-loop pattern (PR #197), reintroduced via this
+/// brand-new subprocess-LLM call site. This test drives the REAL
+/// `reroll::execute` through a second-attempt circuit-breaker comparison
+/// (attempt=2, same reviewer as the stored attempt-1 rejection) with a
+/// scripted LLM reply that contains no JSON object at all, and asserts the
+/// resulting error is transient.
+#[test]
+fn same_underlying_issue_malformed_reply_is_transient_not_fatal() {
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    let vcs = FakeVcs::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let llm = FakeLlm::new();
+    // No JSON object anywhere in this reply -- `reply.rfind('}')` returns
+    // None, exercising exactly the failure mode jleechan-cq8r found.
+    *llm.response.borrow_mut() = Some(Ok(
+        "the model babbled without any JSON object at all".to_string()
+    ));
+
+    let telemetry_log = std::env::temp_dir().join("afd_cq8r_malformed_comparator.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "cq8r-bead".into(),
+        state: OverlayState::Attested,
+        attempt: 2,
+        reroll_count: 1,
+        autonomy_secs: 0,
+        spend_usd: 0.0,
+        pr_number: Some(900),
+        branch: Some("factory/cq8r-bead-r2".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+    };
+    store.save(&bead).unwrap();
+    store
+        .save_rejection("cq8r-bead", 1, "verifier", "deadbeefdeadbeef", "prior rejection text")
+        .unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "verifier".to_string(),
+        review_text: "new rejection text, different from prior".to_string(),
+    };
+
+    let err = reroll::execute(&deps, &mut bead)
+        .expect_err("malformed comparator reply must surface as an Err, not silently succeed");
+
+    assert!(
+        matches!(err, DaemonError::ComparatorUnparseable(_)),
+        "expected DaemonError::ComparatorUnparseable, got {err:?}"
+    );
+    assert!(
+        err.is_transient(),
+        "a malformed circuit-breaker comparator reply must be classified transient (jleechan-cq8r / jleechan-5ia2 pattern), got non-transient: {err:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
 }

@@ -55,7 +55,40 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- corrupt either of those. Older DBs pre-date this column and get it via
   -- the idempotent `ensure_spawn_failure_count_column` migration in
   -- `SqliteStateStore::open` (same guard pattern as `ensure_is_adopted_column`).
-  spawn_failure_count INTEGER NOT NULL DEFAULT 0
+  spawn_failure_count INTEGER NOT NULL DEFAULT 0,
+  -- Pre-remediation-session HEAD SHA for adopted-branch force-push
+  -- detection (bead jleechan-tfs1 amendment). Nullable: only set for
+  -- adopted beads that have been through a remediation dispatch. Kept in
+  -- sync with the idempotent `ensure_pre_session_head_sha_column`
+  -- migration in `SqliteStateStore::open` (same guard pattern as
+  -- `ensure_is_adopted_column`).
+  pre_session_head_sha TEXT,
+  -- Machine-readable reason the bead most recently transitioned to
+  -- HUMAN_HELD (bead jleechan-4jn1: live incident jleechan-93ft / PR
+  -- worldarchitect.ai#7888). Set alongside every state = 'HUMAN_HELD'
+  -- write. `recover_human_held` filters on this column: rows whose
+  -- park_reason starts with 'circuit-breaker' are EXCLUDED from automatic
+  -- requeue (the circuit breaker in reroll.rs parks a bead specifically to
+  -- STOP retrying after repeated identical rejections — requeuing it
+  -- defeats the purpose and caused a 769x re-trigger loop in production).
+  -- Other park reasons (session_stalled, autonomy_timebox_exceeded, etc.)
+  -- are unaffected. Nullable: NULL for beads never parked, and cleared
+  -- back to NULL by `recover_human_held` on successful requeue. Kept in
+  -- sync with the idempotent `ensure_park_reason_column` migration in
+  -- `SqliteStateStore::open` (same guard pattern as
+  -- `ensure_is_adopted_column`).
+  park_reason TEXT,
+  -- Per-bead repo identity (bead jleechan-35y4, Stage A of the multi-repo
+  -- dispatch fix; docs/multirepo-dispatch-investigation-2026-07-11.md).
+  -- NULL ("legacy") means "use the daemon's global cfg.target_repo" — see
+  -- `BeadOverlay::repo` in daemon/src/state.rs, the single accessor every
+  -- call site must use instead of re-implementing this fallback. Set by
+  -- intake from an explicit `target_repo:` body field, else the
+  -- `owner/repo` prefix of the bead's external_ref, else left NULL. Older
+  -- DBs pre-date this column and get it via the idempotent
+  -- `ensure_target_repo_column` migration in `SqliteStateStore::open` (same
+  -- guard pattern as `ensure_is_adopted_column`).
+  target_repo TEXT
 );
 
 -- Deletion guard: the daemon/skills may delete ONLY refs recorded here (spec §4.2.8).

@@ -151,6 +151,7 @@ impl Tracker for TrackerMock {
             let comment = PrComment {
                 author: "dark-factory-er".into(),
                 body: body.into(),
+                created_at_epoch: 0,
             };
             self.posted
                 .borrow_mut()
@@ -204,6 +205,12 @@ impl Vcs for VcsMock {
     }
     fn push_fix_commit(&self, _branch: &str, _message: &str) -> Result<(), daemon::errors::DaemonError> {
         Ok(())
+    }
+    fn remote_head_sha(&self, _branch: &str) -> Result<String, daemon::errors::DaemonError> {
+        Ok("deadbeef".into())
+    }
+    fn is_ancestor(&self, _ancestor_sha: &str, _descendant_sha: &str) -> Result<bool, daemon::errors::DaemonError> {
+        Ok(true)
     }
 }
 
@@ -310,6 +317,7 @@ fn test_cfg() -> Config {
         autonomy_timebox_secs: 10_800,
         budget_warn_usd: 20.0,
         spec_dir: ".factory/specs/".into(),
+        repos: std::collections::HashMap::new(),
     }
 }
 
@@ -320,7 +328,7 @@ fn all_green_snapshot(pr: u64) -> PrSnapshot {
         mergeable: true,
         coderabbit_approved: true,
         bugbot_error_count: 0,
-        unresolved_thread_count: 0,
+        unresolved_thread_count: Some(0),
         head_sha: "deadbeef".into(),
         body: String::new(),
         comments: Vec::new(),
@@ -329,6 +337,7 @@ fn all_green_snapshot(pr: u64) -> PrSnapshot {
         ci_status: "green".into(),
         coderabbit_status: "green".into(),
         ci_pending: false,
+        head_committed_epoch: 0,
     }
 }
 
@@ -345,6 +354,9 @@ fn attested_overlay(bead_id: &str, pr: u64) -> BeadOverlay {
         session_id: Some("s1".into()),
         is_adopted: false,
         spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
     }
 }
 
@@ -391,6 +403,7 @@ fn er_runner_already_posted_short_circuits_no_llm_call() {
     snap.comments.push(PrComment {
         author: "some-human".into(),
         body: "/er PASS — human verifier ran this manually".into(),
+        created_at_epoch: 0,
     });
     scm_rc.borrow_mut().snapshots.borrow_mut().insert(101, snap);
     store
@@ -606,4 +619,109 @@ fn er_runner_emits_posted_telemetry_event() {
     );
 
     let _ = std::fs::remove_file("/tmp/afd_er_runner_int_test_telemetry.jsonl");
+}
+
+// jleechan-nplh regression: an `/er PASS` comment that PREDATES the PR's
+// current head commit is stale evidence — the runner must re-verify, not
+// short-circuit. Live incident: worldarchitect.ai#7888, where a 2026-07-08
+// PASS suppressed re-review of a 2026-07-10 head ~100 commits later.
+#[test]
+fn er_runner_reruns_when_pass_comment_predates_current_head() {
+    let _ = std::fs::remove_file("/tmp/afd_er_runner_int_test_stale.jsonl");
+
+    let scm_rc = Rc::new(RefCell::new(ScmMock::default()));
+    let tracker = TrackerMock::new(scm_rc.clone());
+    let llm = LlmMock::default();
+    let store = StoreMock::default();
+    let cfg = test_cfg();
+
+    // Verdict posted at epoch 1_000; head commit created LATER at 2_000.
+    let mut snap = all_green_snapshot(103);
+    snap.head_committed_epoch = 2_000;
+    snap.comments.push(PrComment {
+        author: "dark-factory-er".into(),
+        body: "/er PASS — verified an old draft of this diff".into(),
+        created_at_epoch: 1_000,
+    });
+    scm_rc.borrow_mut().snapshots.borrow_mut().insert(103, snap);
+    store
+        .overlays
+        .borrow_mut()
+        .insert("b3".into(), attested_overlay("b3", 103));
+    store.register_branch("b3", "factory/b3-r1").unwrap();
+
+    let _summary = drive_one_tick(
+        &scm_rc,
+        &tracker,
+        &llm,
+        &store,
+        &cfg,
+        std::path::Path::new("/tmp/afd_er_runner_int_test_stale.jsonl"),
+        "/er PASS",
+    )
+    .unwrap();
+
+    // The stale verdict must NOT satisfy idempotence — the runner spawns.
+    let comment_calls = tracker.calls.borrow();
+    let er_comments: Vec<&String> = comment_calls
+        .iter()
+        .filter(|c| c.contains("dark-factory /er"))
+        .collect();
+    assert!(
+        !er_comments.is_empty(),
+        "stale (pre-head) /er verdict must trigger a re-run, but no /er comment was posted"
+    );
+
+    let _ = std::fs::remove_file("/tmp/afd_er_runner_int_test_stale.jsonl");
+}
+
+// jleechan-nplh: the counterpart — a verdict AT/AFTER the head commit is
+// fresh and must keep short-circuiting (no redundant reviewer spawns).
+#[test]
+fn er_runner_noop_when_pass_comment_is_fresh_relative_to_head() {
+    let _ = std::fs::remove_file("/tmp/afd_er_runner_int_test_fresh.jsonl");
+
+    let scm_rc = Rc::new(RefCell::new(ScmMock::default()));
+    let tracker = TrackerMock::new(scm_rc.clone());
+    let llm = LlmMock::default();
+    let store = StoreMock::default();
+    let cfg = test_cfg();
+
+    // Head committed at 1_000; verdict posted after it at 2_000.
+    let mut snap = all_green_snapshot(104);
+    snap.head_committed_epoch = 1_000;
+    snap.comments.push(PrComment {
+        author: "dark-factory-er".into(),
+        body: "/er PASS — verified the current head".into(),
+        created_at_epoch: 2_000,
+    });
+    scm_rc.borrow_mut().snapshots.borrow_mut().insert(104, snap);
+    store
+        .overlays
+        .borrow_mut()
+        .insert("b4".into(), attested_overlay("b4", 104));
+    store.register_branch("b4", "factory/b4-r1").unwrap();
+
+    let _summary = drive_one_tick(
+        &scm_rc,
+        &tracker,
+        &llm,
+        &store,
+        &cfg,
+        std::path::Path::new("/tmp/afd_er_runner_int_test_fresh.jsonl"),
+        "/er PASS",
+    )
+    .unwrap();
+
+    let comment_calls = tracker.calls.borrow();
+    let er_comments: Vec<&String> = comment_calls
+        .iter()
+        .filter(|c| c.contains("dark-factory /er"))
+        .collect();
+    assert!(
+        er_comments.is_empty(),
+        "fresh /er verdict must short-circuit the runner; got: {er_comments:?}"
+    );
+
+    let _ = std::fs::remove_file("/tmp/afd_er_runner_int_test_fresh.jsonl");
 }

@@ -30,33 +30,10 @@ if [ ! -x "$TARGET" ]; then
     exit 66
 fi
 
-# Source login shell profile to get PATH, git config, SSH agent env, etc.
-# set +u / -u guards are required because bashrc often uses unbound vars.
-if [ -f "$HOME/.bash_profile" ]; then
-    set +u
-    # shellcheck disable=SC1090
-    source "$HOME/.bash_profile"
-    set -u
-elif [ -f "$HOME/.profile" ]; then
-    set +u
-    # shellcheck disable=SC1090
-    source "$HOME/.profile"
-    set -u
-elif [ -f "$HOME/.bashrc" ]; then
-    set +u
-    # shellcheck disable=SC1090
-    source "$HOME/.bashrc"
-    set -u
-fi
-
-# Make sure the launchd-injected PATH at least contains the usual homebrew dirs.
-case ":$PATH:" in
-    *":/opt/homebrew/bin:"*) ;;
-    *":/usr/local/bin:"*) ;;
-    *)
-        export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-        ;;
-esac
+# Explicitly construct PATH with Homebrew, Cargo, and standard system paths.
+# This resolves br, gh, sqlite3, and python3 without sourcing credential-bearing
+# shell startup files.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Forward to the actual target.
 exec "$TARGET" "$@"

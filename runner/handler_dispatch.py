@@ -26,10 +26,20 @@ All monkeypatched helper symbols are looked up via ``runner.handlers``
 (late binding) so that
 ``monkeypatch.setattr("runner.handlers._sandboxed_args", ...)`` and friends
 still take effect.
+
+The shim is imported lazily inside each helper function
+(``import runner.handlers as _handlers_shim``) rather than at module load.
+A top-level ``import runner.handlers`` would create a module-load cycle:
+this file is imported by ``runner.handlers`` to populate TYPE_REGISTRY, and
+a partial re-import would re-enter the shim before its symbols were bound.
+By the time any helper function runs, ``runner.handlers`` is fully loaded
+and the late import returns the populated module — including any test
+monkeypatch on its attributes.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -37,13 +47,25 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-import runner.handlers as _handlers_shim
-
 from .handler_core import Result
 
 if TYPE_CHECKING:
     from .parser import Node
     from .handler_core import Context
+
+# Importing ``runner.handlers`` at module top would create a module-load
+# cycle: this file is imported by ``runner.handlers`` (line 110 of handlers.py
+# does ``from .handler_dispatch import ...``) and by ``handler_parallel_reviewer``
+# (line 29). Loading this file triggers ``import runner.handlers``; if that
+# re-enters ``runner.handlers`` before it's finished, the re-entrant
+# ``from .handler_dispatch import _gate_subprocess_args`` fails because
+# ``_gate_subprocess_args`` isn't bound yet.
+#
+# Instead, the shim is imported lazily inside each helper function (see the
+# ``import runner.handlers as _handlers_shim`` lines in function bodies).
+# By the time any helper runs, ``runner.handlers`` is fully populated —
+# including any test monkeypatch on its attributes — and the late import
+# returns the populated module.
 
 
 @dataclass
@@ -137,6 +159,7 @@ def _launch_shadow_gate_review(
     ctx: "Context",
     backend: str = "codex",
 ) -> _ShadowGateReview | None:
+    import runner.handlers as _handlers_shim  # late-bound shim (see module docstring)
     """Spawn a shadow reviewer on ``backend`` (no enable-gate).
 
     This is the generalized spawn body; callers must perform their own
@@ -238,6 +261,7 @@ def _finish_shadow_gate_review(
     timeout: int,
     ctx: "Context",
 ) -> "Result":
+    import runner.handlers as _handlers_shim  # late-bound shim
     if shadow is None:
         return result
 
@@ -363,6 +387,7 @@ def _finish_shadow_gate_review(
 
 
 def _gate_subprocess_args(backend: str, prompt: str, ctx: "Context", timeout: int) -> Optional[list[str]]:
+    import runner.handlers as _handlers_shim  # late-bound shim
     """Build the sandboxed argv for a *reviewer* gate on the given backend.
 
     Supported backends:
@@ -404,6 +429,7 @@ def _gate_subprocess_args(backend: str, prompt: str, ctx: "Context", timeout: in
 
 
 def _gate_subprocess_env(backend: str) -> dict[str, str]:
+    import runner.handlers as _handlers_shim  # late-bound shim
     """Env overrides for a reviewer-gate subprocess on ``backend``.
 
     For ``minimax`` the Claude CLI must route through the minimax Anthropic-
@@ -421,6 +447,7 @@ def _run_gate_once(
     backend: str, prompt: str, expected_sha: str, timeout: int, ctx: "Context", name: str,
     *, gate_strict: bool = False,
 ) -> "Result":
+    import runner.handlers as _handlers_shim  # late-bound shim
     """Run one reviewer-gate attempt on ``backend`` and classify the result.
 
     SHA binding, verdict parsing, and infra-vs-real-failure classification are
@@ -624,6 +651,7 @@ def _resolve_adversarial_backend(
     priority: list[str] | None,
     ctx: "Context",
 ) -> tuple[str, dict[str, str]]:
+    import runner.handlers as _handlers_shim  # late-bound shim
     """Pick the first installed backend from the adversarial priority queue.
 
     Resolution order:
@@ -717,7 +745,18 @@ def _resolve_gate_backend(node: "Node", ctx: "Context") -> tuple[str, dict[str, 
             # the verdict, not the resolver.
             prior_key = f"{node.name}.resolved_backend"
             prior = ctx.state.get(prior_key)
-            prior_meta = ctx.state.get(f"{node.name}.resolved_backend_meta") or {}
+            # Read-back tolerates both legacy dict and JSON string (for backward
+            # compatibility during rollout). Malformed values fall back to {}.
+            raw_meta = ctx.state.get(f"{node.name}.resolved_backend_meta")
+            if isinstance(raw_meta, str):
+                try:
+                    prior_meta = json.loads(raw_meta)
+                except (json.JSONDecodeError, TypeError):
+                    prior_meta = {}
+            elif isinstance(raw_meta, dict):
+                prior_meta = raw_meta
+            else:
+                prior_meta = {}
             if prior and prior_meta.get("reviewer_backend_resolution") == "priority_queue":
                 return prior, prior_meta
             # When prefer_adversarial is set, exclude the run-level coder
@@ -737,7 +776,9 @@ def _resolve_gate_backend(node: "Node", ctx: "Context") -> tuple[str, dict[str, 
             ctx.state[prior_key] = resolved
             pq_meta["prefer_adversarial"] = "true" if prefer_adversarial else "false"
             pq_meta["reviewer_backend_resolution"] = "priority_queue"
-            ctx.state[f"{node.name}.resolved_backend_meta"] = dict(pq_meta)
+            # Store as JSON string to satisfy the contract that ctx.state values
+            # are strings (required by handler_render._substitute_placeholders).
+            ctx.state[f"{node.name}.resolved_backend_meta"] = json.dumps(pq_meta, sort_keys=True)
             return resolved, pq_meta
     if "backend" in node.attrs:
         return str(node.attrs["backend"]), {"reviewer_backend_resolution": "explicit"}

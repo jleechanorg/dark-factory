@@ -71,9 +71,16 @@ digraph MinimalPRFactory {
     timeout=600
   ]
 
+  // Resolves via the adversarial-review priority queue (codex > minimax >
+  // agy > claude-sonnet) so the reviewer is a *different vendor* from the
+  // implementing coder. prefer_adversarial=true excludes the run-level
+  // coder backend from the queue. Overridable per-run via
+  // DARK_FACTORY_ADVERSARIAL_PRIORITY. See pipelines/slim/review_pr.dot.
   gate_er [
     type="gate_er",
     label="/er Evidence Review",
+    backend_priority="codex,minimax,agy,claude-sonnet",
+    prefer_adversarial="true",
     timeout=600
   ]
 

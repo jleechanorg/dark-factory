@@ -32,6 +32,36 @@ pub enum GateName {
     Skeptic,
 }
 
+impl GateName {
+    /// Canonical snake_case JSON key for this gate (jleechan-wzgl:
+    /// GATE_ASSESSMENT serializes the full per-gate report). This is NOT a
+    /// free choice — it MUST match three other already-checked-in
+    /// consumers of this exact vocabulary, or `daemon/scripts/auto-merge-
+    /// guard.sh` silently mis-keys/crashes on the dict it reads back out
+    /// of GATE_ASSESSMENT telemetry:
+    ///   - `daemon/factory-overlay.sh`'s `gate-assessment` subcommand
+    ///     `REQUIRED_KEYS` (canonical source comment there: "canonical
+    ///     source: daemon/src/verifier.rs::GateName").
+    ///   - `tests/test_af_gate_contract.py::extract_gate_names_from_rust`'s
+    ///     hardcoded `gate_map` (Ci -> ci_green, etc.).
+    ///   - `tests/scripts/test_auto_merge_guard_gate_vocabulary.sh`'s fixture
+    ///     keys.
+    ///
+    /// PR #235 (jleechan-l4ki) unified all of the above onto ONE
+    /// vocabulary; this must reuse it verbatim rather than mint a fourth.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GateName::Ci => "ci_green",
+            GateName::NoConflicts => "no_conflicts",
+            GateName::CodeRabbitApproved => "coderabbit",
+            GateName::BugbotClean => "bugbot",
+            GateName::CommentsResolved => "comments_resolved",
+            GateName::EvidenceFloor => "evidence_review",
+            GateName::Skeptic => "skeptic",
+        }
+    }
+}
+
 /// One gate's verdict. `Unknown` and `Red` are deliberately distinct variants
 /// (design doc §5: "Unknown ≠ Red: infra vs verdict") — `Unknown` means the
 /// gate could not be evaluated (SCM API error, missing/unparseable Skeptic
@@ -61,6 +91,49 @@ impl GateResult {
 pub struct GateReport {
     pub results: [(GateName, GateResult); 7],
     pub all_green: bool,
+}
+
+impl GateReport {
+    /// jleechan-wzgl: serialize the full per-gate breakdown for
+    /// `GATE_ASSESSMENT` telemetry. Before this, the emit call only logged
+    /// `all_green`, so diagnosing which of the 7 gates failed (and why)
+    /// required a manual GitHub REST sweep even though this report already
+    /// carries the answer. `to_json` is the single source of truth for that
+    /// serialization so the telemetry shape can't drift from what `assess`
+    /// actually computed.
+    ///
+    /// Shape (PR #239 review round 1 finding): `gates` MUST be a `{gate_name:
+    /// verdict}` object, not an array — `daemon/scripts/auto-merge-guard.sh`'s
+    /// `latest_assessment_no_red` predicate does `for k, v in g.items()` on
+    /// exactly this field, and `daemon/factory-overlay.sh`'s `gate-assessment`
+    /// subcommand (+ its `REQUIRED_KEYS`/`OPTIONAL_KEYS` contract, unified in
+    /// PR #235/jleechan-l4ki) is the other checked-in consumer of this same
+    /// vocabulary. Each verdict is either the plain string `"pass"|"warn"|
+    /// "fail"|"unknown"` (green gates), or the structured `{"verdict": ...,
+    /// "evidence": [...]}` object (red/unknown gates, carrying the reason as
+    /// a one-element `evidence` list) — both shapes are accepted by
+    /// `factory-overlay.sh`'s `normalize()`.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut gates = serde_json::Map::new();
+        for (name, result) in &self.results {
+            let value = match result {
+                GateResult::Green => serde_json::Value::String("pass".to_string()),
+                GateResult::Red(reason) => serde_json::json!({
+                    "verdict": "fail",
+                    "evidence": [reason],
+                }),
+                GateResult::Unknown(reason) => serde_json::json!({
+                    "verdict": "unknown",
+                    "evidence": [reason],
+                }),
+            };
+            gates.insert(name.as_str().to_string(), value);
+        }
+        serde_json::json!({
+            "all_green": self.all_green,
+            "gates": serde_json::Value::Object(gates),
+        })
+    }
 }
 
 /// Stage-1 Skeptic verdict grammar (spec §4.2.5): `pass|warn|fail`. `Warn` is
@@ -261,6 +334,18 @@ pub struct PrEvidence {
     /// (or produced directly by an `Llm` adversarial call under Stage 1).
     /// `None` means no verdict is available yet (gate 7 -> `Unknown`).
     pub skeptic_verdict: Option<SkepticVerdict>,
+    /// jleechan-wzgl: identity of the reviewer vendor(s) whose response
+    /// actually contributed to `skeptic_verdict` this tick (e.g. `["agy"]`
+    /// when the dual-dispatch primaries both failed to parse and the
+    /// fallback loop's third vendor produced the usable verdict, or
+    /// `["codex", "claude"]` when both dual-dispatch primaries agreed).
+    /// `["mock_llm"]` marks the Stage-1 `is_test_repo` path (a single
+    /// `Llm::judge` adversarial call, not an independent reviewer CLI) so
+    /// telemetry never mistakes a test-repo mock for a real vendor. Empty
+    /// when no verdict was produced (`skeptic_verdict` is `None`). This is
+    /// GATE_ASSESSMENT's provenance signal for confirming the gate-7
+    /// reviewer was non-self and genuinely ran, not self-certified.
+    pub skeptic_reviewers: Vec<String>,
 }
 
 /// Gate 6 (spec §4.2.5): green only when `/er` returned `Pass` AND the
@@ -313,7 +398,35 @@ fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
 }
 
 pub fn parse_er_verdict(comments: &[crate::tools::PrComment]) -> ErVerdict {
+    parse_er_verdict_since(comments, 0)
+}
+
+/// Like `parse_er_verdict`, but only accepts verdicts from comments created
+/// at or after `min_epoch` (the PR head commit's committer date).
+///
+/// jleechan-nplh: an `/er PASS` posted days and dozens of commits before the
+/// current head does not verify the code that would actually merge; treating
+/// it as valid short-circuits re-verification forever (live incident:
+/// worldarchitect.ai#7888, a 2026-07-08 PASS suppressed re-review of a
+/// 2026-07-10 head). Staleness rules:
+///
+/// - `min_epoch == 0` (head commit time unknown — offline snapshots, test
+///   doubles that predate this field): no filtering, identical to
+///   `parse_er_verdict`. Fail-open here is deliberate: without a reference
+///   point every comment would be "stale" and gate 6 would deadlock.
+/// - comment `created_at_epoch == 0` with `min_epoch > 0` (comment age
+///   unknown but head age known): treated as STALE. Fail-closed is safe —
+///   the worst case is one redundant `/er` run, bounded by
+///   `MAX_ER_RUNNER_ATTEMPTS`; the alternative re-opens the self-
+///   certification hole this function exists to close.
+pub fn parse_er_verdict_since(
+    comments: &[crate::tools::PrComment],
+    min_epoch: u64,
+) -> ErVerdict {
     for comment in comments.iter().rev() {
+        if min_epoch > 0 && comment.created_at_epoch < min_epoch {
+            continue;
+        }
         let body_lower = comment.body.to_ascii_lowercase();
         let mut start_idx = 0;
         let mut last_verdict = None;
@@ -449,19 +562,27 @@ fn skeptic_gate(evidence: &PrEvidence) -> GateResult {
     }
 }
 
-/// Assess all 7 gates for `pr` (spec §4.2.5, design doc §5). `cfg` is accepted
-/// per the design-doc signature for future per-repo gate config (unused today
-/// — Stage 1 has no per-gate config knobs yet); `#[allow(unused_variables)]`
+/// Assess all 7 gates for `pr` (spec §4.2.5, design doc §5). `repo` (bead
+/// jleechan-9xrs, Stage D — see
+/// `docs/multirepo-dispatch-investigation-2026-07-11.md`) is the bead's OWN
+/// resolved repo (`overlay.repo(cfg)`), used to fetch the PR snapshot from
+/// the RIGHT repo instead of whichever repo `cfg.target_repo` names — a bead
+/// dispatched into a non-default `[repos.*]` entry used to have its gates
+/// silently assessed against the daemon-global repo's PR #N (or, worse,
+/// against no PR at all in that repo). `cfg` is accepted per the
+/// design-doc signature for future per-repo gate config (unused today —
+/// Stage 1 has no per-gate config knobs yet); `#[allow(unused_variables)]`
 /// documents that rather than dropping the parameter ahead of a design-doc
 /// revision.
 #[allow(unused_variables)]
 pub fn assess(
     scm: &dyn Scm,
     pr: u64,
+    repo: &str,
     cfg: &Config,
     evidence: &PrEvidence,
 ) -> Result<GateReport, crate::errors::DaemonError> {
-    let snapshot = match scm.pr_snapshot(pr) {
+    let snapshot = match scm.pr_snapshot_for_repo(repo, pr) {
         Ok(snapshot) => snapshot,
         Err(e) => {
             // The whole snapshot fetch failed (e.g. the GraphQL thread query
@@ -521,13 +642,16 @@ pub fn assess(
         ))
     };
 
-    let comments_resolved = if snapshot.unresolved_thread_count == 0 {
-        GateResult::Green
-    } else {
-        GateResult::Red(format!(
-            "{} unresolved review thread(s)",
-            snapshot.unresolved_thread_count
-        ))
+    // jleechan-kk64: `None` means the GraphQL fetch/parse of the
+    // unresolved-review-thread count failed — that is NOT evidence of zero
+    // unresolved threads. Fail closed to `Unknown`, never `Green`.
+    let comments_resolved = match snapshot.unresolved_thread_count {
+        Some(0) => GateResult::Green,
+        Some(n) => GateResult::Red(format!("{n} unresolved review thread(s)")),
+        None => GateResult::Unknown(
+            "unresolved review thread count could not be determined (GraphQL fetch or parse failed)"
+                .to_string(),
+        ),
     };
 
     let evidence_floor = evidence_floor_gate(evidence);
@@ -591,6 +715,24 @@ mod tests {
                 })
         }
 
+        /// jleechan-9xrs Stage D regression coverage: records the `repo`
+        /// argument distinctly from the plain `pr_snapshot({pr})` call log
+        /// entry so tests can assert `assess()` fetched the bead's OWN
+        /// resolved repo, not `cfg.target_repo`.
+        fn pr_snapshot_for_repo(&self, repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("pr_snapshot_for_repo({repo},{pr})"));
+            self.snapshots
+                .get(&pr)
+                .cloned()
+                .ok_or_else(|| DaemonError::Tool {
+                    tool: "gh".into(),
+                    rc: 1,
+                    stderr: format!("no scripted snapshot for pr {pr}"),
+                })
+        }
+
         fn close_pr(&self, _pr: u64, _comment: &str) -> Result<(), DaemonError> {
             Ok(())
         }
@@ -607,7 +749,7 @@ mod tests {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "deadbeef".into(),
             body: "".into(),
             comments: vec![],
@@ -616,6 +758,30 @@ mod tests {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+            head_committed_epoch: 0,
+        }
+    }
+
+    /// Creates a snapshot with unknown unresolved_thread_count (simulating GraphQL failure).
+    /// This is the scenario this test proves: when thread count is unknown,
+    /// the CommentsResolved gate must return Unknown, NOT Green.
+    fn snapshot_with_unknown_thread_count(pr: u64) -> PrSnapshot {
+        PrSnapshot {
+            pr_number: pr,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: None, // Unknown - GraphQL failed
+            head_sha: "deadbeef".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 0,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            head_committed_epoch: 0,
         }
     }
 
@@ -630,6 +796,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         }
     }
 
@@ -642,13 +809,76 @@ mod tests {
             .1
     }
 
+    /// jleechan-9xrs Stage D: `assess()` must fetch the PR snapshot from the
+    /// bead's OWN resolved repo (`repo` argument), not `cfg.target_repo`.
+    /// Regression for the multi-repo dispatch fix
+    /// (docs/multirepo-dispatch-investigation-2026-07-11.md) — before this
+    /// fix, gate assessment for a bead dispatched into a non-default
+    /// `[repos.*]` entry silently read the daemon-global repo's PR state
+    /// instead of the bead's own.
+    #[test]
+    fn assess_fetches_pr_snapshot_from_bead_repo_not_cfg_target_repo() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let mut cfg = test_cfg();
+        cfg.target_repo = "jleechanorg/wrong-global-repo".to_string();
+
+        let report = assess(
+            &scm,
+            7,
+            "otherorg/bead-owned-repo",
+            &cfg,
+            &all_green_evidence(),
+        )
+        .unwrap();
+
+        assert!(report.all_green, "expected all_green, got {report:?}");
+        let calls = scm.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "pr_snapshot_for_repo(otherorg/bead-owned-repo,7)"),
+            "expected assess() to fetch via pr_snapshot_for_repo with the bead's \
+             own repo, got calls: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("wrong-global-repo")),
+            "assess() must never leak cfg.target_repo into the snapshot fetch, \
+             got calls: {calls:?}"
+        );
+    }
+
+    /// Companion to the above: when the bead has no explicit repo (legacy —
+    /// mirrors `overlay.repo(cfg)`'s `None` fallback), passing
+    /// `&cfg.target_repo` as `repo` must behave identically to the
+    /// pre-Stage-D single-repo world. This is the "unchanged for legacy
+    /// beads" half of the acceptance criteria.
+    #[test]
+    fn assess_legacy_repo_equal_to_cfg_target_repo_is_unchanged() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+
+        assert!(report.all_green, "expected all_green, got {report:?}");
+        let calls = scm.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == &format!("pr_snapshot_for_repo({},7)", cfg.target_repo)),
+            "expected the legacy fallback repo (== cfg.target_repo) to reach \
+             pr_snapshot_for_repo unchanged, got calls: {calls:?}"
+        );
+    }
+
     #[test]
     fn all_green_snapshot_yields_all_green_report() {
         let mut scm = FakeScm::default();
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
 
-        let report = assess(&scm, 7, &cfg, &all_green_evidence()).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
 
         assert!(report.all_green, "expected all_green, got {report:?}");
         for (name, result) in &report.results {
@@ -664,7 +894,7 @@ mod tests {
         scm.snapshots.insert(7, snapshot);
         let cfg = test_cfg();
 
-        let report = assess(&scm, 7, &cfg, &all_green_evidence()).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
 
         assert!(!report.all_green);
         assert!(matches!(gate(&report, GateName::Ci), GateResult::Red(_)));
@@ -672,6 +902,44 @@ mod tests {
         assert!(gate(&report, GateName::CodeRabbitApproved).is_green());
         assert!(gate(&report, GateName::BugbotClean).is_green());
         assert!(gate(&report, GateName::CommentsResolved).is_green());
+    }
+
+    #[test]
+    fn unknown_thread_count_marks_comments_resolved_unknown_not_green() {
+        // jleechan-kk64 regression test: a GraphQL fetch/parse failure for
+        // the unresolved-review-thread count (represented here as
+        // `unresolved_thread_count: None`, distinct from the "whole
+        // pr_snapshot call errored" case covered by
+        // `snapshot_fetch_error_marks_thread_gate_unknown_not_red` below)
+        // must make the CommentsResolved gate report Unknown — proving
+        // READY/all_green remains impossible until the thread count is
+        // actually proven, never defaulting to Green.
+        let mut scm = FakeScm::default();
+        scm.snapshots
+            .insert(7, snapshot_with_unknown_thread_count(7));
+        let cfg = test_cfg();
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+
+        assert!(
+            !report.all_green,
+            "all_green must be false when thread count is unknown, got {report:?}"
+        );
+        let comments_resolved = gate(&report, GateName::CommentsResolved);
+        assert!(
+            matches!(comments_resolved, GateResult::Unknown(_)),
+            "expected CommentsResolved gate to be Unknown when thread count is unproven, got {comments_resolved:?}"
+        );
+        assert!(
+            !comments_resolved.is_green(),
+            "CommentsResolved gate must never be Green when thread count is unproven"
+        );
+        // Every other gate stays unaffected — this is an isolated Unknown,
+        // not a cascade.
+        assert!(gate(&report, GateName::Ci).is_green());
+        assert!(gate(&report, GateName::NoConflicts).is_green());
+        assert!(gate(&report, GateName::CodeRabbitApproved).is_green());
+        assert!(gate(&report, GateName::BugbotClean).is_green());
     }
 
     #[test]
@@ -683,7 +951,7 @@ mod tests {
         let scm = FakeScm::default();
         let cfg = test_cfg();
 
-        let report = assess(&scm, 9, &cfg, &all_green_evidence()).unwrap();
+        let report = assess(&scm, 9, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
 
         assert!(!report.all_green);
         let gate5 = gate(&report, GateName::CommentsResolved);
@@ -709,7 +977,7 @@ mod tests {
         let scm = FakeScm::default(); // no snapshot -> every SCM gate Unknown
         let cfg = test_cfg();
 
-        let report = assess(&scm, 42, &cfg, &all_green_evidence()).unwrap();
+        let report = assess(&scm, 42, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
 
         assert!(!report.all_green);
     }
@@ -725,9 +993,10 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         match gate(&report, GateName::EvidenceFloor) {
@@ -747,9 +1016,10 @@ mod tests {
             has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(gate(&report, GateName::EvidenceFloor).is_green());
         assert!(report.all_green);
@@ -766,9 +1036,10 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(gate(&report, GateName::EvidenceFloor).is_green());
         assert!(report.all_green);
@@ -785,9 +1056,10 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Fail("wrong fix".into())),
+            ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         match gate(&report, GateName::Skeptic) {
@@ -807,9 +1079,10 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Warn("minor nit".into())),
+            ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(gate(&report, GateName::Skeptic).is_green());
         assert!(report.all_green);
@@ -826,9 +1099,10 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: None,
+            ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         assert!(matches!(
@@ -870,9 +1144,10 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Absent,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         assert!(
@@ -918,9 +1193,10 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Fail,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         match gate(&report, GateName::EvidenceFloor) {
@@ -940,9 +1216,10 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(gate(&report, GateName::EvidenceFloor).is_green());
         assert!(report.all_green);
@@ -960,9 +1237,10 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         match gate(&report, GateName::EvidenceFloor) {
@@ -982,9 +1260,10 @@ mod tests {
             has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(gate(&report, GateName::EvidenceFloor).is_green());
         assert!(report.all_green);
@@ -1003,9 +1282,10 @@ mod tests {
             has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Absent,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         assert!(matches!(
@@ -1025,9 +1305,10 @@ mod tests {
             has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Fail,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
         };
 
-        let report = assess(&scm, 7, &cfg, &evidence).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
         match gate(&report, GateName::EvidenceFloor) {
@@ -1255,26 +1536,55 @@ mod tests {
     fn test_parse_er_verdict() {
         use crate::tools::PrComment;
         // Simple cases
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er PASS".into() }]), ErVerdict::Pass);
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er PARTIAL".into() }]), ErVerdict::Partial);
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er FAIL".into() }]), ErVerdict::Fail);
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er INCONCLUSIVE".into() }]), ErVerdict::Inconclusive);
+        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er PASS".into(), created_at_epoch: 0 }]), ErVerdict::Pass);
+        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er PARTIAL".into(), created_at_epoch: 0 }]), ErVerdict::Partial);
+        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er FAIL".into(), created_at_epoch: 0 }]), ErVerdict::Fail);
+        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er INCONCLUSIVE".into(), created_at_epoch: 0 }]), ErVerdict::Inconclusive);
 
         // Latest comment wins (comments are in chronological order)
         let comments = vec![
-            PrComment { author: "alice".into(), body: "/er FAIL".into() },
-            PrComment { author: "bob".into(), body: "/er PASS".into() },
+            PrComment { author: "alice".into(), body: "/er FAIL".into(), created_at_epoch: 0 },
+            PrComment { author: "bob".into(), body: "/er PASS".into(), created_at_epoch: 0 },
         ];
         assert_eq!(parse_er_verdict(&comments), ErVerdict::Pass);
 
         // Multiple verdicts in one comment: last one wins
         let comments_multiple = vec![
-            PrComment { author: "alice".into(), body: "/er FAIL then /er PASS".into() },
+            PrComment { author: "alice".into(), body: "/er FAIL then /er PASS".into(), created_at_epoch: 0 },
         ];
         assert_eq!(parse_er_verdict(&comments_multiple), ErVerdict::Pass);
 
         // Word boundary check: "/er-gate" or "/er_gate" should not match as "/er" command
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er-gate PASS".into() }]), ErVerdict::Absent);
+        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er-gate PASS".into(), created_at_epoch: 0 }]), ErVerdict::Absent);
+    }
+
+    // jleechan-nplh: staleness filtering against the head commit epoch.
+    #[test]
+    fn test_parse_er_verdict_since_staleness() {
+        use crate::tools::PrComment;
+        let stale_pass = PrComment { author: "er".into(), body: "/er PASS".into(), created_at_epoch: 1_000 };
+        let fresh_fail = PrComment { author: "er".into(), body: "/er FAIL regressed".into(), created_at_epoch: 3_000 };
+
+        // A verdict older than the head commit is ignored entirely.
+        assert_eq!(parse_er_verdict_since(std::slice::from_ref(&stale_pass), 2_000), ErVerdict::Absent);
+
+        // A verdict at/after the head commit is accepted (>= boundary).
+        assert_eq!(parse_er_verdict_since(std::slice::from_ref(&stale_pass), 1_000), ErVerdict::Pass);
+
+        // Stale PASS must not mask a fresh FAIL.
+        assert_eq!(
+            parse_er_verdict_since(&[stale_pass.clone(), fresh_fail], 2_000),
+            ErVerdict::Fail
+        );
+
+        // min_epoch == 0 (head age unknown) disables filtering — identical
+        // to parse_er_verdict, so old offline snapshots keep working.
+        assert_eq!(parse_er_verdict_since(&[stale_pass], 0), ErVerdict::Pass);
+
+        // Comment age unknown (epoch 0) with a known head age: fail closed,
+        // treat as stale.
+        let unknown_age = PrComment { author: "er".into(), body: "/er PASS".into(), created_at_epoch: 0 };
+        assert_eq!(parse_er_verdict_since(&[unknown_age], 2_000), ErVerdict::Absent);
     }
 
     #[test]
@@ -1313,7 +1623,7 @@ mod tests {
         assert!(check_integration_marker("Here is the integration evidence proof", &[]));
 
         // Comment contains marker
-        let comments = vec![PrComment { author: "alice".into(), body: "Found integration evidence".into() }];
+        let comments = vec![PrComment { author: "alice".into(), body: "Found integration evidence".into(), created_at_epoch: 0 }];
         assert!(check_integration_marker("No marker here", &comments));
 
         // Neither contains marker
@@ -1329,6 +1639,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: None,
+            ..Default::default()
         };
         assert_eq!(evidence_floor_gate(&prod_pass), GateResult::Green);
 
@@ -1338,6 +1649,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Partial,
             skeptic_verdict: None,
+            ..Default::default()
         };
         assert!(matches!(evidence_floor_gate(&prod_partial), GateResult::Red(_)));
 
@@ -1348,6 +1660,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Partial,
             skeptic_verdict: None,
+            ..Default::default()
         };
         assert_eq!(evidence_floor_gate(&non_prod_partial), GateResult::Green);
 
@@ -1357,6 +1670,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: None,
+            ..Default::default()
         };
         assert_eq!(evidence_floor_gate(&non_prod_pass), GateResult::Green);
 
@@ -1367,6 +1681,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Fail,
             skeptic_verdict: None,
+            ..Default::default()
         };
         assert!(matches!(evidence_floor_gate(&prod_fail), GateResult::Red(_)));
 
@@ -1376,6 +1691,7 @@ mod tests {
             has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Inconclusive,
             skeptic_verdict: None,
+            ..Default::default()
         };
         assert!(matches!(evidence_floor_gate(&non_prod_inconclusive), GateResult::Red(_)));
     }
