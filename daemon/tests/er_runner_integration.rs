@@ -317,6 +317,7 @@ fn test_cfg() -> Config {
         autonomy_timebox_secs: 10_800,
         budget_warn_usd: 20.0,
         spec_dir: ".factory/specs/".into(),
+        repos: std::collections::HashMap::new(),
     }
 }
 
@@ -327,7 +328,7 @@ fn all_green_snapshot(pr: u64) -> PrSnapshot {
         mergeable: true,
         coderabbit_approved: true,
         bugbot_error_count: 0,
-        unresolved_thread_count: 0,
+        unresolved_thread_count: Some(0),
         head_sha: "deadbeef".into(),
         body: String::new(),
         comments: Vec::new(),
@@ -355,6 +356,7 @@ fn attested_overlay(bead_id: &str, pr: u64) -> BeadOverlay {
         spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
     }
 }
 

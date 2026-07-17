@@ -1,6 +1,5 @@
-use crate::errors::DaemonError;
+use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
 use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
-use std::io::Read;
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -131,7 +130,7 @@ impl Tracker for CliTracker {
     }
 
     fn comment_external(&self, external_ref: &str, body: &str) -> Result<(), DaemonError> {
-        if let Some((repo, issue)) = parse_external_ref(external_ref) {
+        if let Some((repo, issue)) = canonicalize_external_ref_for_comment(external_ref) {
             run_tool("gh", &["issue", "comment", &issue, "--repo", &repo, "--body", body], 30)?;
             Ok(())
         } else {
@@ -181,6 +180,38 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
     } else {
         None
     }
+}
+
+/// jleechan-mdgr defense-in-depth: recovers the real `<repo>#<pr>` comment
+/// target from the "double external_ref suffix" corruption, where a bead
+/// that already had a valid `parse_external_ref`-shaped ref ALSO got a
+/// `#local-<bead-id>` disambiguation suffix appended on top of it (see
+/// `daemon/scripts/backfill_external_ref.py`'s `#local-<id>` convention,
+/// which is only ever supposed to apply to a base ref with no `#` of its
+/// own — e.g. a bare GitHub PR URL). The 2026-07-11T00:05:15Z incident
+/// (bead jleechan-8dyu, `jleechanorg/worldarchitect.ai#7888#local-8dyu`)
+/// shows the writer mixing that convention with the SHORT canonical
+/// `owner/repo#N` base, which already contains a `#`, producing 3
+/// `#`-delimited segments and a permanent `comment_external` parse failure.
+///
+/// `parse_external_ref` intentionally stays strict (exactly one `#`) so
+/// this corrupted shape is still detected as invalid on its own; this
+/// helper is the single call site (escalation comment posting) that
+/// recognizes the specific `<repo>#<pr>#local-<token>` shape and strips
+/// the trailing disambiguation suffix to recover the real target, so
+/// already-corrupted stored data (which this PR does NOT bulk-repair) can
+/// still have its escalation comment posted. Any other malformed shape —
+/// bare `local-<id>` refs, full GitHub URLs — is left untouched; those are
+/// jleechan-twa0's territory (parser format acceptance), not this bug.
+fn canonicalize_external_ref_for_comment(external_ref: &str) -> Option<(String, String)> {
+    if let Some(parsed) = parse_external_ref(external_ref) {
+        return Some(parsed);
+    }
+    let parts: Vec<&str> = external_ref.split('#').collect();
+    if parts.len() == 3 && parts[2].starts_with("local-") {
+        return parse_external_ref(&format!("{}#{}", parts[0], parts[1]));
+    }
+    None
 }
 
 fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
@@ -244,6 +275,21 @@ impl CliScm {
             pr_snapshot_cache: Mutex::new(HashMap::new()),
             branch_commit_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Return a handle targeting a different repo string (bead jleechan-35y4
+    /// Stage B — see
+    /// `docs/multirepo-dispatch-investigation-2026-07-11.md`'s "keep
+    /// traits, add `with_repo` constructor" note). Deliberately a fresh
+    /// `Self::new(repo)` rather than cloning this instance's in-memory TTL
+    /// caches: those caches (`pr_snapshot_cache` keyed by bare PR number,
+    /// `labeled_issues_cache`/`branch_commit_cache` keyed by label/branch
+    /// name) carry no repo qualifier, so reusing them for a different repo
+    /// could return another repo's cached PR/issue/branch data under a
+    /// colliding key. Construction is cheap (empty `HashMap`s), so a fresh
+    /// instance is both simpler and correct.
+    pub fn with_repo(&self, repo: &str) -> Self {
+        Self::new(repo.to_string())
     }
 
     fn labeled_prs_via_rest(&self, label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
@@ -592,7 +638,7 @@ impl Scm for CliScm {
                         mergeable: snap.mergeable,
                         coderabbit_approved: snap.coderabbit_approved,
                         bugbot_error_count: snap.bugbot_error_count,
-                        unresolved_thread_count: snap.unresolved_thread_count,
+                        unresolved_thread_count: Some(snap.unresolved_thread_count),
                         head_sha: snap.head_sha,
                         body: snap.body,
                         comments: snap.comments,
@@ -916,6 +962,11 @@ impl Scm for CliScm {
               }
             }
         }";
+        // No REST fallback exists for this query: GitHub's REST API does not
+        // expose per-thread resolution status (only GraphQL's
+        // `reviewThreads.isResolved` does), unlike the `pr view` / `pr
+        // checks` calls above which do have REST equivalents. If GraphQL is
+        // unavailable there is currently no alternate path to this data.
         let gql_out = run_tool(
             "gh",
             &[
@@ -932,18 +983,33 @@ impl Scm for CliScm {
             ],
             30,
         );
-        // jleechan-qdw/GraphQL-rate-limit tolerance: a GraphQL failure here
-        // (rate limit, transient network) must not abort the whole
-        // `pr_snapshot` call — unresolved-thread count degrades to 0 (with a
-        // logged warning) rather than propagating the error via `?`.
-        let unresolved_thread_count = match gql_out {
-            Ok(gql_out_str) => unresolved_thread_count_from_gql(&gql_out_str).unwrap_or_else(|e| {
-                eprintln!("[warn] failed to parse unresolved-thread GraphQL response, defaulting to 0: {e:?}");
-                0
-            }),
+        // jleechan-kk64: a GraphQL failure or parse failure here (rate
+        // limit, transient network, malformed/truncated response) must NOT
+        // report a false `0` unresolved-thread count — that would silently
+        // green-light the `CommentsResolved` gate (verifier.rs) while real
+        // unresolved review threads could still exist, exactly the
+        // fail-open bug this fix closes. Report `None` (unknown) instead;
+        // `verifier::assess` maps `None` to `GateResult::Unknown`, never
+        // `Green`. The rest of `pr_snapshot` still returns `Ok(snapshot)` so
+        // an isolated GraphQL hiccup doesn't take down every other gate —
+        // same discipline as the `head_committed_epoch` fallback below.
+        let unresolved_thread_count: Option<u32> = match gql_out {
+            Ok(gql_out_str) => match unresolved_thread_count_from_gql(&gql_out_str) {
+                Ok(count) => Some(count),
+                Err(e) => {
+                    eprintln!(
+                        "[warn] failed to parse unresolved-thread GraphQL response; \
+                         comments-resolved gate will report Unknown, not Green: {e:?}"
+                    );
+                    None
+                }
+            },
             Err(e) => {
-                eprintln!("[warn] GraphQL query failed, defaulting unresolved threads to 0: {e:?}");
-                0
+                eprintln!(
+                    "[warn] GraphQL query failed; comments-resolved gate will report Unknown, \
+                     not Green: {e:?}"
+                );
+                None
             }
         };
 
@@ -1031,6 +1097,19 @@ impl Scm for CliScm {
             cache.insert(pr, (snapshot.clone(), Instant::now()));
         }
         Ok(snapshot)
+    }
+
+    /// jleechan-9xrs Stage D: retarget the query at `repo` via `with_repo`
+    /// instead of always fetching against `self.repo` (the daemon's global
+    /// `cfg.target_repo`, bound at construction time in `main.rs`). Callers
+    /// pass `overlay.repo(cfg)`, so the whole verification loop (skeptic
+    /// gate, /er runner, gate assessment) now reads the bead's OWN PR/CI/
+    /// review state instead of silently reading another repo's PR with the
+    /// same number. Fresh `with_repo` instance (not a cache-sharing clone)
+    /// so a cross-repo call can never return another repo's cached
+    /// `pr_snapshot_cache` entry under a colliding PR-number key.
+    fn pr_snapshot_for_repo(&self, repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
+        self.with_repo(repo).pr_snapshot(pr)
     }
 
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
@@ -1121,6 +1200,20 @@ impl Scm for CliScm {
             cache.insert(branch.to_string(), (Some(epoch), Instant::now()));
         }
         Ok(Some(epoch))
+    }
+
+    /// jleechan-bqdv Stage C: retarget the query at `repo` via `with_repo`
+    /// instead of always polling `self.repo` (the daemon's global
+    /// `cfg.target_repo`, bound at construction time in `main.rs`). Callers
+    /// pass `overlay.repo(cfg)`, so a bead whose resolved repo differs from
+    /// the global one is now actually observable instead of silently
+    /// invisible to the coder-silence watcher.
+    fn remote_branch_last_commit_for_repo(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        self.with_repo(repo).remote_branch_last_commit(branch)
     }
 }
 
@@ -1220,9 +1313,162 @@ mod resolve_holdouts_path_tests {
     }
 }
 
+/// AO v0.1.3 accepts the task prompt positionally but does not expose its
+/// core `branch` field as a CLI flag. The preload bridge keeps the public CLI
+/// argv valid while passing the exact factory branch to AO core before the
+/// workspace or worker is created. `CARGO_MANIFEST_DIR` is embedded by the
+/// build, so the systemd-installed binary resolves the bridge from the same
+/// checkout it was built from rather than assuming a user-specific AO path.
+fn ao_spawn_bridge_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("ao-spawn-v013-bridge.mjs")
+}
+
+fn ao_spawn_command_with_mode(
+    agent: &str,
+    spec: &SpawnSpec,
+    diagnostic: bool,
+) -> Result<Command, DaemonError> {
+    let bridge = ao_spawn_bridge_path();
+    if !bridge.is_file() {
+        return Err(DaemonError::Config(format!(
+            "AO v0.1.3 spawn bridge is missing at {}; rebuild/reinstall the daemon from a complete checkout",
+            bridge.display()
+        )));
+    }
+    let bridge_arg = format!("--import={}", bridge.display());
+    if bridge_arg.chars().any(char::is_whitespace) {
+        return Err(DaemonError::Config(format!(
+            "AO v0.1.3 spawn bridge path contains whitespace and cannot be represented safely in NODE_OPTIONS: {}",
+            bridge.display()
+        )));
+    }
+
+    let mut cmd = if std::env::consts::OS == "macos" {
+        let holdouts = resolve_holdouts_path_or_fail()?;
+        let profile = format!(
+            "(version 1)\n(allow default)\n(deny file-read* (subpath \"{}\"))\n(deny file-write* (subpath \"{}\"))\n",
+            holdouts, holdouts
+        );
+        let mut command = Command::new("sandbox-exec");
+        command.arg("-p").arg(&profile).arg("ao");
+        command
+    } else {
+        Command::new("ao")
+    };
+
+    // This is the complete AO v0.1.3 public spawn argv: no --prompt,
+    // --name, or --branch. The preload validates this shape independently.
+    cmd.arg("spawn")
+        .arg("--project")
+        .arg(&spec.ao_project)
+        .arg("--agent")
+        .arg(agent);
+    if diagnostic {
+        // If the preload fails to execute, AO v0.1.3 rejects this unknown
+        // option before dispatch. That makes the supposedly read-only probe
+        // fail safe instead of accidentally creating a worker.
+        cmd.arg("--dark-factory-read-only-diagnostic");
+    }
+    cmd.arg("--")
+        .arg(&spec.prompt)
+        .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+        .env("DARK_FACTORY_AO_SPAWN_BRANCH", &spec.branch);
+    if diagnostic {
+        cmd.env("DARK_FACTORY_AO_BRIDGE_DIAGNOSTIC", "1");
+    }
+
+    let node_options = std::env::var("NODE_OPTIONS").unwrap_or_default();
+    let bridge_options = format!("--experimental-import-meta-resolve {bridge_arg}");
+    let bridged_node_options = if node_options.trim().is_empty() {
+        bridge_options
+    } else {
+        format!("{node_options} {bridge_options}")
+    };
+    cmd.env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", &node_options)
+        .env("NODE_OPTIONS", bridged_node_options);
+
+    for (key, _) in std::env::vars() {
+        if key == "DARK_FACTORY_HOLDOUTS" || key.to_uppercase().contains("HOLDOUT") {
+            cmd.env_remove(key);
+        }
+    }
+
+    Ok(cmd)
+}
+
+fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonError> {
+    ao_spawn_command_with_mode(agent, spec, false)
+}
+
+/// Runs the AO v0.1.3 preload in its read-only diagnostic mode. This checks
+/// the actual `ao` executable selected by the daemon's production PATH, its
+/// Node major version, package version, core APIs, configured project, and
+/// plugin resolution without performing preflight side effects, acquiring a
+/// spawn lock, creating a workspace, or launching a worker.
+pub fn verify_ao_bridge_compatibility(
+    ao_project: &str,
+    agent: &str,
+) -> Result<(), DaemonError> {
+    let spec = SpawnSpec {
+        bead_id: "daemon-startup-diagnostic".to_string(),
+        branch: "factory/daemon-startup-diagnostic".to_string(),
+        prompt: "dark-factory AO v0.1.3 read-only compatibility diagnostic".to_string(),
+        repo: String::new(),
+        ao_project: ao_project.to_string(),
+        remote: String::new(),
+    };
+    let mut command = ao_spawn_command_with_mode(agent, &spec, true)?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = command.output().map_err(|error| DaemonError::Tool {
+        tool: "ao bridge compatibility diagnostic".to_string(),
+        rc: -1,
+        stderr: format!("execution failed: {error}"),
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() {
+        return Err(DaemonError::Tool {
+            tool: "ao bridge compatibility diagnostic".to_string(),
+            rc: output.status.code().unwrap_or(-1),
+            stderr,
+        });
+    }
+    let payload = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("AO_BRIDGE_DIAGNOSTIC="))
+        .ok_or_else(|| {
+            DaemonError::Parse(format!(
+                "AO bridge compatibility diagnostic returned success without its marker: {stdout}"
+            ))
+        })?;
+    let diagnostic: serde_json::Value = serde_json::from_str(payload).map_err(|error| {
+        DaemonError::Parse(format!(
+            "AO bridge compatibility diagnostic marker was invalid JSON: {error}"
+        ))
+    })?;
+    if diagnostic.get("cliVersion").and_then(|value| value.as_str()) != Some("0.1.3")
+        || !diagnostic
+            .get("nodeVersion")
+            .and_then(|value| value.as_str())
+            .is_some_and(|version| version.starts_with("22."))
+    {
+        return Err(DaemonError::Config(format!(
+            "AO bridge compatibility diagnostic reported an incompatible runtime: {diagnostic}"
+        )));
+    }
+    Ok(())
+}
+
 pub struct CliSessions {
     pub project: String,
     pub agent: String,
+    spawned_worktrees:
+        std::sync::Mutex<std::collections::HashMap<(String, String), std::path::PathBuf>>,
 }
 
 impl CliSessions {
@@ -1234,44 +1480,24 @@ impl CliSessions {
         Self {
             project,
             agent: agent.to_string(),
+            spawned_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     fn run_spawn_process(&self, agent: &str, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
-        let mut cmd = if std::env::consts::OS == "macos" {
-            let holdouts = resolve_holdouts_path_or_fail()?;
-            let profile = format!(
-                "(version 1)\n(allow default)\n(deny file-read* (subpath \"{}\"))\n(deny file-write* (subpath \"{}\"))\n",
-                holdouts, holdouts
-            );
-            let mut c = Command::new("sandbox-exec");
-            c.arg("-p").arg(&profile);
-            c.arg("ao");
-            c
-        } else {
-            Command::new("ao")
-        };
-        let display_name = spec.branch.strip_prefix("factory/").unwrap_or(&spec.branch);
-
-        cmd.arg("spawn")
-            .arg("--prompt")
-            .arg(&spec.prompt)
-            .arg("--project")
-            .arg(&self.project)
-            .arg("--agent")
-            .arg(agent)
-            .arg("--name")
-            .arg(display_name)
-            .arg("--branch")
-            .arg(&spec.branch)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        for (k, _) in std::env::vars() {
-            if k == "DARK_FACTORY_HOLDOUTS" || k.to_uppercase().contains("HOLDOUT") {
-                cmd.env_remove(k);
-            }
-        }
+        // jleechan-bqdv Stage C: spawn into `spec.ao_project` (resolved per
+        // bead by `Config::resolve_repo`, Stage B), not `self.project` (the
+        // daemon's single global project bound once at `CliSessions::new`
+        // construction time). For every pre-existing single-repo config
+        // these are identical — `Config::resolve_repo`'s legacy fallback
+        // path derives `ao_project` via the exact same last-path-segment
+        // rule `CliSessions::new` uses — so this is behavior-preserving for
+        // today's only configured repo, while actually making a bead whose
+        // `target_repo` names a DIFFERENT `[repos.*]` entry spawn into ITS
+        // project instead of silently landing in the global one (the
+        // jleechan-9sh5 root cause).
+        let mut cmd = ao_spawn_command(agent, spec)?;
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = cmd.output().map_err(|e| DaemonError::Tool {
             tool: if std::env::consts::OS == "macos" { "sandbox-exec".to_string() } else { "ao".to_string() },
@@ -1279,14 +1505,117 @@ impl CliSessions {
             stderr: format!("execution failed: {e}"),
         })?;
 
-        let out = String::from_utf8_lossy(&output.stdout);
+        let out = String::from_utf8_lossy(&output.stdout).into_owned();
+        let err_msg = String::from_utf8_lossy(&output.stderr).into_owned();
+        let session = Self::classify_spawn_output(
+            agent,
+            output.status.success(),
+            output.status.code(),
+            &out,
+            &err_msg,
+        )?;
+        let workspace = Self::spawn_workspace_path(&out);
+        let observed_branch = Self::spawn_branch(&out);
+        let spawn_error = if workspace.is_none() {
+            Some(DaemonError::Parse(format!(
+                "ao spawn --agent {agent} returned session {} without an absolute Worktree path; refusing to dispatch without remote verification",
+                session.0
+            )))
+        } else if observed_branch.as_deref() != Some(spec.branch.as_str()) {
+            Some(DaemonError::Parse(format!(
+                "ao spawn --agent {agent} returned session {} with branch {:?}, expected {:?}; refusing to dispatch a branch-mismatched worker",
+                session.0, observed_branch, spec.branch
+            )))
+        } else {
+            None
+        };
+        if let Some(spawn_error) = spawn_error {
+            return match run_tool("ao", &["session", "kill", &session.0], 30) {
+                Ok(_) => Err(spawn_error),
+                Err(cleanup_error) => Err(DaemonError::SpawnCleanupFailed {
+                    session: session.0,
+                    spawn_error: Box::new(spawn_error),
+                    cleanup_error: Box::new(cleanup_error),
+                }),
+            };
+        }
+        let workspace = workspace.expect("validated absolute workspace");
+        self.spawned_worktrees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (spec.ao_project.clone(), spec.branch.clone()),
+                workspace,
+            );
+        Ok(session)
+    }
 
-        if !output.status.success() {
-            let err_msg = String::from_utf8_lossy(&output.stderr);
+    fn spawn_workspace_path(out: &str) -> Option<std::path::PathBuf> {
+        out.lines().find_map(|line| {
+            let value = line.trim().strip_prefix("Worktree:")?.trim();
+            let path = std::path::PathBuf::from(value);
+            (path.is_absolute() && value != "-").then_some(path)
+        })
+    }
+
+    fn spawn_branch(out: &str) -> Option<String> {
+        out.lines().find_map(|line| {
+            let value = line.trim().strip_prefix("Branch:")?.trim();
+            (!value.is_empty() && value != "-").then(|| value.to_string())
+        })
+    }
+
+    /// Pure classification of `ao spawn`'s exit status + stdout/stderr into a
+    /// `SessionId` or a `DaemonError`, split out of `run_spawn_process` so the
+    /// decision logic is unit-testable without shelling out to a real `ao`
+    /// binary.
+    fn classify_spawn_output(
+        agent: &str,
+        success: bool,
+        code: Option<i32>,
+        out: &str,
+        err_msg: &str,
+    ) -> Result<SessionId, DaemonError> {
+        if !success {
+            // jleechan-2s0h / jleechan-la67: AO's spawn-queue admission
+            // control (`packages/core/src/spawn-queue.ts`'s own
+            // `MAX_PENDING_REQUESTS` cap — a DIFFERENT layer than the
+            // "active sessions >= session cap" REQUEST= deferral handled
+            // below) throws a plain `Error` in the CLI that re-propagates
+            // through commander's default handler. That means it surfaces
+            // as a genuine nonzero exit (rc=1, Tool-shaped: stderr contains
+            // "Spawn queue is full for project '<id>' (<n> pending
+            // requests)"), NOT the `REQUEST=` stdout success-with-deferral
+            // pattern. Live incident jleechan-la67 (2026-07-08):
+            // spawn-queue-worldarchitect.json hit its 100-pending cap and
+            // every subsequent `ao spawn` failed rc=1 with this message;
+            // the daemon classified it as `DaemonError::Tool`, a genuine
+            // transient failure that increments `spawn_failure_count`,
+            // eventually parking beads `HumanHeld` purely from admission
+            // backpressure that has nothing to do with the bead itself.
+            // This is provably safe to retry for the same reason as the
+            // REQUEST= case: `enqueueSpawnRequest` threw before any
+            // worktree, branch, or process was created, so nothing is
+            // leaked or double-spawned by requeuing and trying again next
+            // tick.
+            // Anchored on "...is full for project" (not just "spawn queue is
+            // full") to shrink the false-positive surface: this factory's
+            // bead prompts are themselves LLM-generated coding-task text, so
+            // a bead literally about fixing this handling (or quoting this
+            // very error string) could otherwise cause an unrelated spawn
+            // failure whose stderr echoes the bare phrase to be misclassified
+            // as retry-safe backpressure. The longer anchor still tolerates
+            // the variable `'<project-id>'` in the AO-thrown message.
+            if err_msg.to_lowercase().contains("spawn queue is full for project") {
+                return Err(DaemonError::Deferred(format!(
+                    "ao spawn --agent {agent} rejected: admission queue full ({})",
+                    err_msg.trim()
+                )));
+            }
             return Err(DaemonError::Tool {
                 tool: format!("ao spawn --agent {agent}"),
-                rc: output.status.code().unwrap_or(-1),
-                stderr: err_msg.into_owned(),
+                rc: code.unwrap_or(-1),
+                stderr: err_msg.to_string(),
             });
         }
 
@@ -1351,19 +1680,1344 @@ impl CliSessions {
             }
         }
 
-        let mut last_err = None;
-        for agent in &fallback_agents {
-            match self.run_spawn_process(agent, spec) {
-                Ok(sess) => return Ok(sess),
-                Err(e) => {
-                    last_err = Some(e);
-                }
+        fallback_spawn(&fallback_agents, |agent| self.run_spawn_process(agent, spec))
+    }
+}
+
+/// Walks `agents` in order, calling `attempt_spawn` for each until one
+/// succeeds. Pulled out of `spawn_with_fallback` into a free function taking
+/// an injectable closure so the fallback-chain-exhaustion aggregation logic
+/// is unit-testable (see `spawn_fallback_tests` below) without shelling out
+/// to a real `ao` binary via `run_spawn_process`.
+///
+/// jleechan-r56m: each iteration used to overwrite a single `last_err`
+/// variable, so once every agent in `agents` had failed, only the LAST
+/// agent's error survived into the returned `Err`. This discarded every
+/// earlier vendor's specific failure reason, which is exactly what made bead
+/// jleechan-93ft attempt 3's `PARKED_HUMAN_HELD` telemetry (2026-07-10) look
+/// like an "agy plugin missing" problem when agy was merely the last vendor
+/// tried in the chain.
+fn fallback_spawn<F>(agents: &[String], mut attempt_spawn: F) -> Result<SessionId, DaemonError>
+where
+    F: FnMut(&str) -> Result<SessionId, DaemonError>,
+{
+    let mut attempts: Vec<(String, DaemonError)> = Vec::new();
+    for agent in agents {
+        match attempt_spawn(agent) {
+            Ok(sess) => return Ok(sess),
+            Err(error @ DaemonError::SpawnCleanupFailed { .. }) => return Err(error),
+            Err(e) => {
+                attempts.push((agent.clone(), e));
             }
         }
+    }
 
-        Err(last_err.unwrap_or_else(|| {
-            DaemonError::Config("No agents in fallback chain could be run".into())
-        }))
+    Err(if attempts.is_empty() {
+        DaemonError::Config("No agents in fallback chain could be run".into())
+    } else {
+        DaemonError::SpawnFallbackExhausted(attempts)
+    })
+}
+
+#[cfg(test)]
+mod spawn_fallback_tests {
+    use super::fallback_spawn;
+    use crate::errors::DaemonError;
+
+    /// jleechan-r56m red proof: simulate all 3 vendors in a fallback chain
+    /// failing with DIFFERENT, distinguishable errors. Today's aggregation
+    /// (`last_err` overwritten each iteration) only surfaces the LAST
+    /// vendor's error, so the first two vendors' distinguishing markers must
+    /// NOT appear in the final error's `Display` output -- proving the bug
+    /// bead jleechan-r56m describes: triage sees only "agy" and never learns
+    /// minimax/claude-code failed for a different, possibly more important,
+    /// reason.
+    #[test]
+    fn all_vendors_failing_must_surface_every_vendors_error_not_just_the_last() {
+        let agents = vec![
+            "minimax".to_string(),
+            "claude-code".to_string(),
+            "agy".to_string(),
+        ];
+
+        let err = fallback_spawn(&agents, |agent| {
+            Err(match agent {
+                "minimax" => DaemonError::Tool {
+                    tool: "ao spawn --agent minimax".to_string(),
+                    rc: 1,
+                    stderr: "MINIMAX_AUTH_FAILURE_MARKER".to_string(),
+                },
+                "claude-code" => DaemonError::Tool {
+                    tool: "ao spawn --agent claude-code".to_string(),
+                    rc: 1,
+                    stderr: "CLAUDE_CODE_SESSION_CAP_MARKER".to_string(),
+                },
+                "agy" => DaemonError::Tool {
+                    tool: "ao spawn --agent agy".to_string(),
+                    rc: 1,
+                    stderr: "Agent plugin agy not found".to_string(),
+                },
+                other => panic!("unexpected agent {other}"),
+            })
+        })
+        .expect_err("all three vendors fail in this scenario");
+
+        let rendered = err.to_string();
+
+        assert!(
+            rendered.contains("MINIMAX_AUTH_FAILURE_MARKER"),
+            "minimax's specific error must be visible in the aggregated error, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("CLAUDE_CODE_SESSION_CAP_MARKER"),
+            "claude-code's specific error must be visible in the aggregated error, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("Agent plugin agy not found"),
+            "agy's specific error must still be visible in the aggregated error, got: {rendered}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod spawn_classification_tests {
+    use super::CliSessions;
+    use crate::errors::DaemonError;
+
+    /// jleechan-la67 live incident (2026-07-08): once
+    /// `spawn-queue-worldarchitect.json` hit its 100-pending admission cap,
+    /// `ao spawn` began failing rc=1 with stderr containing "Spawn queue is
+    /// full for project 'worldarchitect' (100 pending requests)" — a plain
+    /// thrown `Error` from `enqueueSpawnRequest` (packages/core/src/spawn-queue.ts)
+    /// that re-propagates through commander's default handler. Before this
+    /// fix, `classify_spawn_output` treated ANY nonzero exit as a genuine
+    /// `DaemonError::Tool` vendor failure, indistinguishable from a real
+    /// crash — which increments `spawn_failure_count` and, after
+    /// `MAX_TRANSIENT_SPAWN_RETRY` cycles, parks the bead `HumanHeld` purely
+    /// from admission backpressure that has nothing to do with the bead
+    /// itself. This must classify as `Deferred` instead, exactly like the
+    /// existing `REQUEST=` "at session cap" case, since no worktree/branch/
+    /// process was ever created either way.
+    #[test]
+    fn queue_full_stderr_on_nonzero_exit_is_deferred_not_tool() {
+        let err = CliSessions::classify_spawn_output(
+            "claude-code",
+            false,
+            Some(1),
+            "",
+            "Error: Spawn queue is full for project 'worldarchitect' (100 pending requests)\n",
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DaemonError::Deferred(_)),
+            "queue-full rc=1 must classify as Deferred (retry-later), not a vendor Tool failure: {err:?}"
+        );
+        assert!(
+            err.is_transient(),
+            "Deferred must remain transient so dispatch_ready still requeues it"
+        );
+    }
+
+    /// Matching is case-insensitive since the exact casing of AO's thrown
+    /// error message is not a contract the daemon should be brittle to.
+    #[test]
+    fn queue_full_stderr_matching_is_case_insensitive() {
+        let err = CliSessions::classify_spawn_output(
+            "claude-code",
+            false,
+            Some(1),
+            "",
+            "SPAWN QUEUE IS FULL for project 'worldarchitect' (100 pending requests)",
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, DaemonError::Deferred(_)));
+    }
+
+    /// A genuine crash (e.g. `ao` binary missing, auth failure, unrelated
+    /// CLI error) on a nonzero exit must still classify as a real `Tool`
+    /// vendor failure — this fix must not blanket-suppress all spawn
+    /// failures, only the specific admission-queue-full shape.
+    #[test]
+    fn unrelated_nonzero_exit_is_still_tool_failure() {
+        let err = CliSessions::classify_spawn_output(
+            "claude-code",
+            false,
+            Some(127),
+            "",
+            "ao: command not found",
+        )
+        .unwrap_err();
+
+        match err {
+            DaemonError::Tool { rc, stderr, .. } => {
+                assert_eq!(rc, 127);
+                assert!(stderr.contains("command not found"));
+            }
+            other => panic!("expected DaemonError::Tool for an unrelated failure, got {other:?}"),
+        }
+    }
+
+    /// Existing REQUEST= behavior (jleechan-5ia2) must be unaffected by this
+    /// refactor: a successful exit with no SESSION= line but a REQUEST= line
+    /// still classifies as Deferred.
+    #[test]
+    fn request_line_on_success_exit_is_still_deferred() {
+        let err = CliSessions::classify_spawn_output(
+            "claude-code",
+            true,
+            Some(0),
+            "REQUEST=sq-abc123\n",
+            "",
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, DaemonError::Deferred(_)));
+    }
+
+    /// Existing SESSION= happy path must be unaffected by this refactor.
+    #[test]
+    fn session_line_on_success_exit_is_ok() {
+        let session = CliSessions::classify_spawn_output(
+            "claude-code",
+            true,
+            Some(0),
+            "SESSION=abc-123\n",
+            "",
+        )
+        .unwrap();
+
+        assert_eq!(session.0, "abc-123");
+    }
+
+    /// Regression guard for the pre-existing fallthrough (unchanged by this
+    /// refactor): a successful exit with neither a `SESSION=` nor a
+    /// `REQUEST=` line is a genuine parse failure, not retry-safe.
+    #[test]
+    fn success_exit_with_no_session_or_request_line_is_parse_error() {
+        let err = CliSessions::classify_spawn_output(
+            "claude-code",
+            true,
+            Some(0),
+            "some unexpected stdout with no marker line\n",
+            "",
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DaemonError::Parse(_)),
+            "expected DaemonError::Parse for a success exit with no SESSION=/REQUEST= line, got {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ao_spawn_contract_tests {
+    use super::{ao_spawn_bridge_path, gh_env_test_lock, CliSessions};
+    use crate::errors::DaemonError;
+    use crate::tools::{Sessions, SpawnSpec};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn spec(prompt: &str, branch: &str) -> SpawnSpec {
+        SpawnSpec {
+            bead_id: "jleechan-contract-test".to_string(),
+            branch: branch.to_string(),
+            prompt: prompt.to_string(),
+            repo: "jleechanorg/dark-factory".to_string(),
+            ao_project: "dark-factory".to_string(),
+            remote: "origin".to_string(),
+        }
+    }
+
+    fn bridge_test_node() -> std::path::PathBuf {
+        if let Ok(node) = std::env::var("DARK_FACTORY_AO_BRIDGE_TEST_NODE") {
+            return std::path::PathBuf::from(node);
+        }
+        let node22 = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+            .join(".nvm/versions/node/v22.22.0/bin/node");
+        if node22.is_file() {
+            node22
+        } else {
+            std::path::PathBuf::from("node")
+        }
+    }
+
+    #[test]
+    fn bridge_rejects_non_node22_even_with_legacy_test_bypass_environment() {
+        let bridge = ao_spawn_bridge_path();
+        let output = std::process::Command::new(bridge_test_node())
+            .args([
+                "--input-type=module",
+                "--eval",
+                "Object.defineProperty(process.versions, 'node', {value: '24.15.0'}); const {pathToFileURL} = await import('node:url'); await import(pathToFileURL(process.argv[1]).href);",
+            ])
+            .arg(&bridge)
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env("NODE_ENV", "test")
+            .env("DARK_FACTORY_AO_BRIDGE_ALLOW_TEST_NODE", "1")
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "legacy bypass unexpectedly worked");
+        assert!(stderr.contains("requires Node 22, got 24.15.0"), "{stderr}");
+    }
+
+    fn fake_ao_dir(test_name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "afd_ao_spawn_contract_{test_name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("ao");
+        std::fs::write(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+if args[:2] == ["session", "kill"] and len(args) == 3:
+    with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"kind": "kill", "args": args, "session": args[2]}) + "\n")
+    if os.environ.get("AO_FAKE_KILL_FAIL") == "1":
+        print("scripted batch cleanup failure", file=sys.stderr)
+        raise SystemExit(8)
+    raise SystemExit(0)
+assert len(args) == 7, args
+assert args[:5] == ["spawn", "--project", "dark-factory", "--agent", "minimax"], args
+assert not {"--prompt", "--name", "--branch"}.intersection(args), args
+assert args[5] == "--", args
+prompt = args[6]
+bindings = json.loads(os.environ["AO_FAKE_EXPECTED_BINDINGS"])
+assert bindings[prompt] == os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"]
+assert os.environ["DARK_FACTORY_AO_V013_BRIDGE"] == "1"
+assert "ao-spawn-v013-bridge.mjs" in os.environ["NODE_OPTIONS"]
+with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"kind": "spawn", "args": args, "branch": os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"]}) + "\n")
+if prompt == os.environ.get("AO_FAKE_FAIL_PROMPT"):
+    print("scripted second spawn failure", file=sys.stderr)
+    raise SystemExit(7)
+print("SESSION=fake-" + str(abs(hash(prompt))))
+print("  Worktree: " + os.environ.get("AO_FAKE_WORKTREE", "/tmp/fake-ao-worktree"))
+print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_FACTORY_AO_SPAWN_BRANCH"]))
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+        dir
+    }
+
+    fn with_fake_ao<T>(
+        test_name: &str,
+        bindings: serde_json::Value,
+        run: impl FnOnce(&std::path::Path) -> T,
+    ) -> T {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = fake_ao_dir(test_name);
+        let log = dir.join("calls.jsonl");
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_bindings = std::env::var("AO_FAKE_EXPECTED_BINDINGS").ok();
+        let old_log = std::env::var("AO_FAKE_LOG").ok();
+        std::env::set_var("PATH", format!("{}:{old_path}", dir.display()));
+        std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", bindings.to_string());
+        std::env::set_var("AO_FAKE_LOG", &log);
+
+        let result = run(&log);
+
+        std::env::set_var("PATH", old_path);
+        match old_bindings {
+            Some(value) => std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", value),
+            None => std::env::remove_var("AO_FAKE_EXPECTED_BINDINGS"),
+        }
+        match old_log {
+            Some(value) => std::env::set_var("AO_FAKE_LOG", value),
+            None => std::env::remove_var("AO_FAKE_LOG"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+        result
+    }
+
+    #[test]
+    fn single_spawn_uses_v013_positional_prompt_and_exact_branch_binding() {
+        let prompt = "single prompt with spaces\nand a second line";
+        let branch = "factory/jleechan-contract-single-r1";
+        let bindings = serde_json::json!({ prompt: branch });
+
+        let (spawn_result, calls) = with_fake_ao("single", bindings, |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.spawn(&spec(prompt, branch));
+            let calls = std::fs::read_to_string(log).unwrap_or_default();
+            (result, calls)
+        });
+
+        assert!(
+            spawn_result.is_ok(),
+            "single spawn failed: {spawn_result:?}"
+        );
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1, "expected exactly one AO invocation: {calls}");
+        assert_eq!(rows[0]["args"][5], "--");
+        assert_eq!(rows[0]["args"][6], prompt);
+        assert_eq!(rows[0]["branch"], branch);
+    }
+
+    #[test]
+    fn bridge_branch_mismatch_is_killed_and_never_returned_as_a_session() {
+        let prompt = "branch mismatch prompt";
+        let branch = "factory/jleechan-contract-branch-mismatch-r1";
+        let bindings = serde_json::json!({ prompt: branch });
+
+        let (spawn_result, calls) = with_fake_ao("branch_mismatch", bindings, |log| {
+            let saved = [
+                ("AO_FAKE_RETURN_BRANCH", std::env::var("AO_FAKE_RETURN_BRANCH").ok()),
+                (
+                    "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
+                    std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok(),
+                ),
+            ];
+            std::env::set_var("AO_FAKE_RETURN_BRANCH", "factory/unexpected-r1");
+            std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax");
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.spawn(&spec(prompt, branch));
+            for (key, value) in saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let calls = std::fs::read_to_string(log).unwrap_or_default();
+            (result, calls)
+        });
+
+        let error = spawn_result.expect_err("a mismatched Branch echo must fail closed");
+        assert!(error.to_string().contains("branch-mismatched worker"));
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows.iter().filter(|row| row["kind"] == "spawn").count(),
+            1
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row["kind"] == "kill").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn batch_spawn_uses_v013_contract_for_every_item() {
+        let first = spec(
+            "batch prompt alpha",
+            "factory/jleechan-contract-batch-alpha-r1",
+        );
+        let second = spec(
+            "batch prompt beta",
+            "factory/jleechan-contract-batch-beta-r1",
+        );
+        let bindings = serde_json::json!({
+            first.prompt.clone(): first.branch.clone(),
+            second.prompt.clone(): second.branch.clone(),
+        });
+
+        let (spawn_result, calls) = with_fake_ao("batch", bindings, |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.spawn_batch(&[first.clone(), second.clone()]);
+            let calls = std::fs::read_to_string(log).unwrap_or_default();
+            (result, calls)
+        });
+
+        assert!(spawn_result.is_ok(), "batch spawn failed: {spawn_result:?}");
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected one AO invocation per spec: {calls}"
+        );
+        let observed: std::collections::HashMap<&str, &str> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["args"][6].as_str().unwrap(),
+                    row["branch"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            observed.get(first.prompt.as_str()),
+            Some(&first.branch.as_str())
+        );
+        assert_eq!(
+            observed.get(second.prompt.as_str()),
+            Some(&second.branch.as_str())
+        );
+    }
+
+    #[test]
+    fn batch_spawn_failure_kills_every_prior_session() {
+        let first = spec(
+            "batch succeeds first",
+            "factory/jleechan-contract-batch-cleanup-first-r1",
+        );
+        let second = spec(
+            "batch fails second",
+            "factory/jleechan-contract-batch-cleanup-second-r1",
+        );
+        let bindings = serde_json::json!({
+            first.prompt.clone(): first.branch.clone(),
+            second.prompt.clone(): second.branch.clone(),
+        });
+
+        let (batch_result, calls) = with_fake_ao("batch_cleanup", bindings, |log| {
+            let old_fail_prompt = std::env::var("AO_FAKE_FAIL_PROMPT").ok();
+            let old_fallback = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+            std::env::set_var("AO_FAKE_FAIL_PROMPT", &second.prompt);
+            std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax");
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.spawn_batch(&[first.clone(), second.clone()]);
+            match old_fail_prompt {
+                Some(value) => std::env::set_var("AO_FAKE_FAIL_PROMPT", value),
+                None => std::env::remove_var("AO_FAKE_FAIL_PROMPT"),
+            }
+            match old_fallback {
+                Some(value) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", value),
+                None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
+            }
+            let calls = std::fs::read_to_string(log).unwrap_or_default();
+            (result, calls)
+        });
+
+        assert!(batch_result.is_err(), "second spawn must fail");
+        let rows: Vec<serde_json::Value> = calls.lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let successful_spawns: Vec<&serde_json::Value> = rows.iter()
+            .filter(|row| row["kind"] == "spawn" && row["args"][6] == first.prompt)
+            .collect();
+        let kills: Vec<&serde_json::Value> = rows.iter()
+            .filter(|row| row["kind"] == "kill")
+            .collect();
+        assert_eq!(successful_spawns.len(), 1, "calls={calls}");
+        assert_eq!(kills.len(), successful_spawns.len(), "calls={calls}");
+        assert_eq!(
+            kills[0]["args"],
+            serde_json::json!(["session", "kill", kills[0]["session"]])
+        );
+    }
+
+    #[test]
+    fn batch_spawn_reports_root_and_cleanup_failures() {
+        let first = spec(
+            "batch cleanup failure first",
+            "factory/jleechan-contract-batch-cleanup-error-first-r1",
+        );
+        let second = spec(
+            "batch cleanup failure second",
+            "factory/jleechan-contract-batch-cleanup-error-second-r1",
+        );
+        let bindings = serde_json::json!({
+            first.prompt.clone(): first.branch.clone(),
+            second.prompt.clone(): second.branch.clone(),
+        });
+
+        let (batch_result, calls) = with_fake_ao("batch_cleanup_error", bindings, |log| {
+            let old_fail_prompt = std::env::var("AO_FAKE_FAIL_PROMPT").ok();
+            let old_kill_fail = std::env::var("AO_FAKE_KILL_FAIL").ok();
+            let old_fallback = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+            std::env::set_var("AO_FAKE_FAIL_PROMPT", &second.prompt);
+            std::env::set_var("AO_FAKE_KILL_FAIL", "1");
+            std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax");
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.spawn_batch(&[first.clone(), second.clone()]);
+            for (key, old) in [
+                ("AO_FAKE_FAIL_PROMPT", old_fail_prompt),
+                ("AO_FAKE_KILL_FAIL", old_kill_fail),
+                ("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", old_fallback),
+            ] {
+                match old {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let calls = std::fs::read_to_string(log).unwrap_or_default();
+            (result, calls)
+        });
+
+        let error = batch_result.expect_err("second spawn and cleanup must fail");
+        let rendered = error.to_string();
+        let cleanup_errors = match &error {
+            DaemonError::SpawnBatchCleanupFailed { cleanup_errors, .. } => cleanup_errors,
+            other => panic!("expected typed batch cleanup failure, got {other:?}"),
+        };
+        assert_eq!(cleanup_errors.len(), 1);
+        assert_eq!(cleanup_errors[0].bead_id, first.bead_id);
+        assert_eq!(cleanup_errors[0].branch, first.branch);
+        assert!(rendered.contains("scripted second spawn failure"), "{rendered}");
+        assert!(rendered.contains("scripted batch cleanup failure"), "{rendered}");
+        assert!(rendered.contains("jleechan-contract-test"), "{rendered}");
+        assert!(
+            rendered.contains("factory/jleechan-contract-batch-cleanup-error-first-r1"),
+            "{rendered}"
+        );
+        let rows: Vec<serde_json::Value> = calls.lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows.iter().filter(|row| row["kind"] == "kill").count(),
+            1,
+            "calls={calls}"
+        );
+    }
+
+    #[test]
+    fn prompt_beginning_with_dash_remains_positional() {
+        let prompt = "--not-an-ao-option preserve this prompt verbatim";
+        let branch = "factory/jleechan-contract-dash-prompt-r1";
+        let bindings = serde_json::json!({ prompt: branch });
+
+        let (spawn_result, calls) = with_fake_ao("dash_prompt", bindings, |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.spawn(&spec(prompt, branch));
+            let calls = std::fs::read_to_string(log).unwrap_or_default();
+            (result, calls)
+        });
+
+        assert!(spawn_result.is_ok(), "dash prompt failed: {spawn_result:?}");
+        let row: serde_json::Value = serde_json::from_str(calls.lines().next().unwrap()).unwrap();
+        assert_eq!(row["args"][5], "--");
+        assert_eq!(row["args"][6], prompt);
+        assert_eq!(row["branch"], branch);
+    }
+
+    #[test]
+    fn missing_worktree_uses_session_kill_cleanup_contract() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_missing_worktree_cleanup_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("calls.jsonl");
+        let fake_ao = root.join("ao");
+        std::fs::write(
+            &fake_ao,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+with open(os.environ["AO_FAKE_CLEANUP_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(sys.argv[1:]) + "\n")
+if sys.argv[1] == "spawn":
+    print("SESSION=missing-worktree-session")
+    raise SystemExit(0)
+if sys.argv[1:] == ["session", "kill", "missing-worktree-session"]:
+    raise SystemExit(0)
+raise SystemExit(9)
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_ao, permissions).unwrap();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_log = std::env::var("AO_FAKE_CLEANUP_LOG").ok();
+        let old_fallback = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+        std::env::set_var("PATH", format!("{}:{old_path}", root.display()));
+        std::env::set_var("AO_FAKE_CLEANUP_LOG", &log);
+        std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax");
+
+        let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+        let result = sessions.spawn(&spec(
+            "missing workspace cleanup",
+            "factory/missing-worktree-cleanup-r1",
+        ));
+        std::env::set_var("PATH", old_path);
+        match old_log {
+            Some(value) => std::env::set_var("AO_FAKE_CLEANUP_LOG", value),
+            None => std::env::remove_var("AO_FAKE_CLEANUP_LOG"),
+        }
+        match old_fallback {
+            Some(value) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", value),
+            None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
+        }
+        let calls: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.is_err(), "missing Worktree must fail closed");
+        assert_eq!(
+            calls.last().unwrap(),
+            &serde_json::json!(["session", "kill", "missing-worktree-session"])
+        );
+        assert!(!calls.iter().any(|call| call == &serde_json::json!(["stop", "missing-worktree-session"])));
+    }
+
+    #[test]
+    fn missing_worktree_kill_failure_does_not_spawn_fallback_vendor() {
+        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_missing_worktree_kill_failure_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("calls.jsonl");
+        let fake_ao = root.join("ao");
+        std::fs::write(
+            &fake_ao,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+with open(os.environ["AO_FAKE_CLEANUP_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(sys.argv[1:]) + "\n")
+if sys.argv[1] == "spawn":
+    print("SESSION=untracked-session")
+    raise SystemExit(0)
+if sys.argv[1:] == ["session", "kill", "untracked-session"]:
+    print("scripted kill failure", file=sys.stderr)
+    raise SystemExit(8)
+raise SystemExit(9)
+"#,
+        ).unwrap();
+        let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_ao, permissions).unwrap();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_log = std::env::var("AO_FAKE_CLEANUP_LOG").ok();
+        let old_fallback = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+        std::env::set_var("PATH", format!("{}:{old_path}", root.display()));
+        std::env::set_var("AO_FAKE_CLEANUP_LOG", &log);
+        std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax->claude-code");
+
+        let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+        let result = sessions.spawn(&spec(
+            "missing workspace kill failure",
+            "factory/missing-worktree-kill-failure-r1",
+        ));
+        std::env::set_var("PATH", old_path);
+        match old_log {
+            Some(value) => std::env::set_var("AO_FAKE_CLEANUP_LOG", value),
+            None => std::env::remove_var("AO_FAKE_CLEANUP_LOG"),
+        }
+        match old_fallback {
+            Some(value) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", value),
+            None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
+        }
+        let calls: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })));
+        assert_eq!(
+            calls.iter().filter(|call| call[0] == "spawn").count(),
+            1,
+            "cleanup failure must stop fallback dispatch: {calls:?}"
+        );
+        assert_eq!(
+            calls.last().unwrap(),
+            &serde_json::json!(["session", "kill", "untracked-session"])
+        );
+    }
+
+    #[test]
+    fn spawned_opaque_workspace_is_used_for_remote_validation() {
+        let prompt = "opaque workspace validation prompt";
+        let branch = "factory/jleechan-contract-opaque-r1";
+        let bindings = serde_json::json!({ prompt: branch });
+        let (spawn_result, remote_result) = with_fake_ao("opaque", bindings, |log| {
+            let workspace = log.parent().unwrap().join("df-opaque-134");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&workspace)
+                .status()
+                .unwrap();
+            std::process::Command::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/wrong-owner/wrong-repo.git",
+                ])
+                .current_dir(&workspace)
+                .status()
+                .unwrap();
+            let previous_workspace = std::env::var("AO_FAKE_WORKTREE").ok();
+            std::env::set_var("AO_FAKE_WORKTREE", &workspace);
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let spawn_result = sessions.spawn(&spec(prompt, branch));
+            let remote_result =
+                sessions.worktree_remote_url("dark-factory", branch, "origin");
+            match previous_workspace {
+                Some(value) => std::env::set_var("AO_FAKE_WORKTREE", value),
+                None => std::env::remove_var("AO_FAKE_WORKTREE"),
+            }
+            (spawn_result, remote_result)
+        });
+
+        assert!(spawn_result.is_ok(), "spawn failed: {spawn_result:?}");
+        assert_eq!(
+            remote_result.unwrap().as_deref(),
+            Some("https://github.com/wrong-owner/wrong-repo.git")
+        );
+    }
+
+    #[test]
+    fn bridge_resolves_import_only_ao_core_from_hoisted_node_modules() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_bridge_hoisted_resolution_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cli = root.join("node_modules/@jleechanorg/ao-cli");
+        let core = root.join("node_modules/@jleechanorg/ao-core");
+        std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
+        std::fs::create_dir_all(core.join("dist")).unwrap();
+        std::fs::write(
+            cli.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
+            .unwrap();
+        std::fs::write(
+            core.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            core.join("dist/index.js"),
+            r#"export const loadConfig = () => ({configPath: "/tmp/fake-ao.yaml", projects: {"dark-factory": {path: "/tmp/fake-project"}}});
+export const createPluginRegistry = () => ({loadFromConfig: async () => {}});
+export const createSessionManager = () => ({});
+export const acquireSpawnLock = () => ({acquired: true, release() {}});
+export const resolveSpawnQueueConfig = () => ({enabled: true, maxActiveSessions: 20});
+export const isTerminalSession = () => false;
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/preflight.js"),
+            "export const preflight = {checkTmux: async () => {}, checkGhAuth: async () => {}};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/running-state.js"),
+            "export const getRunning = async () => ({projects: ['dark-factory']});\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/lifecycle-service.js"),
+            "export const ensureLifecycleWorker = async () => {};\n",
+        )
+        .unwrap();
+
+        let bridge = ao_spawn_bridge_path();
+        let output = std::process::Command::new(bridge_test_node())
+            .arg(cli.join("dist/index.js"))
+            .args([
+                "spawn",
+                "--project",
+                "dark-factory",
+                "--agent",
+                "minimax",
+                "--dark-factory-read-only-diagnostic",
+                "--",
+                "hoisted resolution probe",
+            ])
+            .env(
+                "NODE_OPTIONS",
+                format!(
+                    "--experimental-import-meta-resolve --import={}",
+                    bridge.display()
+                ),
+            )
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env("DARK_FACTORY_AO_BRIDGE_DIAGNOSTIC", "1")
+            .env(
+                "DARK_FACTORY_AO_SPAWN_BRANCH",
+                "factory/hoisted-resolution-r1",
+            )
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            output.status.success(),
+            "bridge failed to resolve import-only hoisted AO core; stdout={stdout}; stderr={stderr}"
+        );
+        assert!(stdout.contains("AO_BRIDGE_DIAGNOSTIC="), "stdout={stdout}");
+    }
+
+    #[test]
+    fn bridge_runs_v013_guards_and_defers_at_active_cap_without_spawning() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_bridge_admission_semantics_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cli = root.join("node_modules/@jleechanorg/ao-cli");
+        let core = root.join("node_modules/@jleechanorg/ao-core");
+        let calls = root.join("calls.log");
+        std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
+        std::fs::create_dir_all(core.join("dist")).unwrap();
+        std::fs::write(
+            cli.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
+            .unwrap();
+        std::fs::write(
+            core.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            core.join("dist/index.js"),
+            r#"import {appendFileSync} from 'node:fs';
+const log = (value) => appendFileSync(process.env.AO_FAKE_CALLS, value + '\n');
+export const loadConfig = () => ({configPath: '/tmp/fake-ao.yaml', defaults: {runtime: 'tmux'}, projects: {'dark-factory': {path: '/tmp/fake-project', tracker: {plugin: 'github'}}}});
+export const createPluginRegistry = () => ({loadFromConfig: async () => {}});
+export const createSessionManager = () => ({
+  list: async () => {log('list'); return [{status: 'working'}];},
+  spawn: async () => {log('SPAWN_CALLED'); throw new Error('spawn must not run at cap');},
+});
+export const acquireSpawnLock = () => {log('lock'); return {acquired: true, release() {log('release');}}};
+export const resolveSpawnQueueConfig = () => ({enabled: true, maxActiveSessions: 1});
+export const isTerminalSession = () => false;
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/preflight.js"),
+            r#"import {appendFileSync} from 'node:fs';
+const log = (v) => appendFileSync(process.env.AO_FAKE_CALLS, v + '\n');
+export const preflight = {checkTmux: async () => log('tmux'), checkGhAuth: async () => log('gh')};
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/running-state.js"),
+            r#"import {appendFileSync} from 'node:fs';
+export const getRunning = async () => {appendFileSync(process.env.AO_FAKE_CALLS, 'running\n'); return {projects: ['dark-factory']}};
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/lifecycle-service.js"),
+            r#"import {appendFileSync} from 'node:fs';
+export const ensureLifecycleWorker = async () => appendFileSync(process.env.AO_FAKE_CALLS, 'lifecycle\n');
+"#,
+        )
+        .unwrap();
+
+        let bridge = ao_spawn_bridge_path();
+        let output = std::process::Command::new(bridge_test_node())
+            .arg(cli.join("dist/index.js"))
+            .args([
+                "spawn",
+                "--project",
+                "dark-factory",
+                "--agent",
+                "minimax",
+                "--",
+                "admission probe",
+            ])
+            .env(
+                "NODE_OPTIONS",
+                format!(
+                    "--experimental-import-meta-resolve --import={}",
+                    bridge.display()
+                ),
+            )
+            .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "")
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env(
+                "DARK_FACTORY_AO_SPAWN_BRANCH",
+                "factory/admission-probe-r1",
+            )
+            .env("AO_FAKE_CALLS", &calls)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            output.status.success(),
+            "cap deferral failed; stdout={stdout}; stderr={stderr}; calls={calls}"
+        );
+        assert!(stdout.contains("REQUEST=dark-factory-exact-branch-dark-factory"));
+        for expected in ["tmux", "gh", "running", "lifecycle", "lock", "list", "release"] {
+            assert!(calls.lines().any(|line| line == expected), "missing {expected}: {calls}");
+        }
+        assert!(!calls.contains("SPAWN_CALLED"), "{calls}");
+    }
+
+    #[test]
+    fn bridge_sanitizes_prompt_preserves_branch_and_cleans_worker_environment() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_bridge_spawn_semantics_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cli = root.join("node_modules/@jleechanorg/ao-cli");
+        let core = root.join("node_modules/@jleechanorg/ao-core");
+        let calls = root.join("calls.log");
+        std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
+        std::fs::create_dir_all(core.join("dist")).unwrap();
+        std::fs::write(
+            cli.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
+            .unwrap();
+        std::fs::write(
+            core.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            core.join("dist/index.js"),
+            r#"import {appendFileSync} from 'node:fs';
+const log = (value) => appendFileSync(process.env.AO_FAKE_CALLS, value + '\n');
+export const loadConfig = () => ({configPath: '/tmp/fake-ao.yaml', defaults: {runtime: 'tmux'}, projects: {'dark-factory': {path: '/tmp/fake-project', tracker: {plugin: 'github'}}}});
+export const createPluginRegistry = () => ({loadFromConfig: async () => {}});
+export const createSessionManager = () => ({
+  list: async () => {log('list'); return [];},
+  spawn: async (spec) => {
+    log('spawn=' + JSON.stringify({
+      spec,
+      nodeOptions: process.env.NODE_OPTIONS ?? null,
+      bridge: process.env.DARK_FACTORY_AO_V013_BRIDGE ?? null,
+      branchEnv: process.env.DARK_FACTORY_AO_SPAWN_BRANCH ?? null,
+      parentNodeOptions: process.env.DARK_FACTORY_AO_PARENT_NODE_OPTIONS ?? null,
+    }));
+    return {id: 'spawn-semantic-session', branch: spec.branch, workspacePath: '/tmp/fake-worktree'};
+  },
+});
+export const acquireSpawnLock = () => {log('lock'); return {acquired: true, release() {log('release');}}};
+export const resolveSpawnQueueConfig = () => ({enabled: true, maxActiveSessions: 2});
+export const isTerminalSession = () => false;
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/preflight.js"),
+            r#"export const preflight = {checkTmux: async () => {}, checkGhAuth: async () => {}};
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/running-state.js"),
+            "export const getRunning = async () => ({projects: ['dark-factory']});\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/lifecycle-service.js"),
+            "export const ensureLifecycleWorker = async () => {};\n",
+        )
+        .unwrap();
+
+        let bridge = ao_spawn_bridge_path();
+        let output = std::process::Command::new(bridge_test_node())
+            .arg(cli.join("dist/index.js"))
+            .args([
+                "spawn",
+                "--project",
+                "dark-factory",
+                "--agent",
+                "minimax",
+                "--",
+                "  hello\r\nworld  ",
+            ])
+            .env(
+                "NODE_OPTIONS",
+                format!(
+                    "--trace-warnings --experimental-import-meta-resolve --import={}",
+                    bridge.display()
+                ),
+            )
+            .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "--trace-warnings")
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env(
+                "DARK_FACTORY_AO_SPAWN_BRANCH",
+                "factory/spawn-semantics-r1",
+            )
+            .env("AO_FAKE_CALLS", &calls)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            output.status.success(),
+            "below-cap spawn failed; stdout={stdout}; stderr={stderr}; calls={calls}"
+        );
+        assert!(stdout.contains("SESSION=spawn-semantic-session"), "{stdout}");
+        let spawn_line = calls
+            .lines()
+            .find_map(|line| line.strip_prefix("spawn="))
+            .expect("spawn call was not recorded");
+        let observed: serde_json::Value = serde_json::from_str(spawn_line).unwrap();
+        assert_eq!(observed["spec"]["prompt"], "hello  world");
+        assert_eq!(observed["spec"]["branch"], "factory/spawn-semantics-r1");
+        assert_eq!(observed["spec"]["projectId"], "dark-factory");
+        assert_eq!(observed["spec"]["agent"], "minimax");
+        assert_eq!(observed["nodeOptions"], "--trace-warnings");
+        assert!(observed["bridge"].is_null());
+        assert!(observed["branchEnv"].is_null());
+        assert!(observed["parentNodeOptions"].is_null());
+        assert_eq!(calls.lines().filter(|line| *line == "release").count(), 1);
+    }
+
+    #[test]
+    fn bridge_backed_batch_and_invalid_workspace_cleanup_are_fail_closed() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_ao_bridge_batch_semantics_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        let cli = root.join("node_modules/@jleechanorg/ao-cli");
+        let core = root.join("node_modules/@jleechanorg/ao-core");
+        let calls = root.join("calls.jsonl");
+        let lock = root.join("spawn.lock");
+        let first_workspace = root.join("df-batch-alpha");
+        let second_workspace = root.join("df-batch-beta");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
+        std::fs::create_dir_all(core.join("dist")).unwrap();
+        for workspace in [&first_workspace, &second_workspace] {
+            std::fs::create_dir_all(workspace).unwrap();
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace)
+                .status()
+                .unwrap();
+            std::process::Command::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/jleechanorg/dark-factory.git",
+                ])
+                .current_dir(workspace)
+                .status()
+                .unwrap();
+        }
+        std::fs::write(
+            cli.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
+            .unwrap();
+        std::fs::write(
+            core.join("package.json"),
+            r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            core.join("dist/index.js"),
+            r#"import {appendFileSync, closeSync, openSync, rmSync} from 'node:fs';
+const log = (value) => appendFileSync(process.env.AO_FAKE_CALLS, JSON.stringify(value) + '\n');
+export const loadConfig = () => ({configPath: '/tmp/fake-ao.yaml', defaults: {runtime: 'tmux'}, projects: {'dark-factory': {path: '/tmp/fake-project'}}});
+export const createPluginRegistry = () => ({loadFromConfig: async () => {}});
+export const createSessionManager = () => ({
+  list: async () => [],
+  spawn: async (spec) => {
+    log({kind: 'spawn', agent: spec.agent, branch: spec.branch, prompt: spec.prompt});
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const workspaces = JSON.parse(process.env.AO_FAKE_WORKSPACES);
+    const workspacePath = spec.prompt === process.env.AO_FAKE_INVALID_WORKSPACE_PROMPT
+      ? 'relative-worktree'
+      : workspaces[spec.branch];
+    return {id: 'session-' + spec.branch.split('/').pop(), branch: spec.branch, workspacePath};
+  },
+  kill: async () => {},
+});
+export const acquireSpawnLock = () => {
+  try {
+    closeSync(openSync(process.env.AO_FAKE_LOCK, 'wx'));
+    return {acquired: true, release() {rmSync(process.env.AO_FAKE_LOCK, {force: true});}};
+  } catch {
+    return {acquired: false};
+  }
+};
+export const resolveSpawnQueueConfig = () => ({enabled: true, maxActiveSessions: 10});
+export const isTerminalSession = () => false;
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/preflight.js"),
+            "export const preflight = {checkTmux: async () => {}, checkGhAuth: async () => {}};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/running-state.js"),
+            "export const getRunning = async () => ({projects: ['dark-factory']});\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("dist/lib/lifecycle-service.js"),
+            "export const ensureLifecycleWorker = async () => {};\n",
+        )
+        .unwrap();
+        let fake_ao = bin.join("ao");
+        std::fs::write(
+            &fake_ao,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+if sys.argv[1:3] == ["session", "kill"]:
+    with open(os.environ["AO_FAKE_CALLS"], "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"kind": "kill", "args": sys.argv[1:]}) + "\n")
+    print("scripted bridge-backed kill failure", file=sys.stderr)
+    raise SystemExit(8)
+os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["AO_FAKE_CLI_ENTRY"], *sys.argv[1:]])
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_ao, permissions).unwrap();
+
+        let first = spec("batch alpha", "factory/batch-alpha-r1");
+        let second = spec("batch beta", "factory/batch-beta-r1");
+        let invalid = spec(
+            "bridge invalid workspace",
+            "factory/bridge-invalid-workspace-r1",
+        );
+        let saved = [
+            ("PATH", std::env::var("PATH").ok()),
+            ("AO_FAKE_NODE", std::env::var("AO_FAKE_NODE").ok()),
+            ("AO_FAKE_CLI_ENTRY", std::env::var("AO_FAKE_CLI_ENTRY").ok()),
+            ("AO_FAKE_CALLS", std::env::var("AO_FAKE_CALLS").ok()),
+            ("AO_FAKE_LOCK", std::env::var("AO_FAKE_LOCK").ok()),
+            ("AO_FAKE_WORKSPACES", std::env::var("AO_FAKE_WORKSPACES").ok()),
+            (
+                "AO_FAKE_INVALID_WORKSPACE_PROMPT",
+                std::env::var("AO_FAKE_INVALID_WORKSPACE_PROMPT").ok(),
+            ),
+            (
+                "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
+                std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok(),
+            ),
+        ];
+        let old_path = saved[0].1.clone().unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old_path}", bin.display()));
+        std::env::set_var("AO_FAKE_NODE", bridge_test_node());
+        std::env::set_var("AO_FAKE_CLI_ENTRY", cli.join("dist/index.js"));
+        std::env::set_var("AO_FAKE_CALLS", &calls);
+        std::env::set_var("AO_FAKE_LOCK", &lock);
+        std::env::set_var(
+            "AO_FAKE_WORKSPACES",
+            serde_json::json!({
+                first.branch.clone(): first_workspace,
+                second.branch.clone(): second_workspace,
+            })
+            .to_string(),
+        );
+        std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax->claude-code");
+
+        let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+        let batch_result = sessions.spawn_batch(&[first.clone(), second.clone()]);
+        let first_remote = sessions.worktree_remote_url("dark-factory", &first.branch, "origin");
+        let second_remote =
+            sessions.worktree_remote_url("dark-factory", &second.branch, "origin");
+        std::env::set_var("AO_FAKE_INVALID_WORKSPACE_PROMPT", &invalid.prompt);
+        let cleanup_failure = sessions.spawn(&invalid);
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(batch_result.is_ok(), "batch failed: {batch_result:?}; calls={calls}");
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let spawn_rows: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|row| row["kind"] == "spawn")
+            .collect();
+        assert_eq!(spawn_rows.len(), 3, "each spec must spawn exactly once: {calls}");
+        assert!(spawn_rows.iter().all(|row| row["agent"] == "minimax"), "{calls}");
+        assert_eq!(
+            spawn_rows
+                .iter()
+                .filter(|row| row["prompt"] == invalid.prompt)
+                .count(),
+            1,
+            "fatal cleanup failure must not advance to a fallback vendor: {calls}"
+        );
+        assert!(
+            matches!(cleanup_failure, Err(DaemonError::SpawnCleanupFailed { .. })),
+            "cleanup_failure={cleanup_failure:?}; calls={calls}"
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row["kind"] == "kill").count(),
+            1,
+            "calls={calls}"
+        );
+        assert_eq!(
+            first_remote.unwrap().as_deref(),
+            Some("https://github.com/jleechanorg/dark-factory.git")
+        );
+        assert_eq!(
+            second_remote.unwrap().as_deref(),
+            Some("https://github.com/jleechanorg/dark-factory.git")
+        );
     }
 }
 
@@ -1374,22 +3028,7 @@ impl Sessions for CliSessions {
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
         })?;
-        let mut count = 0;
-        if let Some(arr) = data.as_array() {
-            for entry in arr {
-                if let Some(project) = entry.get("project").and_then(|v| v.as_str()) {
-                    if project != self.project {
-                        continue;
-                    }
-                }
-                if let Some(activity) = entry.get("activity").and_then(|v| v.as_str()) {
-                    if activity != "exited" && activity != "missing" {
-                        count += 1;
-                    }
-                }
-            }
-        }
-        Ok(count)
+        active_session_count(&data)
     }
 
     fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
@@ -1397,140 +3036,42 @@ impl Sessions for CliSessions {
     }
 
     fn spawn_batch(&self, specs: &[SpawnSpec]) -> Result<Vec<SessionId>, DaemonError> {
-        let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
-            .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
-        
-        let mut fallback_agents = Vec::new();
-        fallback_agents.push(self.agent.clone());
-        for part in fallback_str.split("->") {
-            let part_trimmed = part.trim().to_string();
-            let mapped_agent = if part_trimmed == "aow" {
-                "minimax".to_string()
-            } else {
-                part_trimmed
-            };
-            if !mapped_agent.is_empty() && !fallback_agents.contains(&mapped_agent) {
-                fallback_agents.push(mapped_agent);
-            }
-        }
-
-        // Resolved once, outside the per-spec loop below: same env var, same
-        // filesystem state for every item in the batch, so there is no need
-        // (and no benefit) to re-resolve or re-validate it per iteration.
-        let sandbox_profile: Option<String> = if std::env::consts::OS == "macos" {
-            let holdouts = resolve_holdouts_path_or_fail()?;
-            Some(format!(
-                "(version 1)\n(allow default)\n(deny file-read* (subpath \"{}\"))\n(deny file-write* (subpath \"{}\"))\n",
-                holdouts, holdouts
-            ))
-        } else {
-            None
-        };
-
-        let mut results = vec![None; specs.len()];
-        let mut active_indices: Vec<usize> = (0..specs.len()).collect();
-
-        for agent in &fallback_agents {
-            if active_indices.is_empty() {
-                break;
-            }
-
-            let mut children = Vec::new();
-            for &idx in &active_indices {
-                let spec = &specs[idx];
-                let mut cmd = if let Some(profile) = &sandbox_profile {
-                    let mut c = Command::new("sandbox-exec");
-                    c.arg("-p").arg(profile);
-                    c.arg("ao");
-                    c
-                } else {
-                    Command::new("ao")
-                };
-                // jleechan-pqip follow-up (PR#163 finding 3): mirror
-                // `run_spawn_process`'s argv exactly — omitting `--name`/
-                // `--branch` here previously meant every batch-spawned
-                // session landed on whatever branch `ao spawn` defaults to
-                // instead of `spec.branch`, and `spec.bead_id` was never
-                // read at all.
-                let display_name = spec.branch.strip_prefix("factory/").unwrap_or(&spec.branch);
-                cmd.arg("spawn")
-                    .arg("--prompt")
-                    .arg(&spec.prompt)
-                    .arg("--project")
-                    .arg(&self.project)
-                    .arg("--agent")
-                    .arg(agent)
-                    .arg("--name")
-                    .arg(display_name)
-                    .arg("--branch")
-                    .arg(&spec.branch)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-
-                for (k, _) in std::env::vars() {
-                    if k == "DARK_FACTORY_HOLDOUTS" || k.to_uppercase().contains("HOLDOUT") {
-                        cmd.env_remove(k);
+        // AO's v0.1.3 spawn lock is per project. Serializing here is not an
+        // optimization choice: concurrent bridge processes collide on that
+        // lock, spuriously shift later specs to fallback vendors, and bypass
+        // the single path's REQUEST=/Worktree classification. Reuse the
+        // complete single-spawn path so every batch item preserves the same
+        // admission, fallback, workspace, and error semantics.
+        let mut spawned = Vec::with_capacity(specs.len());
+        for spec in specs {
+            match self.spawn_with_fallback(spec) {
+                Ok(session) => spawned.push((session, spec)),
+                Err(spawn_error) => {
+                    let mut cleanup_errors = Vec::new();
+                    for (session, spawned_spec) in spawned.iter().rev() {
+                        if let Err(cleanup_error) = self.stop(session) {
+                            cleanup_errors.push(SpawnBatchCleanupFailure {
+                                session: session.0.clone(),
+                                bead_id: spawned_spec.bead_id.clone(),
+                                branch: spawned_spec.branch.clone(),
+                                error: cleanup_error,
+                            });
+                        }
                     }
-                }
-
-                if let Ok(child) = cmd.spawn() {
-                    children.push((idx, child, agent.clone()));
-                }
-            }
-
-            let mut next_active_indices = Vec::new();
-            for (idx, mut child, _ag) in children {
-                let status = match child.wait() {
-                    Ok(st) => st,
-                    Err(_) => {
-                        next_active_indices.push(idx);
-                        continue;
+                    if cleanup_errors.is_empty() {
+                        return Err(spawn_error);
                     }
-                };
-
-                let mut stdout_buf = Vec::new();
-                if let Some(mut stdout) = child.stdout {
-                    let _ = stdout.read_to_end(&mut stdout_buf);
-                }
-                let out = String::from_utf8_lossy(&stdout_buf);
-
-                if !status.success() {
-                    next_active_indices.push(idx);
-                    continue;
-                }
-
-                let mut sess_name = None;
-                for line in out.lines() {
-                    if line.starts_with("SESSION=") {
-                        sess_name = Some(line.split('=').nth(1).unwrap_or("").trim().to_string());
-                    }
-                }
-
-                if let Some(name) = sess_name {
-                    results[idx] = Some(SessionId(name));
-                } else {
-                    next_active_indices.push(idx);
-                }
-            }
-
-            active_indices = next_active_indices;
-        }
-
-        let mut final_ids = Vec::new();
-        for (idx, res) in results.into_iter().enumerate() {
-            match res {
-                Some(id) => final_ids.push(id),
-                None => {
-                    return Err(DaemonError::Tool {
-                        tool: "ao spawn batch".to_string(),
-                        rc: -1,
-                        stderr: format!("Failed to spawn session for spec prompt: {}", specs[idx].prompt),
+                    return Err(DaemonError::SpawnBatchCleanupFailed {
+                        spawn_error: Box::new(spawn_error),
+                        cleanup_errors,
                     });
                 }
             }
         }
-
-        Ok(final_ids)
+        Ok(spawned
+            .into_iter()
+            .map(|(session, _)| session)
+            .collect())
     }
 
     /// jleechan-hna3: reverse lookup of the AO session CURRENTLY associated
@@ -1558,19 +3099,7 @@ impl Sessions for CliSessions {
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
         })?;
-        if let Some(arr) = data.as_array() {
-            for entry in arr {
-                if entry.get("branch").and_then(|v| v.as_str()) == Some(branch) {
-                    if let Some(name) = entry.get("name").and_then(|v| v.as_str()) {
-                        return Ok(SessionId(name.to_string()));
-                    }
-                }
-            }
-        }
-        Err(DaemonError::Config(format!(
-            "attach: no ao session currently tracks branch '{branch}' (bead {bead_id}); \
-             it may have already exited, been reaped, or never been spawned"
-        )))
+        session_for_branch(&data, branch, bead_id)
     }
 
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
@@ -1584,16 +3113,7 @@ impl Sessions for CliSessions {
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
         })?;
-        if let Some(arr) = data.as_array() {
-            for entry in arr {
-                if entry.get("name").and_then(|v| v.as_str()) == Some(&id.0) {
-                    if let Some(activity) = entry.get("activity").and_then(|v| v.as_str()) {
-                        return Ok(activity == "ready" || activity == "exited" || activity == "missing");
-                    }
-                }
-            }
-        }
-        Ok(true)
+        session_is_quiescent(&data, id)
     }
 
     /// jleechan-5ia2: `ao status --json` already reports each session's
@@ -1625,6 +3145,415 @@ impl Sessions for CliSessions {
         }
         Ok(None)
     }
+
+    /// jleechan-bqdv Stage C: the spawn-time worktree remote assertion's data
+    /// source. Uses the exact absolute `workspacePath` AO returned during
+    /// spawn and reads back whatever `remote_name` would actually be pushed
+    /// to there via `git remote get-url --push`. Missing mapping, missing
+    /// directory, and git inspection failure are errors: after AO has
+    /// returned a session, accepting an unverifiable worktree would silently
+    /// bypass the wrong-repository safety gate.
+    ///
+    /// **Adversarial review finding (independent Claude review of this
+    /// PR):** the original version used `git remote get-url <name>` (the
+    /// FETCH url). What the coder actually pushes with is governed by
+    /// `remote.<name>.pushurl` when one is configured — a real possibility
+    /// for exactly the dual-remote worktree setups this check exists to
+    /// police. `--push` asks git for the URL a `git push` would actually
+    /// use, falling back to the fetch URL automatically when no separate
+    /// pushurl is configured (so the common single-URL case is unaffected).
+    fn worktree_remote_url(
+        &self,
+        ao_project: &str,
+        branch: &str,
+        remote_name: &str,
+    ) -> Result<Option<String>, DaemonError> {
+        let key = (ao_project.to_string(), branch.to_string());
+        let path = self
+            .spawned_worktrees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| {
+                DaemonError::Config(format!(
+                    "no AO workspacePath recorded for project {ao_project:?} branch {branch:?}; refusing to skip remote verification"
+                ))
+            })?;
+        if !path.is_dir() {
+            return Err(DaemonError::Config(format!(
+                "AO workspacePath {} for project {ao_project:?} branch {branch:?} is not a directory",
+                path.display()
+            )));
+        }
+        let cwd = path.to_string_lossy().into_owned();
+        let out = run_tool_in_dir(
+            "git",
+            &["remote", "get-url", "--push", remote_name],
+            &cwd,
+            10,
+        )?;
+        let trimmed = out.trim();
+        if trimmed.is_empty() {
+            Err(DaemonError::Parse(format!(
+                "git returned an empty push URL for remote {remote_name:?} in AO workspace {}",
+                path.display()
+            )))
+        } else {
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+}
+
+/// Count the daemon's one global AO worker envelope across every project.
+/// Multi-repo dispatch resolves `SpawnSpec.ao_project` per bead, so filtering
+/// status to `CliSessions::project` would undercount other configured projects
+/// and let the global `max_workers` cap be exceeded. A status row is counted
+/// unless AO positively reports one of its canonical terminal statuses or the
+/// terminal `exited` activity. Explicit orchestrator rows do not consume the
+/// worker budget; missing/unknown role or state fails closed as an active
+/// worker.
+fn is_terminal_ao_session(entry: &serde_json::Value) -> bool {
+    matches!(
+        entry.get("status").and_then(|value| value.as_str()),
+        Some("killed" | "terminated" | "done" | "cleanup" | "errored" | "merged")
+    ) || entry.get("activity").and_then(|value| value.as_str()) == Some("exited")
+}
+
+fn session_is_quiescent(
+    data: &serde_json::Value,
+    id: &SessionId,
+) -> Result<bool, DaemonError> {
+    let sessions = data
+        .as_array()
+        .ok_or_else(|| DaemonError::Parse("ao status JSON must be an array".to_string()))?;
+    Ok(sessions
+        .iter()
+        .find(|entry| entry.get("name").and_then(|value| value.as_str()) == Some(&id.0))
+        .is_some_and(is_terminal_ao_session))
+}
+
+fn session_for_branch(
+    data: &serde_json::Value,
+    branch: &str,
+    bead_id: &str,
+) -> Result<SessionId, DaemonError> {
+    let sessions = data
+        .as_array()
+        .ok_or_else(|| DaemonError::Parse("ao status JSON must be an array".to_string()))?;
+    let matching: Vec<&serde_json::Value> = sessions
+        .iter()
+        .filter(|entry| entry.get("branch").and_then(|value| value.as_str()) == Some(branch))
+        .collect();
+    if matching
+        .iter()
+        .any(|entry| entry.get("name").and_then(|value| value.as_str()).is_none())
+    {
+        return Err(DaemonError::SessionAmbiguous {
+            branch: branch.to_string(),
+            sessions: vec!["<missing-name>".to_string()],
+        });
+    }
+    let active: Vec<String> = matching
+        .iter()
+        .filter(|entry| !is_terminal_ao_session(entry))
+        .filter_map(|entry| {
+            entry
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    match active.as_slice() {
+        [name] => return Ok(SessionId(name.clone())),
+        [] => {}
+        _ => {
+            return Err(DaemonError::SessionAmbiguous {
+                branch: branch.to_string(),
+                sessions: active,
+            });
+        }
+    }
+
+    let terminal: Vec<String> = matching
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    match terminal.as_slice() {
+        [name] => Ok(SessionId(name.clone())),
+        [] => Err(DaemonError::SessionNotFound {
+            branch: branch.to_string(),
+            bead_id: bead_id.to_string(),
+        }),
+        _ => Err(DaemonError::SessionAmbiguous {
+            branch: branch.to_string(),
+            sessions: terminal,
+        }),
+    }
+}
+
+fn active_session_count(data: &serde_json::Value) -> Result<usize, DaemonError> {
+    let sessions = data
+        .as_array()
+        .ok_or_else(|| DaemonError::Parse("ao status JSON must be an array".to_string()))?;
+    Ok(sessions
+        .iter()
+        .filter(|entry| {
+            let is_orchestrator = entry.get("role").and_then(|value| value.as_str())
+                == Some("orchestrator");
+            !is_orchestrator && !is_terminal_ao_session(entry)
+        })
+        .count())
+}
+
+#[cfg(test)]
+mod active_session_count_tests {
+    use super::{active_session_count, session_for_branch, session_is_quiescent};
+    use crate::tools::SessionId;
+
+    #[test]
+    fn global_cap_counts_active_sessions_across_projects_and_unknown_activity() {
+        let status = serde_json::json!([
+            {"project": "dark-factory", "role": "worker", "status": "working", "activity": "working"},
+            {"project": "worldarchitect", "role": "worker", "status": "review_pending", "activity": "ready"},
+            {"project": "third-repo"},
+            {"project": "dark-factory", "role": "worker", "status": "working", "activity": "exited"},
+            {"project": "worldarchitect", "role": "worker", "status": "merged", "activity": "ready"},
+            {"project": "worldarchitect", "role": "orchestrator", "status": "working", "activity": "working"}
+        ]);
+
+        assert_eq!(active_session_count(&status).unwrap(), 3);
+    }
+
+    #[test]
+    fn malformed_non_array_status_fails_closed() {
+        assert!(active_session_count(&serde_json::json!({"sessions": []})).is_err());
+    }
+
+    #[test]
+    fn quiescence_uses_the_same_positive_terminal_contract_as_worker_accounting() {
+        let status = serde_json::json!([
+            {"name": "ready", "status": "working", "activity": "ready"},
+            {"name": "unknown", "status": "mystery", "activity": "missing"},
+            {"name": "exited", "status": "working", "activity": "exited"},
+            {"name": "done", "status": "done", "activity": "ready"}
+        ]);
+
+        assert!(!session_is_quiescent(&status, &SessionId("ready".into())).unwrap());
+        assert!(!session_is_quiescent(&status, &SessionId("unknown".into())).unwrap());
+        assert!(!session_is_quiescent(&status, &SessionId("not-found".into())).unwrap());
+        assert!(session_is_quiescent(&status, &SessionId("exited".into())).unwrap());
+        assert!(session_is_quiescent(&status, &SessionId("done".into())).unwrap());
+        assert!(session_is_quiescent(&serde_json::json!({}), &SessionId("x".into())).is_err());
+    }
+
+    #[test]
+    fn branch_lookup_prefers_the_unique_active_row_over_older_terminal_history() {
+        let status = serde_json::json!([
+            {"name": "old", "branch": "feat/shared", "status": "done", "activity": "exited"},
+            {"name": "current", "branch": "feat/shared", "status": "working", "activity": "ready"}
+        ]);
+        assert_eq!(
+            session_for_branch(&status, "feat/shared", "bead").unwrap().0,
+            "current"
+        );
+
+        let ambiguous = serde_json::json!([
+            {"name": "a", "branch": "feat/shared", "status": "working", "activity": "ready"},
+            {"name": "b", "branch": "feat/shared", "status": "working", "activity": "working"}
+        ]);
+        assert!(matches!(
+            session_for_branch(&ambiguous, "feat/shared", "bead"),
+            Err(crate::errors::DaemonError::SessionAmbiguous { .. })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod worktree_remote_url_tests {
+    use super::{gh_env_test_lock, CliSessions};
+    use crate::tools::Sessions;
+
+    fn record_workspace(
+        sessions: &CliSessions,
+        project: &str,
+        branch: &str,
+        path: &std::path::Path,
+    ) {
+        sessions
+            .spawned_worktrees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (project.to_string(), branch.to_string()),
+                path.to_path_buf(),
+            );
+    }
+
+    #[test]
+    fn worktree_remote_url_fails_closed_without_spawned_workspace() {
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        let result = sessions.worktree_remote_url("dark-factory", "factory/missing-r1", "origin");
+
+        let error = result.expect_err("missing AO workspace mapping must fail closed");
+        assert!(error.to_string().contains("no AO workspacePath recorded"));
+    }
+
+    /// Real `git`, no shim: record an opaque AO workspace, add a remote, and
+    /// confirm validation reads that exact path rather than reconstructing
+    /// one from the factory branch.
+    #[test]
+    fn worktree_remote_url_reads_real_git_remote() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_worktree_remote_url_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let worktree_path = root.join("df-opaque-134");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        let cwd = worktree_path.to_string_lossy().into_owned();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&cwd)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "worldai",
+                "https://github.com/jleechanorg/worldarchitect.ai.git",
+            ])
+            .current_dir(&cwd)
+            .status()
+            .unwrap();
+
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        record_workspace(
+            &sessions,
+            "dark-factory",
+            "factory/jleechan-bqdv-r1",
+            &worktree_path,
+        );
+        let result =
+            sessions.worktree_remote_url("dark-factory", "factory/jleechan-bqdv-r1", "worldai");
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            result.unwrap().as_deref(),
+            Some("https://github.com/jleechanorg/worldarchitect.ai.git")
+        );
+    }
+
+    /// Adversarial review finding (independent Claude review of this PR):
+    /// when a remote has a SEPARATE `pushurl` configured (distinct from its
+    /// fetch URL — a real dual-remote-worktree scenario), `worktree_remote_url`
+    /// must report the URL a `git push` would actually use, not the fetch
+    /// URL. Regression guard for the `git remote get-url` -> `git remote
+    /// get-url --push` fix.
+    #[test]
+    fn worktree_remote_url_reports_pushurl_when_distinct_from_fetch_url() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_worktree_remote_url_pushurl_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let worktree_path = root.join("df-opaque-pushurl");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        let cwd = worktree_path.to_string_lossy().into_owned();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&cwd)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "worldai",
+                "https://github.com/jleechanorg/jleechanclaw.git",
+            ])
+            .current_dir(&cwd)
+            .status()
+            .unwrap();
+        // Configure a DIFFERENT push URL — the exact scenario that defeats a
+        // plain `git remote get-url` (fetch URL) check.
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "set-url",
+                "--push",
+                "worldai",
+                "https://github.com/jleechanorg/worldarchitect.ai.git",
+            ])
+            .current_dir(&cwd)
+            .status()
+            .unwrap();
+
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        record_workspace(
+            &sessions,
+            "dark-factory",
+            "factory/jleechan-bqdv-r1",
+            &worktree_path,
+        );
+        let result =
+            sessions.worktree_remote_url("dark-factory", "factory/jleechan-bqdv-r1", "worldai");
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            result.unwrap().as_deref(),
+            Some("https://github.com/jleechanorg/worldarchitect.ai.git"),
+            "must report the PUSH url, not the (different) fetch url"
+        );
+    }
+
+    #[test]
+    fn worktree_remote_url_fails_closed_for_unconfigured_remote_name() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_worktree_remote_url_unconfigured_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let worktree_path = root.join("df-opaque-no-remote");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        let cwd = worktree_path.to_string_lossy().into_owned();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&cwd)
+            .status()
+            .unwrap();
+
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        record_workspace(
+            &sessions,
+            "dark-factory",
+            "factory/jleechan-bqdv-r1",
+            &worktree_path,
+        );
+        let result =
+            sessions.worktree_remote_url("dark-factory", "factory/jleechan-bqdv-r1", "origin");
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.is_err(), "an unconfigured push remote must fail closed");
+    }
 }
 
 /// `target_repo` is the "<owner>/<repo>" the daemon automates (`cfg.target_repo`,
@@ -1642,6 +3571,23 @@ pub struct CliVcs {
 impl CliVcs {
     pub fn new(target_repo: String) -> Self {
         Self { target_repo }
+    }
+
+    /// Clone this adapter targeting a different repo string (bead
+    /// jleechan-35y4 Stage B — see
+    /// `docs/multirepo-dispatch-investigation-2026-07-11.md`'s "keep
+    /// traits, add `with_repo` constructor" note). `CliVcs` carries no
+    /// state beyond `target_repo`, so this is a cheap clone-with-override,
+    /// not a trait signature change — call sites keep using the same `Vcs`
+    /// trait, just against a handle bound to `repo` instead of the
+    /// process-global `cfg.target_repo`. Migrating the ~27 call sites that
+    /// currently read `cfg.target_repo` directly to call this (via
+    /// `overlay.repo(cfg)`) is Stage D, bead jleechan-9xrs — this
+    /// constructor is the capability, not the migration.
+    pub fn with_repo(&self, repo: &str) -> Self {
+        Self {
+            target_repo: repo.to_string(),
+        }
     }
 }
 
@@ -1937,9 +3883,89 @@ pub fn ci_success_from_check_buckets(buckets: &[&str], iteration_stub: bool) -> 
     }
 }
 
+/// jleechan-35y4 Stage B: `with_repo` constructors on `CliScm`/`CliVcs` — the
+/// repo-parameterized adapter capability the multi-repo dispatch fix
+/// depends on. `CliScm`/`CliVcs` have no test-visible way to invoke gh/git,
+/// so these tests only assert the cheap clone-with-override contract:
+/// the returned handle targets the new repo string, and the original
+/// instance is untouched (it's `&self`, not `self` — no move).
+#[cfg(test)]
+mod with_repo_tests {
+    use super::{CliScm, CliVcs};
+
+    #[test]
+    fn cli_vcs_with_repo_targets_new_repo_and_leaves_original_untouched() {
+        let original = CliVcs::new("jleechanorg/worldarchitect.ai".to_string());
+        let retargeted = original.with_repo("jleechanorg/dark-factory");
+        assert_eq!(retargeted.target_repo, "jleechanorg/dark-factory");
+        assert_eq!(original.target_repo, "jleechanorg/worldarchitect.ai");
+    }
+
+    #[test]
+    fn cli_scm_with_repo_targets_new_repo_and_leaves_original_untouched() {
+        let original = CliScm::new("jleechanorg/worldarchitect.ai".to_string());
+        let retargeted = original.with_repo("jleechanorg/dark-factory");
+        assert_eq!(retargeted.repo, "jleechanorg/dark-factory");
+        assert_eq!(original.repo, "jleechanorg/worldarchitect.ai");
+    }
+}
+
 #[cfg(test)]
 mod external_ref_tests {
-    use super::{parse_external_refs_from_br_list, unresolved_thread_count_from_gql};
+    use super::{
+        canonicalize_external_ref_for_comment, parse_external_refs_from_br_list,
+        unresolved_thread_count_from_gql,
+    };
+
+    /// jleechan-mdgr: reproduces the exact 2026-07-11T00:05:15Z corruption —
+    /// `ESCALATION_NOTIFICATION_FAILED` fired for bead jleechan-8dyu with
+    /// error "parse: invalid external_ref format for comment:
+    /// jleechanorg/worldarchitect.ai#7888#local-8dyu". The stored
+    /// `external_ref` already had a valid `<repo>#<pr>` shape AND had a
+    /// `#local-<bead-id>` disambiguation suffix (see
+    /// `daemon/scripts/backfill_external_ref.py`) appended on top of it,
+    /// producing 3 `#`-delimited segments instead of 2. `comment_external`
+    /// must still be able to recover the real `repo#PR` comment target from
+    /// this already-corrupted shape (defense in depth — no bulk data
+    /// cleanup pass) even though the writer itself is fixed to never
+    /// produce this shape again.
+    #[test]
+    fn double_suffix_external_ref_is_recovered_for_comment_target() {
+        let corrupted = "jleechanorg/worldarchitect.ai#7888#local-8dyu";
+        assert_eq!(
+            canonicalize_external_ref_for_comment(corrupted),
+            Some(("jleechanorg/worldarchitect.ai".to_string(), "7888".to_string())),
+            "expected the real repo#PR target to be recovered from the double-suffix corruption"
+        );
+    }
+
+    #[test]
+    fn clean_external_ref_still_parses_unchanged() {
+        assert_eq!(
+            canonicalize_external_ref_for_comment("owner/repo#42"),
+            Some(("owner/repo".to_string(), "42".to_string()))
+        );
+    }
+
+    #[test]
+    fn bare_local_ref_is_not_recovered_by_this_helper() {
+        // jleechan-twa0's territory — a bare `local-<id>` ref (no real PR at
+        // all) is a distinct bug (parser format acceptance), not the
+        // double-append this fixes. Must stay None here so this helper does
+        // not silently grow into twa0's scope.
+        assert_eq!(canonicalize_external_ref_for_comment("local-w1y"), None);
+    }
+
+    #[test]
+    fn triple_hash_ref_without_local_marker_is_not_recovered() {
+        // Only the specific `<repo>#<pr>#local-<id>` shape is recovered;
+        // anything else with more than one `#` and no `local-` marker on
+        // the trailing segment is left as a genuine parse failure.
+        assert_eq!(
+            canonicalize_external_ref_for_comment("owner/repo#42#weird-suffix"),
+            None
+        );
+    }
 
     #[test]
     fn fetch_all_external_refs_includes_closed_beads() {

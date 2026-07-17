@@ -23,7 +23,9 @@ use crate::dispatch::{self, MAX_TRANSIENT_SPAWN_RETRY};
 use crate::errors::DaemonError;
 use crate::intake::{self, IntakeOutcome, IntakeVerdict};
 use crate::router::{self, RoutingVerdict};
-use crate::state::{BeadOverlay, OverlayState, StateStore};
+use crate::state::{
+    set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
+};
 use crate::telemetry::{self, TelemetryEvent};
 use crate::tools::{Bead, Llm, Scm, SessionId, Sessions, Tracker, Vcs};
 use crate::verifier::{self, PrEvidence};
@@ -110,13 +112,21 @@ enum CiPendingStatus {
     SnapshotUnavailable,
 }
 
-fn ci_pending_for_attested(overlay: &BeadOverlay, scm: &dyn crate::tools::Scm) -> CiPendingStatus {
+/// `repo` (bead jleechan-9xrs, Stage D) is the bead's OWN resolved repo
+/// (`overlay.repo(cfg)`) — was `scm.pr_snapshot(pr)` bound to the daemon's
+/// global `cfg.target_repo`, silently wrong for a bead dispatched into a
+/// different `[repos.*]` entry.
+fn ci_pending_for_attested(
+    overlay: &BeadOverlay,
+    scm: &dyn crate::tools::Scm,
+    repo: &str,
+) -> CiPendingStatus {
     if overlay.state != OverlayState::Attested {
         return CiPendingStatus::NotApplicable;
     }
     match overlay.pr_number {
         None => CiPendingStatus::NotApplicable,
-        Some(pr) => match scm.pr_snapshot(pr) {
+        Some(pr) => match scm.pr_snapshot_for_repo(repo, pr) {
             Ok(snap) => CiPendingStatus::Known(snap.ci_pending),
             Err(_) => CiPendingStatus::SnapshotUnavailable,
         },
@@ -271,7 +281,8 @@ pub fn run_tick(
         // any of those would risk false-parking a near-timebox bead on a
         // single transient `gh`/GraphQL/network hiccup. Skip this overlay
         // for the rest of the active-overlay loop and continue to the next.
-        match ci_pending_for_attested(&overlay, deps.scm) {
+        let active_overlay_repo = overlay.repo(deps.cfg).to_string();
+        match ci_pending_for_attested(&overlay, deps.scm, &active_overlay_repo) {
             CiPendingStatus::SnapshotUnavailable => {
                 let _ = emit(
                     deps.telemetry_log,
@@ -302,7 +313,7 @@ pub fn run_tick(
         // 1. Time-box envelope check
         if overlay.autonomy_secs >= deps.cfg.autonomy_timebox_secs {
             overlay.state = OverlayState::HumanHeld;
-            overlay.park_reason = Some("autonomy_timebox_exceeded".to_string());
+            set_human_hold_reason(&mut overlay, HumanHoldReason::AutonomyTimeboxExceeded);
             deps.store.save(&overlay)?;
             emit(
                 deps.telemetry_log,
@@ -374,8 +385,10 @@ pub fn run_tick(
                             Ok((true, _)) => {}
                             Ok((false, post_sha)) => {
                                 overlay.state = OverlayState::HumanHeld;
-                                overlay.park_reason =
-                                    Some("adopted_branch_history_rewrite_detected".to_string());
+                                set_human_hold_reason(
+                                    &mut overlay,
+                                    HumanHoldReason::AdoptedBranchHistoryRewriteDetected,
+                                );
                                 deps.store.save(&overlay)?;
                                 emit(
                                     deps.telemetry_log,
@@ -412,8 +425,10 @@ pub fn run_tick(
                             }
                             Err(e) => {
                                 overlay.state = OverlayState::HumanHeld;
-                                overlay.park_reason =
-                                    Some("adopted_branch_append_only_check_failed".to_string());
+                                set_human_hold_reason(
+                                    &mut overlay,
+                                    HumanHoldReason::AdoptedBranchAppendOnlyCheckFailed,
+                                );
                                 deps.store.save(&overlay)?;
                                 emit(
                                     deps.telemetry_log,
@@ -470,13 +485,16 @@ pub fn run_tick(
                 // `Ok(None)` ("cannot verify") is intentionally NOT
                 // treated as a violation — only a positively confirmed
                 // mismatch (or a confirmed-dead session) parks the bead.
-                if let Some(ref session_id_str) = overlay.session_id {
+                if let Some(session_id_str) = overlay.session_id.clone() {
                     let session_id = SessionId(session_id_str.clone());
                     if let Ok(Some(actual_branch)) = deps.sessions.session_branch(&session_id) {
                         let expected_branch = overlay.branch.clone().unwrap_or_default();
                         if actual_branch != expected_branch {
                             overlay.state = OverlayState::HumanHeld;
-                            overlay.park_reason = Some("session_branch_mismatch".to_string());
+                            set_human_hold_reason(
+                                &mut overlay,
+                                HumanHoldReason::SessionBranchMismatch,
+                            );
                             deps.store.save(&overlay)?;
                             emit(
                                 deps.telemetry_log,
@@ -510,7 +528,18 @@ pub fn run_tick(
                 if !overlay.is_adopted {
                     if let Some(ref branch) = overlay.branch {
                         if overlay.autonomy_secs >= 1800 {
-                            let last_commit_epoch = deps.scm.remote_branch_last_commit(branch)?;
+                            // jleechan-bqdv Stage C: poll the bead's OWN
+                            // resolved repo (`overlay.repo(cfg)`), not
+                            // `cfg.target_repo` directly. Before this fix, a
+                            // bead dispatched into a non-default `[repos.*]`
+                            // repo was watched against the wrong repo's
+                            // branch history — the coder-silence watcher
+                            // could never observe real progress and would
+                            // eventually park a perfectly healthy, actively
+                            // pushing coder as `coder_silent`.
+                            let last_commit_epoch = deps
+                                .scm
+                                .remote_branch_last_commit_for_repo(overlay.repo(deps.cfg), branch)?;
                             let now_epoch = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -523,7 +552,7 @@ pub fn run_tick(
 
                             if is_silent {
                                 overlay.state = OverlayState::HumanHeld;
-                                overlay.park_reason = Some("coder_silent".to_string());
+                                set_human_hold_reason(&mut overlay, HumanHoldReason::CoderSilent);
                                 deps.store.save(&overlay)?;
                                 emit(
                                     deps.telemetry_log,
@@ -555,7 +584,16 @@ pub fn run_tick(
                     // loop and freeze every other active overlay. Log the
                     // error and skip to the next overlay; the wedge check
                     // re-runs on the next tick when the snapshot succeeds.
-                    let pr_snapshot = match deps.scm.pr_snapshot(pr_number) {
+                    // jleechan-9xrs Stage D: was `deps.scm.pr_snapshot(pr_number)`
+                    // — this is the SAME active-overlay loop iteration whose
+                    // sibling `ci_pending_for_attested` call above already
+                    // resolves `active_overlay_repo`; missing this one meant
+                    // the wedge-detection / timebox-park path still read a
+                    // cross-repo bead's PR from `cfg.target_repo`.
+                    let pr_snapshot = match deps
+                        .scm
+                        .pr_snapshot_for_repo(&active_overlay_repo, pr_number)
+                    {
                         Ok(snap) => snap,
                         Err(e) => {
                             let _ = emit(
@@ -650,7 +688,12 @@ pub fn run_tick(
                             }
 
                             overlay.state = OverlayState::HumanHeld;
-                            overlay.park_reason = Some("session_stalled".to_string());
+                            // `is_quiescent` positively reported a canonical
+                            // AO terminal state above. Persist the cleared
+                            // handle with the recoverable hold so recovery
+                            // cannot overlap a live worker.
+                            overlay.session_id = None;
+                            set_human_hold_reason(&mut overlay, HumanHoldReason::SessionStalled);
                             deps.store.save(&overlay)?;
                             emit(
                                 deps.telemetry_log,
@@ -703,9 +746,10 @@ pub fn run_tick(
 }
 
 /// jleechan-gib: automated HUMAN_HELD exit (Rust port of shell
-/// `recover-held`). Requeues every `HUMAN_HELD` bead whose `attempt` is
-/// below `MAX_HUMAN_HELD_RECOVERY_ATTEMPT` back to `QUEUED`, increments
-/// `attempt`, and zeros `autonomy_secs`. Must run BEFORE the
+/// `recover-held`). Requeues only allow-listed retry-safe `HUMAN_HELD`
+/// beads below `MAX_HUMAN_HELD_RECOVERY_ATTEMPT` whose durable overlay has
+/// no session handle, increments `attempt`, and zeros `autonomy_secs`.
+/// Unknown/possibly-live holds fail closed. Must run BEFORE the
 /// active-overlay wedge-detection loop in `run_tick` so a freshly-QUEUED
 /// bead is not immediately re-parked by the timebox/wedge checks in the
 /// same tick.
@@ -864,6 +908,14 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             Some(OverlayState::Ready) | Some(OverlayState::HumanHeld)
         );
         if should_adopt {
+            // jleechan-35y4 Stage A: adopted PRs are always same-repo
+            // (fork/cross-repo PRs are rejected earlier by `same_repo_pr`
+            // in intake.rs), so this always resolves to `cfg.target_repo`'s
+            // owner/repo today. Still resolved from `external_ref` (not
+            // left `None`) so it stays correct once Stage C/D lift the
+            // same-repo-only restriction for adopted PRs.
+            let target_repo =
+                intake::resolve_target_repo("", Some(adopted.external_ref.as_str()));
             let mut overlay = existing.unwrap_or(BeadOverlay {
                 bead_id: adopted.bead_id.clone(),
                 state: OverlayState::Attested,
@@ -878,6 +930,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo,
             });
             overlay.state = OverlayState::Attested;
             overlay.pr_number = Some(adopted.pr_number);
@@ -924,11 +977,40 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             .iter()
             .find(|bead| bead.id == *bead_id)
             .cloned();
+        // jleechan-35y4 Stage A: resolve per-bead repo identity at intake
+        // time — explicit `target_repo:` body field wins, else the
+        // `owner/repo` prefix of external_ref, else None (legacy/global,
+        // resolved later via `BeadOverlay::repo`). Computed BEFORE the
+        // PR-existence probe below (jleechan-x8tf) so that probe can target
+        // the bead's OWN resolved repo instead of unconditionally
+        // `cfg.target_repo`.
+        let target_repo = intake::resolve_target_repo(
+            tracker_bead.as_ref().map(|b| b.description.as_str()).unwrap_or(""),
+            tracker_bead.as_ref().and_then(|b| b.external_ref.as_deref()),
+        );
+
         if deps.llm.is_real() {
             if let Some(bead) = tracker_bead.as_ref() {
                 if let Some(ref ext_ref) = bead.external_ref {
                     if let Some((_, num_str)) = parse_external_ref(ext_ref) {
                         if let Ok(num) = num_str.parse::<u64>() {
+                            // jleechan-x8tf: probe the bead's OWN resolved
+                            // repo (`target_repo`, computed above), not
+                            // unconditionally `deps.cfg.target_repo` — this
+                            // used to parse a repo out of `ext_ref` via
+                            // `parse_external_ref` and then discard it
+                            // (`_`), silently falling back to the global
+                            // config repo. For any bead whose external_ref
+                            // or `target_repo:` body field names a repo
+                            // OTHER than `cfg.target_repo` (e.g. a
+                            // dark-factory fixture bead while the daemon's
+                            // global default is worldarchitect.ai), this
+                            // probe silently checked the WRONG repo's PR
+                            // list — corrupting any multi-repo E2E proof
+                            // that depends on this check landing on the
+                            // bead's own repo.
+                            let probe_repo =
+                                target_repo.as_deref().unwrap_or(&deps.cfg.target_repo);
                             if crate::tools::run_tool(
                                 "gh",
                                 &[
@@ -936,7 +1018,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                     "view",
                                     &num.to_string(),
                                     "--repo",
-                                    &deps.cfg.target_repo,
+                                    probe_repo,
                                     "--json",
                                     "number",
                                 ],
@@ -951,7 +1033,6 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 }
             }
         }
-
         let overlay = BeadOverlay {
             bead_id: bead_id.clone(),
             state: OverlayState::Queued,
@@ -966,6 +1047,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo,
         };
         deps.store.save(&overlay)?;
         summary.beads_created += 1;
@@ -1021,6 +1103,14 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 }
             }
             None => {
+                // jleechan-35y4 Stage A: same intake resolution precedence
+                // as the GH-issue path above, applied identically to
+                // manual `br`-created beads (spec requirement: "Manual `br`
+                // beads: same body-field parse").
+                let target_repo = intake::resolve_target_repo(
+                    bead.description.as_str(),
+                    bead.external_ref.as_deref(),
+                );
                 let o = BeadOverlay {
                     bead_id: bead.id.clone(),
                     state: OverlayState::Queued,
@@ -1035,6 +1125,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo,
                 };
                 deps.store.save(&o)?;
                 summary.beads_created += 1;
@@ -1067,7 +1158,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     OverlayState::Queued.as_str(),
                     "TASK_ROUTED",
                     serde_json::json!({}),
-                    serde_json::json!({"routingVerdict": verdict_str}),
+                    // jleechan-35y4: target_repo now visible in daemon.jsonl
+                    // (null == legacy/global cfg.target_repo).
+                    serde_json::json!({"routingVerdict": verdict_str, "target_repo": overlay.target_repo}),
                 )?;
                 ready.push((bead.clone(), verdict));
             }
@@ -1077,7 +1170,10 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // silent default" discipline router.rs already enforces.
                 let mut held = overlay;
                 held.state = OverlayState::HumanHeld;
-                held.park_reason = Some(format!("router_parse_error: {reason}"));
+                set_human_hold_reason(
+                    &mut held,
+                    HumanHoldReason::RouterParse(reason.clone()),
+                );
                 deps.store.save(&held)?;
                 summary.beads_parked_human_held += 1;
                 emit(
@@ -1193,6 +1289,176 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 continue;
             }
 
+            if failure.phase == "unmapped_target_repo" {
+                // jleechan-35y4 (adversarial review of PR #245): this phase
+                // (from `dispatch::dispatch_ready`'s fail-loud park) was
+                // previously falling through to the generic
+                // `BEAD_DISPATCH_TRANSIENT_ERROR` branch below, which
+                // labeled a genuinely HUMAN_HELD, non-transient park as
+                // `lifecycle_state = QUEUED` / `"transient": false`-but-
+                // treated-as-retryable telemetry, incremented no
+                // HUMAN_HELD counter, and posted no escalation comment —
+                // the exact opposite of the "fail loud" intent. Mirror the
+                // `spawn_retry_cap_exceeded` idiom: record the park, then
+                // best-effort escalate exactly once.
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "unmapped_target_repo",
+                        "error": failure.error.as_str(),
+                    }),
+                )?;
+                if escalation_already_recorded(deps, &failure.bead_id)? {
+                    continue;
+                }
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: bead `{}` claims a `target_repo` with no matching `[repos.*]` config entry (and it is not the daemon's global `target_repo`). Automation parked it HUMAN_HELD rather than guessing which repo/AO-project to dispatch into; please add a `[repos.\"<repo>\"]` entry to `config/daemon.toml` (or correct the bead's `target_repo`) before requeuing.",
+                    failure.bead_id
+                );
+                if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
+                {
+                    if is_missing_scm_target_error(&err) {
+                        record_local_escalation_fallback(
+                            deps,
+                            &failure.bead_id,
+                            "unmapped_target_repo",
+                        )?;
+                        summary.beads_escalated_locally += 1;
+                        emit(
+                            deps.telemetry_log,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "ESCALATED_LOCALLY",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "unmapped_target_repo",
+                                "scm_error": err.to_string(),
+                            }),
+                        )?;
+                        continue;
+                    }
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_NOTIFICATION_FAILED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "unmapped_target_repo",
+                            "error": err.to_string(),
+                        }),
+                    )?;
+                    continue;
+                }
+                record_escalation(deps, &failure.bead_id, "unmapped_target_repo")?;
+                summary.beads_escalated += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "ESCALATION_REQUIRED",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "unmapped_target_repo"}),
+                )?;
+                continue;
+            }
+
+            if failure.phase == "worktree_remote_mismatch" {
+                // jleechan-bqdv Stage C: mirrors the `unmapped_target_repo`
+                // idiom immediately above. `dispatch::dispatch_ready` already
+                // parked this bead HUMAN_HELD (and killed the mismatched
+                // session) on disk before returning this failure — it has no
+                // `Tracker`/`Scm` access to post a comment itself (same
+                // module-boundary reason as every other dispatch.rs park).
+                // Record the state-transition fact unconditionally, then
+                // best-effort escalate exactly once so this NEVER falls
+                // through to the generic `BEAD_DISPATCH_TRANSIENT_ERROR`
+                // branch below (which would misreport a genuinely
+                // HUMAN_HELD, non-transient park as retryable and post no
+                // escalation comment — the exact anti-pattern jleechan-35y4's
+                // review fixed for `unmapped_target_repo`).
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "worktree_remote_mismatch",
+                        "branch": failure.branch.as_deref(),
+                        "error": failure.error.as_str(),
+                    }),
+                )?;
+                if escalation_already_recorded(deps, &failure.bead_id)? {
+                    continue;
+                }
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: bead `{}`'s spawned worktree had a git remote that does NOT match the bead's resolved repo. Automation killed the session and parked it HUMAN_HELD rather than risk the coder pushing to the wrong repo (jleechan-9sh5 / jleechan-bqdv); please verify the target AO project's local checkout/remotes before requeuing. Details: {}",
+                    failure.bead_id,
+                    failure.error.as_str()
+                );
+                if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
+                {
+                    if is_missing_scm_target_error(&err) {
+                        record_local_escalation_fallback(
+                            deps,
+                            &failure.bead_id,
+                            "worktree_remote_mismatch",
+                        )?;
+                        summary.beads_escalated_locally += 1;
+                        emit(
+                            deps.telemetry_log,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "ESCALATED_LOCALLY",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "worktree_remote_mismatch",
+                                "scm_error": err.to_string(),
+                            }),
+                        )?;
+                        continue;
+                    }
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_NOTIFICATION_FAILED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "worktree_remote_mismatch",
+                            "error": err.to_string(),
+                        }),
+                    )?;
+                    continue;
+                }
+                record_escalation(deps, &failure.bead_id, "worktree_remote_mismatch")?;
+                summary.beads_escalated += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "ESCALATION_REQUIRED",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "worktree_remote_mismatch"}),
+                )?;
+                continue;
+            }
+
             let lifecycle_state = if failure.branch.is_some() {
                 OverlayState::Dispatching.as_str()
             } else {
@@ -1224,7 +1490,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 serde_json::json!({}),
                 serde_json::json!({
                     "branch": success.branch.as_str(),
-                    "sessionId": success.session_id.as_str()
+                    "sessionId": success.session_id.as_str(),
+                    // jleechan-35y4: resolved repo now visible in daemon.jsonl.
+                    "target_repo": success.target_repo.as_str(),
                 }),
             )?;
             let comment_body = format!(
@@ -1351,12 +1619,25 @@ fn skeptic_evidence(
     deps: &TickDeps,
     bead_id: &str,
     pr: u64,
+    repo: &str,
     snapshot: &crate::tools::PrSnapshot,
 ) -> Result<PrEvidence, DaemonError> {
+    // jleechan-9xrs Stage D: the reviewer subprocess (`dispatch_reviewer`)
+    // runs `codex exec` / `claude --print` with no cwd override, so `gh`
+    // commands the reviewer issues without an explicit `--repo` default to
+    // whatever repo the daemon process's own cwd happens to be checked out
+    // as. Embedding `repo` (the bead's OWN resolved repo, `overlay.repo(cfg)`
+    // at the call site) plus explicit `--repo` flags — mirroring
+    // `er_runner::build_er_prompt` — makes the reviewer query the RIGHT repo
+    // regardless of daemon cwd, instead of silently reviewing PR #{pr} in
+    // whatever repo happened to be checked out.
     let prompt = format!(
         "You are the Stage-1 Skeptic gate for an autonomous coding factory.\n\
-         Review bead {bead_id}'s PR #{pr} end-to-end (diff, evidence, tests) and \
-         judge whether it is ready to merge.\n\
+         Review bead {bead_id}'s PR #{pr} in repo {repo} end-to-end (diff, \
+         evidence, tests) and judge whether it is ready to merge:\n\
+           gh pr diff {pr} --repo {repo}\n\
+           gh pr view {pr} --repo {repo} --json body,comments\n\
+           gh pr checks {pr} --repo {repo}\n\
          Respond with exactly one line of the form:\n\
          pass|warn <note>|fail <reason>",
     );
@@ -1386,9 +1667,12 @@ fn skeptic_evidence(
         priority.retain(|&v| v != coder_vendor);
     }
 
-    let is_test_repo = deps.cfg.target_repo.contains("fake-")
-        || deps.cfg.target_repo.contains("test-")
-        || deps.cfg.target_repo == "owner/repo";
+    // jleechan-9xrs Stage D: was `deps.cfg.target_repo` — must be the
+    // bead's OWN resolved repo so a test-repo bead dispatched under a
+    // non-test global `cfg.target_repo` (or vice versa) is classified
+    // correctly instead of by the daemon-global repo.
+    let is_test_repo =
+        repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
 
     let mut gha_verdict = "verdict: absent";
     let mut signoff_verdict = "verdict: absent";
@@ -1426,9 +1710,21 @@ fn skeptic_evidence(
         }
     }
 
+    // jleechan-wzgl: track which reviewer vendor(s) actually contributed a
+    // parseable verdict to `skeptic_verdict`, so GATE_ASSESSMENT telemetry
+    // can report gate-7 provenance (confirming the reviewer was non-self
+    // and genuinely ran, not self-certified) instead of leaving it
+    // unrecoverable. `"mock_llm"` marks the `is_test_repo` path explicitly
+    // as a mock, not a real independent vendor.
+    let mut used_vendors: Vec<String> = Vec::new();
+
     let skeptic_verdict = if is_test_repo {
         let reply = deps.llm.judge(&prompt)?;
-        verifier::parse_skeptic_verdict(&reply)
+        let verdict = verifier::parse_skeptic_verdict(&reply);
+        if verdict.is_some() {
+            used_vendors.push("mock_llm".to_string());
+        }
+        verdict
     } else {
         // PR#163 finding 2: dispatch the first TWO vendors in the
         // coder-exclusion-filtered priority list as INDEPENDENT parallel
@@ -1454,6 +1750,8 @@ fn skeptic_evidence(
         // retries, instead of guessing a verdict.
         let vendor1 = priority.first().copied().unwrap_or("codex").to_string();
         let vendor2 = priority.get(1).copied().unwrap_or("claude").to_string();
+        let vendor1_label = vendor1.clone();
+        let vendor2_label = vendor2.clone();
 
         let prompt1 = prompt.clone();
         let handle1 = std::thread::spawn(move || dispatch_reviewer(&vendor1, &prompt1));
@@ -1473,9 +1771,24 @@ fn skeptic_evidence(
 
         let v1 = res1.ok().and_then(|r| verifier::parse_skeptic_verdict(&r));
         let v2 = res2.ok().and_then(|r| verifier::parse_skeptic_verdict(&r));
+        let v1_present = v1.is_some();
+        let v2_present = v2.is_some();
 
         let dual_verdict = match combine_dual_verdict(v1, v2, bead_id, pr) {
-            Ok(v) => v.expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)"),
+            Ok(v) => {
+                // jleechan-wzgl: both dual-dispatch primaries can
+                // contribute (e.g. two Fails combine into one `Fail`
+                // reason) — record whichever of the two actually produced
+                // a parseable verdict, in dispatch order, so telemetry
+                // never over- or under-reports which vendor(s) ran.
+                if v1_present {
+                    used_vendors.push(vendor1_label.clone());
+                }
+                if v2_present {
+                    used_vendors.push(vendor2_label.clone());
+                }
+                v.expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)")
+            }
             Err(total_outage_err) => {
                 // vendor1 AND vendor2 both failed to parse. Try each
                 // remaining `priority` member (index 2, 3, ...) in turn
@@ -1489,10 +1802,12 @@ fn skeptic_evidence(
                 // simultaneously non-functional, so a fallback that only
                 // ever tried a single 3rd vendor was no longer sufficient.
                 let mut fallback_verdict = None;
+                let mut fallback_vendor: Option<String> = None;
                 for vendor_n in priority.iter().skip(2) {
                     let v_n = dispatch_reviewer(vendor_n, &prompt)
                         .ok()
                         .and_then(|r| verifier::parse_skeptic_verdict(&r));
+                    let v_n_present = v_n.is_some();
                     // Re-use combine_dual_verdict as a single-verdict
                     // wrapper (its (Some, None) arms already treat a lone
                     // verdict as a full success); if vendor_n ALSO fails to
@@ -1500,11 +1815,25 @@ fn skeptic_evidence(
                     // `Err` as above and the loop tries the next vendor.
                     if let Ok(v) = combine_dual_verdict(v_n, None, bead_id, pr) {
                         fallback_verdict = v;
+                        if v_n_present {
+                            fallback_vendor = Some((*vendor_n).to_string());
+                        }
                         break;
                     }
                 }
                 match fallback_verdict {
-                    Some(v) => v,
+                    Some(v) => {
+                        // jleechan-wzgl: v1_present/v2_present were both
+                        // false in this arm (that is what made
+                        // combine_dual_verdict return `Err` above), so only
+                        // the fallback vendor that actually produced this
+                        // verdict is recorded — never codex/claude, which
+                        // were dispatched but never produced usable output.
+                        if let Some(fv) = fallback_vendor {
+                            used_vendors.push(fv);
+                        }
+                        v
+                    }
                     // Every remaining vendor (if any) also failed to parse
                     // — or coder vendor exclusion left fewer than 3
                     // candidates in the first place — propagate the
@@ -1573,6 +1902,7 @@ fn skeptic_evidence(
         has_integration_evidence_marker: false,
         er_verdict: verifier::ErVerdict::Absent,
         skeptic_verdict,
+        skeptic_reviewers: used_vendors,
     })
 }
 
@@ -1656,16 +1986,21 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             Some(o) => o,
             None => continue,
         };
+        // jleechan-9xrs Stage D: resolve THIS bead's own repo once per
+        // iteration (`overlay.repo(cfg)` — `None` falls back to
+        // `cfg.target_repo`, so legacy beads are unaffected) and thread it
+        // through every verification-loop call below instead of reading
+        // `deps.cfg.target_repo` directly. See
+        // docs/multirepo-dispatch-investigation-2026-07-11.md Stage D.
+        let repo = overlay.repo(deps.cfg).to_string();
 
         if overlay.state == OverlayState::Dispatched && overlay.pr_number.is_none() {
-            let is_test_repo = deps.cfg.target_repo.contains("fake-")
-                || deps.cfg.target_repo.contains("test-")
-                || deps.cfg.target_repo == "owner/repo";
+            let is_test_repo =
+                repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
 
             if !is_test_repo {
                 if let Some(ref session_id) = overlay.session_id {
-                    let repo = &deps.cfg.target_repo;
-                    let mut project = repo.split('/').next_back().unwrap_or(repo).to_string();
+                    let mut project = repo.split('/').next_back().unwrap_or(&repo).to_string();
                     if project == "worldarchitect.ai" {
                         project = "worldarchitect".to_string();
                     }
@@ -1707,7 +2042,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             "--head",
                             branch,
                             "--repo",
-                            &deps.cfg.target_repo,
+                            &repo,
                             "--json",
                             "number",
                             "--jq",
@@ -1789,7 +2124,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // failure via telemetry and skip to the next bead; the bead stays
         // ATTESTED so the next tick retries the snapshot fetch (no false-
         // green, no false-park on a single transient error).
-        let mut snapshot = match deps.scm.pr_snapshot(pr) {
+        let mut snapshot = match deps.scm.pr_snapshot_for_repo(&repo, pr) {
             Ok(snap) => snap,
             Err(e) => {
                 let _ = emit(
@@ -1817,7 +2152,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             continue;
         }
 
-        let mut evidence = match skeptic_evidence(deps, bead_id, pr, &snapshot) {
+        let mut evidence = match skeptic_evidence(deps, bead_id, pr, &repo, &snapshot) {
             Ok(e) => e,
             Err(e) => {
                 let _ = emit(
@@ -1886,7 +2221,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // later tick rather than falling through into `assess()`,
                 // which performs another `pr_snapshot` and would turn the
                 // outage into Unknown/all_green=false -> HUMAN_HELD.
-                match deps.scm.pr_snapshot(pr) {
+                match deps.scm.pr_snapshot_for_repo(&repo, pr) {
                     Ok(snap) => snapshot = snap,
                     Err(e) => {
                         let _ = emit(
@@ -1956,8 +2291,27 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
         evidence.has_integration_evidence_marker =
             verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
-        let report = verifier::assess(deps.scm, pr, deps.cfg, &evidence)?;
+        let report = verifier::assess(deps.scm, pr, &repo, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
+        // jleechan-wzgl: log the full per-gate breakdown (all 7 gates,
+        // verdict + reason) plus the gate-7 reviewer vendor identity, not
+        // just the aggregate `all_green` boolean — `report.to_json()` is
+        // `verifier::assess`'s own serialization, so this can't drift from
+        // what was actually computed, and `evidence.skeptic_reviewers`
+        // names the vendor(s) that produced this tick's skeptic verdict.
+        let mut gate_assessment_context = report.to_json();
+        if let Some(obj) = gate_assessment_context.as_object_mut() {
+            obj.insert(
+                "skeptic_reviewers".to_string(),
+                serde_json::json!(evidence.skeptic_reviewers),
+            );
+            // jleechan-wzgl (PR #239 review round 1): `auto-merge-guard.sh`'s
+            // `latest_assessment_no_red` greps GATE_ASSESSMENT lines by
+            // `context.pr_number` before parsing `context.gates` — without
+            // this key the guard's match path is permanently dormant no
+            // matter how correct the `gates` shape is.
+            obj.insert("pr_number".to_string(), serde_json::json!(pr));
+        }
         emit(
             deps.telemetry_log,
             bead_id,
@@ -1965,7 +2319,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             OverlayState::Attested.as_str(),
             "GATE_ASSESSMENT",
             serde_json::json!({}),
-            serde_json::json!({"all_green": report.all_green}),
+            gate_assessment_context,
         )?;
 
         if report.all_green {
@@ -2016,6 +2370,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             // forever.
                             overlay.state = OverlayState::HumanHeld;
                             overlay.attempt = MAX_HUMAN_HELD_RECOVERY_ATTEMPT;
+                            set_human_hold_reason(
+                                &mut overlay,
+                                HumanHoldReason::UnknownOnlyGateCapped,
+                            );
                             deps.store.save(&overlay)?;
                             record_local_escalation_fallback(
                                 deps,
@@ -2058,8 +2416,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     }
                     overlay.state = OverlayState::HumanHeld;
                     overlay.attempt = MAX_HUMAN_HELD_RECOVERY_ATTEMPT;
-                    overlay.park_reason =
-                        Some("unknown_only_gate_report_with_er_runner_capped".to_string());
+                    set_human_hold_reason(
+                        &mut overlay,
+                        HumanHoldReason::UnknownOnlyGateCapped,
+                    );
                     deps.store.save(&overlay)?;
                     record_escalation(
                         deps,
@@ -2108,8 +2468,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     serde_json::json!({"stage": deps.cfg.stage}),
                 )?;
                 overlay.state = OverlayState::HumanHeld;
-                overlay.park_reason =
-                    Some("gate assessment not all-green (stage 1: recorded, not executed)".to_string());
+                // ATTESTED is reached only after positive worker quiescence;
+                // make that no-live-session proof durable in this same save.
+                overlay.session_id = None;
+                set_human_hold_reason(&mut overlay, HumanHoldReason::Stage1GateNotGreen);
                 deps.store.save(&overlay)?;
                 summary.beads_parked_human_held += 1;
                 emit(
@@ -2217,8 +2579,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                         } else {
                             overlay.state = OverlayState::HumanHeld;
-                            overlay.park_reason =
-                                Some("spec file validation failed in recovery".to_string());
+                            set_human_hold_reason(
+                                &mut overlay,
+                                HumanHoldReason::SpecValidationFailed,
+                            );
                             deps.store.save(&overlay)?;
                             summary.beads_parked_human_held += 1;
                             emit(
@@ -2332,8 +2696,6 @@ fn is_missing_scm_target_error(err: &DaemonError) -> bool {
 /// beads reaching this path are already at/above
 /// `MAX_HUMAN_HELD_RECOVERY_ATTEMPT` and therefore already excluded from
 /// requeue by attempt count regardless of `park_reason`.
-const ESCALATION_LOCAL_FALLBACK_PARK_REASON_PREFIX: &str = "escalation_local_fallback";
-
 /// Fallback for the HUMAN_HELD recovery-cap escalation idiom (used by
 /// `run_recovery_step`, the dispatch spawn-retry-cap path, and the
 /// unknown-only-gate-report cap path) when `post_scm_comment_by_bead_id`
@@ -2353,9 +2715,10 @@ fn record_local_escalation_fallback(
     reason: &str,
 ) -> Result<(), DaemonError> {
     if let Some(mut overlay) = deps.store.load(bead_id)? {
-        overlay.park_reason = Some(format!(
-            "{ESCALATION_LOCAL_FALLBACK_PARK_REASON_PREFIX}:{reason}"
-        ));
+        set_human_hold_reason(
+            &mut overlay,
+            HumanHoldReason::EscalationLocalFallback(reason.to_string()),
+        );
         deps.store.save(&overlay)?;
     }
     record_escalation(deps, bead_id, reason)
@@ -2377,7 +2740,14 @@ fn post_scm_comment_by_bead_id(
 ) -> Result<(), DaemonError> {
     if let Some(overlay) = deps.store.load(bead_id)? {
         if let Some(pr) = overlay.pr_number {
-            let ext_ref = format!("{}#{}", deps.cfg.target_repo, pr);
+            // jleechan-9xrs Stage D: was `deps.cfg.target_repo` — escalation
+            // (and every other caller of this function, including gate
+            // failure / HUMAN_HELD comments) must target the bead's OWN
+            // resolved repo or the comment lands on the wrong repo's PR
+            // entirely (the twa0/mdgr cross-repo escalation class this
+            // stage closes). `overlay` is already loaded here, so
+            // `overlay.repo(cfg)` is free.
+            let ext_ref = format!("{}#{}", overlay.repo(deps.cfg), pr);
             return deps.tracker.comment_external(&ext_ref, body);
         }
     }

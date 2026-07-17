@@ -47,6 +47,7 @@ fn test_cfg() -> Config {
         autonomy_timebox_secs: 10_800,
         budget_warn_usd: 20.0,
         spec_dir: ".factory/specs/".into(),
+        repos: std::collections::HashMap::new(),
     }
 }
 
@@ -139,7 +140,7 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "deadbeef".into(),
             body: "".into(),
             comments: vec![],
@@ -432,6 +433,7 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
             })
             .unwrap();
     }
@@ -541,6 +543,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
 
@@ -604,6 +607,7 @@ fn test_autonomy_budget_warning_crossing() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
 
@@ -661,6 +665,7 @@ fn test_wedge_detection_dispatched_coder_silent() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
 
@@ -732,6 +737,7 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
 
@@ -773,6 +779,28 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
         logs
     );
 
+    let recovery = run_tick(&deps, 2, 0).unwrap();
+    assert_eq!(
+        recovery.beads_recovered_from_held, 0,
+        "a branch-mismatch hold retaining a live session must never auto-requeue"
+    );
+    let held = store.load("jleechan-vj89").unwrap().unwrap();
+    assert_eq!(held.state, OverlayState::HumanHeld);
+    assert_eq!(held.session_id.as_deref(), Some("wa-3004"));
+    assert_eq!(
+        held.park_reason.as_deref(),
+        Some("session_branch_mismatch")
+    );
+    assert!(
+        !sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.starts_with("spawn(")),
+        "recovery must not create an overlapping worker: {:?}",
+        sessions.calls.borrow()
+    );
+
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -805,6 +833,7 @@ fn test_dispatch_integrity_sweep_leaves_matching_branch_alone() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
 
@@ -866,6 +895,7 @@ fn test_dispatch_integrity_sweep_detects_force_push_on_adopted_branch() {
             spawn_failure_count: 0,
             pre_session_head_sha: Some("pre-session-sha-abc123".into()),
             park_reason: None,
+            target_repo: None,
         },
     );
 
@@ -952,6 +982,7 @@ fn test_dispatch_integrity_sweep_allows_fast_forward_adopted_commit() {
             spawn_failure_count: 0,
             pre_session_head_sha: Some("pre-session-sha-def456".into()),
             park_reason: None,
+            target_repo: None,
         },
     );
 
@@ -1020,6 +1051,7 @@ fn test_wedge_detection_attested_session_stalled() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
 
@@ -1036,7 +1068,7 @@ fn test_wedge_detection_attested_session_stalled() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "deadbeef".into(),
             body: "".into(),
             comments: vec![],
@@ -1073,6 +1105,10 @@ fn test_wedge_detection_attested_session_stalled() {
 
     let o = store.load("bead-stalled").unwrap().unwrap();
     assert_eq!(o.state, OverlayState::HumanHeld);
+    assert_eq!(
+        o.session_id, None,
+        "positive terminal proof must be persisted with the recoverable hold"
+    );
 
     let logs = std::fs::read_to_string(&telemetry_log).unwrap();
     assert!(logs.contains("session_stalled"), "logs: {}", logs);
@@ -1114,6 +1150,7 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
 
@@ -1132,7 +1169,7 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "remote-head-advanced".into(),
             body: "".into(),
             comments: vec![],
@@ -1229,6 +1266,7 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
 
@@ -1249,7 +1287,7 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             body: "".into(),
             comments: vec![],
             files: vec![],
@@ -1320,6 +1358,7 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
 
@@ -1343,7 +1382,7 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             body: "".into(),
             comments: vec![],
             files: vec![],
@@ -1434,6 +1473,7 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
 
@@ -1453,7 +1493,7 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             body: "".into(),
             comments: vec![],
             files: vec![],
@@ -1771,6 +1811,7 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         })
         .unwrap();
     store
@@ -2333,6 +2374,80 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+#[test]
+fn remote_credentials_never_reach_tick_telemetry_or_escalation_comments() {
+    const SECRET: &str = "SYNTHETIC_REMOTE_CREDENTIAL_SENTINEL";
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "credential-redaction-bead".into(),
+        title: "Verify remote credential redaction".into(),
+        description: "synthetic integration fixture".into(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#291".into()),
+    });
+    let sessions = FakeSessions::new();
+    sessions.set_worktree_remote(&format!(
+        "https://user:{SECRET}@github.com/wrong-owner/wrong-repo.git"
+    ));
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log =
+        std::env::temp_dir().join(format!("afd_remote_redaction_{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("remote mismatch should park safely without failing the tick");
+
+    assert_eq!(summary.beads_dispatched, 0);
+    assert_eq!(summary.beads_parked_human_held, 1);
+    assert_eq!(summary.beads_escalated, 1);
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(telemetry.contains("<redacted-git-remote>"));
+    assert!(!telemetry.contains(SECRET));
+
+    let tracker_calls = tracker.calls.borrow();
+    let comment = tracker_calls
+        .iter()
+        .find(|call| call.starts_with("comment_external(owner/repo#291,"))
+        .expect("remote mismatch must post an escalation comment");
+    assert!(comment.contains("<redacted-git-remote>"));
+    assert!(!comment.contains(SECRET));
+
+    let overlay = store.load("credential-redaction-bead").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("worktree_remote_mismatch")
+    );
+    assert!(sessions
+        .calls
+        .borrow()
+        .iter()
+        .any(|call| call == "stop(fake-session-1)"));
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// jleechan-3wh0: file:line-cited regression guard for the *actual* root
 /// cause of the 15-orphan-bead defect. This is not a bug in `create_bead`
 /// (that trait method has always required a non-optional `external_ref: &str`
@@ -2469,13 +2584,23 @@ fn newly_intaken_bead_dispatch_uses_real_tracker_title() {
     assert_eq!(summary.beads_created, 1);
     assert_eq!(summary.beads_dispatched, 1);
     let prompts = sessions.spawn_prompts.borrow();
-    assert_eq!(
-        prompts.as_slice(),
-        &[(
-            "fake-bead-1".to_string(),
-            "Wire a durable Linux trigger (owner/repo)".to_string()
-        )],
-        "new intake must dispatch the real tracker title, not an empty stub prompt"
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].0, "fake-bead-1");
+    // jleechan-if09 (PR #247) + jleechan-bqdv Stage C: the default dispatch
+    // arm renders through `build_coder_prompt`, the enriched coder contract
+    // (title + description + repo/remote/branch/push-command instructions),
+    // not the bare bead title. This test's original intent — the REAL
+    // tracker title reaches the coder, not an empty stub — is preserved as a
+    // containment check, plus the tracker-supplied description.
+    assert!(
+        prompts[0].1.contains("Wire a durable Linux trigger (owner/repo)"),
+        "new intake must dispatch the real tracker title, not an empty stub prompt: {}",
+        prompts[0].1
+    );
+    assert!(
+        prompts[0].1.contains("systemd user unit acceptance criteria"),
+        "tracker-supplied description must reach the coder prompt: {}",
+        prompts[0].1
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -2509,6 +2634,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
     store
@@ -2528,7 +2654,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "abc".into(),
             body: "".into(),
             comments: vec![],
@@ -2600,6 +2726,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
     store
@@ -2619,7 +2746,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "abc".into(),
             body: "".into(),
             comments: vec![],
@@ -2693,7 +2820,8 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
-            park_reason: None,
+            park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
+            target_repo: None,
         },
     );
 
@@ -2776,6 +2904,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
     // Also seed one above the cap (defensive — matches the shell overlay)
@@ -2795,6 +2924,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
 
@@ -3119,6 +3249,7 @@ fn capped_human_held_comment_failure_retries_before_recording_escalation() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
     *tracker.fail_next_comment.borrow_mut() = Some("transient comment failure".into());
@@ -3204,6 +3335,7 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
     tracker.candidates.borrow_mut().push(Bead {
@@ -3306,6 +3438,7 @@ fn capped_human_held_missing_comment_target_records_local_escalation_fallback() 
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
     // No candidates registered on the tracker either — this bead's source
@@ -3391,6 +3524,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
     store
@@ -3415,7 +3549,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "head9101".into(),
             body: String::new(),
             comments: Vec::new(),
@@ -3549,6 +3683,7 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
     store
@@ -3662,6 +3797,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
     scm.pr_snapshots.insert(
@@ -3672,7 +3808,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "abc".into(),
             body: "".into(),
             comments: vec![],
@@ -3763,6 +3899,7 @@ fn attested_ci_pending_does_not_timebox_park() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
     scm.pr_snapshots.insert(
@@ -3773,7 +3910,7 @@ fn attested_ci_pending_does_not_timebox_park() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "ghi".into(),
             body: "".into(),
             comments: vec![],
@@ -3869,7 +4006,10 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
-            park_reason: None,
+            park_reason: Some(
+                "gate assessment not all-green (stage 1: recorded, not executed)".into(),
+            ),
+            target_repo: None,
         },
     );
 
@@ -3962,6 +4102,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
     scm.pr_snapshots.insert(
@@ -3972,7 +4113,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "def".into(),
             body: "".into(),
             comments: vec![],
@@ -4062,6 +4203,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
             })
             .unwrap();
         store
@@ -4080,7 +4222,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "deadbeef".into(),
             body: String::new(),
             comments: vec![PrComment {
@@ -4217,6 +4359,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         })
         .unwrap();
     store
@@ -4239,6 +4382,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         })
         .unwrap();
     store
@@ -4257,7 +4401,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "cafebabe".into(),
             body: String::new(),
             comments: vec![PrComment {
@@ -4626,7 +4770,7 @@ fn qdw_green_snapshot(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         mergeable: true,
         coderabbit_approved: true,
         bugbot_error_count: 0,
-        unresolved_thread_count: 0,
+        unresolved_thread_count: Some(0),
         head_sha: format!("sha-{pr}"),
         body: String::new(),
         comments,
@@ -4678,6 +4822,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         })
         .unwrap();
     store
@@ -4701,6 +4846,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         })
         .unwrap();
     store
@@ -4858,6 +5004,7 @@ fn qdw_assess_refetch_failure_stays_attested_and_never_closes_pr() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         })
         .unwrap();
     store
@@ -5161,6 +5308,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
     store
@@ -5180,7 +5328,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "deadbeef555".into(),
             body: String::new(),
             // Deliberately NO github-actions/skeptic comment and NO human
@@ -5343,6 +5491,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
     store
@@ -5362,7 +5511,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "deadbeef556".into(),
             body: String::new(),
             // No gha/skeptic-workflow comment at all (this target repo has
@@ -5543,6 +5692,7 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
     store
@@ -5562,7 +5712,7 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "deadbeef557".into(),
             body: String::new(),
             comments: vec![PrComment {
@@ -5633,6 +5783,461 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
 
     let _ = std::fs::remove_file(&telemetry_log);
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+// jleechan-wzgl: GATE_ASSESSMENT must serialize the full per-gate report
+// (all 7 gates, verdict + reason) AND the gate-7 reviewer vendor identity,
+// not just the aggregate `all_green` boolean. Before this fix, diagnosing
+// which of the 7 gates failed for bead jleechan-93ft required a manual
+// GitHub REST sweep even though `verifier::assess` already computed the
+// per-gate array; and it was impossible to tell from telemetry which
+// vendor produced the gate-7 skeptic verdict, which the af-e2e mission's
+// "ironclad" exit criterion E3 needs to confirm the reviewer was non-self
+// and genuinely ran (not self-certified).
+//
+// This scenario reuses the third-vendor-fallback fixture above (codex and
+// claude both produce unparseable output, agy is the one that actually
+// resolves gate 7) specifically because it makes vendor provenance
+// observable: the fix must report `agy` as the contributing reviewer, not
+// `codex`/`claude` (which were dispatched but never produced a usable
+// verdict) and not a placeholder.
+#[test]
+#[cfg(unix)]
+fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_fake_reviewers_wzgl_gate_report_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    write_fake_reviewer(&fake_bin_dir, "codex", "not a verdict at all");
+    write_fake_reviewer(&fake_bin_dir, "claude", "still not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "agy", "pass");
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
+    ]);
+
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+
+    let mut cfg = test_cfg();
+    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" -> is_test_repo == false
+
+    store.overlays.borrow_mut().insert(
+        "wzgl-gate-report-bead".into(),
+        BeadOverlay {
+            bead_id: "wzgl-gate-report-bead".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(558),
+            branch: Some("factory/wzgl-gate-report-bead-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+    store
+        .branches
+        .borrow_mut()
+        .push("factory/wzgl-gate-report-bead-r1".into());
+    store.branch_beads.borrow_mut().insert(
+        "factory/wzgl-gate-report-bead-r1".into(),
+        "wzgl-gate-report-bead".into(),
+    );
+
+    scm.pr_snapshots.insert(
+        558,
+        PrSnapshot {
+            pr_number: 558,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadbeef558".into(),
+            body: String::new(),
+            comments: vec![PrComment {
+                author: "some-reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
+            files: vec![],
+            updated_at_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            ci_status: "green".into(),
+            coderabbit_status: "green".into(),
+            ci_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_wzgl_gate_report_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
+
+    assert_eq!(summary.beads_ready, 1, "bead should reach READY via the agy fallback verdict");
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let gate_assessment_line = telemetry
+        .lines()
+        .find(|line| line.contains("\"eventType\":\"GATE_ASSESSMENT\""))
+        .unwrap_or_else(|| panic!("no GATE_ASSESSMENT line found; telemetry:\n{telemetry}"));
+    let parsed: serde_json::Value = serde_json::from_str(gate_assessment_line)
+        .unwrap_or_else(|e| panic!("GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}"));
+    let context = &parsed["context"];
+
+    // jleechan-wzgl (PR #239 review round 1): `gates` MUST be a
+    // `{gate_name: verdict}` OBJECT using the PR #235/jleechan-l4ki
+    // canonical 7-gate vocabulary — `daemon/scripts/auto-merge-guard.sh`'s
+    // `latest_assessment_no_red` predicate does `for k, v in g.items()` on
+    // this exact field and would crash on `list.items()` if it were an
+    // array, which is why this is asserted as an object, not a length-7
+    // array like round 1 checked.
+    let gates = context["gates"]
+        .as_object()
+        .unwrap_or_else(|| panic!("GATE_ASSESSMENT context.gates must be a {{gate_name: verdict}} object, not an array; context:\n{context}"));
+    const CANONICAL_GATE_KEYS: [&str; 7] = [
+        "ci_green",
+        "no_conflicts",
+        "coderabbit",
+        "bugbot",
+        "comments_resolved",
+        "evidence_review",
+        "skeptic",
+    ];
+    assert_eq!(
+        gates.len(),
+        7,
+        "GATE_ASSESSMENT must report all 7 per-gate results, not just all_green; context:\n{context}"
+    );
+    for key in CANONICAL_GATE_KEYS {
+        assert!(
+            gates.contains_key(key),
+            "GATE_ASSESSMENT gates dict must use the PR #235/jleechan-l4ki \
+             canonical vocabulary (daemon/factory-overlay.sh REQUIRED_KEYS); \
+             missing key {key:?}; context:\n{context}"
+        );
+    }
+
+    let skeptic_reviewers = context["skeptic_reviewers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("GATE_ASSESSMENT context.skeptic_reviewers must be an array; context:\n{context}"));
+    let skeptic_reviewers: Vec<&str> = skeptic_reviewers
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        skeptic_reviewers,
+        vec!["agy"],
+        "GATE_ASSESSMENT must report the gate-7 reviewer vendor that actually \
+         produced the verdict (agy, the 3rd-vendor fallback), not the first \
+         two dispatched vendors (codex/claude) that failed to parse, and not \
+         a placeholder; context:\n{context}"
+    );
+
+    // jleechan-wzgl (PR #239 review round 1): `pr_number` must be present
+    // in context — without it, `auto-merge-guard.sh`'s
+    // `grep -E "\"pr_number\": *$pr[,}]"` never matches this line at all,
+    // and the dict-shape/vocabulary fix above stays permanently dormant.
+    assert_eq!(
+        context["pr_number"].as_u64(),
+        Some(558),
+        "GATE_ASSESSMENT context must carry pr_number so auto-merge-guard.sh's \
+         grep-by-PR-number match path is reachable; context:\n{context}"
+    );
+
+    // jleechan-wzgl (PR #239 review round 2, team-lead request): don't just
+    // assert our own shape expectations — pipe the ACTUAL emitted line
+    // through auto-merge-guard.sh's REAL predicate (the exact python
+    // heredoc it runs, extracted the same way
+    // tests/scripts/test_auto_merge_guard_gate_vocabulary.sh does) and
+    // confirm the match path is genuinely non-dormant: it parses without
+    // crashing and reports a non-blocking verdict for this all-green
+    // scenario.
+    let guard_script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/auto-merge-guard.sh");
+    let guard_src = std::fs::read_to_string(&guard_script)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", guard_script.display()));
+    let predicate_block: String = guard_src
+        .lines()
+        .skip(40) // 0-indexed: line 41 (1-indexed) of auto-merge-guard.sh
+        .take(29) // lines 41..=69 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh's `sed -n '41,69p'`
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        predicate_block.contains("g.items()"),
+        "extracted predicate block drifted from auto-merge-guard.sh's actual \
+         line range 41-69 (line numbers may have shifted); block:\n{predicate_block}"
+    );
+
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(&predicate_block)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn python3 for auto-merge-guard.sh predicate");
+    child
+        .stdin
+        .take()
+        .expect("child stdin must be piped")
+        .write_all(gate_assessment_line.as_bytes())
+        .expect("failed to write GATE_ASSESSMENT line to predicate stdin");
+    let output = child
+        .wait_with_output()
+        .expect("python3 predicate failed to run to completion");
+    let predicate_stdout = String::from_utf8_lossy(&output.stdout);
+    let predicate_stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "auto-merge-guard.sh's real predicate must accept the emitted \
+         GATE_ASSESSMENT line (dict-shaped gates, canonical vocab) for this \
+         all-green scenario; stdout={predicate_stdout}\nstderr={predicate_stderr}\n\
+         line={gate_assessment_line}"
+    );
+    assert!(
+        predicate_stdout.contains("no-fail"),
+        "expected a non-blocking 'no-fail' verdict from auto-merge-guard.sh's \
+         predicate for this all-green scenario; got: {predicate_stdout}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+/// jleechan-9xrs Stage D end-to-end regression: a bead whose `target_repo`
+/// is a "test-repo" placeholder (`owner/repo`), dispatched under a daemon
+/// whose GLOBAL `cfg.target_repo` is a DIFFERENT, non-test-pattern repo,
+/// must have its ENTIRE verification loop (skeptic gate's `is_test_repo`
+/// classification + snapshot fetch, gate assessment's snapshot fetch, and
+/// the PARKED_HUMAN_HELD escalation comment) target the bead's OWN repo —
+/// never `cfg.target_repo`. See
+/// docs/multirepo-dispatch-investigation-2026-07-11.md Stage D.
+///
+/// This is a strong regression pin: before the Stage D fix, `is_test_repo`
+/// was computed from `cfg.target_repo` (here a real-looking, non-test
+/// string), so `skeptic_evidence` would have taken the REAL dual-reviewer
+/// dispatch branch (spawning `codex`/`claude`/`agy` subprocesses) instead of
+/// the mock `FakeLlm` path — this test's `FakeLlm` script would never be
+/// consulted, and the test would hang/fail against a `PATH` with no
+/// scripted reviewer binaries.
+#[test]
+fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+
+    let mut cfg = test_cfg();
+    // Deliberately NOT "owner/repo" / "fake-*" / "test-*" -- if is_test_repo
+    // were (incorrectly) computed from this, skeptic_evidence would try to
+    // spawn real reviewer subprocesses.
+    cfg.target_repo = "myorg/global-real-repo".into();
+
+    let pr = 4242;
+    let bead_id = "bxrs-cross-repo";
+    store.overlays.borrow_mut().insert(
+        bead_id.into(),
+        BeadOverlay {
+            bead_id: bead_id.into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some(format!("factory/{bead_id}-r1")),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            // The bead's OWN resolved repo: a test-pattern placeholder,
+            // deliberately DIFFERENT from cfg.target_repo above.
+            target_repo: Some("owner/repo".into()),
+        },
+    );
+    store
+        .branches
+        .borrow_mut()
+        .push(format!("factory/{bead_id}-r1"));
+    store
+        .branch_beads
+        .borrow_mut()
+        .insert(format!("factory/{bead_id}-r1"), bead_id.into());
+
+    // CI is red -> gate assessment is not all-green -> Stage 1 parks
+    // HUMAN_HELD and posts an escalation comment via
+    // post_scm_comment_by_bead_id.
+    let mut snapshot = qdw_green_snapshot(pr, vec![]);
+    snapshot.ci_success = false;
+    snapshot.ci_status = "failure".into();
+    scm.pr_snapshots.insert(pr, snapshot);
+
+    let telemetry_log =
+        std::env::temp_dir().join("afd_9xrs_cross_repo_verification_loop.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("run_tick should succeed for a cross-repo bead");
+
+    assert_eq!(summary.gates_assessed, 1);
+    assert_eq!(summary.beads_parked_human_held, 1);
+    let overlay = store.load(bead_id).unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+
+    // 1. EVERY snapshot fetch in the whole verification loop (the
+    //    active-overlay wedge-detection fetch in `run_tick`, plus
+    //    skeptic_evidence + verifier::assess in `run_fast_tier`) must have
+    //    gone through `pr_snapshot_for_repo` with the bead's OWN repo --
+    //    never the plain (cfg-bound) `pr_snapshot`. This positive assertion
+    //    on its own is not sufficient: a stray missed call site that still
+    //    calls plain `pr_snapshot(pr)` logs a call string containing
+    //    neither "owner/repo" nor "global-real-repo" (FakeScm's plain
+    //    `pr_snapshot` call-log format carries no repo string at all), so
+    //    it would silently pass both the positive check above and a
+    //    "doesn't contain global-real-repo" negative check. The explicit
+    //    "zero plain pr_snapshot(...) calls" assertion below closes that
+    //    gap.
+    let scm_calls = scm.calls.borrow();
+    assert!(
+        scm_calls
+            .iter()
+            .any(|c| c == &format!("pr_snapshot_for_repo(owner/repo,{pr})")),
+        "expected pr_snapshot_for_repo with the bead's own repo, got: {scm_calls:?}"
+    );
+    assert!(
+        !scm_calls.iter().any(|c| c.contains("global-real-repo")),
+        "verification loop must never fall back to cfg.target_repo for a \
+         bead with an explicit target_repo, got: {scm_calls:?}"
+    );
+    assert!(
+        !scm_calls.iter().any(|c| c.starts_with("pr_snapshot(")),
+        "found a call to the plain (cfg-bound) pr_snapshot -- every \
+         verification-loop snapshot fetch must go through \
+         pr_snapshot_for_repo instead, got: {scm_calls:?}"
+    );
+
+    // 2. The skeptic prompt must embed the bead's own repo, not
+    //    cfg.target_repo -- AND `skeptic_evidence` reaching the mock LLM
+    //    path AT ALL proves `is_test_repo` was computed from the bead's own
+    //    repo, not cfg.target_repo (which matches no test pattern here).
+    //
+    //    `er_runner::maybe_run` ALSO calls the mock LLM unconditionally
+    //    (its dispatch is gated on `Llm::is_real()`, which `FakeLlm`
+    //    defaults to `false`, independent of `is_test_repo`) -- so a naive
+    //    "at least one judge() call happened" assertion cannot distinguish
+    //    the fix from the bug: reverting `is_test_repo` back to
+    //    `cfg.target_repo` still produces exactly one judge() call (from
+    //    er_runner alone) if the real `codex`/`claude`/`agy` binaries
+    //    happen to be on `PATH` and return a parseable verdict, silently
+    //    passing this test while `skeptic_evidence` spawned REAL reviewer
+    //    subprocesses instead of using the mock. Two independent checks
+    //    close that gap: (a) an EXACT call count of 2 (skeptic +
+    //    er_runner -- one fewer than expected if skeptic took the real
+    //    subprocess branch instead), and (b) inspecting the
+    //    skeptic-specific prompt (identified by its unique "Stage-1
+    //    Skeptic" marker, distinct from er_runner's "/er (evidence
+    //    review)" marker) for the bead's own repo.
+    let llm_calls = llm.calls.borrow();
+    assert_eq!(
+        llm_calls.len(),
+        2,
+        "expected exactly 2 mock LLM calls (skeptic_evidence + \
+         er_runner::maybe_run); a count of 1 means skeptic_evidence took \
+         the REAL dual-reviewer subprocess branch instead of the mock \
+         path, i.e. is_test_repo was computed from cfg.target_repo (not \
+         the bead's own repo). got: {llm_calls:?}"
+    );
+    let skeptic_prompt = llm_calls
+        .iter()
+        .find(|c| c.contains("Stage-1 Skeptic"))
+        .unwrap_or_else(|| panic!("expected a Stage-1 Skeptic prompt among judge() calls, got: {llm_calls:?}"));
+    assert!(
+        skeptic_prompt.contains("owner/repo"),
+        "skeptic prompt must embed the bead's own repo, got: {skeptic_prompt:?}"
+    );
+    assert!(
+        !skeptic_prompt.contains("global-real-repo"),
+        "skeptic prompt must not leak cfg.target_repo, got: {skeptic_prompt:?}"
+    );
+
+    // 3. The PARKED_HUMAN_HELD escalation comment's ext_ref must target the
+    //    bead's own repo -- this is the twa0/mdgr escalation cross-repo
+    //    class Stage D closes.
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls
+            .iter()
+            .any(|c| c.starts_with(&format!("comment_external(owner/repo#{pr}"))),
+        "escalation comment must target the bead's own repo, got: {tracker_calls:?}"
+    );
+    assert!(
+        !tracker_calls.iter().any(|c| c.contains("global-real-repo")),
+        "escalation comment must not leak cfg.target_repo, got: {tracker_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
 }
 
 // --- jleechan-bkru: 4th-vendor (gemini) fallback gap --------------------
@@ -5713,6 +6318,7 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         },
     );
     store
@@ -5732,7 +6338,7 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
-            unresolved_thread_count: 0,
+            unresolved_thread_count: Some(0),
             head_sha: "deadbeef558".into(),
             body: String::new(),
             comments: vec![PrComment {
@@ -6670,6 +7276,7 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
+                target_repo: None,
             })
             .unwrap();
         store.register_branch(bead_id, branch).unwrap();
@@ -6759,4 +7366,278 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// --- jleechan-x8tf: run_slow_tier PR-existence probe must target the ---
+// --- bead's OWN resolved repo, not unconditionally `cfg.target_repo` ---
+//
+// Stage D (jleechan-9xrs, PR #250) swept the verification loop's repo call
+// sites but did NOT touch this one: the intake `created`-bead loop in
+// `run_slow_tier` parses a repo out of the bead's `external_ref` via the
+// local `parse_external_ref` helper, discards it (`_`), and unconditionally
+// probes `deps.cfg.target_repo` via `gh pr view --repo <cfg.target_repo>` to
+// decide whether the bead already has an open PR. For any bead whose
+// `external_ref`/`target_repo:` body field names a DIFFERENT repo than the
+// daemon's global default, this silently checks the WRONG repo's PR list —
+// flagged during Stage D review as a risk to Stage E's two-repo E2E
+// acceptance proof (a dark-factory fixture bead's probe could silently
+// check worldarchitect.ai instead).
+//
+// This gates on `Llm::is_real()` (see `tick.rs` around the `parse_external_ref`
+// call), so these tests use a small local `is_real()==true` `Llm` fake — NOT
+// `common::FakeLlm`, which always reports `is_real() == false` (see the
+// `real_target_repo_skeptic_gate_...` test's comment above for why that
+// distinction matters). `cfg.target_repo` is kept at the file's usual
+// `"owner/repo"` test-repo convention so `skeptic_evidence`'s SEPARATE
+// `is_test_repo` gate (driven by repo name, not `Llm::is_real()`) still takes
+// the mock-LLM path and this test stays fast/hermetic apart from the one
+// `gh` shell-out under test.
+struct RealLlmForRepoProbe {
+    response: std::cell::RefCell<Option<Result<String, String>>>,
+}
+
+impl Llm for RealLlmForRepoProbe {
+    fn judge(&self, _prompt: &str) -> Result<String, DaemonError> {
+        match self.response.borrow().as_ref() {
+            Some(Ok(t)) => Ok(t.clone()),
+            Some(Err(e)) => Err(DaemonError::Parse(e.clone())),
+            None => Ok(String::new()),
+        }
+    }
+    fn is_real(&self) -> bool {
+        true
+    }
+}
+
+/// Write a fake `gh` script into `dir` that answers `pr view <num> --repo
+/// <repo> --json number` by (a) recording the value passed to `--repo` into
+/// `capture_file` and (b) printing a valid `{"number": ...}` JSON payload so
+/// the caller's `.is_ok()` check succeeds regardless of which repo was
+/// probed — this test only cares WHICH repo `run_slow_tier` asked about, not
+/// simulating a real PR-not-found case.
+#[cfg(unix)]
+fn write_fake_gh_capturing_repo_arg(
+    dir: &std::path::Path,
+    capture_file: &std::path::Path,
+    expect_num: u64,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("gh");
+    let script = format!(
+        "#!/bin/sh\n\
+         prev=\"\"\n\
+         match=0\n\
+         repo_val=\"\"\n\
+         for arg in \"$@\"; do\n\
+           if [ \"$arg\" = \"{expect_num}\" ]; then\n\
+             match=1\n\
+           fi\n\
+           if [ \"$prev\" = \"--repo\" ]; then\n\
+             repo_val=\"$arg\"\n\
+           fi\n\
+           prev=\"$arg\"\n\
+         done\n\
+         if [ $match -eq 1 ] && [ -n \"$repo_val\" ]; then\n\
+           printf '%s' \"$repo_val\" > \"{capture}\"\n\
+         fi\n\
+         echo '{{\"number\": 1}}'\n",
+        expect_num = expect_num,
+        capture = capture_file.display()
+    );
+    std::fs::write(&path, script)
+        .unwrap_or_else(|e| panic!("failed to write fake gh: {e}"));
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+}
+
+/// The fix: a bead whose `external_ref` names a DIFFERENT repo than
+/// `cfg.target_repo` must have its PR-existence probe target ITS OWN repo,
+/// not silently fall back to the global config repo.
+#[test]
+#[cfg(unix)]
+fn run_slow_tier_pr_existence_probe_targets_bead_own_repo_not_global_cfg() {
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_x8tf_probe_own_repo_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    let capture_file = fake_bin_dir.join("captured_repo.txt");
+    write_fake_gh_capturing_repo_arg(&fake_bin_dir, &capture_file, 42);
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let _env_guard = EnvVarGuard::set(&[("PATH", &new_path)]);
+
+    let mut scm = FakeScm::new();
+    // external_ref names a DIFFERENT repo than cfg.target_repo ("owner/repo"
+    // below) — exactly the multi-repo-fixture-vs-global-default scenario
+    // Stage E's two-repo E2E proof depends on.
+    scm.issues.push(Issue {
+        number: 42,
+        title: "Fixture bead in a different repo".into(),
+        body: "please fix the thing".into(),
+        author_login: "alice".into(),
+        external_ref: "jleechanorg/dark-factory-holdouts#42".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = RealLlmForRepoProbe {
+        response: std::cell::RefCell::new(Some(Ok(
+            r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+        ))),
+    };
+    let store = FakeStateStore::new();
+    let cfg = test_cfg(); // target_repo == "owner/repo"
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_x8tf_probe_own_repo_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("tick should succeed");
+
+    assert_eq!(summary.beads_created, 1, "one bead should be created");
+
+    let captured = std::fs::read_to_string(&capture_file).unwrap_or_else(|e| {
+        panic!(
+            "expected the fake gh to have recorded a --repo arg, but reading \
+             {capture_file:?} failed: {e} (gh pr view was never called with \
+             --repo at all)"
+        )
+    });
+    assert_eq!(
+        captured, "jleechanorg/dark-factory-holdouts",
+        "run_slow_tier's PR-existence probe must target the bead's OWN \
+         resolved repo (from external_ref), not cfg.target_repo \
+         (\"owner/repo\"); captured --repo arg: {captured:?}"
+    );
+
+    let overlay = store
+        .load("fake-bead-1")
+        .unwrap()
+        .expect("overlay must exist");
+    assert_eq!(
+        overlay.target_repo.as_deref(),
+        Some("jleechanorg/dark-factory-holdouts"),
+        "overlay must carry the bead's own resolved target_repo"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+/// Legacy-behavior regression: a bead whose resolved repo happens to MATCH
+/// `cfg.target_repo` (the pre-multi-repo, single-repo default — every other
+/// test in this file uses this shape) must still probe that same repo,
+/// unchanged, after the fix.
+#[test]
+#[cfg(unix)]
+fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_x8tf_probe_legacy_repo_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    let capture_file = fake_bin_dir.join("captured_repo.txt");
+    write_fake_gh_capturing_repo_arg(&fake_bin_dir, &capture_file, 43);
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let _env_guard = EnvVarGuard::set(&[("PATH", &new_path)]);
+
+    let mut scm = FakeScm::new();
+    // external_ref's repo prefix MATCHES cfg.target_repo — the single-repo
+    // shape every other test in this file already exercises.
+    scm.issues.push(Issue {
+        number: 43,
+        title: "Same-repo bead".into(),
+        body: "please fix the other thing".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#43".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = RealLlmForRepoProbe {
+        response: std::cell::RefCell::new(Some(Ok(
+            r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+        ))),
+    };
+    let store = FakeStateStore::new();
+    let cfg = test_cfg(); // target_repo == "owner/repo"
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_x8tf_probe_legacy_repo_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("tick should succeed");
+
+    assert_eq!(summary.beads_created, 1, "one bead should be created");
+
+    let captured = std::fs::read_to_string(&capture_file).unwrap_or_else(|e| {
+        panic!(
+            "expected the fake gh to have recorded a --repo arg, but reading \
+             {capture_file:?} failed: {e} (gh pr view was never called with \
+             --repo at all)"
+        )
+    });
+    assert_eq!(
+        captured, "owner/repo",
+        "single-repo (legacy default) beads must keep probing \
+         cfg.target_repo's value unchanged; captured --repo arg: {captured:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }

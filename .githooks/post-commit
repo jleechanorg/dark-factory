@@ -1,0 +1,2 @@
+#!/bin/sh
+GIT_LFS_VERB=post-commit . "$(dirname "$0")/_git-lfs-hook.sh" "$@"

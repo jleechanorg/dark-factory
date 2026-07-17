@@ -251,7 +251,7 @@ Additional floors and optimizations are enforced:
 *   **Spec mutation grammar:** The spec file for the bead is append-only. Each re-roll appends one block containing the source event, attesting reviewer, superseded attempt, extracted constraints, and raw feedback snapshot. Atomicity is guaranteed via write-temp -> fsync -> rename.
 *   **Overlay States:**
     *   Pre-PR lifecycle (previously implicit, named in r3): *QUEUED* (bead accepted by intake, awaiting dispatch) -> *DISPATCHED* (worker or pipeline running, no PR yet) -> *ATTESTED* (PR open).
-    *   *ATTESTED* (all 9 gates green — 7 originals + `/code-standards` + `/zfc`; readiness posted) -> *READY* — terminal on the automated path; the daemon stops driving (added r3.1 so "stops driving" is a mechanized state, not a behavior note).
+    *   *ATTESTED* (all 7 automated gates green — as defined in `daemon/src/verifier.rs::GateName`; readiness posted) -> *READY* — terminal on the automated path; the daemon stops driving (added r3.1 so "stops driving" is a mechanized state, not a behavior note). The `/code-standards` and `/zfc` checks are separate advisory reviews tracked via bead jleechan-1gft, not counted in the automated `all_green` contract.
     *   *ATTESTED* (on PR rejection + cooldown) -> *RE_ROLL*
     *   *RE_ROLL* (on abort) -> *ATTESTED*
     *   *RE_ROLL* (on success) -> *RECOVERY*
@@ -351,3 +351,5 @@ Three LLM roles carry the daemon's judgment (ZFC: Zero-Framework Cognition — r
 1. **Task Router** — input: bead title/description, file tree, dependency map. Output JSON: `{ "routingVerdict": "SMALL_PATH" | "STANDARD_PATH", "justification": "<one sentence>" }`. Routing is model judgment over the whole task shape; no file-count or keyword rules in daemon code.
 2. **Constraint Extractor + Holdout-Leak Screen** — input: rejection review text. Output JSON: `{ "inhibitionSpecs": [...], "positiveAssertions": [...], "securityRedactionEncountered": <bool> }`. Inhibition specs take precedence; holdout internals are redacted before spec mutation (§4.2.6).
 3. **Skeptic Reviewer** — input: diff + spec manifest + validation history. Output verdict uses the runner's normalized grammar (`pass | warn | fail`, marker line `verdict: <token>`), plus `blockingIssues[]`. Binary `PASS/FAIL`-only schemas from external variants are non-conforming.
+
+<!-- jleechan-s3c timer-fire-test: green control fixture; long-lived regression -->
