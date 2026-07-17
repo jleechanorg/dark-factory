@@ -75,6 +75,45 @@ findings folded in below).
 - `safe-push-main.sh` semantics: reviewer advances origin/main mid-run once; the daemon's push
   path must rebase+verify HEAD==origin or fail loudly — a silent no-op push = FAIL.
 
+### X4 — live result (2026-07-10, PARTIAL — milestone, not sign-off)
+
+Bead jleechan-vbbi. First **live** exercise of the production merge function
+`daemon/scripts/auto-merge-guard.sh` under the operator-approved **Option A** path — the
+externally-scheduled guard (systemd user timer `dark-factory-merge-guard.timer`, 60s,
+active since 2026-07-10 12:39 PDT), which is the spec §4.2.8-conformant resolution of the
+"daemon merges: never" vs X4 contradiction (the Rust daemon never merges; merge authority
+is this one externally-run policy script). Evidence bundle:
+[`evidence/x4-live-merge-20260710/`](../evidence/x4-live-merge-20260710/) (README + raw
+`gh api` JSON, guard-log excerpts, `merge-timestamps` ledger, timer status, guard sha256).
+
+- **Green control — OBSERVED.** PR
+  [#228](https://github.com/jleechanorg/dark-factory/pull/228)
+  (`factory/ez-gh-actions-mw5a-r2`, a real work item) merged through the guard:
+  `merged_at 2026-07-10T20:48:04Z`, `merge_commit_sha f59b4888…`. External anchor is the
+  `gh api` PR state + git merge SHA; the guard (not a hand-merge) performed it —
+  `merged_by` is `jleechan2015`, the identity the externally-scheduled guard authenticates
+  as, corroborated by the guard's `PR 228 MERGED, bead … closed+READY` log line and the
+  `~/.dark-factory/merge-timestamps` epoch `1783716480` (= 13:48 PDT, guard-only ledger).
+  The guard held the merge until a GATE_ASSESSMENT existed AND the PR was mergeable (18
+  `assessment missing — refusing merge (green CI is insufficient)` ticks first).
+- **Refusal control — OBSERVED (adjacent branch, not strict red control).** PRs
+  [#205](https://github.com/jleechanorg/dark-factory/pull/205) (2534×),
+  [#208](https://github.com/jleechanorg/dark-factory/pull/208) (2569×) refused on
+  `verifier assessment missing — refusing merge (green CI is insufficient)` and
+  [#207](https://github.com/jleechanorg/dark-factory/pull/207) on `CI FAILED — skip`,
+  all through the SAME guard function in the same run; all three remain `state: open`
+  afterward. PR #205 is `mergeable_state: clean` (green CI) yet refused every tick —
+  the "green-CI-is-insufficient" policy demonstrated end-to-end.
+- **Assessment source (no overclaim):** the guard's gate reads the latest `GATE_ASSESSMENT`
+  event from the daemon JSONL, which is implementer-authored telemetry (charter R2,
+  corroborating only). The load-bearing anchors are the GitHub PR state and merge SHA.
+- **Still owed before X4 = PASS (this is PARTIAL):** the refusals above are the
+  *assessment-missing* and *CI-failed* branches, **not** the strict X4 red control (a PR
+  carrying a GATE_ASSESSMENT with a gate=`red`/`fail`, guard refusing while citing the gate
+  name). The **mislabel control**, **TOCTOU head-SHA binding**, and **`safe-push-main.sh`**
+  semantics were also not exercised by this passive observation. These remain to be shown in
+  a reviewer-personal run (R4) before X4 can be marked PASS.
+
 ## Exit criterion X5 — Holdout isolation on the production spawn path
 
 - Proven from INSIDE a coder session spawned by the daemon (not the daemon parent, not a fresh
