@@ -8485,7 +8485,7 @@ fn dispatched_recovery_dead_session_requeues() {
     let scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let mut sessions = FakeSessions::new();
-    sessions.quiescent = true; // is_session_dead returns true
+    sessions.session_dead = true; // is_session_dead returns true (independent of quiescence)
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let cfg = test_cfg();

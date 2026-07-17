@@ -3375,15 +3375,33 @@ impl Sessions for CliSessions {
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
         })?;
-        if let Some(arr) = data.as_array() {
-            for entry in arr {
-                if entry.get("name").and_then(|v| v.as_str()) == Some(&id.0) {
-                    if let Some(activity) = entry.get("activity").and_then(|v| v.as_str()) {
-                        return Ok(activity == "exited" || activity == "missing");
-                    }
-                }
+        // Fail closed: ao's --json output is documented as a top-level array
+        // of session objects. Anything else (an object, scalar, or unparsable
+        // shape) is malformed and must NOT be treated as "session is dead" —
+        // the caller would requeue a live session.
+        let arr = data.as_array().ok_or_else(|| {
+            DaemonError::Parse(format!(
+                "ao status --json returned non-array top-level value for liveness check of {}",
+                id.0
+            ))
+        })?;
+        for entry in arr {
+            if entry.get("name").and_then(|v| v.as_str()) == Some(&id.0) {
+                let activity = entry
+                    .get("activity")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        DaemonError::Parse(format!(
+                            "ao status entry for {} missing string activity field: {:?}",
+                            id.0, entry
+                        ))
+                    })?;
+                return Ok(activity == "exited" || activity == "missing");
             }
         }
+        // Session id not found in ao's output → treat as dead (the canonical
+        // "missing" state); this preserves the live-state default where an
+        // absent entry proves the session is gone.
         Ok(true)
     }
 

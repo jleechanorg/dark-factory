@@ -885,18 +885,27 @@ fn run_bead_reconciliation_step(
             }
             Ok(Some(BeadStatus::Open | BeadStatus::Active)) => {}
             Err(e) => {
-                emit(
-                    deps.telemetry_log,
-                    &overlay.bead_id,
-                    overlay.attempt,
-                    overlay.state.as_str(),
-                    "BEAD_RECONCILIATION_TRANSIENT_ERROR",
-                    serde_json::json!({}),
-                    serde_json::json!({
-                        "phase": "bead_status_check",
-                        "error": format!("{e:?}"),
-                    }),
-                )?;
+                if e.is_transient() {
+                    emit(
+                        deps.telemetry_log,
+                        &overlay.bead_id,
+                        overlay.attempt,
+                        overlay.state.as_str(),
+                        "BEAD_RECONCILIATION_TRANSIENT_ERROR",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "phase": "bead_status_check",
+                            "error": format!("{e:?}"),
+                        }),
+                    )?;
+                } else {
+                    // Non-transient tracker errors (Config, malformed-response
+                    // Parse, etc.) must propagate so the tick fails closed.
+                    // Silently treating them as transient would let a missing
+                    // `bead_status` implementation or persistent parser failure
+                    // sweep a real reconciliation gap under the rug.
+                    return Err(e);
+                }
             }
         }
     }
@@ -953,7 +962,21 @@ fn run_dispatched_recovery_step(
             }
         };
         if should_requeue {
-            let requeued = deps.store.requeue_stale_dispatched(&overlay.bead_id)?;
+            // Requeue atomically with the session id observed during the
+            // liveness probe. If a concurrent dispatch replaced the row's
+            // session_id in the meantime, the UPDATE matches zero rows and
+            // the store returns the current overlay unchanged — do NOT
+            // bump beads_recovered_stale_dispatched in that case.
+            let prior_session_id = overlay.session_id.clone();
+            let requeued =
+                deps.store
+                    .requeue_stale_dispatched(&overlay.bead_id, prior_session_id.as_deref())?;
+            if requeued.state != OverlayState::Queued {
+                // Contention path: another writer touched the row between
+                // our liveness probe and the update. Skip the recovery
+                // telemetry — the live session has reclaimed the bead.
+                continue;
+            }
             summary.beads_recovered_stale_dispatched += 1;
             emit(
                 deps.telemetry_log,

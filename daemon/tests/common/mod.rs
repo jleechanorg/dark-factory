@@ -285,6 +285,11 @@ pub struct FakeSessions {
     pub active_count: usize,
     pub next_session_id: String,
     pub quiescent: bool,
+    /// Independent liveness flag for `is_session_dead` so tests can model a
+    /// session that is alive but quiescent (or vice-versa). Without this,
+    /// `is_session_dead` would collapse back into `is_quiescent` and lose the
+    /// distinction the PR introduced.
+    pub session_dead: bool,
     pub fail_spawn_for: RefCell<Vec<String>>,
     pub panic_after_spawn_for: RefCell<Vec<String>>,
     pub fail_spawn_cleanup_for: RefCell<Vec<String>>,
@@ -333,6 +338,7 @@ impl Default for FakeSessions {
             active_count: 0,
             next_session_id: "fake-session-1".into(),
             quiescent: false,
+            session_dead: false,
             fail_spawn_for: RefCell::new(Vec::new()),
             panic_after_spawn_for: RefCell::new(Vec::new()),
             fail_spawn_cleanup_for: RefCell::new(Vec::new()),
@@ -522,7 +528,7 @@ impl Sessions for FakeSessions {
         if let Some(at) = *self.terminal_at.borrow() {
             return Ok(std::time::Instant::now() >= at);
         }
-        Ok(self.quiescent)
+        Ok(self.session_dead)
     }
 
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
@@ -1041,10 +1047,12 @@ impl StateStore for FakeStateStore {
     fn requeue_stale_dispatched(
         &self,
         bead_id: &str,
+        expected_session_id: Option<&str>,
     ) -> Result<BeadOverlay, DaemonError> {
         self.calls
             .borrow_mut()
             .push(format!("requeue_stale_dispatched({bead_id})"));
+        let _ = expected_session_id;
         let mut overlays = self.overlays.borrow_mut();
         let overlay = overlays
             .get_mut(bead_id)

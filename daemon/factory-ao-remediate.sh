@@ -155,7 +155,7 @@ classify_spawn_outcome() {
   if echo "$out" | grep -qE 'spawned session |Session [a-z0-9_-]+ created|✓ Session|pr_open|working|spawning|claimed https://'; then
     return 0
   fi
-  if "$AO" session ls 2>/dev/null | grep "pulls/${PR}" | grep -qE "\[(spawning|running|active|working|pr_open)\]"; then
+  if "$AO" session ls 2>/dev/null | grep -E "pulls/${PR}([^0-9]|$)" | grep -qE "\[(spawning|running|active|working|pr_open)\]"; then
     return 0
   fi
   return 1

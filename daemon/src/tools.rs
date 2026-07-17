@@ -519,8 +519,10 @@ pub trait Sessions {
     /// error so a single transient probe failure never falsely requeues a
     /// live session).
     fn is_session_dead(&self, id: &SessionId) -> Result<bool, DaemonError> {
-        let _ = id;
-        Ok(false)
+        Err(DaemonError::Config(format!(
+            "is_session_dead({}) not implemented for this session adapter",
+            id.0
+        )))
     }
     /// Returns the live branch AO reports for a given session, if known.
     ///
