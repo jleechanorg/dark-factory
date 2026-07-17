@@ -323,6 +323,47 @@ pub fn remote_url_for_display(_url: &str) -> &'static str {
     "<redacted-git-remote>"
 }
 
+/// Pure syntax transform (no judgment call, ZFC-exempt), bead
+/// jleechan-coder-silent-false-parks-h92r: Claude Code CLI names each
+/// session's transcript directory under `~/.claude/projects/` after the
+/// absolute cwd it was launched in, with every `/` and `.` replaced by `-`
+/// (observed convention, e.g. `/home/jleechan/.worktrees/dark-factory/df-100`
+/// -> `-home-jleechan--worktrees-dark-factory-df-100`). This lets the
+/// coder-silence watcher locate a dispatched coder's own transcript
+/// directory from the absolute worktree path AO already reports at spawn
+/// time, without guessing at session identity.
+pub fn claude_project_slug(worktree_path: &std::path::Path) -> String {
+    worktree_path
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+#[cfg(test)]
+mod claude_project_slug_tests {
+    use super::claude_project_slug;
+    use std::path::Path;
+
+    #[test]
+    fn replaces_slashes_and_dots_with_dashes() {
+        let path = Path::new("/home/jleechan/.worktrees/dark-factory/df-100");
+        assert_eq!(
+            claude_project_slug(path),
+            "-home-jleechan--worktrees-dark-factory-df-100"
+        );
+    }
+
+    #[test]
+    fn handles_plain_projects_path_without_leading_dotdir() {
+        let path = Path::new("/home/jleechan/projects/dark-factory");
+        assert_eq!(
+            claude_project_slug(path),
+            "-home-jleechan-projects-dark-factory"
+        );
+    }
+}
+
 /// `br` CLI. `fetch_candidates` == `br list --status open --label factory --json`.
 pub trait Tracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError>;
@@ -445,6 +486,38 @@ pub trait Sessions {
         remote_name: &str,
     ) -> Result<Option<String>, DaemonError> {
         let _ = (ao_project, branch, remote_name);
+        Ok(None)
+    }
+    /// Most recent modification time (unix epoch seconds) observed across
+    /// the coder's own Claude Code transcript directory for the worktree
+    /// backing `ao_project`/`branch`, or `None` when it cannot be
+    /// determined (bead jleechan-coder-silent-false-parks-h92r).
+    ///
+    /// 2026-07-17: all 6 active dispatch lanes were parked
+    /// `PARKED_HUMAN_HELD reason=coder_silent` by `tick.rs`'s wedge-detection
+    /// sweep while their coders were demonstrably working — transcripts
+    /// growing, commits landing — because that sweep's only liveness signal
+    /// was "has the branch received a REMOTE commit in the last 30
+    /// minutes". A coder can spend well over 30 minutes editing, running
+    /// tests, and iterating locally before its next push; silence on the
+    /// remote branch is not evidence the coder is silent. This method gives
+    /// the sweep a second, independent liveness signal sourced from the
+    /// coder's own transcript activity, which updates continuously
+    /// regardless of push cadence.
+    ///
+    /// `Ok(None)` means "no evidence" (missing worktree mapping, missing
+    /// transcript directory, unreadable files, no `$HOME`) — callers MUST
+    /// NOT treat that as proof the coder is silent, only as "this signal
+    /// could not corroborate liveness". The default impl (for fakes/older
+    /// adapters) always returns `Ok(None)`, which preserves today's
+    /// branch-only fail-closed behavior for any caller that doesn't opt
+    /// into the combined check.
+    fn worktree_transcript_last_activity_epoch(
+        &self,
+        ao_project: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let _ = (ao_project, branch);
         Ok(None)
     }
     fn spawn_batch(&self, specs: &[SpawnSpec]) -> Result<Vec<SessionId>, DaemonError> {
