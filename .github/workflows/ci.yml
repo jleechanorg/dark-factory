@@ -31,6 +31,8 @@ jobs:
         # Download pinned, architecture-aware sqlite3 CLI from sqlite.org.
         # Checksum-verified (SHA3-256), user-scope (no sudo), placed on PATH
         # before the bash integration test suite.  See bead jleechan-432s.
+        # Linux-aarch64 has no upstream sqlite-tools binary; fall back to
+        # the system package manager in that case.
         run: |
           if command -v sqlite3 >/dev/null 2>&1 && sqlite3 ':memory:' 'SELECT 1;' >/dev/null 2>&1; then
             echo "sqlite3 $(sqlite3 --version) already on PATH"
@@ -52,6 +54,20 @@ jobs:
             Linux-x86_64)
               URL="https://sqlite.org/${YEAR}/sqlite-tools-linux-x64-${VER}.zip"
               SHA3="83b43a9ef8b56f74ece1813161816133045ca834444bfa6bb34c6166328474f8"
+              ;;
+            Linux-aarch64)
+              # No upstream sqlite-tools binary for Linux arm64; use the OS
+              # package. Self-hosted runners commonly run as root, so try
+              # apt-get first and fall back to sudo.
+              echo "::warning::No sqlite-tools binary for Linux-aarch64; falling back to apt-get"
+              if command -v apt-get >/dev/null 2>&1; then
+                (apt-get update -y && apt-get install -y sqlite3) || \
+                  (sudo -n apt-get update -y && sudo -n apt-get install -y sqlite3)
+                sqlite3 --version
+                exit 0
+              fi
+              echo "::error::Linux-aarch64 requires apt-get (sqlite.org has no binary for this arch)"
+              exit 1
               ;;
             *)
               echo "::error::Unsupported platform: ${OS}-${ARCH}"; exit 1
@@ -151,3 +167,29 @@ jobs:
       - name: cargo clippy (deny warnings)
         working-directory: daemon
         run: cargo clippy -- -D warnings
+
+      - name: Provision Node 22.22.0 (for AO bridge tests)
+        # bridge_test_node() in adapters.rs looks for
+        # ~/.nvm/versions/node/v22.22.0/bin/node. Self-hosted runners don't
+        # ship nvm, so install via NodeSource tarball into the same path.
+        # See global CLAUDE.md "Use nvm Node 22 (v22.22.0)".
+        run: |
+          NODE_BIN="${HOME}/.nvm/versions/node/v22.22.0/bin"
+          if [ -x "${NODE_BIN}/node" ]; then
+            "${NODE_BIN}/node" --version
+            exit 0
+          fi
+          OS="$(uname -s)"
+          ARCH="$(uname -m)"
+          case "${OS}-${ARCH}" in
+            Darwin-x86_64) NODE_ARCH=darwin-x64 ;;
+            Darwin-arm64)  NODE_ARCH=darwin-arm64 ;;
+            Linux-x86_64)  NODE_ARCH=linux-x64 ;;
+            Linux-aarch64) NODE_ARCH=linux-arm64 ;;
+            *) echo "::error::Unsupported Node arch: ${OS}-${ARCH}"; exit 1 ;;
+          esac
+          mkdir -p "${NODE_BIN%/*}"
+          curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/v22.22.0/node-v22.22.0-${NODE_ARCH}.tar.xz"
+          tar -xJf /tmp/node.tar.xz -C /tmp
+          cp -r "/tmp/node-v22.22.0-${NODE_ARCH}/bin" "/tmp/node-v22.22.0-${NODE_ARCH}/lib" "/tmp/node-v22.22.0-${NODE_ARCH}/include" "/tmp/node-v22.22.0-${NODE_ARCH}/share" "${NODE_BIN%/*}/"
+          "${NODE_BIN}/node" --version
