@@ -20,6 +20,10 @@ pub struct ExistingPrIntake {
     pub pr_number: u64,
     pub head_ref_name: String,
     pub external_ref: String,
+    /// jleechan-dljf (issue #271): resolved repo identity from the PR's
+    /// external_ref prefix, propagated through to the adoption path so
+    /// `run_slow_tier` never needs to re-derive it.
+    pub target_repo: Option<String>,
     pub newly_created: bool,
 }
 
@@ -66,26 +70,27 @@ pub struct IntakeOutcome {
 /// jleechan-35y4 Stage A: resolve which repo a bead belongs to, in
 /// precedence order:
 ///
-/// 1. An explicit `target_repo: <owner>/<name>` field in the bead body —
-///    the existing `/auto-factory` drive-existing-pr protocol grammar (see
-///    `.claude/skills/auto-factory/SKILL.md` §1c, alongside
-///    `existing_branch:`/`existing_pr:`). Applies identically to
-///    daemon-created beads and beads created manually via `br`.
-/// 2. Else the `owner/repo` prefix of the bead's `external_ref`
-///    (`"<owner>/<repo>#<number>"`).
-/// 3. Else `None` — legacy/manual bead with no way to determine its repo;
-///    callers fall back to the daemon's global `cfg.target_repo` via
-///    [`crate::state::BeadOverlay::repo`].
+/// 1. An explicit `target_repo: <owner>/<name>` field in the bead body.
+/// 2. Else the `owner/repo` prefix of the bead's `external_ref`.
+/// 3. Else `None` — legacy bead with no way to determine its repo;
+///    callers fall back to `cfg.target_repo` via `BeadOverlay::repo`.
+///
+/// jleechan-dljf (issue #271): resolved results are validated with
+/// `is_valid_owner_repo` — malformed strings return `None` rather than
+/// propagating an unparseable string.
 ///
 /// This is the single call site for body-field/external_ref repo-identity
 /// parsing — do not re-implement this precedence elsewhere.
 pub fn resolve_target_repo(body: &str, external_ref: Option<&str>) -> Option<String> {
     if let Some(explicit) = parse_target_repo_body_field(body) {
-        return Some(explicit);
+        if crate::config::is_valid_owner_repo(&explicit) {
+            return Some(explicit);
+        }
     }
     external_ref
         .and_then(parse_owner_repo_from_external_ref)
         .map(|(owner_repo, _issue)| owner_repo)
+        .filter(|s| crate::config::is_valid_owner_repo(s))
 }
 
 /// Same `owner/repo#N` split as the private `parse_external_ref` helpers in
@@ -345,11 +350,13 @@ pub fn normalize_labeled_prs(
             .iter()
             .find(|bead| bead.external_ref.as_deref() == Some(pr.external_ref.as_str()))
         {
+            let target_repo = resolve_target_repo(&pr.body, Some(pr.external_ref.as_str()));
             intakes.push(ExistingPrIntake {
                 bead_id: bead.id.clone(),
                 pr_number: pr.number,
                 head_ref_name: pr.head_ref_name,
                 external_ref: pr.external_ref,
+                target_repo,
                 newly_created: false,
             });
             continue;
@@ -401,11 +408,13 @@ pub fn normalize_labeled_prs(
             bead_id, pr.head_ref_name
         );
         let _ = tracker.comment_external(&pr.external_ref, &comment_body);
+        let target_repo = resolve_target_repo(&pr.body, Some(pr.external_ref.as_str()));
         intakes.push(ExistingPrIntake {
             bead_id,
             pr_number: pr.number,
             head_ref_name: pr.head_ref_name,
             external_ref: pr.external_ref,
+            target_repo,
             newly_created: true,
         });
     }
@@ -418,8 +427,8 @@ mod tests {
     // Unit-level coverage for the pure permission-gate helper; the fake-backed
     // contract tests (idempotency, write-tier gate, mixed batch) live in
     // `daemon/tests/intake.rs` per Task 6 Step 1.
-    use crate::tools::Permission;
     use super::resolve_target_repo;
+    use crate::tools::Permission;
 
     #[test]
     fn permission_write_tier_gate_matches_design_contract() {
@@ -436,7 +445,8 @@ mod tests {
 
     #[test]
     fn resolve_target_repo_prefers_explicit_body_field_over_external_ref() {
-        let body = "Some description.\ntarget_repo: jleechanorg/dark-factory\nexisting_branch: fix/x\n";
+        let body =
+            "Some description.\ntarget_repo: jleechanorg/dark-factory\nexisting_branch: fix/x\n";
         let got = resolve_target_repo(body, Some("jleechanorg/worldarchitect.ai#123"));
         assert_eq!(got.as_deref(), Some("jleechanorg/dark-factory"));
     }

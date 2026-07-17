@@ -4,12 +4,13 @@
 // `StateStore` trait calls — no subprocess use, no LLM judgment (ZFC: routing
 // to SMALL_PATH/STANDARD_PATH already happened in router.rs; this module only
 // spawns whatever `ready` already contains, in order).
-use crate::config::Config;
+use crate::config::{Config, RoutingSource};
 use crate::errors::DaemonError;
 use crate::router::RoutingVerdict;
 use crate::state::{
     set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
 };
+use crate::telemetry::TelemetryEvent;
 use crate::tools::{remote_url_for_display, remote_url_matches_repo, Bead, Sessions, SpawnSpec};
 
 #[cfg(test)]
@@ -80,10 +81,10 @@ pub struct DispatchSuccess {
     pub attempt: u32,
     pub branch: String,
     pub session_id: String,
-    /// `overlay.repo(cfg)` at dispatch time (bead jleechan-35y4 Stage A/B):
-    /// surfaced so `tick.rs`'s `TASK_DISPATCHED` telemetry makes the
-    /// resolved repo visible in daemon.jsonl.
     pub target_repo: String,
+    /// jleechan-dljf skeptic: routing provenance for structured JSONL
+    /// telemetry (Explicit/GlobalTarget/Derived).
+    pub routing_source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +126,31 @@ fn failure(
     }
 }
 
+fn now_iso8601() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (y, mo, d) = civil_from_days(days as i64);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 /// Dispatch as many `ready` beads as the safety envelope allows.
 ///
 /// Free slots = `min(max_workers - active_count, max_batch)` (spec §4.2.8).
@@ -161,6 +187,7 @@ pub fn dispatch_ready(
     store: &dyn StateStore,
     cfg: &Config,
     ready: &[(Bead, RoutingVerdict)],
+    telemetry_log: Option<&std::path::Path>,
 ) -> Result<DispatchReport, DaemonError> {
     let active = sessions.active_count()?;
     let free_slots = cfg.max_workers.saturating_sub(active);
@@ -186,9 +213,9 @@ pub fn dispatch_ready(
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             },
             Err(err) if err.is_transient() => {
                 report
@@ -240,6 +267,58 @@ pub fn dispatch_ready(
             }
         };
 
+        // jleechan-87ea: emit DERIVED_ROUTE_RESOLVED BEFORE any derived
+        // dispatch, branch-register, or spawn so derived-route telemetry is
+        // durable even for deferred or failed spawns. Fail-closed: the emit
+        // is NOT best-effort — a DERIVED route whose telemetry cannot be
+        // written must park rather than silently dispatch without a durable
+        // provenance record (jleechan-y8vk correction).
+        if routing.source == RoutingSource::Derived {
+            if let Some(log) = telemetry_log {
+                let ev = TelemetryEvent {
+                    timestamp: now_iso8601(),
+                    bead_id: bead.id.clone(),
+                    attempt_id: overlay.attempt,
+                    lifecycle_state: OverlayState::Queued.as_str().to_string(),
+                    event_type: "DERIVED_ROUTE_RESOLVED".to_string(),
+                    metrics: serde_json::json!({}),
+                    context: serde_json::json!({
+                        "target_repo": &repo,
+                        "routing_source": "derived",
+                    }),
+                };
+                if let Err(err) = crate::telemetry::emit(log, &ev) {
+                    overlay.state = OverlayState::Queued;
+                    store.save(&overlay)?;
+                    report.failures.push(failure(
+                        bead,
+                        overlay.attempt,
+                        None,
+                        "derived_route_telemetry",
+                        DaemonError::Config(format!(
+                            "DERIVED_ROUTE_RESOLVED telemetry emit failed for bead {} (repo {repo:?}): {err}",
+                            bead.id
+                        )),
+                    ));
+                    continue;
+                }
+            } else {
+                overlay.state = OverlayState::Queued;
+                store.save(&overlay)?;
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    None,
+                    "derived_route_telemetry",
+                    DaemonError::Config(format!(
+                        "telemetry_log required for derived route dispatch for bead {} (repo {repo:?}): telemetry_log is None",
+                        bead.id
+                    )),
+                ));
+                continue;
+            }
+        }
+
         let branch = format!("factory/{}-r{}", bead.id, overlay.attempt);
 
         // Register the branch + persist the DISPATCHING intent BEFORE
@@ -289,12 +368,6 @@ pub fn dispatch_ready(
                     bead.title
                 )
             }
-            // jleechan-bqdv Stage C: `build_coder_prompt` (jleechan-if09,
-            // PR #247) now takes the bead's RESOLVED repo (`repo`, from
-            // Stage A/B — not the bare `cfg.target_repo` #247 used as an
-            // interim mitigation before this bead's `[repos]` plumbing
-            // existed) plus the exact `routing.push_remote`, closing the
-            // gap #247's doc comment explicitly deferred to this bead.
             _ => build_coder_prompt(bead, &branch, &repo, &routing.push_remote),
         };
 
@@ -595,6 +668,7 @@ pub fn dispatch_ready(
             branch,
             session_id: session_id.0,
             target_repo: repo,
+            routing_source: routing.source.as_str().to_string(),
         });
     }
 
@@ -865,19 +939,14 @@ mod tests {
         // returning a session whose live branch does NOT match what was
         // requested (the wa-3004 contamination scenario).
         scripted_branch: RefCell<HashMap<String, String>>,
-        /// jleechan-bqdv Stage C: captures every `(bead_id, prompt)` passed
-        /// to `spawn()`, so the dispatch-prompt-content acceptance test can
-        /// assert on the exact rendered prompt string without needing
-        /// `Sessions::spawn` to do anything else differently. Supersedes
-        /// jleechan-if09's narrower `prompts: RefCell<Vec<String>>` (same
-        /// purpose, plus the bead id).
-        spawn_prompts: RefCell<Vec<(String, String)>>,
-        /// jleechan-bqdv Stage C: scripted `worktree_remote_url` override,
-        /// keyed by `ao_project`. Empty by default (matches the trait's
-        /// `Ok(None)` default — "cannot verify") so every pre-existing test
-        /// keeps trusting a fresh spawn unconditionally; only the
-        /// worktree-remote-mismatch regression tests populate this.
+        // jleechan-bqdv: scripted `worktree_remote_url` override, keyed by
+        // ao_project. Empty by default (matches the trait's `Ok(None)`) so
+        // pre-existing tests are unaffected.
         scripted_worktree_remote: RefCell<HashMap<String, String>>,
+        // jleechan-if09: captured (bead_id, SpawnSpec.prompt) per spawn, so
+        // tests can pin what the coder actually receives (the wiring, not
+        // just the builder function).
+        spawn_prompts: RefCell<Vec<(String, String)>>,
     }
 
     impl FakeSessions {
@@ -1025,10 +1094,7 @@ mod tests {
                     ),
                     (
                         "agy".to_string(),
-                        DaemonError::Deferred(format!(
-                            "REQUEST=sq-scripted-{}",
-                            spec.bead_id
-                        )),
+                        DaemonError::Deferred(format!("REQUEST=sq-scripted-{}", spec.bead_id)),
                     ),
                 ]));
             }
@@ -1293,7 +1359,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(40);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(
             report.success_count(),
@@ -1316,7 +1382,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(40);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(
             report.success_count(),
@@ -1339,7 +1405,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(40);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(report.success_count(), 0);
         let spawn_calls = sessions
@@ -1372,15 +1438,15 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             })
             .unwrap();
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(report.success_count(), 1);
 
         assert_eq!(store.branches.borrow().as_slice(), ["factory/bead-0-r1"]);
@@ -1390,14 +1456,11 @@ mod tests {
         assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
     }
 
-    /// jleechan-35y4 Stage B acceptance criterion: a bead whose resolved
-    /// `target_repo` (Stage A) names neither an explicit `[repos.*]` entry
-    /// nor the daemon's global `cfg.target_repo` must park HUMAN_HELD with
-    /// reason `unmapped_target_repo` — fail loud, never guess/fall back to
-    /// the global repo (the jleechan-9sh5 discipline this spec explicitly
-    /// calls out). No branch registration, no spawn attempt.
+    /// jleechan-dljf (issue #271): valid `owner/repo` strings now derive safe
+    /// defaults, so they no longer park HUMAN_HELD. Only MALFORMED repo
+    /// strings still fail closed.
     #[test]
-    fn dispatch_ready_parks_human_held_when_target_repo_is_unmapped() {
+    fn dispatch_ready_parks_human_held_when_target_repo_is_malformed() {
         let sessions = FakeSessions::new(0);
         let store = FakeStateStore::new();
         store
@@ -1415,38 +1478,28 @@ mod tests {
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
-                // Neither cfg().target_repo ("owner/repo") nor any
-                // [repos.*] entry (cfg() has an empty repos table) names
-                // this repo.
-                target_repo: Some("someorg/unrelated-repo".to_string()),
+                target_repo: Some("just-a-bare-string".to_string()),
             })
             .unwrap();
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
-        assert_eq!(report.success_count(), 0, "unmapped repo must never spawn");
+        assert_eq!(report.success_count(), 0, "malformed repo must never spawn");
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].phase, "unmapped_target_repo");
         assert!(
-            report.failures[0].error.contains("someorg/unrelated-repo"),
-            "error should name the unmapped repo: {}",
-            report.failures[0].error
+            report.failures[0].error.contains("just-a-bare-string"),
+            "error should name the malformed repo"
         );
 
         let overlay = store.load("bead-0").unwrap().unwrap();
         assert_eq!(overlay.state, OverlayState::HumanHeld);
         assert_eq!(overlay.park_reason.as_deref(), Some("unmapped_target_repo"));
-        assert!(
-            overlay.branch.is_none(),
-            "no branch should ever be registered/assigned for an unmappable bead"
-        );
-        assert!(
-            store.branches.borrow().is_empty(),
-            "register_branch must never be called for an unmapped repo"
-        );
-        let spawn_calls = sessions
+        assert!(overlay.branch.is_none());
+        assert!(store.branches.borrow().is_empty());
+        let spawn_calls: usize = sessions
             .calls
             .borrow()
             .iter()
@@ -1455,7 +1508,72 @@ mod tests {
         assert_eq!(spawn_calls, 0, "Sessions::spawn must never be called");
     }
 
-    /// Companion to the unmapped-repo park test: when the bead's
+    /// jleechan-dljf (issue #271): a valid unseen repo must derive safe
+    /// defaults and dispatch normally — no per-repo config required.
+    #[test]
+    fn dispatch_ready_derives_defaults_for_unseen_valid_repo() {
+        let sessions = FakeSessions::new(0);
+        sessions.set_worktree_remote(
+            "ez-gh-actions",
+            "https://github.com/jleechanorg/ez-gh-actions.git",
+        );
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("jleechanorg/ez-gh-actions".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let telemetry_log =
+            std::env::temp_dir().join(format!("afd_derive_unseen_{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
+
+        assert_eq!(report.success_count(), 1, "unseen valid repo must dispatch");
+        assert_eq!(report.failures.len(), 0);
+
+        let log_content = std::fs::read_to_string(&telemetry_log).unwrap();
+        assert!(
+            log_content.contains("DERIVED_ROUTE_RESOLVED"),
+            "DERIVED_ROUTE_RESOLVED must be emitted for derived dispatch: {log_content}"
+        );
+        assert!(
+            log_content.contains("jleechanorg/ez-gh-actions"),
+            "telemetry context must carry the derived target_repo"
+        );
+
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Dispatched);
+        assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
+
+        let prompts = sessions.spawn_prompts.borrow();
+        let prompt = &prompts[0].1;
+        assert!(prompt.contains("jleechanorg/ez-gh-actions"));
+        assert!(
+            !prompt.contains("jleechanorg/dark-factory"),
+            "prompt must NOT contain cfg.target_repo; bead target_repo must be used instead"
+        );
+    }
+
+    /// Companion to the malformed-repo park test: when the bead's
     /// `target_repo` DOES have an explicit `[repos.*]` entry (distinct from
     /// `cfg.target_repo`), dispatch must proceed normally and the resolved
     /// `SpawnSpec` must carry that entry's `ao_project`/`push_remote`, not
@@ -1493,7 +1611,7 @@ mod tests {
         );
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(report.success_count(), 1);
         let overlay = store.load("bead-0").unwrap().unwrap();
@@ -1507,7 +1625,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(5);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(
             report.success_count(),
             1,
@@ -1535,7 +1653,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(report.success_count(), 1);
 
         // Final state is DISPATCHED (spawn + confirmation both succeeded),
@@ -1568,7 +1686,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(
             report.success_count(),
@@ -1603,7 +1721,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
 
         assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
         let overlay = store.load("bead-0").unwrap().unwrap();
@@ -1636,7 +1754,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(report.success_count(), 0);
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].bead_id, "bead-0");
@@ -1669,7 +1787,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(report.success_count(), 1);
         assert_eq!(report.successes[0].bead_id, "bead-1");
@@ -1700,7 +1818,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(
             report.success_count(),
@@ -1719,7 +1837,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(3);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         let success_ids: Vec<&str> = report
             .successes
@@ -1761,7 +1879,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(3);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         let success_ids: Vec<&str> = report
             .successes
@@ -1818,7 +1936,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(3);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         let success_ids: Vec<&str> = report
             .successes
@@ -1866,7 +1984,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
         assert!(
             matches!(err, DaemonError::Parse(_)),
             "non-transient spawn failure must stop the batch: {err:?}"
@@ -1891,7 +2009,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
 
         assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
         assert!(!err.is_transient());
@@ -1924,7 +2042,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
 
         assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
         assert!(err
@@ -1952,7 +2070,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(report.success_count(), 1);
         assert_eq!(report.successes[0].bead_id, "bead-1");
@@ -1981,7 +2099,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
         assert!(
             matches!(err, DaemonError::Tool { .. }),
             "failed rollback requeue must be fatal so top-level reconciliation can recover: {err:?}"
@@ -2008,7 +2126,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
         assert!(
             matches!(err, DaemonError::SpawnCleanupFailed { .. }),
             "stop failure must remain fatal because a live untracked worker may remain: {err:?}"
@@ -2044,7 +2162,12 @@ mod tests {
             file_tree_summary: "src/\n  flux.rs\n  main.rs".into(),
             external_ref: Some("jleechanorg/delorean#42".into()),
         };
-        let prompt = build_coder_prompt(&bead, "factory/bead-x-r1", "jleechanorg/delorean", "worldai");
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/bead-x-r1",
+            "jleechanorg/delorean",
+            "worldai",
+        );
 
         assert!(prompt.contains("Fix the flux capacitor"), "title missing");
         assert!(
@@ -2245,7 +2368,7 @@ mod tests {
             },
             RoutingVerdict::ResearchPath,
         )];
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(report.success_count(), 1);
         let prompts = sessions.spawn_prompts.borrow();
         assert!(
@@ -2273,7 +2396,7 @@ mod tests {
             },
             RoutingVerdict::StandardPath,
         )];
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(report.success_count(), 1);
         let prompts = sessions.spawn_prompts.borrow();
         assert!(
@@ -2300,7 +2423,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(report.success_count(), 1);
 
         let prompts = sessions.spawn_prompts.borrow();
@@ -2308,7 +2431,10 @@ mod tests {
         let prompt = &prompts[0].1;
         assert!(prompt.contains("REPO: owner/repo"), "prompt: {prompt}");
         assert!(prompt.contains("REMOTE: origin"), "prompt: {prompt}");
-        assert!(prompt.contains("BRANCH: factory/bead-0-r1"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("BRANCH: factory/bead-0-r1"),
+            "prompt: {prompt}"
+        );
         assert!(
             prompt.contains("git push origin factory/bead-0-r1"),
             "prompt must state the literal push command verbatim: {prompt}"
@@ -2350,12 +2476,15 @@ mod tests {
         );
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
         assert_eq!(report.success_count(), 1);
 
         let prompts = sessions.spawn_prompts.borrow();
         let prompt = &prompts[0].1;
-        assert!(prompt.contains("REPO: jleechanorg/worldarchitect.ai"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("REPO: jleechanorg/worldarchitect.ai"),
+            "prompt: {prompt}"
+        );
         assert!(prompt.contains("REMOTE: worldai"), "prompt: {prompt}");
         assert!(
             prompt.contains("git push worldai factory/bead-0-r1"),
@@ -2382,7 +2511,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(
             report.success_count(),
@@ -2428,7 +2557,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(report.success_count(), 1);
         assert!(report.failures.is_empty());
@@ -2461,7 +2590,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
         assert!(
             matches!(err, DaemonError::SpawnCleanupFailed { .. }),
             "failure to kill a confirmed wrong-repo session must be fatal"
@@ -2495,7 +2624,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(2);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
 
         assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
         assert!(err
@@ -2526,7 +2655,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
         assert_eq!(report.success_count(), 0);
         assert_eq!(report.failures[0].phase, "worktree_remote_unverifiable");
@@ -2554,7 +2683,7 @@ mod tests {
         let cfg = cfg();
         let ready = beads(1);
 
-        let err = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap_err();
+        let err = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap_err();
 
         assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
         assert!(!err.is_transient());
@@ -2584,7 +2713,7 @@ mod tests {
             let cfg = cfg();
             let ready = beads(1);
 
-            let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+            let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
 
             assert_eq!(report.success_count(), 0, "remote={remote_url}");
             assert_eq!(report.failures[0].phase, "worktree_remote_mismatch", "remote={remote_url}");
@@ -2597,5 +2726,310 @@ mod tests {
             assert_eq!(overlay.state, OverlayState::HumanHeld);
             assert_eq!(overlay.park_reason.as_deref(), Some("worktree_remote_mismatch"));
         }
+    }
+
+    // jleechan-y8vk: DERIVED_ROUTE_RESOLVED fail-closed telemetry tests.
+    // The emit must succeed before any derived dispatch, branch-register,
+    // or spawn. Four scenarios: success, deferred, spawn failure,
+    // unwritable log.
+
+    /// DERIVED_ROUTE_RESOLVED is emitted and dispatch succeeds.
+    #[test]
+    fn derived_route_telemetry_emitted_on_success() {
+        let sessions = FakeSessions::new(0);
+        sessions.set_worktree_remote(
+            "ez-gh-actions",
+            "https://github.com/jleechanorg/ez-gh-actions.git",
+        );
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("jleechanorg/ez-gh-actions".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let telemetry_log = std::env::temp_dir().join(format!(
+            "afd_derived_route_success_{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
+
+        assert_eq!(report.success_count(), 1, "derived route must dispatch");
+        assert!(report.failures.is_empty());
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Dispatched);
+
+        let log_content = std::fs::read_to_string(&telemetry_log).unwrap();
+        assert!(
+            log_content.contains("DERIVED_ROUTE_RESOLVED"),
+            "DERIVED_ROUTE_RESOLVED event must be emitted before dispatch: {log_content}"
+        );
+        assert!(
+            log_content.contains("jleechanorg/ez-gh-actions"),
+            "telemetry context must carry the derived target_repo"
+        );
+
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+
+    /// DERIVED_ROUTE_RESOLVED is emitted even when spawn is deferred
+    /// (admission-control backpressure), BEFORE the spawn attempt.
+    #[test]
+    fn derived_route_telemetry_emitted_on_deferred_spawn() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_deferred_for("bead-0");
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("jleechanorg/ez-gh-actions".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let telemetry_log = std::env::temp_dir().join(format!(
+            "afd_derived_route_deferred_{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
+
+        assert_eq!(report.success_count(), 0);
+        assert!(
+            report.failures.iter().any(|f| f.phase == "spawn_deferred"),
+            "deferred spawn must be reported"
+        );
+
+        let log_content = std::fs::read_to_string(&telemetry_log).unwrap();
+        assert!(
+            log_content.contains("DERIVED_ROUTE_RESOLVED"),
+            "DERIVED_ROUTE_RESOLVED must be emitted BEFORE the deferred spawn: {log_content}"
+        );
+
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+
+    /// DERIVED_ROUTE_RESOLVED is emitted even when spawn fails with
+    /// a transient tool error, BEFORE the spawn attempt.
+    #[test]
+    fn derived_route_telemetry_emitted_on_spawn_failure() {
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_for("bead-0");
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("jleechanorg/ez-gh-actions".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let telemetry_log = std::env::temp_dir().join(format!(
+            "afd_derived_route_spawn_fail_{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, Some(&telemetry_log)).unwrap();
+
+        assert_eq!(report.success_count(), 0);
+        assert!(
+            report.failures.iter().any(|f| f.phase == "spawn"),
+            "spawn failure must be reported"
+        );
+
+        let log_content = std::fs::read_to_string(&telemetry_log).unwrap();
+        assert!(
+            log_content.contains("DERIVED_ROUTE_RESOLVED"),
+            "DERIVED_ROUTE_RESOLVED must be emitted BEFORE the failed spawn: {log_content}"
+        );
+        assert!(
+            log_content.contains("jleechanorg/ez-gh-actions"),
+            "telemetry context must carry the derived target_repo even on failure"
+        );
+
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+
+    /// Unwritable telemetry log must block derived-route dispatch
+    /// (fail-closed): no branch register, no spawn, no dispatch state.
+    #[test]
+    #[cfg(unix)]
+    fn derived_route_unwritable_log_blocks_dispatch() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("jleechanorg/ez-gh-actions".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        // A directory path where a file can't be opened (isdir error)
+        let unwritable_dir =
+            std::env::temp_dir().join(format!("afd_derived_unwritable_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&unwritable_dir);
+        std::fs::create_dir_all(&unwritable_dir).unwrap();
+
+        let report =
+            dispatch_ready(&sessions, &store, &cfg, &ready, Some(&unwritable_dir)).unwrap();
+
+        // The dispatch must NOT succeed for the derived bead
+        assert_eq!(
+            report.success_count(),
+            0,
+            "derived route must not dispatch on unwritable log"
+        );
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| f.phase == "derived_route_telemetry"),
+            "fail-closed: derived route must fail with derived_route_telemetry phase when emit fails: {:?}",
+            report.failures
+        );
+
+        // The bead must remain Queued (NOT Dispatched)
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            overlay.state,
+            OverlayState::Queued,
+            "bead must stay Queued after emit failure"
+        );
+
+        // No branch must have been registered
+        let branches = store.owned_branches().unwrap();
+        assert!(
+            branches.is_empty(),
+            "no branch must be registered on emit failure"
+        );
+
+        // No spawn must have been attempted
+        let calls = sessions.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("spawn(")),
+            "no spawn must have been attempted on emit failure: {calls:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&unwritable_dir);
+    }
+
+    /// `telemetry_log` is `None` — a derived route must NOT silently dispatch
+    /// without a durable DERIVED_ROUTE_RESOLVED provenance record (jleechan-ntzj
+    /// correction: the None-success path was a gap in the original fail-closed
+    /// design; the production caller always passes Some, but the public API
+    /// must enforce the invariant). Regression: no branch register, no spawn,
+    /// no dispatch state.
+    #[test]
+    fn derived_route_none_telemetry_log_blocks_dispatch() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("jleechanorg/ez-gh-actions".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready, None).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            0,
+            "derived route must not dispatch when telemetry_log is None"
+        );
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| f.phase == "derived_route_telemetry"),
+            "fail-closed: derived route must fail with derived_route_telemetry phase when telemetry_log is None: {:?}",
+            report.failures
+        );
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Queued, "bead must stay Queued");
+
+        let branches = store.owned_branches().unwrap();
+        assert!(branches.is_empty(), "no branch must be registered");
+
+        let calls = sessions.calls.borrow();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("spawn(")),
+            "no spawn must have been attempted: {calls:?}"
+        );
     }
 }

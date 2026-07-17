@@ -2517,4 +2517,280 @@ mod tests {
         let h_after = store.load("h").unwrap().unwrap();
         assert_eq!(h_after.autonomy_secs, 10299);
     }
+
+    /// jleechan-87ea skeptic: overlay target_repo must survive save/load
+    /// roundtrip and be verifiable at every lookup instant — proves the
+    /// fake-gh seam: when a BeadOverlay carries a persisted target_repo,
+    /// loading it at any point returns the same repo identity, not None
+    /// or the daemon global default.
+    #[test]
+    fn overlay_target_repo_persists_through_repeated_loads() {
+        let s = store();
+        let target = Some("jleechanorg/ez-gh-actions".to_string());
+        let o = BeadOverlay {
+            bead_id: "b-repo".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: None,
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: target.clone(),
+        };
+        s.save(&o).unwrap();
+
+        // Multiple load instants — each must return the same persisted repo.
+        for _ in 0..5 {
+            let got = s.load("b-repo").unwrap().unwrap();
+            assert_eq!(
+                got.target_repo, target,
+                "target_repo must survive each load instant"
+            );
+        }
+    }
+
+    /// jleechan-87ea skeptic: a populated overlay with non-default metadata
+    /// in every field (state, attempt, reroll, session, branch, target_repo,
+    /// park_reason, etc.) must preserve all values through a save/load
+    /// roundtrip — repository persistence must not clobber unrelated state.
+    #[test]
+    fn overlay_populated_metadata_persists_full_roundtrip() {
+        let s = store();
+        let o = BeadOverlay {
+            bead_id: "b-full".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 7,
+            reroll_count: 3,
+            autonomy_secs: 4200,
+            spend_usd: 12.75,
+            pr_number: Some(271),
+            branch: Some("factory/b-full-r7".into()),
+            session_id: Some("ao-session-abc123".into()),
+            is_adopted: true,
+            spawn_failure_count: 2,
+            pre_session_head_sha: Some("abc123def456".into()),
+            park_reason: Some("session_stalled".into()),
+            target_repo: Some("jleechanorg/dark-factory".into()),
+        };
+        s.save(&o).unwrap();
+        let got = s.load("b-full").unwrap().unwrap();
+
+        assert_eq!(got.bead_id, "b-full");
+        assert_eq!(got.state, OverlayState::HumanHeld);
+        assert_eq!(got.attempt, 7);
+        assert_eq!(got.reroll_count, 3);
+        assert_eq!(got.autonomy_secs, 4200);
+        assert_eq!(got.spend_usd, 12.75);
+        assert_eq!(got.pr_number, Some(271));
+        assert_eq!(got.branch, Some("factory/b-full-r7".into()));
+        assert_eq!(got.session_id, Some("ao-session-abc123".into()));
+        assert!(got.is_adopted);
+        assert_eq!(got.spawn_failure_count, 2);
+        assert_eq!(got.pre_session_head_sha, Some("abc123def456".into()));
+        assert_eq!(got.park_reason, Some("session_stalled".into()));
+        assert_eq!(got.target_repo, Some("jleechanorg/dark-factory".into()));
+    }
+
+    /// jleechan-y8vk: the real intake update path must be able to change
+    /// exactly `target_repo` (what `intake::resolve_target_repo` computes
+    /// from the bead's body/external_ref) without corrupting any other field.
+    /// Seed every unrelated field with distinct non-default values, then
+    /// simulate an intake-supplied target_repo update only, and prove all
+    /// other fields remain unchanged.
+    #[test]
+    fn overlay_populated_intake_update_only_target_repo_changes() {
+        let s = store();
+
+        let original = BeadOverlay {
+            bead_id: "b-intake-update".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 5,
+            reroll_count: 2,
+            autonomy_secs: 3600,
+            spend_usd: 8.50,
+            pr_number: Some(99),
+            branch: Some("factory/b-intake-update-r5".into()),
+            session_id: Some("ao-session-xyz789".into()),
+            is_adopted: true,
+            spawn_failure_count: 1,
+            pre_session_head_sha: Some("deadbeefcafe".into()),
+            park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
+            target_repo: Some("jleechanorg/worldarchitect.ai".into()),
+        };
+        s.save(&original).unwrap();
+
+        let loaded = s.load("b-intake-update").unwrap().unwrap();
+        assert_eq!(
+            loaded.target_repo,
+            Some("jleechanorg/worldarchitect.ai".into())
+        );
+
+        let updated = BeadOverlay {
+            bead_id: loaded.bead_id,
+            state: loaded.state,
+            attempt: loaded.attempt,
+            reroll_count: loaded.reroll_count,
+            autonomy_secs: loaded.autonomy_secs,
+            spend_usd: loaded.spend_usd,
+            pr_number: loaded.pr_number,
+            branch: loaded.branch,
+            session_id: loaded.session_id,
+            is_adopted: loaded.is_adopted,
+            spawn_failure_count: loaded.spawn_failure_count,
+            pre_session_head_sha: loaded.pre_session_head_sha,
+            park_reason: loaded.park_reason,
+            target_repo: Some("jleechanorg/dark-factory".into()),
+        };
+        s.save(&updated).unwrap();
+
+        let got = s.load("b-intake-update").unwrap().unwrap();
+
+        assert_eq!(got.bead_id, "b-intake-update");
+        assert_eq!(
+            got.state,
+            OverlayState::HumanHeld,
+            "state must not change during intake update"
+        );
+        assert_eq!(got.attempt, 5, "attempt must not change");
+        assert_eq!(got.reroll_count, 2, "reroll_count must not change");
+        assert_eq!(got.autonomy_secs, 3600, "autonomy_secs must not change");
+        assert_eq!(got.spend_usd, 8.50, "spend_usd must not change");
+        assert_eq!(got.pr_number, Some(99), "pr_number must not change");
+        assert_eq!(
+            got.branch,
+            Some("factory/b-intake-update-r5".into()),
+            "branch must not change"
+        );
+        assert_eq!(
+            got.session_id,
+            Some("ao-session-xyz789".into()),
+            "session_id must not change"
+        );
+        assert!(got.is_adopted, "is_adopted must not change");
+        assert_eq!(
+            got.spawn_failure_count, 1,
+            "spawn_failure_count must not change"
+        );
+        assert_eq!(
+            got.pre_session_head_sha,
+            Some("deadbeefcafe".into()),
+            "pre_session_head_sha must not change"
+        );
+        assert_eq!(
+            got.park_reason,
+            Some("transient_spawn_retry_cap_exceeded".into()),
+            "park_reason must not change"
+        );
+        assert_eq!(
+            got.target_repo,
+            Some("jleechanorg/dark-factory".into()),
+            "target_repo must reflect the intake-supplied update"
+        );
+        assert_ne!(
+            got.target_repo, original.target_repo,
+            "target_repo must actually differ from original to prove the update took effect"
+        );
+    }
+
+    /// jleechan-ntzj: production-path intake regression. Start with a fully
+    /// populated existing overlay (all fields set to distinct non-default
+    /// values already persisted), drive real `intake::resolve_target_repo()`
+    /// against a bead body carrying an explicit `target_repo:` field, and
+    /// prove that updating only the resolved target_repo leaves every other
+    /// field intact. Fresh intake/manual save-load are insufficient — this
+    /// test exercises the same `resolve_target_repo()` production call site
+    /// that `run_slow_tier` calls during the intake sweep.
+    #[test]
+    fn overlay_populated_intake_resolve_target_repo_production_path_preserves_unrelated_fields() {
+        let s = store();
+
+        let original = BeadOverlay {
+            bead_id: "b-intake-prod".into(),
+            state: OverlayState::Dispatched,
+            attempt: 8,
+            reroll_count: 4,
+            autonomy_secs: 7200,
+            spend_usd: 15.99,
+            pr_number: Some(314),
+            branch: Some("factory/b-intake-prod-r8".into()),
+            session_id: Some("ao-session-prod-001".into()),
+            is_adopted: true,
+            spawn_failure_count: 3,
+            pre_session_head_sha: Some("abcdef0123456789".into()),
+            park_reason: None,
+            target_repo: Some("jleechanorg/worldarchitect.ai".into()),
+        };
+        s.save(&original).unwrap();
+
+        let loaded = s.load("b-intake-prod").unwrap().unwrap();
+        assert_eq!(loaded.attempt, 8, "precondition: attempt persisted");
+        assert_eq!(
+            loaded.target_repo,
+            Some("jleechanorg/worldarchitect.ai".into()),
+            "precondition: target_repo persisted"
+        );
+
+        let body = "Some bead description\n\ntarget_repo: jleechanorg/dark-factory\n\nMore details";
+        let resolved = crate::intake::resolve_target_repo(body, None);
+        assert_eq!(
+            resolved,
+            Some("jleechanorg/dark-factory".to_string()),
+            "resolve_target_repo must parse the body field"
+        );
+
+        let mut updated = loaded.clone();
+        updated.target_repo = resolved;
+
+        assert_ne!(
+            updated.target_repo, original.target_repo,
+            "target_repo must actually change to prove the mutation took effect"
+        );
+
+        s.save(&updated).unwrap();
+        let got = s.load("b-intake-prod").unwrap().unwrap();
+
+        assert_eq!(got.bead_id, "b-intake-prod");
+        assert_eq!(
+            got.state,
+            OverlayState::Dispatched,
+            "state must not change during intake update"
+        );
+        assert_eq!(got.attempt, 8, "attempt must not change");
+        assert_eq!(got.reroll_count, 4, "reroll_count must not change");
+        assert_eq!(got.autonomy_secs, 7200, "autonomy_secs must not change");
+        assert_eq!(got.spend_usd, 15.99, "spend_usd must not change");
+        assert_eq!(got.pr_number, Some(314), "pr_number must not change");
+        assert_eq!(
+            got.branch,
+            Some("factory/b-intake-prod-r8".into()),
+            "branch must not change"
+        );
+        assert_eq!(
+            got.session_id,
+            Some("ao-session-prod-001".into()),
+            "session_id must not change"
+        );
+        assert!(got.is_adopted, "is_adopted must not change");
+        assert_eq!(
+            got.spawn_failure_count, 3,
+            "spawn_failure_count must not change"
+        );
+        assert_eq!(
+            got.pre_session_head_sha,
+            Some("abcdef0123456789".into()),
+            "pre_session_head_sha must not change"
+        );
+        assert_eq!(got.park_reason, None, "park_reason must not change");
+        assert_eq!(
+            got.target_repo,
+            Some("jleechanorg/dark-factory".into()),
+            "target_repo must reflect the intake-supplied update from resolve_target_repo"
+        );
+    }
 }

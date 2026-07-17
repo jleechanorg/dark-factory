@@ -62,7 +62,11 @@ pub fn summarize_file_tree(root: &std::path::Path, max_entries: usize) -> String
                 continue; // skip .git, .venv, dotfiles — noise for a router prompt
             }
             let path = entry.path();
-            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
 
             if path.is_dir() {
                 entries.push(format!("{rel}/"));
@@ -363,26 +367,11 @@ pub trait Scm {
     }
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError>;
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError>;
-    /// Repo-scoped variant of [`remote_branch_last_commit`](Scm::remote_branch_last_commit)
-    /// (bead jleechan-bqdv, Stage C of the multi-repo dispatch fix — see
-    /// `docs/multirepo-dispatch-investigation-2026-07-11.md`). The daemon's
-    /// coder-silence watcher (`tick.rs`'s `Dispatched` autonomy check) used
-    /// to always poll `cfg.target_repo`'s branch, which is silently wrong
-    /// for any bead whose `overlay.repo(cfg)` names a DIFFERENT repo — the
-    /// watcher could never observe that coder's real progress and would
-    /// eventually park it `coder_silent` even while it was actively pushing
-    /// commits to its own (correct) repo. `repo` should be
-    /// `overlay.repo(cfg)`, not `cfg.target_repo` directly. Default impl
-    /// ignores `repo` and delegates to `remote_branch_last_commit` so
-    /// existing test fakes and any impl that predates this method keep their
-    /// original (single-repo) behavior; `CliScm` overrides it to actually
-    /// retarget the query via `with_repo`.
     fn remote_branch_last_commit_for_repo(
         &self,
-        repo: &str,
+        _repo: &str,
         branch: &str,
     ) -> Result<Option<u64>, DaemonError> {
-        let _ = repo;
         self.remote_branch_last_commit(branch)
     }
 }
@@ -582,13 +571,11 @@ fn run_tool_with_cwd(
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|e| DaemonError::Tool {
-            tool: cmd.to_string(),
-            rc: -1,
-            stderr: format!("spawn failed: {e}"),
-        })?;
+    let mut child = command.spawn().map_err(|e| DaemonError::Tool {
+        tool: cmd.to_string(),
+        rc: -1,
+        stderr: format!("spawn failed: {e}"),
+    })?;
 
     // Take the pipes and hand them to dedicated reader threads immediately so
     // they drain concurrently with the wait/poll loop below. Readers run to
@@ -950,19 +937,14 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_tool_in_dir_sets_child_cwd() {
-        let tmp = std::env::temp_dir().join(format!(
-            "afd_run_tool_in_dir_{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("afd_run_tool_in_dir_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         // Run `pwd` in the tmp dir — if `current_dir` is honored, the output
         // is the canonicalized tmp path; if it is dropped, we get the daemon's
         // cwd which is something else under `cargo test`.
         let out = run_tool_in_dir("pwd", &[], tmp.to_str().unwrap(), 5).unwrap();
         assert!(
-            std::path::Path::new(out.trim())
-                .canonicalize()
-                .unwrap()
+            std::path::Path::new(out.trim()).canonicalize().unwrap()
                 == std::path::Path::new(tmp.to_str().unwrap())
                     .canonicalize()
                     .unwrap(),

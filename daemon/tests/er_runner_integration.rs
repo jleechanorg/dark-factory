@@ -70,7 +70,9 @@ impl Scm for ScmMock {
         &self,
         label: &str,
     ) -> Result<Vec<daemon::tools::LabeledPr>, daemon::errors::DaemonError> {
-        self.calls.borrow_mut().push(format!("labeled_prs({label})"));
+        self.calls
+            .borrow_mut()
+            .push(format!("labeled_prs({label})"));
         Ok(Vec::new())
     }
     fn collaborator_permission(
@@ -98,7 +100,10 @@ impl Scm for ScmMock {
         self.calls.borrow_mut().push(format!("close_pr({pr})"));
         Ok(())
     }
-    fn remote_branch_last_commit(&self, _b: &str) -> Result<Option<u64>, daemon::errors::DaemonError> {
+    fn remote_branch_last_commit(
+        &self,
+        _b: &str,
+    ) -> Result<Option<u64>, daemon::errors::DaemonError> {
         Ok(None)
     }
 }
@@ -132,7 +137,9 @@ impl Tracker for TrackerMock {
         Ok(Vec::new())
     }
     fn fetch_all_external_refs(&self) -> Result<HashSet<String>, daemon::errors::DaemonError> {
-        self.calls.borrow_mut().push("fetch_all_external_refs".into());
+        self.calls
+            .borrow_mut()
+            .push("fetch_all_external_refs".into());
         Ok(HashSet::new())
     }
     fn create_bead(
@@ -143,7 +150,11 @@ impl Tracker for TrackerMock {
     ) -> Result<String, daemon::errors::DaemonError> {
         Ok("fake-bead-1".into())
     }
-    fn comment_external(&self, ext_ref: &str, body: &str) -> Result<(), daemon::errors::DaemonError> {
+    fn comment_external(
+        &self,
+        ext_ref: &str,
+        body: &str,
+    ) -> Result<(), daemon::errors::DaemonError> {
         self.calls
             .borrow_mut()
             .push(format!("comment_external({ext_ref},{body})"));
@@ -196,20 +207,24 @@ impl Vcs for VcsMock {
     fn head_sha(&self, _b: &str) -> Result<String, daemon::errors::DaemonError> {
         Ok("deadbeef".into())
     }
-    fn is_remote_ahead(
-        &self,
-        _b: &str,
-        _r: &str,
-    ) -> Result<bool, daemon::errors::DaemonError> {
+    fn is_remote_ahead(&self, _b: &str, _r: &str) -> Result<bool, daemon::errors::DaemonError> {
         Ok(false)
     }
-    fn push_fix_commit(&self, _branch: &str, _message: &str) -> Result<(), daemon::errors::DaemonError> {
+    fn push_fix_commit(
+        &self,
+        _branch: &str,
+        _message: &str,
+    ) -> Result<(), daemon::errors::DaemonError> {
         Ok(())
     }
     fn remote_head_sha(&self, _branch: &str) -> Result<String, daemon::errors::DaemonError> {
         Ok("deadbeef".into())
     }
-    fn is_ancestor(&self, _ancestor_sha: &str, _descendant_sha: &str) -> Result<bool, daemon::errors::DaemonError> {
+    fn is_ancestor(
+        &self,
+        _ancestor_sha: &str,
+        _descendant_sha: &str,
+    ) -> Result<bool, daemon::errors::DaemonError> {
         Ok(true)
     }
 }
@@ -231,7 +246,11 @@ impl StateStore for StoreMock {
             .insert(overlay.bead_id.clone(), overlay.clone());
         Ok(())
     }
-    fn register_branch(&self, bead_id: &str, branch: &str) -> Result<(), daemon::errors::DaemonError> {
+    fn register_branch(
+        &self,
+        bead_id: &str,
+        branch: &str,
+    ) -> Result<(), daemon::errors::DaemonError> {
         self.branch_beads
             .borrow_mut()
             .insert(branch.to_string(), bead_id.to_string());
@@ -242,16 +261,26 @@ impl StateStore for StoreMock {
         v.sort();
         Ok(v)
     }
-    fn bead_id_for_branch(&self, branch: &str) -> Result<Option<String>, daemon::errors::DaemonError> {
+    fn bead_id_for_branch(
+        &self,
+        branch: &str,
+    ) -> Result<Option<String>, daemon::errors::DaemonError> {
         Ok(self.branch_beads.borrow().get(branch).cloned())
     }
-    fn increment_active_autonomy(&self, _e: u64) -> Result<Vec<BeadOverlay>, daemon::errors::DaemonError> {
+    fn increment_active_autonomy(
+        &self,
+        _e: u64,
+    ) -> Result<Vec<BeadOverlay>, daemon::errors::DaemonError> {
         Ok(Vec::new())
     }
     fn list_active_overlays(&self) -> Result<Vec<BeadOverlay>, daemon::errors::DaemonError> {
         Ok(Vec::new())
     }
-    fn bump_autonomy_secs(&self, _bead_id: &str, _delta_secs: u64) -> Result<(), daemon::errors::DaemonError> {
+    fn bump_autonomy_secs(
+        &self,
+        _bead_id: &str,
+        _delta_secs: u64,
+    ) -> Result<(), daemon::errors::DaemonError> {
         Ok(())
     }
     fn human_held_at_or_above_attempt(
@@ -354,9 +383,9 @@ fn attested_overlay(bead_id: &str, pr: u64) -> BeadOverlay {
         session_id: Some("s1".into()),
         is_adopted: false,
         spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
     }
 }
 

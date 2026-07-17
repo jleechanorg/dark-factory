@@ -39,11 +39,27 @@ pub fn redact_holdouts(text: &str) -> (String, bool) {
 
             // Check for surrounding quotes or punctuation (e.g. at the start/end)
             let mut start_idx = 0;
-            while start_idx < word.len() && (word.as_bytes()[start_idx] == b'"' || word.as_bytes()[start_idx] == b'\'' || word.as_bytes()[start_idx] == b'(' || word.as_bytes()[start_idx] == b'[' || word.as_bytes()[start_idx] == b'{') {
+            while start_idx < word.len()
+                && (word.as_bytes()[start_idx] == b'"'
+                    || word.as_bytes()[start_idx] == b'\''
+                    || word.as_bytes()[start_idx] == b'('
+                    || word.as_bytes()[start_idx] == b'['
+                    || word.as_bytes()[start_idx] == b'{')
+            {
                 start_idx += 1;
             }
             let mut end_idx = word.len();
-            while end_idx > start_idx && (word.as_bytes()[end_idx - 1] == b'"' || word.as_bytes()[end_idx - 1] == b'\'' || word.as_bytes()[end_idx - 1] == b')' || word.as_bytes()[end_idx - 1] == b']' || word.as_bytes()[end_idx - 1] == b'}' || word.as_bytes()[end_idx - 1] == b'.' || word.as_bytes()[end_idx - 1] == b',' || word.as_bytes()[end_idx - 1] == b';' || word.as_bytes()[end_idx - 1] == b':') {
+            while end_idx > start_idx
+                && (word.as_bytes()[end_idx - 1] == b'"'
+                    || word.as_bytes()[end_idx - 1] == b'\''
+                    || word.as_bytes()[end_idx - 1] == b')'
+                    || word.as_bytes()[end_idx - 1] == b']'
+                    || word.as_bytes()[end_idx - 1] == b'}'
+                    || word.as_bytes()[end_idx - 1] == b'.'
+                    || word.as_bytes()[end_idx - 1] == b','
+                    || word.as_bytes()[end_idx - 1] == b';'
+                    || word.as_bytes()[end_idx - 1] == b':')
+            {
                 end_idx -= 1;
             }
 
@@ -112,7 +128,10 @@ pub fn extract(llm: &dyn Llm, review_text: &str) -> Result<Extracted, DaemonErro
 /// Atomicity is guaranteed via write-temp -> fsync -> rename.
 pub fn append_mutation(spec_path: &Path, block: &str) -> Result<(), DaemonError> {
     let parent = spec_path.parent().ok_or_else(|| {
-        DaemonError::Config(format!("spec path {} has no parent directory", spec_path.display()))
+        DaemonError::Config(format!(
+            "spec path {} has no parent directory",
+            spec_path.display()
+        ))
     })?;
 
     std::fs::create_dir_all(parent).map_err(|e| DaemonError::Tool {
@@ -123,7 +142,10 @@ pub fn append_mutation(spec_path: &Path, block: &str) -> Result<(), DaemonError>
 
     let temp_filename = format!(
         ".{}.tmp.{}",
-        spec_path.file_name().and_then(|f| f.to_str()).unwrap_or("spec"),
+        spec_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("spec"),
         std::process::id()
     );
     let temp_path = parent.join(temp_filename);
@@ -146,22 +168,22 @@ pub fn append_mutation(spec_path: &Path, block: &str) -> Result<(), DaemonError>
                 rc: -1,
                 stderr: format!("read existing spec: {e}"),
             })?;
-            temp_file.write_all(existing.as_bytes()).map_err(|e| {
-                DaemonError::Tool {
+            temp_file
+                .write_all(existing.as_bytes())
+                .map_err(|e| DaemonError::Tool {
                     tool: "fs".into(),
                     rc: -1,
                     stderr: format!("write existing spec: {e}"),
-                }
-            })?;
+                })?;
         }
 
-        temp_file.write_all(block.as_bytes()).map_err(|e| {
-            DaemonError::Tool {
+        temp_file
+            .write_all(block.as_bytes())
+            .map_err(|e| DaemonError::Tool {
                 tool: "fs".into(),
                 rc: -1,
                 stderr: format!("write block: {e}"),
-            }
-        })?;
+            })?;
 
         temp_file.sync_all().map_err(|e| DaemonError::Tool {
             tool: "fs".into(),
@@ -196,10 +218,7 @@ mod tests {
         let text = "Fail: test in $DARK_FACTORY_HOLDOUTS/scenario_1.py failed";
         let (redacted, enc) = redact_holdouts(text);
         assert!(enc);
-        assert_eq!(
-            redacted,
-            "Fail: test in [REDACTED_HOLDOUT_PATH] failed"
-        );
+        assert_eq!(redacted, "Fail: test in [REDACTED_HOLDOUT_PATH] failed");
 
         let text2 = "Check holdouts/test_foo.py";
         let (redacted2, enc2) = redact_holdouts(text2);
@@ -234,7 +253,8 @@ mod tests {
     fn test_extract_programmatic_redaction_wins() {
         let reply = r#"
             {"inhibitionSpecs":[],"positiveAssertions":[],"securityRedactionEncountered":false}
-        "#.to_string();
+        "#
+        .to_string();
         let llm = FakeLlm(reply);
         // Even though LLM says false, our programmatic redact_holdouts detects holdout and sets it to true
         let ext = extract(&llm, "Check holdouts/test.py").unwrap();

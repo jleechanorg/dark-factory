@@ -33,7 +33,15 @@ pub fn run_gates_compute(pr: u64, repo_opt: Option<String>) -> Result<(), Daemon
     // Gate 1: CI green
     let checks_out = run_tool(
         "gh",
-        &["pr", "checks", &pr_str, "--repo", &repo, "--json", "state,bucket"],
+        &[
+            "pr",
+            "checks",
+            &pr_str,
+            "--repo",
+            &repo,
+            "--json",
+            "state,bucket",
+        ],
         30,
     )?;
 
@@ -44,9 +52,8 @@ pub fn run_gates_compute(pr: u64, repo_opt: Option<String>) -> Result<(), Daemon
     }
 
     let json_start_c = checks_out.find('[').unwrap_or(0);
-    let checks: Vec<GhCheck> = serde_json::from_str(&checks_out[json_start_c..]).map_err(|e| {
-        DaemonError::Parse(format!("failed to parse gh pr checks JSON: {e}"))
-    })?;
+    let checks: Vec<GhCheck> = serde_json::from_str(&checks_out[json_start_c..])
+        .map_err(|e| DaemonError::Parse(format!("failed to parse gh pr checks JSON: {e}")))?;
 
     let ci_green = if checks.is_empty() {
         "unknown".to_string()
@@ -103,15 +110,7 @@ pub fn run_gates_compute(pr: u64, repo_opt: Option<String>) -> Result<(), Daemon
     // Gate 3: CodeRabbit approval
     let reviews_out = run_tool(
         "gh",
-        &[
-            "pr",
-            "view",
-            &pr_str,
-            "--repo",
-            &repo,
-            "--json",
-            "reviews",
-        ],
+        &["pr", "view", &pr_str, "--repo", &repo, "--json", "reviews"],
         30,
     )?;
 
@@ -130,11 +129,12 @@ pub fn run_gates_compute(pr: u64, repo_opt: Option<String>) -> Result<(), Daemon
     }
 
     let json_start_r = reviews_out.find('{').unwrap_or(0);
-    let reviews_view: GhReviewsView = serde_json::from_str(&reviews_out[json_start_r..]).map_err(|e| {
-        DaemonError::Parse(format!("failed to parse gh pr view reviews JSON: {e}"))
-    })?;
+    let reviews_view: GhReviewsView = serde_json::from_str(&reviews_out[json_start_r..])
+        .map_err(|e| DaemonError::Parse(format!("failed to parse gh pr view reviews JSON: {e}")))?;
 
-    let last_coderabbit_review = reviews_view.reviews.iter()
+    let last_coderabbit_review = reviews_view
+        .reviews
+        .iter()
         .rfind(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED");
 
     let coderabbit = match last_coderabbit_review {
@@ -168,9 +168,8 @@ pub fn run_gates_compute(pr: u64, repo_opt: Option<String>) -> Result<(), Daemon
     }
 
     let json_start_comments = comments_out.find('{').unwrap_or(0);
-    let comments_view: GhCommentsView = serde_json::from_str(&comments_out[json_start_comments..]).map_err(|e| {
-        DaemonError::Parse(format!("failed to parse gh pr comments JSON: {e}"))
-    })?;
+    let comments_view: GhCommentsView = serde_json::from_str(&comments_out[json_start_comments..])
+        .map_err(|e| DaemonError::Parse(format!("failed to parse gh pr comments JSON: {e}")))?;
 
     let mut bugbot_error_count = 0;
     for comment in comments_view.comments {
@@ -250,13 +249,17 @@ pub fn run_gates_compute(pr: u64, repo_opt: Option<String>) -> Result<(), Daemon
     }
 
     let json_start_g = gql_out.find('{').unwrap_or(0);
-    let gql: GhGqlResponse = serde_json::from_str(&gql_out[json_start_g..]).map_err(|e| {
-        DaemonError::Parse(format!("failed to parse gh graphql JSON: {e}"))
-    })?;
+    let gql: GhGqlResponse = serde_json::from_str(&gql_out[json_start_g..])
+        .map_err(|e| DaemonError::Parse(format!("failed to parse gh graphql JSON: {e}")))?;
 
     let mut unresolved_thread_count = 0;
     if let Some(pr_data) = gql.data.repository.pull_request {
-        unresolved_thread_count = pr_data.review_threads.nodes.iter().filter(|n| !n.is_resolved).count() as u32;
+        unresolved_thread_count = pr_data
+            .review_threads
+            .nodes
+            .iter()
+            .filter(|n| !n.is_resolved)
+            .count() as u32;
     }
 
     let comments_resolved = if unresolved_thread_count == 0 {
@@ -273,9 +276,8 @@ pub fn run_gates_compute(pr: u64, repo_opt: Option<String>) -> Result<(), Daemon
         comments_resolved,
     };
 
-    let out_json = serde_json::to_string_pretty(&output).map_err(|e| {
-        DaemonError::Parse(format!("failed to serialize output: {e}"))
-    })?;
+    let out_json = serde_json::to_string_pretty(&output)
+        .map_err(|e| DaemonError::Parse(format!("failed to serialize output: {e}")))?;
     println!("{out_json}");
 
     Ok(())

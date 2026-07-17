@@ -24,6 +24,7 @@ fn fake_tracker_records_calls_and_returns_scripted_response() {
         create_bead_fail_for_ref: Default::default(),
         fail_next_fetch_candidates: Default::default(),
         fail_next_comment: Default::default(),
+        create_bead_seq_ids: Default::default(),
         calls: Default::default(),
     };
 
@@ -184,4 +185,60 @@ fn fake_vcs_missing_head_is_tool_error() {
     let fake = FakeVcs::new();
     let err = fake.base_head("nonexistent").unwrap_err();
     assert!(matches!(err, daemon::errors::DaemonError::Tool { .. }));
+}
+
+#[test]
+fn fake_scm_seam_check_verifies_persisted_target_repo() {
+    use common::FakeScm;
+    use daemon::tools::Scm;
+
+    let dir = std::env::temp_dir().join(format!("afd_fake_scm_seam_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let seam = dir.join("seam.txt");
+    let _ = std::fs::remove_file(&seam);
+
+    let mut scm = FakeScm::new();
+    scm.seam_path = Some(seam.clone());
+
+    // Empty seam — verify_seam_nonempty must panic on any gh call
+    // File doesn't exist yet, which is also "empty"
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = scm.labeled_issues("factory").unwrap();
+    }));
+    assert!(
+        result.is_err(),
+        "FakeScm with missing seam file must panic on gh invocations (SEAM EMPTY)"
+    );
+
+    // Create empty file — must also panic
+    std::fs::write(&seam, "").unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = scm.labeled_issues("factory").unwrap();
+    }));
+    assert!(
+        result.is_err(),
+        "FakeScm with empty seam file must panic on gh invocations (SEAM EMPTY)"
+    );
+
+    // Populate seam and verify repo-specific check
+    std::fs::write(&seam, "bead-0\tjleechanorg/dark-factory\n").unwrap();
+    let _ = scm.labeled_issues("factory").unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = scm
+            .pr_snapshot_for_repo("jleechanorg/missing-repo", 7)
+            .unwrap();
+    }));
+    assert!(
+        result.is_err(),
+        "pr_snapshot_for_repo with missing repo in seam must panic (SEAM MISSING REPO)"
+    );
+
+    // Matching repo in seam — must succeed
+    let _ = scm
+        .pr_snapshot_for_repo("jleechanorg/dark-factory", 7)
+        .unwrap_err(); // snapshot not scripted, but seam check must pass first
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

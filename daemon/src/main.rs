@@ -7,7 +7,9 @@ use daemon::config::{self, Config};
 use daemon::errors::DaemonError;
 use daemon::state::{SqliteStateStore, StateStore};
 use daemon::tick::{run_tick, TickDeps};
-use daemon::tools::{Bead, Issue, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
+use daemon::tools::{
+    Bead, Issue, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs,
+};
 use std::path::{Path, PathBuf};
 
 const MAX_TICK_BACKOFF_SECS: u64 = 300;
@@ -122,7 +124,9 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CommandMode, Str
                 match arg.as_str() {
                     "--pr" => {
                         if let Some(val) = argv.next() {
-                            let parsed_pr = val.parse::<u64>().map_err(|_| format!("Invalid PR number: {}", val))?;
+                            let parsed_pr = val
+                                .parse::<u64>()
+                                .map_err(|_| format!("Invalid PR number: {}", val))?;
                             pr = Some(parsed_pr);
                         } else {
                             return Err("Missing value for --pr".to_string());
@@ -156,9 +160,7 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CommandMode, Str
             }
             Ok(CommandMode::Daemon(args))
         }
-        None => {
-            Ok(CommandMode::Daemon(Args::default()))
-        }
+        None => Ok(CommandMode::Daemon(Args::default())),
     }
 }
 
@@ -175,7 +177,12 @@ impl Tracker for NoopAdapters {
     fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
         Ok(std::collections::HashSet::new())
     }
-    fn create_bead(&self, _title: &str, _body: &str, _external_ref: &str) -> Result<String, DaemonError> {
+    fn create_bead(
+        &self,
+        _title: &str,
+        _body: &str,
+        _external_ref: &str,
+    ) -> Result<String, DaemonError> {
         Ok(String::new())
     }
     fn comment_external(&self, _external_ref: &str, _body: &str) -> Result<(), DaemonError> {
@@ -241,11 +248,7 @@ impl Vcs for NoopAdapters {
     fn head_sha(&self, _branch: &str) -> Result<String, DaemonError> {
         Ok(String::new())
     }
-    fn is_remote_ahead(
-        &self,
-        _branch: &str,
-        _remote_sha: &str,
-    ) -> Result<bool, DaemonError> {
+    fn is_remote_ahead(&self, _branch: &str, _remote_sha: &str) -> Result<bool, DaemonError> {
         Ok(false)
     }
     fn push_fix_commit(&self, _branch: &str, _message: &str) -> Result<(), DaemonError> {
@@ -709,7 +712,11 @@ mod tests {
 
     #[test]
     fn parse_args_recognizes_once_and_dry_run() {
-        let argv = vec!["daemon".to_string(), "--once".to_string(), "--dry-run".to_string()];
+        let argv = vec![
+            "daemon".to_string(),
+            "--once".to_string(),
+            "--dry-run".to_string(),
+        ];
         let mode = parse_args(argv.into_iter()).unwrap();
         if let CommandMode::Daemon(args) = mode {
             assert!(args.once);
@@ -733,7 +740,11 @@ mod tests {
 
     #[test]
     fn parse_args_ignores_unknown_flags() {
-        let argv = vec!["daemon".to_string(), "--bogus".to_string(), "--once".to_string()];
+        let argv = vec![
+            "daemon".to_string(),
+            "--bogus".to_string(),
+            "--once".to_string(),
+        ];
         let mode = parse_args(argv.into_iter()).unwrap();
         if let CommandMode::Daemon(args) = mode {
             assert!(args.once);

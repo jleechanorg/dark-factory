@@ -46,9 +46,12 @@ fn test_cli_vcs_real_git() {
         .args(["branch", "-D", &temp_branch])
         .status();
 
-    vcs.create_branch_at(&temp_branch, &sha).expect("create_branch_at failed");
+    vcs.create_branch_at(&temp_branch, &sha)
+        .expect("create_branch_at failed");
 
-    let check_sha = vcs.head_sha(&temp_branch).expect("head_sha on temp branch failed");
+    let check_sha = vcs
+        .head_sha(&temp_branch)
+        .expect("head_sha on temp branch failed");
     assert_eq!(sha, check_sha);
 
     let status = std::process::Command::new("git")
@@ -180,16 +183,16 @@ fn test_chain_llm_real_fallback() {
 
 #[test]
 #[ignore] // Requires real `ao` CLI — run locally with `cargo test -- --ignored`
-// Stage-2 prereq #1 (jleechan-hna3): CliSessions::attach is the entry point
-// the spec's "attach, remediate, quiesce" lifecycle depends on. It used to be
-// an unconditional stub that always returned Err — this test used to assert
-// that stub behavior (gate self-certification: "no error" would trivially
-// hold for any Err variant). Now that attach() is a real reverse lookup over
-// `ao status --json` (branch -> SessionId), this asserts the ERROR PATH still
-// behaves correctly: a branch nothing is tracking must still fail, with a
-// specific, non-generic message (this string ends up directly in
-// reroll.rs's `Held(format!("failed to attach to session: {e}"))`, which
-// surfaces in HumanHeld telemetry a human reads).
+          // Stage-2 prereq #1 (jleechan-hna3): CliSessions::attach is the entry point
+          // the spec's "attach, remediate, quiesce" lifecycle depends on. It used to be
+          // an unconditional stub that always returned Err — this test used to assert
+          // that stub behavior (gate self-certification: "no error" would trivially
+          // hold for any Err variant). Now that attach() is a real reverse lookup over
+          // `ao status --json` (branch -> SessionId), this asserts the ERROR PATH still
+          // behaves correctly: a branch nothing is tracking must still fail, with a
+          // specific, non-generic message (this string ends up directly in
+          // reroll.rs's `Held(format!("failed to attach to session: {e}"))`, which
+          // surfaces in HumanHeld telemetry a human reads).
 fn test_cli_sessions_real_attach_errors_for_unknown_branch() {
     if std::env::var("GITHUB_ACTIONS").is_ok() {
         return;
@@ -217,11 +220,11 @@ fn test_cli_sessions_real_attach_errors_for_unknown_branch() {
 
 #[test]
 #[ignore] // Requires a real `ao` CLI with at least one active session — run locally with `cargo test -- --ignored`
-// Companion to the error-path test above: proves the SUCCESS path is a
-// genuine reverse lookup (branch -> SessionId) against ground truth pulled
-// directly from `ao status --json`, not just "returns Ok sometimes". Also
-// confirms the returned SessionId is real/usable by feeding it into
-// `is_quiescent`, exactly as `reroll.rs` does immediately after `attach()`.
+          // Companion to the error-path test above: proves the SUCCESS path is a
+          // genuine reverse lookup (branch -> SessionId) against ground truth pulled
+          // directly from `ao status --json`, not just "returns Ok sometimes". Also
+          // confirms the returned SessionId is real/usable by feeding it into
+          // `is_quiescent`, exactly as `reroll.rs` does immediately after `attach()`.
 fn test_cli_sessions_real_attach_finds_session_by_branch() {
     if std::env::var("GITHUB_ACTIONS").is_ok() {
         return;
@@ -260,12 +263,12 @@ fn test_cli_sessions_real_attach_finds_session_by_branch() {
 
 #[test]
 #[ignore] // Requires a real `ao` CLI with >=2 active sessions on distinct branches — run locally with `cargo test -- --ignored`
-// Mutation-test guard: a broken implementation that ignores `branch` and
-// always returns e.g. the first entry in `ao status --json` would still
-// pass `test_cli_sessions_real_attach_finds_session_by_branch` whenever the
-// matching session happens to be first in the array. This test specifically
-// targets the second (non-first) candidate so an "always return the first
-// match" mutation is caught: it must return candidate #2's name, not #1's.
+          // Mutation-test guard: a broken implementation that ignores `branch` and
+          // always returns e.g. the first entry in `ao status --json` would still
+          // pass `test_cli_sessions_real_attach_finds_session_by_branch` whenever the
+          // matching session happens to be first in the array. This test specifically
+          // targets the second (non-first) candidate so an "always return the first
+          // match" mutation is caught: it must return candidate #2's name, not #1's.
 fn test_cli_sessions_real_attach_returns_matching_session_not_arbitrary_one() {
     if std::env::var("GITHUB_ACTIONS").is_ok() {
         return;
@@ -340,7 +343,9 @@ fn test_cli_scm_offline_fallback() {
     std::fs::create_dir_all(offline_dir).unwrap();
 
     let pr_file = offline_dir.join("pr_9999.json");
-    std::fs::write(&pr_file, r#"{
+    std::fs::write(
+        &pr_file,
+        r#"{
         "ci_success": true,
         "mergeable": true,
         "coderabbit_approved": false,
@@ -350,14 +355,16 @@ fn test_cli_scm_offline_fallback() {
         "body": "offline body",
         "comments": [],
         "files": []
-    }"#).unwrap();
-    
+    }"#,
+    )
+    .unwrap();
+
     let snap = scm.pr_snapshot(9999).unwrap();
     assert_eq!(snap.head_sha, "abc123sha");
     assert_eq!(snap.body, "offline body");
     assert_eq!(snap.bugbot_error_count, 2);
     assert!(!snap.coderabbit_approved);
-    
+
     let _ = std::fs::remove_file(pr_file);
 }
 
@@ -462,7 +469,11 @@ fn test_cli_scm_pr_snapshot_graphql_command_failure_reports_unknown_not_green() 
     let result = scm.pr_snapshot(pr_num);
 
     // The snapshot fetch should succeed (only the thread count is unknown)
-    assert!(result.is_ok(), "pr_snapshot should succeed even when GraphQL fails: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "pr_snapshot should succeed even when GraphQL fails: {:?}",
+        result
+    );
     let snapshot = result.unwrap();
 
     // BUG: Currently this returns Some(0) — but it SHOULD return None (Unknown)
@@ -503,7 +514,11 @@ fn test_cli_scm_pr_snapshot_graphql_malformed_output_reports_unknown_not_green()
     let scm = CliScm::new("jleechanorg/dark-factory".to_string());
     let result = scm.pr_snapshot(pr_num);
 
-    assert!(result.is_ok(), "pr_snapshot should succeed even when GraphQL is malformed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "pr_snapshot should succeed even when GraphQL is malformed: {:?}",
+        result
+    );
     let snapshot = result.unwrap();
 
     // BUG: Currently this returns Some(0) — but it SHOULD return None (Unknown)
