@@ -12,8 +12,14 @@
 # (32 logical CPUs) spiked load average to 48, making the host unresponsive
 # to SSH for several minutes.
 #
-# 8 leaves headroom for other work (self-hosted CI runners, other AO/Claude
-# sessions) on a 32-thread shared host. Override locally with
+# 2 leaves headroom for other work on every host we ship CI to:
+# GitHub-hosted ubuntu-24.04 runners expose 4 logical CPUs, so any value
+# >= 4 would not actually cap on the smallest shared host and would
+# re-trigger the starvation pattern (RED: PR #222 daemon-tests job
+# 86446729028 — `jobs = 8` failed the cap-below-nproc invariant on a
+# 4-vCPU runner). 2 is also the right per-job allowance on a 32-thread
+# box with ~16 concurrent self-hosted CI runners — each runner gets 2
+# jobs and significant headroom remains. Override locally with
 # `cargo build -j <N>` / `CARGO_BUILD_JOBS=<N>` if you have a dedicated box.
 [build]
-jobs = 8
+jobs = 2
