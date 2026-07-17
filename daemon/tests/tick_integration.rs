@@ -877,6 +877,103 @@ fn test_wedge_detection_dispatched_coder_silent_stale_transcript_still_parks() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// jleechan-drive-pr-branch-binding-pcpr regression test: a bead whose
+/// `external_ref` points to an OPEN PR must bind to the PR's real
+/// head_ref_name at routing time — not fabricate a new
+/// `factory/<id>-r1` branch. Live bug (2026-07-17, bead
+/// `jleechan-drive-pr-branch-binding-pcpr`): the daemon dispatched onto
+/// `factory/jleechan-drive-pr-branch-binding-pcpr-r1` while the coder
+/// session `wa-3286` was actually attached to a pre-existing PR's head
+/// branch. The dispatch-integrity sweep correctly caught the
+/// `session_branch_mismatch` and parked the bead, but the root cause —
+/// the daemon's blind fabrication of a factory branch for a bead that
+/// should have been adopted — was unfixed.
+///
+/// Repro: bead with `external_ref="jleechanorg/worldarchitect.ai#8417"`
+/// (open PR), routed through `run_slow_tier`'s normal path. The resulting
+/// overlay must carry `pr_number = Some(8417)` and `is_adopted = true`,
+/// and must NOT have a fabricated `factory/<id>-r1` branch.
+#[test]
+fn test_external_ref_open_pr_binds_to_pr_head_branch_pcpr() {
+    let mut scm = FakeScm::new();
+    let pr_number: u64 = 8417;
+    scm.pr_snapshots.insert(
+        pr_number,
+        PrSnapshot {
+            pr_number,
+            ci_success: false,
+            mergeable: false,
+            coderabbit_approved: false,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "abc123".into(),
+            body: String::new(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 1_700_000_000,
+            ci_status: "".into(),
+            coderabbit_status: "".into(),
+            ci_pending: true,
+            head_committed_epoch: 1_700_000_000,
+        },
+    );
+    let tracker = FakeTracker::new();
+    let bead = Bead {
+        id: "jleechan-drive-pr-branch-binding-pcpr".into(),
+        title: "PR branch binding fix".into(),
+        description: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: Some("jleechanorg/worldarchitect.ai#8417".into()),
+    };
+    tracker.candidates.borrow_mut().push(bead);
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("STANDARD_PATH".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_pcpr_bind_to_pr_head.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = FakeVcs::new();
+    let mut sessions = FakeSessions::new();
+    sessions.active_count = 0;
+    sessions.next_session_id = "wa-pcpr-1".into();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let _summary = run_tick(&deps, 1, 10).unwrap();
+
+    let o = store
+        .load("jleechan-drive-pr-branch-binding-pcpr")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        o.pr_number,
+        Some(pr_number),
+        "bead must carry the external_ref's PR number so the verifier picks it up"
+    );
+    assert_eq!(
+        o.is_adopted, true,
+        "bead with external_ref pointing to an open PR must be marked adopted \
+         (so dispatch binds to the PR's head branch, not a fabricated one)"
+    );
+    assert_ne!(
+        o.branch.as_deref(),
+        Some("factory/jleechan-drive-pr-branch-binding-pcpr-r1"),
+        "bead with external_ref -> OPEN PR must NOT get a fabricated factory branch"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// jleechan-5ia2 regression test: reproduces the LIVE bug this bead tracks.
 /// Bead `jleechan-vj89`'s overlay was observed with `state=DISPATCHED`,
 /// `branch=factory/jleechan-vj89-r1`, and a real, alive `session_id`

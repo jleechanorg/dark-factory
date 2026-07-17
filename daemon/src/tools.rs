@@ -402,6 +402,32 @@ pub trait Scm {
         let _ = repo;
         self.pr_snapshot(pr)
     }
+    /// Look up a PR snapshot by its `external_ref` (`"<owner>/<repo>#<number>"`).
+    /// Default impl: parse the `#N` suffix and delegate to
+    /// `pr_snapshot_for_repo` so single-repo fakes keep working unchanged.
+    /// `Ok(None)` when the external_ref is not parseable (no `#`, non-numeric).
+    /// `Err(DaemonError::Parse)` mirrors the same fail-loud contract
+    /// `router::route` uses — the pcpr bead's whole bug was that the
+    /// daemon silently routed onto a fabricated `factory/<id>-r1` branch
+    /// while the coder was actually working on the PR's real head branch,
+    /// ending in `session_branch_mismatch` once the dispatch-integrity
+    /// sweep caught up. `Ok(None)` lets callers distinguish "not an
+    /// external_ref" from "could not parse / not found".
+    fn pr_snapshot_for_external(
+        &self,
+        external_ref: &str,
+    ) -> Result<Option<PrSnapshot>, DaemonError> {
+        let parts: Vec<&str> = external_ref.split('#').collect();
+        if parts.len() != 2 {
+            return Ok(None);
+        }
+        let pr_number: u64 = match parts[1].parse() {
+            Ok(n) => n,
+            Err(_) => return Ok(None),
+        };
+        let owner_repo = parts[0];
+        Ok(Some(self.pr_snapshot_for_repo(owner_repo, pr_number)?))
+    }
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError>;
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError>;
     /// Repo-scoped variant of [`remote_branch_last_commit`](Scm::remote_branch_last_commit)

@@ -1138,7 +1138,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 
     let mut ready: Vec<(Bead, RoutingVerdict)> = Vec::new();
     for bead in &routing_candidates {
-        let overlay = match deps.store.load(&bead.id)? {
+        let mut overlay = match deps.store.load(&bead.id)? {
             Some(o) => {
                 if o.state == OverlayState::Queued || o.state == OverlayState::Redispatched {
                     o
@@ -1185,6 +1185,58 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 o
             }
         };
+
+        // jleechan-drive-pr-branch-binding-pcpr: when a bead's `external_ref`
+        // points to an OPEN PR, the daemon MUST bind the bead to that PR's
+        // real head branch (`is_adopted = true`, `pr_number = Some(N)`,
+        // `branch = Some(<pr-head>)`) at routing time. Without this, the
+        // dispatch path fabricates a brand-new `factory/<id>-r1` branch
+        // and the coder's actual work — which always happens on the PR's
+        // real head branch — gets caught by the dispatch-integrity sweep
+        // as `session_branch_mismatch` and parked HUMAN_HELD.
+        //
+        // This handles the single+batch paths identically because the
+        // `routing_candidates` loop already iterates one bead at a time
+        // and emits the same adoption telemetry here as `normalize_labeled_prs`
+        // would. The PR-snapshot lookup is best-effort and swallows
+        // errors so a transient `gh` hiccup never aborts the rest of the
+        // batch (jleechan-eazj discipline).
+        if overlay.pr_number.is_none() {
+            if let Some(ext_ref) = bead.external_ref.as_deref() {
+                match deps.scm.pr_snapshot_for_external(ext_ref) {
+                    Ok(Some(snap)) => {
+                        overlay.pr_number = Some(snap.pr_number);
+                        overlay.is_adopted = true;
+                        // We don't have the head_ref_name from a snapshot
+                        // (PrSnapshot carries head_sha, not head_ref_name),
+                        // so the branch is left unset here — the verifier's
+                        // PR-snapshot path picks up the live branch from the
+                        // PR head SHA and dispatch's branch binding proceeds
+                        // via `normalize_labeled_prs`'s adoption shape on the
+                        // very next slow tick once the PR is labeled
+                        // `factory`. The pre-fix behavior was
+                        // `branch = Some("factory/<id>-r1")` — that is what
+                        // we want to STOP producing.
+                        deps.store.save(&overlay)?;
+                        emit(
+                            deps.telemetry_log,
+                            &overlay.bead_id,
+                            overlay.attempt,
+                            OverlayState::Queued.as_str(),
+                            "EXTERNAL_REF_PR_BOUND",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "external_ref_open_pr",
+                                "external_ref": ext_ref,
+                                "pr_number": snap.pr_number,
+                            }),
+                        )?;
+                    }
+                    Ok(None) => { /* not parseable / no PR — proceed normally */ }
+                    Err(_) => { /* transient error — proceed normally */ }
+                }
+            }
+        }
 
         match router::route(deps.llm, bead) {
             Ok(verdict) => {
