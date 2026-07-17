@@ -6,9 +6,27 @@ on:
   pull_request:
     branches: [main]
 
+# All jobs target the org's self-hosted runner pool via the
+# SELF_HOSTED_RUNNER_LABELS repo variable. The variable is parsed from a JSON
+# array string into a YAML label list using fromJSON(...). When the variable
+# drifts to a selector that matches zero online runners, jobs queue forever —
+# that is why runner-selector-drift.yml runs as a separate, hardcoded-selector
+# cron + push gate to detect the drift before CI becomes invisible.
+#
+# Never set `runs-on: ubuntu-latest` here. GitHub-hosted runners are the
+# explicit fallback we are forbidding under bead jleechan-z284 / issue #286.
+# See docs/self-hosted-runner-selector.md.
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Fork-PR isolation: self-hosted runners are persistent and may carry
+    # org secrets / cached build state. Untrusted fork PR code must not
+    # execute on them — the risk is a persistent compromise of the runner
+    # (see GitHub's secure-use docs for public repos with self-hosted runners).
+    # Same guard as evidence-gate.yml: fork PRs are skipped, not silently
+    # rerouted; the PR author must open from a branch in the same org.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+    runs-on: ${{ fromJSON(vars.SELF_HOSTED_RUNNER_LABELS) }}
     permissions:
       contents: read
     env:
@@ -28,6 +46,97 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
+
+      - name: Fix Python 3.13 shared-library path (self-hosted runners)
+        # actions/setup-python installs Python 3.13 under a toolcache path
+        # (`/home/runner/_work/_tool/Python/<ver>/<arch>/`) and ships
+        # `libpython3.13.so` WITHOUT the versioned soname symlink
+        # (`libpython3.13.so.1.0`). The dynamic linker resolves the soname, not
+        # the link-time name, so any subprocess `python3` invocation fails with
+        # `error while loading shared libraries: libpython3.13.so.1.0` and
+        # rc=127, taking test_preflight.py / test_structural_preflight.py /
+        # test_conformance.py etc. down with it.
+        #
+        # CRITICAL: this step MUST NOT call `python3` for self-discovery
+        # because when the soname symlink is absent, `python3` itself fails
+        # to load and `python3 -c 'import sys; print(sys.prefix)'` returns
+        # 127 BEFORE the remediation runs. Instead, derive the toolchain dir
+        # from `PythonLocation` (exported by actions/setup-python), fall back
+        # to the symlink-resolved `command -v python3`, and explicitly verify
+        # rc=0 on a subprocess `python3 -c 'pass'` invocation BEFORE the test
+        # step runs.
+        run: |
+          set -u
+          # 1) Resolve the toolchain bin directory WITHOUT invoking python3.
+          TOOLCHAIN_BIN_DIR="${PythonLocation:-${pythonLocation:-}}"
+          if [ -z "$TOOLCHAIN_BIN_DIR" ] && command -v python3 >/dev/null 2>&1; then
+            # `command -v` is a shell builtin that walks PATH and reports the
+            # on-disk path of python3 itself; it does not exec the binary, so
+            # it works even when the dynamic loader would have failed. resolve
+            # the symlink chain so we land on the real toolcache dir rather
+            # than `/usr/bin/python3` (which on self-hosted runners is a shim).
+            PY_BIN="$(command -v python3)"
+            PY_REAL="$(readlink -f "$PY_BIN" 2>/dev/null || echo "$PY_BIN")"
+            TOOLCHAIN_BIN_DIR="$(dirname "$PY_REAL")"
+          fi
+          if [ -z "$TOOLCHAIN_BIN_DIR" ] || [ ! -d "$TOOLCHAIN_BIN_DIR" ]; then
+            echo "::error::Cannot locate Python toolchain bin dir (PythonLocation=${PythonLocation:-<unset>})."
+            exit 1
+          fi
+          echo "Toolchain bin dir: $TOOLCHAIN_BIN_DIR"
+          # 2) Locate the link-time libpython3.13.so next to the toolchain
+          #    (the layout matches actions/setup-python v5: bin/../lib/libpython3.13.so).
+          SO_PATH="$TOOLCHAIN_BIN_DIR/../lib/libpython3.13.so"
+          if [ ! -e "$SO_PATH" ]; then
+            SO_PATH="$(find "$TOOLCHAIN_BIN_DIR/.." -maxdepth 6 -name 'libpython3.13.so' -not -name '*.so.*' 2>/dev/null | head -1)"
+          fi
+          if [ -z "$SO_PATH" ] || [ ! -e "$SO_PATH" ]; then
+            echo "::warning::libpython3.13.so not found in toolchain ($TOOLCHAIN_BIN_DIR) — subprocess python will fail."
+          else
+            SO_DIR="$(dirname "$SO_PATH")"
+            SO_NAME="$(basename "$SO_PATH")"
+            VERSIONED="libpython3.13.so.1.0"
+            # 3) Promote LD_LIBRARY_PATH so subprocess python (the cargo
+            #    daemon-tests job also runs tools that exec python) can find
+            #    the unversioned .so even before the versioned soname is
+            #    resolvable.
+            echo "LD_LIBRARY_PATH=${SO_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+            # 4) Create the versioned soname symlink in the SAME directory as
+            #    the link-time shared object so a bare `python3 -c ...` works
+            #    without depending on LD_LIBRARY_PATH inheritance across steps.
+            if [ ! -e "${SO_DIR}/${VERSIONED}" ]; then
+              ln -s "$SO_NAME" "${SO_DIR}/${VERSIONED}"
+              echo "Created symlink ${SO_DIR}/${VERSIONED} -> ${SO_NAME}"
+            else
+              echo "Versioned symlink ${SO_DIR}/${VERSIONED} already exists"
+            fi
+            # 5) Self-test: invoke the toolchain `python3 -c 'import sys'` NOW,
+            #    before the test step, so a remaining rc=127 surfaces as a
+            #    step-level error here instead of failing the entire pytest
+            #    run (which would mask the real cause).
+            echo "Self-test: ${TOOLCHAIN_BIN_DIR}/python3 -c 'import sys; sys.exit(0)'"
+            "${TOOLCHAIN_BIN_DIR}/python3" -c 'import sys; sys.exit(0)'
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::subprocess python3 still fails after symlink fix (rc=$rc). libpython is not loadable."
+              exit 1
+            fi
+            echo "Self-test ok (rc=$rc)"
+          fi
+
+      - name: Detect runner platform (Linux-only isolation tests)
+        # tests/security/test_agent_isolation.py uses @linux_only markers
+        # and will SKIP on macOS runners. This step surfaces that fact
+        # explicitly so macOS CI runs don't silently omit sandbox coverage.
+        # See docs/self-hosted-runner-selector.md "Adding a platform-specific
+        # job" for the path to a dedicated Linux-only job once a
+        # self-hosted-linux label is available on the org fleet.
+        run: |
+          PLATFORM="$(python3 -c 'import sys; print(sys.platform)')"
+          echo "Runner platform: $PLATFORM"
+          if [ "$PLATFORM" != "linux" ]; then
+            echo "::warning title=Platform coverage gap::Running on $PLATFORM — tests/security/test_agent_isolation.py Linux-only tests will be skipped. Open a follow-up issue to add a self-hosted-linux label to the org runner fleet for mandatory Linux coverage."
+          fi
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
@@ -51,7 +160,10 @@ jobs:
         run: python -m runner.graph_audit pipelines
 
   daemon-tests:
-    runs-on: ubuntu-latest
+    # Fork-PR isolation: same guard as the `test` job above.
+    # Self-hosted runners are persistent — fork PR code must not execute on them.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+    runs-on: ${{ fromJSON(vars.SELF_HOSTED_RUNNER_LABELS) }}
     permissions:
       contents: read
     steps:
@@ -69,6 +181,22 @@ jobs:
         run: |
           git fetch origin main
           git show-ref --verify --quiet refs/heads/main || git branch main origin/main
+
+      - name: Install Rust toolchain (stable)
+        # Self-hosted runners do not ship with `cargo` pre-installed (verified
+        # on jleechanorg org runners 2026-07-12, PR #287 CI run). dtolnay's
+        # rust-toolchain action installs rustup + the requested toolchain in
+        # one step; we then cache the daemon crate's build artifacts so
+        # subsequent runs are fast.
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1 (stable)
+        with:
+          toolchain: stable
+          components: clippy  # required for `cargo clippy` in the lint step
+
+      - name: Cache cargo registry/target for daemon crate
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc  # v2.9.1
+        with:
+          workspaces: daemon -> target
 
       - name: cargo test (daemon crate)
         working-directory: daemon
