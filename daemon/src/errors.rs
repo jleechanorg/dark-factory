@@ -1,3 +1,11 @@
+#[derive(Debug)]
+pub struct SpawnBatchCleanupFailure {
+    pub session: String,
+    pub bead_id: String,
+    pub branch: String,
+    pub error: DaemonError,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum DaemonError {
     #[error("tool {tool} failed (rc={rc}): {stderr}")]
@@ -12,6 +20,13 @@ pub enum DaemonError {
     Timeout(String),
     #[error("config: {0}")]
     Config(String),
+    #[error("no AO session currently tracks branch {branch:?} for bead {bead_id}")]
+    SessionNotFound { branch: String, bead_id: String },
+    #[error("AO session rows for branch {branch:?} are ambiguous: {sessions:?}")]
+    SessionAmbiguous {
+        branch: String,
+        sessions: Vec<String>,
+    },
     /// `ao spawn` declined to synchronously create a session and instead
     /// enqueued a deferred `SpawnRequest` (its own internal admission-control
     /// queue, hit when a project's active-session count is at/above AO's
@@ -63,6 +78,28 @@ pub enum DaemonError {
     /// `PARKED_HUMAN_HELD` telemetry) always shows the whole chain.
     #[error("all {} fallback vendor(s) failed: {}", .0.len(), format_spawn_attempts(.0))]
     SpawnFallbackExhausted(Vec<(String, DaemonError)>),
+    /// AO reported a live session but returned unusable spawn metadata, and
+    /// the compensating session kill also failed. This is deliberately
+    /// fatal and must never advance to another fallback vendor.
+    #[error(
+        "spawn returned invalid output for session {session}: {spawn_error}; cleanup also failed: {cleanup_error}"
+    )]
+    SpawnCleanupFailed {
+        session: String,
+        spawn_error: Box<DaemonError>,
+        cleanup_error: Box<DaemonError>,
+    },
+    /// A later item in a serialized batch failed after earlier items had
+    /// spawned, and at least one compensating session kill failed.
+    #[error(
+        "batch spawn failed: {spawn_error}; cleanup also failed for {} session(s): {}",
+        .cleanup_errors.len(),
+        format_cleanup_errors(.cleanup_errors)
+    )]
+    SpawnBatchCleanupFailed {
+        spawn_error: Box<DaemonError>,
+        cleanup_errors: Vec<SpawnBatchCleanupFailure>,
+    },
 }
 
 /// Renders every `(vendor, error)` pair collected by
@@ -77,6 +114,19 @@ fn format_spawn_attempts(attempts: &[(String, DaemonError)]) -> String {
     attempts
         .iter()
         .map(|(vendor, err)| format!("{vendor}: {err}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn format_cleanup_errors(errors: &[SpawnBatchCleanupFailure]) -> String {
+    errors
+        .iter()
+        .map(|failure| {
+            format!(
+                "session {} for bead {} branch {:?}: {}",
+                failure.session, failure.bead_id, failure.branch, failure.error
+            )
+        })
         .collect::<Vec<_>>()
         .join("; ")
 }

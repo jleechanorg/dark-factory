@@ -1,5 +1,5 @@
 use daemon::adapters::{ChainLlm, CliScm, CliSessions, CliTracker, CliVcs};
-use daemon::tools::{Llm, Scm, Sessions, Tracker, Vcs};
+use daemon::tools::{Llm, Scm, Sessions, SpawnSpec, Tracker, Vcs};
 
 /// Guard for setting environment variables during tests.
 /// SAFETY: must be used with a mutex lock to prevent concurrent test interference.
@@ -92,6 +92,80 @@ fn test_cli_sessions_real_ao() {
     let sessions = CliSessions::new("dark-factory", "claude-code");
     let count = sessions.active_count();
     assert!(count.is_ok(), "active_count failed: {:?}", count);
+}
+
+#[test]
+#[ignore] // Creates one real AO worker; run explicitly with --ignored --exact.
+fn test_cli_sessions_real_spawn_v013_contract() {
+    assert_eq!(
+        std::env::var("DARK_FACTORY_RUN_REAL_AO_SPAWN").as_deref(),
+        Ok("1"),
+        "set DARK_FACTORY_RUN_REAL_AO_SPAWN=1 to run this ignored real-service test"
+    );
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    );
+    let branch = format!("factory/uald-real-spawn-{nonce}");
+    let marker = format!("UALD_REAL_SPAWN_PROBE_{nonce}");
+    let prompt = format!(
+        "{marker}: This is a benign adapter integration probe. Do not edit files, commit, push, open a PR, or run product commands. Print `PROBE_MARKER: {marker}` and `BRANCH: <current git branch>`, then exit."
+    );
+    let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+    let session = sessions
+        .spawn(&SpawnSpec {
+            bead_id: format!("uald-real-spawn-{nonce}"),
+            branch: branch.clone(),
+            prompt,
+            repo: "jleechanorg/dark-factory".to_string(),
+            ao_project: "dark-factory".to_string(),
+            remote: "origin".to_string(),
+        })
+        .expect("real AO v0.1.3 adapter spawn failed");
+
+    let observed_branch = sessions.session_branch(&session);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let mut worker_evidence = None;
+    while std::time::Instant::now() < deadline {
+        let targets = std::process::Command::new("tmux")
+            .args(["list-sessions", "-F", "#{session_name}"])
+            .output();
+        if let Ok(targets) = targets {
+            let targets = String::from_utf8_lossy(&targets.stdout);
+            if let Some(target) = targets
+                .lines()
+                .find(|target| *target == session.0 || target.ends_with(&format!("-{}", session.0)))
+            {
+                if let Ok(captured) = std::process::Command::new("tmux")
+                    .args(["capture-pane", "-p", "-t", target, "-S", "-300"])
+                    .output()
+                {
+                    let captured = String::from_utf8_lossy(&captured.stdout).into_owned();
+                    if captured.contains(&format!("PROBE_MARKER: {marker}"))
+                        && captured.contains(&format!("BRANCH: {branch}"))
+                    {
+                        worker_evidence = Some(captured);
+                        break;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    println!("REAL_AO_SESSION={}", session.0);
+    println!("REAL_AO_BRANCH={branch}");
+    let cleanup = sessions.stop(&session);
+    assert!(cleanup.is_ok(), "real AO probe cleanup failed: {cleanup:?}");
+    let observed_branch = observed_branch.expect("AO branch lookup failed after spawn");
+    assert_eq!(observed_branch.as_deref(), Some(branch.as_str()));
+    let worker_evidence = worker_evidence.unwrap_or_else(|| {
+        panic!("worker did not emit the unique marker and exact branch within 180 seconds")
+    });
+    println!("REAL_AO_WORKER_EVIDENCE_BEGIN\n{worker_evidence}\nREAL_AO_WORKER_EVIDENCE_END");
 }
 
 #[test]

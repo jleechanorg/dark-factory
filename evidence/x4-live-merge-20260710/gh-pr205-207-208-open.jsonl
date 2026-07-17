@@ -1,0 +1,3 @@
+{"head":"factory/jleechan-bpb6-r2","mergeable_state":"clean","merged":false,"number":205,"state":"open","title":"[agento] feat(er_runner): async process-child pattern (jleechan-bpb6)"}
+{"head":"factory/jleechan-s3c-smoke-green-r1","mergeable_state":"unstable","merged":false,"number":207,"state":"open","title":"[fixture] jleechan-s3c timer smoke — green control"}
+{"head":"factory/jleechan-s3c-smoke-red-r1","mergeable_state":"clean","merged":false,"number":208,"state":"open","title":"[fixture] jleechan-s3c timer smoke — red control (deliberate CI failure)"}

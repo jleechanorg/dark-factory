@@ -1,0 +1,1 @@
+{"head":"factory/ez-gh-actions-mw5a-r2","merge_commit_sha":"f59b488808487d49ac6d3571478222fe73f95531","merged":true,"merged_at":"2026-07-10T20:48:04Z","merged_by":"jleechan2015","number":228,"state":"closed","title":"fix(runner): dict in state crashes prompt render + reviewer verdict/outcome contradiction (ez-gh-actions-mw5a)"}
