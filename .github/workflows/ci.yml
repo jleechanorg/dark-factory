@@ -83,9 +83,20 @@ jobs:
         # The tests/scripts/*.sh suite exercises factory-overlay.sh, factory-af-tick.sh,
         # and the callpath overlay-harness probe. Without this step, regressions in
         # those scripts only surface when an operator runs them locally.
-        # See bead jleechan-50jf.
+        # test_factory_overlay.sh falls back to `cargo build` if the daemon
+        # binary is missing, so the toolchain must be present in this job.
+        # See bead jleechan-50jf and jleechan-u2es.
         run: |
           set +e
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            source "$HOME/.cargo/env"
+          fi
+          rustup show
+          cargo --version
+          rustc --version
+          cargo build --quiet --manifest-path daemon/Cargo.toml
           fail=0
           for t in tests/scripts/test_*.sh; do
             echo "::group::$t"
