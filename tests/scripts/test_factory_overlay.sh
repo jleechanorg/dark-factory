@@ -13,6 +13,10 @@ OVERLAY="$ROOT/daemon/factory-overlay.sh"
 export AFD_DB="/tmp/test-overlay-$$-$$.sqlite"
 export AFD_LOG="/tmp/test-overlay-$$-$$.jsonl"
 export CONFIG="$ROOT/daemon/contracts/daemon.toml.example"
+export AFD_DAEMON_BIN="${AFD_DAEMON_BIN:-$ROOT/daemon/target/debug/daemon}"
+if [ ! -x "$AFD_DAEMON_BIN" ]; then
+  cargo build --quiet --manifest-path "$ROOT/daemon/Cargo.toml"
+fi
 # br needs a beads.db; point at a fresh temp one so bead-closed-check can run.
 export BR_DB="/tmp/test-overlay-$$-beads.db"
 touch "$BR_DB"
@@ -213,15 +217,36 @@ assert "state after ready" "READY" "$state"
 # 13. park (generic)
 "$OVERLAY" intake-upsert test-park 'park test' >/dev/null
 "$OVERLAY" route-record test-park SMALL_PATH >/dev/null
-out="$("$OVERLAY" park test-park 'manual hold')"
+out="$("$OVERLAY" park test-park session_stalled)"
 assert "park ok" "ok" "$out"
 state="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='test-park';")"
 assert "state after park" "HUMAN_HELD" "$state"
 
 # 14. recover-held HUMAN_HELD → QUEUED
+sqlite3 "$AFD_DB" <<'SQL'
+INSERT INTO bead_overlay (bead_id,state,attempt,branch,session_id,park_reason,updated_at)
+VALUES
+  ('held-permanent','HUMAN_HELD',2,'factory/held-permanent-r2','live-permanent','session_branch_mismatch','2026-07-13T00:00:00Z'),
+  ('held-unknown','HUMAN_HELD',2,'factory/held-unknown-r2',NULL,'future_reason','2026-07-13T00:00:00Z'),
+  ('held-null','HUMAN_HELD',2,'factory/held-null-r2',NULL,NULL,'2026-07-13T00:00:00Z'),
+  ('held-retryable-live','HUMAN_HELD',2,'factory/held-retryable-live-r2','live-retryable','session_stalled','2026-07-13T00:00:00Z');
+SQL
 out="$("$OVERLAY" recover-held)"
-[[ "$out" =~ recovered=1 ]] || { echo "FAIL: recover-held did not recover 1 (got $out)"; FAIL=$((FAIL+1)); }
-[ $? -eq 0 ] && echo "PASS: recover-held recovered 1" && PASS=$((PASS+1))
+assert "recover-held delegates to canonical policy" "recovered=1" "$out"
+assert "retry-safe no-session row requeued" "QUEUED|2||" \
+  "$(sqlite3 -separator '|' "$AFD_DB" "SELECT state,attempt,coalesce(session_id,''),coalesce(park_reason,'') FROM bead_overlay WHERE bead_id='test-park';")"
+assert "permanent live-session row preserved" \
+  "HUMAN_HELD|2|factory/held-permanent-r2|live-permanent|session_branch_mismatch" \
+  "$(sqlite3 -separator '|' "$AFD_DB" "SELECT state,attempt,branch,session_id,park_reason FROM bead_overlay WHERE bead_id='held-permanent';")"
+assert "unknown hold preserved" \
+  "HUMAN_HELD|2|factory/held-unknown-r2||future_reason" \
+  "$(sqlite3 -separator '|' "$AFD_DB" "SELECT state,attempt,branch,coalesce(session_id,''),park_reason FROM bead_overlay WHERE bead_id='held-unknown';")"
+assert "NULL-reason hold preserved" \
+  "HUMAN_HELD|2|factory/held-null-r2||" \
+  "$(sqlite3 -separator '|' "$AFD_DB" "SELECT state,attempt,branch,coalesce(session_id,''),coalesce(park_reason,'') FROM bead_overlay WHERE bead_id='held-null';")"
+assert "retry-safe reason with live session preserved" \
+  "HUMAN_HELD|2|factory/held-retryable-live-r2|live-retryable|session_stalled" \
+  "$(sqlite3 -separator '|' "$AFD_DB" "SELECT state,attempt,branch,session_id,park_reason FROM bead_overlay WHERE bead_id='held-retryable-live';")"
 
 # 15. tick-summary emits telemetry
 echo "tick" > /tmp/br-status  # doesn't matter for tick-summary

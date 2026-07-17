@@ -67,3 +67,9 @@ test.db
 .ao/
 .claude/activity-updater.sh
 .beads/.local_version
+
+# Generated runner diagnostics — per-run failure logs and per-branch
+# failure-step markers dropped by the dark-factory runner when a pipeline
+# exhausts retries. Not canonical history; regenerate per run.
+failed_run_log*.txt
+branch_fail_step_*

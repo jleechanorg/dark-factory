@@ -110,11 +110,16 @@ pub fn maybe_run(
     now_epoch: u64,
 ) -> Result<Outcome, DaemonError> {
     // 1. Bead + PR must be valid (overlay is loaded to validate state + PR
-    //    consistency; the actual fetch is done in step 2)
-    match deps.store.load(bead_id)? {
-        Some(o) if o.state == OverlayState::Attested && o.pr_number == Some(pr) => {}
+    //    consistency; the actual fetch is done in step 2). Captured (not
+    //    discarded) so its resolved repo (jleechan-9xrs Stage D —
+    //    `overlay.repo(cfg)`) can be threaded through the snapshot fetch,
+    //    reviewer prompt, and posted comment's ext_ref below instead of
+    //    `deps.cfg.target_repo`.
+    let overlay = match deps.store.load(bead_id)? {
+        Some(o) if o.state == OverlayState::Attested && o.pr_number == Some(pr) => o,
         _ => return Ok(Outcome::NotApplicable),
     };
+    let repo = overlay.repo(deps.cfg).to_string();
 
     // 2. Already posted? (idempotence) — jleechan-nplh: only a verdict
     //    posted at/after the CURRENT head commit counts. A verdict that
@@ -122,7 +127,7 @@ pub fn maybe_run(
     //    as valid would short-circuit re-verification forever (live
     //    incident: worldarchitect.ai#7888, a 2026-07-08 PASS suppressed
     //    re-review of a 2026-07-10 head ~100 commits later).
-    let snapshot = deps.scm.pr_snapshot(pr)?;
+    let snapshot = deps.scm.pr_snapshot_for_repo(&repo, pr)?;
     let existing =
         verifier::parse_er_verdict_since(&snapshot.comments, snapshot.head_committed_epoch);
     if existing != ErVerdict::Absent {
@@ -147,7 +152,7 @@ pub fn maybe_run(
     }
 
     // 5. Spawn reviewer
-    let prompt = build_er_prompt(bead_id, pr, &deps.cfg.target_repo);
+    let prompt = build_er_prompt(bead_id, pr, &repo);
     let reply = if !deps.llm.is_real() {
         deps.llm.judge(&prompt)?
     } else {
@@ -160,7 +165,7 @@ pub fn maybe_run(
     let body = format!(
         "🤖 **[dark-factory /er]** Evidence review verdict:\n\n```\n{reply}\n```"
     );
-    let ext_ref = format!("{}#{}", deps.cfg.target_repo, pr);
+    let ext_ref = format!("{}#{}", repo, pr);
     deps.tracker.comment_external(&ext_ref, &body)?;
 
     // 7. Increment attempt counter — only AFTER the comment landed, so a
@@ -340,6 +345,23 @@ mod tests {
                     stderr: format!("no scripted snapshot for pr {pr}"),
                 })
         }
+        /// jleechan-9xrs Stage D regression coverage: records the `repo`
+        /// argument distinctly so tests can assert `maybe_run` fetched the
+        /// bead's OWN resolved repo, not `cfg.target_repo`.
+        fn pr_snapshot_for_repo(&self, repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("pr_snapshot_for_repo({repo},{pr})"));
+            self.snapshots
+                .borrow()
+                .get(&pr)
+                .cloned()
+                .ok_or_else(|| DaemonError::Tool {
+                    tool: "gh".into(),
+                    rc: 1,
+                    stderr: format!("no scripted snapshot for pr {pr}"),
+                })
+        }
         fn close_pr(&self, pr: u64, _c: &str) -> Result<(), DaemonError> {
             self.calls.borrow_mut().push(format!("close_pr({pr})"));
             Ok(())
@@ -491,6 +513,7 @@ mod tests {
             autonomy_timebox_secs: 10_800,
             budget_warn_usd: 20.0,
             spec_dir: ".factory/specs/".into(),
+            repos: std::collections::HashMap::new(),
         }
     }
 
@@ -509,6 +532,7 @@ mod tests {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
+            target_repo: None,
         }
     }
 
@@ -631,6 +655,85 @@ mod tests {
         let (ext_ref, body) = &comment_calls[0];
         assert_eq!(ext_ref, "owner/repo#103");
         assert!(body.contains("/er PASS"), "verbatim verdict in comment: {body:?}");
+    }
+
+    /// jleechan-9xrs Stage D: when the bead has an explicit `target_repo`
+    /// DIFFERENT from `cfg.target_repo`, `maybe_run` must fetch the PR
+    /// snapshot, build the reviewer prompt, and post the verdict comment
+    /// against the BEAD's OWN repo — not the daemon-global
+    /// `cfg.target_repo`. Regression for the multi-repo dispatch fix
+    /// (docs/multirepo-dispatch-investigation-2026-07-11.md); this is the
+    /// "er_runner prompts/ext_ref" half of Stage D's acceptance criteria.
+    /// The companion `spawns_reviewer_when_no_verdict_and_posts_comment`
+    /// test above (bead `target_repo: None`) pins the legacy-fallback half.
+    #[test]
+    fn cross_repo_bead_uses_its_own_repo_not_cfg_target_repo() {
+        telemetry_cleanup();
+        let scm = S::default();
+        let tracker = T::default();
+        let sessions = Ss;
+        let llm = L::default();
+        *llm.response.borrow_mut() = Some(Ok("/er PASS — saw integration test output".into()));
+        let store = St::default();
+        let cfg = test_cfg(); // cfg.target_repo == "owner/repo"
+
+        let pr = 999;
+        let bead = "b-cross-repo";
+        let mut overlay = attested_overlay(bead, pr);
+        overlay.target_repo = Some("otherorg/other-repo".to_string());
+        store.overlays.borrow_mut().insert(bead.into(), overlay);
+        scm.snapshots
+            .borrow_mut()
+            .insert(pr, snapshot_with_comments(pr, vec![]));
+
+        let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
+        let outcome = maybe_run(&deps, bead, pr, 1_000_000).unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::Posted {
+                verdict: ErVerdict::Pass,
+                count: 1,
+            }
+        );
+
+        // The posted comment's ext_ref must target the bead's own repo.
+        let comment_calls = tracker.comment_calls.borrow();
+        assert_eq!(comment_calls.len(), 1, "exactly one PR comment expected");
+        let (ext_ref, _body) = &comment_calls[0];
+        assert_eq!(
+            ext_ref, "otherorg/other-repo#999",
+            "escalation/er comment must target the bead's own repo, not cfg.target_repo"
+        );
+
+        // The snapshot fetch must have gone through pr_snapshot_for_repo
+        // with the bead's own repo, not the plain (cfg-bound) pr_snapshot.
+        let scm_calls = scm.calls.borrow();
+        assert!(
+            scm_calls
+                .iter()
+                .any(|c| c == "pr_snapshot_for_repo(otherorg/other-repo,999)"),
+            "expected pr_snapshot_for_repo with the bead's own repo, got: {scm_calls:?}"
+        );
+        assert!(
+            !scm_calls.iter().any(|c| c.contains("owner/repo")),
+            "must never fall back to cfg.target_repo for a bead with an \
+             explicit target_repo, got: {scm_calls:?}"
+        );
+
+        // The reviewer prompt (captured via the mock LLM's judge() call log)
+        // must reference the bead's own repo, not cfg.target_repo.
+        let llm_calls = llm.calls.borrow();
+        assert_eq!(llm_calls.len(), 1, "reviewer spawn expected");
+        assert!(
+            llm_calls[0].contains("otherorg/other-repo"),
+            "reviewer prompt must embed the bead's own repo, got: {:?}",
+            llm_calls[0]
+        );
+        assert!(
+            !llm_calls[0].contains("owner/repo"),
+            "reviewer prompt must not leak cfg.target_repo, got: {:?}",
+            llm_calls[0]
+        );
     }
 
     #[test]

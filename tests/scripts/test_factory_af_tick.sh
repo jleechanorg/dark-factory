@@ -50,7 +50,7 @@ trap cleanup EXIT
 FAKE_R="$SCRATCH_DIR/fake-r.sh"
 cat > "$FAKE_R" <<'STUB_R_EOF'
 #!/usr/bin/env bash
-echo "[fake-R] called: bead_id=$1 pr=$2 branch=${3:-}" >> /tmp/test-af-tick-fake-r.log
+echo "[fake-R] called: bead_id=$1 pr=$2 repo=${3:-} proj=${4:-}" >> /tmp/test-af-tick-fake-r.log
 exit 0
 STUB_R_EOF
 chmod +x "$FAKE_R"
@@ -64,11 +64,12 @@ fresh_db() {
   "$OVERLAY" init >/dev/null
 }
 
-# Helper: write a config TOML file with the requested capacity knobs.
 write_config() {
   local mw="${1:-30}" mb="${2:-15}"
   local cfg="$SCRATCH_DIR/daemon-cap-$mw-$mb.toml"
   cat > "$cfg" <<TOML_EOF
+target_repo = "jleechanorg/worldarchitect.ai"
+ao_project = "worldarchitect"
 max_workers = $mw
 max_batch = $mb
 TOML_EOF
@@ -189,11 +190,56 @@ ERR_TMP="\$(mktemp -t af_int.XXXXXX)"
 trap 'rm -f "\$ERR_TMP"' EXIT
 dispatched=0
 MAX_DISPATCH=2
-while IFS=\$'\t' read -r bead_id pr branch; do
+while IFS=\$'\t' read -r bead_id pr branch bead_repo; do
   [ -n "\$bead_id" ] || continue
   [ "\$dispatched" -ge "\$MAX_DISPATCH" ] && break
-  echo "[af] remediate \$bead_id PR #\$pr"
-  if bash "\$R" "\$bead_id" "\$pr" 2>&1; then
+
+  # Resolve target repo (default to global TARGET_REPO if empty)
+  repo="\${bead_repo:-jleechanorg/worldarchitect.ai}"
+
+  # Resolve AO project for this repo from config
+  proj="\$(python3 - "\$CONFIG" "\$repo" <<'PY'
+import sys, toml
+config_path = sys.argv[1]
+target_repo = sys.argv[2]
+try:
+    cfg = toml.load(config_path)
+except Exception:
+    cfg = {}
+
+# 1. Look in [repos]
+repos = cfg.get("repos", {})
+if target_repo in repos:
+    print(repos[target_repo].get("ao_project", ""))
+    sys.exit(0)
+
+# 2. Compare to global target_repo
+global_target = cfg.get("target_repo")
+if target_repo == global_target:
+    ao_project = cfg.get("ao_project")
+    if ao_project:
+        print(ao_project)
+        sys.exit(0)
+    # Derivation fallback
+    project = target_repo.split('/')[-1]
+    if project == "worldarchitect.ai":
+        project = "worldarchitect"
+    print(project)
+    sys.exit(0)
+
+# Unmapped
+print("")
+PY
+)"
+
+  if [ -z "\$proj" ]; then
+    echo "[af] fail closed: target repo '\$repo' has no matching configured AO project. Parking bead \$bead_id." >&2
+    "\$O" park "\$bead_id" "unmapped_target_repo" >/dev/null || true
+    continue
+  fi
+
+  echo "[af] remediate \$bead_id PR #\$pr on \$repo in project \$proj"
+  if bash "\$R" "\$bead_id" "\$pr" "\$repo" "\$proj" 2>&1; then
     cur_state="\$(sqlite3 "\$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='\$(printf "%s" "\$bead_id" | sed "s/'/''/g")';" 2>/dev/null || true)"
     if [ "\$cur_state" = "QUEUED" ]; then
       if [ -n "\$branch" ]; then
@@ -217,16 +263,16 @@ while IFS=\$'\t' read -r bead_id pr branch; do
     dispatched=\$((dispatched + 1))
   fi
 done < <(sqlite3 "\$AFD_DB" -separator \$'\t' \
-  "SELECT bead_id, pr_number, coalesce(branch,'') FROM bead_overlay
+  "SELECT bead_id, pr_number, coalesce(branch,''), coalesce(target_repo,'') FROM bead_overlay
    WHERE state IN ('QUEUED','ATTESTED') AND pr_number IS NOT NULL
-   AND bead_id IN ('\$WRAPPER_BEAD')
+   AND bead_id IN ('\${WRAPPER_BEAD}')
    ORDER BY updated_at LIMIT 10;")
 echo "af_dispatched=\$dispatched"
 WRAP_EOF
 chmod +x "$WRAPPER"
 
 : > /tmp/test-af-tick-fake-r.log
-out="$(AFD_WRAPPER_BEAD=test-integ bash "$WRAPPER" 2>&1)"
+out="$(AFD_WRAPPER_BEAD=test-integ CONFIG="$(write_config 30 15)" bash "$WRAPPER" 2>&1)"
 af_dispatched="$(echo "$out" | grep -oE 'af_dispatched=[0-9]+' | head -1 | cut -d= -f2)"
 assert "integration: af_dispatched=1" "1" "$af_dispatched"
 state="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='test-integ';")"
@@ -265,6 +311,56 @@ case "$out" in
 esac
 state="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='test-caploop';")"
 assert "integration: state stays QUEUED under capacity refusal" "QUEUED" "$state"
+
+# ---------------------------------------------------------------------------
+# Test 7: Multi-repo dispatch loop integration with same numeric PR
+# Verify that two beads with different target_repo but same pr_number
+# are dispatched to their corresponding repos/projects.
+# ---------------------------------------------------------------------------
+write_multirepo_config() {
+  local cfg="$SCRATCH_DIR/daemon-multirepo.toml"
+  cat > "$cfg" <<TOML_EOF
+target_repo = "jleechanorg/worldarchitect.ai"
+ao_project = "worldarchitect"
+max_workers = 30
+max_batch = 15
+
+[repos."jleechanorg/worldarchitect.ai"]
+ao_project = "worldarchitect"
+push_remote = "worldai"
+
+[repos."jleechanorg/dark-factory"]
+ao_project = "dark-factory"
+push_remote = "origin"
+TOML_EOF
+  printf '%s' "$cfg"
+}
+
+fresh_db multirepo
+export CONFIG="$(write_multirepo_config)"
+
+# Insert two beads with the same numeric PR but different target repos
+"$OVERLAY" intake-upsert bead-wa 'wa test' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=56, branch='fix/wa-56', target_repo='jleechanorg/worldarchitect.ai' WHERE bead_id='bead-wa';"
+"$OVERLAY" route-record bead-wa STANDARD_PATH 'drive-existing-pr' >/dev/null
+
+"$OVERLAY" intake-upsert bead-df 'df test' >/dev/null
+sqlite3 "$AFD_DB" "UPDATE bead_overlay SET pr_number=56, branch='fix/df-56', target_repo='jleechanorg/dark-factory' WHERE bead_id='bead-df';"
+"$OVERLAY" route-record bead-df STANDARD_PATH 'drive-existing-pr' >/dev/null
+
+: > /tmp/test-af-tick-fake-r.log
+AFD_WRAPPER_BEAD="bead-wa','bead-df" bash "$WRAPPER" >/tmp/test-af-tick-multirepo.log 2>&1 || true
+
+# Verify they both got dispatched
+state_wa="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='bead-wa';")"
+assert "bead-wa state=DISPATCHED" "DISPATCHED" "$state_wa"
+
+state_df="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='bead-df';")"
+assert "bead-df state=DISPATCHED" "DISPATCHED" "$state_df"
+
+# Verify fake-R calls passed the correct repo and project to factory-ao-remediate.sh
+assert_grep "remediate bead-wa on WA project" "called:.*bead_id=bead-wa pr=56 repo=jleechanorg/worldarchitect.ai proj=worldarchitect" /tmp/test-af-tick-fake-r.log
+assert_grep "remediate bead-df on DF project" "called:.*bead_id=bead-df pr=56 repo=jleechanorg/dark-factory proj=dark-factory" /tmp/test-af-tick-fake-r.log
 
 echo
 echo "=== RESULTS: $PASS passed, $FAIL failed ==="
