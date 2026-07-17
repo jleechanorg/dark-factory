@@ -104,7 +104,13 @@ gh pr list --repo "$TARGET_REPO" --head "factory/<bead_id>-r<attempt>" --state o
 
 ## 7. Verifier tick (gate assessment)
 
-For every ATTESTED bead (PR opened/updated), run the 9 gates (7 original + `/code-standards` + `/zfc`). All nine gates share one verdict space:
+For every ATTESTED bead (PR opened/updated), run the canonical 7 gates as defined in
+`daemon/src/verifier.rs::GateName` (`Ci, NoConflicts, CodeRabbitApproved, BugbotClean,
+CommentsResolved, EvidenceFloor, Skeptic`). The `code_standards` and `zfc` checks are
+optional advisory reviews — they are NOT required keys in the gate-assessment JSON and their
+absence never blocks `all_green`. If you DO record them, they participate like any recorded
+gate: a `fail` verdict blocks `all_green` and routes through the same `reroll-verdict` fix
+loop. See bead jleechan-1gft for promoting them to required `GateName` gates in the Rust verifier.
 
 | Verdict  | Meaning                                                                | Gate result     |
 |----------|------------------------------------------------------------------------|-----------------|
@@ -151,13 +157,15 @@ model:
                       "msg": "keyword blacklist enforced in app code"}]}
 ```
 
-Record via `$H gate-assessment <bead_id> <pr> '<gates_json>'`. The 9-key JSON
-schema (strict) is enforced by `factory-overlay.sh`:
+Record via `$H gate-assessment <bead_id> <pr> '<gates_json>'`. The 7-key JSON
+schema (strict, matching `daemon/src/verifier.rs::GateName`) is enforced by `factory-overlay.sh`:
 
 ```json
 {"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass",
  "bugbot":"pass","comments_resolved":"pass","evidence_review":"pass",
- "skeptic":"pass","code_standards":"pass","zfc":"pass"}
+ "skeptic":"pass"}
+ // optional advisory keys — not required; if present, a fail still blocks:
+ // "code_standards":"pass","zfc":"pass"
 ```
 
 Legacy aliases `"green" → "pass"`, `"red" → "fail"` are still accepted so
@@ -194,6 +202,6 @@ result (cooldown handling is unchanged from the original 7-gate design).
 
 - **GH API rate-limited**: skip GH pickup, use beads-only mode; continue.
 - **Daemon DOWN** (no auto-factory tick loop running): invoke `bash daemon/factory-af-tick.sh` for one tick; for a 24/7 poll loop, install the launchd plist from `daemon/launchd/ai.dark-factory.af-tick.plist` (bead jleechan-57h0) and `launchctl bootstrap gui/$UID <plist>`.
-- **Bead stuck HUMAN_HELD**: query previous `gate-assessment` — if cooldown over, reset bead to QUEUED via direct sqlite3 update + increment attempt counter.
+- **Bead stuck HUMAN_HELD**: `factory-af-tick.sh` already calls `$H recover-held` every tick, which requeues any `HUMAN_HELD` bead with `attempt < 10` back to `QUEUED` (incrementing `attempt`, resetting `autonomy_secs`) automatically. To force it immediately: `$H recover-held` (no bead-id argument — it processes every eligible `HUMAN_HELD` row). Never mutate `bead_overlay` with a raw `sqlite3` command.
 - **PR ci_green stuck on pre-existing infra**: document in PR comment, treat as known-issue; do NOT block readiness.
 - **File-overlap conflict across multiple PRs**: serialize per stacked-PR single-writer rule.

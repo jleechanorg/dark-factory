@@ -131,3 +131,79 @@ Per the launchd-plist-template skill, every plist installed to
 `~/Library/LaunchAgents/` must have a template committed to the owning
 repo. Without the template, `./install-launchagents.sh` cannot clean up
 or rotate the plist across machines.
+
+## Checkout drift protection (bead jleechan-vxs8)
+
+The plist's `ProgramArguments` point at `@HOME@/projects/dark-factory` — a
+dev working tree that is also used interactively, NOT a dedicated
+deploy-only checkout. Historically this meant every `git checkout <branch>`
+in that tree was an unaudited production deploy: on 2026-07-11 the tree sat
+on a crashing feature branch for hours, then was silently switched to a
+different branch by another session, and neither state was a deliberate
+deploy.
+
+Rather than splitting off a separate deploy-owned checkout path (more
+moving parts: a second clone to keep in sync, a second directory to explain
+in every runbook, and `install-launchagents.sh`/the plist would need
+rewiring to point at it), `daemon/factory-af-tick.sh` embeds a **Gate-0-style
+drift-refusal check** near the top of its main body (search for `Gate 0:
+refuse to tick`). Before doing any dispatch work, every tick verifies its
+own checkout:
+
+1. is on branch `main`,
+2. has no uncommitted changes,
+3. matches `origin/main` (best-effort fetch — a transient network blip does
+   not fail the tick, only a *confirmed* mismatch does).
+
+Any violation makes the tick **refuse and exit 10** with a clear log line
+(landing in `af-tick.err.log`) instead of silently running whatever code
+happens to be on disk. `AFD_SKIP_DRIFT_CHECK=1` bypasses the gate for local
+dev/test invocations of the script — the production plist never sets this.
+
+### Deploying a change to the daemon
+
+The daemon's checkout is only ever advanced by
+`daemon/scripts/deploy-af-tick.sh`, the one sanctioned deploy step. It
+refuses to run against a dirty or non-main checkout, fast-forwards to
+`origin/main`, and logs the SHA transition (old -> new) both to stdout and
+to a JSONL audit log (`~/Library/Logs/dark-factory/deploy.jsonl` by
+default). See that script's header comment for the full contract
+(exit codes, `--dry-run`, `--target-dir`). It does **not** restart the
+launchd job — see "Single-writer rule" below.
+
+## Single-writer rule — who runs the deploy step
+
+Per CLAUDE.md policy, restarting the live `ai.dark-factory.af-tick` launchd
+job is the exclusive responsibility of the session's designated
+deploy-owner. A coder/PR-driving session must never bootstrap/bootout the
+live job or touch `~/projects/dark-factory` directly — see the bead
+jleechan-vxs8 non-goals. `deploy-af-tick.sh` mirrors this: it fast-forwards
+the checkout only. The running daemon picks up new code on its next tick
+(each tick execs `factory-af-tick.sh` fresh from disk), so no restart is
+required for a normal deploy. A human deploy-owner would run, from any
+machine with SSH/terminal access to the box that runs the launchd job:
+
+```bash
+# 1. Deploy: fast-forward the daemon's checkout to origin/main.
+daemon/scripts/deploy-af-tick.sh
+#    -> prints "deploy-af-tick: DEPLOYED <dir>: <old_sha> -> <new_sha>"
+#       or "deploy-af-tick: no-op — already at origin/main (<sha>)"
+
+# 2. Verify a scheduled tick actually ran the new code (wait up to one
+#    AFD_TICK_INTERVAL_SEC, default 240s, for the next natural tick — do NOT
+#    force a restart just to "prove" this; it's not required, see above):
+tail -f ~/Library/Logs/dark-factory/af-tick.out.log
+#    -> confirm a fresh tick line lands after the deploy timestamp and does
+#       NOT contain "REFUSING TICK" (which would mean the drift check itself
+#       is unexpectedly firing post-deploy — a bug, since deploy-af-tick.sh
+#       leaves the checkout clean and on main by construction).
+
+# 3. Cross-check the audit trail:
+tail -1 ~/Library/Logs/dark-factory/deploy.jsonl
+#    -> {"ts":"...","target_dir":"...","old_sha":"...","new_sha":"...","noop":false}
+```
+
+If step 2 shows a `REFUSING TICK` line instead of normal dispatch activity,
+something external touched the checkout between the deploy and the next
+tick (e.g. a stray interactive `git checkout` in the same tree) — treat
+that as a defect in whatever touched the tree, not in the daemon.

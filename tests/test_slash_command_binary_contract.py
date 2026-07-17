@@ -6,6 +6,7 @@ import re
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 COMMANDS_DIR = ROOT / ".claude" / "commands"
+SKILLS_DIR = ROOT / ".claude" / "skills"
 
 PROOF_LABELS = (
     "# Literal command run:",
@@ -23,6 +24,10 @@ def _command(name: str) -> str:
     return (COMMANDS_DIR / name).read_text()
 
 
+def _skill(name: str) -> str:
+    return (SKILLS_DIR / name / "SKILL.md").read_text()
+
+
 def _aliases(text: str) -> list[str]:
     match = re.search(r"^aliases:\s*\[(.*?)\]\s*$", text, re.MULTILINE)
     if not match:
@@ -34,14 +39,24 @@ def _aliases(text: str) -> list[str]:
 
 
 def test_f_and_fs_require_binary_proof_block() -> None:
+    """f.md/fs.md are thin stubs pointing at a canonical SKILL.md; the
+    binary proof-block contract lives there (single source of truth), not
+    duplicated in the command file. Verify the skill each command points
+    at actually carries the full contract, and that the stub itself still
+    points at that skill (so the pointer can't silently rot)."""
     missing: list[str] = []
-    for name in ("f.md", "fs.md"):
-        text = _command(name)
+    command_to_skill = {"f.md": "dark-factory", "fs.md": "factory-spec"}
+    for command_name, skill_name in command_to_skill.items():
+        command_text = _command(command_name)
+        if f"skills/{skill_name}/SKILL.md" not in command_text:
+            missing.append(f"{command_name}: no longer points at skills/{skill_name}/SKILL.md")
+
+        skill_text = _skill(skill_name)
         for label in PROOF_LABELS:
-            if label not in text:
-                missing.append(f"{name}: missing {label}")
-        if "dark-factory \\" not in text:
-            missing.append(f"{name}: missing literal dark-factory command shape")
+            if label not in skill_text:
+                missing.append(f"{skill_name}/SKILL.md: missing {label}")
+        if "dark-factory \\" not in skill_text:
+            missing.append(f"{skill_name}/SKILL.md: missing literal dark-factory command shape")
     assert not missing, "Slash command binary proof block is incomplete:\n  " + "\n  ".join(missing)
 
 
@@ -103,26 +118,23 @@ def test_fs_alias_has_single_owner() -> None:
 
 
 def test_f_defaults_reviewer_calibration_on() -> None:
+    """/f and /factory are thin stubs; the reviewer-calibration contract
+    lives in dark-factory/SKILL.md (single source of truth) rather than
+    being duplicated in each command file. Verify both stubs still point
+    at that skill, and that the skill carries the full contract."""
     f_text = _command("f.md")
     factory_text = _command("factory.md")
-    required_f_phrases = (
+    assert "skills/dark-factory/SKILL.md" in f_text, "f.md no longer points at dark-factory/SKILL.md"
+    assert "skills/dark-factory/SKILL.md" in factory_text, "factory.md no longer points at dark-factory/SKILL.md"
+
+    skill_text = _skill("dark-factory")
+    required_phrases = (
         "--reviewer-calibration=true` is the default",
         "--reviewer-calibration=false",
-        "# Reviewer calibration:",
+        "## Reviewer calibration",
         "evidence/<run-id>/reviewer-calibration/",
         "codex exec --yolo -m gpt-5.3-codex-spark",
         "Do not claim delegated subagents underperformed raw Codex unless",
     )
-    missing = [phrase for phrase in required_f_phrases if phrase not in f_text]
-    assert not missing, "f.md missing reviewer calibration contract: " + ", ".join(missing)
-
-    required_factory_phrases = (
-        "Reviewer calibration is also inherited from `/f`: default on",
-        "--reviewer-calibration=false",
-        "evidence/<run-id>/reviewer-calibration/",
-    )
-    missing_factory = [phrase for phrase in required_factory_phrases if phrase not in factory_text]
-    assert not missing_factory, (
-        "factory.md missing reviewer calibration alias contract: "
-        + ", ".join(missing_factory)
-    )
+    missing = [phrase for phrase in required_phrases if phrase not in skill_text]
+    assert not missing, "dark-factory/SKILL.md missing reviewer calibration contract: " + ", ".join(missing)

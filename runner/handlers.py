@@ -45,6 +45,13 @@ from .handler_sandbox import (
     _sealed_benchmark_doc_paths,
     _sandboxed_args,
     _sandboxed_args_for_workdir,
+    # Linux isolation backend (jleechan-haux) — re-exported so
+    # tests/security/test_agent_isolation.py can exercise + monkeypatch
+    # them the same way the macOS sandbox-exec helpers are exercised.
+    _linux_preload_lib_path,
+    _verify_linux_preload_denies,
+    _linux_sandbox_prefix,
+    _reset_linux_preload_verification_cache_for_tests,
 )
 
 # AO backend helpers.
@@ -86,7 +93,7 @@ from .handler_metrics import (
     _claude_json_result,
 )
 
-# Verdict parsing + SHA binding.
+# Verdict parsing + SHA binding + outcome/verdict consistency.
 from .handler_verdict import (
     _VERDICT_NORMALIZE,
     _HEAD_SHA_ECHO_RE,
@@ -97,6 +104,7 @@ from .handler_verdict import (
     _MARKER_PRESENT_RE,
     _STANDALONE_RE,
     _parse_verdict,
+    _enforce_outcome_verdict_consistency,
 )
 
 # Gate subprocess + adversarial priority queue + execute-gate fallback.

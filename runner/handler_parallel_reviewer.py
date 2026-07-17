@@ -11,13 +11,24 @@ behavior is aligned with existing lanes (`_resolve_gate_backend`,
 from __future__ import annotations
 
 import json
-
 from typing import TYPE_CHECKING
 
-import runner.handlers as _handlers_shim
-
+# Import collaborators from their source modules directly. Importing
+# `runner.handlers` (the re-export shim) here would create a module-load
+# cycle: handlers.py imports this file at TYPE_REGISTRY registration time,
+# and at module-load that partial re-import would re-enter handlers before
+# `_parallel_reviewer` is bound. The shim still re-exports these names, so
+# downstream monkeypatching via `runner.handlers._render_prompt` etc. keeps
+# working unchanged.
+#
+# Symbols that tests monkeypatch via ``runner.handlers._X`` are looked up
+# lazily inside ``_parallel_reviewer`` via the shim — see the function body.
 from .handler_core import Result
 from .handler_core import _gate_strict_flag
+# Canonical implementation lives in handler_verdict (pr228 B1 relocation).
+# Re-exported here for backward compatibility: handler_verdict is a leaf
+# module (imports nothing from handlers), so this creates no import cycle.
+from .handler_verdict import _enforce_outcome_verdict_consistency  # noqa: F401
 from .handler_dispatch import (
     _finish_shadow_gate_review,
     _is_gate_infra_failure,
@@ -162,6 +173,7 @@ def _coalesce_parallel_outcome(primary: str, shadows: list[str]) -> str:
 
 def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
+    import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
     prompt = _handlers_shim._render_prompt(node, ctx)
     if ctx.backend in ("echo", "mock_llm"):
         hint = ctx.state.get(f"{node.name}.outcome", "success")
@@ -214,6 +226,14 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     primary.metadata.update(backend_meta)
 
     if not shadows:
+        # Bug 2 fix: Ensure outcome and verdict are consistent. A contradictory
+        # verdict (e.g., outcome=failure with verdict=pass) can occur when stale
+        # spec artifacts cause the reviewer to misjudge. Force verdict to match outcome.
+        # Dispatch via the canonical re-export shim so the unqualified name here
+        # reaches the single definition in ``runner.handler_verdict``.
+        primary = _handlers_shim._enforce_outcome_verdict_consistency(
+            primary, gate_strict=gate_strict,
+        )
         return primary
 
     result = primary
@@ -234,11 +254,15 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     merged_metadata["parallel_reviewer_shadow_backends"] = ",".join(s.backend for s in shadows)
     merged_metadata["shadow_reviews"] = json.dumps(shadow_reviews, sort_keys=True)
     merged_metadata["parallel_reviewer_outcome"] = final_outcome
-    return Result(
+    # Build result and enforce outcome/verdict consistency.
+    final_result = Result(
         outcome=final_outcome,
         output=result.output,
         metadata=merged_metadata,
         preferred_label=result.preferred_label,
         suggested_next_ids=result.suggested_next_ids,
         context_updates=result.context_updates,
+    )
+    return _handlers_shim._enforce_outcome_verdict_consistency(
+        final_result, gate_strict=gate_strict,
     )
