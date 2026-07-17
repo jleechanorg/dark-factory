@@ -95,6 +95,18 @@ Instead:
 
 Dark Factory runs in **two phases — generate the spec, then execute the factory.**
 
+**Prerequisite: [Git LFS](https://git-lfs.com/)** — this repo tracks
+`artifacts/repro-developer/**/*.{tar.zst,tar.gz,gpg}` via LFS filters
+(`.gitattributes`), whose checkout-time filter requires `git-lfs` on `PATH`;
+`.githooks/pre-push` separately hard-gates pushes when `git-lfs` is absent.
+Without it, `git clone`/`git worktree add` fails at checkout time. Install
+first:
+`sudo apt-get install -y git-lfs && git lfs install` (Debian/Ubuntu) or
+`brew install git-lfs && git lfs install` (macOS). No sudo? Grab a static
+binary from the [releases page](https://github.com/git-lfs/git-lfs/releases)
+and put it on `PATH` (e.g. `~/.local/bin/git-lfs`). `install.sh` also
+verifies this and fails fast with the same instructions if it's missing.
+
 ```bash
 # 0. Install once (uv-managed Python 3.13 venv + binaries on PATH)
 git clone https://github.com/jleechanorg/dark-factory ~/projects/dark-factory
