@@ -78,9 +78,13 @@ install_systemd_user() {
     fi
     local user="${USER:-$(id -un 2>/dev/null)}"
     if [ -z "${XDG_RUNTIME_DIR:-}" ] && ! loginctl show-user "$user" >/dev/null 2>&1; then
-        echo "[error] systemd user session not available (no XDG_RUNTIME_DIR, loginctl inactive)" >&2
-        echo "[hint]  enable lingering with: sudo loginctl enable-linger $user" >&2
-        exit 3
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "[dry-run] skipping systemd user session check (no XDG_RUNTIME_DIR / loginctl inactive in this env)"
+        else
+            echo "[error] systemd user session not available (no XDG_RUNTIME_DIR, loginctl inactive)" >&2
+            echo "[hint]  enable lingering with: sudo loginctl enable-linger $user" >&2
+            exit 3
+        fi
     fi
 
     ensure_log_dir

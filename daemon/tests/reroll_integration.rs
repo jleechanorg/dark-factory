@@ -660,7 +660,8 @@ fn adopted_spawn_failures_never_leave_an_untracked_or_recoverable_live_worker() 
     for case in ["typed-cleanup", "save-stop-ok", "save-stop-fails"] {
         let bead_id = format!("adopted-{case}");
         let scm = FakeScm::new();
-        let sessions = FakeSessions::new();
+        let mut sessions = FakeSessions::new();
+        sessions.quiescent = true;
         if case == "typed-cleanup" {
             sessions.fail_spawn_cleanup_for(&bead_id);
         } else {
@@ -826,7 +827,8 @@ fn test_reroll_adopted_skips_duplicate_spawn_when_session_already_active() {
 fn adopted_spawn_crash_is_reconciled_without_duplicate_redispatch() {
     let bead_id = "adopted-crash-after-spawn";
     let scm = FakeScm::new();
-    let sessions = FakeSessions::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
     sessions.panic_after_spawn_for(bead_id);
     let mut vcs = FakeVcs::new();
     vcs.heads.insert(
