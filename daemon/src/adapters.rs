@@ -3263,6 +3263,68 @@ impl Sessions for CliSessions {
             Ok(Some(trimmed.to_string()))
         }
     }
+
+    /// Bead jleechan-coder-silent-false-parks-h92r: unlike
+    /// `worktree_remote_url` (a spawn-time-only assertion that fails closed
+    /// on a missing mapping), this is an advisory liveness signal consulted
+    /// on every tick a bead sits DISPATCHED — a missing AO workspace
+    /// mapping, missing `$HOME`, or missing transcript directory are all
+    /// "no evidence", not an error, so the coder-silence sweep can fall back
+    /// to its other signal instead of hard-failing the whole tick.
+    fn worktree_transcript_last_activity_epoch(
+        &self,
+        ao_project: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let key = (ao_project.to_string(), branch.to_string());
+        let path = self
+            .spawned_worktrees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned();
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return Ok(None);
+        }
+        let slug = crate::tools::claude_project_slug(&path);
+        let transcript_dir = std::path::Path::new(&home)
+            .join(".claude")
+            .join("projects")
+            .join(slug);
+        Ok(latest_jsonl_mtime_epoch(&transcript_dir))
+    }
+}
+
+/// Most recent modification time (unix epoch seconds) across every
+/// `*.jsonl` file directly inside `dir`, or `None` when `dir` doesn't exist,
+/// isn't readable, or contains no `.jsonl` files. A single unreadable entry
+/// is skipped rather than failing the whole scan — this is a best-effort
+/// liveness signal, not a correctness-critical read.
+fn latest_jsonl_mtime_epoch(dir: &std::path::Path) -> Option<u64> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut latest: Option<u64> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) else {
+            continue;
+        };
+        let epoch = dur.as_secs();
+        latest = Some(latest.map_or(epoch, |l: u64| l.max(epoch)));
+    }
+    latest
 }
 
 /// Count the daemon's one global AO worker envelope across every project.
@@ -3613,6 +3675,129 @@ mod worktree_remote_url_tests {
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(result.is_err(), "an unconfigured push remote must fail closed");
+    }
+}
+
+#[cfg(test)]
+mod worktree_transcript_last_activity_epoch_tests {
+    use super::{gh_env_test_lock, CliSessions};
+    use crate::tools::Sessions;
+
+    fn record_workspace(
+        sessions: &CliSessions,
+        project: &str,
+        branch: &str,
+        path: &std::path::Path,
+    ) {
+        sessions
+            .spawned_worktrees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (project.to_string(), branch.to_string()),
+                path.to_path_buf(),
+            );
+    }
+
+    /// Bead jleechan-coder-silent-false-parks-h92r: no `spawned_worktrees`
+    /// entry for the (project, branch) key must be "no evidence"
+    /// (`Ok(None)`), never an error and never treated as proof of silence —
+    /// this signal is advisory, unlike the spawn-time-only
+    /// `worktree_remote_url` fail-closed check.
+    #[test]
+    fn no_evidence_without_spawned_workspace() {
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        let result = sessions
+            .worktree_transcript_last_activity_epoch("dark-factory", "factory/missing-r1");
+
+        assert_eq!(result.unwrap(), None);
+    }
+
+    /// Reproduces the 2026-07-17 false-park scenario: a real worktree with a
+    /// transcript directory whose `.jsonl` file was modified moments ago
+    /// must report a recent epoch, even though nothing was pushed to the
+    /// remote branch.
+    #[test]
+    fn reports_latest_jsonl_mtime_from_derived_transcript_dir() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_transcript_activity_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let fake_home = root.join("home");
+        let worktree_path = root.join("worktrees").join("dark-factory").join("df-100");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+
+        let slug = crate::tools::claude_project_slug(&worktree_path);
+        let transcript_dir = fake_home.join(".claude").join("projects").join(&slug);
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(transcript_dir.join("session-1.jsonl"), "{}\n").unwrap();
+        std::fs::write(transcript_dir.join("not-a-transcript.txt"), "ignore me").unwrap();
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &fake_home);
+
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        record_workspace(&sessions, "dark-factory", "factory/df-100-r1", &worktree_path);
+        let result =
+            sessions.worktree_transcript_last_activity_epoch("dark-factory", "factory/df-100-r1");
+
+        if let Some(v) = prev_home {
+            std::env::set_var("HOME", v);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        let epoch = result.unwrap().expect("must find the .jsonl file's mtime");
+        assert!(
+            epoch >= before,
+            "reported epoch {epoch} must be >= test-start epoch {before}"
+        );
+    }
+
+    /// A resolvable worktree whose transcript directory doesn't exist yet
+    /// (e.g. the coder session hasn't written any transcript file yet, or
+    /// the naming convention drifted) is "no evidence", not an error.
+    #[test]
+    fn no_evidence_when_transcript_dir_missing() {
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "afd_transcript_activity_missing_dir_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let fake_home = root.join("home");
+        let worktree_path = root.join("worktrees").join("dark-factory").join("df-101");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &fake_home);
+
+        let sessions = CliSessions::new("owner/repo", "claude-code");
+        record_workspace(&sessions, "dark-factory", "factory/df-101-r1", &worktree_path);
+        let result =
+            sessions.worktree_transcript_last_activity_epoch("dark-factory", "factory/df-101-r1");
+
+        if let Some(v) = prev_home {
+            std::env::set_var("HOME", v);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(result.unwrap(), None);
     }
 }
 

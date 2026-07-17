@@ -706,6 +706,181 @@ fn test_wedge_detection_dispatched_coder_silent() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// jleechan-coder-silent-false-parks-h92r regression test: reproduces the
+/// LIVE 2026-07-17 bug this bead tracks. All 6 active dispatch lanes were
+/// parked `PARKED_HUMAN_HELD reason=coder_silent` while their coders were
+/// demonstrably working (transcripts growing, real commits landing) — the
+/// wedge-detection sweep's ONLY liveness signal was "no remote branch commit
+/// in 30 minutes", which is not evidence of silence for a coder mid-edit
+/// that simply hasn't pushed yet. Same setup as
+/// `test_wedge_detection_dispatched_coder_silent` (remote branch has no
+/// commit at all), but this time the coder's own transcript directory was
+/// modified moments ago — the bead must NOT be parked, and a
+/// `CODER_ACTIVE_GRACE` telemetry event must record why.
+#[test]
+fn test_wedge_detection_dispatched_coder_silent_saved_by_transcript_activity() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "bead-active".into(),
+        BeadOverlay {
+            bead_id: "bead-active".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 1900,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-active-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+
+    // Same as the false-park scenario: the remote branch has received no
+    // commit at all, which alone would trigger the silence park.
+    scm.remote_branches
+        .insert("factory/bead-active-r1".into(), None);
+
+    // But the coder's own transcript was modified 5 seconds ago — real,
+    // ongoing local activity the old branch-only check couldn't see.
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // `test_cfg()` leaves `ao_project: None` and `target_repo: "owner/repo"`,
+    // so `Config::resolve_repo` derives `ao_project = "repo"` (last path
+    // segment) — the same derivation `SpawnSpec` tests already rely on.
+    sessions.set_transcript_activity("repo", "factory/bead-active-r1", now_epoch - 5);
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_wedge_silent_grace.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = FakeVcs::new();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 10).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "a coder with recent transcript activity must NOT be parked"
+    );
+
+    let o = store.load("bead-active").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "bead must remain DISPATCHED, not be parked HUMAN_HELD"
+    );
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(
+        logs.contains("CODER_ACTIVE_GRACE"),
+        "telemetry must record the grace decision: {}",
+        logs
+    );
+    assert!(
+        !logs.contains("PARKED_HUMAN_HELD"),
+        "must not park: {}",
+        logs
+    );
+    assert!(!logs.contains("coder_silent"), "must not park: {}", logs);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Fail-closed companion to the grace test above: a STALE transcript
+/// (last modified over 30 minutes ago) must not save a bead from parking —
+/// only genuinely recent evidence should count. Guards against a naive "any
+/// transcript record ever" implementation that would defeat the timeout.
+#[test]
+fn test_wedge_detection_dispatched_coder_silent_stale_transcript_still_parks() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "bead-stale".into(),
+        BeadOverlay {
+            bead_id: "bead-stale".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 1900,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-stale-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+
+    scm.remote_branches
+        .insert("factory/bead-stale-r1".into(), None);
+
+    // Transcript exists but was last modified 2 hours ago — no evidence of
+    // CURRENT activity.
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    sessions.set_transcript_activity("repo", "factory/bead-stale-r1", now_epoch - 7200);
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_wedge_silent_stale.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = FakeVcs::new();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 10).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "a stale transcript must not save a genuinely silent coder from parking"
+    );
+
+    let o = store.load("bead-stale").unwrap().unwrap();
+    assert_eq!(o.state, OverlayState::HumanHeld);
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(logs.contains("PARKED_HUMAN_HELD"), "logs: {}", logs);
+    assert!(logs.contains("coder_silent"), "logs: {}", logs);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// jleechan-5ia2 regression test: reproduces the LIVE bug this bead tracks.
 /// Bead `jleechan-vj89`'s overlay was observed with `state=DISPATCHED`,
 /// `branch=factory/jleechan-vj89-r1`, and a real, alive `session_id`

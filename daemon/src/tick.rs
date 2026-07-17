@@ -576,12 +576,56 @@ pub fn run_tick(
                                 .unwrap_or_default()
                                 .as_secs();
 
-                            let is_silent = match last_commit_epoch {
+                            let branch_is_silent = match last_commit_epoch {
                                 None => true,
                                 Some(commit_time) => now_epoch.saturating_sub(commit_time) >= 1800,
                             };
 
-                            if is_silent {
+                            // Bead jleechan-coder-silent-false-parks-h92r:
+                            // 2026-07-17 all 6 active lanes were parked
+                            // `coder_silent` while their coders were
+                            // demonstrably working — a coder can iterate
+                            // locally (edit/test/edit) for well over 30
+                            // minutes before its next push, so "no remote
+                            // commit in 30 minutes" alone is not evidence of
+                            // silence. Consult the coder's own transcript
+                            // mtime as a second, independent liveness
+                            // signal before parking; only park when NEITHER
+                            // signal shows recent activity (fail-closed
+                            // preserved: missing/unresolvable transcript
+                            // evidence does not by itself save a bead from
+                            // parking).
+                            let transcript_epoch = deps
+                                .cfg
+                                .resolve_repo(overlay.repo(deps.cfg))
+                                .and_then(|routing| {
+                                    deps.sessions
+                                        .worktree_transcript_last_activity_epoch(
+                                            &routing.ao_project,
+                                            branch,
+                                        )
+                                        .ok()
+                                        .flatten()
+                                });
+                            let transcript_is_active = transcript_epoch
+                                .is_some_and(|t| now_epoch.saturating_sub(t) < 1800);
+
+                            if branch_is_silent && transcript_is_active {
+                                emit(
+                                    deps.telemetry_log,
+                                    &overlay.bead_id,
+                                    overlay.attempt,
+                                    overlay.state.as_str(),
+                                    "CODER_ACTIVE_GRACE",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "reason": "coder_active_grace",
+                                        "branch": branch,
+                                        "last_commit_epoch": last_commit_epoch,
+                                        "transcript_epoch": transcript_epoch,
+                                    }),
+                                )?;
+                            } else if branch_is_silent {
                                 overlay.state = OverlayState::HumanHeld;
                                 set_human_hold_reason(&mut overlay, HumanHoldReason::CoderSilent);
                                 deps.store.save(&overlay)?;
