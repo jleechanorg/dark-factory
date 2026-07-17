@@ -247,6 +247,42 @@ jobs:
         with:
           workspaces: daemon -> target
 
+      - name: Provision Node 22.22.0 (for AO bridge tests)
+        # `bridge_test_node()` in `daemon/src/adapters.rs:1942` looks for
+        # `${HOME}/.nvm/versions/node/v22.22.0/bin/node` (the global
+        # CLAUDE.md "Use nvm Node 22 (v22.22.0)" convention) before
+        # falling back to `node` on PATH. Self-hosted runners don't ship
+        # nvm or Node 22 preinstalled — verified on PR #287 CI run
+        # 29549724870 where 5 `adapters::ao_spawn_contract_tests`
+        # panicked with `[Errno 2] No such file or directory` because
+        # the AO bridge python shim `os.execvp`'d a missing
+        # `AO_FAKE_NODE` path. Provision Node 22.22.0 from NodeSource
+        # to the exact nvm path so the bridge tests can find their
+        # runtime.
+        # Short-circuit cleanly when the binary already exists so
+        # cached/ephemeral runners don't re-download ~30MB on every run.
+        # Bead: jleechan-af-drive-pr287-aw9y.
+        run: |
+          NODE_BIN="${HOME}/.nvm/versions/node/v22.22.0/bin"
+          if [ -x "${NODE_BIN}/node" ]; then
+            "${NODE_BIN}/node" --version
+            exit 0
+          fi
+          OS="$(uname -s)"
+          ARCH="$(uname -m)"
+          case "${OS}-${ARCH}" in
+            Darwin-x86_64)  NODE_ARCH=darwin-x64 ;;
+            Darwin-arm64)   NODE_ARCH=darwin-arm64 ;;
+            Linux-x86_64)   NODE_ARCH=linux-x64 ;;
+            Linux-aarch64)  NODE_ARCH=linux-arm64 ;;
+            *) echo "::error::Unsupported Node arch: ${OS}-${ARCH}"; exit 1 ;;
+          esac
+          mkdir -p "${NODE_BIN%/*}"
+          curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/v22.22.0/node-v22.22.0-${NODE_ARCH}.tar.xz"
+          tar -xJf /tmp/node.tar.xz -C /tmp
+          cp -r "/tmp/node-v22.22.0-${NODE_ARCH}/bin" "/tmp/node-v22.22.0-${NODE_ARCH}/lib" "/tmp/node-v22.22.0-${NODE_ARCH}/include" "/tmp/node-v22.22.0-${NODE_ARCH}/share" "${NODE_BIN%/*}/"
+          "${NODE_BIN}/node" --version
+
       - name: cargo test (daemon crate)
         working-directory: daemon
         run: cargo test --verbose
