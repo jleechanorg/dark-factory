@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template: ai.dark-factory.github-webhook.plist.template
+  Purpose: long-running launchd agent that serves a localhost:9876 HTTP
+           endpoint for GitHub webhook delivery. On a validated 'push'
+           event for an allow-listed repo, it posts a 1-line /af milestone
+           beacon to #factory (C0BGEC77EP4) via post-webhook-beacon.sh.
+
+  Why this exists alongside the 5-min status beacon (commit 2):
+    The user explicitly asked for 'every 5 min or when milestone happens
+    or remote commit'. The status beacon covers the periodic case; this
+    plist covers the event-driven case (GitHub push events). Push events
+    fire within seconds of the remote commit, so this provides near-real-
+    time visibility into remote work.
+
+  Webhook configuration:
+    Operators must configure GitHub to POST to:
+        http://127.0.0.1:9876/webhook
+    on push events for the allow-listed repos. The tunnel path from the
+    public internet to 127.0.0.1 is operator-managed (e.g. cloudflared,
+    ngrok, ssh reverse tunnel, or a Tailscale funnel). The launchd agent
+    binds 127.0.0.1 ONLY — it is not exposed to the LAN by default.
+
+  Invocation:
+    launchd-wrapper.sh sources the operator's interactive login env (PATH,
+    python3) before exec'ing the listener .sh wrapper. The wrapper exec's
+    github-webhook-listener.py with stdlib only — no pip dependencies.
+
+  Usage (manual install):
+    launchctl bootstrap gui/$UID "$HOME/Library/LaunchAgents/ai.dark-factory.github-webhook.plist"
+
+  Disarm:
+    launchctl bootout gui/$UID "$HOME/Library/LaunchAgents/ai.dark-factory.github-webhook.plist"
+    rm "$HOME/Library/LaunchAgents/ai.dark-factory.github-webhook.plist"
+
+  Notes:
+    - @HOME@, @FACTORY_SLACK_CHANNEL_ID@, @HERMES_SLACK_BOT_TOKEN@,
+      @GITHUB_WEBHOOK_SECRET@, @GH_REPOS@ are all substituted by
+      install-launchagents.sh.
+    - GITHUB_WEBHOOK_SECRET MUST be non-empty; the listener refuses to
+      start without it (see github-webhook-listener.py:main()).
+    - KeepAlive=true + ThrottleInterval=10 so a crash is restarted quickly
+      but a crash loop doesn't burn CPU.
+    - ProcessType=Background marks this as a long-running daemon (lower
+      scheduling priority than Interactive tasks).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.dark-factory.github-webhook</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>@HOME@/projects/dark-factory/daemon/launchd/launchd-wrapper.sh</string>
+        <string>@HOME@/projects/dark-factory/daemon/scripts/github-webhook-listener.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>@HOME@/Library/Logs/dark-factory/github-webhook.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>@HOME@/Library/Logs/dark-factory/github-webhook.err.log</string>
+
+    <!--
+      GitHub webhook secret + Slack channel/token + repo allow-list.
+      All substituted by install-launchagents.sh (never commit a real
+      secret or token). GH_REPOS is a comma-separated list of full_name
+      repos; empty string = accept all (operator opt-in).
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>GITHUB_WEBHOOK_SECRET</key>
+        <string>@GITHUB_WEBHOOK_SECRET@</string>
+        <key>FACTORY_SLACK_CHANNEL_ID</key>
+        <string>C0BGEC77EP4</string>
+        <key>HERMES_SLACK_BOT_TOKEN</key>
+        <string>@HERMES_SLACK_BOT_TOKEN@</string>
+        <key>GH_REPOS</key>
+        <string>@GH_REPOS@</string>
+        <key>PORT</key>
+        <string>9876</string>
+        <key>REPO_ROOT</key>
+        <string>@HOME@/projects/dark-factory</string>
+        <key>BEACON_SCRIPT</key>
+        <string>@HOME@/projects/dark-factory/daemon/scripts/post-webhook-beacon.sh</string>
+    </dict>
+</dict>
+</plist>

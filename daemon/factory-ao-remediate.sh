@@ -58,7 +58,49 @@ else
   MODE="async"
 fi
 
-PROMPT="Factory bead ${BEAD_ID}: drive PR #${PR} on ${TARGET_REPO} to /green + /er. Push to existing branch only; do NOT open new PR; do NOT merge."
+# Pull bead body so the worker sees the goal artifact, not just IDs.
+# Use `description` (which inlines the "Acceptance:" paragraph) + the
+# dedicated `acceptance_criteria` field if populated.
+BEAD_JSON="$("$ROOT/../bin/br" --db "${BR_DB:-$ROOT/../.beads/beads.db}" show "$BEAD_ID" --json 2>/dev/null || true)"
+if [ -z "$BEAD_JSON" ]; then
+  if command -v br >/dev/null 2>&1; then
+    BEAD_JSON="$(br --db "${BR_DB:-$HOME/.beads/beads.db}" show "$BEAD_ID" --json 2>/dev/null || true)"
+  fi
+fi
+BEAD_DESC="$(printf '%s' "$BEAD_JSON" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read() or "{}")
+except Exception:
+    d = {}
+desc = (d.get("description") or "").strip()
+acc = (d.get("acceptance_criteria") or "").strip()
+if desc and acc:
+    print(desc + "\n\nAcceptance:\n" + acc)
+elif desc:
+    print(desc)
+elif acc:
+    print("Acceptance:\n" + acc)
+else:
+    print("(no description on bead)")
+' 2>/dev/null || echo '(br show --json unavailable)')"
+
+# /goal is a built-in slash for both Claude Code and Codex. Prepending it
+# activates structured goal-tracking in the spawned worker; the bead's
+# description + acceptance are appended so the worker reads the goal
+# artifact rather than re-deriving it from IDs.
+PROMPT="/goal
+Factory bead ${BEAD_ID}: drive PR #${PR} on ${TARGET_REPO} to /green + /er. Push to existing branch only; do NOT open new PR; do NOT merge.
+
+--- Bead goal artifact (br show --json) ---
+${BEAD_DESC}"
+
+# Optional Slack pickup announcement (no-op when libnotify-slack.sh or env unset).
+if [ -r "$ROOT/daemon/scripts/libnotify-slack.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$ROOT/daemon/scripts/libnotify-slack.sh"
+  slack_announce ":rocket: bead \`${BEAD_ID}\` PR #${PR} on ${TARGET_REPO} — async-spawning via AO" || true
+fi
 
 # Pre-flight: ensure AO is reachable. Bounded at 5s wallclock so the
 # async path never blocks more than that on cold-start. Two failure modes
