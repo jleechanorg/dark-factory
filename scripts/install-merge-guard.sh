@@ -76,9 +76,10 @@ install_systemd_user() {
         echo "[error] systemctl not found on PATH; cannot install systemd user unit" >&2
         exit 3
     fi
-    if [ -z "${XDG_RUNTIME_DIR:-}" ] && ! loginctl show-user "$USER" >/dev/null 2>&1; then
+    local user="${USER:-$(id -un 2>/dev/null)}"
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] && ! loginctl show-user "$user" >/dev/null 2>&1; then
         echo "[error] systemd user session not available (no XDG_RUNTIME_DIR, loginctl inactive)" >&2
-        echo "[hint]  enable lingering with: sudo loginctl enable-linger $USER" >&2
+        echo "[hint]  enable lingering with: sudo loginctl enable-linger $user" >&2
         exit 3
     fi
 
