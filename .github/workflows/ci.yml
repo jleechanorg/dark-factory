@@ -67,31 +67,39 @@ jobs:
         # step runs.
         run: |
           set -u
-          # 1) Resolve the toolchain bin directory WITHOUT invoking python3.
-          TOOLCHAIN_BIN_DIR="${PythonLocation:-${pythonLocation:-}}"
-          if [ -z "$TOOLCHAIN_BIN_DIR" ] && command -v python3 >/dev/null 2>&1; then
-            # `command -v` is a shell builtin that walks PATH and reports the
-            # on-disk path of python3 itself; it does not exec the binary, so
-            # it works even when the dynamic loader would have failed. resolve
-            # the symlink chain so we land on the real toolcache dir rather
-            # than `/usr/bin/python3` (which on self-hosted runners is a shim).
+          # 1) Resolve the toolchain ROOT directory WITHOUT invoking python3.
+          # `pythonLocation` (set by actions/setup-python v5) points at the
+          # toolchain ROOT (e.g. /home/runner/_work/_tool/Python/3.13.14/arm64),
+          # not the bin subdir; the binary lives at `$TOOLCHAIN_ROOT/bin/python3`.
+          TOOLCHAIN_ROOT="${PythonLocation:-${pythonLocation:-}}"
+          if [ -z "$TOOLCHAIN_ROOT" ] && command -v python3 >/dev/null 2>&1; then
+            # `command -v` is a shell builtin; it does not exec the binary, so
+            # it works even when libpython would have failed. Resolve the
+            # symlink chain so we land on the real toolcache root rather than
+            # `/usr/bin/python3` (which on self-hosted runners is a shim).
             PY_BIN="$(command -v python3)"
             PY_REAL="$(readlink -f "$PY_BIN" 2>/dev/null || echo "$PY_BIN")"
-            TOOLCHAIN_BIN_DIR="$(dirname "$PY_REAL")"
+            # the python binary's directory is `<root>/bin`, so the root is its parent
+            TOOLCHAIN_ROOT="$(dirname "$(dirname "$PY_REAL")")"
           fi
-          if [ -z "$TOOLCHAIN_BIN_DIR" ] || [ ! -d "$TOOLCHAIN_BIN_DIR" ]; then
-            echo "::error::Cannot locate Python toolchain bin dir (PythonLocation=${PythonLocation:-<unset>})."
+          if [ -z "$TOOLCHAIN_ROOT" ] || [ ! -d "$TOOLCHAIN_ROOT" ]; then
+            echo "::error::Cannot locate Python toolchain root (PythonLocation=${PythonLocation:-<unset>})."
             exit 1
           fi
-          echo "Toolchain bin dir: $TOOLCHAIN_BIN_DIR"
-          # 2) Locate the link-time libpython3.13.so next to the toolchain
-          #    (the layout matches actions/setup-python v5: bin/../lib/libpython3.13.so).
-          SO_PATH="$TOOLCHAIN_BIN_DIR/../lib/libpython3.13.so"
+          # Sanity: confirm the python3 binary actually exists where we think it is.
+          if [ ! -x "$TOOLCHAIN_ROOT/bin/python3" ]; then
+            echo "::error::Expected python3 binary at $TOOLCHAIN_ROOT/bin/python3 but it is missing or not executable."
+            ls -la "$TOOLCHAIN_ROOT" 2>/dev/null || true
+            exit 1
+          fi
+          echo "Toolchain root: $TOOLCHAIN_ROOT"
+          # 2) Locate the link-time libpython3.13.so in the toolchain's lib dir.
+          SO_PATH="$TOOLCHAIN_ROOT/lib/libpython3.13.so"
           if [ ! -e "$SO_PATH" ]; then
-            SO_PATH="$(find "$TOOLCHAIN_BIN_DIR/.." -maxdepth 6 -name 'libpython3.13.so' -not -name '*.so.*' 2>/dev/null | head -1)"
+            SO_PATH="$(find "$TOOLCHAIN_ROOT" -maxdepth 4 -name 'libpython3.13.so' -not -name '*.so.*' 2>/dev/null | head -1)"
           fi
           if [ -z "$SO_PATH" ] || [ ! -e "$SO_PATH" ]; then
-            echo "::warning::libpython3.13.so not found in toolchain ($TOOLCHAIN_BIN_DIR) — subprocess python will fail."
+            echo "::warning::libpython3.13.so not found in toolchain ($TOOLCHAIN_ROOT) — subprocess python will fail."
           else
             SO_DIR="$(dirname "$SO_PATH")"
             SO_NAME="$(basename "$SO_PATH")"
@@ -110,12 +118,53 @@ jobs:
             else
               echo "Versioned symlink ${SO_DIR}/${VERSIONED} already exists"
             fi
+            # 4b) tests/test_*.py subprocess calls (test_subprocess_fail_exit_code,
+            #     test_subprocess_emits_valid_json, test_cli_subprocess_emits_exact_message,
+            #     test_module_runnable_as_python_m_runner, …) invoke
+            #     sys.executable with an explicit `env=` argument that
+            #     intentionally strips LD_LIBRARY_PATH. The fix at step (4)
+            #     above + the LD_LIBRARY_PATH export do not reach those
+            #     subprocesses. The remaining mechanism is to install a tiny
+            #     `python3` shim at `$TOOLCHAIN_ROOT/bin/python3` that execs
+            #     the original toolchain binary with `LD_PRELOAD` set to the
+            #     link-time `libpython3.13.so`. Force-loading libpython via
+            #     LD_PRELOAD satisfies the python binary's libpython3.13.so.1.0
+            #     soname reference regardless of LD_LIBRARY_PATH inheritance.
+            #
+            #     The shim is installed ONLY if a real toolchain `python3`
+            #     exists at the expected location. It backs up the original
+            #     binary first so the failure mode is reversible if the
+            #     shell that runs the step misbehaves.
+            SHIM_REAL="$TOOLCHAIN_ROOT/bin/python3.real"
+            for SHIM_NAME in python3 python; do
+              SHIM_BIN="$TOOLCHAIN_ROOT/bin/$SHIM_NAME"
+              if [ -e "$SHIM_REAL" ]; then
+                # Real binary is already preserved by an earlier iteration.
+                # Install (or refresh) the shim that execs it with LD_PRELOAD.
+                if [ "$SHIM_BIN" = "$SHIM_REAL" ]; then
+                  continue
+                fi
+                printf '#!/usr/bin/env bash\nexec env LD_PRELOAD="%s" "%s" "$@"\n' \
+                  "$SO_PATH" "$SHIM_REAL" > "$SHIM_BIN"
+                chmod +x "$SHIM_BIN"
+                echo "Installed shim: $SHIM_BIN -> exec $SHIM_REAL with LD_PRELOAD=$SO_PATH"
+              elif [ -x "$SHIM_BIN" ]; then
+                # First iteration: preserve the real binary then shim it.
+                mv "$SHIM_BIN" "$SHIM_REAL"
+                printf '#!/usr/bin/env bash\nexec env LD_PRELOAD="%s" "%s" "$@"\n' \
+                  "$SO_PATH" "$SHIM_REAL" > "$SHIM_BIN"
+                chmod +x "$SHIM_BIN"
+                echo "Installed shim: $SHIM_BIN -> exec $SHIM_REAL with LD_PRELOAD=$SO_PATH"
+              else
+                echo "::warning::No toolchain python at $SHIM_BIN — skipping shim for that name."
+              fi
+            done
             # 5) Self-test: invoke the toolchain `python3 -c 'import sys'` NOW,
             #    before the test step, so a remaining rc=127 surfaces as a
             #    step-level error here instead of failing the entire pytest
             #    run (which would mask the real cause).
-            echo "Self-test: ${TOOLCHAIN_BIN_DIR}/python3 -c 'import sys; sys.exit(0)'"
-            "${TOOLCHAIN_BIN_DIR}/python3" -c 'import sys; sys.exit(0)'
+            echo "Self-test: $SHIM_BIN -c 'import sys; sys.exit(0)'"
+            "$SHIM_BIN" -c 'import sys; sys.exit(0)'
             rc=$?
             if [ "$rc" -ne 0 ]; then
               echo "::error::subprocess python3 still fails after symlink fix (rc=$rc). libpython is not loadable."
