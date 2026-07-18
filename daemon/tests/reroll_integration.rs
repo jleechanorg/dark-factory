@@ -245,9 +245,19 @@ fn test_reroll_success() {
         &["factory/bead-success-r2"]
     );
 
-    // Verify SCM PR close call
+    // Verify SCM PR close call. jleechan-v6ud / issue #340: reroll now
+    // dispatches through `close_pr_for_repo(<bead.repo(cfg)>, ...)` —
+    // `bead.target_repo` is None here, so it falls back to
+    // `cfg.target_repo` ("owner/repo") via `BeadOverlay::repo`. The
+    // regression test for cross-repo beads (8jxr / 9rkz class) is added
+    // below.
     let scm_calls = scm.calls.borrow();
-    assert!(scm_calls.iter().any(|c| c.contains("close_pr(201")));
+    assert!(
+        scm_calls
+            .iter()
+            .any(|c| c.contains("close_pr_for_repo(owner/repo,201")),
+        "expected close_pr_for_repo call to bead's resolved repo (owner/repo); got: {scm_calls:?}"
+    );
 
     // bead jleechan-tfs1 regression guard: a factory-fabricated bead
     // (is_adopted=false) must still use today's create-branch-at path and
@@ -554,7 +564,7 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
     // (c) Never closes the original PR:
     let scm_calls = scm.calls.borrow();
     assert!(
-        scm_calls.iter().all(|c| !c.starts_with("close_pr(")),
+        scm_calls.iter().all(|c| !c.starts_with("close_pr_for_repo(") && !c.starts_with("close_pr(")),
         "adopted remediation must never close the contributor's PR: {scm_calls:?}"
     );
 
@@ -650,7 +660,7 @@ fn test_reroll_adopted_spawn_failure_parks_human_held() {
     );
     let scm_calls = scm.calls.borrow();
     assert!(
-        scm_calls.iter().all(|c| !c.starts_with("close_pr(")),
+        scm_calls.iter().all(|c| !c.starts_with("close_pr_for_repo(") && !c.starts_with("close_pr(")),
         "a failed adopted remediation must never close the contributor's PR: {scm_calls:?}"
     );
 
@@ -1271,7 +1281,7 @@ mod quiescence_timeout_races {
         let vcs_calls = vcs.calls.borrow();
         assert!(vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")));
         let scm_calls = scm.calls.borrow();
-        assert!(scm_calls.iter().all(|c| !c.starts_with("close_pr(")));
+        assert!(scm_calls.iter().all(|c| !c.starts_with("close_pr_for_repo(") && !c.starts_with("close_pr(")));
 
         let _ = std::fs::remove_file(&telemetry_log);
     }
@@ -1333,7 +1343,7 @@ mod quiescence_timeout_races {
         let vcs_calls = vcs.calls.borrow();
         assert!(vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")));
         let scm_calls = scm.calls.borrow();
-        assert!(scm_calls.iter().all(|c| !c.starts_with("close_pr(")));
+        assert!(scm_calls.iter().all(|c| !c.starts_with("close_pr_for_repo(") && !c.starts_with("close_pr(")));
 
         let _ = std::fs::remove_file(&telemetry_log);
     }
@@ -1869,5 +1879,154 @@ fn same_underlying_issue_malformed_reply_is_transient_not_fatal() {
         "a malformed circuit-breaker comparator reply must be classified transient (jleechan-cq8r / jleechan-5ia2 pattern), got non-transient: {err:?}"
     );
 
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-v6ud / issue #340 — RECURSIVE INSTANCE of the jleechan-8jxr /
+/// jleechan-drive-pr-branch-binding-pcpr #306 bug class.
+///
+/// Live failure: at 2026-07-18T21:46:53Z the reroll for `jleechan-8jxr`
+/// (real PR: jleechanorg/dark-factory#315, OPEN) attempted to close its
+/// superseded r1 PR after a clean `REROLL_BRANCH_CREATED`. The close call
+/// resolved PR #315 against `jleechanorg/worldarchitect.ai` instead of
+/// `jleechanorg/dark-factory` — a different, already-merged PR that
+/// happened to share the same number — and `gh pr close` errored with
+/// "can't be closed because it was already merged", wedging the bead on
+/// a transient tool error. The identical failure mode hit `jleechan-9rkz`
+/// (#314) twice on the same day. Repro construction below:
+///   * `cfg.target_repo = "jleechanorg/worldarchitect.ai"` (the daemon
+///     default — the OLD wrong target for the close call).
+///   * `bead.target_repo = Some("jleechanorg/dark-factory")` (Stage A
+///     intake resolved repo — the BEAD's real target).
+///   * The bead has `pr_number = Some(315)`. In production there are TWO
+///     same-numbered PRs: the bead's real open PR in
+///     `jleechanorg/dark-factory#315`, AND a different merged PR
+///     `jleechanorg/worldarchitect.ai#315`. Reroll's old
+///     `close_pr(pr_number, comment)` was bound at `main.rs` construction
+///     time to `cfg.target_repo`, so it would `gh pr close 315 --repo
+///     jleechanorg/worldarchitect.ai` against the merged one and error
+///     out. Reroll's new `close_pr_for_repo(bead.repo(cfg), ...)` MUST
+///     close the bead's real repo's PR (`jleechanorg/dark-factory`) and
+///     MUST NOT touch the default repo's PR.
+///
+/// The test asserts:
+///   (a) The recorded SCM call uses `close_pr_for_repo(<bead's repo>, 315, ...)`
+///       — not the legacy `close_pr(315, ...)` form.
+///   (b) The recorded repo string is `jleechanorg/dark-factory`, NOT
+///       `cfg.target_repo` (`jleechanorg/worldarchitect.ai`). This is the
+///       exact assertion that would have caught the jleechan-8jxr /
+///       jleechan-9rkz regression pre-deploy.
+///   (c) The reroll completes (`RerollOutcome::Rerolled`), proving the
+///       bead's resolved repo is now usable end-to-end.
+#[test]
+fn test_reroll_close_pr_uses_bead_resolved_repo_not_cfg_target_repo() {
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("main".into(), "base-sha-v6ud".into());
+    vcs.heads
+        .insert("factory/jleechan-8jxr-r1".into(), "head-sha-v6ud".into());
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["address 315"],"positiveAssertions":["close bead's PR"],"securityRedactionEncountered":false}"#.into()
+    ));
+
+    // `cfg.target_repo` deliberately names the OLD wrong default
+    // (`worldarchitect.ai`) — the same daemon-wide default that the live
+    // failure had. This is the repo reroll.rs MUST NOT use for the close
+    // call when the bead has a different resolved `target_repo`.
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/worldarchitect.ai".into();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_v6ud_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_reroll_v6ud_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // The bead has its OWN resolved `target_repo` (Stage A intake) —
+    // this is what reroll MUST use for the PR-close call.
+    let mut bead = BeadOverlay {
+        bead_id: "jleechan-8jxr".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 30,
+        spend_usd: 0.5,
+        pr_number: Some(315), // same number as the merged default-repo PR
+        branch: Some("factory/jleechan-8jxr-r1".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: Some("jleechanorg/dark-factory".into()),
+    };
+    store.save(&bead).unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "Address the open comments on 8jxr.".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    match outcome {
+        RerollOutcome::Rerolled { new_branch } => {
+            assert_eq!(new_branch, "factory/jleechan-8jxr-r2");
+        }
+        other => panic!("expected RerollOutcome::Rerolled, got {:?}", other),
+    }
+
+    // (a) + (b): the close call MUST be repo-scoped to the bead's
+    // resolved repo (`jleechanorg/dark-factory`), NOT `cfg.target_repo`
+    // (`jleechanorg/worldarchitect.ai`).
+    let scm_calls = scm.calls.borrow();
+    let close_calls: Vec<&String> = scm_calls
+        .iter()
+        .filter(|c| c.starts_with("close_pr_for_repo(") || c.starts_with("close_pr("))
+        .collect();
+    assert_eq!(
+        close_calls.len(),
+        1,
+        "reroll must make exactly one PR-close call; got: {scm_calls:?}"
+    );
+    assert!(
+        close_calls[0].starts_with("close_pr_for_repo(jleechanorg/dark-factory,315,"),
+        "reroll must close the bead's resolved repo's PR (jleechanorg/dark-factory#315); \
+         the live failure for 8jxr/9rkz was that it targeted cfg.target_repo's \
+         same-numbered PR (jleechanorg/worldarchitect.ai#315, already merged). \
+         Actual close call: {}",
+        close_calls[0]
+    );
+    // Belt-and-suspenders: explicit anti-assertion that the wrong repo
+    // was NOT targeted. If the regression recurs, this string would
+    // appear in the recorded call and the test fails loudly with a
+    // bead ID + repo pair (not just "close_pr" was missing).
+    assert!(
+        !close_calls[0].contains("worldarchitect.ai"),
+        "reroll closed against cfg.target_repo (worldarchitect.ai), which is the exact \
+         jleechan-8jxr/9rkz regression: got {}",
+        close_calls[0]
+    );
+
+    let updated = store.load("jleechan-8jxr").unwrap().unwrap();
+    assert_eq!(updated.state, OverlayState::Recovery);
+    assert_eq!(updated.attempt, 2);
+    assert_eq!(updated.pr_number, None);
+
+    std::fs::remove_dir_all(spec_dir).ok();
     let _ = std::fs::remove_file(&telemetry_log);
 }
