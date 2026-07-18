@@ -1136,6 +1136,57 @@ impl Scm for CliScm {
         Ok(parse_open_pr_head_ref(&out, repo))
     }
 
+    /// Bead jleechan-t40t (issue #326): resolve the CURRENT open PR whose
+    /// head ref is `branch` in `repo`. Implementation issues
+    /// `gh pr list --head <branch> --repo <repo> --json number --jq '.[0].number'`
+    /// and parses the trimmed stdout as a `u64`. Mirrors the
+    /// slow-tier DISPATCHED re-resolution path in `tick.rs::run_slow_tier`
+    /// — both have to agree on the same branch→PR contract. `Err(_)` is
+    /// returned only on a hard `gh` failure; "no such PR" is `Ok(None)` so
+    /// callers can distinguish "transient tool error" (retry next tick)
+    /// from "the branch really has no open PR right now" (legitimate —
+    /// keep using the existing `pr_number` until one appears).
+    fn pr_number_for_branch(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let out = match run_tool(
+            "gh",
+            &[
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--repo",
+                repo,
+                "--json",
+                "number",
+                "--jq",
+                ".[0].number",
+            ],
+            30,
+        ) {
+            Ok(o) => o,
+            Err(DaemonError::Tool { stderr, .. })
+                if stderr.contains("404")
+                    || stderr.contains("Not Found")
+                    || stderr.contains("not found") =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let trimmed = out.trim();
+        if trimmed.is_empty() || trimmed == "null" {
+            return Ok(None);
+        }
+        match trimmed.parse::<u64>() {
+            Ok(pr) => Ok(Some(pr)),
+            Err(_) => Ok(None),
+        }
+    }
+
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
         let offline_path = std::path::Path::new(".beads/offline").join(format!("pr_{}.json", pr));
         if offline_path.exists() {

@@ -8253,3 +8253,264 @@ fn tick_deferred_reroll_stays_attested_and_reselects_next_tick() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// jleechan-t40t (issue #326, live incident jleechan-t8fd / PR #316):
+/// branch-mismatch handling preserves stale `pr_number`, blocking
+/// discovery of a later correct PR — bead stays DISPATCHED indefinitely.
+/// Regression test: a bead is dispatched onto a branch that originally
+/// resolved to PR `3001`, but the live state has a LATER PR (`3002`) on
+/// the same branch (e.g. the original PR was closed and a fresh one was
+/// opened on the same head ref). The slow-tier DISPATCHED→ATTESTED path
+/// must re-resolve `pr_number` from the branch, NOT trust the stale
+/// stored `pr_number`, so the bead promotes against the correct PR.
+///
+/// Pre-fix: this test fails — `pr_number` stays `3001`, the bead never
+/// converges, and no `PR_NUMBER_REREZOLVED` telemetry event fires.
+/// Post-fix: `pr_number` becomes `3002`, the bead promotes to ATTESTED,
+/// and the telemetry log carries the `PR_NUMBER_REREZOLVED` line so the
+/// drift is auditable from the daemon log alone.
+#[test]
+fn slow_tier_dispatched_branch_mismatch_re_resolves_stale_pr_number() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    // Seed a DISPATCHED bead on `factory/stale-pr-bead-r1` with a STALE
+    // `pr_number = 3001`. Live state: a different PR (3002) is now bound
+    // to the same branch — must supersede the stored value.
+    let branch = "factory/stale-pr-bead-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "stale-pr-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(3001), // stale
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("stale-pr-bead", branch).unwrap();
+
+    // Script the branch→PR lookup: branch now resolves to 3002 (current).
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(3002));
+    // PR 3002 has green gates; PR 3001 is irrelevant after re-resolution.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        3002,
+        PrSnapshot {
+            pr_number: 3002,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "cafebabe".into(),
+            body: "".into(),
+            comments: vec![PrComment {
+                author: "reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: now,
+            }],
+            files: vec![],
+            updated_at_epoch: now,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_t40t_branch_mismatch_stale_pr.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 0).expect("tick should succeed");
+    let after = store.load("stale-pr-bead").unwrap().unwrap();
+
+    // Core fix: `pr_number` was re-resolved from the branch — old value
+    // is gone, new value is stored, persisted state was updated.
+    assert_eq!(
+        after.pr_number,
+        Some(3002),
+        "branch→PR re-resolution must supersede the stale stored pr_number"
+    );
+    assert_ne!(
+        after.state,
+        OverlayState::Dispatched,
+        "bead must advance past DISPATCHED against the correctly-resolved PR \
+         (this is the core convergence invariant the bug violated; it may land \
+         at ATTESTED with pending gates or at READY when the scripted snapshot is \
+         all-green — both prove the drift was detected)"
+    );
+    assert_eq!(
+        summary.beads_dispatched, 0,
+        "this bead was already DISPATCHED (seeded), so no fresh dispatch should occur"
+    );
+
+    // Auditability: the drift must be observable from the daemon log alone
+    // — `grep PR_NUMBER_REREZOLVED` must find it without reading code.
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let rerez = events
+        .iter()
+        .find(|e| e["eventType"].as_str() == Some("PR_NUMBER_REREZOLVED"))
+        .expect("expected a PR_NUMBER_REREZOLVED telemetry event after drift detection");
+    let context = &rerez["context"];
+    assert_eq!(context["branch"].as_str(), Some(branch));
+    assert_eq!(context["previous_pr_number"].as_u64(), Some(3001));
+    assert_eq!(context["current_pr_number"].as_u64(), Some(3002));
+    assert_eq!(
+        context["reason"].as_str(),
+        Some("branch_mismatch_stale_state")
+    );
+
+    // Sanity: the FakeScm was actually called with the right (repo, branch)
+    // tuple (not cfg.target_repo or some other wrong key).
+    let calls = scm.calls.borrow();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == &format!("pr_number_for_branch(owner/repo,{branch})")),
+        "expected pr_number_for_branch(owner/repo,{branch}) in calls, got: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == "pr_snapshot_for_repo(owner/repo,3002)"),
+        "fast-tier gate assessment must query the RE-RESOLVED pr 3002, not the stale 3001: {calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|c| c.contains(",3001)")),
+        "no gate assessment may target the stale pr 3001 once drift is detected: {calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-t40t complement: a DISPATCHED bead whose stored `pr_number`
+/// ALREADY matches the branch's live PR must NOT re-emit the drift
+/// telemetry (it would be a per-tick spam storm on healthy beads) and
+/// must NOT regress to a different value. The branch→PR re-resolution
+/// is a quiet self-healing check, not a hot path.
+#[test]
+fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    let branch = "factory/clean-pr-bead-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "clean-pr-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(4001),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("clean-pr-bead", branch).unwrap();
+
+    // Branch→PR lookup agrees with the stored pr_number — no drift.
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(4001));
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        4001,
+        PrSnapshot {
+            pr_number: 4001,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "abc".into(),
+            body: "".into(),
+            comments: vec![PrComment {
+                author: "reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: now,
+            }],
+            files: vec![],
+            updated_at_epoch: now,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_t40t_branch_mismatch_clean.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+    let _ = run_tick(&deps, 1, 0).expect("tick should succeed");
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(
+        !body.lines().any(|l| l.contains("PR_NUMBER_REREZOLVED")),
+        "no drift event must fire when stored pr_number already matches the live PR"
+    );
+    assert!(
+        !body.lines().any(|l| l.contains("PR_NUMBER_REREZOLVE_TRANSIENT_ERROR")),
+        "no transient-error event must fire on a clean FakeScm lookup"
+    );
+    let after = store.load("clean-pr-bead").unwrap().unwrap();
+    assert_eq!(after.pr_number, Some(4001));
+    let _ = std::fs::remove_file(&telemetry_log);
+}

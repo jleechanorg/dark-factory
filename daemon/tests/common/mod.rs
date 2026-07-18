@@ -162,6 +162,11 @@ pub struct FakeScm {
     pub permissions: HashMap<String, Permission>,
     pub pr_snapshots: HashMap<u64, PrSnapshot>,
     pub remote_branches: HashMap<String, Option<u64>>,
+    /// jleechan-t40t (issue #326): scripted `pr_number_for_branch` lookups,
+    /// keyed by `(repo, branch)`. `Some(pr)` is a confirmed open PR bound
+    /// to that branch in that repo; absence of a key means "no open PR
+    /// bound" (`Ok(None)`), mirroring the real `CliScm` resolution path.
+    pub pr_numbers_for_branch: HashMap<(String, String), Option<u64>>,
     /// jleechan-drive-pr-branch-binding-pcpr: scripted open-PR lookups,
     /// keyed by `(repo, pr_number)`. Absence of a key (the `Default` case)
     /// means `PrHeadBranch::NotFound`, matching the real `CliScm` fail-safe
@@ -262,6 +267,21 @@ impl Scm for FakeScm {
             .get(&(repo.to_string(), pr))
             .cloned()
             .unwrap_or(PrHeadBranch::NotFound))
+    }
+
+    fn pr_number_for_branch(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("pr_number_for_branch({repo},{branch})"));
+        Ok(self
+            .pr_numbers_for_branch
+            .get(&(repo.to_string(), branch.to_string()))
+            .copied()
+            .flatten())
     }
 }
 
