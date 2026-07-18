@@ -435,7 +435,11 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            // jleechan-8jxr r2: real intake-persisted overlays carry a
+            // resolved `target_repo`; the old `None` here relied on the
+            // pre-fix silent default to `cfg.target_repo`. Update the
+            // test fixture to reflect production reality.
+            target_repo: Some("owner/repo".to_string()),
             })
             .unwrap();
     }
@@ -2501,7 +2505,14 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
         title: "Test manual bead".into(),
         description: "manually created".into(),
         file_tree_summary: "".into(),
-        external_ref: None, // manual beads have no external_ref
+        // jleechan-8jxr r2: a manual bead without an explicit external_ref
+        // (or body `target_repo:` field) is now parked `unmapped_repo`
+        // at dispatch time rather than silently defaulting to
+        // `cfg.target_repo`. Provide an explicit external_ref matching
+        // the test cfg's `target_repo` ("owner/repo") so this test
+        // exercises the happy path; the no-repo failure mode is
+        // covered by the dedicated regression test in dispatch.rs.
+        external_ref: Some("owner/repo#1".into()),
     });
 
     let sessions = FakeSessions::new();
