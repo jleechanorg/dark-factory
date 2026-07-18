@@ -179,6 +179,10 @@ pub struct FakeScm {
     /// bound" (`Ok(None)`), mirroring the real `CliScm` resolution path.
     pub pr_numbers_for_branch: HashMap<(String, String), Option<u64>>,
     pub pr_number_for_branch_errors: HashMap<(String, String), String>,
+    /// jleechan-coder-silent-false-parks-h92r (PR #307 reconciliation):
+    /// scripted local worktree HEAD commit timestamps keyed by
+    /// `(ao_project, branch)`.
+    pub worktree_branch_commits: HashMap<(String, String), Option<u64>>,
     /// jleechan-drive-pr-branch-binding-pcpr: scripted open-PR lookups,
     /// keyed by `(repo, pr_number)`. Absence of a key (the `Default` case)
     /// means `PrHeadBranch::NotFound`, matching the real `CliScm` fail-safe
@@ -402,6 +406,25 @@ impl Scm for FakeScm {
             // Absent = definitively not found (404).
             None => Ok(None),
         }
+    }
+
+    fn worktree_branch_last_commit(
+        &self,
+        ao_project: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("worktree_branch_last_commit({ao_project},{branch})"));
+        if let Some(&res) = self
+            .worktree_branch_commits
+            .get(&(ao_project.into(), branch.into()))
+        {
+            Ok(res)
+        } else {
+            Ok(None)
+        }
+    }
     }
 }
 

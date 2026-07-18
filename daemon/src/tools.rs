@@ -364,6 +364,29 @@ pub fn claude_project_slug(worktree_path: &std::path::Path) -> String {
         .collect()
 }
 
+/// Resolve the local Agent-Orchestrator worktree directory for
+/// `(ao_project, branch)`. Pure path arithmetic (no judgment call,
+/// ZFC-exempt): joins `$HOME/.agent-orchestrator/<ao_project>/<branch>` —
+/// the same convention `agent-orchestrator/packages/cli/src/commands/spawn.ts`
+/// uses to mount coder worktrees. Used by
+/// `Scm::worktree_branch_last_commit`'s CliScm impl to read a coder's
+/// local git HEAD commit timestamp without depending on a `spawned_worktrees`
+/// in-memory mapping (which only this CliScm can never have — that map
+/// lives on `CliSessions`).
+///
+/// Returns `None` when `$HOME` is not set so callers treat the worktree as
+/// absent on disk rather than guessing a path off `/`.
+pub fn resolve_worktree_path(ao_project: &str, branch: &str) -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        return std::path::PathBuf::from("/");
+    }
+    std::path::PathBuf::from(home)
+        .join(".agent-orchestrator")
+        .join(ao_project)
+        .join(branch)
+}
+
 #[cfg(test)]
 mod claude_project_slug_tests {
     use super::claude_project_slug;
@@ -478,6 +501,38 @@ pub trait Scm {
     ) -> Result<Option<u64>, DaemonError> {
         let _ = repo;
         self.remote_branch_last_commit(branch)
+    }
+
+    /// Local worktree HEAD commit timestamp for `branch` under `ao_project`,
+    /// if a worktree can be located on disk. `None` means "no positive
+    /// liveness signal" — the caller treats it as "cannot disprove silence",
+    /// NOT as "confirmed silent". Used by the coder-silence watcher
+    /// (`tick.rs`'s `Dispatched` autonomy check, bead
+    /// jleechan-coder-silent-false-parks-h92r / #307 reconciliation) as a
+    /// third "has-committed-locally" signal so a long-running Claude
+    /// coder that is actively committing locally but has not yet pushed
+    /// (`git push` cadence is typically 5-15 min, well above the 30-min
+    /// silence threshold) is not false-parked as `coder_silent`. Pairs with
+    /// `remote_branch_last_commit_for_repo` (remote-side check) and the
+    /// `Sessions::worktree_transcript_last_activity_epoch` (transcript
+    /// mtime) signal so the silence decision has THREE independent signals
+    /// instead of TWO. Pairs only with `Scm` (not `Sessions`) so the
+    /// worktree-local check lives next to its sibling `remote_branch_last_*`
+    /// on the same trait.
+    ///
+    /// Default impl returns `Ok(None)` ("cannot verify") so existing impls
+    /// and fakes that predate the field keep their original behavior. The
+    /// production `CliScm` impl runs `git -C <worktree> log -1 --format=%ct`
+    /// against `$HOME/.agent-orchestrator/<ao_project>/<branch>` (the same
+    /// convention `agent-orchestrator/packages/cli/src/commands/spawn.ts`
+    /// uses to mount coder worktrees).
+    fn worktree_branch_last_commit(
+        &self,
+        ao_project: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let _ = (ao_project, branch);
+        Ok(None)
     }
     /// Resolve the head branch of PR `pr` in `repo`, but ONLY when that PR
     /// is currently OPEN AND its head lives in the SAME repo
