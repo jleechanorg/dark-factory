@@ -284,6 +284,26 @@ pub trait StateStore {
     fn incr_er_runner_attempt(&self, _bead_id: &str, _now_epoch: u64) -> Result<u32, DaemonError> {
         Ok(1)
     }
+    /// Read the consecutive re-roll deferral count for `bead_id` (bead
+    /// jleechan-zeij / issue #322 r2). Persisted in its own column rather
+    /// than on [`BeadOverlay`] — like `attempt_er_runner_count`, it is a
+    /// per-bead retry counter the reroll engine owns, decoupled from the
+    /// overlay struct's ~100 construction sites. Default `Ok(0)` so fakes
+    /// that don't exercise the fail-closed defer path see "never deferred".
+    fn reroll_deferral_count(&self, _bead_id: &str) -> Result<u32, DaemonError> {
+        Ok(0)
+    }
+    /// Atomically increment `bead_id`'s consecutive re-roll deferral count and
+    /// return the new value. Default `Ok(1)` mirrors `incr_er_runner_attempt`.
+    fn incr_reroll_deferral(&self, _bead_id: &str) -> Result<u32, DaemonError> {
+        Ok(1)
+    }
+    /// Reset `bead_id`'s consecutive re-roll deferral count to `0` — called on
+    /// a confirmed proceed so a later, unrelated re-roll starts fresh. Default
+    /// `Ok(())` (no-op) for fakes that don't persist the counter.
+    fn reset_reroll_deferral(&self, _bead_id: &str) -> Result<(), DaemonError> {
+        Ok(())
+    }
     fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
         Ok(())
     }
@@ -431,6 +451,24 @@ pub enum HumanHoldReason {
     RerollSessionStopFailed,
     RerollQuiescenceCheckFailed,
     RerollQuiescenceTimeout,
+    /// Bead jleechan-zeij / issue #322 r2: the fail-closed re-roll proceed
+    /// predicate deferred this bead the maximum number of consecutive ticks
+    /// without ever confirming the previous worker was safe to supersede
+    /// (an active session, a moving branch HEAD, or a failed `stop()` every
+    /// time). Only at this bounded cap does deferral escalate to a park —
+    /// unlike `RerollQuiescenceTimeout` (the removed r0 behavior), a single
+    /// unconfirmed poll never parks.
+    RerollQuiescenceDeferralCapExceeded,
+    /// Bead jleechan-zeij / issue #322 r4 P1: `reroll::execute` returned a
+    /// PERMANENT (non-`is_transient()`) error. `execute` persists `RE_ROLL`
+    /// before the failure, and the fast tier only re-selects `ATTESTED`
+    /// overlays, so a permanent error that the tick loop merely logged-and-
+    /// continued would strand the bead in `RE_ROLL` forever (invisible to
+    /// recovery). The tick boundary parks it `HUMAN_HELD` with this reason
+    /// instead — loud and operator-visible. Not in the auto-recover allow-list
+    /// (a permanent error needs a human), unlike transient reroll errors which
+    /// keep their log-and-retry-next-tick behavior.
+    RerollPermanentError,
     AdoptedMissingBranch,
     AdoptedQuiescenceCheckFailed,
     AdoptedSessionAttachFailed,
@@ -469,6 +507,8 @@ impl HumanHoldReason {
             Self::RerollSessionStopFailed => "reroll_session_stop_failed",
             Self::RerollQuiescenceCheckFailed => "reroll_quiescence_check_failed",
             Self::RerollQuiescenceTimeout => "reroll_quiescence_timeout",
+            Self::RerollQuiescenceDeferralCapExceeded => "reroll_quiescence_deferral_cap_exceeded",
+            Self::RerollPermanentError => "reroll_permanent_error",
             Self::AdoptedMissingBranch => "adopted_missing_branch",
             Self::AdoptedQuiescenceCheckFailed => "adopted_quiescence_check_failed",
             Self::AdoptedSessionAttachFailed => "adopted_session_attach_failed",
@@ -759,6 +799,7 @@ impl SqliteStateStore {
         Ok(())
     }
 
+    <<<
     /// Idempotent migration for the `held_recheck_after` column (bead
     /// jleechan-zaga / issue #348 r3). Same probe-then-`ALTER` pattern as
     /// `ensure_reroll_deferral_count_column`. Nullable (NULL = "re-assess
@@ -1846,6 +1887,53 @@ impl StateStore for SqliteStateStore {
             Err(e) => Err(tool_err("incr_er_runner_attempt", e)),
         }
     }
+
+    fn reroll_deferral_count(&self, bead_id: &str) -> Result<u32, DaemonError> {
+        // Same legacy-DB tolerance as `er_runner_attempt`: a pre-migration DB
+        // lacks the column, so a "no such column" SELECT error means "never
+        // deferred" (0) rather than a hard failure.
+        let row: Result<i64, rusqlite::Error> = self.conn.query_row(
+            "SELECT reroll_deferral_count FROM bead_overlay WHERE bead_id = ?1",
+            params![bead_id],
+            |row| row.get(0),
+        );
+        match row {
+            Ok(count) => Ok(count.max(0) as u32),
+            Err(e) if no_such_column(&e) => Ok(0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(tool_err("reroll_deferral_count", e)),
+        }
+    }
+
+    fn incr_reroll_deferral(&self, bead_id: &str) -> Result<u32, DaemonError> {
+        let res = self.conn.execute(
+            "UPDATE bead_overlay SET \
+                reroll_deferral_count = COALESCE(reroll_deferral_count, 0) + 1, \
+                updated_at = ?2 \
+             WHERE bead_id = ?1",
+            params![bead_id, now_iso8601()],
+        );
+        match res {
+            Ok(_) => self.reroll_deferral_count(bead_id),
+            // Legacy DB without the column: fall back to 1 so the deferral
+            // cap still fires (mirrors `incr_er_runner_attempt`).
+            Err(e) if no_such_column(&e) => Ok(1),
+            Err(e) => Err(tool_err("incr_reroll_deferral", e)),
+        }
+    }
+
+    fn reset_reroll_deferral(&self, bead_id: &str) -> Result<(), DaemonError> {
+        let res = self.conn.execute(
+            "UPDATE bead_overlay SET reroll_deferral_count = 0, updated_at = ?2 \
+             WHERE bead_id = ?1",
+            params![bead_id, now_iso8601()],
+        );
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) if no_such_column(&e) => Ok(()),
+            Err(e) => Err(tool_err("reset_reroll_deferral", e)),
+        }
+    }
 }
 
 
@@ -1916,6 +2004,45 @@ mod tests {
         assert!(is_permanent_human_hold_reason(Some(
             "future_unknown_reason"
         )));
+    }
+
+    #[test]
+    fn reroll_deferral_counter_increments_resets_and_persists() {
+        // Bead jleechan-zeij / issue #322 r2: the fail-closed defer/cap path
+        // depends on this counter surviving between ticks (separate
+        // `reroll::execute` calls). Exercise the REAL SqliteStateStore, not
+        // just the fake.
+        let s = store();
+        let o = BeadOverlay {
+            bead_id: "defer-bead".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(42),
+            branch: Some("factory/defer-bead-r1".into()),
+            session_id: Some("sess-live".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        };
+        s.save(&o).unwrap();
+
+        // Never deferred yet.
+        assert_eq!(s.reroll_deferral_count("defer-bead").unwrap(), 0);
+        // Consecutive increments accumulate and are returned.
+        assert_eq!(s.incr_reroll_deferral("defer-bead").unwrap(), 1);
+        assert_eq!(s.incr_reroll_deferral("defer-bead").unwrap(), 2);
+        assert_eq!(s.reroll_deferral_count("defer-bead").unwrap(), 2);
+        // A confirmed proceed resets the streak.
+        s.reset_reroll_deferral("defer-bead").unwrap();
+        assert_eq!(s.reroll_deferral_count("defer-bead").unwrap(), 0);
+        // Incrementing/reading a bead with no overlay row is a no-op read of 0
+        // (the UPDATE matches nothing) rather than an error.
+        assert_eq!(s.reroll_deferral_count("no-such-bead").unwrap(), 0);
     }
 
     #[test]

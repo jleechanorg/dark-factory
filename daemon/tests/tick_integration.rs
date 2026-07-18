@@ -47,6 +47,8 @@ fn test_cfg() -> Config {
         autonomy_timebox_secs: 10_800,
         budget_warn_usd: 20.0,
         spec_dir: ".factory/specs/".into(),
+        reroll_head_stability_window_secs: 1,
+        reroll_death_confirm_secs: 0,
         repos: std::collections::HashMap::new(),
     }
 }
@@ -8123,4 +8125,212 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
 
     let _ = std::fs::remove_file(&telemetry_log);
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+// ===========================================================================
+// Bead jleechan-zeij / issue #322 r4 P1: tick-boundary handling of the re-roll
+// engine's Deferred outcome and permanent errors. These drive the REAL
+// `run_tick` fast-tier selection (not `reroll::execute` directly) so they
+// prove ATTESTED re-eligibility and the permanent-error park at the seam the
+// finding names (run_fast_tier's ATTESTED filter + the reroll Err arm).
+// ===========================================================================
+
+/// Stage-2 config whose `target_repo` = "owner/repo" makes `is_test_repo`
+/// true, so the Skeptic gate uses the scripted `FakeLlm` (no subprocess), and
+/// with tiny re-roll windows.
+fn reroll_stage2_cfg() -> Config {
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    cfg.reroll_head_stability_window_secs = 1;
+    cfg.reroll_death_confirm_secs = 0;
+    cfg
+}
+
+/// An ATTESTED bead + a scripted RED-CI PR snapshot that routes the fast tier
+/// into the Stage-2 re-roll lane. A pre-posted `/er PASS` comment makes
+/// `er_runner::maybe_run` return `AlreadyPosted` (no `claude` subprocess), and
+/// `FakeLlm` "pass" greens the Skeptic gate, so CI-red is the sole Red gate.
+fn seed_attested_red_ci_bead(
+    scm: &mut FakeScm,
+    store: &FakeStateStore,
+    bead_id: &str,
+    pr: u64,
+) -> String {
+    let branch = format!("factory/{bead_id}-r1");
+    store
+        .save(&BeadOverlay {
+            bead_id: bead_id.into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some(branch.clone()),
+            session_id: Some("fake-session-1".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch(bead_id, &branch).unwrap();
+    // Use a RECENT `updated_at_epoch` so the wedge/stall sweep (which fires on
+    // `now - updated_at >= 1800s`) does not park the ATTESTED bead before it
+    // reaches the reroll lane; and a `head_committed_epoch` older than the
+    // pre-posted `/er PASS` comment so `parse_er_verdict_since` treats the
+    // verdict as fresh (er_runner short-circuits -> no `claude` subprocess).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        pr,
+        PrSnapshot {
+            pr_number: pr,
+            ci_success: false, // -> CI gate RED
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadbeef".into(),
+            body: "".into(),
+            comments: vec![PrComment {
+                author: "reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: now,
+            }],
+            files: vec![],
+            updated_at_epoch: now,
+            ci_status: "red".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+    branch
+}
+
+/// r4 P1: a PERMANENT re-roll error must park the bead HUMAN_HELD (loud,
+/// operator-visible) at the tick boundary — NOT strand it in RE_ROLL. Drives
+/// the real fast tier; the entry `attach` fails with a permanent parse error,
+/// so `reroll::execute` returns `Err(Parse)`, and the tick Err arm parks it
+/// with reason `reroll_permanent_error`.
+#[test]
+fn tick_parks_human_held_on_permanent_reroll_error() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into())); // greens the Skeptic gate
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = reroll_stage2_cfg();
+
+    let branch = seed_attested_red_ci_bead(&mut scm, &store, "perm-bead", 5001);
+    // Entry attach fails permanently -> reroll::execute returns Err(Parse).
+    sessions.fail_attach_permanent_for(&branch);
+
+    let telemetry_log = std::env::temp_dir().join("afd_r4_tick_perm.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should isolate the permanent reroll error and continue");
+
+    let overlay = store.load("perm-bead").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::HumanHeld,
+        "a permanent reroll error must park the bead HUMAN_HELD, not strand it in RE_ROLL"
+    );
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("reroll_permanent_error")
+    );
+    assert!(
+        summary.beads_parked_human_held >= 1,
+        "the permanent-error park must be counted"
+    );
+
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(
+        body.lines().any(|l| l.contains("\"reroll_permanent_error\"")),
+        "operator-visible PARKED_HUMAN_HELD telemetry with the permanent-error reason must be emitted"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// r4 P1: a Deferred re-roll outcome must leave the bead ATTESTED and
+/// RE-SELECTABLE by the fast tier on a later tick (proving full tick re-entry,
+/// which the direct-`execute` cap test cannot). Two real ticks: each routes to
+/// re-roll (RED CI), each defers (a transient stop() failure), and the bead is
+/// gate-assessed BOTH times.
+#[test]
+fn tick_deferred_reroll_stays_attested_and_reselects_next_tick() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = reroll_stage2_cfg();
+
+    seed_attested_red_ci_bead(&mut scm, &store, "defer-bead", 5002);
+    // attach() succeeds (returns fake-session-1); stop() fails transiently ->
+    // reroll defers before touching the branch/PR.
+    sessions.fail_stop_for("fake-session-1");
+
+    let telemetry_log = std::env::temp_dir().join("afd_r4_tick_defer.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary1 = run_tick(&deps, 1, 0).expect("tick 1 should succeed");
+    assert_eq!(summary1.gates_assessed, 1, "tick 1 must gate-assess the ATTESTED bead");
+    let after1 = store.load("defer-bead").unwrap().unwrap();
+    assert_eq!(
+        after1.state,
+        OverlayState::Attested,
+        "a deferred reroll must leave the bead ATTESTED (re-eligible), not parked or advanced"
+    );
+    assert_eq!(store.reroll_deferral_count("defer-bead").unwrap(), 1);
+    assert_eq!(summary1.beads_parked_human_held, 0, "a defer is not a park");
+
+    // Tick 2: the SAME bead must be re-selected by run_fast_tier (proving
+    // ATTESTED re-eligibility through tick selection) and deferred again.
+    let summary2 = run_tick(&deps, 2, 0).expect("tick 2 should succeed");
+    assert_eq!(
+        summary2.gates_assessed, 1,
+        "tick 2 must re-select and re-assess the still-ATTESTED bead"
+    );
+    let after2 = store.load("defer-bead").unwrap().unwrap();
+    assert_eq!(after2.state, OverlayState::Attested);
+    assert_eq!(store.reroll_deferral_count("defer-bead").unwrap(), 2);
+
+    let _ = std::fs::remove_file(&telemetry_log);
 }

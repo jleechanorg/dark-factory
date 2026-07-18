@@ -88,7 +88,22 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- DBs pre-date this column and get it via the idempotent
   -- `ensure_target_repo_column` migration in `SqliteStateStore::open` (same
   -- guard pattern as `ensure_is_adopted_column`).
-  target_repo TEXT
+  target_repo TEXT,
+  -- Consecutive re-roll deferral counter (bead jleechan-zeij / issue #322
+  -- r2). The fail-closed re-roll proceed predicate in daemon/src/reroll.rs
+  -- supersedes a worker ONLY once it can positively confirm the previous
+  -- session is safe to replace (SessionNotFound, terminal+stable HEAD, or
+  -- idle+stable HEAD). When it cannot (active session, moving HEAD, failed
+  -- stop()), it DEFERS instead of parking: the bead is left ATTESTED and
+  -- retried next tick, incrementing this counter, and only escalates to
+  -- HUMAN_HELD once the counter hits MAX_REROLL_DEFERRALS. Reset to 0 on a
+  -- confirmed proceed. Owned by the reroll engine via the
+  -- `reroll_deferral_count`/`incr_reroll_deferral`/`reset_reroll_deferral`
+  -- StateStore methods (NOT a BeadOverlay field — same decoupling as
+  -- `attempt_er_runner_count`). Older DBs pre-date this column and get it via
+  -- the idempotent `ensure_reroll_deferral_count_column` migration in
+  -- `SqliteStateStore::open` (same guard pattern as `ensure_is_adopted_column`).
+  reroll_deferral_count INTEGER NOT NULL DEFAULT 0
 );
 
 -- Deletion guard: the daemon/skills may delete ONLY refs recorded here (spec §4.2.8).
