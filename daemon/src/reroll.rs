@@ -567,11 +567,46 @@ fn evaluate_proceed(
     death_window: std::time::Duration,
 ) -> Result<Option<&'static str>, DaemonError> {
     let poll_interval = std::time::Duration::from_millis(500);
-    let deadline = window.max(death_window);
+    // Give-up deadline. One extra poll interval of grace beyond the larger of
+    // the two confirmation windows so the poll that would confirm a
+    // stable-window proceed (which only fires at `elapsed >= window`) still
+    // has probe budget left — without the grace, `deadline == window` would
+    // let the budget check preempt that final confirming poll and always
+    // defer a legitimately-stable session.
+    let deadline = window.max(death_window) + poll_interval;
     let start = std::time::Instant::now();
+    let deadline_instant = start + deadline;
     let mut last_head: Option<String> = None;
     let mut head_stable_since: Option<std::time::Instant> = None;
     let mut not_found_since: Option<std::time::Instant> = None;
+
+    // Codex r4 P2: each real adapter probe (`ao status`, `git rev-parse`)
+    // can block up to its own subprocess timeout (~30s), so a poll that only
+    // checked the deadline BETWEEN blocking probes could overrun the window
+    // by 2-3x. Cap every probe at the budget remaining until `deadline_instant`
+    // (floored at 1s so a probe never gets a 0s timeout); when the budget is
+    // exhausted mid-cycle, defer. `budget_or_defer!` recomputes the remaining
+    // secs immediately before each probe and short-circuits to a
+    // budget-exhausted defer if none is left.
+    macro_rules! budget_or_defer {
+        () => {{
+            let remaining = deadline_instant.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_QUIESCENCE_BUDGET_EXHAUSTED",
+                    serde_json::json!({"elapsedMs": start.elapsed().as_millis() as u64}),
+                    serde_json::json!({"reason": "probe_budget_exhausted"}),
+                )?;
+                return Ok(None);
+            }
+            // Floor at 1s: a probe must never be handed a 0s timeout.
+            remaining.as_secs().max(1)
+        }};
+    }
 
     loop {
         let poll_at = std::time::Instant::now();
@@ -579,7 +614,7 @@ fn evaluate_proceed(
         // Codex P3: sample head_sha FIRST on every poll, before any
         // liveness-based break, so "HEAD sampled every poll" is unconditionally
         // true and a mid-window push is always observed.
-        let head = match deps.vcs.head_sha(branch) {
+        let head = match deps.vcs.head_sha_within(branch, budget_or_defer!()) {
             Ok(h) => h,
             Err(e) if e.is_transient() => {
                 emit_telemetry(
@@ -603,16 +638,17 @@ fn evaluate_proceed(
             }
         }
 
-        // Positive-death probe: re-attach to see whether the AO session record
-        // is gone. Distinguish "gone" from "still present + its activity".
-        let present_activity: Option<SessionActivity> =
-            match deps.sessions.attach(branch, &bead.bead_id) {
-                Err(DaemonError::SessionNotFound { .. }) => {
-                    if not_found_since.is_none() {
-                        not_found_since = Some(poll_at);
-                    }
-                    None
-                }
+        // Liveness probe. `gone` means the AO session record is absent this
+        // poll — either a `SessionNotFound` attach OR a successful attach whose
+        // `session_activity` reports `NotFound` (the session vanished between
+        // the two calls). Codex r4 P1: a `NotFound` observation must route ONLY
+        // through the positive-death path (continuous absence for
+        // `death_window`), never as a `stable_window_terminal` shortcut — so it
+        // is folded into `gone` here, and any successful non-`NotFound`
+        // re-attach below resets `not_found_since`, killing the streak.
+        let (gone, activity): (bool, Option<SessionActivity>) =
+            match deps.sessions.attach_within(branch, &bead.bead_id, budget_or_defer!()) {
+                Err(DaemonError::SessionNotFound { .. }) => (true, None),
                 Err(e) if e.is_transient() => {
                     emit_telemetry(
                         deps.telemetry_log,
@@ -627,9 +663,12 @@ fn evaluate_proceed(
                 }
                 Err(e) => return Err(e),
                 Ok(session_id) => {
-                    not_found_since = None;
-                    match deps.sessions.session_activity(&session_id) {
-                        Ok(a) => Some(a),
+                    match deps
+                        .sessions
+                        .session_activity_within(&session_id, budget_or_defer!())
+                    {
+                        Ok(SessionActivity::NotFound) => (true, None),
+                        Ok(a) => (false, Some(a)),
                         Err(e) if e.is_transient() => {
                             emit_telemetry(
                                 deps.telemetry_log,
@@ -647,47 +686,47 @@ fn evaluate_proceed(
                 }
             };
 
-        match present_activity {
-            // Session gone: positive death once the SessionNotFound streak has
-            // held for the confirmation window. A dead session cannot push, so
-            // no HEAD-stability wait is required.
-            None => {
-                if let Some(since) = not_found_since {
-                    if poll_at.duration_since(since) >= death_window {
-                        return Ok(Some("positive_death"));
-                    }
+        if gone {
+            // Positive death: absent continuously for the confirmation window.
+            // A dead session cannot push, so no HEAD-stability wait is needed.
+            if not_found_since.is_none() {
+                not_found_since = Some(poll_at);
+            }
+            if let Some(since) = not_found_since {
+                if poll_at.duration_since(since) >= death_window {
+                    return Ok(Some("positive_death"));
                 }
             }
-            // Session still present: only a non-running classification can
-            // proceed, and only once HEAD has held stable for the full window.
-            Some(activity) => {
-                let non_running_reason: Option<&'static str> = match activity {
-                    SessionActivity::Terminal | SessionActivity::NotFound => {
-                        Some("stable_window_terminal")
+        } else {
+            // Present: a successful re-attach resets the absence streak (a flap
+            // NotFound -> present must NOT count toward positive death), and
+            // only a non-running classification with a HEAD stable for the full
+            // window can proceed. `NotFound` is deliberately NOT an arm here —
+            // it was folded into `gone` above.
+            not_found_since = None;
+            let non_running_reason: Option<&'static str> = match activity {
+                Some(SessionActivity::Terminal) => Some("stable_window_terminal"),
+                Some(SessionActivity::Idle) => {
+                    if transcript_quiet(deps, ao_project, branch, window)? {
+                        Some("stable_window_idle")
+                    } else {
+                        None
                     }
-                    SessionActivity::Idle => {
-                        if transcript_quiet(deps, ao_project, branch, window)? {
-                            Some("stable_window_idle")
-                        } else {
-                            None
-                        }
-                    }
-                    SessionActivity::Running => None,
-                };
-                match non_running_reason {
-                    Some(reason) => {
-                        if let Some(since) = head_stable_since {
-                            if poll_at.duration_since(since) >= window
-                                && start.elapsed() >= window
-                            {
-                                return Ok(Some(reason));
-                            }
-                        }
-                    }
-                    // Running, or idle-but-recently-active: the worker is (or
-                    // may be) live — reset the HEAD-stability streak.
-                    None => head_stable_since = None,
                 }
+                // Running, or (defensively) any other present state.
+                _ => None,
+            };
+            match non_running_reason {
+                Some(reason) => {
+                    if let Some(since) = head_stable_since {
+                        if poll_at.duration_since(since) >= window && start.elapsed() >= window {
+                            return Ok(Some(reason));
+                        }
+                    }
+                }
+                // Running, or idle-but-recently-active: the worker is (or may
+                // be) live — reset the HEAD-stability streak.
+                None => head_stable_since = None,
             }
         }
 

@@ -345,6 +345,16 @@ pub enum HumanHoldReason {
     /// unlike `RerollQuiescenceTimeout` (the removed r0 behavior), a single
     /// unconfirmed poll never parks.
     RerollQuiescenceDeferralCapExceeded,
+    /// Bead jleechan-zeij / issue #322 r4 P1: `reroll::execute` returned a
+    /// PERMANENT (non-`is_transient()`) error. `execute` persists `RE_ROLL`
+    /// before the failure, and the fast tier only re-selects `ATTESTED`
+    /// overlays, so a permanent error that the tick loop merely logged-and-
+    /// continued would strand the bead in `RE_ROLL` forever (invisible to
+    /// recovery). The tick boundary parks it `HUMAN_HELD` with this reason
+    /// instead — loud and operator-visible. Not in the auto-recover allow-list
+    /// (a permanent error needs a human), unlike transient reroll errors which
+    /// keep their log-and-retry-next-tick behavior.
+    RerollPermanentError,
     AdoptedMissingBranch,
     AdoptedQuiescenceCheckFailed,
     AdoptedSessionAttachFailed,
@@ -384,6 +394,7 @@ impl HumanHoldReason {
             Self::RerollQuiescenceCheckFailed => "reroll_quiescence_check_failed",
             Self::RerollQuiescenceTimeout => "reroll_quiescence_timeout",
             Self::RerollQuiescenceDeferralCapExceeded => "reroll_quiescence_deferral_cap_exceeded",
+            Self::RerollPermanentError => "reroll_permanent_error",
             Self::AdoptedMissingBranch => "adopted_missing_branch",
             Self::AdoptedQuiescenceCheckFailed => "adopted_quiescence_check_failed",
             Self::AdoptedSessionAttachFailed => "adopted_session_attach_failed",

@@ -1722,6 +1722,81 @@ mod quiescence_timeout_races {
 
         let _ = std::fs::remove_file(&telemetry_log);
     }
+
+    /// Codex r4 P1 — a `NotFound` observation inside the poll must NOT
+    /// shortcut the stable-HEAD (window) lane; it routes ONLY through
+    /// positive-death, and any successful re-attach after it resets that
+    /// streak. A FLAPPING session — Terminal (building a stable-HEAD streak),
+    /// then a single NotFound poll after the window has elapsed, then Running
+    /// — must DEFER: r2 would have superseded on that NotFound poll (treating
+    /// it like Terminal with a stable HEAD), r4 does not. HEAD is static
+    /// throughout; window=1s, death=2s so continuous-NotFound death cannot
+    /// confirm before the flap breaks it. Real wall-clock duration: ~2s.
+    #[test]
+    fn notfound_activity_does_not_shortcut_stable_window_lane() {
+        let scm = FakeScm::new();
+        let sessions = FakeSessions::new();
+        let branch = "factory/bead-race-nfl-r1";
+        let mut vcs = FakeVcs::new();
+        vcs.heads.insert("main".into(), "base-sha-nfl".into());
+        vcs.heads.insert(branch.into(), "head-sha-nfl".into()); // static HEAD
+        let store = FakeStateStore::new();
+        let llm = FakeLlm::new();
+        let mut cfg = test_cfg();
+        cfg.reroll_head_stability_window_secs = 1;
+        cfg.reroll_death_confirm_secs = 2;
+        let telemetry_log = std::env::temp_dir().join("afd_r4_nfl_telemetry.jsonl");
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let mut bead = race_test_bead("bead-race-nfl", branch);
+        bead.session_id = Some("fake-session-1".into());
+        store.save(&bead).unwrap();
+        // Present (orphan) so `session_activity` is what's probed; the flap:
+        // Terminal, Terminal, NotFound (past the 1s window), then Running.
+        sessions.set_orphan_after_stop();
+        sessions.set_activity_sequence(vec![
+            SessionActivity::Terminal,
+            SessionActivity::Terminal,
+            SessionActivity::NotFound,
+            SessionActivity::Running,
+        ]);
+        // After the sequence, stay Running (a live worker) so nothing later
+        // grants a stable-window proceed.
+        sessions.set_activity(SessionActivity::Running);
+
+        let deps = RerollDeps {
+            scm: &scm,
+            sessions: &sessions,
+            vcs: &vcs,
+            store: &store,
+            llm: &llm,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            reviewer: "skeptic".into(),
+            review_text: "flapping NotFound must not shortcut".into(),
+        };
+
+        match reroll::execute(&deps, &mut bead).unwrap() {
+            RerollOutcome::Deferred(reason) => {
+                assert_eq!(reason, "unconfirmed_live_or_moving_head");
+            }
+            other => panic!(
+                "expected Deferred — a NotFound poll must not supersede via the stable-HEAD lane (r4 P1), got {:?}",
+                other
+            ),
+        }
+
+        let updated = store.load("bead-race-nfl").unwrap().unwrap();
+        assert_eq!(updated.state, OverlayState::Attested);
+        assert_eq!(updated.session_id.as_deref(), Some("fake-session-1"));
+        let vcs_calls = vcs.calls.borrow();
+        assert!(
+            vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")),
+            "a NotFound flap must not fabricate a branch: {vcs_calls:?}"
+        );
+
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
 }
 /// semantic comparator LLM call must NOT crash the daemon. Before this fix,
 /// `same_underlying_issue` (reroll.rs) constructed `DaemonError::Parse` for

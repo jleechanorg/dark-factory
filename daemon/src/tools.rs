@@ -517,6 +517,33 @@ pub trait Sessions {
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError>;
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError>;
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError>;
+    /// Budget-bounded `attach` (bead jleechan-zeij / issue #322 r4 P2). The
+    /// re-roll proceed poll caps each probe at the time remaining until its
+    /// window deadline so a single poll cannot block for multiples of the
+    /// window on stacked ~30s subprocess timeouts. The default ignores the
+    /// budget and delegates to [`attach`](Sessions::attach) (fakes are
+    /// instant); the real `CliSessions` overrides it to pass `timeout_secs`
+    /// down to `ao status`.
+    fn attach_within(
+        &self,
+        branch: &str,
+        bead_id: &str,
+        timeout_secs: u64,
+    ) -> Result<SessionId, DaemonError> {
+        let _ = timeout_secs;
+        self.attach(branch, bead_id)
+    }
+    /// Budget-bounded [`session_activity`](Sessions::session_activity) (bead
+    /// jleechan-zeij / issue #322 r4 P2). Default delegates to the unbounded
+    /// method; `CliSessions` overrides to pass `timeout_secs` to `ao status`.
+    fn session_activity_within(
+        &self,
+        id: &SessionId,
+        timeout_secs: u64,
+    ) -> Result<SessionActivity, DaemonError> {
+        let _ = timeout_secs;
+        self.session_activity(id)
+    }
     /// Activity probe distinguishing idle vs running vs terminal (bead
     /// jleechan-zeij / issue #322 r2 — see [`SessionActivity`]). The default
     /// derives from `is_quiescent`: a quiescent session maps to `Terminal`,
@@ -631,6 +658,13 @@ pub trait Vcs {
     fn base_head(&self, base_branch: &str) -> Result<String, DaemonError>;
     fn create_branch_at(&self, name: &str, sha: &str) -> Result<(), DaemonError>;
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError>;
+    /// Budget-bounded [`head_sha`](Vcs::head_sha) (bead jleechan-zeij / issue
+    /// #322 r4 P2). Default delegates to the unbounded method; the real
+    /// `CliVcs` overrides to pass `timeout_secs` down to `git`.
+    fn head_sha_within(&self, branch: &str, timeout_secs: u64) -> Result<String, DaemonError> {
+        let _ = timeout_secs;
+        self.head_sha(branch)
+    }
     /// `true` iff `local_head` (the local branch's SHA) is a strict ancestor of
     /// `remote_sha` — i.e. the remote PR head contains every local commit AND
     /// has at least one extra commit the local checkout has not seen yet. Returns

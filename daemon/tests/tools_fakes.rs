@@ -114,6 +114,7 @@ fn fake_sessions_spawn_attach_stop_quiescent_roundtrip() {
         fail_stop_permanent_for: Default::default(),
         activity: Default::default(),
         activity_permanent_error: Default::default(),
+        activity_sequence: Default::default(),
         worktree_remote_override: Default::default(),
         transcript_activity_for: Default::default(),
     };

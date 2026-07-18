@@ -3224,7 +3224,20 @@ impl Sessions for CliSessions {
     /// verbatim in telemetry a human reads, so the message names the branch
     /// and bead explicitly instead of a generic "not found".
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
-        let out = run_tool("ao", &["status", "--json"], 30)?;
+        self.attach_within(branch, bead_id, 30)
+    }
+
+    /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded `attach` — the
+    /// re-roll poll passes the time remaining until its window deadline so a
+    /// single poll cannot block for multiples of the window on stacked ~30s
+    /// `ao status` timeouts.
+    fn attach_within(
+        &self,
+        branch: &str,
+        bead_id: &str,
+        timeout_secs: u64,
+    ) -> Result<SessionId, DaemonError> {
+        let out = run_tool("ao", &["status", "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -3256,7 +3269,17 @@ impl Sessions for CliSessions {
         &self,
         id: &SessionId,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        let out = run_tool("ao", &["status", "--json"], 30)?;
+        self.session_activity_within(id, 30)
+    }
+
+    /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded
+    /// `session_activity` — same rationale as `attach_within`.
+    fn session_activity_within(
+        &self,
+        id: &SessionId,
+        timeout_secs: u64,
+    ) -> Result<crate::tools::SessionActivity, DaemonError> {
+        let out = run_tool("ao", &["status", "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -4007,7 +4030,13 @@ impl Vcs for CliVcs {
     }
 
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError> {
-        let out = run_tool("git", &["rev-parse", branch], 30)?;
+        self.head_sha_within(branch, 30)
+    }
+
+    /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded `head_sha` — the
+    /// re-roll poll caps this `git rev-parse` at the remaining window budget.
+    fn head_sha_within(&self, branch: &str, timeout_secs: u64) -> Result<String, DaemonError> {
+        let out = run_tool("git", &["rev-parse", branch], timeout_secs)?;
         Ok(out.trim().to_string())
     }
 

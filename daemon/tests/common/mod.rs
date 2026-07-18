@@ -337,6 +337,12 @@ pub struct FakeSessions {
     /// `session_activity` on every call — models a non-transient `ao status`
     /// parse failure that must PROPAGATE, not be swallowed as a defer.
     pub activity_permanent_error: RefCell<Option<String>>,
+    /// Bead jleechan-zeij / issue #322 r4 P1: a per-call scripted
+    /// `session_activity` SEQUENCE (consumed front-to-back), used to model a
+    /// FLAPPING session (e.g. Terminal, Terminal, NotFound, Running…). Once
+    /// exhausted, `session_activity` falls back to the static `activity`
+    /// override / derived value. Empty by default.
+    pub activity_sequence: RefCell<Vec<SessionActivity>>,
     pub worktree_remote_override: RefCell<Option<String>>,
     /// jleechan-coder-silent-false-parks-h92r: scripted
     /// `worktree_transcript_last_activity_epoch` override, keyed by
@@ -372,6 +378,7 @@ impl Default for FakeSessions {
             fail_stop_permanent_for: RefCell::new(Vec::new()),
             activity: RefCell::new(None),
             activity_permanent_error: RefCell::new(None),
+            activity_sequence: RefCell::new(Vec::new()),
             worktree_remote_override: RefCell::new(None),
             transcript_activity_for: RefCell::new(HashMap::new()),
         }
@@ -483,6 +490,13 @@ impl FakeSessions {
     /// every call — models a non-transient failure that must propagate.
     pub fn fail_activity_permanent(&self, message: &str) {
         *self.activity_permanent_error.borrow_mut() = Some(message.to_string());
+    }
+
+    /// Script a per-call `session_activity` sequence (consumed front-to-back)
+    /// to model a flapping session; falls back to the static override once
+    /// exhausted.
+    pub fn set_activity_sequence(&self, seq: Vec<SessionActivity>) {
+        *self.activity_sequence.borrow_mut() = seq;
     }
 
     pub fn set_worktree_remote(&self, remote: &str) {
@@ -654,6 +668,13 @@ impl Sessions for FakeSessions {
                 rc: 1,
                 stderr: msg.clone(),
             });
+        }
+        // Scripted per-call sequence (flapping session) takes precedence.
+        {
+            let mut seq = self.activity_sequence.borrow_mut();
+            if !seq.is_empty() {
+                return Ok(seq.remove(0));
+            }
         }
         // Explicit static override (idle / running / terminal / not-found).
         if let Some(activity) = *self.activity.borrow() {

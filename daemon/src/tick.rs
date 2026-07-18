@@ -2696,12 +2696,12 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         )?;
                     }
                     Ok(crate::reroll::RerollOutcome::Aborted(_)) => {}
-                    Err(e) => {
+                    Err(e) if e.is_transient() => {
                         // jleechan-cq8r: per-bead isolation, matching the
                         // jleechan-qdw pattern used elsewhere in this same
                         // loop (BEAD_SNAPSHOT_TRANSIENT_ERROR /
                         // BEAD_PROCESSING_TRANSIENT_ERROR above). A single
-                        // bead's re-roll engine failure -- e.g. the
+                        // bead's TRANSIENT re-roll engine failure -- e.g. the
                         // circuit-breaker comparator's LLM call hitting a
                         // rate limit or returning a malformed reply -- must
                         // not abort processing for every OTHER in-flight
@@ -2709,7 +2709,9 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         // persisted this bead as `ReRoll` before the
                         // failure; emit telemetry and move on to the next
                         // bead rather than propagating with `return Err`,
-                        // which used to abort the entire fast tier.
+                        // which used to abort the entire fast tier. The bead is
+                        // re-selected next tick once it returns to ATTESTED (or
+                        // via the transient's own retry path).
                         let _ = emit(
                             deps.telemetry_log,
                             bead_id,
@@ -2719,6 +2721,38 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             serde_json::json!({}),
                             serde_json::json!({"phase": "reroll_execute", "error": format!("{e:?}")}),
                         );
+                        continue;
+                    }
+                    Err(e) => {
+                        // Bead jleechan-zeij / issue #322 r4 P1: a PERMANENT
+                        // re-roll error must NOT be swallowed as transient.
+                        // `reroll::execute` persisted this bead as RE_ROLL
+                        // before returning, and the fast tier only re-selects
+                        // ATTESTED overlays (see the `overlay.state != Attested`
+                        // guard at the top of run_fast_tier), so logging-and-
+                        // continuing would strand it in RE_ROLL forever,
+                        // invisible to recovery. Park it HUMAN_HELD with a
+                        // distinct, operator-visible reason instead.
+                        overlay.state = OverlayState::HumanHeld;
+                        set_human_hold_reason(
+                            &mut overlay,
+                            HumanHoldReason::RerollPermanentError,
+                        );
+                        deps.store.save(&overlay)?;
+                        summary.beads_parked_human_held += 1;
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "PARKED_HUMAN_HELD",
+                            serde_json::json!({}),
+                            serde_json::json!({"reason": "reroll_permanent_error", "error": format!("{e:?}")}),
+                        )?;
+                        let comment_body = format!(
+                            "🤖 **[dark-factory]** Coder session parked (human held): the re-roll engine hit a permanent (non-transient) error and cannot self-recover. Error: {e}"
+                        );
+                        let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                         continue;
                     }
                 }
