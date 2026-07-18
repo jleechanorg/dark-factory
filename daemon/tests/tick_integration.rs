@@ -2557,6 +2557,16 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
          jleechan-8jxr fail-closed gate parks them with reason `unmapped_repo`, not dispatch \
          to cfg.target_repo"
     );
+    // jleechan-8jxr P2 follow-up: the wiring change in `tick::run_slow_tier`
+    // (now mirrors the `unmapped_target_repo` idiom) increments the human
+    // held counter so operators see the permanent hold, not a queued
+    // transient dispatch error.
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "jleechan-8jxr: the manual bead's permanent human-hold park must be counted in \
+         beads_parked_human_held (mirror of `unmapped_target_repo` wiring — otherwise \
+         operators would see a queued transient dispatch error and miss the escalation)"
+    );
 
     let final_overlay = store.load("manual-bead-123").unwrap().unwrap();
     assert_eq!(
@@ -2564,11 +2574,23 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
         OverlayState::HumanHeld,
         "jleechan-8jxr: manual bead must be parked HUMAN_HELD by the fail-closed gate"
     );
-    assert_eq!(
-        final_overlay.park_reason.as_deref(),
-        Some("unmapped_repo"),
-        "jleechan-8jxr: the new `unmapped_repo` reason is distinct from the existing \
-         `unmapped_target_repo` — see HumanHoldReason enum doc"
+    // jleechan-8jxr P2 review follow-up: the dispatch-failure loop in
+    // `tick::run_slow_tier` mirrors the `unmapped_target_repo` idiom to
+    // record the park (PARKED_HUMAN_HELD telemetry + escalation
+    // comment). When the SCM has no comment target for a manual bead
+    // (FakeScm is empty here), the path falls into the local-fallback
+    // arm and records `escalation_local_fallback:unmapped_repo` as the
+    // park_reason instead of the bare `unmapped_repo` reason string.
+    // The park reason either contains the bare reason or has the
+    // `escalation_local_fallback:` prefix — accept either form so the
+    // test exercises the persistent HUMAN_HELD contract without coupling
+    // to whether FakeScm can post the comment.
+    let park_reason = final_overlay.park_reason.as_deref().unwrap_or("");
+    assert!(
+        park_reason == "unmapped_repo"
+            || park_reason == "escalation_local_fallback:unmapped_repo",
+        "jleechan-8jxr: park_reason must be either the bare `unmapped_repo` reason or its \
+         `escalation_local_fallback:` variant (got {park_reason:?})"
     );
     assert!(
         final_overlay.branch.is_none(),

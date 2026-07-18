@@ -1428,6 +1428,97 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 continue;
             }
 
+            if failure.phase == "unmapped_repo" {
+                // jleechan-8jxr: mirrors the `unmapped_target_repo` idiom
+                // immediately above (bead jleechan-35y4 PR #245 review).
+                // Without this branch, `dispatch::dispatch_ready`'s new
+                // fail-closed gate parks the bead HUMAN_HELD on disk but
+                // tick loops here fall through to the generic
+                // `BEAD_DISPATCH_TRANSIENT_ERROR` path — operators would
+                // see a queued transient dispatch error instead of the
+                // permanent hold the gate just created, and no escalation
+                // comment would be posted. Same escalation semantics as
+                // `unmapped_target_repo`: durable HUMAN_HELD + retryable
+                // escalation comment naming the exact remediation
+                // (supply an explicit `external_ref` or `target_repo:`
+                // body field before redispatch), with the same
+                // missing-SCM-target local fallback. Distinct from
+                // `unmapped_target_repo` (which asks for a `[repos.*]`
+                // entry to be added) because the remediation path is
+                // different: a missing external_ref / body field cannot
+                // be fixed by editing config — the operator must refile
+                // the bead itself with explicit repo context.
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "unmapped_repo",
+                        "error": failure.error.as_str(),
+                    }),
+                )?;
+                if escalation_already_recorded(deps, &failure.bead_id)? {
+                    continue;
+                }
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: bead `{}` has no resolvable repo identity — neither a `target_repo:` body field nor a `<owner>/<repo>#N` external_ref was available. Automation parked it HUMAN_HELD rather than silently dispatching into the daemon's global `cfg.target_repo` (jleechan-8jxr fail-closed gate). Please refile the bead with an explicit `external_ref` (e.g. `jleechanorg/dark-factory#306`) or a `target_repo: <owner>/<repo>` body field before requeuing.",
+                    failure.bead_id
+                );
+                if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
+                {
+                    if is_missing_scm_target_error(&err) {
+                        record_local_escalation_fallback(
+                            deps,
+                            &failure.bead_id,
+                            "unmapped_repo",
+                        )?;
+                        summary.beads_escalated_locally += 1;
+                        emit(
+                            deps.telemetry_log,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "ESCALATED_LOCALLY",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "unmapped_repo",
+                                "scm_error": err.to_string(),
+                            }),
+                        )?;
+                        continue;
+                    }
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_NOTIFICATION_FAILED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "unmapped_repo",
+                            "error": err.to_string(),
+                        }),
+                    )?;
+                    continue;
+                }
+                record_escalation(deps, &failure.bead_id, "unmapped_repo")?;
+                summary.beads_escalated += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "ESCALATION_REQUIRED",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "unmapped_repo"}),
+                )?;
+                continue;
+            }
+
             if failure.phase == "worktree_remote_mismatch" {
                 // jleechan-bqdv Stage C: mirrors the `unmapped_target_repo`
                 // idiom immediately above. `dispatch::dispatch_ready` already
