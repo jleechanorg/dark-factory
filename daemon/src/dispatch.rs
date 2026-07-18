@@ -837,6 +837,26 @@ fn render_coder_prompt(
          {target_repo} containing the completed task, with tests proving the \
          change (red→green where feasible).\n\
          \n\
+         EVIDENCE BUNDLE (jleechan-yoqy, issue #323 — MANDATORY):\n\
+         The factory's `evidence_review` gate (gate 6) FAIL-CLOSES on a PR \
+         whose body has no PUBLIC-GIST evidence bundle, even when every \
+         other gate is green. Without the bundle, `all_green` is structurally \
+         unreachable and the lane dead-ends in HUMAN_HELD. After every \
+         red→green unit of work you MUST:\n\
+           1. Build the bundle (the full red→green test transcript, the \
+              verification commands you executed, and the current head SHA \
+              captured via `git rev-parse HEAD`) into a file under the \
+              worktree (e.g. `./evidence.md`).\n\
+           2. Publish it as a PUBLIC gist so the bundle is reachable from the \
+              PR body without auth (per the operator /es rule — inline evidence \
+              in PR bodies is NOT acceptable):\n\
+                gh gist create --public --desc \"Evidence for PR #<N>\" ./evidence.md\n\
+           3. Add a line in the PR body, exactly:\n\
+                **Evidence:** https://gist.github.com/<user>/<gist-id>\n\
+           4. Re-push the PR body change to {remote} {branch}.\n\
+         The bundle must reference the current head SHA so the reviewer can \
+         bind the evidence to the commit being claimed, not a stale one.\n\
+         \n\
          RULES:\n\
          - Do NOT merge anything and do NOT close the PR or the bead — the \
          factory's verifier gates (/green, /er, skeptic) decide promotion.\n\
@@ -2307,6 +2327,53 @@ mod tests {
             "external ref missing"
         );
         assert!(prompt.contains("flux.rs"), "file-tree orientation missing");
+    }
+
+    // jleechan-yoqy (issue #323): the coder lane protocol must require the
+    // coder to publish an evidence bundle as a PUBLIC GIST and reference the
+    // gist URL in the PR body. Without these two artifacts the `evidence_review`
+    // gate's `/er` reviewer has nothing concrete to evaluate, so gate 6 falls
+    // to "evidence floor" and every factory-coded PR dead-ends — even when
+    // every other gate is green. The original `render_coder_prompt` template
+    // (jleechan-if09 / jleechan-bqdv Stage C) never mentioned gist publication,
+    // so coders had no way to know it was required.
+    //
+    // Regression markers (TDD red→green):
+    //   - "evidence bundle" appears in the prompt (the rule itself)
+    //   - "gh gist create --public" appears (the exact publish command)
+    //   - "**Evidence:**" appears (the exact PR-body marker the parser greps)
+    //   - The current head SHA must be referenced so the reviewer can bind
+    //     the bundle to the commit it claims to verify.
+    #[test]
+    fn coder_prompt_requires_public_gist_evidence_bundle() {
+        let bead = Bead {
+            id: "bead-yoqy".into(),
+            title: "Factory coder never publishes evidence bundles".into(),
+            description: "Gate 6 evidence floor must pass without operator action.".into(),
+            file_tree_summary: "daemon/src/dispatch.rs".into(),
+            external_ref: Some("jleechanorg/dark-factory#323".into()),
+        };
+        let prompt = build_coder_prompt(&bead, "factory/bead-yoqy-r2", "jleechanorg/dark-factory", "origin");
+
+        assert!(
+            prompt.contains("evidence bundle"),
+            "coder prompt must state the evidence-bundle obligation (jleechan-yoqy / #323)"
+        );
+        assert!(
+            prompt.contains("gh gist create --public"),
+            "coder prompt must give the literal `gh gist create --public` publish command; \
+             coders otherwise hand-curl api.github.com/gists and produce non-public or missing artifacts"
+        );
+        assert!(
+            prompt.contains("**Evidence:**"),
+            "coder prompt must require the canonical `**Evidence:** <gist-url>` PR-body marker; \
+             /er and the evidence-floor check both grep for this exact token"
+        );
+        assert!(
+            prompt.contains("HEAD") || prompt.to_ascii_lowercase().contains("head sha"),
+            "coder prompt must require the bundle to reference the current head SHA so the \
+             reviewer can bind the evidence to the commit being claimed"
+        );
     }
 
     #[test]

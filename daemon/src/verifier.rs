@@ -535,18 +535,41 @@ pub fn calculate_non_test_loc(files: &[crate::tools::PrFile]) -> u32 {
 
 pub fn check_integration_marker(body: &str, comments: &[crate::tools::PrComment]) -> bool {
     let lower_body = body.to_lowercase();
-    if lower_body.contains("has_integration_evidence_marker") 
-       || lower_body.contains("integration-evidence") 
-       || lower_body.contains("integration evidence") 
+    // jleechan-yoqy (issue #323): the factory coder lane publishes a
+    // gist-hosted evidence bundle and references it via the operator's
+    // canonical `**Evidence:** <gist-url>` marker. Accept that exact
+    // shape (the gist host is the load-bearing token — `example.com` and
+    // other non-gist URLs deliberately do NOT satisfy the marker, so the
+    // floor cannot be trivially gamed). The three legacy phrases are kept
+    // for back-compat with older reviews.
+    if lower_body.contains("has_integration_evidence_marker")
+       || lower_body.contains("integration-evidence")
+       || lower_body.contains("integration evidence")
+       || has_evidence_gist_marker(&lower_body)
     {
         return true;
     }
     for comment in comments {
         let lower_comment = comment.body.to_lowercase();
-        if lower_comment.contains("has_integration_evidence_marker") 
-           || lower_comment.contains("integration-evidence") 
-           || lower_comment.contains("integration evidence") 
+        if lower_comment.contains("has_integration_evidence_marker")
+           || lower_comment.contains("integration-evidence")
+           || lower_comment.contains("integration evidence")
+           || has_evidence_gist_marker(&lower_comment)
         {
+            return true;
+        }
+    }
+    false
+}
+
+/// True iff `lower_text` contains the canonical `**evidence:**` marker
+/// paired with a `gist.github.com` URL on the same line. jleechan-yoqy
+/// (issue #323): the gate's structural floor — non-gist URLs are rejected
+/// so a body of `**Evidence:** https://example.com` does not flip the
+/// gate green without a real published bundle.
+fn has_evidence_gist_marker(lower_text: &str) -> bool {
+    for line in lower_text.lines() {
+        if line.contains("**evidence:**") && line.contains("gist.github.com") {
             return true;
         }
     }
@@ -1628,6 +1651,54 @@ mod tests {
 
         // Neither contains marker
         assert!(!check_integration_marker("No marker here", &[]));
+    }
+
+    // jleechan-yoqy: factory coder lanes publish a gist-hosted evidence
+    // bundle and reference it in the PR body. The /es evidence-standards
+    // rule mandates `gh gist create --public` + a `**Evidence:** <gist_url>`
+    // marker — without it the evidence floor gate fails every factory PR.
+    // The structural fix: accept a gist URL line under `**Evidence:**` as an
+    // evidence marker. This also lets the gate fail-closed on obvious junk
+    // (e.g. `example.com`) so it can't be trivially gamed.
+    #[test]
+    fn test_check_integration_marker_accepts_gist_evidence_url() {
+        use crate::tools::PrComment;
+        // GitHub gist URL under **Evidence:** marker.
+        assert!(check_integration_marker(
+            "## Description\n\n**Evidence:** https://gist.github.com/jleechan/abc123def456",
+            &[]
+        ));
+        assert!(check_integration_marker(
+            "**Evidence:** https://gist.github.com/jleechanorg/0123456789abcdef0123456789abcdef/raw",
+            &[]
+        ));
+        // Marker in a comment (not body) is also accepted.
+        let comments = vec![PrComment {
+            author: "factory-coder".into(),
+            body: "**Evidence:** https://gist.github.com/jleechanorg/factory-bundle-yoqy".into(),
+            created_at_epoch: 0,
+        }];
+        assert!(check_integration_marker("no body marker", &comments));
+    }
+
+    #[test]
+    fn test_check_integration_marker_rejects_non_gist_evidence_url() {
+        // Random domains must NOT satisfy the marker — preserves the floor
+        // by preventing trivial bypass with `**Evidence:** https://example.com`.
+        assert!(!check_integration_marker(
+            "**Evidence:** https://example.com/some-page",
+            &[]
+        ));
+        assert!(!check_integration_marker(
+            "**Evidence:** https://gist.example.com/not-real",
+            &[]
+        ));
+        // Plain `**Evidence:**` without any URL still fails — the gate's
+        // contract is that the marker points at a real gist artifact.
+        assert!(!check_integration_marker(
+            "**Evidence:** (no url yet)",
+            &[]
+        ));
     }
 
     #[test]
