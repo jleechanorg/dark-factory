@@ -13,8 +13,8 @@ use daemon::state::{
     OverlayState, StateStore,
 };
 use daemon::tools::{
-    Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec,
-    Tracker, Vcs,
+    Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions,
+    SpawnSpec, Tracker, Vcs,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -162,6 +162,13 @@ pub struct FakeScm {
     pub permissions: HashMap<String, Permission>,
     pub pr_snapshots: HashMap<u64, PrSnapshot>,
     pub remote_branches: HashMap<String, Option<u64>>,
+    /// jleechan-drive-pr-branch-binding-pcpr: scripted open-PR lookups,
+    /// keyed by `(repo, pr_number)`. Absence of a key (the `Default` case)
+    /// means `PrHeadBranch::NotFound`, matching the real `CliScm` fail-safe
+    /// default — script `PrHeadBranch::SameRepo(head_ref)` for a confirmed
+    /// same-repo open PR, or `PrHeadBranch::Fork` for a confirmed open PR
+    /// whose head lives on a fork (the fail-closed guard).
+    pub open_pr_head_refs: HashMap<(String, u64), PrHeadBranch>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -244,6 +251,17 @@ impl Scm for FakeScm {
         } else {
             Ok(None)
         }
+    }
+
+    fn open_pr_head_ref_for_repo(&self, repo: &str, pr: u64) -> Result<PrHeadBranch, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("open_pr_head_ref_for_repo({repo},{pr})"));
+        Ok(self
+            .open_pr_head_refs
+            .get(&(repo.to_string(), pr))
+            .cloned()
+            .unwrap_or(PrHeadBranch::NotFound))
     }
 }
 

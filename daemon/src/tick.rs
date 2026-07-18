@@ -27,7 +27,7 @@ use crate::state::{
     set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
 };
 use crate::telemetry::{self, TelemetryEvent};
-use crate::tools::{Bead, Llm, Scm, SessionId, Sessions, Tracker, Vcs};
+use crate::tools::{Bead, Llm, PrHeadBranch, Scm, SessionId, Sessions, Tracker, Vcs};
 use crate::verifier::{self, PrEvidence};
 use std::collections::HashSet;
 use std::path::Path;
@@ -1136,7 +1136,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         }
     }
 
-    let mut ready: Vec<(Bead, RoutingVerdict)> = Vec::new();
+    let mut ready: Vec<(Bead, RoutingVerdict, dispatch::DriveBranchDecision)> = Vec::new();
     for bead in &routing_candidates {
         let overlay = match deps.store.load(&bead.id)? {
             Some(o) => {
@@ -1206,7 +1206,19 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     // (null == legacy/global cfg.target_repo).
                     serde_json::json!({"routingVerdict": verdict_str, "target_repo": overlay.target_repo}),
                 )?;
-                ready.push((bead.clone(), verdict));
+                // jleechan-drive-pr-branch-binding-pcpr: resolved here (not
+                // in `dispatch.rs`, which intentionally has no `Scm`
+                // access) so a bead whose `external_ref` names a currently
+                // OPEN PR in its OWN resolved repo dispatches onto that
+                // PR's head branch instead of a freshly fabricated one.
+                // Recomputed on every tick this bead is `ready` (fresh
+                // dispatch AND every redispatch/park-recovery cycle) — the
+                // live 2026-07-17 incident this closes happened on a
+                // redispatch, not just the first attempt.
+                let resolved_repo = overlay.repo(deps.cfg).to_string();
+                let drive_branch =
+                    resolve_drive_pr_head_branch(deps.scm, deps.cfg, bead, &resolved_repo);
+                ready.push((bead.clone(), verdict, drive_branch));
             }
             Err(DaemonError::Parse(reason)) => {
                 // ZFC: an unparseable routing verdict is never guessed at —
@@ -1537,6 +1549,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     "sessionId": success.session_id.as_str(),
                     // jleechan-35y4: resolved repo now visible in daemon.jsonl.
                     "target_repo": success.target_repo.as_str(),
+                    // jleechan-drive-pr-branch-binding-pcpr: "pr_head" vs
+                    // "generated" — which branch-binding mode this dispatch used.
+                    "branch_mode": success.branch_mode,
                 }),
             )?;
             let comment_body = format!(
@@ -1545,8 +1560,8 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             );
             if let Some(ext_ref) = ready
                 .iter()
-                .find(|(bead, _)| bead.id == success.bead_id)
-                .and_then(|(bead, _)| bead.external_ref.as_ref())
+                .find(|(bead, _, _)| bead.id == success.bead_id)
+                .and_then(|(bead, _, _)| bead.external_ref.as_ref())
             {
                 let _ = deps.tracker.comment_external(ext_ref, &comment_body);
             }
@@ -2774,6 +2789,59 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
         Some((parts[0].to_string(), parts[1].to_string()))
     } else {
         None
+    }
+}
+
+/// jleechan-drive-pr-branch-binding-pcpr: resolve whether `bead` should
+/// dispatch onto an existing PR's own head branch instead of a freshly
+/// generated `factory/<bead>-r<attempt>` one. Fires only when ALL of:
+/// * `bead.external_ref` parses to `owner/repo#N`,
+/// * that `owner/repo` matches the bead's OWN already-resolved repo
+///   (`resolved_repo`, `overlay.repo(cfg)`) — a bead whose `external_ref`
+///   happens to name a DIFFERENT repo than its resolved `target_repo` (a
+///   stray/contradictory `target_repo:` body field) must never bind to
+///   that other repo's PR,
+/// * `owner/repo` is a configured repo (`cfg.resolve_repo`), and
+/// * `Scm::open_pr_head_ref_for_repo` positively confirms PR `N` is OPEN
+///   AND same-repo (`PrHeadBranch::SameRepo`) -> `DriveBranchDecision::PrHead`.
+///
+/// An OPEN PR whose head lives on a fork (`PrHeadBranch::Fork`) resolves to
+/// `DriveBranchDecision::ForkFallback` — the fail-closed guard mirroring
+/// `intake::same_repo_pr`; dispatch still falls back to the generated
+/// branch, but telemetry records WHY (`branch_mode:
+/// "generated_fork_fallback"`) instead of conflating it with "no drive-PR
+/// signal at all".
+///
+/// Every other case — closed/merged/missing PR, malformed `external_ref`,
+/// unconfigured repo, repo mismatch, or a transient lookup failure — is
+/// `DriveBranchDecision::Generated` (fail-safe: dispatch falls back to the
+/// generated-branch path exactly as before this bead).
+fn resolve_drive_pr_head_branch(
+    scm: &dyn Scm,
+    cfg: &Config,
+    bead: &Bead,
+    resolved_repo: &str,
+) -> dispatch::DriveBranchDecision {
+    use dispatch::DriveBranchDecision;
+    let Some(ext_ref) = bead.external_ref.as_deref() else {
+        return DriveBranchDecision::Generated;
+    };
+    let Some((owner_repo, num_str)) = parse_external_ref(ext_ref) else {
+        return DriveBranchDecision::Generated;
+    };
+    if owner_repo != resolved_repo {
+        return DriveBranchDecision::Generated;
+    }
+    if cfg.resolve_repo(&owner_repo).is_none() {
+        return DriveBranchDecision::Generated;
+    }
+    let Ok(pr_num) = num_str.parse::<u64>() else {
+        return DriveBranchDecision::Generated;
+    };
+    match scm.open_pr_head_ref_for_repo(&owner_repo, pr_num) {
+        Ok(PrHeadBranch::SameRepo(head_ref)) => DriveBranchDecision::PrHead(head_ref),
+        Ok(PrHeadBranch::Fork) => DriveBranchDecision::ForkFallback,
+        Ok(PrHeadBranch::NotFound) | Err(_) => DriveBranchDecision::Generated,
     }
 }
 

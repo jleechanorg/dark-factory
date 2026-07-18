@@ -28,7 +28,7 @@ use daemon::er_runner;
 use daemon::errors::DaemonError;
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
-use daemon::tools::{Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrSnapshot, Scm};
+use daemon::tools::{Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrHeadBranch, PrSnapshot, Scm};
 use daemon::verifier::SkepticVerdict;
 
 fn test_cfg() -> Config {
@@ -2544,6 +2544,233 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
     assert_eq!(
         final_overlay.branch.as_deref(),
         Some("factory/manual-bead-123-r1")
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-drive-pr-branch-binding-pcpr red-proof: a manually-created
+/// "drive an existing PR" bead (`external_ref` names a currently-OPEN PR in
+/// the daemon's configured repo) must dispatch onto that PR's own head
+/// branch, not the generated `factory/<bead>-r1` one. Live incident
+/// 2026-07-17: beads `jleechan-af-drive-pr288-gd2x` / `...pr289-inoy` parked
+/// `session_branch_mismatch` because AO correctly reused the session
+/// already bound to the PR's real branch while dispatch had requested a
+/// different, freshly fabricated branch.
+#[test]
+fn drive_existing_pr_bead_dispatches_onto_pr_head_branch_not_generated_branch() {
+    let mut scm = FakeScm::new();
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".to_string(), 288),
+        PrHeadBranch::SameRepo("factory/jleechan-xa99-reconciliation-rebased".to_string()),
+    );
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "jleechan-af-drive-pr288-gd2x".into(),
+        title: "drive PR #288".into(),
+        description: "existing_pr: 288".into(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#288".into()),
+    });
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"drive existing PR"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_drive_pr_branch_binding_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
+    assert_eq!(summary.beads_dispatched, 1, "the drive-PR bead must dispatch");
+
+    let final_overlay = store
+        .load("jleechan-af-drive-pr288-gd2x")
+        .unwrap()
+        .expect("overlay must exist");
+    // `test_cfg()` runs the fast tier in the same `run_tick(0, 0)` call
+    // (fast_tick_secs == slow_tick_secs), and setting `pr_number` at
+    // dispatch time (below) makes this bead eligible for further same-tick
+    // gate-assessment progress — so the state may already have moved past
+    // `Dispatched`. The branch/adoption/pr_number bindings this test is
+    // actually proving are stable across that further progress; assert
+    // those directly instead of pinning the exact downstream state.
+    assert_eq!(
+        final_overlay.branch.as_deref(),
+        Some("factory/jleechan-xa99-reconciliation-rebased"),
+        "must bind to the PR's own head branch, not factory/jleechan-af-drive-pr288-gd2x-r1"
+    );
+    assert!(
+        final_overlay.is_adopted,
+        "drive-PR dispatch must mark is_adopted so a later reroll takes the \
+         append-only remediation path instead of fabricating a replacement \
+         branch and closing PR #288"
+    );
+    assert_eq!(final_overlay.pr_number, Some(288));
+
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let dispatched = events
+        .iter()
+        .find(|e| e["eventType"] == "TASK_DISPATCHED")
+        .expect("TASK_DISPATCHED event must be emitted");
+    assert_eq!(
+        dispatched["context"]["branch"], "factory/jleechan-xa99-reconciliation-rebased"
+    );
+    assert_eq!(
+        dispatched["context"]["branch_mode"], "pr_head",
+        "telemetry must record which branch-binding mode fired: {dispatched:#?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Complementary case: the SAME `external_ref` shape (`owner/repo#N`), but
+/// the PR is closed/missing — `FakeScm` has no scripted entry for it, so
+/// `open_pr_head_ref_for_repo` returns `Ok(PrHeadBranch::NotFound)` (the
+/// fail-safe default). Dispatch must fall back to the ordinary
+/// generated-branch path exactly as before this bead, not treat every
+/// `external_ref` as a drive-PR bead.
+#[test]
+fn bead_with_external_ref_but_no_open_pr_falls_back_to_generated_branch() {
+    let scm = FakeScm::new(); // no open PRs scripted at all
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "bead-closed-pr-ref".into(),
+        title: "issue-tracked bead".into(),
+        description: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#999".into()),
+    });
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"ordinary work"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_no_open_pr_generated_branch_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
+    assert_eq!(summary.beads_dispatched, 1);
+
+    let final_overlay = store.load("bead-closed-pr-ref").unwrap().unwrap();
+    assert_eq!(
+        final_overlay.branch.as_deref(),
+        Some("factory/bead-closed-pr-ref-r1"),
+        "no confirmed-open PR means the generated-branch path must fire, unchanged"
+    );
+    assert!(!final_overlay.is_adopted);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Codex cross-model review of PR #305 red-proof: an OPEN PR whose head
+/// lives on a FORK must NEVER be bound to by branch name — the base repo
+/// has no such branch, so binding would create an unrelated same-named
+/// branch there and silently never update the actual PR being driven.
+/// `FakeScm` scripts `PrHeadBranch::Fork` for PR #501, simulating a real
+/// `gh api repos/owner/repo/pulls/501` response whose `head.repo.full_name`
+/// is a fork (or a deleted fork, where GitHub omits `head.repo` entirely).
+#[test]
+fn drive_pr_bead_with_fork_head_falls_back_to_generated_branch_not_fork_head() {
+    let mut scm = FakeScm::new();
+    scm.open_pr_head_refs
+        .insert(("owner/repo".to_string(), 501), PrHeadBranch::Fork);
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "jleechan-fork-pr-bead-e2e".into(),
+        title: "drive PR whose head is on a fork".into(),
+        description: "existing_pr: 501".into(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#501".into()),
+    });
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"drive existing PR"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_fork_pr_generated_fallback_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
+    assert_eq!(summary.beads_dispatched, 1);
+
+    let final_overlay = store.load("jleechan-fork-pr-bead-e2e").unwrap().unwrap();
+    assert_eq!(
+        final_overlay.branch.as_deref(),
+        Some("factory/jleechan-fork-pr-bead-e2e-r1"),
+        "a fork PR's head branch name must NEVER be bound to — must fall back to the          generated branch, exactly like an ordinary create-new-work bead"
+    );
+    assert!(
+        !final_overlay.is_adopted,
+        "fork fallback must not take the append-only adopted-remediation path —          it never actually bound to the PR's own branch"
+    );
+
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let dispatched = events
+        .iter()
+        .find(|e| e["eventType"] == "TASK_DISPATCHED")
+        .expect("TASK_DISPATCHED event must be emitted");
+    assert_eq!(
+        dispatched["context"]["branch_mode"], "generated_fork_fallback",
+        "telemetry must distinguish a fork-blocked drive-PR bead from an ordinary          generated dispatch: {dispatched:#?}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
