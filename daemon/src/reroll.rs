@@ -263,178 +263,120 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
 
     // 3. Stop the AO session and evaluate the fail-closed proceed predicate.
     //
-    // Bead jleechan-zeij / issue #322 (r2). Re-roll may supersede the
-    // previous worker — fabricate a fresh attempt branch and close the old
-    // PR — ONLY when it can positively confirm that worker is safe to
-    // replace. r0 confirmed nothing useful (a 60s HEAD-stability wait that
-    // parked HUMAN_HELD on the idle+spawning case, defeating unattended
-    // end-to-end on every red gate_assessment); r1 over-corrected to
-    // fail-OPEN (always proceed after a short best-effort wait), which lets a
-    // genuinely-live worker get its PR closed and a duplicate lane spawned
-    // while it is still pushing. r2 is fail-CLOSED: supersede ONLY on a
-    // positive proceed signal, otherwise DEFER — never park on a single
-    // unconfirmed poll, never proceed on doubt.
+    // Bead jleechan-zeij / issue #322 (r3, adversarial Codex review of r2).
+    // Re-roll may supersede the previous worker — fabricate a fresh attempt
+    // branch and close the old PR — ONLY when it can POSITIVELY confirm that
+    // worker is safe to replace. r2 confirmed too weakly: a post-stop
+    // `Idle`/`NotFound` classification plus two HEAD reads ~500ms apart does
+    // not prove process death (`ao session kill` swallows tmux-destruction
+    // failures and archives metadata, so stop() can "succeed" while a live
+    // orphan survives and pushes AFTER supersede), and `activity=idle` ≠ task
+    // complete (a worker blocked in a long tool call is "idle" with a stable
+    // HEAD). r3 tightens both:
     //
     // Proceed predicate — supersede iff ANY of:
-    //   (a) attach() -> SessionNotFound: the worker is already fully reaped;
+    //   (a) attach() at entry -> SessionNotFound: already fully reaped;
     //       nothing live to guard against (reason "no_live_session").
-    //   (b) session TERMINAL and two consecutive stable head_sha(branch)
-    //       reads: the worker exited and its branch has settled.
-    //   (c) session activity IDLE and head_sha stable across the window: the
-    //       #322 live case (`status=spawning, activity=idle`) — the worker
-    //       finished and went idle without an explicit kill; safe to
-    //       supersede once its branch is observably static.
-    // Liveness and head-stability are evaluated JOINTLY on every poll, and
-    // head_sha is sampled on EVERY poll (not only terminal ones) so a
-    // mid-window push denies the predicate.
+    //   (b) POSITIVE DEATH: after stop(), a re-attach probe observes a
+    //       CONTINUOUS SessionNotFound for `reroll_death_confirm_secs` (guards
+    //       against a momentary `ao status` omission). This is the fast path.
+    //   (c) WIDENED STABILITY WINDOW: the session is still present but
+    //       non-running — Terminal, or Idle with a transcript quiet for the
+    //       window (probed from the coder's own activity timestamp, NOT
+    //       re-derived from one instant) — AND the branch HEAD holds unchanged
+    //       for a materially wide `reroll_head_stability_window_secs` (default
+    //       ≥30s), wide enough that an active worker's next push lands inside
+    //       it. head_sha is sampled on EVERY poll so a mid-window push resets
+    //       the streak.
+    // Anything else — a running worker, a moving HEAD, a failed stop(), or a
+    // transient probe error — is a DEFER (never a park on a single poll,
+    // never a proceed on doubt). TOCTOU cannot be fully eliminated without
+    // cooperative fencing, so the goal is a window wide enough to catch an
+    // active worker plus telemetry recording the window used.
     //
-    // Ordering (req 4): stop() must succeed BEFORE the predicate — a failed
-    // kill means the worker is still alive, which is a DEFER. Session state
-    // and head_sha are read AFTER stop. bead.session_id is cleared ONLY on a
-    // confirmed proceed.
-    //
-    // Errors (req 5): only DaemonError::is_transient() errors are swallowed
-    // (as a DEFER, with distinct telemetry reasons quiescence_check_transient
-    // / head_query_transient); a permanent error propagates.
+    // Ordering: stop() must succeed BEFORE the predicate. Errors are handled
+    // per spec — only DaemonError::is_transient() errors enter the deferral
+    // path; PERMANENT errors PROPAGATE (surface as an error outcome, never a
+    // silent park/defer). bead.session_id is cleared ONLY on a confirmed
+    // proceed.
     if let Some(branch) = bead.branch.clone() {
+        let window = std::time::Duration::from_secs(deps.cfg.reroll_head_stability_window_secs);
+        let death_window = std::time::Duration::from_secs(deps.cfg.reroll_death_confirm_secs);
+        // AO project for the idle-liveness transcript probe. Mirrors the
+        // adopted path's resolution; falls back to the repo's last path
+        // segment when unmapped (the probe then simply yields "no evidence").
+        let ao_project = deps
+            .cfg
+            .resolve_repo(bead.repo(deps.cfg))
+            .map(|r| r.ao_project)
+            .unwrap_or_else(|| {
+                bead.repo(deps.cfg)
+                    .split('/')
+                    .next_back()
+                    .unwrap_or("")
+                    .to_string()
+            });
+
         emit_telemetry(
             deps.telemetry_log,
             &bead.bead_id,
             bead.attempt,
             bead.state.as_str(),
             "REROLL_QUIESCENCE_WAIT",
-            serde_json::json!({}),
+            serde_json::json!({
+                "headStabilityWindowSecs": deps.cfg.reroll_head_stability_window_secs,
+                "deathConfirmSecs": deps.cfg.reroll_death_confirm_secs,
+            }),
             serde_json::json!({"branch": branch}),
         )?;
 
         // Yields the static proceed reason to fall through to step 4; every
-        // non-proceed path early-returns (Deferred / Held) from within.
+        // non-proceed path early-returns (Deferred / Err) from within.
         let proceed_reason: &'static str = match deps.sessions.attach(&branch, &bead.bead_id) {
             // (a) No live worker to supersede — fast-path proceed.
             Err(DaemonError::SessionNotFound { .. }) => "no_live_session",
-            // A transient `ao status` failure means we cannot even identify
-            // the session this tick — defer rather than park.
+            // Transient `ao status` failure — cannot identify the session this
+            // tick — defer.
             Err(e) if e.is_transient() => {
                 return defer_or_cap(deps, bead, "attach_transient");
             }
-            // A permanent attach failure (ambiguous/malformed status) fails
-            // closed to a human hold, exactly as r0/r1 did.
-            Err(e) => {
-                bead.state = OverlayState::HumanHeld;
-                set_human_hold_reason(bead, HumanHoldReason::RerollSessionAttachFailed);
-                deps.store.save(bead)?;
-                return Ok(RerollOutcome::Held(format!("failed to attach to session: {e}")));
-            }
+            // Permanent attach failure (ambiguous/malformed status) — PROPAGATE
+            // (Codex r3 P2: only transient errors enter deferral).
+            Err(e) => return Err(e),
             Ok(session_id) => {
-                // Ordering req: stop() must succeed BEFORE evaluating the
-                // predicate. A failed kill means the worker is (or may be)
-                // alive — DEFER, do not proceed.
-                if let Err(e) = deps.sessions.stop(&session_id) {
-                    emit_telemetry(
-                        deps.telemetry_log,
-                        &bead.bead_id,
-                        bead.attempt,
-                        bead.state.as_str(),
-                        "REROLL_QUIESCENCE_STOP_FAILED",
-                        serde_json::json!({}),
-                        serde_json::json!({"sessionId": session_id.0, "error": format!("{e}")}),
-                    )?;
-                    return defer_or_cap(deps, bead, "stop_failed");
-                }
-
-                // Joint liveness + head-stability poll (state read AFTER
-                // stop). A confirmed proceed requires a non-running activity
-                // (Terminal / Idle / NotFound) observed TWICE in a row with
-                // an unchanged head_sha in between.
-                let start = std::time::Instant::now();
-                let poll_interval = std::time::Duration::from_millis(500);
-                let max_wait = std::time::Duration::from_secs(3);
-                let mut confirmed_reason: Option<&'static str> = None;
-                let mut last_stable_head: Option<String> = None;
-                while start.elapsed() < max_wait {
-                    // Liveness probe (idle vs running vs terminal).
-                    let activity = match deps.sessions.session_activity(&session_id) {
-                        Ok(a) => a,
-                        Err(e) if e.is_transient() => {
-                            emit_telemetry(
-                                deps.telemetry_log,
-                                &bead.bead_id,
-                                bead.attempt,
-                                bead.state.as_str(),
-                                "REROLL_QUIESCENCE_CHECK_TRANSIENT",
-                                serde_json::json!({}),
-                                serde_json::json!({"reason": "quiescence_check_transient", "error": format!("{e}")}),
-                            )?;
-                            break;
-                        }
-                        Err(e) => return Err(e),
-                    };
-
-                    // Sample head_sha on EVERY poll (req 3): a mid-window
-                    // push must deny the predicate even while the session
-                    // already looks idle/terminal.
-                    let head = match deps.vcs.head_sha(&branch) {
-                        Ok(h) => h,
-                        Err(e) if e.is_transient() => {
-                            emit_telemetry(
-                                deps.telemetry_log,
-                                &bead.bead_id,
-                                bead.attempt,
-                                bead.state.as_str(),
-                                "REROLL_QUIESCENCE_HEAD_TRANSIENT",
-                                serde_json::json!({}),
-                                serde_json::json!({"reason": "head_query_transient", "error": format!("{e}")}),
-                            )?;
-                            break;
-                        }
-                        Err(e) => return Err(e),
-                    };
-
-                    match activity {
-                        SessionActivity::Running => {
-                            // The genuine "do not supersede a live worker"
-                            // case. Any prior stability streak is void; keep
-                            // polling until the ceiling, then defer.
-                            last_stable_head = None;
-                        }
-                        SessionActivity::Terminal
-                        | SessionActivity::Idle
-                        | SessionActivity::NotFound => match &last_stable_head {
-                            Some(prev) if *prev == head => {
-                                // Two consecutive non-running polls with an
-                                // unchanged HEAD — the branch has settled.
-                                confirmed_reason = Some(match activity {
-                                    SessionActivity::Terminal => "confirmed_terminal_stable_head",
-                                    SessionActivity::NotFound => "confirmed_session_reaped",
-                                    _ => "confirmed_idle_stable_head",
-                                });
-                                break;
-                            }
-                            _ => {
-                                // First non-running observation, or the HEAD
-                                // moved since the last one (a push landed
-                                // mid-window) — (re)start the two-read streak.
-                                last_stable_head = Some(head);
-                            }
-                        },
+                // Ordering: stop() must succeed BEFORE the predicate. A
+                // transient stop failure defers (worker may be alive); a
+                // permanent one propagates.
+                match deps.sessions.stop(&session_id) {
+                    Ok(()) => {}
+                    Err(e) if e.is_transient() => {
+                        emit_telemetry(
+                            deps.telemetry_log,
+                            &bead.bead_id,
+                            bead.attempt,
+                            bead.state.as_str(),
+                            "REROLL_QUIESCENCE_STOP_FAILED",
+                            serde_json::json!({}),
+                            serde_json::json!({"sessionId": session_id.0, "error": format!("{e}")}),
+                        )?;
+                        return defer_or_cap(deps, bead, "stop_failed");
                     }
-
-                    std::thread::sleep(poll_interval);
+                    Err(e) => return Err(e),
                 }
 
-                match confirmed_reason {
+                match evaluate_proceed(deps, bead, &branch, &ao_project, window, death_window)? {
                     Some(reason) => reason,
-                    // Unconfirmed (live/running worker, moving HEAD, or a
-                    // transient-check break): DEFER. session_id is
+                    // Unconfirmed (running worker, moving HEAD, idle-but-active,
+                    // or a transient-probe break): DEFER. session_id is
                     // deliberately NOT cleared — the worker may still be live.
                     None => return defer_or_cap(deps, bead, "unconfirmed_live_or_moving_head"),
                 }
             }
         };
 
-        // Confirmed proceed: clear the durable session handle (ONLY here —
-        // req 4) and reset the consecutive-deferral counter in the same save
-        // before any later step can create a recoverable hold.
+        // Confirmed proceed: clear the durable session handle (ONLY here) and
+        // reset the consecutive-deferral counter in the same save before any
+        // later step can create a recoverable hold.
         deps.store.reset_reroll_deferral(&bead.bead_id)?;
         bead.session_id = None;
         deps.store.save(bead)?;
@@ -445,7 +387,10 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
             bead.attempt,
             bead.state.as_str(),
             "REROLL_QUIESCENCE_SUCCESS",
-            serde_json::json!({}),
+            serde_json::json!({
+                "headStabilityWindowSecs": deps.cfg.reroll_head_stability_window_secs,
+                "deathConfirmSecs": deps.cfg.reroll_death_confirm_secs,
+            }),
             serde_json::json!({"reason": proceed_reason}),
         )?;
     }
@@ -561,6 +506,196 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     )?;
 
     Ok(RerollOutcome::Rerolled { new_branch })
+}
+
+/// Current unix epoch seconds (bead jleechan-zeij / issue #322 r3). Used to
+/// age the coder's transcript activity timestamp against the stability window
+/// for the idle-liveness check.
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Bead jleechan-zeij / issue #322 r3 (Codex P1b): a session reporting
+/// `activity=idle` is not necessarily done — a worker blocked in a long tool
+/// call is idle too. Consult the coder's OWN transcript last-activity
+/// timestamp (not the one-instant AO `activity` field) and require it to have
+/// been quiet for the whole stability window before an idle session counts as
+/// non-running. `None` from the probe means "no evidence" (missing worktree
+/// mapping, e.g. after a daemon restart) — fail closed to "not quiet" so an
+/// idle session with no corroborating liveness signal never proceeds via the
+/// stability-window path (it still can via positive death once its process
+/// actually exits).
+fn transcript_quiet(
+    deps: &RerollDeps,
+    ao_project: &str,
+    branch: &str,
+    window: std::time::Duration,
+) -> Result<bool, DaemonError> {
+    match deps
+        .sessions
+        .worktree_transcript_last_activity_epoch(ao_project, branch)?
+    {
+        Some(ts) => Ok(now_epoch_secs().saturating_sub(ts) >= window.as_secs()),
+        None => Ok(false),
+    }
+}
+
+/// Bead jleechan-zeij / issue #322 r3: the fail-closed proceed evaluation run
+/// AFTER a successful stop(). Returns `Ok(Some(reason))` to proceed,
+/// `Ok(None)` to DEFER, or `Err` to propagate a permanent probe failure.
+///
+/// Two positive-confirmation mechanisms run jointly over a single poll loop:
+///   * POSITIVE DEATH — a re-attach probe observes a CONTINUOUS
+///     `SessionNotFound` for `death_window`; once the AO session record is
+///     provably gone the worker cannot push, so no HEAD-stability wait is
+///     needed (the fast path; a genuinely-dead idle+spawning session confirms
+///     here).
+///   * WIDENED STABILITY WINDOW — the session is still present but non-running
+///     (Terminal, or Idle with a transcript quiet for the window) AND the
+///     branch HEAD holds unchanged for `window`. head_sha is sampled on EVERY
+///     poll (Codex P3: before any activity-based break) so a mid-window push
+///     resets the stability streak.
+fn evaluate_proceed(
+    deps: &RerollDeps,
+    bead: &BeadOverlay,
+    branch: &str,
+    ao_project: &str,
+    window: std::time::Duration,
+    death_window: std::time::Duration,
+) -> Result<Option<&'static str>, DaemonError> {
+    let poll_interval = std::time::Duration::from_millis(500);
+    let deadline = window.max(death_window);
+    let start = std::time::Instant::now();
+    let mut last_head: Option<String> = None;
+    let mut head_stable_since: Option<std::time::Instant> = None;
+    let mut not_found_since: Option<std::time::Instant> = None;
+
+    loop {
+        let poll_at = std::time::Instant::now();
+
+        // Codex P3: sample head_sha FIRST on every poll, before any
+        // liveness-based break, so "HEAD sampled every poll" is unconditionally
+        // true and a mid-window push is always observed.
+        let head = match deps.vcs.head_sha(branch) {
+            Ok(h) => h,
+            Err(e) if e.is_transient() => {
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_QUIESCENCE_HEAD_TRANSIENT",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "head_query_transient", "error": format!("{e}")}),
+                )?;
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        match &last_head {
+            Some(prev) if *prev == head => {}
+            _ => {
+                head_stable_since = Some(poll_at);
+                last_head = Some(head);
+            }
+        }
+
+        // Positive-death probe: re-attach to see whether the AO session record
+        // is gone. Distinguish "gone" from "still present + its activity".
+        let present_activity: Option<SessionActivity> =
+            match deps.sessions.attach(branch, &bead.bead_id) {
+                Err(DaemonError::SessionNotFound { .. }) => {
+                    if not_found_since.is_none() {
+                        not_found_since = Some(poll_at);
+                    }
+                    None
+                }
+                Err(e) if e.is_transient() => {
+                    emit_telemetry(
+                        deps.telemetry_log,
+                        &bead.bead_id,
+                        bead.attempt,
+                        bead.state.as_str(),
+                        "REROLL_QUIESCENCE_CHECK_TRANSIENT",
+                        serde_json::json!({}),
+                        serde_json::json!({"reason": "quiescence_check_transient", "error": format!("{e}")}),
+                    )?;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+                Ok(session_id) => {
+                    not_found_since = None;
+                    match deps.sessions.session_activity(&session_id) {
+                        Ok(a) => Some(a),
+                        Err(e) if e.is_transient() => {
+                            emit_telemetry(
+                                deps.telemetry_log,
+                                &bead.bead_id,
+                                bead.attempt,
+                                bead.state.as_str(),
+                                "REROLL_QUIESCENCE_CHECK_TRANSIENT",
+                                serde_json::json!({}),
+                                serde_json::json!({"reason": "quiescence_check_transient", "error": format!("{e}")}),
+                            )?;
+                            return Ok(None);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            };
+
+        match present_activity {
+            // Session gone: positive death once the SessionNotFound streak has
+            // held for the confirmation window. A dead session cannot push, so
+            // no HEAD-stability wait is required.
+            None => {
+                if let Some(since) = not_found_since {
+                    if poll_at.duration_since(since) >= death_window {
+                        return Ok(Some("positive_death"));
+                    }
+                }
+            }
+            // Session still present: only a non-running classification can
+            // proceed, and only once HEAD has held stable for the full window.
+            Some(activity) => {
+                let non_running_reason: Option<&'static str> = match activity {
+                    SessionActivity::Terminal | SessionActivity::NotFound => {
+                        Some("stable_window_terminal")
+                    }
+                    SessionActivity::Idle => {
+                        if transcript_quiet(deps, ao_project, branch, window)? {
+                            Some("stable_window_idle")
+                        } else {
+                            None
+                        }
+                    }
+                    SessionActivity::Running => None,
+                };
+                match non_running_reason {
+                    Some(reason) => {
+                        if let Some(since) = head_stable_since {
+                            if poll_at.duration_since(since) >= window
+                                && start.elapsed() >= window
+                            {
+                                return Ok(Some(reason));
+                            }
+                        }
+                    }
+                    // Running, or idle-but-recently-active: the worker is (or
+                    // may be) live — reset the HEAD-stability streak.
+                    None => head_stable_since = None,
+                }
+            }
+        }
+
+        if start.elapsed() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(poll_interval);
+    }
 }
 
 /// Bead jleechan-zeij / issue #322 r2: the fail-closed defer/escalate step of

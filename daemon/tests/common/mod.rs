@@ -16,7 +16,7 @@ use daemon::tools::{
     Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionActivity,
     SessionId, Sessions, SpawnSpec, Tracker, Vcs,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 /// Scripted `Tracker` fake: pre-seeded candidates + a call log of every method
@@ -306,9 +306,28 @@ pub struct FakeSessions {
     /// `SessionNotFound` (the "already reaped" fast path). Empty by default.
     pub attach_not_found_for: RefCell<Vec<String>>,
     /// Branches for which `attach` returns a PERMANENT (`DaemonError::Parse`)
-    /// error — models an ambiguous/malformed `ao status` that must park
-    /// HUMAN_HELD rather than defer. Empty by default.
+    /// error — models an ambiguous/malformed `ao status` that must PROPAGATE
+    /// (Codex r3 P2) rather than defer/park. Empty by default.
     pub fail_attach_permanent_for: RefCell<Vec<String>>,
+    /// Branches for which `attach` returns a TRANSIENT (`DaemonError::Tool`)
+    /// error — models a momentary `ao status` failure that must DEFER. Empty
+    /// by default.
+    pub fail_attach_transient_for: RefCell<Vec<String>>,
+    /// Bead jleechan-zeij / issue #322 r3 (positive-death modeling): once
+    /// `true`, a successful `stop()` does NOT terminate the session — it
+    /// survives as a live orphan (`ao session kill` swallowed the tmux
+    /// destruction), so post-stop `attach` still returns it. Default `false`:
+    /// a successful `stop()` genuinely terminates the session, so post-stop
+    /// `attach` returns `SessionNotFound` (positive death).
+    pub orphan_after_stop: Cell<bool>,
+    /// Set once a `stop()` call has SUCCEEDED. Combined with
+    /// `orphan_after_stop`, this drives the post-stop `attach` result:
+    /// terminated (SessionNotFound) vs surviving orphan.
+    pub stop_succeeded: Cell<bool>,
+    /// Session ids for which `stop()` returns a PERMANENT (`DaemonError::Parse`)
+    /// error — models a non-transient kill failure that must PROPAGATE. Empty
+    /// by default.
+    pub fail_stop_permanent_for: RefCell<Vec<String>>,
     /// Static `session_activity` override (idle vs running vs terminal). When
     /// `None`, `session_activity` derives from `terminal_at`/`quiescent` to
     /// match the trait default. Set it to `Idle` to reproduce the #322 live
@@ -347,6 +366,10 @@ impl Default for FakeSessions {
             quiescence_check_error: RefCell::new(None),
             attach_not_found_for: RefCell::new(Vec::new()),
             fail_attach_permanent_for: RefCell::new(Vec::new()),
+            fail_attach_transient_for: RefCell::new(Vec::new()),
+            orphan_after_stop: Cell::new(false),
+            stop_succeeded: Cell::new(false),
+            fail_stop_permanent_for: RefCell::new(Vec::new()),
             activity: RefCell::new(None),
             activity_permanent_error: RefCell::new(None),
             worktree_remote_override: RefCell::new(None),
@@ -420,11 +443,34 @@ impl FakeSessions {
     }
 
     /// Script `attach(branch, _)` to return a PERMANENT `DaemonError::Parse`
-    /// — models an ambiguous/malformed `ao status` that must park HUMAN_HELD.
+    /// — models an ambiguous/malformed `ao status` that must PROPAGATE.
     pub fn fail_attach_permanent_for(&self, branch: &str) {
         self.fail_attach_permanent_for
             .borrow_mut()
             .push(branch.to_string());
+    }
+
+    /// Script `attach(branch, _)` to return a TRANSIENT `DaemonError::Tool` —
+    /// models a momentary `ao status` failure that must DEFER.
+    pub fn fail_attach_transient_for(&self, branch: &str) {
+        self.fail_attach_transient_for
+            .borrow_mut()
+            .push(branch.to_string());
+    }
+
+    /// Bead jleechan-zeij / issue #322 r3: model `ao session kill` swallowing
+    /// tmux destruction — a successful `stop()` leaves the session alive as an
+    /// orphan, so post-stop `attach` keeps returning it (no positive death).
+    pub fn set_orphan_after_stop(&self) {
+        self.orphan_after_stop.set(true);
+    }
+
+    /// Script `stop(session_id)` to return a PERMANENT `DaemonError::Parse` —
+    /// models a non-transient kill failure that must PROPAGATE.
+    pub fn fail_stop_permanent_for(&self, session_id: &str) {
+        self.fail_stop_permanent_for
+            .borrow_mut()
+            .push(session_id.to_string());
     }
 
     /// Script the static `session_activity` classification (idle vs running
@@ -531,11 +577,38 @@ impl Sessions for FakeSessions {
                 "scripted permanent attach failure for {branch}"
             )));
         }
+        if self
+            .fail_attach_transient_for
+            .borrow()
+            .iter()
+            .any(|b| b == branch)
+        {
+            return Err(DaemonError::Tool {
+                tool: "ao".into(),
+                rc: 1,
+                stderr: format!("scripted transient attach failure for {branch}"),
+            });
+        }
+        // Bead jleechan-zeij / issue #322 r3: after a successful `stop()` that
+        // genuinely terminated the session (the default, not an orphan), a
+        // re-attach reports the session gone — the positive-death signal.
+        if self.stop_succeeded.get() && !self.orphan_after_stop.get() {
+            return Err(DaemonError::SessionNotFound {
+                branch: branch.to_string(),
+                bead_id: bead_id.to_string(),
+            });
+        }
         Ok(SessionId(self.next_session_id.clone()))
     }
 
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
         self.calls.borrow_mut().push(format!("stop({})", id.0));
+        if self.fail_stop_permanent_for.borrow().contains(&id.0) {
+            return Err(DaemonError::Parse(format!(
+                "scripted permanent stop failure for {}",
+                id.0
+            )));
+        }
         if self.fail_stop_for.borrow().contains(&id.0) {
             return Err(DaemonError::Tool {
                 tool: "ao".into(),
@@ -543,6 +616,9 @@ impl Sessions for FakeSessions {
                 stderr: format!("scripted stop failure for {}", id.0),
             });
         }
+        // A successful kill: record it so the post-stop re-attach models the
+        // session as terminated (positive death) unless flagged as an orphan.
+        self.stop_succeeded.set(true);
         Ok(())
     }
 

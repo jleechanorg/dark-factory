@@ -47,6 +47,8 @@ fn test_cfg() -> Config {
         autonomy_timebox_secs: 10_800,
         budget_warn_usd: 20.0,
         spec_dir: ".factory/specs/".into(),
+        reroll_head_stability_window_secs: 1,
+        reroll_death_confirm_secs: 0,
         repos: std::collections::HashMap::new(),
     }
 }
