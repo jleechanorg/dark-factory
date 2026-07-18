@@ -74,6 +74,31 @@ fn dispatch_prompt_preamble(repo: &str, remote: &str, branch: &str) -> String {
 /// frequent/short-lived than a full gate-rejection HUMAN_HELD cycle.
 pub(crate) const MAX_TRANSIENT_SPAWN_RETRY: u32 = 15;
 
+/// Caller-resolved drive-PR branch-binding decision (bead
+/// jleechan-drive-pr-branch-binding-pcpr), threaded from
+/// `tick.rs::run_slow_tier` into `dispatch_ready` via `ready`'s third tuple
+/// element — this module intentionally has no `Scm` access (see the module
+/// doc comment), so the `gh`-backed lookup happens before `ready` is built.
+/// Three states rather than `Option<String>` so a fork PR (confirmed open,
+/// but its head lives on a different repo — the fail-closed guard mirroring
+/// `intake::same_repo_pr`) is distinguishable in telemetry from "no drive-PR
+/// signal at all"; both fall back to the generated branch, but an operator
+/// needs to know WHY.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriveBranchDecision {
+    /// Bind the coder branch to this PR's own head ref.
+    PrHead(String),
+    /// An open PR was confirmed, but its head lives on a fork — refuse to
+    /// bind (would create an unrelated same-named branch in the queried
+    /// repo and never touch the actual PR). Falls back to the generated
+    /// branch, tagged distinctly in telemetry (`branch_mode:
+    /// "generated_fork_fallback"`).
+    ForkFallback,
+    /// Ordinary create-new-work bead, or a closed/missing/non-PR
+    /// `external_ref` — the generated-branch path.
+    Generated,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchSuccess {
     pub bead_id: String,
@@ -84,6 +109,15 @@ pub struct DispatchSuccess {
     /// surfaced so `tick.rs`'s `TASK_DISPATCHED` telemetry makes the
     /// resolved repo visible in daemon.jsonl.
     pub target_repo: String,
+    /// `"pr_head"` when `branch` was bound to a caller-resolved open PR's
+    /// own head ref (bead jleechan-drive-pr-branch-binding-pcpr — drive an
+    /// existing PR rather than fabricate a parallel branch),
+    /// `"generated_fork_fallback"` when an open PR was confirmed but its
+    /// head lives on a fork (fail-closed — see `DriveBranchDecision`),
+    /// `"generated"` for the ordinary `factory/<bead>-r<attempt>` path.
+    /// Surfaced so `tick.rs`'s `TASK_DISPATCHED` telemetry records which
+    /// mode fired.
+    pub branch_mode: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,18 +190,26 @@ fn failure(
 /// Returns a per-bead report. Never spawns past the cap; if zero slots are
 /// free, returns an empty report without calling `sessions.spawn` (verified by
 /// the fake's call log in tests — spec §4.2.8's caps are absolute).
+///
+/// `ready`'s third tuple element is the caller-resolved
+/// [`DriveBranchDecision`] (bead jleechan-drive-pr-branch-binding-pcpr,
+/// resolved by `tick.rs::run_slow_tier` via `Scm::open_pr_head_ref_for_repo`
+/// — this module intentionally has no `Scm` access, see the module doc
+/// comment, so the lookup happens before `ready` is built). This module
+/// never re-derives that decision; it only consumes whatever `ready`
+/// already contains, in order, exactly like the routing verdict beside it.
 pub fn dispatch_ready(
     sessions: &dyn Sessions,
     store: &dyn StateStore,
     cfg: &Config,
-    ready: &[(Bead, RoutingVerdict)],
+    ready: &[(Bead, RoutingVerdict, DriveBranchDecision)],
 ) -> Result<DispatchReport, DaemonError> {
     let active = sessions.active_count()?;
     let free_slots = cfg.max_workers.saturating_sub(active);
     let batch = free_slots.min(cfg.max_batch);
 
     let mut report = DispatchReport::default();
-    for (bead, verdict) in ready {
+    for (bead, verdict, drive_branch) in ready {
         if report.success_count() >= batch {
             break;
         }
@@ -240,11 +282,31 @@ pub fn dispatch_ready(
             }
         };
 
-        let branch = format!("factory/{}-r{}", bead.id, overlay.attempt);
+        // jleechan-drive-pr-branch-binding-pcpr: a resolved open-PR head
+        // branch wins over the generated `factory/<bead>-r<attempt>` one —
+        // the coder MUST land work on the PR's own branch (that's what
+        // "drive an existing PR" means), and AO reusing a session already
+        // bound to that branch is exactly what the fail-closed
+        // `spawn_branch_mismatch` validation below expects to see, not a
+        // mismatch to reject.
+        let (branch, branch_mode) = match drive_branch {
+            DriveBranchDecision::PrHead(head_ref) => (head_ref.clone(), "pr_head"),
+            DriveBranchDecision::ForkFallback => (
+                format!("factory/{}-r{}", bead.id, overlay.attempt),
+                "generated_fork_fallback",
+            ),
+            DriveBranchDecision::Generated => (
+                format!("factory/{}-r{}", bead.id, overlay.attempt),
+                "generated",
+            ),
+        };
 
         // Register the branch + persist the DISPATCHING intent BEFORE
         // spawning a worker. Neither creates a live process, so a failure
-        // here needs no rollback.
+        // here needs no rollback. `register_branch` is idempotent for the
+        // SAME bead (see its doc comment), so re-registering a PR head
+        // branch on every redispatch/reroll of the same drive-PR bead is
+        // safe; only a genuine cross-bead collision errors.
         if let Err(err) = store.register_branch(&bead.id, &branch) {
             if err.is_transient() {
                 report.failures.push(failure(
@@ -261,6 +323,23 @@ pub fn dispatch_ready(
 
         overlay.state = OverlayState::Dispatching;
         overlay.branch = Some(branch.clone());
+        if branch_mode == "pr_head" {
+            // Explicit stored provenance flag (mirrors
+            // `intake::normalize_labeled_prs`'s ADOPTED path): a bead
+            // dispatched onto an external PR's own head branch must take
+            // `reroll::execute_adopted`'s append-only remediation path on a
+            // later reviewer rejection, never `reroll::execute`'s
+            // fabricate-new-branch-and-close-PR path — that would destroy
+            // the very PR this dispatch was told to drive.
+            overlay.is_adopted = true;
+            if overlay.pr_number.is_none() {
+                overlay.pr_number = bead
+                    .external_ref
+                    .as_deref()
+                    .and_then(|ext_ref| ext_ref.rsplit('#').next())
+                    .and_then(|num| num.parse::<u64>().ok());
+            }
+        }
         if let Err(err) = store.save(&overlay) {
             if err.is_transient() {
                 report.failures.push(failure(
@@ -595,6 +674,7 @@ pub fn dispatch_ready(
             branch,
             session_id: session_id.0,
             target_repo: repo,
+            branch_mode,
         });
     }
 
@@ -1269,7 +1349,7 @@ mod tests {
         }
     }
 
-    fn beads(n: usize) -> Vec<(Bead, RoutingVerdict)> {
+    fn beads(n: usize) -> Vec<(Bead, RoutingVerdict, DriveBranchDecision)> {
         (0..n)
             .map(|i| {
                 (
@@ -1281,9 +1361,154 @@ mod tests {
                         external_ref: None,
                     },
                     RoutingVerdict::StandardPath,
+                    DriveBranchDecision::Generated,
                 )
             })
             .collect()
+    }
+
+    // jleechan-drive-pr-branch-binding-pcpr: a bead resolved by the caller
+    // (tick.rs's `run_slow_tier`, which owns `Scm` access) to have an OPEN
+    // PR at its `external_ref` must dispatch onto that PR's OWN head
+    // branch, not a freshly fabricated `factory/<bead>-r<attempt>` one.
+    // Live incident 2026-07-17: AO correctly reused the session already
+    // bound to the PR's real branch, and the fail-closed
+    // `spawn_branch_mismatch` validation rejected it because dispatch had
+    // requested a different (generated) branch — parking the bead
+    // `session_branch_mismatch`/`spawn_branch_mismatch` forever. `ready`'s
+    // third tuple element carries the pre-resolved PR head branch (`None`
+    // for ordinary create-new-work beads, preserving the generated-branch
+    // path unchanged).
+    #[test]
+    fn ready_bead_with_resolved_pr_head_branch_dispatches_onto_it() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = vec![(
+            Bead {
+                id: "jleechan-af-drive-pr288-gd2x".into(),
+                title: "drive PR #288".into(),
+                description: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: Some("owner/repo#288".into()),
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::PrHead("factory/jleechan-xa99-reconciliation-rebased".to_string()),
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        let success = &report.successes[0];
+        assert_eq!(
+            success.branch, "factory/jleechan-xa99-reconciliation-rebased",
+            "must bind to the PR's own head branch, not a generated one"
+        );
+
+        let overlay = store
+            .overlays
+            .borrow()
+            .get("jleechan-af-drive-pr288-gd2x")
+            .cloned()
+            .expect("overlay must be persisted");
+        assert_eq!(
+            overlay.branch.as_deref(),
+            Some("factory/jleechan-xa99-reconciliation-rebased")
+        );
+        assert!(
+            overlay.is_adopted,
+            "drive-existing-PR dispatch must mark is_adopted so a later reroll \
+             takes the append-only remediation path instead of fabricating a \
+             replacement branch and closing this PR"
+        );
+    }
+
+    // The complementary case: no pre-resolved PR head branch (ordinary
+    // create-new-work bead, or a bead whose external_ref pointed at a
+    // closed/missing PR — the caller already applied the fail-safe and
+    // passed `None`) keeps today's generated-branch behavior exactly.
+    #[test]
+    fn ready_bead_without_resolved_pr_head_branch_generates_branch_as_before() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = vec![(
+            Bead {
+                id: "bead-fresh".into(),
+                title: "fresh work".into(),
+                description: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        assert_eq!(report.successes[0].branch, "factory/bead-fresh-r1");
+        let overlay = store
+            .overlays
+            .borrow()
+            .get("bead-fresh")
+            .cloned()
+            .expect("overlay must be persisted");
+        assert!(!overlay.is_adopted);
+    }
+
+    // Codex cross-model review of PR #305 (jleechan-drive-pr-branch-binding-pcpr):
+    // an OPEN PR whose head lives on a FORK must never be bound to by name —
+    // the queried repo has no such branch, so binding would create an
+    // unrelated same-named branch there and silently never update the
+    // actual PR. The caller (`tick.rs::resolve_drive_pr_head_branch`) is
+    // responsible for making this fail-closed call BEFORE `ready` is built
+    // (this module has no `Scm` access); this test proves `dispatch_ready`
+    // honors `DriveBranchDecision::ForkFallback` by falling back to the
+    // generated branch and tagging telemetry distinctly from both the
+    // ordinary generated path and the same-repo pr_head path — it must
+    // NEVER bind to a fork PR's head branch name.
+    #[test]
+    fn fork_pr_head_never_binds_falls_back_to_generated_branch_with_distinct_telemetry() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = vec![(
+            Bead {
+                id: "jleechan-fork-pr-bead".into(),
+                title: "drive PR whose head is on a fork".into(),
+                description: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: Some("owner/repo#404".into()),
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::ForkFallback,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(report.success_count(), 1);
+        let success = &report.successes[0];
+        assert_eq!(
+            success.branch, "factory/jleechan-fork-pr-bead-r1",
+            "a fork PR's head branch name must NEVER be bound to — must fall back to generated"
+        );
+        assert_eq!(
+            success.branch_mode, "generated_fork_fallback",
+            "fork fallback must be distinguishable in telemetry from plain 'generated'"
+        );
+
+        let overlay = store
+            .overlays
+            .borrow()
+            .get("jleechan-fork-pr-bead")
+            .cloned()
+            .expect("overlay must be persisted");
+        assert_eq!(overlay.branch.as_deref(), Some("factory/jleechan-fork-pr-bead-r1"));
+        assert!(
+            !overlay.is_adopted,
+            "fork fallback dispatches a fresh generated branch, not the PR's own              branch, so it must NOT take the append-only adopted-remediation path"
+        );
     }
 
     #[test]
@@ -2244,6 +2469,7 @@ mod tests {
                 external_ref: None,
             },
             RoutingVerdict::ResearchPath,
+            DriveBranchDecision::Generated,
         )];
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
         assert_eq!(report.success_count(), 1);
@@ -2272,6 +2498,7 @@ mod tests {
                 external_ref: None,
             },
             RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
         )];
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
         assert_eq!(report.success_count(), 1);
