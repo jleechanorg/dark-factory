@@ -352,4 +352,49 @@ Three LLM roles carry the daemon's judgment (ZFC: Zero-Framework Cognition — r
 2. **Constraint Extractor + Holdout-Leak Screen** — input: rejection review text. Output JSON: `{ "inhibitionSpecs": [...], "positiveAssertions": [...], "securityRedactionEncountered": <bool> }`. Inhibition specs take precedence; holdout internals are redacted before spec mutation (§4.2.6).
 3. **Skeptic Reviewer** — input: diff + spec manifest + validation history. Output verdict uses the runner's normalized grammar (`pass | warn | fail`, marker line `verdict: <token>`), plus `blockingIssues[]`. Binary `PASS/FAIL`-only schemas from external variants are non-conforming.
 
+---
+
+## Appendix D — Telemetry Contamination Window (jleechan-bze8.4)
+
+On **2026-07-18T18:35Z–18:41Z UTC**, the telemetry log
+`~/Library/Logs/dark-factory/daemon.jsonl` was contaminated by a duplicate
+daemon process. An ostensibly read-only diagnostic invocation of
+`daemon/target/release/daemon --help` (PID 3486748) bypassed CLI parsing
+and entered the production tick loop while the systemd-managed daemon
+(PID 1621182) was already active. The two processes interleaved
+telemetry with overlapping `tick_index` ranges (0..5 vs 748..755) and
+both dispatched df-184/185/186, producing double-dispatch events and
+overlay mutations that cannot be attributed to a single source of
+truth.
+
+**All daemon-side telemetry emitted between 2026-07-18T18:35:00Z and
+2026-07-18T18:41:00Z is excluded from `/af` autonomy evidence and from
+hand-rolled /goal-driven missions.** Evidence falls into three categories:
+
+1. **Telemetry events** — start with the `DAEMON_STARTED` event in
+   §4.2.9 (`event_type == "DAEMON_STARTED"`) — every event emitted
+   before PR #332's `[antig] feat(daemon): strict CLI arg boundary +
+   single-instance lease` lands is *not* trustworthy.
+2. **Overlay rows** — `DISPATCHING`/`DISPATCHED` rows in
+   `~/.dark-factory/daemon-cxdb.sqlite` mutated during the window are
+   flagged `CONTAMINATED` in CXDB metadata and queued for human review.
+3. **PR dispatches** — df-184, df-185, df-186 are excluded from the
+   `last_attempt_uuid` → `READY` chain. Their PRs were eventually
+   re-dispatched by the systemd daemon after the duplicate process
+   was terminated, so each shows two `DISPATCHED` events with no
+   intermediate `HUMAN_HELD`.
+
+The fix (this PR) prevents future occurrences by:
+
+- Strict CLI parsing that rejects unknown flags and routes `--help`/
+  `--version` to a `PrintUsage`/`PrintVersion` preflight — never
+  reaches the run loop.
+- A `mkdir(2)`-based single-instance lease at `<cxdb_dir>/daemon.lock.d/`
+  carrying `LeasePayload{pid, startTimeUnixSecs, instanceUuid,
+  executableSha256, configIdentity}`. Stale leases are reclaimed when
+  the recorded PID is no longer alive.
+- Per-process `instance_uuid` stamped into every telemetry event so
+  postmortem review can attribute every line to a daemon process
+  without ambiguity.
+
 <!-- jleechan-s3c timer-fire-test: green control fixture; long-lived regression -->

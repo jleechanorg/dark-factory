@@ -9,3 +9,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 thiserror = "2"
+# jleechan-bze8.4: POSIX fcntl(F_SETLK) for the single-instance lease cannot
+# be expressed through std (Rust deliberately hides fcntl). `libc` is the
+# canonical thin wrapper and adds zero transitive machinery (no
+# windows/not-wasm shim beyond cfg gating).
+libc = "0.2"

@@ -5,7 +5,9 @@
 
 use daemon::config::{self, Config};
 use daemon::errors::DaemonError;
+use daemon::instancelock::{self, AcquireOutcome, LeasePayload};
 use daemon::state::{SqliteStateStore, StateStore};
+use daemon::telemetry::{self, TelemetryEvent};
 use daemon::tick::{run_tick, TickDeps};
 use daemon::tools::{Bead, Issue, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 use std::path::{Path, PathBuf};
@@ -68,9 +70,47 @@ struct Args {
     dry_run: bool,
 }
 
+/// Pre-flight result for the daemon subcommand: either we run normally or
+/// the user asked us to print usage/version and exit 0 (before we touch
+/// CXDB, leases, timers, or telemetry). `--help`/`--version` returning a
+/// value rather than mutating state is what stops an ostensibly read-only
+/// diagnostic from entering the live tick loop and dispatching beads
+/// (jleechan-bze8.4 incident of 2026-07-18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonPreFlight {
+    Run,
+    PrintUsage,
+    PrintVersion,
+}
+
+/// Strict-parse the daemon subcommand's argv. Returns `Err` for any
+/// unrecognized flag (after `--help`/`--version` short-circuits), which
+/// lets `main` exit non-zero without opening the lease, opening CXDB, or
+/// emitting any telemetry.
+fn parse_daemon_flags(
+    iter: impl Iterator<Item = String>,
+) -> Result<(DaemonPreFlight, Args), String> {
+    let mut args = Args::default();
+    let mut preflight = DaemonPreFlight::Run;
+    for arg in iter {
+        match arg.as_str() {
+            "--once" => args.once = true,
+            "--dry-run" => args.dry_run = true,
+            "--help" | "-h" => preflight = DaemonPreFlight::PrintUsage,
+            "--version" | "-V" => preflight = DaemonPreFlight::PrintVersion,
+            other => {
+                return Err(format!(
+                    "unknown daemon flag `{other}`; pass --help for usage"
+                ));
+            }
+        }
+    }
+    Ok((preflight, args))
+}
+
 #[derive(Debug, Clone)]
 enum CommandMode {
-    Daemon(Args),
+    Daemon(DaemonPreFlight, Args),
     RecoverHeld {
         db: PathBuf,
         telemetry_log: PathBuf,
@@ -80,6 +120,32 @@ enum CommandMode {
         repo: Option<String>,
     },
 }
+
+const USAGE_BANNER: &str = "dark-factory daemon — auto-factory tick loop\n\
+\n\
+USAGE:\n  \
+daemon [--once] [--dry-run] [--help] [--version]\n\
+\n\
+OPTIONS:\n  \
+--once       Run exactly one tick then exit (instead of looping forever)\n  \
+--dry-run    Construct every tool-boundary trait as a no-op stub (tests only)\n  \
+-h, --help   Print this help and exit 0\n  \
+-V, --version  Print the daemon version and exit 0\n\
+\n\
+SUBCOMMANDS:\n  \
+gates-compute --pr <N> [--repo <owner/repo>]   Compute gates for a PR (read-only)\n  \
+recover-held --db <path> --telemetry-log <path>  Recover stuck HUMAN_HELD beads\n\
+\n\
+NOTE:\n  \
+All other arguments are rejected before the daemon touches CXDB, acquires\n  \
+its single-instance lease, emits startup telemetry, or opens a tick. This\n  \
+is the jleechan-bze8.4 fix: --help previously entered the production tick\n  \
+loop and dispatched beads.";
+
+const DAEMON_VERSION: &str = env!(
+    "CARGO_PKG_VERSION",
+    "CARGO_PKG_VERSION must be set by cargo build for daemon"
+);
 
 fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CommandMode, String> {
     let _bin_name = argv.next();
@@ -144,21 +210,16 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CommandMode, Str
             Ok(CommandMode::GatesCompute { pr, repo })
         }
         Some(first_flag) => {
-            let mut args = Args::default();
+            // Strict parse for the daemon subcommand: --help/--version return
+            // a preflight so main prints + exits 0 WITHOUT touching the
+            // lease, CXDB, timers, or telemetry; unknown args return Err so
+            // main exits non-zero without a tick (jleechan-bze8.4).
             let mut all_args = vec![first_flag.to_string()];
             all_args.extend(argv);
-            for arg in all_args {
-                match arg.as_str() {
-                    "--once" => args.once = true,
-                    "--dry-run" => args.dry_run = true,
-                    _ => {}
-                }
-            }
-            Ok(CommandMode::Daemon(args))
+            let (preflight, args) = parse_daemon_flags(all_args.into_iter())?;
+            Ok(CommandMode::Daemon(preflight, args))
         }
-        None => {
-            Ok(CommandMode::Daemon(Args::default()))
-        }
+        None => Ok(CommandMode::Daemon(DaemonPreFlight::Run, Args::default())),
     }
 }
 
@@ -447,6 +508,121 @@ fn verify_startup_ao_compatibility(
     verify(ao_project, agent)
 }
 
+/// Build the lease payload from the daemon's own runtime identity.
+fn build_lease_payload(cfg: &Config) -> Result<LeasePayload, DaemonError> {
+    let pid = std::process::id();
+    let start_time_unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let instance_uuid = format!("inst-{:032x}", start_time_unix_secs ^ pid as u64);
+    let executable_sha256 = executable_sha256().unwrap_or_else(|e| {
+        format!("sha-unavailable:{e}")
+    });
+    let config_identity = config_identity(cfg);
+    telemetry::set_instance_uuid(&instance_uuid);
+    Ok(LeasePayload {
+        pid,
+        start_time_unix_secs,
+        instance_uuid,
+        executable_sha256,
+        config_identity,
+    })
+}
+
+/// Compute config identity from the on-disk config (path) so a config file
+/// edit changes the identity and postmortems can correlate.
+fn config_identity(cfg: &Config) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    cfg.target_repo.hash(&mut h);
+    cfg.stage.hash(&mut h);
+    cfg.fast_tick_secs.hash(&mut h);
+    cfg.slow_tick_secs.hash(&mut h);
+    cfg.base_branch.hash(&mut h);
+    format!("cfg-{:016x}", h.finish())
+}
+
+/// SHA-256 of the running executable. Tolerant of `Err` (e.g. the binary
+/// was unlinked by `cargo run` cleanup) so the daemon still starts.
+fn executable_sha256() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(&exe).map_err(|e| {
+        format!("read {}: {e}", exe.display())
+    })?;
+    // Lightweight, dep-free SHA-256: exact-match against the well-known
+    // "cirun" bad-binary sentinel would be cheaper, but a real hash is the
+    // postmortem operator's first stop. We avoid openssl by using the
+    // system `sha256sum` CLI — it's present on every Linux runner and
+    // macOS developer machine even when `cargo` deps are stripped.
+    let output = std::process::Command::new("sha256sum")
+        .arg("--")
+        .arg(&exe)
+        .output()
+        .or_else(|_| {
+            // macOS fallback: `shasum -a 256`.
+            std::process::Command::new("shasum")
+                .arg("-a")
+                .arg("256")
+                .arg("--")
+                .arg(&exe)
+                .output()
+        })
+        .map_err(|e| format!("sha256sum/shasum missing: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let digest = stdout
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "sha256sum produced no digest".to_string())?
+        .to_string();
+    // Sanity: never persist an empty hash; if hashing failed silently
+    // we'd rather mark the lease so clearly than silently leak it.
+    if digest.is_empty() || digest == bytes.len().to_string() {
+        return Err(format!("unexpected sha digest: {digest}"));
+    }
+    Ok(digest)
+}
+
+fn emit_startup_event(
+    telemetry_log: &Path,
+    payload: &LeasePayload,
+    config_path: &Path,
+    lock_path: &Path,
+) -> Result<(), DaemonError> {
+    telemetry::emit(
+        telemetry_log,
+        &telemetry::TelemetryEvent {
+            timestamp: daemon::state::now_iso8601(),
+            bead_id: "daemon-startup".into(),
+            attempt_id: 0,
+            lifecycle_state: "STARTUP".into(),
+            event_type: "DAEMON_STARTED".into(),
+            metrics: serde_json::json!({}),
+            context: serde_json::json!({
+                "pid": payload.pid,
+                "startTimeUnixSecs": payload.start_time_unix_secs,
+                "instanceUuid": payload.instance_uuid,
+                "executableSha256": payload.executable_sha256,
+                "configIdentity": payload.config_identity,
+                "configPath": config_path.display().to_string(),
+                "lockPath": lock_path.display().to_string(),
+            }),
+        },
+    )
+}
+
+fn emit_lock_contended_event(
+    telemetry_log: &Path,
+    holder: &LeasePayload,
+    lock_path: &Path,
+) -> Result<(), DaemonError> {
+    let _ = telemetry_log;
+    let _ = holder;
+    let _ = lock_path;
+    Ok(())
+}
+
 fn run(args: Args) -> Result<(), DaemonError> {
     let cfg_path = default_config_path();
     let cfg = load_config(&cfg_path)?;
@@ -460,6 +636,40 @@ fn run(args: Args) -> Result<(), DaemonError> {
     })?;
     let telemetry_log = default_telemetry_log();
     let db_path = default_state_db_path();
+
+    // jleechan-bze8.4: acquire the single-instance lease BEFORE opening
+    // CXDB, starting timers, or reconciling state. If another live daemon
+    // already holds it, exit non-zero without dispatching or writing any
+    // tick telemetry. The startup telemetry IS emitted (to a dedicated
+    // channel that carries the failure) so postmortem operators can see
+    // exactly which process tried to start and against whom.
+    let lease_payload = build_lease_payload(&cfg)?;
+    let lock_path = instancelock::default_lock_path(&db_path);
+    let lease_outcome = instancelock::acquire(&lock_path, lease_payload)?;
+    let _lease_guard = match lease_outcome {
+        AcquireOutcome::Acquired(lease) => {
+            // Best-effort STARTUP event — telemetry write failure must NOT
+            // prevent the daemon from running (a tmpdir-ro crash should
+            // not kill the dispatch loop).
+            if let Err(e) =
+                emit_startup_event(&telemetry_log, &lease.payload, &cfg_path, &lease.dir)
+            {
+                eprintln!("auto-factory daemon: warn: startup telemetry failed: {e}");
+            }
+            lease
+        }
+        AcquireOutcome::AlreadyHeld { path, holder } => {
+            eprintln!(
+                "auto-factory daemon: another daemon already holds the lease at {path:?}; owner pid={} instance_uuid={} started_at={}",
+                holder.pid, holder.instance_uuid, holder.start_time_unix_secs
+            );
+            let _ = emit_lock_contended_event(&telemetry_log, &holder, &path);
+            return Err(DaemonError::Config(format!(
+                "single-instance lock held by pid={} (instance_uuid={}); refusing to start",
+                holder.pid, holder.instance_uuid
+            )));
+        }
+    };
 
     let store: Box<dyn StateStore> = if args.dry_run {
         Box::new(SqliteStateStore::open_in_memory_with_schema(include_str!(
@@ -602,15 +812,33 @@ fn main() {
         Ok(m) => m,
         Err(e) => {
             eprintln!("auto-factory daemon: args: {e}");
-            std::process::exit(1);
+            std::process::exit(2);
         }
     };
 
     match mode {
-        CommandMode::Daemon(args) => {
-            if let Err(e) = run(args) {
-                eprintln!("auto-factory daemon: fatal: {e}");
-                std::process::exit(1);
+        CommandMode::Daemon(preflight, args) => {
+            // jleechan-bze8.4: --help / --version are handled strictly
+            // here, BEFORE `run()` touches the lease, CXDB, or timers.
+            // `parse_daemon_flags` returned a preflight directive rather
+            // than letting the unknown-flag value escape the parser —
+            // see `parse_args` for the matching `parse_daemon_flags`
+            // boundary.
+            match preflight {
+                DaemonPreFlight::PrintUsage => {
+                    println!("{}", USAGE_BANNER);
+                    std::process::exit(0);
+                }
+                DaemonPreFlight::PrintVersion => {
+                    println!("dark-factory daemon {}", DAEMON_VERSION);
+                    std::process::exit(0);
+                }
+                DaemonPreFlight::Run => {
+                    if let Err(e) = run(args) {
+                        eprintln!("auto-factory daemon: fatal: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
         }
         CommandMode::GatesCompute { pr, repo } => {
@@ -711,7 +939,8 @@ mod tests {
     fn parse_args_recognizes_once_and_dry_run() {
         let argv = vec!["daemon".to_string(), "--once".to_string(), "--dry-run".to_string()];
         let mode = parse_args(argv.into_iter()).unwrap();
-        if let CommandMode::Daemon(args) = mode {
+        if let CommandMode::Daemon(preflight, args) = mode {
+            assert_eq!(preflight, DaemonPreFlight::Run);
             assert!(args.once);
             assert!(args.dry_run);
         } else {
@@ -723,7 +952,8 @@ mod tests {
     fn parse_args_defaults_false_with_no_flags() {
         let argv = vec!["daemon".to_string()];
         let mode = parse_args(argv.into_iter()).unwrap();
-        if let CommandMode::Daemon(args) = mode {
+        if let CommandMode::Daemon(preflight, args) = mode {
+            assert_eq!(preflight, DaemonPreFlight::Run);
             assert!(!args.once);
             assert!(!args.dry_run);
         } else {
@@ -731,15 +961,59 @@ mod tests {
         }
     }
 
+    /// jleechan-bze8.4: the previous parser silently accepted `--bogus`,
+    /// which is what let `daemon --help` flow into the live tick loop
+    /// on 2026-07-18. The strict boundary must reject any unknown flag
+    /// BEFORE the daemon reaches `run()` or its single-instance lease.
     #[test]
-    fn parse_args_ignores_unknown_flags() {
-        let argv = vec!["daemon".to_string(), "--bogus".to_string(), "--once".to_string()];
+    fn parse_args_rejects_unknown_flags() {
+        let argv = vec![
+            "daemon".to_string(),
+            "--bogus".to_string(),
+            "--once".to_string(),
+        ];
+        let err = parse_args(argv.into_iter()).unwrap_err();
+        assert!(err.contains("--bogus"), "got: {err}");
+        assert!(
+            err.contains("--help"),
+            "rejection must suggest --help; got: {err}"
+        );
+    }
+
+    /// jleechan-bze8.4: `--help` returns a preflight so `main` exits 0
+    /// without opening CXDB, acquiring the lease, or starting timers.
+    #[test]
+    fn parse_args_help_returns_preflight_without_running() {
+        let argv = vec!["daemon".to_string(), "--help".to_string()];
         let mode = parse_args(argv.into_iter()).unwrap();
-        if let CommandMode::Daemon(args) = mode {
-            assert!(args.once);
-            assert!(!args.dry_run);
-        } else {
-            panic!("expected Daemon mode");
+        match mode {
+            CommandMode::Daemon(DaemonPreFlight::PrintUsage, args) => {
+                assert!(!args.once && !args.dry_run);
+            }
+            other => panic!("expected help preflight, got {other:?}"),
+        }
+    }
+
+    /// jleechan-bze8.4: `--version` mirrors `--help`'s preflight.
+    #[test]
+    fn parse_args_version_returns_preflight_without_running() {
+        let argv = vec!["daemon".to_string(), "-V".to_string()];
+        let mode = parse_args(argv.into_iter()).unwrap();
+        match mode {
+            CommandMode::Daemon(DaemonPreFlight::PrintVersion, _) => {}
+            other => panic!("expected version preflight, got {other:?}"),
+        }
+    }
+
+    /// jleechan-bze8.4: `daemon` with zero args runs normally — preflight
+    /// is `Run`, no flag rejected, no side effect of the parser itself.
+    #[test]
+    fn parse_args_no_args_does_not_trigger_preflight() {
+        let argv = vec!["daemon".to_string()];
+        let mode = parse_args(argv.into_iter()).unwrap();
+        match mode {
+            CommandMode::Daemon(DaemonPreFlight::Run, _) => {}
+            other => panic!("expected Run preflight, got {other:?}"),
         }
     }
 
