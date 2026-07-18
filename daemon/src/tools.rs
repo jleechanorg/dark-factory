@@ -657,6 +657,34 @@ pub trait Sessions {
 pub trait Vcs {
     fn base_head(&self, base_branch: &str) -> Result<String, DaemonError>;
     fn create_branch_at(&self, name: &str, sha: &str) -> Result<(), DaemonError>;
+
+    /// `true` iff a local branch named `name` already exists in the daemon's
+    /// git workdir (`git rev-parse --verify refs/heads/<name>` returns 0).
+    ///
+    /// jleechan-znmh: lets the re-roll path probe for the stale-local-branch
+    /// failure mode (`factory/<bead>-rN` left behind by a prior failed
+    /// attempt that errored after branch fabrication but before bead
+    /// promotion) BEFORE attempting `create_branch_at`, which would otherwise
+    /// fatal with `a branch named ... already exists` and wedge the bead in
+    /// `RE_ROLL` indefinitely. Returns `Ok(false)` on a clean worktree;
+    /// transient `git` errors are surfaced as `DaemonError::Tool` so the
+    /// caller can apply the same retry/defer policy it applies to
+    /// `create_branch_at`.
+    fn branch_exists(&self, name: &str) -> Result<bool, DaemonError>;
+
+    /// Force-reset a local branch to `sha` (`git branch -f <name> <sha>`).
+    /// MUST NOT push anything — this only mutates the LOCAL ref.
+    ///
+    /// jleechan-znmh: paired with [`branch_exists`](Vcs::branch_exists)
+    /// to form the reuse-or-reset path that lets a re-roll retry of a bead
+    /// whose prior attempt errored AFTER fabricating `factory/<bead>-rN`
+    /// locally (the stale-branch failure class) proceed: detect → reset to
+    /// the freshly-computed baseline → continue, never fatal. Caller is
+    /// responsible for confirming `name` exists locally first (or for being
+    /// willing to ignore "branch not found" — `git branch -f` on a
+    /// non-existent branch falls back to a create, which IS what we want if
+    /// the test fake forgot to script `branch_exists`).
+    fn reset_branch_to(&self, name: &str, sha: &str) -> Result<(), DaemonError>;
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError>;
     /// Budget-bounded [`head_sha`](Vcs::head_sha) (bead jleechan-zeij / issue
     /// #322 r4 P2). Default delegates to the unbounded method; the real

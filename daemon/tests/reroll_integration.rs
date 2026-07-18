@@ -276,6 +276,339 @@ fn test_reroll_success() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// jleechan-znmh: regression for the stale-local-branch wedge. A prior
+/// failed reroll attempt fabricated `factory/<bead>-rN` locally and then
+/// errored on the cross-repo PR-close step (the companion issue), leaving
+/// the ref behind. The retry must NOT fatal with `a branch named ... already
+/// exists`; it must detect the existing ref, reset it to the freshly-
+/// computed baseline, and proceed to Rerolled.
+#[test]
+fn test_reroll_recovers_when_stale_local_branch_exists() {
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("main".into(), "base-sha-abc".into());
+    vcs.heads
+        .insert("factory/bead-znmh-r1".into(), "head-old".into());
+    // Pre-seed the stale local branch the prior failed attempt left behind.
+    vcs.record_branch_exists("factory/bead-znmh-r2");
+
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into()
+    ));
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_stale_branch_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_reroll_stale_branch_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-znmh".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 20,
+        spend_usd: 0.5,
+        pr_number: Some(303),
+        branch: Some("factory/bead-znmh-r1".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+    };
+    store.save(&bead).unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "Don't print to stdout, log errors.".into(),
+    };
+
+    // Must NOT error with "a branch named 'factory/bead-znmh-r2' already exists".
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    match outcome {
+        RerollOutcome::Rerolled { new_branch } => {
+            assert_eq!(new_branch, "factory/bead-znmh-r2");
+        }
+        other => panic!(
+            "expected RerollOutcome::Rerolled (the stale-branch recovery path), got {:?}",
+            other
+        ),
+    }
+
+    // The branch-create path MUST have used reset_branch_to, NOT
+    // create_branch_at — that's the entire point of the idempotency fix.
+    let vcs_calls = vcs.calls.borrow();
+    assert!(
+        vcs_calls
+            .iter()
+            .any(|c| c.starts_with("branch_exists(factory/bead-znmh-r2)")),
+        "reroll must probe branch_exists before fabricating: {vcs_calls:?}"
+    );
+    assert!(
+        vcs_calls
+            .iter()
+            .any(|c| c.starts_with("reset_branch_to(factory/bead-znmh-r2,base-sha-abc)")),
+        "reroll must reset the existing local branch to the freshly computed baseline, not recreate it: {vcs_calls:?}"
+    );
+    assert!(
+        vcs_calls
+            .iter()
+            .all(|c| !c.starts_with("create_branch_at(factory/bead-znmh-r2")),
+        "reroll must NOT call create_branch_at when the branch already exists locally \
+         (would have fataled with `a branch named ... already exists`): {vcs_calls:?}"
+    );
+
+    // Recovery state must be set: bead attempt incremented, branch updated,
+    // PR cleared, branch-registry updated.
+    let updated = store.load("bead-znmh").unwrap().unwrap();
+    assert_eq!(updated.state, OverlayState::Recovery);
+    assert_eq!(updated.attempt, 2);
+    assert_eq!(updated.branch, Some("factory/bead-znmh-r2".into()));
+    assert_eq!(updated.pr_number, None);
+    assert_eq!(
+        store.branches.borrow().as_slice(),
+        &["factory/bead-znmh-r2".to_string()]
+    );
+
+    // Sanity-check the REROLL_STALE_BRANCH_RESET telemetry event was emitted
+    // so the Healer can spot this exact recovery class in production logs.
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(
+        telemetry.contains("REROLL_STALE_BRANCH_RESET"),
+        "expected REROLL_STALE_BRANCH_RESET telemetry event for the stale-branch recovery path; \
+         got: {telemetry}"
+    );
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-znmh: regression for the close-pr-already-closed tolerance.
+/// The cross-repo PR-close fix (or a concurrent operator action, or the
+/// worker's own self-merge) may close the superseded PR between the time
+/// reroll observes it open and the time step 7 calls `close_pr`. The reroll
+/// MUST classify that as supersede-already-complete and continue to
+/// Rerolled, not abort the whole reroll with `Err`.
+#[test]
+fn test_reroll_tolerates_close_pr_already_closed() {
+    let scm = FakeScm::new();
+    // Script `close_pr(404)` to return the real-gh "already closed" stderr.
+    scm.fail_close_pr_for(
+        404,
+        "cannot close: pull request is already closed\n",
+    );
+
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("main".into(), "base-sha-abc".into());
+    vcs.heads
+        .insert("factory/bead-pr-closed-r1".into(), "head-sha-abc".into());
+
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into()
+    ));
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_pr_already_closed_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log =
+        std::env::temp_dir().join("afd_reroll_pr_already_closed_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-pr-closed".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 20,
+        spend_usd: 0.5,
+        pr_number: Some(404),
+        branch: Some("factory/bead-pr-closed-r1".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+    };
+    store.save(&bead).unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "Don't print to stdout, log errors.".into(),
+    };
+
+    // Must NOT propagate the "already closed" tool error — must treat as
+    // supersede-complete and continue to Recovery.
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    match outcome {
+        RerollOutcome::Rerolled { new_branch } => {
+            assert_eq!(new_branch, "factory/bead-pr-closed-r2");
+        }
+        other => panic!(
+            "expected RerollOutcome::Rerolled (the close-already-closed tolerance path), got {:?}",
+            other
+        ),
+    }
+
+    // close_pr MUST have been called (we don't skip it preemptively — only
+    // tolerate its failure when it actually returns the supersede-complete
+    // signal).
+    let scm_calls = scm.calls.borrow();
+    assert!(
+        scm_calls.iter().any(|c| c.contains("close_pr(404")),
+        "reroll must still attempt close_pr (the tolerance is on failure, not on skipping): {scm_calls:?}"
+    );
+
+    // The bead must be fully promoted: PR cleared, branch updated, state Recovery.
+    let updated = store.load("bead-pr-closed").unwrap().unwrap();
+    assert_eq!(updated.state, OverlayState::Recovery);
+    assert_eq!(updated.attempt, 2);
+    assert_eq!(updated.branch, Some("factory/bead-pr-closed-r2".into()));
+    assert_eq!(updated.pr_number, None);
+
+    // Sanity-check the REROLL_PR_ALREADY_CLOSED telemetry event was emitted
+    // (distinct from REROLL_PR_CLOSED so the Healer can tell the two apart).
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(
+        telemetry.contains("REROLL_PR_ALREADY_CLOSED"),
+        "expected REROLL_PR_ALREADY_CLOSED telemetry event for the close-already-closed tolerance; \
+         got: {telemetry}"
+    );
+    assert!(
+        !telemetry.contains("\"REROLL_PR_CLOSED\""),
+        "must NOT emit REROLL_PR_CLOSED when the close was already done elsewhere; \
+         got: {telemetry}"
+    );
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-znmh: combined self-recovery test. A bead whose prior attempt
+/// both (a) left a stale local `factory/<bead>-rN` behind AND (b) closed the
+/// PR via a sibling fix before retry MUST recover in a single
+/// `reroll::execute` call, without any operator intervention. This is the
+/// exact failure shape that wedged jleechan-9rkz/jleechan-8jxr in RE_ROLL.
+#[test]
+fn test_reroll_self_recovers_with_stale_branch_and_closed_pr() {
+    let scm = FakeScm::new();
+    scm.fail_close_pr_for(
+        505,
+        "Pull request #505 in owner/repo is not open, cannot close",
+    );
+
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("main".into(), "base-sha-recover".into());
+    vcs.heads
+        .insert("factory/bead-wedge-r1".into(), "head-stale".into());
+    vcs.record_branch_exists("factory/bead-wedge-r2");
+
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":[],"positiveAssertions":[],"securityRedactionEncountered":false}"#.into()
+    ));
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_wedge_recovery_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log =
+        std::env::temp_dir().join("afd_reroll_wedge_recovery_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // Bead starts in RE_ROLL — exactly the wedge state from the bead task.
+    let mut bead = BeadOverlay {
+        bead_id: "bead-wedge".into(),
+        state: OverlayState::ReRoll,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 30,
+        spend_usd: 0.7,
+        pr_number: Some(505),
+        branch: Some("factory/bead-wedge-r1".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+    };
+    store.save(&bead).unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "Please retry with a clean implementation.".into(),
+    };
+
+    // Self-recovery in a single execute() call — zero operator/overlay
+    // intervention, exactly what the bead acceptance criterion requires.
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    assert!(
+        matches!(outcome, RerollOutcome::Rerolled { .. }),
+        "wedged bead must self-recover to Rerolled in one execute() call; got {outcome:?}"
+    );
+
+    let updated = store.load("bead-wedge").unwrap().unwrap();
+    assert_eq!(updated.state, OverlayState::Recovery);
+    assert_eq!(updated.attempt, 2);
+    assert_eq!(updated.branch, Some("factory/bead-wedge-r2".into()));
+    assert_eq!(updated.pr_number, None);
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 #[test]
 fn test_tick_stage2_integration() {
     let mut scm = FakeScm::new();

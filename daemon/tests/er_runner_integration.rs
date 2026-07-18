@@ -193,6 +193,12 @@ impl Vcs for VcsMock {
     fn create_branch_at(&self, _n: &str, _s: &str) -> Result<(), daemon::errors::DaemonError> {
         Ok(())
     }
+    fn branch_exists(&self, _n: &str) -> Result<bool, daemon::errors::DaemonError> {
+        Ok(false)
+    }
+    fn reset_branch_to(&self, _n: &str, _s: &str) -> Result<(), daemon::errors::DaemonError> {
+        Ok(())
+    }
     fn head_sha(&self, _b: &str) -> Result<String, daemon::errors::DaemonError> {
         Ok("deadbeef".into())
     }

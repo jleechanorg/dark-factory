@@ -238,6 +238,12 @@ impl Vcs for NoopAdapters {
     fn create_branch_at(&self, _name: &str, _sha: &str) -> Result<(), DaemonError> {
         Ok(())
     }
+    fn branch_exists(&self, _name: &str) -> Result<bool, DaemonError> {
+        Ok(false)
+    }
+    fn reset_branch_to(&self, _name: &str, _sha: &str) -> Result<(), DaemonError> {
+        Ok(())
+    }
     fn head_sha(&self, _branch: &str) -> Result<String, DaemonError> {
         Ok(String::new())
     }

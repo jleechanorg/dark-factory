@@ -170,11 +170,30 @@ pub struct FakeScm {
     /// whose head lives on a fork (the fail-closed guard).
     pub open_pr_head_refs: HashMap<(String, u64), PrHeadBranch>,
     pub calls: RefCell<Vec<String>>,
+    /// jleechan-znmh: script `close_pr(pr)` to return a specific
+    /// `DaemonError::Tool` stderr (e.g. "already closed") instead of the
+    /// default `Ok(())`. Tests use this to drive the close-pr-already-
+    /// completed supersede tolerance without touching a real `gh`
+    /// subprocess. Stored as a raw stderr string (rather than a `DaemonError`
+    /// directly) because `DaemonError` is not `Clone` and the integration
+    /// tests need to script multiple failing PRs without moving values out
+    /// of the map.
+    pub fail_close_pr_for: RefCell<std::collections::HashMap<u64, String>>,
 }
 
 impl FakeScm {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// jleechan-znmh: script `close_pr(pr)` to fail with the given stderr
+    /// (reconstructed as `DaemonError::Tool`). Used to simulate `gh pr close`
+    /// returning "already closed"/"not open" for a PR that another code path
+    /// (or a concurrent operator action) closed first.
+    pub fn fail_close_pr_for(&self, pr: u64, stderr: &str) {
+        self.fail_close_pr_for
+            .borrow_mut()
+            .insert(pr, stderr.to_string());
     }
 }
 
@@ -239,6 +258,16 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("close_pr({pr},{comment})"));
+        // jleechan-znmh: honor a scriptable failure for this PR — lets tests
+        // drive the "PR was already closed when reroll tried to close it"
+        // race without a real gh subprocess.
+        if let Some(stderr) = self.fail_close_pr_for.borrow().get(&pr).cloned() {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr,
+            });
+        }
         Ok(())
     }
 
@@ -743,6 +772,14 @@ impl Sessions for FakeSessions {
 #[derive(Default)]
 pub struct FakeVcs {
     pub heads: HashMap<String, String>,
+    /// jleechan-znmh: tracks every branch name ever fabricated via
+    /// `create_branch_at` or `reset_branch_to`, so `branch_exists` returns
+    /// `true` for those names without requiring the test to seed `heads`
+    /// directly. Tests that simulate a stale-local-branch left behind by a
+    /// PRIOR attempt that errored before the bead was promoted can call
+    /// [`FakeVcs::record_branch_exists`] to pre-populate this set without
+    /// first driving a (real-failing) `create_branch_at`.
+    pub created_branches: RefCell<std::collections::HashSet<String>>,
     /// Per-(branch, remote_sha) script for `is_remote_ahead`. When absent the
     /// default is `false` so tests that don't exercise the stall-bypass guard
     /// don't have to set it up. Tests that DO exercise the guard
@@ -808,6 +845,20 @@ impl FakeVcs {
             .borrow_mut()
             .insert(branch.to_string(), message.to_string());
     }
+
+    /// jleechan-znmh: pre-seed `branch_exists(name)` to return `true`,
+    /// simulating a stale local branch left behind by a prior failed
+    /// `create_branch_at` whose bead was never promoted out of `RE_ROLL`.
+    /// Tests use this to script the exact failure class the reroll retry
+    /// must recover from — without having to drive a real-failing
+    /// `create_branch_at` (the fake returns `Ok(())` and just records the
+    /// call, so a real-failing seam would require a scriptable failure
+    /// hook we don't currently have).
+    pub fn record_branch_exists(&self, name: &str) {
+        self.created_branches
+            .borrow_mut()
+            .insert(name.to_string());
+    }
 }
 
 impl Vcs for FakeVcs {
@@ -829,6 +880,47 @@ impl Vcs for FakeVcs {
         self.calls
             .borrow_mut()
             .push(format!("create_branch_at({name},{sha})"));
+        // jleechan-znmh: track every branch name this fake ever fabricated so
+        // `branch_exists(name)` can report it without forcing the test to
+        // separately seed `heads` (mirrors the real-git behavior where a
+        // successful `git branch <name> <sha>` leaves refs/heads/<name>
+        // discoverable via `git rev-parse --verify refs/heads/<name>`).
+        self.created_branches
+            .borrow_mut()
+            .insert(name.to_string());
+        Ok(())
+    }
+
+    fn branch_exists(&self, name: &str) -> Result<bool, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("branch_exists({name})"));
+        // Default: a branch exists if it has been recorded via
+        // `create_branch_at` OR has a scripted head entry. Tests that need
+        // to simulate a stale local branch left behind by a prior failed
+        // attempt can either pre-populate `heads[name]` or call
+        // `record_branch_exists(name)`.
+        if self.created_branches.borrow().contains(name) {
+            return Ok(true);
+        }
+        if self.heads.contains_key(name) {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn reset_branch_to(&self, name: &str, sha: &str) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("reset_branch_to({name},{sha})"));
+        // Mirror create_branch_at: track that the branch now exists.
+        // `heads` is a plain HashMap (not behind RefCell) because the fake's
+        // public contract gives tests direct `heads.insert(name, sha)` access
+        // — the reset primitive only needs to confirm the ref now exists for
+        // a subsequent `branch_exists` probe, which uses `created_branches`.
+        self.created_branches
+            .borrow_mut()
+            .insert(name.to_string());
         Ok(())
     }
 

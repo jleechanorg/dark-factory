@@ -407,12 +407,37 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         serde_json::json!({"baseCommit": base_sha}),
     )?;
 
-    // 5. Fresh attempt branch
+    // 5. Fresh attempt branch — jleechan-znmh: idempotent against a stale
+    // local branch left behind by a prior failed attempt that errored
+    // AFTER fabricating `factory/<bead>-rN` locally (e.g. the cross-repo
+    // PR-close bug that was the immediate trigger for this fix). A plain
+    // `create_branch_at` here would fatal with `a branch named ... already
+    // exists` and wedge the bead in RE_ROLL forever; the previous worker
+    // is already gone (the proceed predicate cleared it above) so the stale
+    // ref has no live consumer and is safe to either delete-and-recreate or
+    // reset-to-baseline. We do the latter: keep the ref name and re-point it
+    // at the freshly computed baseline, so any `factory/<bead>-rN`-pinned
+    // consumer (AO session metadata, downstream worktree mirrors, the
+    // branch-registry entry) sees the SAME branch name land at the SAME
+    // commit the reroll plan just committed to.
     let superseded_attempt = bead.attempt;
     bead.attempt += 1;
     bead.reroll_count += 1;
     let new_branch = format!("factory/{}-r{}", bead.bead_id, bead.attempt);
-    deps.vcs.create_branch_at(&new_branch, &base_sha)?;
+    if deps.vcs.branch_exists(&new_branch)? {
+        emit_telemetry(
+            deps.telemetry_log,
+            &bead.bead_id,
+            bead.attempt,
+            bead.state.as_str(),
+            "REROLL_STALE_BRANCH_RESET",
+            serde_json::json!({}),
+            serde_json::json!({"branch": new_branch, "baseCommit": base_sha}),
+        )?;
+        deps.vcs.reset_branch_to(&new_branch, &base_sha)?;
+    } else {
+        deps.vcs.create_branch_at(&new_branch, &base_sha)?;
+    }
 
     emit_telemetry(
         deps.telemetry_log,
@@ -428,21 +453,58 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     deps.store.register_branch(&bead.bead_id, &new_branch)?;
     bead.branch = Some(new_branch.clone());
 
-    // 7. Old PR closure
+    // 7. Old PR closure — jleechan-znmh: tolerant of "PR already closed/merged".
+    //
+    // The immediate trigger for this fix: the companion cross-repo PR-close
+    // bug (separate bead) races with reroll step 7. By the time step 7 runs,
+    // the previous PR may have already been closed/merged by either:
+    //   (a) a sibling fix that closed it as part of repair, or
+    //   (b) a concurrent operator action, or
+    //   (c) the worker's own self-merge that landed while quiescence was
+    //       being evaluated.
+    // In every one of those cases the reroll's INTENT ("supersede the old PR
+    // with this new branch") is ALREADY SATISFIED — there's nothing left to
+    // close. Treating `close_pr`'s "already closed" failure as a hard error
+    // wedges the bead in RE_ROLL with no forward progress, exactly the same
+    // shape as the stale-local-branch bug fixed in step 5 above.
+    //
+    // We therefore classify the failure via `is_pr_already_closed` and
+    // treat it as supersede-complete: clear `pr_number`, emit
+    // `REROLL_PR_ALREADY_CLOSED` telemetry (distinct event from the happy-
+    // path `REROLL_PR_CLOSED` so the Healer / audit can tell the two apart),
+    // and continue to step 8.
     if let Some(pr_number) = bead.pr_number {
         let comment = format!("Superseded by new attempt branch {}", new_branch);
-        deps.scm.close_pr(pr_number, &comment)?;
+        match deps.scm.close_pr(pr_number, &comment) {
+            Ok(()) => {
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_PR_CLOSED",
+                    serde_json::json!({}),
+                    serde_json::json!({"prNumber": pr_number, "comment": comment}),
+                )?;
+            }
+            Err(e) if e.is_pr_already_closed() => {
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_PR_ALREADY_CLOSED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "prNumber": pr_number,
+                        "comment": comment,
+                        "ghStderr": e.to_string(),
+                    }),
+                )?;
+            }
+            Err(e) => return Err(e),
+        }
         bead.pr_number = None;
-
-        emit_telemetry(
-            deps.telemetry_log,
-            &bead.bead_id,
-            bead.attempt,
-            bead.state.as_str(),
-            "REROLL_PR_CLOSED",
-            serde_json::json!({}),
-            serde_json::json!({"prNumber": pr_number, "comment": comment}),
-        )?;
     }
 
     // 8. Constraint Extraction & Spec Mutation

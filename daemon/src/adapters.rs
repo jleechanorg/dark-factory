@@ -4029,6 +4029,31 @@ impl Vcs for CliVcs {
         Ok(())
     }
 
+    fn branch_exists(&self, name: &str) -> Result<bool, DaemonError> {
+        // jleechan-znmh: probe for a stale local branch left behind by a prior
+        // failed reroll attempt. `git rev-parse --verify refs/heads/<name>`
+        // exits 0 iff the local branch ref exists; rc=1 (and stderr to that
+        // effect) means it does not. We capture stderr to suppress noise but
+        // still surface other git failures (rc>=2, e.g. corrupted object db)
+        // as transient tool errors so the caller applies the same retry
+        // policy as for create_branch_at.
+        match run_tool("git", &["rev-parse", "--verify", &format!("refs/heads/{name}")], 30) {
+            Ok(_) => Ok(true),
+            Err(DaemonError::Tool { rc: 1, .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn reset_branch_to(&self, name: &str, sha: &str) -> Result<(), DaemonError> {
+        // jleechan-znmh: force-reset a LOCAL branch to sha. `git branch -f`
+        // creates the branch if it does not exist (so this is safe to call
+        // without a prior branch_exists probe, e.g. when the caller wants a
+        // single primitive that always lands the branch at sha). MUST NOT
+        // push anything -- this only mutates refs/heads/<name>.
+        run_tool("git", &["branch", "-f", name, sha], 30)?;
+        Ok(())
+    }
+
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError> {
         self.head_sha_within(branch, 30)
     }

@@ -203,6 +203,38 @@ impl DaemonError {
             .find(|tok| !tok.is_empty())?;
         Some(id.to_string())
     }
+
+    /// jleechan-znmh: detect `gh pr close` failing because the PR is no
+    /// longer open — i.e. already closed, already merged, or otherwise not in
+    /// a state where `gh pr close` can transition it to CLOSED. The exact
+    /// stderr shapes covered:
+    ///
+    /// - `"cannot close: pull request is already closed"` (real `gh` output)
+    /// - `"Could not close the pull request: already closed"` (variant)
+    /// - `"is not open, cannot close"` (older `gh` versions)
+    ///
+    /// Detection is purely substring-based against the stderr captured by
+    /// [`run_tool`]; it deliberately stays conservative (lowercase, full
+    /// phrase, the AND of "close" + "already" / "not open") so it never
+    /// false-positives a real close failure. The reroll path uses this to
+    /// classify step-7's `close_pr` error as "supersede already complete"
+    /// rather than a hard error that aborts the reroll — the companion
+    /// fix to jleechan-znmh's stale-local-branch wedge, addressing the
+    /// "the cross-repo PR-close fix already closed this PR between the time
+    /// we observed it open and the time we tried to close it" race.
+    pub fn is_pr_already_closed(&self) -> bool {
+        let DaemonError::Tool { stderr, .. } = self else {
+            return false;
+        };
+        let lower = stderr.to_lowercase();
+        let says_already_closed = lower.contains("already closed")
+            || lower.contains("is not open")
+            || (lower.contains("could not close") && lower.contains("closed"));
+        let mentions_close_intent = lower.contains("close")
+            || lower.contains("pull request")
+            || lower.contains("pr");
+        says_already_closed && mentions_close_intent
+    }
 }
 
 #[cfg(test)]
@@ -342,6 +374,70 @@ mod tests {
     fn duplicate_external_ref_bead_id_none_for_non_tool_error() {
         let err = DaemonError::Timeout("br list timed out".to_string());
         assert_eq!(err.duplicate_external_ref_bead_id(), None);
+    }
+
+    /// jleechan-znmh: real `gh pr close` on an already-closed PR emits
+    /// stderr beginning with "cannot close: pull request is already closed".
+    /// The reroll path's step-7 close_pr must classify this as
+    /// supersede-already-complete (success), NOT a transient error that
+    /// wedges the bead in RE_ROLL.
+    #[test]
+    fn is_pr_already_closed_matches_real_gh_stderr() {
+        let err = DaemonError::Tool {
+            tool: "gh".into(),
+            rc: 1,
+            stderr: "cannot close: pull request is already closed\n".into(),
+        };
+        assert!(err.is_pr_already_closed());
+    }
+
+    /// Older `gh` versions emit "Pull request ... is not open, cannot close"
+    /// for the same condition. Same intent, slightly different shape — must
+    /// also be classified as supersede-complete.
+    #[test]
+    fn is_pr_already_closed_matches_not_open_stderr() {
+        let err = DaemonError::Tool {
+            tool: "gh".into(),
+            rc: 1,
+            stderr: "Pull request #42 in owner/repo is not open, cannot close".into(),
+        };
+        assert!(err.is_pr_already_closed());
+    }
+
+    /// The "Could not close the pull request: already closed" variant. The
+    /// classifier requires BOTH "closed" AND a close-intent marker, so
+    /// "already closed" alone satisfies both conditions.
+    #[test]
+    fn is_pr_already_closed_matches_could_not_close_variant() {
+        let err = DaemonError::Tool {
+            tool: "gh".into(),
+            rc: 1,
+            stderr: "Could not close the pull request: already closed".into(),
+        };
+        assert!(err.is_pr_already_closed());
+    }
+
+    /// Negative case: a generic gh error that happens to mention "close"
+    /// but is about something ELSE (e.g. permission denied, rate limit)
+    /// must NOT false-positive the inspector — that would mask a real
+    /// transient failure and silently swallow it as supersede-complete.
+    #[test]
+    fn is_pr_already_closed_false_for_unrelated_close_error() {
+        let err = DaemonError::Tool {
+            tool: "gh".into(),
+            rc: 1,
+            stderr: "HTTP 403: rate limit exceeded while attempting to close".into(),
+        };
+        assert!(!err.is_pr_already_closed());
+    }
+
+    /// Negative case: a non-`Tool` error variant must never be classified
+    /// as "PR already closed" — the inspector only applies to gh subprocess
+    /// failures, not to e.g. parse or config errors.
+    #[test]
+    fn is_pr_already_closed_false_for_non_tool_error() {
+        assert!(!DaemonError::Timeout("gh pr close timed out".into()).is_pr_already_closed());
+        assert!(!DaemonError::Config("bad repo".into()).is_pr_already_closed());
     }
 
     /// jleechan-r56m: `Display`/`to_string()` on `SpawnFallbackExhausted`
