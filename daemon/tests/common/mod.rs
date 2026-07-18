@@ -845,6 +845,50 @@ impl Vcs for FakeVcs {
         Ok(())
     }
 
+    /// jleechan-wuts / issue #349: per-repo variant of `base_head`.
+    /// Default trait impl would delegate to `base_head`, which is keyed
+    /// on branch name only — that collides across repos (a `main` in
+    /// repo A and a `main` in repo B both resolve to the same key).
+    /// The fake looks up `"<repo>@<branch>"` first (the form
+    /// cross-repo tests seed) and falls back to the bare `<branch>`
+    /// key (the form single-repo tests seed) — preserves existing
+    /// test scripts without forcing a sweeping rewrite, while letting
+    /// cross-repo tests opt into distinct per-repo fixtures.
+    fn base_head_for_repo(&self, repo: &str, base_branch: &str) -> Result<String, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("base_head_for_repo({repo},{base_branch})"));
+        let scoped_key = format!("{repo}@{base_branch}");
+        if let Some(sha) = self.heads.get(&scoped_key) {
+            return Ok(sha.clone());
+        }
+        self.heads
+            .get(base_branch)
+            .cloned()
+            .ok_or_else(|| DaemonError::Tool {
+                tool: "git".into(),
+                rc: 1,
+                stderr: format!("no scripted head for {scoped_key}"),
+            })
+    }
+
+    /// jleechan-wuts / issue #349: per-repo variant of `create_branch_at`.
+    /// Default trait impl would delegate to `create_branch_at` (which
+    /// shells out to the daemon's local git), masking the cross-repo bug.
+    /// The fake simply records the call so tests can assert that reroll
+    /// routed through the per-repo entry point with the bead's repo.
+    fn create_branch_at_for_repo(
+        &self,
+        repo: &str,
+        name: &str,
+        sha: &str,
+    ) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("create_branch_at_for_repo({repo},{name},{sha})"));
+        Ok(())
+    }
+
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError> {
         self.calls.borrow_mut().push(format!("head_sha({branch})"));
         if let Some(msg) = self.fail_head_sha_for.borrow().get(branch) {
