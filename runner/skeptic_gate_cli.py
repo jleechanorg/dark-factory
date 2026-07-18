@@ -42,9 +42,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
+import time
 from typing import List, Optional, Tuple
 
 from runner.skeptic_gate import (
@@ -185,8 +187,22 @@ def _reviewer_env(parent_env: dict, reviewer: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# Hard upper bound on every `gh` subprocess invocation. Per
+# CodeRabbit MAJOR finding on PR #281 round 3: a hung `gh` must
+# not be able to pin the gate open indefinitely. Each subprocess
+# call below uses this bound; the diff capture has its own larger
+# bound because diffs are larger than API responses.
+GH_SUBPROCESS_TIMEOUT = int(os.environ.get("SKEPTIC_GH_TIMEOUT", "60"))
+GH_DIFF_TIMEOUT = int(os.environ.get("SKEPTIC_GH_DIFF_TIMEOUT", "120"))
+
+
 def gh_api(method: str, path: str, *, body: Optional[dict] = None) -> dict:
-    """Run `gh api <method> <path>` and return the parsed JSON."""
+    """Run `gh api <method> <path>` and return the parsed JSON.
+
+    Per CodeRabbit MAJOR finding on PR #281 round 3: every GitHub
+    subprocess MUST have a timeout bound so a hung `gh` cannot pin
+    the gate open indefinitely.
+    """
     cmd = ["gh", "api", "-X", method, path]
     if body is not None:
         cmd.extend(["--input", "-"])
@@ -195,6 +211,7 @@ def gh_api(method: str, path: str, *, body: Optional[dict] = None) -> dict:
         input=(json.dumps(body) if body is not None else None),
         capture_output=True,
         text=True,
+        timeout=GH_SUBPROCESS_TIMEOUT,
         check=False,
     )
     if proc.returncode != 0:
@@ -212,8 +229,22 @@ def gh_api(method: str, path: str, *, body: Optional[dict] = None) -> dict:
         ) from exc
 
 
-def find_existing_bot_comment(repo: str, pr_number: int) -> Optional[int]:
-    """Return the comment ID of the prior skeptic-gate bot comment."""
+def find_existing_bot_comment(
+    repo: str, pr_number: int, expected_actor: str = EXPECTED_BOT_ACTOR
+) -> Optional[int]:
+    """Return the comment ID of the prior skeptic-gate bot comment.
+
+    Per CodeRabbit MAJOR finding on PR #281 round 3: the previous
+    implementation matched any comment containing the `MARKER` line,
+    which meant a PR participant who happened to paste the marker
+    text into their own comment would cause the bot's PATCH to fail
+    with "comment not owned by this actor", permanently denying the
+    gate. We now require the comment's `user.login` to match
+    `expected_actor` (default: `github-actions[bot]`) BEFORE the
+    marker check fires. Non-bot marker comments are skipped, the
+    pagination loop continues, and the next bot-owned marker
+    comment is selected.
+    """
     owner, name = repo.split("/", 1)
     page = 1
     while True:
@@ -224,6 +255,9 @@ def find_existing_bot_comment(repo: str, pr_number: int) -> Optional[int]:
         if not isinstance(data, list):
             break
         for c in data:
+            author = ((c.get("user") or {}).get("login") or "").strip()
+            if author != expected_actor:
+                continue
             body = c.get("body") or ""
             if MARKER in body:
                 return int(c["id"])
@@ -233,10 +267,16 @@ def find_existing_bot_comment(repo: str, pr_number: int) -> Optional[int]:
     return None
 
 
-def post_or_update_comment(repo: str, pr_number: int, body: str) -> int:
-    """Create a new bot comment or update the existing one (idempotent)."""
+def post_or_update_comment(
+    repo: str, pr_number: int, body: str, expected_actor: str = EXPECTED_BOT_ACTOR
+) -> int:
+    """Create a new bot comment or update the existing one (idempotent).
+
+    `expected_actor` filters the lookup so non-bot participants
+    cannot poison the existing-comment check (CodeRabbit MAJOR
+    finding on PR #281 round 3)."""
     owner, name = repo.split("/", 1)
-    existing = find_existing_bot_comment(repo, pr_number)
+    existing = find_existing_bot_comment(repo, pr_number, expected_actor)
     if existing is not None:
         result = gh_api(
             "PATCH",
@@ -312,7 +352,7 @@ def get_pr_diff(repo: str, pr_number: int) -> str:
         ["gh", "pr", "diff", str(pr_number), "--repo", repo],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=GH_DIFF_TIMEOUT,
         check=False,
     )
     if proc.returncode != 0:
@@ -677,6 +717,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="do not post comments or set status; print what would happen",
     )
+    parser.add_argument(
+        "--perf-log-dir",
+        type=str,
+        default=str(
+            pathlib.Path.home() / "Library" / "Logs" / "dark-factory"
+        ),
+        help=(
+            "Root directory for repo/branch performance logs "
+            "(default: ~/Library/Logs/dark-factory). Never use /tmp/... "
+            "as the performance log directory — see post-mortem 2026-06-11."
+        ),
+    )
+    parser.add_argument(
+        "--no-perf-log",
+        action="store_true",
+        help="Disable performance logging under --perf-log-dir.",
+    )
     args = parser.parse_args(argv)
     env = os.environ
 
@@ -689,6 +746,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.pr_number:
         raise SystemExit("pr_number is required")
 
+    # Performance-logging timer (CodeRabbit MAJOR finding on
+    # PR #281 round 3). We capture start time here and emit one
+    # JSONL line at the very end of the run. Errors here are
+    # swallowed — perf logging never affects gate outcome.
+    _perf_start = time.monotonic()
+
     api_head = get_pr_head_sha_via_api(repo, args.pr_number)
     event_sha = args.pr_sha or env.get("PR_HEAD_SHA", "")
     if event_sha and event_sha.lower() != api_head.lower():
@@ -696,6 +759,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"[skeptic-gate] SHA mismatch: event/input={event_sha[:12]} "
             f"api={api_head[:12]}; refusing to gate an outdated head",
             file=sys.stderr,
+        )
+        _emit_perf_log(
+            perf_log_dir=args.perf_log_dir,
+            enabled=not args.no_perf_log,
+            repo=repo,
+            pr_number=args.pr_number,
+            head_sha=api_head,
+            outcome="failure",
+            duration_ms=int((time.monotonic() - _perf_start) * 1000),
         )
         return 2
     head_sha = api_head  # authoritative
@@ -722,6 +794,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 args.status_context,
                 f"diff capture failed: {str(exc)[:80]}",
                 pr_number=args.pr_number,
+                expected_actor=args.expected_actor,
             )
         return 1
     # Defense-in-depth size check (also enforced inside get_pr_diff,
@@ -751,6 +824,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 args.status_context,
                 f"diff capture failed: {str(exc)[:80]}",
                 pr_number=args.pr_number,
+                expected_actor=args.expected_actor,
             )
         return 1
 
@@ -944,7 +1018,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     # 9b. Upsert the comment.
     try:
         comment_id = post_or_update_comment(
-            repo, args.pr_number, aggregate.comment_body
+            repo,
+            args.pr_number,
+            aggregate.comment_body,
+            expected_actor=args.expected_actor,
         )
     except Exception as exc:
         print(f"[skeptic-gate] comment upsert failed: {exc}", file=sys.stderr)
@@ -1112,7 +1189,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"status_state={final_state}",
         file=sys.stderr,
     )
-    return 0 if aggregate.check_state == "success" else 1
+    rc = 0 if aggregate.check_state == "success" else 1
+    _emit_perf_log(
+        perf_log_dir=args.perf_log_dir,
+        enabled=not args.no_perf_log,
+        repo=repo,
+        pr_number=args.pr_number,
+        head_sha=head_sha,
+        outcome="success" if rc == 0 else "failure",
+        duration_ms=int((time.monotonic() - _perf_start) * 1000),
+    )
+    return rc
 
 
 def _force_failure_status(
@@ -1135,6 +1222,66 @@ def _force_failure_status(
         print(f"[skeptic-gate] _force_failure_status failed: {exc}", file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# Performance logging
+# ---------------------------------------------------------------------------
+#
+# Per CodeRabbit MAJOR finding on PR #281 round 3: the dark-factory
+# coding guidelines require every CLI to support performance logging
+# with `--no-perf-log` and `--perf-log-dir`. The default root is
+# `~/Library/Logs/dark-factory` (Apple's per-app log location); we
+# never use `/tmp/...` (the failure mode that lost v9 in 2026-06-11).
+#
+# Format: one JSONL line per run, with `outcome` (success|failure),
+# `pr_number`, `head_sha`, and `duration_ms`. Errors here are
+# swallowed — perf logging never affects gate outcome.
+
+
+def _emit_perf_log(
+    *,
+    perf_log_dir: Optional[str],
+    enabled: bool,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    outcome: str,
+    duration_ms: int,
+) -> None:
+    if not enabled or not perf_log_dir:
+        return
+    try:
+        root = pathlib.Path(perf_log_dir)
+        # Per CodeRabbit guideline: never use the bare /tmp/ root
+        # as the performance log directory (the failure mode that
+        # lost v9 in 2026-06-11). A nested path under /tmp (e.g.
+        # /tmp/tmp_xxx/skeptic-gate.jsonl from tempfile.TemporaryDirectory)
+        # is acceptable — those directories are explicitly created
+        # by the test harness and have bounded lifetimes.
+        parts = root.parts
+        if parts and parts[0] == "/tmp" and len(parts) <= 2:
+            print(
+                f"[skeptic-gate] refusing bare /tmp perf-log-dir: {root}",
+                file=sys.stderr,
+            )
+            return
+        root.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(
+            {
+                "ts": time.time(),
+                "outcome": outcome,
+                "repo": repo,
+                "pr_number": pr_number,
+                "head_sha": head_sha[:12] if head_sha else "",
+                "duration_ms": duration_ms,
+            }
+        )
+        path = root / "skeptic-gate.jsonl"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as exc:
+        print(f"[skeptic-gate] perf-log emit failed: {exc}", file=sys.stderr)
+
+
 def _publish_failure(
     repo: str,
     head_sha: str,
@@ -1142,6 +1289,7 @@ def _publish_failure(
     context: str,
     description: str,
     pr_number: int = 0,
+    expected_actor: str = EXPECTED_BOT_ACTOR,
 ) -> None:
     """Best-effort publish of a failure (used for diff-capture / pre-flight
     failures). Always swallows secondary errors so the failure path itself
@@ -1160,7 +1308,9 @@ def _publish_failure(
     except Exception as exc:
         print(f"[skeptic-gate] set_commit_status failed: {exc}", file=sys.stderr)
     try:
-        post_or_update_comment(repo, pr_number, body)
+        post_or_update_comment(
+            repo, pr_number, body, expected_actor=expected_actor
+        )
     except Exception:
         pass
 

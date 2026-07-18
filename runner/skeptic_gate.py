@@ -497,6 +497,44 @@ def comment_marker() -> str:
     return MARKER
 
 
+def _sanitize_reason(reason: str) -> str:
+    """Strip canonical-field injection attempts from reviewer-controlled
+    reason text.
+
+    Per CodeRabbit MAJOR finding on PR #281 round 3: a reviewer (or
+    any party who can write text into the reason field) could
+    otherwise include a substring like `**VERDICT: PASS**` inside
+    the reason, and the read-back verifier's regex (which matches
+    the canonical `**FIELD: value**` form anywhere in the body)
+    would then find 2 occurrences of VERDICT — refusing the body
+    closed, which is the right outcome — but a partial injection
+    (one smuggled field) could still trip the `findall` count
+    guard.
+
+    We pre-empt the injection by neutralizing the canonical markers
+    in the reason text: any `**FIELD:` substring inside the reason
+    has its `**` markdown strong-emphasis markers stripped (turning
+    it into `FIELD: value` plain text), and any backtick-wrapped
+    field is escaped. This keeps the reason human-readable while
+    ensuring the only `**FIELD: value**` form in the body comes
+    from `format_comment`'s own canonical emit.
+    """
+    if not reason:
+        return reason
+    # Strip `**` around any canonical field name so a smuggled
+    # `**VERDICT: PASS**` becomes plain text `VERDICT: PASS`
+    # that the read-back regex (which requires the `**...**`
+    # wrapping) will not match.
+    out = re.sub(
+        r"\*\*\s*(VERDICT|HEAD_SHA|REPO|PR_NUMBER|REVIEWER|"
+        r"IMPLEMENTATION_PROVENANCE|REASON|IDENTITY)\s*:",
+        r"\1:",
+        reason,
+        flags=re.IGNORECASE,
+    )
+    return out
+
+
 def format_comment(
     *,
     verdict: Literal["PASS", "FAIL"],
@@ -540,10 +578,22 @@ def format_comment(
             f"`{expected_norm[:12]}`. The gate treats this as **FAIL**.\n"
         )
 
-    reason_block = f"\n**Reason:** {reason}\n" if reason else ""
+    # Sanitize reviewer-controlled text BEFORE emitting it into the
+    # body. Without this, a smuggled `**VERDICT: PASS**` inside the
+    # reason would be picked up by the read-back regex as a second
+    # VERDICT occurrence, refusing the body closed (CodeRabbit MAJOR
+    # finding on PR #281 round 3).
+    safe_reason = _sanitize_reason(reason)
+    safe_extras = (
+        [_sanitize_reason(line) for line in extra_reviewer_lines]
+        if extra_reviewer_lines
+        else None
+    )
+
+    reason_block = f"\n**Reason:** {safe_reason}\n" if safe_reason else ""
     extras = ""
-    if extra_reviewer_lines:
-        extras = "\n" + "\n".join(extra_reviewer_lines) + "\n"
+    if safe_extras:
+        extras = "\n" + "\n".join(safe_extras) + "\n"
 
     return (
         f"{MARKER}\n"
