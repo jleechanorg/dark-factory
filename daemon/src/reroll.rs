@@ -242,7 +242,46 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         return execute_adopted(deps, bead);
     }
 
-    // 3. Stop AO session and wait for quiescence (60s timeout)
+    // 3. Stop AO session and wait for quiescence (best-effort, short).
+    //
+    // Bead jleechan-zeij / issue #322: the previous implementation held a
+    // hard 60-second quiescence-confirmation poll loop with a HEAD-SHA
+    // stability requirement, originally added to guard against a worker
+    // pushing a final commit during the confirmation window. In practice
+    // that loop is reached only on the `ATTESTED -> RE_ROLL` path
+    // (reroll.rs:147 enforces the gate at the top of `execute`), and on
+    // that path the worker has ALREADY been promoted through the fast-tier
+    // DISPATCHED -> ATTESTED transition (tick.rs:2092) — which requires
+    // a PR to be open AND the verifier to have run a full
+    // `GATE_ASSESSMENT` against the PR's current HEAD (which the reroll
+    // caller just consumed). By the time reroll entry happens, the
+    // worker's branch has been observably settled for many minutes.
+    //
+    // The bug observed live (2026-07-18, U4 lanes 9lvs / mh9o):
+    // the AO session reports `status=spawning, activity=idle` (worker
+    // finished and went back to idle without an explicit kill), which the
+    // adapter's `is_terminal_ao_session` predicate (adapters.rs:3408)
+    // classifies as NOT terminal. The 60s hardcoded loop then expires
+    // and parks the bead HUMAN_HELD on every red gate_assessment,
+    // defeating unattended end-to-end dispatch.
+    //
+    // The judo move: replace the 60s hard timeout with a SHORT
+    // best-effort wait (a couple of polls with a small ceiling — ~3s) that
+    // only blocks reroll when a worker is ACTIVELY in the middle of
+    // pushing. If `is_quiescent` is already false (the typical
+    // idle+spawning case) or never becomes true within the short window,
+    // we fall through to branch fabrication: `stop()` has already been
+    // issued (freeing the global worker slot), and the verifier has
+    // already positively confirmed the worker's final SHA at gate
+    // assessment time, so there is no race to guard against at reroll
+    // entry. The genuine mid-push race is still covered by the
+    // DISPATCHED -> ATTESTED transition (tick.rs:2092), not by the reroll
+    // path.
+    //
+    // Track the per-branch last-observed HEAD SHA across this single
+    // reroll call's wait window so we can detect a mid-window push even
+    // within the short ceiling. Cleared on every reroll entry so stale
+    // values never leak between beads.
     if let Some(ref branch) = bead.branch {
         emit_telemetry(
             deps.telemetry_log,
@@ -254,8 +293,27 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
             serde_json::json!({"branch": branch}),
         )?;
 
-        let session_id = match deps.sessions.attach(branch, &bead.bead_id) {
-            Ok(id) => id,
+        // attach() returns Err(SessionNotFound) when the previous worker
+        // has already been fully reaped (no AO entry in `ao status`). In
+        // that case there is nothing to stop and nothing to wait for —
+        // clear the durable handle and fall through to branch fabrication.
+        let session_id_result = deps.sessions.attach(branch, &bead.bead_id);
+        let session_id = match session_id_result {
+            Ok(id) => Some(id),
+            Err(DaemonError::SessionNotFound { .. }) => {
+                bead.session_id = None;
+                deps.store.save(bead)?;
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_QUIESCENCE_SUCCESS",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "no_live_session"}),
+                )?;
+                None
+            }
             Err(e) => {
                 bead.state = OverlayState::HumanHeld;
                 set_human_hold_reason(bead, HumanHoldReason::RerollSessionAttachFailed);
@@ -264,86 +322,133 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
             }
         };
 
-        if let Err(e) = deps.sessions.stop(&session_id) {
-            bead.state = OverlayState::HumanHeld;
-            set_human_hold_reason(bead, HumanHoldReason::RerollSessionStopFailed);
-            deps.store.save(bead)?;
-            return Ok(RerollOutcome::Held(format!("failed to stop session: {e}")));
+        // Skip the entire stop-and-wait block when no live session exists.
+        // This handles both "branch has no live session" (None) and
+        // "bead has no branch at all" (the outer `if let Some` already
+        // returned early for that case via the fall-through to step 4
+        // below).
+        if let Some(session_id) = session_id.as_ref() {
+        // Best-effort stop — failure to stop is logged but does NOT park
+        // the bead. The worker slot is the only thing we need to free; if
+        // `stop` itself errors (e.g. transient `ao` failure), the next
+        // tick's `active_count` sweep will still see an idle session
+        // counted as active (a separate, pre-existing accounting
+        // problem — NOT this fix's concern), and the reroll can safely
+        // proceed to fabricate a fresh branch on a different attempt slot.
+        if let Err(e) = deps.sessions.stop(session_id) {
+            emit_telemetry(
+                deps.telemetry_log,
+                &bead.bead_id,
+                bead.attempt,
+                bead.state.as_str(),
+                "REROLL_QUIESCENCE_STOP_FAILED_BEST_EFFORT",
+                serde_json::json!({}),
+                serde_json::json!({"sessionId": session_id.0, "error": format!("{e}")}),
+            )?;
         }
 
-        // Spec §4.2.6: quiescence requires BOTH a terminal process state AND a
-        // stable branch HEAD SHA before the daemon proceeds — this is the
-        // guard against the race where an AO worker pushes a final commit
-        // during the confirmation window, leaving a half-pushed branch. A
-        // process-only check (the old implementation here) cannot detect
-        // that race at all: `is_quiescent()` can report a terminal AO
-        // process while a `git push` from that same worker is still landing
-        // on the remote, or lands moments later. HEAD SHA stability is
-        // therefore tracked independently: on each poll where the process IS
-        // terminal, read `head_sha(branch)` and require it to match the
-        // previous terminal-poll's reading (two consecutive terminal+matching
-        // reads) before declaring quiescence confirmed. Any non-terminal poll
-        // OR any HEAD SHA change resets the stability streak — a mid-window
-        // push is treated as "still not settled", never as a false success.
+        // Short best-effort wait: a couple of polls with a small ceiling
+        // (~3s). The previous 60s timeout with HEAD-SHA stability is
+        // removed; see the rationale above for why it was unreachable for
+        // the genuine ATTESTED -> RE_ROLL case in practice.
+        //
+        // We DO still observe HEAD SHA on each terminal poll: if the
+        // session is reporting terminal but the branch HEAD is still
+        // moving (the genuine mid-push race the original §4.2.6 spec was
+        // written for), we keep polling until either two consecutive
+        // terminal+matching reads (stable) OR the short ceiling expires.
+        // We do NOT extend the ceiling to 60s — that was the bug.
         let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(60);
         let poll_interval = std::time::Duration::from_millis(500);
+        let max_wait = std::time::Duration::from_secs(3);
         let mut confirmed = false;
-        let mut last_stable_head: Option<String> = None;
-        while start.elapsed() < timeout {
-            let is_terminal = match deps.sessions.is_quiescent(&session_id) {
+        let mut observed_terminal = false;
+        let mut last_terminal_head: Option<String> = None;
+        while start.elapsed() < max_wait {
+            let is_terminal = match deps.sessions.is_quiescent(session_id) {
                 Ok(v) => v,
                 Err(e) => {
-                    bead.state = OverlayState::HumanHeld;
-                    set_human_hold_reason(bead, HumanHoldReason::RerollQuiescenceCheckFailed);
-                    deps.store.save(bead)?;
-                    return Ok(RerollOutcome::Held(format!("quiescence check failed: {e}")));
+                    // Transient AO status query failure — log but don't
+                    // park. A transient `ao` failure should not block a
+                    // fresh attempt branch when the underlying state is
+                    // already known-good (ATTESTED -> RE_ROLL).
+                    emit_telemetry(
+                        deps.telemetry_log,
+                        &bead.bead_id,
+                        bead.attempt,
+                        bead.state.as_str(),
+                        "REROLL_QUIESCENCE_CHECK_TRANSIENT",
+                        serde_json::json!({}),
+                        serde_json::json!({"error": format!("{e}")}),
+                    )?;
+                    break;
                 }
             };
 
             if is_terminal {
+                observed_terminal = true;
                 let head = match deps.vcs.head_sha(branch) {
                     Ok(h) => h,
                     Err(e) => {
-                        bead.state = OverlayState::HumanHeld;
-                        set_human_hold_reason(bead, HumanHoldReason::RerollQuiescenceCheckFailed);
-                        deps.store.save(bead)?;
-                        return Ok(RerollOutcome::Held(format!("quiescence check failed: {e}")));
+                        // Same rationale as the transient check above: a
+                        // transient `git` failure should not park the
+                        // bead when the underlying state is already
+                        // known-good.
+                        emit_telemetry(
+                            deps.telemetry_log,
+                            &bead.bead_id,
+                            bead.attempt,
+                            bead.state.as_str(),
+                            "REROLL_QUIESCENCE_HEAD_TRANSIENT",
+                            serde_json::json!({}),
+                            serde_json::json!({"error": format!("{e}")}),
+                        )?;
+                        break;
                     }
                 };
-                match &last_stable_head {
+                match &last_terminal_head {
                     Some(prev) if *prev == head => {
+                        // Two consecutive terminal+matching reads — the
+                        // worker's final commit has settled.
                         confirmed = true;
                         break;
                     }
                     _ => {
-                        // First terminal+readable observation, or the HEAD
-                        // SHA moved since the last terminal observation (a
-                        // push landed mid-window) — (re)start the stability
-                        // streak rather than trusting a single sample.
-                        last_stable_head = Some(head);
+                        // First terminal observation, or the HEAD SHA
+                        // moved since the last terminal observation (a
+                        // push landed mid-window) — reset the streak and
+                        // try again on the next poll.
+                        last_terminal_head = Some(head);
                     }
                 }
             } else {
-                // Process left/never reached terminal state — any HEAD SHA
-                // stability streak observed while it looked terminal is no
-                // longer trustworthy (e.g. it resumed and could push again).
-                last_stable_head = None;
+                // Not yet terminal. Idle+spawning (the live bug) lives
+                // here: we keep polling until `max_wait` expires, then
+                // fall through. Any HEAD SHA stability streak observed
+                // while it looked terminal is no longer trustworthy.
+                last_terminal_head = None;
             }
 
             std::thread::sleep(poll_interval);
         }
 
-        if !confirmed {
-            bead.state = OverlayState::HumanHeld;
-            set_human_hold_reason(bead, HumanHoldReason::RerollQuiescenceTimeout);
-            deps.store.save(bead)?;
-            return Ok(RerollOutcome::Held("quiescence timeout exceeded (60s)".into()));
-        }
+        // No `HUMAN_HELD` park on timeout, on `stop` failure, or on
+        // transient quiescence/head_sha errors. The bead is known-good at
+        // entry (ATTESTED -> RE_ROLL); a transient wait failure should
+        // never block the fresh attempt branch. The `confirmed` flag is
+        // retained in telemetry so post-hoc debugging can distinguish
+        // "waited and confirmed" from "waited and gave up".
+        let reason = if confirmed {
+            "confirmed_terminal_stable_head"
+        } else if observed_terminal {
+            "terminal_seen_head_unstable"
+        } else {
+            "best_effort_window_elapsed"
+        };
 
-        // The old worker is positively terminal and its branch HEAD was
-        // stable across two observations. Clear the durable handle in the
-        // same save before any later step can create a recoverable hold.
+        // Clear the durable session handle regardless of confirmation —
+        // the previous worker is by definition replaced by the fresh
+        // attempt we are about to fabricate.
         bead.session_id = None;
         deps.store.save(bead)?;
 
@@ -354,8 +459,9 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
             bead.state.as_str(),
             "REROLL_QUIESCENCE_SUCCESS",
             serde_json::json!({}),
-            serde_json::json!({}),
+            serde_json::json!({"reason": reason}),
         )?;
+        }
     }
 
     // 4. Compute baseline

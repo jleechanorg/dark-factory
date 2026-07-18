@@ -922,15 +922,17 @@ mod quiescence_timeout_races {
         }
     }
 
-    /// Case A — genuine mid-push race that NEVER settles: the fake AO
-    /// session reports "not terminal" for the entire 60s window (models a
-    /// worker that is actively pushing / retrying throughout). Expect: the
-    /// hard 60s timeout fires, `RerollOutcome::Held("quiescence timeout
-    /// exceeded (60s)")`, bead parks HUMAN_HELD, and — critically — the
-    /// daemon must NOT proceed to fabricate a fresh branch or close the old
-    /// PR on top of an unconfirmed base. Real wall-clock duration: ~60s.
+    /// Case A — bead jleechan-zeij / issue #322 (negative): a NEVER-settling
+    /// AO session used to cause a 60s timeout-park, defeating unattended
+    /// end-to-end on every red gate_assessment. After the fix, a session
+    /// that never settles within the short best-effort ceiling (~3s) must
+    /// STILL proceed to branch fabrication (we do not park HUMAN_HELD on
+    /// quiescence wait alone). The worker's `head_sha` is stable (no
+    /// schedule) and the verifier has already positively confirmed the
+    /// worker's final SHA at gate_assessment time, so there is no race to
+    /// guard against at reroll entry. Real wall-clock duration: ~3s.
     #[test]
-    fn case_a_never_settles_timeout_fires_and_blocks_branch_creation() {
+    fn case_a_never_settles_proceeds_to_branch_fabrication() {
         let scm = FakeScm::new();
         let sessions = FakeSessions::new();
         let mut vcs = FakeVcs::new();
@@ -939,14 +941,25 @@ mod quiescence_timeout_races {
             .insert("factory/bead-race-a-r1".into(), "head-sha-a".into());
         let store = FakeStateStore::new();
         let llm = FakeLlm::new();
-        let cfg = test_cfg();
+        *llm.response.borrow_mut() = Some(Ok(
+            r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into(),
+        ));
+        let mut cfg = test_cfg();
+        cfg.spec_dir = std::env::temp_dir()
+            .join("afd_quiescence_case_a_spec")
+            .to_string_lossy()
+            .to_string();
+        let spec_dir = std::path::Path::new(&cfg.spec_dir);
+        let _ = std::fs::remove_dir_all(spec_dir);
+        std::fs::create_dir_all(spec_dir).unwrap();
         let telemetry_log = std::env::temp_dir().join("afd_quiescence_case_a_telemetry.jsonl");
         let _ = std::fs::remove_file(&telemetry_log);
 
         let mut bead = race_test_bead("bead-race-a", "factory/bead-race-a-r1");
         store.save(&bead).unwrap();
 
-        // Never terminal within any realistic test window.
+        // Never terminal within any realistic test window — the live bug
+        // signature. With the fix, this no longer parks HUMAN_HELD.
         sessions.set_terminal_at(Instant::now() + Duration::from_secs(3600));
 
         let deps = RerollDeps {
@@ -958,7 +971,7 @@ mod quiescence_timeout_races {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             reviewer: "skeptic".into(),
-            review_text: "mid-push race case A".into(),
+            review_text: "never settles case A".into(),
         };
 
         let start = Instant::now();
@@ -966,44 +979,44 @@ mod quiescence_timeout_races {
         let elapsed = start.elapsed();
 
         match outcome {
-            RerollOutcome::Held(reason) => {
-                assert!(
-                    reason.contains("quiescence timeout exceeded"),
-                    "expected timeout Held reason, got: {reason}"
-                );
+            RerollOutcome::Rerolled { new_branch } => {
+                assert_eq!(new_branch, "factory/bead-race-a-r2");
             }
-            other => panic!("expected Held(timeout), got {:?}", other),
+            other => panic!(
+                "expected Rerolled (never-settling session must not park; issue #322), got {:?}",
+                other
+            ),
         }
-
-        // Proves the REAL 60s constant is wired (not e.g. 60ms or 6000ms):
-        // an aborted attempt must take roughly 60 real seconds, not near-zero.
+        // The new short ceiling: must NOT take 60s. ~3s ceiling + slack.
         assert!(
-            elapsed >= Duration::from_secs(58) && elapsed <= Duration::from_secs(65),
-            "expected ~60s real elapsed time for the hard timeout, got {elapsed:?}"
+            elapsed < Duration::from_secs(15),
+            "expected best-effort wait to complete in well under 15s (the old 60s timeout \
+             would have elapsed ~60s here), got {elapsed:?}"
         );
 
         let updated = store.load("bead-race-a").unwrap().unwrap();
-        assert_eq!(updated.state, OverlayState::HumanHeld);
-        // Never proceeded past quiescence: no fresh branch, old PR untouched.
+        assert_eq!(updated.state, OverlayState::Recovery);
         let vcs_calls = vcs.calls.borrow();
         assert!(
             vcs_calls
                 .iter()
-                .all(|c| !c.starts_with("create_branch_at(")),
-            "must not fabricate a branch when quiescence never confirmed: {vcs_calls:?}"
+                .any(|c| c.starts_with("create_branch_at(factory/bead-race-a-r2")),
+            "expected fresh attempt branch fabrication even on never-settling session, got {vcs_calls:?}"
         );
         let scm_calls = scm.calls.borrow();
         assert!(
-            scm_calls.iter().all(|c| !c.starts_with("close_pr(")),
-            "must not close the old PR when quiescence never confirmed: {scm_calls:?}"
+            scm_calls.iter().any(|c| c.starts_with("close_pr(900")),
+            "expected old PR to be closed (Superseded comment) once reroll succeeds, got {scm_calls:?}"
         );
 
+        std::fs::remove_dir_all(spec_dir).ok();
         let _ = std::fs::remove_file(&telemetry_log);
     }
 
-    /// Case B — session settles well under the timeout (~50s in). Expect a
-    /// normal successful re-roll, not a false-positive abort. Real
-    /// wall-clock duration: ~50-51s.
+    /// Case B — session settles well under the short best-effort ceiling
+    /// (~1.5s in). Expect a normal successful re-roll with HEAD-SHA
+    /// stability confirmed, not a false-positive abort. Real wall-clock
+    /// duration: ~1.5-2s.
     #[test]
     fn case_b_settles_under_timeout_succeeds() {
         let scm = FakeScm::new();
@@ -1031,11 +1044,10 @@ mod quiescence_timeout_races {
         let mut bead = race_test_bead("bead-race-b", "factory/bead-race-b-r1");
         store.save(&bead).unwrap();
 
-        // Terminal at t=50s — squarely in the "45-55s" boundary band, still
-        // well inside the 60s window. HEAD SHA is static (no schedule), so
-        // once terminal, the very next two polls read the same value and
-        // confirm.
-        sessions.set_terminal_at(Instant::now() + Duration::from_secs(50));
+        // Terminal at t=1.5s — under the new short ~3s ceiling. HEAD SHA
+        // is static, so once terminal, two consecutive polls read the same
+        // value and confirm.
+        sessions.set_terminal_at(Instant::now() + Duration::from_millis(1500));
 
         let deps = RerollDeps {
             scm: &scm,
@@ -1063,9 +1075,9 @@ mod quiescence_timeout_races {
             ),
         }
         assert!(
-            elapsed >= Duration::from_secs(50) && elapsed < Duration::from_secs(58),
-            "expected confirmation shortly after the t=50s settle point and well under the \
-             60s timeout, got {elapsed:?}"
+            elapsed >= Duration::from_millis(1500) && elapsed < Duration::from_secs(15),
+            "expected confirmation shortly after the t=1.5s settle point and well under the \
+             ~3s ceiling, got {elapsed:?}"
         );
 
         let updated = store.load("bead-race-b").unwrap().unwrap();
@@ -1075,13 +1087,14 @@ mod quiescence_timeout_races {
         let _ = std::fs::remove_file(&telemetry_log);
     }
 
-    /// Case C — session settles just OVER the timeout (~61s in, i.e. AFTER
-    /// the 60s deadline has already elapsed). Expect the abort — boundary
-    /// correctness, not just "eventually true". Real wall-clock duration:
-    /// ~60s (the loop exits at the 60s deadline, never observing the
-    /// terminal state that only arrives at 61s).
+    /// Case C — bead jleechan-zeij / issue #322 (boundary): the AO session
+    /// only settles AFTER the short best-effort ceiling has elapsed. With
+    /// the fix, the wait gives up gracefully and proceeds to branch
+    /// fabrication — exactly the same outcome as Case A. The settle-after
+    /// window is an advisory observation in telemetry, not a hard abort.
+    /// Real wall-clock duration: ~3s.
     #[test]
-    fn case_c_settles_just_over_timeout_aborts() {
+    fn case_c_settles_after_short_ceiling_still_proceeds() {
         let scm = FakeScm::new();
         let sessions = FakeSessions::new();
         let mut vcs = FakeVcs::new();
@@ -1090,15 +1103,28 @@ mod quiescence_timeout_races {
             .insert("factory/bead-race-c-r1".into(), "head-sha-c".into());
         let store = FakeStateStore::new();
         let llm = FakeLlm::new();
-        let cfg = test_cfg();
+        *llm.response.borrow_mut() = Some(Ok(
+            r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into(),
+        ));
+        let mut cfg = test_cfg();
+        cfg.spec_dir = std::env::temp_dir()
+            .join("afd_quiescence_case_c_spec")
+            .to_string_lossy()
+            .to_string();
+        let spec_dir = std::path::Path::new(&cfg.spec_dir);
+        let _ = std::fs::remove_dir_all(spec_dir);
+        std::fs::create_dir_all(spec_dir).unwrap();
         let telemetry_log = std::env::temp_dir().join("afd_quiescence_case_c_telemetry.jsonl");
         let _ = std::fs::remove_file(&telemetry_log);
 
         let mut bead = race_test_bead("bead-race-c", "factory/bead-race-c-r1");
         store.save(&bead).unwrap();
 
-        // Terminal only at t=61s — one second past the hard deadline.
-        sessions.set_terminal_at(Instant::now() + Duration::from_secs(61));
+        // Terminal only at t=10s — well past the new short ~3s ceiling.
+        // The previous 60s contract would have aborted at ~60s before
+        // observing the settle; the new contract observes the settle
+        // (advisory) but does not block on it.
+        sessions.set_terminal_at(Instant::now() + Duration::from_secs(10));
 
         let deps = RerollDeps {
             scm: &scm,
@@ -1109,7 +1135,7 @@ mod quiescence_timeout_races {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             reviewer: "skeptic".into(),
-            review_text: "settles just over timeout case C".into(),
+            review_text: "settles after short ceiling case C".into(),
         };
 
         let start = Instant::now();
@@ -1117,26 +1143,26 @@ mod quiescence_timeout_races {
         let elapsed = start.elapsed();
 
         match outcome {
-            RerollOutcome::Held(reason) => {
-                assert!(
-                    reason.contains("quiescence timeout exceeded"),
-                    "expected timeout Held reason, got: {reason}"
-                );
+            RerollOutcome::Rerolled { new_branch } => {
+                assert_eq!(new_branch, "factory/bead-race-c-r2");
             }
             other => panic!(
-                "expected Held(timeout) for a settle-just-past-deadline session, got {:?}",
+                "expected Rerolled on a session that settles after the short ceiling, got {:?}",
                 other
             ),
         }
+        // Must complete in the short ceiling, NOT wait the full 10s for
+        // the session to settle — the old 60s contract was the bug.
         assert!(
-            elapsed >= Duration::from_secs(58) && elapsed < Duration::from_secs(61),
-            "the loop must exit at the ~60s deadline itself, before ever observing the t=61s \
-             terminal state, got {elapsed:?}"
+            elapsed < Duration::from_secs(15),
+            "expected best-effort wait to give up at the ~3s ceiling, not block on the t=10s settle, \
+             got {elapsed:?}"
         );
 
         let updated = store.load("bead-race-c").unwrap().unwrap();
-        assert_eq!(updated.state, OverlayState::HumanHeld);
+        assert_eq!(updated.state, OverlayState::Recovery);
 
+        std::fs::remove_dir_all(spec_dir).ok();
         let _ = std::fs::remove_file(&telemetry_log);
     }
 
@@ -1241,9 +1267,110 @@ mod quiescence_timeout_races {
         std::fs::remove_dir_all(spec_dir).ok();
         let _ = std::fs::remove_file(&telemetry_log);
     }
-}
 
-/// jleechan-cq8r: a malformed/unparseable reply from the circuit-breaker's
+    /// Case E — bead jleechan-zeij / issue #322: the AO session is
+    /// "idle+spawning" (worker finished its task and went back to idle
+    /// without being explicitly killed) — i.e. `is_quiescent` returns
+    /// `Ok(false)` permanently. This is the EXACT live state observed in
+    /// the 04:30:43Z U4 telemetry (sessions df-179 / df-180 on the
+    /// `factory/jleechan-agy-vendor-name-drift-9lvs-r1` /
+    /// `factory/jleechan-park-leaves-zombie-session-mh9o-r1` branches
+    /// reported `status=spawning, activity=idle` at reroll entry). The
+    /// previous fix's 60s hardcoded quiescence timeout fired and parked
+    /// the bead HUMAN_HELD, defeating unattended end-to-end on every red
+    /// gate_assessment.
+    ///
+    /// Expect: reroll proceeds in well under 60s with `Rerolled`, NOT a
+    /// 60s Held(timeout). The previous worker cannot push a final commit
+    /// while idle (verified by `head_sha` static), and a fast best-effort
+    /// stop is sufficient to free the worker slot. Real wall-clock
+    /// duration: < ~10s.
+    #[test]
+    fn case_e_idle_spawning_session_does_not_block_reroll() {
+        let scm = FakeScm::new();
+        let sessions = FakeSessions::new();
+        let mut vcs = FakeVcs::new();
+        vcs.heads.insert("main".into(), "base-sha-e".into());
+        let branch = "factory/bead-race-e-r1";
+        vcs.heads.insert(branch.into(), "head-sha-e".into());
+        let store = FakeStateStore::new();
+        let llm = FakeLlm::new();
+        *llm.response.borrow_mut() = Some(Ok(
+            r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into(),
+        ));
+        let mut cfg = test_cfg();
+        cfg.spec_dir = std::env::temp_dir()
+            .join("afd_quiescence_case_e_spec")
+            .to_string_lossy()
+            .to_string();
+        let spec_dir = std::path::Path::new(&cfg.spec_dir);
+        let _ = std::fs::remove_dir_all(spec_dir);
+        std::fs::create_dir_all(spec_dir).unwrap();
+        let telemetry_log = std::env::temp_dir().join("afd_quiescence_case_e_telemetry.jsonl");
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let mut bead = race_test_bead("bead-race-e", branch);
+        store.save(&bead).unwrap();
+
+        // Live bug signature: AO session is idle (never terminal within any
+        // realistic window), so `is_quiescent` returns `Ok(false)` forever.
+        // Without the fix, the 60s hardcoded timeout fires and parks
+        // HUMAN_HELD. With the fix, a short best-effort wait succeeds or
+        // the path falls through to branch fabrication in well under 60s.
+        sessions.set_terminal_at(Instant::now() + Duration::from_secs(3600));
+
+        let deps = RerollDeps {
+            scm: &scm,
+            sessions: &sessions,
+            vcs: &vcs,
+            store: &store,
+            llm: &llm,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            reviewer: "skeptic".into(),
+            review_text: "idle+spawning AO session never settles; reroll must not park".into(),
+        };
+
+        let start = Instant::now();
+        let outcome = reroll::execute(&deps, &mut bead).unwrap();
+        let elapsed = start.elapsed();
+
+        match outcome {
+            RerollOutcome::Rerolled { new_branch } => {
+                assert_eq!(new_branch, "factory/bead-race-e-r2");
+            }
+            other => panic!(
+                "expected Rerolled on an idle+spawning session (issue #322), got {:?}",
+                other
+            ),
+        }
+        // Crux of the regression: a 60s timeout park would have elapsed
+        // ~60s. With the fix, the path must complete in a small fraction
+        // of that. We allow generous slack (15s) for CI jitter while still
+        // catching a regression to the old 60s timeout behavior.
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "expected idle+spawning reroll to complete in well under the old 60s timeout, got {elapsed:?}"
+        );
+
+        let updated = store.load("bead-race-e").unwrap().unwrap();
+        assert_eq!(updated.state, OverlayState::Recovery);
+
+        // And critically: a fresh attempt branch was fabricated, NOT the
+        // bead parked HUMAN_HELD (which would have left `updated.state`
+        // as HumanHeld with the 60s-timeout reason).
+        let vcs_calls = vcs.calls.borrow();
+        assert!(
+            vcs_calls
+                .iter()
+                .any(|c| c.starts_with("create_branch_at(factory/bead-race-e-r2")),
+            "expected fresh attempt branch to be fabricated on idle+spawning reroll, got {vcs_calls:?}"
+        );
+
+        std::fs::remove_dir_all(spec_dir).ok();
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+}
 /// semantic comparator LLM call must NOT crash the daemon. Before this fix,
 /// `same_underlying_issue` (reroll.rs) constructed `DaemonError::Parse` for
 /// this case, which `is_transient()` does not cover -- the exact
