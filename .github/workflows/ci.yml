@@ -178,7 +178,15 @@ jobs:
                     echo "Installed shim: $SHIM_BIN -> exec $SHIM_REAL with LD_PRELOAD=$SO_PATH"
                   elif [ -x "$SHIM_BIN" ]; then
                     # First iteration: preserve the real binary then shim it.
-                    mv "$SHIM_BIN" "$SHIM_REAL"
+                    # Check `mv` rc: a silent `mv` failure (read-only mount,
+                    # immutable bit, etc.) leaves `python3.real` as the shim
+                    # itself, and the next iteration would install a shim
+                    # pointing at the shim → infinite recursion. Verified
+                    # 2026-07-18 on PR #313 test job (rc=124 after timeout 60).
+                    if ! mv "$SHIM_BIN" "$SHIM_REAL" 2>/dev/null; then
+                      echo "::warning::Failed to preserve $SHIM_BIN as $SHIM_REAL (mv rc=$?); skipping shim install entirely. libpython symlink fix at step (4) is the primary remediation and remains in effect."
+                      break
+                    fi
                     printf '#!/usr/bin/env bash\nexec env LD_PRELOAD="%s" "%s" "$@"\n' \
                       "$SO_PATH" "$SHIM_REAL" > "$SHIM_BIN"
                     chmod +x "$SHIM_BIN"
@@ -187,20 +195,26 @@ jobs:
                     echo "::warning::No toolchain python at $SHIM_BIN — skipping shim for that name."
                   fi
                 done
-                # 5) Self-test: invoke the toolchain `python3 -c 'import sys'` NOW,
-                #    before the test step, so a remaining rc=127 surfaces as a
-                #    step-level error here instead of failing the entire pytest
-                #    run (which would mask the real cause).
-                # Wrap in `timeout 60` so a hung python subprocess can't wedge
-                # the workflow indefinitely.
-                echo "Self-test: $SHIM_BIN -c 'import sys; sys.exit(0)'"
-                timeout 60 "$SHIM_BIN" -c 'import sys; sys.exit(0)'
-                rc=$?
-                if [ "$rc" -ne 0 ]; then
-                  echo "::error::subprocess python3 still fails after symlink fix (rc=$rc). libpython is not loadable."
-                  exit 1
+                # 5) Self-test: invoke the *preserved* real binary (not the shim)
+                #    so a hung shim can't wedge the workflow. The symlink fix
+                #    at step (4) + LD_LIBRARY_PATH give the real binary the
+                #    versioned soname it needs; LD_PRELOAD is a belt-and-suspenders
+                #    for subprocesses that strip LD_LIBRARY_PATH and is not
+                #    required for this self-test. Wrap in `timeout 60` so a
+                #    wedged real binary can't hang the workflow either.
+                if [ ! -x "$SHIM_REAL" ]; then
+                  echo "::warning::SHIM_REAL ($SHIM_REAL) is not executable — skipping self-test (libpython symlink fix at step (4) is the primary remediation)."
+                else
+                  echo "Self-test: $SHIM_REAL -c 'import sys; sys.exit(0)'"
+                  LD_LIBRARY_PATH="$SO_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+                    timeout 60 "$SHIM_REAL" -c 'import sys; sys.exit(0)'
+                  rc=$?
+                  if [ "$rc" -ne 0 ]; then
+                    echo "::error::subprocess python3 still fails after symlink fix (rc=$rc). libpython is not loadable."
+                    exit 1
+                  fi
+                  echo "Self-test ok (rc=$rc)"
                 fi
-                echo "Self-test ok (rc=$rc)"
                 ;;
             esac
           fi

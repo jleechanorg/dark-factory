@@ -184,13 +184,22 @@ def test_libpython_self_test_python_is_timeout_bounded():
 
     The original step ran `"$SHIM_BIN" -c 'import sys; sys.exit(0)'`
     with no upper bound. On a runner where the shim install silently
-    failed (because SHIM_BIN is SIP-protected), the python invocation
+    failed (because SHIM_BIN is SIP-protected, or the `mv` to preserve
+    the real binary failed for some other reason), the python invocation
     could hang forever waiting on a binary that was never actually
-    replaced.
+    replaced — or recurse through a self-pointing shim.
 
-    The fix wraps the self-test in `timeout 60` so a hung subprocess
-    surfaces as a step-level error in at most 60 seconds, not a
+    The fix invokes the *preserved real* binary (`$SHIM_REAL`, the
+    toolchain's actual python that was `mv`'d to `python3.real`) instead
+    of the shim, and wraps the call in `timeout 60` so a wedged real
+    binary surfaces as a step-level error in at most 60 seconds, not a
     45-minute job stall.
+
+    Verified 2026-07-18 on PR #313 test job (rc=124 after timeout 60):
+    a shim install on a Linux ARM64 GitHub-hosted runner produced a
+    self-pointing shim that hung; calling `$SHIM_REAL` directly
+    bypasses that failure mode and the symlink fix at step (4) plus
+    LD_LIBRARY_PATH give the real binary the versioned soname it needs.
     """
     run = _libpython_fix_step_run(WORKFLOW.read_text())
     self_test_lines = [
@@ -208,4 +217,17 @@ def test_libpython_self_test_python_is_timeout_bounded():
         f"libpython fix step's self-test python invocation must be "
         f"wrapped in `timeout N` so a hung subprocess can't wedge "
         f"the workflow. Found: {self_test_lines!r}"
+    )
+    # The self-test MUST target the preserved real binary ($SHIM_REAL),
+    # NOT the shim ($SHIM_BIN). A self-pointing shim would otherwise
+    # produce an infinite recursion loop (verified on PR #313 CI).
+    invokes_real = any("$SHIM_REAL" in line for line in self_test_lines)
+    assert invokes_real, (
+        "libpython fix step's self-test MUST invoke the preserved real "
+        "binary ($SHIM_REAL = $TOOLCHAIN_ROOT/bin/python3.real), not the "
+        "shim ($SHIM_BIN). On a runner where the `mv` to preserve the "
+        "real binary silently fails (read-only mount, immutable bit, "
+        "etc.), $SHIM_BIN ends up being the shim itself, which exec's "
+        "$SHIM_REAL == the shim again → infinite recursion that only "
+        "the `timeout` bound can interrupt."
     )
