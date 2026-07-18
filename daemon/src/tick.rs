@@ -2674,6 +2674,27 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         let comment_body = format!("🤖 **[dark-factory]** Coder session parked (human held): re-roll held. Reason: {}", reason);
                         let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                     }
+                    Ok(crate::reroll::RerollOutcome::Deferred(reason)) => {
+                        // Bead jleechan-zeij / issue #322 r2: the fail-closed
+                        // proceed predicate could not confirm the previous
+                        // worker was safe to supersede this tick (active
+                        // session, moving HEAD, or failed stop()). `execute`
+                        // left the bead ATTESTED (no fresh branch, PR
+                        // untouched, session_id preserved) so this loop
+                        // re-selects and re-evaluates it next tick. This is
+                        // NOT a park — do not count it toward
+                        // beads_parked_human_held and do not post an
+                        // escalation comment.
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Attested.as_str(),
+                            "REROLL_DEFERRED",
+                            serde_json::json!({}),
+                            serde_json::json!({"reason": reason}),
+                        )?;
+                    }
                     Ok(crate::reroll::RerollOutcome::Aborted(_)) => {}
                     Err(e) => {
                         // jleechan-cq8r: per-bead isolation, matching the

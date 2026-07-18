@@ -13,8 +13,8 @@ use daemon::state::{
     OverlayState, StateStore,
 };
 use daemon::tools::{
-    Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions,
-    SpawnSpec, Tracker, Vcs,
+    Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionActivity,
+    SessionId, Sessions, SpawnSpec, Tracker, Vcs,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -302,6 +302,22 @@ pub struct FakeSessions {
     /// Optional error to return from `is_quiescent` (models the "quiescence
     /// check failed" error path independent of the timeout path).
     pub quiescence_check_error: RefCell<Option<String>>,
+    /// Bead jleechan-zeij / issue #322 r2. Branches for which `attach` returns
+    /// `SessionNotFound` (the "already reaped" fast path). Empty by default.
+    pub attach_not_found_for: RefCell<Vec<String>>,
+    /// Branches for which `attach` returns a PERMANENT (`DaemonError::Parse`)
+    /// error — models an ambiguous/malformed `ao status` that must park
+    /// HUMAN_HELD rather than defer. Empty by default.
+    pub fail_attach_permanent_for: RefCell<Vec<String>>,
+    /// Static `session_activity` override (idle vs running vs terminal). When
+    /// `None`, `session_activity` derives from `terminal_at`/`quiescent` to
+    /// match the trait default. Set it to `Idle` to reproduce the #322 live
+    /// signature, or `Running` to model a worker actively pushing.
+    pub activity: RefCell<Option<SessionActivity>>,
+    /// Optional PERMANENT (`DaemonError::Parse`) error to return from
+    /// `session_activity` on every call — models a non-transient `ao status`
+    /// parse failure that must PROPAGATE, not be swallowed as a defer.
+    pub activity_permanent_error: RefCell<Option<String>>,
     pub worktree_remote_override: RefCell<Option<String>>,
     /// jleechan-coder-silent-false-parks-h92r: scripted
     /// `worktree_transcript_last_activity_epoch` override, keyed by
@@ -329,6 +345,10 @@ impl Default for FakeSessions {
             branch_for: RefCell::new(HashMap::new()),
             terminal_at: RefCell::new(None),
             quiescence_check_error: RefCell::new(None),
+            attach_not_found_for: RefCell::new(Vec::new()),
+            fail_attach_permanent_for: RefCell::new(Vec::new()),
+            activity: RefCell::new(None),
+            activity_permanent_error: RefCell::new(None),
             worktree_remote_override: RefCell::new(None),
             transcript_activity_for: RefCell::new(HashMap::new()),
         }
@@ -389,6 +409,34 @@ impl FakeSessions {
     /// AO status-query failure independent of the timeout path.
     pub fn fail_quiescence_check(&self, message: &str) {
         *self.quiescence_check_error.borrow_mut() = Some(message.to_string());
+    }
+
+    /// Bead jleechan-zeij / issue #322 r2: script `attach(branch, _)` to
+    /// return `SessionNotFound` — the "worker already fully reaped" fast path.
+    pub fn attach_not_found_for(&self, branch: &str) {
+        self.attach_not_found_for
+            .borrow_mut()
+            .push(branch.to_string());
+    }
+
+    /// Script `attach(branch, _)` to return a PERMANENT `DaemonError::Parse`
+    /// — models an ambiguous/malformed `ao status` that must park HUMAN_HELD.
+    pub fn fail_attach_permanent_for(&self, branch: &str) {
+        self.fail_attach_permanent_for
+            .borrow_mut()
+            .push(branch.to_string());
+    }
+
+    /// Script the static `session_activity` classification (idle vs running
+    /// vs terminal), overriding the `terminal_at`/`quiescent`-derived default.
+    pub fn set_activity(&self, activity: SessionActivity) {
+        *self.activity.borrow_mut() = Some(activity);
+    }
+
+    /// Script `session_activity` to return a PERMANENT `DaemonError::Parse` on
+    /// every call — models a non-transient failure that must propagate.
+    pub fn fail_activity_permanent(&self, message: &str) {
+        *self.activity_permanent_error.borrow_mut() = Some(message.to_string());
     }
 
     pub fn set_worktree_remote(&self, remote: &str) {
@@ -462,6 +510,27 @@ impl Sessions for FakeSessions {
         self.calls
             .borrow_mut()
             .push(format!("attach({branch},{bead_id})"));
+        if self
+            .attach_not_found_for
+            .borrow()
+            .iter()
+            .any(|b| b == branch)
+        {
+            return Err(DaemonError::SessionNotFound {
+                branch: branch.to_string(),
+                bead_id: bead_id.to_string(),
+            });
+        }
+        if self
+            .fail_attach_permanent_for
+            .borrow()
+            .iter()
+            .any(|b| b == branch)
+        {
+            return Err(DaemonError::Parse(format!(
+                "scripted permanent attach failure for {branch}"
+            )));
+        }
         Ok(SessionId(self.next_session_id.clone()))
     }
 
@@ -492,6 +561,42 @@ impl Sessions for FakeSessions {
             return Ok(std::time::Instant::now() >= at);
         }
         Ok(self.quiescent)
+    }
+
+    fn session_activity(&self, id: &SessionId) -> Result<SessionActivity, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("session_activity({})", id.0));
+        // Permanent error takes precedence — must PROPAGATE, not defer.
+        if let Some(msg) = self.activity_permanent_error.borrow().as_ref() {
+            return Err(DaemonError::Parse(msg.clone()));
+        }
+        // A scripted transient quiescence-check error also breaks the probe.
+        if let Some(msg) = self.quiescence_check_error.borrow().as_ref() {
+            return Err(DaemonError::Tool {
+                tool: "ao".into(),
+                rc: 1,
+                stderr: msg.clone(),
+            });
+        }
+        // Explicit static override (idle / running / terminal / not-found).
+        if let Some(activity) = *self.activity.borrow() {
+            return Ok(activity);
+        }
+        // Otherwise derive from the terminal_at/quiescent schedule so the
+        // classification matches this fake's `is_quiescent` (and the trait
+        // default): terminal once quiescent, running until then. This fake
+        // never reports Idle unless `set_activity` is used.
+        let terminal = if let Some(at) = *self.terminal_at.borrow() {
+            std::time::Instant::now() >= at
+        } else {
+            self.quiescent
+        };
+        Ok(if terminal {
+            SessionActivity::Terminal
+        } else {
+            SessionActivity::Running
+        })
     }
 
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
@@ -769,6 +874,11 @@ pub struct FakeStateStore {
     pub branch_beads: RefCell<HashMap<String, String>>,
     pub rejections: RefCell<HashMap<(String, u32), RejectionRecord>>,
     pub fail_save_for_state: RefCell<Vec<(String, OverlayState)>>,
+    /// Bead jleechan-zeij / issue #322 r2: consecutive re-roll deferral count
+    /// per bead. Persisted independently of `BeadOverlay` (mirrors the real
+    /// `reroll_deferral_count` SQLite column), so the fail-closed defer/cap
+    /// path can be driven across repeated `reroll::execute` calls in a test.
+    pub reroll_deferrals: RefCell<HashMap<String, u32>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -935,6 +1045,36 @@ impl StateStore for FakeStateStore {
             })
             .cloned()
             .collect())
+    }
+
+    fn reroll_deferral_count(&self, bead_id: &str) -> Result<u32, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("reroll_deferral_count({bead_id})"));
+        Ok(self
+            .reroll_deferrals
+            .borrow()
+            .get(bead_id)
+            .copied()
+            .unwrap_or(0))
+    }
+
+    fn incr_reroll_deferral(&self, bead_id: &str) -> Result<u32, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("incr_reroll_deferral({bead_id})"));
+        let mut map = self.reroll_deferrals.borrow_mut();
+        let count = map.entry(bead_id.to_string()).or_insert(0);
+        *count += 1;
+        Ok(*count)
+    }
+
+    fn reset_reroll_deferral(&self, bead_id: &str) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("reset_reroll_deferral({bead_id})"));
+        self.reroll_deferrals.borrow_mut().insert(bead_id.to_string(), 0);
+        Ok(())
     }
 
     fn save_rejection(

@@ -481,6 +481,35 @@ pub enum PrHeadBranch {
     NotFound,
 }
 
+/// Liveness classification of a single AO session (bead jleechan-zeij /
+/// issue #322 r2). `is_quiescent` collapses everything into a single
+/// terminal-or-not boolean, which cannot tell "the worker exited" apart from
+/// "the worker finished its task and went back to idle without an explicit
+/// kill" — the exact `status=spawning, activity=idle` state that made the r1
+/// quiescence loop stall. The re-roll fail-closed proceed predicate
+/// (`reroll::execute`) needs that distinction: an `Idle` worker with a stable
+/// branch HEAD is safe to supersede (predicate (c)), a `Running` worker is
+/// NOT (it may still be pushing), so they must be joined with head-stability
+/// in the same poll rather than treated identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionActivity {
+    /// AO reports the session is actively doing work (any non-idle,
+    /// non-terminal `activity`). Never safe to supersede — the worker may be
+    /// mid-`git push`.
+    Running,
+    /// AO reports the session is alive but idle (`activity == "idle"`) — the
+    /// #322 live signature. Safe to supersede ONLY jointly with a stable
+    /// branch HEAD.
+    Idle,
+    /// AO reports one of its terminal statuses (`killed`/`done`/…) or
+    /// `activity == "exited"` — equivalent to `is_quiescent == true`.
+    Terminal,
+    /// No AO status row currently names this session — the worker has been
+    /// fully reaped. Equivalent to a `SessionNotFound` attach for supersede
+    /// purposes (nothing live left to guard against).
+    NotFound,
+}
+
 /// `ao` / `aow` CLIs.
 pub trait Sessions {
     fn active_count(&self) -> Result<usize, DaemonError>;
@@ -488,6 +517,21 @@ pub trait Sessions {
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError>;
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError>;
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError>;
+    /// Activity probe distinguishing idle vs running vs terminal (bead
+    /// jleechan-zeij / issue #322 r2 — see [`SessionActivity`]). The default
+    /// derives from `is_quiescent`: a quiescent session maps to `Terminal`,
+    /// a non-quiescent one to `Running`. That default deliberately CANNOT
+    /// report `Idle` — it fails closed toward "still running", so any adapter
+    /// that does not override this treats an idle worker as live and defers
+    /// rather than superseding it. The real adapter (`CliSessions`) overrides
+    /// this to read AO's `activity` field directly and surface `Idle`.
+    fn session_activity(&self, id: &SessionId) -> Result<SessionActivity, DaemonError> {
+        if self.is_quiescent(id)? {
+            Ok(SessionActivity::Terminal)
+        } else {
+            Ok(SessionActivity::Running)
+        }
+    }
     /// Returns the live branch AO reports for a given session, if known.
     ///
     /// jleechan-5ia2: a `bead_overlay` row was found with

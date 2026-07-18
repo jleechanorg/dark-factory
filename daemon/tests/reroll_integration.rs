@@ -890,18 +890,25 @@ fn adopted_spawn_crash_is_reconciled_without_duplicate_redispatch() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
-/// Stage-2 prerequisite #3 (quiescence timeout validated): four adversarial
-/// race-condition tests against `reroll::execute`'s quiescence-confirmation
-/// loop (reroll.rs, "Stop AO session and wait for quiescence" section), run
-/// with REAL wall-clock timing against the actual production
-/// `Duration::from_secs(60)` timeout and `500ms` poll interval hardcoded in
-/// `reroll::execute` — not an injected/fake clock — so a wrong constant,
-/// unit, or off-by-one in that wiring would actually fail these tests, not
-/// just a logic-level unit test with a mocked clock. Each test takes real
-/// wall-clock seconds to run by design; see individual doc comments for
-/// expected duration.
+/// Bead jleechan-zeij / issue #322 (r2): adversarial race tests against
+/// `reroll::execute`'s FAIL-CLOSED proceed predicate (reroll.rs, "Stop the AO
+/// session and evaluate the fail-closed proceed predicate" section), run with
+/// REAL wall-clock timing against the actual production `500ms` poll interval
+/// and `3s` best-effort ceiling — not an injected/fake clock — so a wrong
+/// constant, unit, or off-by-one in that wiring would actually fail these
+/// tests.
+///
+/// The r2 contract: supersede the previous worker (fabricate a fresh branch,
+/// close the old PR) ONLY on a positive proceed signal — attach() ->
+/// SessionNotFound, session terminal + stable HEAD, or session idle + stable
+/// HEAD. On any doubt (a running worker, a moving HEAD, or a failed stop())
+/// the engine DEFERS (leaves the bead ATTESTED, preserves session_id, retries
+/// next tick) up to a bounded cap, then parks HUMAN_HELD — it NEVER proceeds
+/// on doubt and never parks on a single unconfirmed poll. Each test's doc
+/// comment states its expected real wall-clock duration.
 mod quiescence_timeout_races {
     use super::*;
+    use daemon::tools::SessionActivity;
 
     fn race_test_bead(bead_id: &str, branch: &str) -> BeadOverlay {
         BeadOverlay {
@@ -922,45 +929,43 @@ mod quiescence_timeout_races {
         }
     }
 
-    /// Case A — bead jleechan-zeij / issue #322 (negative): a NEVER-settling
-    /// AO session used to cause a 60s timeout-park, defeating unattended
-    /// end-to-end on every red gate_assessment. After the fix, a session
-    /// that never settles within the short best-effort ceiling (~3s) must
-    /// STILL proceed to branch fabrication (we do not park HUMAN_HELD on
-    /// quiescence wait alone). The worker's `head_sha` is stable (no
-    /// schedule) and the verifier has already positively confirmed the
-    /// worker's final SHA at gate_assessment time, so there is no race to
-    /// guard against at reroll entry. Real wall-clock duration: ~3s.
+    /// Live worker (r2 core case): the AO session reports `activity=running`
+    /// and its branch HEAD is actively moving (a `git push` schedule) for the
+    /// entire best-effort window. This is the exact "do not supersede a
+    /// worker that is still pushing" hazard the Codex P1 review flagged
+    /// against r1's fail-OPEN behavior. The fail-closed predicate must NEVER
+    /// confirm here: no fresh branch is fabricated, the old PR is NOT closed,
+    /// the outcome is `Deferred`, the bead stays `ATTESTED`, and its
+    /// `session_id` is PRESERVED (the worker may still be live). Real
+    /// wall-clock duration: ~3s (the ceiling elapses without a confirm).
     #[test]
-    fn case_a_never_settles_proceeds_to_branch_fabrication() {
+    fn live_worker_running_moving_head_defers_without_superseding() {
         let scm = FakeScm::new();
         let sessions = FakeSessions::new();
+        let branch = "factory/bead-race-live-r1";
         let mut vcs = FakeVcs::new();
-        vcs.heads.insert("main".into(), "base-sha-a".into());
-        vcs.heads
-            .insert("factory/bead-race-a-r1".into(), "head-sha-a".into());
+        vcs.heads.insert("main".into(), "base-sha-live".into());
+        vcs.heads.insert(branch.into(), "head-live-0".into());
         let store = FakeStateStore::new();
         let llm = FakeLlm::new();
-        *llm.response.borrow_mut() = Some(Ok(
-            r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into(),
-        ));
-        let mut cfg = test_cfg();
-        cfg.spec_dir = std::env::temp_dir()
-            .join("afd_quiescence_case_a_spec")
-            .to_string_lossy()
-            .to_string();
-        let spec_dir = std::path::Path::new(&cfg.spec_dir);
-        let _ = std::fs::remove_dir_all(spec_dir);
-        std::fs::create_dir_all(spec_dir).unwrap();
-        let telemetry_log = std::env::temp_dir().join("afd_quiescence_case_a_telemetry.jsonl");
+        let cfg = test_cfg();
+        let telemetry_log = std::env::temp_dir().join("afd_quiescence_live_telemetry.jsonl");
         let _ = std::fs::remove_file(&telemetry_log);
 
-        let mut bead = race_test_bead("bead-race-a", "factory/bead-race-a-r1");
+        let mut bead = race_test_bead("bead-race-live", branch);
+        // A live worker holds a durable session handle; the defer path must
+        // preserve it (clearing is reserved for a confirmed proceed).
+        bead.session_id = Some("fake-session-1".into());
         store.save(&bead).unwrap();
 
-        // Never terminal within any realistic test window — the live bug
-        // signature. With the fix, this no longer parks HUMAN_HELD.
-        sessions.set_terminal_at(Instant::now() + Duration::from_secs(3600));
+        // Worker actively running AND pushing: `session_activity` is Running,
+        // and the branch HEAD advances mid-window. Either alone denies the
+        // predicate; together they are the unambiguous "still live" signal.
+        sessions.set_activity(SessionActivity::Running);
+        let t0 = Instant::now();
+        vcs.schedule_head_sha(branch, t0, "head-live-0");
+        vcs.schedule_head_sha(branch, t0 + Duration::from_millis(800), "head-live-1");
+        vcs.schedule_head_sha(branch, t0 + Duration::from_millis(1600), "head-live-2");
 
         let deps = RerollDeps {
             scm: &scm,
@@ -971,7 +976,7 @@ mod quiescence_timeout_races {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             reviewer: "skeptic".into(),
-            review_text: "never settles case A".into(),
+            review_text: "live worker still pushing".into(),
         };
 
         let start = Instant::now();
@@ -979,46 +984,54 @@ mod quiescence_timeout_races {
         let elapsed = start.elapsed();
 
         match outcome {
-            RerollOutcome::Rerolled { new_branch } => {
-                assert_eq!(new_branch, "factory/bead-race-a-r2");
+            RerollOutcome::Deferred(reason) => {
+                assert_eq!(reason, "unconfirmed_live_or_moving_head");
             }
             other => panic!(
-                "expected Rerolled (never-settling session must not park; issue #322), got {:?}",
+                "expected Deferred on a live+pushing worker (must not supersede; issue #322 r2), got {:?}",
                 other
             ),
         }
-        // The new short ceiling: must NOT take 60s. ~3s ceiling + slack.
+        // Bounded by the ~3s ceiling, never the old 60s park.
         assert!(
             elapsed < Duration::from_secs(15),
-            "expected best-effort wait to complete in well under 15s (the old 60s timeout \
-             would have elapsed ~60s here), got {elapsed:?}"
+            "expected the best-effort wait to give up at the ~3s ceiling, got {elapsed:?}"
         );
 
-        let updated = store.load("bead-race-a").unwrap().unwrap();
-        assert_eq!(updated.state, OverlayState::Recovery);
+        let updated = store.load("bead-race-live").unwrap().unwrap();
+        // Left re-eligible for the fast tier next tick, NOT parked, NOT advanced.
+        assert_eq!(updated.state, OverlayState::Attested);
+        assert_eq!(
+            updated.session_id.as_deref(),
+            Some("fake-session-1"),
+            "session_id must be preserved on defer — clearing is reserved for a confirmed proceed"
+        );
+        assert_eq!(store.reroll_deferral_count("bead-race-live").unwrap(), 1);
+
         let vcs_calls = vcs.calls.borrow();
         assert!(
-            vcs_calls
-                .iter()
-                .any(|c| c.starts_with("create_branch_at(factory/bead-race-a-r2")),
-            "expected fresh attempt branch fabrication even on never-settling session, got {vcs_calls:?}"
+            vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")),
+            "must NOT fabricate a branch while the worker is still live: {vcs_calls:?}"
         );
         let scm_calls = scm.calls.borrow();
         assert!(
-            scm_calls.iter().any(|c| c.starts_with("close_pr(900")),
-            "expected old PR to be closed (Superseded comment) once reroll succeeds, got {scm_calls:?}"
+            scm_calls.iter().all(|c| !c.starts_with("close_pr(")),
+            "must NOT close the old PR while the worker is still live: {scm_calls:?}"
         );
 
-        std::fs::remove_dir_all(spec_dir).ok();
         let _ = std::fs::remove_file(&telemetry_log);
     }
 
-    /// Case B — session settles well under the short best-effort ceiling
-    /// (~1.5s in). Expect a normal successful re-roll with HEAD-SHA
-    /// stability confirmed, not a false-positive abort. Real wall-clock
-    /// duration: ~1.5-2s.
+    /// Terminal settles under the ceiling (predicate (b)): the AO session
+    /// becomes terminal at ~t=1.5s with a static HEAD, so the next two polls
+    /// read the same value and confirm well inside the ~3s ceiling. Expect a
+    /// normal successful re-roll and the durable `session_id` CLEARED (a
+    /// confirmed proceed is the only path that clears it). One shared `start`
+    /// Instant anchors both `set_terminal_at` and the elapsed assertion so
+    /// the "t=1.5s" boundary is precise (CodeRabbit minor). Real wall-clock
+    /// duration: ~2s.
     #[test]
-    fn case_b_settles_under_timeout_succeeds() {
+    fn terminal_settles_under_ceiling_proceeds() {
         let scm = FakeScm::new();
         let sessions = FakeSessions::new();
         let mut vcs = FakeVcs::new();
@@ -1042,12 +1055,16 @@ mod quiescence_timeout_races {
         let _ = std::fs::remove_file(&telemetry_log);
 
         let mut bead = race_test_bead("bead-race-b", "factory/bead-race-b-r1");
+        bead.session_id = Some("fake-session-1".into());
         store.save(&bead).unwrap();
 
-        // Terminal at t=1.5s — under the new short ~3s ceiling. HEAD SHA
-        // is static, so once terminal, two consecutive polls read the same
-        // value and confirm.
-        sessions.set_terminal_at(Instant::now() + Duration::from_millis(1500));
+        // One shared reference instant anchors both the scripted terminal
+        // boundary and the elapsed measurement below, so "terminal at t=1.5s"
+        // is measured against the same clock the assertion uses.
+        let start = Instant::now();
+        // Terminal at t=1.5s — under the ~3s ceiling. HEAD SHA is static, so
+        // once terminal, two consecutive polls read the same value and confirm.
+        sessions.set_terminal_at(start + Duration::from_millis(1500));
 
         let deps = RerollDeps {
             scm: &scm,
@@ -1058,10 +1075,9 @@ mod quiescence_timeout_races {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             reviewer: "skeptic".into(),
-            review_text: "settles under timeout case B".into(),
+            review_text: "terminal settles under ceiling".into(),
         };
 
-        let start = Instant::now();
         let outcome = reroll::execute(&deps, &mut bead).unwrap();
         let elapsed = start.elapsed();
 
@@ -1070,7 +1086,7 @@ mod quiescence_timeout_races {
                 assert_eq!(new_branch, "factory/bead-race-b-r2");
             }
             other => panic!(
-                "expected Rerolled (not a false-positive abort), got {:?}",
+                "expected Rerolled (terminal + stable HEAD is a confirmed proceed), got {:?}",
                 other
             ),
         }
@@ -1082,19 +1098,24 @@ mod quiescence_timeout_races {
 
         let updated = store.load("bead-race-b").unwrap().unwrap();
         assert_eq!(updated.state, OverlayState::Recovery);
+        assert_eq!(
+            updated.session_id, None,
+            "a confirmed proceed must clear the durable session handle"
+        );
 
         std::fs::remove_dir_all(spec_dir).ok();
         let _ = std::fs::remove_file(&telemetry_log);
     }
 
-    /// Case C — bead jleechan-zeij / issue #322 (boundary): the AO session
-    /// only settles AFTER the short best-effort ceiling has elapsed. With
-    /// the fix, the wait gives up gracefully and proceeds to branch
-    /// fabrication — exactly the same outcome as Case A. The settle-after
-    /// window is an advisory observation in telemetry, not a hard abort.
-    /// Real wall-clock duration: ~3s.
+    /// Settle-after-ceiling (r2 boundary): the AO session is still `Running`
+    /// throughout the ~3s best-effort window and only becomes terminal at
+    /// t=10s — well past the ceiling. Because the predicate can only observe
+    /// a running worker within the window, it must NOT proceed: it DEFERS
+    /// (fail-closed), giving up at the ceiling rather than blocking for the
+    /// full 10s settle. One shared `start` Instant anchors both the terminal
+    /// boundary and the elapsed assertion. Real wall-clock duration: ~3s.
     #[test]
-    fn case_c_settles_after_short_ceiling_still_proceeds() {
+    fn settles_after_short_ceiling_defers() {
         let scm = FakeScm::new();
         let sessions = FakeSessions::new();
         let mut vcs = FakeVcs::new();
@@ -1103,28 +1124,20 @@ mod quiescence_timeout_races {
             .insert("factory/bead-race-c-r1".into(), "head-sha-c".into());
         let store = FakeStateStore::new();
         let llm = FakeLlm::new();
-        *llm.response.borrow_mut() = Some(Ok(
-            r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into(),
-        ));
-        let mut cfg = test_cfg();
-        cfg.spec_dir = std::env::temp_dir()
-            .join("afd_quiescence_case_c_spec")
-            .to_string_lossy()
-            .to_string();
-        let spec_dir = std::path::Path::new(&cfg.spec_dir);
-        let _ = std::fs::remove_dir_all(spec_dir);
-        std::fs::create_dir_all(spec_dir).unwrap();
+        let cfg = test_cfg();
         let telemetry_log = std::env::temp_dir().join("afd_quiescence_case_c_telemetry.jsonl");
         let _ = std::fs::remove_file(&telemetry_log);
 
         let mut bead = race_test_bead("bead-race-c", "factory/bead-race-c-r1");
+        bead.session_id = Some("fake-session-1".into());
         store.save(&bead).unwrap();
 
-        // Terminal only at t=10s — well past the new short ~3s ceiling.
-        // The previous 60s contract would have aborted at ~60s before
-        // observing the settle; the new contract observes the settle
-        // (advisory) but does not block on it.
-        sessions.set_terminal_at(Instant::now() + Duration::from_secs(10));
+        // One shared reference instant for both the scripted terminal boundary
+        // and the elapsed measurement.
+        let start = Instant::now();
+        // Terminal only at t=10s — well past the ~3s ceiling. Until then the
+        // derived activity is `Running`, so the predicate never confirms.
+        sessions.set_terminal_at(start + Duration::from_secs(10));
 
         let deps = RerollDeps {
             scm: &scm,
@@ -1135,50 +1148,45 @@ mod quiescence_timeout_races {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             reviewer: "skeptic".into(),
-            review_text: "settles after short ceiling case C".into(),
+            review_text: "settles after short ceiling".into(),
         };
 
-        let start = Instant::now();
         let outcome = reroll::execute(&deps, &mut bead).unwrap();
         let elapsed = start.elapsed();
 
         match outcome {
-            RerollOutcome::Rerolled { new_branch } => {
-                assert_eq!(new_branch, "factory/bead-race-c-r2");
+            RerollOutcome::Deferred(reason) => {
+                assert_eq!(reason, "unconfirmed_live_or_moving_head");
             }
             other => panic!(
-                "expected Rerolled on a session that settles after the short ceiling, got {:?}",
+                "expected Deferred on a session still running at the ceiling, got {:?}",
                 other
             ),
         }
-        // Must complete in the short ceiling, NOT wait the full 10s for
-        // the session to settle — the old 60s contract was the bug.
+        // Gave up at the ~3s ceiling, did NOT block for the t=10s settle.
         assert!(
-            elapsed < Duration::from_secs(15),
-            "expected best-effort wait to give up at the ~3s ceiling, not block on the t=10s settle, \
-             got {elapsed:?}"
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(9),
+            "expected the best-effort wait to give up at the ~3s ceiling, not block on the t=10s \
+             settle, got {elapsed:?}"
         );
 
         let updated = store.load("bead-race-c").unwrap().unwrap();
-        assert_eq!(updated.state, OverlayState::Recovery);
+        assert_eq!(updated.state, OverlayState::Attested);
+        assert_eq!(updated.session_id.as_deref(), Some("fake-session-1"));
 
-        std::fs::remove_dir_all(spec_dir).ok();
         let _ = std::fs::remove_file(&telemetry_log);
     }
 
-    /// Case D — the actual race from the spec's own rationale: the AO
-    /// process is ALREADY terminal from t=0 (it exited quickly), but the
-    /// worker's `git push` for its final commit is still landing — the
-    /// branch's HEAD SHA changes partway through the confirmation window
-    /// (at ~250ms, between the 1st poll at ~0ms and the 2nd poll at
-    /// ~500ms). Expect: the daemon must NOT declare success off the stale
-    /// pre-push SHA; it must detect the SHA change as non-stability, keep
-    /// polling, and only confirm once the POST-push SHA has itself been
-    /// observed unchanged across two consecutive polls. This is exactly the
-    /// class of bug the missing HEAD-SHA check (fixed alongside these
-    /// tests) would produce a false positive on. Real wall-clock duration:
-    /// ~1-1.5s — the race resolves quickly; only the boundary cases A-C
-    /// need the full 60s window.
+    /// Case D — the mid-push race: the AO process is ALREADY terminal from
+    /// t=0 (it exited quickly), but the worker's `git push` for its final
+    /// commit is still landing — the branch's HEAD SHA changes partway
+    /// through the confirmation window (at ~250ms, between the 1st poll at
+    /// ~0ms and the 2nd poll at ~500ms). Expect: the predicate must NOT
+    /// declare success off the stale pre-push SHA (req 3 — head_sha is
+    /// sampled every poll); it must detect the SHA change as non-stability,
+    /// keep polling, and only confirm once the POST-push SHA has itself been
+    /// observed unchanged across two consecutive polls. Real wall-clock
+    /// duration: ~1-1.5s — the race resolves inside the ~3s ceiling.
     #[test]
     fn case_d_push_lands_mid_poll_is_detected_not_falsely_confirmed() {
         let scm = FakeScm::new();
@@ -1268,25 +1276,19 @@ mod quiescence_timeout_races {
         let _ = std::fs::remove_file(&telemetry_log);
     }
 
-    /// Case E — bead jleechan-zeij / issue #322: the AO session is
-    /// "idle+spawning" (worker finished its task and went back to idle
-    /// without being explicitly killed) — i.e. `is_quiescent` returns
-    /// `Ok(false)` permanently. This is the EXACT live state observed in
-    /// the 04:30:43Z U4 telemetry (sessions df-179 / df-180 on the
-    /// `factory/jleechan-agy-vendor-name-drift-9lvs-r1` /
-    /// `factory/jleechan-park-leaves-zombie-session-mh9o-r1` branches
-    /// reported `status=spawning, activity=idle` at reroll entry). The
-    /// previous fix's 60s hardcoded quiescence timeout fired and parked
-    /// the bead HUMAN_HELD, defeating unattended end-to-end on every red
-    /// gate_assessment.
-    ///
-    /// Expect: reroll proceeds in well under 60s with `Rerolled`, NOT a
-    /// 60s Held(timeout). The previous worker cannot push a final commit
-    /// while idle (verified by `head_sha` static), and a fast best-effort
-    /// stop is sufficient to free the worker slot. Real wall-clock
-    /// duration: < ~10s.
+    /// Case E (the #322 pin) — the AO session is idle+spawning: the worker
+    /// finished its task and went back to idle without an explicit kill
+    /// (`status=spawning, activity=idle`), so `is_quiescent` returns
+    /// `Ok(false)` forever. This is the EXACT live state observed in the
+    /// 04:30:43Z U4 telemetry (df-179 / df-180 on the `…-9lvs-r1` / `…-mh9o-r1`
+    /// branches). r0 parked HUMAN_HELD on it (defeating unattended
+    /// end-to-end); r2 recognizes it as predicate (c): idle activity + a
+    /// stable HEAD is a positive, FAST proceed. The elapsed LOWER bound pins
+    /// that the two-read stability streak actually runs (it is not an
+    /// instant/unchecked confirm), and the upper bound pins that it never
+    /// regresses to the old 60s park. Real wall-clock duration: ~0.5-1s.
     #[test]
-    fn case_e_idle_spawning_session_does_not_block_reroll() {
+    fn case_e_idle_spawning_session_proceeds_fast() {
         let scm = FakeScm::new();
         let sessions = FakeSessions::new();
         let mut vcs = FakeVcs::new();
@@ -1310,14 +1312,13 @@ mod quiescence_timeout_races {
         let _ = std::fs::remove_file(&telemetry_log);
 
         let mut bead = race_test_bead("bead-race-e", branch);
+        bead.session_id = Some("fake-session-1".into());
         store.save(&bead).unwrap();
 
-        // Live bug signature: AO session is idle (never terminal within any
-        // realistic window), so `is_quiescent` returns `Ok(false)` forever.
-        // Without the fix, the 60s hardcoded timeout fires and parks
-        // HUMAN_HELD. With the fix, a short best-effort wait succeeds or
-        // the path falls through to branch fabrication in well under 60s.
-        sessions.set_terminal_at(Instant::now() + Duration::from_secs(3600));
+        // Live bug signature: AO reports the session idle (alive but not
+        // terminal). HEAD is static, so predicate (c) confirms on the second
+        // consecutive idle+matching-HEAD poll.
+        sessions.set_activity(SessionActivity::Idle);
 
         let deps = RerollDeps {
             scm: &scm,
@@ -1328,7 +1329,7 @@ mod quiescence_timeout_races {
             cfg: &cfg,
             telemetry_log: &telemetry_log,
             reviewer: "skeptic".into(),
-            review_text: "idle+spawning AO session never settles; reroll must not park".into(),
+            review_text: "idle+spawning AO session; stable HEAD; reroll must proceed".into(),
         };
 
         let start = Instant::now();
@@ -1340,34 +1341,364 @@ mod quiescence_timeout_races {
                 assert_eq!(new_branch, "factory/bead-race-e-r2");
             }
             other => panic!(
-                "expected Rerolled on an idle+spawning session (issue #322), got {:?}",
+                "expected Rerolled on an idle+stable-HEAD session (issue #322 predicate c), got {:?}",
                 other
             ),
         }
-        // Crux of the regression: a 60s timeout park would have elapsed
-        // ~60s. With the fix, the path must complete in a small fraction
-        // of that. We allow generous slack (15s) for CI jitter while still
-        // catching a regression to the old 60s timeout behavior.
+        // Lower bound: the two-read stability streak spans at least one poll
+        // interval (~500ms), proving the confirm is not an unchecked instant
+        // pass. Upper bound: nowhere near the old 60s park.
         assert!(
-            elapsed < Duration::from_secs(15),
-            "expected idle+spawning reroll to complete in well under the old 60s timeout, got {elapsed:?}"
+            elapsed >= Duration::from_millis(400) && elapsed < Duration::from_secs(15),
+            "expected an idle+stable-HEAD confirm after ~one poll interval and well under 60s, got {elapsed:?}"
         );
 
         let updated = store.load("bead-race-e").unwrap().unwrap();
         assert_eq!(updated.state, OverlayState::Recovery);
+        assert_eq!(
+            updated.session_id, None,
+            "a confirmed proceed must clear the durable session handle"
+        );
 
-        // And critically: a fresh attempt branch was fabricated, NOT the
-        // bead parked HUMAN_HELD (which would have left `updated.state`
-        // as HumanHeld with the 60s-timeout reason).
+        // A fresh attempt branch was fabricated, NOT the bead parked HUMAN_HELD.
         let vcs_calls = vcs.calls.borrow();
         assert!(
             vcs_calls
                 .iter()
                 .any(|c| c.starts_with("create_branch_at(factory/bead-race-e-r2")),
-            "expected fresh attempt branch to be fabricated on idle+spawning reroll, got {vcs_calls:?}"
+            "expected fresh attempt branch to be fabricated on idle+stable-HEAD reroll, got {vcs_calls:?}"
         );
 
         std::fs::remove_dir_all(spec_dir).ok();
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+
+    /// SessionNotFound fast path (predicate (a)): the previous worker has
+    /// been fully reaped, so `attach` returns `SessionNotFound`. There is
+    /// nothing to stop and nothing to wait for — reroll proceeds essentially
+    /// instantly with reason `no_live_session`, clears the durable handle,
+    /// and never calls `stop`/`is_quiescent`/`session_activity`. Real
+    /// wall-clock duration: near-zero.
+    #[test]
+    fn session_not_found_fast_path_proceeds() {
+        let scm = FakeScm::new();
+        let sessions = FakeSessions::new();
+        let mut vcs = FakeVcs::new();
+        vcs.heads.insert("main".into(), "base-sha-nf".into());
+        let branch = "factory/bead-race-nf-r1";
+        vcs.heads.insert(branch.into(), "head-sha-nf".into());
+        let store = FakeStateStore::new();
+        let llm = FakeLlm::new();
+        *llm.response.borrow_mut() = Some(Ok(
+            r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into(),
+        ));
+        let mut cfg = test_cfg();
+        cfg.spec_dir = std::env::temp_dir()
+            .join("afd_quiescence_nf_spec")
+            .to_string_lossy()
+            .to_string();
+        let spec_dir = std::path::Path::new(&cfg.spec_dir);
+        let _ = std::fs::remove_dir_all(spec_dir);
+        std::fs::create_dir_all(spec_dir).unwrap();
+        let telemetry_log = std::env::temp_dir().join("afd_quiescence_nf_telemetry.jsonl");
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let mut bead = race_test_bead("bead-race-nf", branch);
+        bead.session_id = Some("fake-session-1".into());
+        store.save(&bead).unwrap();
+
+        sessions.attach_not_found_for(branch);
+
+        let deps = RerollDeps {
+            scm: &scm,
+            sessions: &sessions,
+            vcs: &vcs,
+            store: &store,
+            llm: &llm,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            reviewer: "skeptic".into(),
+            review_text: "session already reaped".into(),
+        };
+
+        let outcome = reroll::execute(&deps, &mut bead).unwrap();
+        match outcome {
+            RerollOutcome::Rerolled { new_branch } => {
+                assert_eq!(new_branch, "factory/bead-race-nf-r2");
+            }
+            other => panic!("expected Rerolled on the no-live-session fast path, got {:?}", other),
+        }
+
+        let updated = store.load("bead-race-nf").unwrap().unwrap();
+        assert_eq!(updated.state, OverlayState::Recovery);
+        assert_eq!(
+            updated.session_id, None,
+            "the no-live-session fast path clears the durable handle before proceeding"
+        );
+
+        let session_calls = sessions.calls.borrow();
+        assert!(
+            session_calls.iter().all(|c| !c.starts_with("stop(")
+                && !c.starts_with("is_quiescent(")
+                && !c.starts_with("session_activity(")),
+            "SessionNotFound must skip stop/liveness polling entirely, got {session_calls:?}"
+        );
+
+        std::fs::remove_dir_all(spec_dir).ok();
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+
+    /// Hard (permanent) attach error still parks: a non-`SessionNotFound`,
+    /// non-transient `attach` failure (an ambiguous/malformed `ao status`)
+    /// means the daemon cannot even identify the session — it fails closed to
+    /// HUMAN_HELD rather than deferring or proceeding. Real wall-clock
+    /// duration: near-zero.
+    #[test]
+    fn hard_attach_error_parks_human_held() {
+        let scm = FakeScm::new();
+        let sessions = FakeSessions::new();
+        let mut vcs = FakeVcs::new();
+        vcs.heads.insert("main".into(), "base-sha-ha".into());
+        let branch = "factory/bead-race-ha-r1";
+        vcs.heads.insert(branch.into(), "head-sha-ha".into());
+        let store = FakeStateStore::new();
+        let llm = FakeLlm::new();
+        let cfg = test_cfg();
+        let telemetry_log = std::env::temp_dir().join("afd_quiescence_ha_telemetry.jsonl");
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let mut bead = race_test_bead("bead-race-ha", branch);
+        store.save(&bead).unwrap();
+
+        sessions.fail_attach_permanent_for(branch);
+
+        let deps = RerollDeps {
+            scm: &scm,
+            sessions: &sessions,
+            vcs: &vcs,
+            store: &store,
+            llm: &llm,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            reviewer: "skeptic".into(),
+            review_text: "ambiguous ao status".into(),
+        };
+
+        match reroll::execute(&deps, &mut bead).unwrap() {
+            RerollOutcome::Held(reason) => {
+                assert!(
+                    reason.contains("failed to attach to session"),
+                    "expected an attach-failure Held reason, got: {reason}"
+                );
+            }
+            other => panic!("expected Held on a permanent attach failure, got {:?}", other),
+        }
+
+        let updated = store.load("bead-race-ha").unwrap().unwrap();
+        assert_eq!(updated.state, OverlayState::HumanHeld);
+        assert_eq!(
+            updated.park_reason.as_deref(),
+            Some("reroll_session_attach_failed")
+        );
+        // A permanent attach error is NOT counted as a deferral.
+        assert_eq!(store.reroll_deferral_count("bead-race-ha").unwrap(), 0);
+
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+
+    /// A failed `stop()` defers (ordering req 4): the kill did not succeed,
+    /// so the worker is (or may be) alive — the predicate must not evaluate
+    /// past it. Expect `Deferred`, the bead left ATTESTED, `session_id`
+    /// preserved, no branch fabricated, no PR closed. Fails fast (no poll
+    /// wait). Real wall-clock duration: near-zero.
+    #[test]
+    fn stop_failure_defers() {
+        let scm = FakeScm::new();
+        let sessions = FakeSessions::new();
+        let mut vcs = FakeVcs::new();
+        vcs.heads.insert("main".into(), "base-sha-sf".into());
+        let branch = "factory/bead-race-sf-r1";
+        vcs.heads.insert(branch.into(), "head-sha-sf".into());
+        let store = FakeStateStore::new();
+        let llm = FakeLlm::new();
+        let cfg = test_cfg();
+        let telemetry_log = std::env::temp_dir().join("afd_quiescence_sf_telemetry.jsonl");
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let mut bead = race_test_bead("bead-race-sf", branch);
+        bead.session_id = Some("fake-session-1".into());
+        store.save(&bead).unwrap();
+
+        // attach() returns the default session id "fake-session-1"; scripting
+        // stop() to fail for it forces the fail-closed defer.
+        sessions.fail_stop_for("fake-session-1");
+
+        let deps = RerollDeps {
+            scm: &scm,
+            sessions: &sessions,
+            vcs: &vcs,
+            store: &store,
+            llm: &llm,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            reviewer: "skeptic".into(),
+            review_text: "stop failed".into(),
+        };
+
+        match reroll::execute(&deps, &mut bead).unwrap() {
+            RerollOutcome::Deferred(reason) => assert_eq!(reason, "stop_failed"),
+            other => panic!("expected Deferred on a failed stop(), got {:?}", other),
+        }
+
+        let updated = store.load("bead-race-sf").unwrap().unwrap();
+        assert_eq!(updated.state, OverlayState::Attested);
+        assert_eq!(updated.session_id.as_deref(), Some("fake-session-1"));
+        assert_eq!(store.reroll_deferral_count("bead-race-sf").unwrap(), 1);
+
+        let vcs_calls = vcs.calls.borrow();
+        assert!(
+            vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")),
+            "a failed stop() must not fabricate a branch: {vcs_calls:?}"
+        );
+        let scm_calls = scm.calls.borrow();
+        assert!(
+            scm_calls.iter().all(|c| !c.starts_with("close_pr(")),
+            "a failed stop() must not close the PR: {scm_calls:?}"
+        );
+
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+
+    /// The bounded deferral counter escalates to HUMAN_HELD at the cap: a
+    /// worker that defers on every tick (here via a persistently-failing
+    /// stop(), so each call fails fast) is retried `MAX_REROLL_DEFERRALS`
+    /// times, and only the cap-th call parks HUMAN_HELD with the
+    /// deferral-cap reason. The first `cap-1` calls all return `Deferred`.
+    /// Real wall-clock duration: near-zero (no poll waits).
+    #[test]
+    fn deferral_cap_parks_human_held() {
+        let scm = FakeScm::new();
+        let sessions = FakeSessions::new();
+        let mut vcs = FakeVcs::new();
+        vcs.heads.insert("main".into(), "base-sha-cap".into());
+        let branch = "factory/bead-race-cap-r1";
+        vcs.heads.insert(branch.into(), "head-sha-cap".into());
+        let store = FakeStateStore::new();
+        let llm = FakeLlm::new();
+        let cfg = test_cfg();
+        let telemetry_log = std::env::temp_dir().join("afd_quiescence_cap_telemetry.jsonl");
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let mut bead = race_test_bead("bead-race-cap", branch);
+        bead.session_id = Some("fake-session-1".into());
+        store.save(&bead).unwrap();
+        // Every tick's stop() fails → every reroll defers, driving the counter.
+        sessions.fail_stop_for("fake-session-1");
+
+        // MAX_REROLL_DEFERRALS is 5; drive up to and including the cap.
+        const CAP: u32 = 5;
+        for tick in 1..CAP {
+            let deps = RerollDeps {
+                scm: &scm,
+                sessions: &sessions,
+                vcs: &vcs,
+                store: &store,
+                llm: &llm,
+                cfg: &cfg,
+                telemetry_log: &telemetry_log,
+                reviewer: "skeptic".into(),
+                review_text: "stop keeps failing".into(),
+            };
+            let mut b = store.load("bead-race-cap").unwrap().unwrap();
+            match reroll::execute(&deps, &mut b).unwrap() {
+                RerollOutcome::Deferred(_) => {}
+                other => panic!("tick {tick}: expected Deferred below the cap, got {:?}", other),
+            }
+            assert_eq!(store.reroll_deferral_count("bead-race-cap").unwrap(), tick);
+            assert_eq!(
+                store.load("bead-race-cap").unwrap().unwrap().state,
+                OverlayState::Attested
+            );
+        }
+
+        // The cap-th deferral parks HUMAN_HELD.
+        let deps = RerollDeps {
+            scm: &scm,
+            sessions: &sessions,
+            vcs: &vcs,
+            store: &store,
+            llm: &llm,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            reviewer: "skeptic".into(),
+            review_text: "stop keeps failing".into(),
+        };
+        let mut b = store.load("bead-race-cap").unwrap().unwrap();
+        match reroll::execute(&deps, &mut b).unwrap() {
+            RerollOutcome::Held(reason) => {
+                assert!(
+                    reason.contains("deferred") && reason.contains("cap"),
+                    "expected a deferral-cap Held reason, got: {reason}"
+                );
+            }
+            other => panic!("expected Held at the deferral cap, got {:?}", other),
+        }
+        let updated = store.load("bead-race-cap").unwrap().unwrap();
+        assert_eq!(updated.state, OverlayState::HumanHeld);
+        assert_eq!(
+            updated.park_reason.as_deref(),
+            Some("reroll_quiescence_deferral_cap_exceeded")
+        );
+
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+
+    /// A PERMANENT (non-transient) liveness-probe error PROPAGATES (req 5):
+    /// only `is_transient()` errors are swallowed as a defer. A
+    /// `DaemonError::Parse` from `session_activity` (a malformed `ao status`)
+    /// must surface as `Err`, not be silently absorbed. Real wall-clock
+    /// duration: near-zero.
+    #[test]
+    fn permanent_liveness_error_propagates() {
+        let scm = FakeScm::new();
+        let sessions = FakeSessions::new();
+        let mut vcs = FakeVcs::new();
+        vcs.heads.insert("main".into(), "base-sha-pe".into());
+        let branch = "factory/bead-race-pe-r1";
+        vcs.heads.insert(branch.into(), "head-sha-pe".into());
+        let store = FakeStateStore::new();
+        let llm = FakeLlm::new();
+        let cfg = test_cfg();
+        let telemetry_log = std::env::temp_dir().join("afd_quiescence_pe_telemetry.jsonl");
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        let mut bead = race_test_bead("bead-race-pe", branch);
+        bead.session_id = Some("fake-session-1".into());
+        store.save(&bead).unwrap();
+
+        // attach() + stop() succeed; the poll's activity probe hits a
+        // permanent parse failure.
+        sessions.fail_activity_permanent("ao status JSON must be an array");
+
+        let deps = RerollDeps {
+            scm: &scm,
+            sessions: &sessions,
+            vcs: &vcs,
+            store: &store,
+            llm: &llm,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            reviewer: "skeptic".into(),
+            review_text: "malformed ao status".into(),
+        };
+
+        let result = reroll::execute(&deps, &mut bead);
+        assert!(
+            matches!(result, Err(DaemonError::Parse(_))),
+            "a permanent liveness-probe error must propagate, got {:?}",
+            result
+        );
+
         let _ = std::fs::remove_file(&telemetry_log);
     }
 }

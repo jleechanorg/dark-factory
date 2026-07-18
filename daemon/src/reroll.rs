@@ -3,7 +3,7 @@ use crate::errors::DaemonError;
 use crate::state::{
     set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
 };
-use crate::tools::{Llm, Scm, Sessions, SpawnSpec, Vcs};
+use crate::tools::{Llm, Scm, SessionActivity, Sessions, SpawnSpec, Vcs};
 use crate::telemetry::{self, TelemetryEvent};
 use crate::constraints;
 use std::path::Path;
@@ -26,7 +26,26 @@ pub enum RerollOutcome {
     Rerolled { new_branch: String },
     Aborted(String),
     Held(String),
+    /// Bead jleechan-zeij / issue #322 r2: the fail-closed proceed predicate
+    /// could NOT positively confirm the previous worker is safe to supersede
+    /// this tick (an active session, a moving branch HEAD, or a failed
+    /// `stop()`). The bead is left `ATTESTED` — no fresh branch fabricated, no
+    /// PR closed, `session_id` preserved — so `run_fast_tier` re-selects it
+    /// next tick and re-evaluates the predicate. Distinct from `Held` (a
+    /// terminal park requiring a human) and `Aborted` (state changed out from
+    /// under us): a deferral is a benign "not yet, retry soon". Only after
+    /// `MAX_REROLL_DEFERRALS` consecutive deferrals does the engine escalate
+    /// to `Held(HUMAN_HELD)`.
+    Deferred(String),
 }
+
+/// Maximum consecutive re-roll deferrals before the fail-closed proceed
+/// predicate escalates a bead to `HUMAN_HELD` (bead jleechan-zeij / issue
+/// #322 r2). At a ~1-tick cadence this bounds "silently retrying a worker
+/// that never settles" to a handful of ticks before a human is asked to look,
+/// while still absorbing the common transient case (a worker one or two ticks
+/// away from going idle) without any park at all.
+const MAX_REROLL_DEFERRALS: u32 = 5;
 
 /// Park reason recorded in `BeadOverlay::park_reason` when the circuit
 /// breaker (bead jleechan-cq8r) trips. Deliberately prefixed with
@@ -242,47 +261,42 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         return execute_adopted(deps, bead);
     }
 
-    // 3. Stop AO session and wait for quiescence (best-effort, short).
+    // 3. Stop the AO session and evaluate the fail-closed proceed predicate.
     //
-    // Bead jleechan-zeij / issue #322: the previous implementation held a
-    // hard 60-second quiescence-confirmation poll loop with a HEAD-SHA
-    // stability requirement, originally added to guard against a worker
-    // pushing a final commit during the confirmation window. In practice
-    // that loop is reached only on the `ATTESTED -> RE_ROLL` path
-    // (reroll.rs:147 enforces the gate at the top of `execute`), and on
-    // that path the worker has ALREADY been promoted through the fast-tier
-    // DISPATCHED -> ATTESTED transition (tick.rs:2092) — which requires
-    // a PR to be open AND the verifier to have run a full
-    // `GATE_ASSESSMENT` against the PR's current HEAD (which the reroll
-    // caller just consumed). By the time reroll entry happens, the
-    // worker's branch has been observably settled for many minutes.
+    // Bead jleechan-zeij / issue #322 (r2). Re-roll may supersede the
+    // previous worker — fabricate a fresh attempt branch and close the old
+    // PR — ONLY when it can positively confirm that worker is safe to
+    // replace. r0 confirmed nothing useful (a 60s HEAD-stability wait that
+    // parked HUMAN_HELD on the idle+spawning case, defeating unattended
+    // end-to-end on every red gate_assessment); r1 over-corrected to
+    // fail-OPEN (always proceed after a short best-effort wait), which lets a
+    // genuinely-live worker get its PR closed and a duplicate lane spawned
+    // while it is still pushing. r2 is fail-CLOSED: supersede ONLY on a
+    // positive proceed signal, otherwise DEFER — never park on a single
+    // unconfirmed poll, never proceed on doubt.
     //
-    // The bug observed live (2026-07-18, U4 lanes 9lvs / mh9o):
-    // the AO session reports `status=spawning, activity=idle` (worker
-    // finished and went back to idle without an explicit kill), which the
-    // adapter's `is_terminal_ao_session` predicate (adapters.rs:3408)
-    // classifies as NOT terminal. The 60s hardcoded loop then expires
-    // and parks the bead HUMAN_HELD on every red gate_assessment,
-    // defeating unattended end-to-end dispatch.
+    // Proceed predicate — supersede iff ANY of:
+    //   (a) attach() -> SessionNotFound: the worker is already fully reaped;
+    //       nothing live to guard against (reason "no_live_session").
+    //   (b) session TERMINAL and two consecutive stable head_sha(branch)
+    //       reads: the worker exited and its branch has settled.
+    //   (c) session activity IDLE and head_sha stable across the window: the
+    //       #322 live case (`status=spawning, activity=idle`) — the worker
+    //       finished and went idle without an explicit kill; safe to
+    //       supersede once its branch is observably static.
+    // Liveness and head-stability are evaluated JOINTLY on every poll, and
+    // head_sha is sampled on EVERY poll (not only terminal ones) so a
+    // mid-window push denies the predicate.
     //
-    // The judo move: replace the 60s hard timeout with a SHORT
-    // best-effort wait (a couple of polls with a small ceiling — ~3s) that
-    // only blocks reroll when a worker is ACTIVELY in the middle of
-    // pushing. If `is_quiescent` is already false (the typical
-    // idle+spawning case) or never becomes true within the short window,
-    // we fall through to branch fabrication: `stop()` has already been
-    // issued (freeing the global worker slot), and the verifier has
-    // already positively confirmed the worker's final SHA at gate
-    // assessment time, so there is no race to guard against at reroll
-    // entry. The genuine mid-push race is still covered by the
-    // DISPATCHED -> ATTESTED transition (tick.rs:2092), not by the reroll
-    // path.
+    // Ordering (req 4): stop() must succeed BEFORE the predicate — a failed
+    // kill means the worker is still alive, which is a DEFER. Session state
+    // and head_sha are read AFTER stop. bead.session_id is cleared ONLY on a
+    // confirmed proceed.
     //
-    // Track the per-branch last-observed HEAD SHA across this single
-    // reroll call's wait window so we can detect a mid-window push even
-    // within the short ceiling. Cleared on every reroll entry so stale
-    // values never leak between beads.
-    if let Some(ref branch) = bead.branch {
+    // Errors (req 5): only DaemonError::is_transient() errors are swallowed
+    // (as a DEFER, with distinct telemetry reasons quiescence_check_transient
+    // / head_query_transient); a permanent error propagates.
+    if let Some(branch) = bead.branch.clone() {
         emit_telemetry(
             deps.telemetry_log,
             &bead.bead_id,
@@ -293,162 +307,135 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
             serde_json::json!({"branch": branch}),
         )?;
 
-        // attach() returns Err(SessionNotFound) when the previous worker
-        // has already been fully reaped (no AO entry in `ao status`). In
-        // that case there is nothing to stop and nothing to wait for —
-        // clear the durable handle and fall through to branch fabrication.
-        let session_id_result = deps.sessions.attach(branch, &bead.bead_id);
-        let session_id = match session_id_result {
-            Ok(id) => Some(id),
-            Err(DaemonError::SessionNotFound { .. }) => {
-                bead.session_id = None;
-                deps.store.save(bead)?;
-                emit_telemetry(
-                    deps.telemetry_log,
-                    &bead.bead_id,
-                    bead.attempt,
-                    bead.state.as_str(),
-                    "REROLL_QUIESCENCE_SUCCESS",
-                    serde_json::json!({}),
-                    serde_json::json!({"reason": "no_live_session"}),
-                )?;
-                None
+        // Yields the static proceed reason to fall through to step 4; every
+        // non-proceed path early-returns (Deferred / Held) from within.
+        let proceed_reason: &'static str = match deps.sessions.attach(&branch, &bead.bead_id) {
+            // (a) No live worker to supersede — fast-path proceed.
+            Err(DaemonError::SessionNotFound { .. }) => "no_live_session",
+            // A transient `ao status` failure means we cannot even identify
+            // the session this tick — defer rather than park.
+            Err(e) if e.is_transient() => {
+                return defer_or_cap(deps, bead, "attach_transient");
             }
+            // A permanent attach failure (ambiguous/malformed status) fails
+            // closed to a human hold, exactly as r0/r1 did.
             Err(e) => {
                 bead.state = OverlayState::HumanHeld;
                 set_human_hold_reason(bead, HumanHoldReason::RerollSessionAttachFailed);
                 deps.store.save(bead)?;
                 return Ok(RerollOutcome::Held(format!("failed to attach to session: {e}")));
             }
-        };
-
-        // Skip the entire stop-and-wait block when no live session exists.
-        // This handles both "branch has no live session" (None) and
-        // "bead has no branch at all" (the outer `if let Some` already
-        // returned early for that case via the fall-through to step 4
-        // below).
-        if let Some(session_id) = session_id.as_ref() {
-        // Best-effort stop — failure to stop is logged but does NOT park
-        // the bead. The worker slot is the only thing we need to free; if
-        // `stop` itself errors (e.g. transient `ao` failure), the next
-        // tick's `active_count` sweep will still see an idle session
-        // counted as active (a separate, pre-existing accounting
-        // problem — NOT this fix's concern), and the reroll can safely
-        // proceed to fabricate a fresh branch on a different attempt slot.
-        if let Err(e) = deps.sessions.stop(session_id) {
-            emit_telemetry(
-                deps.telemetry_log,
-                &bead.bead_id,
-                bead.attempt,
-                bead.state.as_str(),
-                "REROLL_QUIESCENCE_STOP_FAILED_BEST_EFFORT",
-                serde_json::json!({}),
-                serde_json::json!({"sessionId": session_id.0, "error": format!("{e}")}),
-            )?;
-        }
-
-        // Short best-effort wait: a couple of polls with a small ceiling
-        // (~3s). The previous 60s timeout with HEAD-SHA stability is
-        // removed; see the rationale above for why it was unreachable for
-        // the genuine ATTESTED -> RE_ROLL case in practice.
-        //
-        // We DO still observe HEAD SHA on each terminal poll: if the
-        // session is reporting terminal but the branch HEAD is still
-        // moving (the genuine mid-push race the original §4.2.6 spec was
-        // written for), we keep polling until either two consecutive
-        // terminal+matching reads (stable) OR the short ceiling expires.
-        // We do NOT extend the ceiling to 60s — that was the bug.
-        let start = std::time::Instant::now();
-        let poll_interval = std::time::Duration::from_millis(500);
-        let max_wait = std::time::Duration::from_secs(3);
-        let mut confirmed = false;
-        let mut observed_terminal = false;
-        let mut last_terminal_head: Option<String> = None;
-        while start.elapsed() < max_wait {
-            let is_terminal = match deps.sessions.is_quiescent(session_id) {
-                Ok(v) => v,
-                Err(e) => {
-                    // Transient AO status query failure — log but don't
-                    // park. A transient `ao` failure should not block a
-                    // fresh attempt branch when the underlying state is
-                    // already known-good (ATTESTED -> RE_ROLL).
+            Ok(session_id) => {
+                // Ordering req: stop() must succeed BEFORE evaluating the
+                // predicate. A failed kill means the worker is (or may be)
+                // alive — DEFER, do not proceed.
+                if let Err(e) = deps.sessions.stop(&session_id) {
                     emit_telemetry(
                         deps.telemetry_log,
                         &bead.bead_id,
                         bead.attempt,
                         bead.state.as_str(),
-                        "REROLL_QUIESCENCE_CHECK_TRANSIENT",
+                        "REROLL_QUIESCENCE_STOP_FAILED",
                         serde_json::json!({}),
-                        serde_json::json!({"error": format!("{e}")}),
+                        serde_json::json!({"sessionId": session_id.0, "error": format!("{e}")}),
                     )?;
-                    break;
+                    return defer_or_cap(deps, bead, "stop_failed");
                 }
-            };
 
-            if is_terminal {
-                observed_terminal = true;
-                let head = match deps.vcs.head_sha(branch) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        // Same rationale as the transient check above: a
-                        // transient `git` failure should not park the
-                        // bead when the underlying state is already
-                        // known-good.
-                        emit_telemetry(
-                            deps.telemetry_log,
-                            &bead.bead_id,
-                            bead.attempt,
-                            bead.state.as_str(),
-                            "REROLL_QUIESCENCE_HEAD_TRANSIENT",
-                            serde_json::json!({}),
-                            serde_json::json!({"error": format!("{e}")}),
-                        )?;
-                        break;
+                // Joint liveness + head-stability poll (state read AFTER
+                // stop). A confirmed proceed requires a non-running activity
+                // (Terminal / Idle / NotFound) observed TWICE in a row with
+                // an unchanged head_sha in between.
+                let start = std::time::Instant::now();
+                let poll_interval = std::time::Duration::from_millis(500);
+                let max_wait = std::time::Duration::from_secs(3);
+                let mut confirmed_reason: Option<&'static str> = None;
+                let mut last_stable_head: Option<String> = None;
+                while start.elapsed() < max_wait {
+                    // Liveness probe (idle vs running vs terminal).
+                    let activity = match deps.sessions.session_activity(&session_id) {
+                        Ok(a) => a,
+                        Err(e) if e.is_transient() => {
+                            emit_telemetry(
+                                deps.telemetry_log,
+                                &bead.bead_id,
+                                bead.attempt,
+                                bead.state.as_str(),
+                                "REROLL_QUIESCENCE_CHECK_TRANSIENT",
+                                serde_json::json!({}),
+                                serde_json::json!({"reason": "quiescence_check_transient", "error": format!("{e}")}),
+                            )?;
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    };
+
+                    // Sample head_sha on EVERY poll (req 3): a mid-window
+                    // push must deny the predicate even while the session
+                    // already looks idle/terminal.
+                    let head = match deps.vcs.head_sha(&branch) {
+                        Ok(h) => h,
+                        Err(e) if e.is_transient() => {
+                            emit_telemetry(
+                                deps.telemetry_log,
+                                &bead.bead_id,
+                                bead.attempt,
+                                bead.state.as_str(),
+                                "REROLL_QUIESCENCE_HEAD_TRANSIENT",
+                                serde_json::json!({}),
+                                serde_json::json!({"reason": "head_query_transient", "error": format!("{e}")}),
+                            )?;
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    };
+
+                    match activity {
+                        SessionActivity::Running => {
+                            // The genuine "do not supersede a live worker"
+                            // case. Any prior stability streak is void; keep
+                            // polling until the ceiling, then defer.
+                            last_stable_head = None;
+                        }
+                        SessionActivity::Terminal
+                        | SessionActivity::Idle
+                        | SessionActivity::NotFound => match &last_stable_head {
+                            Some(prev) if *prev == head => {
+                                // Two consecutive non-running polls with an
+                                // unchanged HEAD — the branch has settled.
+                                confirmed_reason = Some(match activity {
+                                    SessionActivity::Terminal => "confirmed_terminal_stable_head",
+                                    SessionActivity::NotFound => "confirmed_session_reaped",
+                                    _ => "confirmed_idle_stable_head",
+                                });
+                                break;
+                            }
+                            _ => {
+                                // First non-running observation, or the HEAD
+                                // moved since the last one (a push landed
+                                // mid-window) — (re)start the two-read streak.
+                                last_stable_head = Some(head);
+                            }
+                        },
                     }
-                };
-                match &last_terminal_head {
-                    Some(prev) if *prev == head => {
-                        // Two consecutive terminal+matching reads — the
-                        // worker's final commit has settled.
-                        confirmed = true;
-                        break;
-                    }
-                    _ => {
-                        // First terminal observation, or the HEAD SHA
-                        // moved since the last terminal observation (a
-                        // push landed mid-window) — reset the streak and
-                        // try again on the next poll.
-                        last_terminal_head = Some(head);
-                    }
+
+                    std::thread::sleep(poll_interval);
                 }
-            } else {
-                // Not yet terminal. Idle+spawning (the live bug) lives
-                // here: we keep polling until `max_wait` expires, then
-                // fall through. Any HEAD SHA stability streak observed
-                // while it looked terminal is no longer trustworthy.
-                last_terminal_head = None;
+
+                match confirmed_reason {
+                    Some(reason) => reason,
+                    // Unconfirmed (live/running worker, moving HEAD, or a
+                    // transient-check break): DEFER. session_id is
+                    // deliberately NOT cleared — the worker may still be live.
+                    None => return defer_or_cap(deps, bead, "unconfirmed_live_or_moving_head"),
+                }
             }
-
-            std::thread::sleep(poll_interval);
-        }
-
-        // No `HUMAN_HELD` park on timeout, on `stop` failure, or on
-        // transient quiescence/head_sha errors. The bead is known-good at
-        // entry (ATTESTED -> RE_ROLL); a transient wait failure should
-        // never block the fresh attempt branch. The `confirmed` flag is
-        // retained in telemetry so post-hoc debugging can distinguish
-        // "waited and confirmed" from "waited and gave up".
-        let reason = if confirmed {
-            "confirmed_terminal_stable_head"
-        } else if observed_terminal {
-            "terminal_seen_head_unstable"
-        } else {
-            "best_effort_window_elapsed"
         };
 
-        // Clear the durable session handle regardless of confirmation —
-        // the previous worker is by definition replaced by the fresh
-        // attempt we are about to fabricate.
+        // Confirmed proceed: clear the durable session handle (ONLY here —
+        // req 4) and reset the consecutive-deferral counter in the same save
+        // before any later step can create a recoverable hold.
+        deps.store.reset_reroll_deferral(&bead.bead_id)?;
         bead.session_id = None;
         deps.store.save(bead)?;
 
@@ -459,9 +446,8 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
             bead.state.as_str(),
             "REROLL_QUIESCENCE_SUCCESS",
             serde_json::json!({}),
-            serde_json::json!({"reason": reason}),
+            serde_json::json!({"reason": proceed_reason}),
         )?;
-        }
     }
 
     // 4. Compute baseline
@@ -575,6 +561,58 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     )?;
 
     Ok(RerollOutcome::Rerolled { new_branch })
+}
+
+/// Bead jleechan-zeij / issue #322 r2: the fail-closed defer/escalate step of
+/// the re-roll proceed predicate. Increments the bead's consecutive re-roll
+/// deferral counter; below `MAX_REROLL_DEFERRALS` it leaves the bead
+/// `ATTESTED` (so `run_fast_tier` re-selects and re-evaluates it next tick)
+/// and returns `Deferred`; at the cap it escalates to `HUMAN_HELD`.
+///
+/// `session_id` is deliberately left untouched — a deferral means the
+/// previous worker may still be live, and clearing the durable handle is
+/// reserved for a confirmed proceed (`execute` step 3). Likewise NO fresh
+/// branch is fabricated and NO PR is closed on this path.
+fn defer_or_cap(
+    deps: &RerollDeps,
+    bead: &mut BeadOverlay,
+    reason: &str,
+) -> Result<RerollOutcome, DaemonError> {
+    let count = deps.store.incr_reroll_deferral(&bead.bead_id)?;
+    if count >= MAX_REROLL_DEFERRALS {
+        bead.state = OverlayState::HumanHeld;
+        set_human_hold_reason(bead, HumanHoldReason::RerollQuiescenceDeferralCapExceeded);
+        deps.store.save(bead)?;
+        emit_telemetry(
+            deps.telemetry_log,
+            &bead.bead_id,
+            bead.attempt,
+            bead.state.as_str(),
+            "REROLL_QUIESCENCE_DEFERRAL_CAP_EXCEEDED",
+            serde_json::json!({"deferralCount": count}),
+            serde_json::json!({"reason": reason, "cap": MAX_REROLL_DEFERRALS}),
+        )?;
+        return Ok(RerollOutcome::Held(format!(
+            "re-roll deferred {count} consecutive ticks without confirming the previous worker \
+             was safe to supersede (last reason: {reason}); parked at cap {MAX_REROLL_DEFERRALS}"
+        )));
+    }
+
+    // Below the cap: leave the bead re-eligible for the fast tier. `execute`
+    // set state=RE_ROLL at entry; reset to ATTESTED so `run_fast_tier`
+    // re-selects it next tick (it skips non-ATTESTED overlays).
+    bead.state = OverlayState::Attested;
+    deps.store.save(bead)?;
+    emit_telemetry(
+        deps.telemetry_log,
+        &bead.bead_id,
+        bead.attempt,
+        bead.state.as_str(),
+        "REROLL_QUIESCENCE_DEFERRED",
+        serde_json::json!({"deferralCount": count}),
+        serde_json::json!({"reason": reason}),
+    )?;
+    Ok(RerollOutcome::Deferred(reason.to_string()))
 }
 
 /// Adopted-PR remediation dispatches a real coder session onto the EXISTING

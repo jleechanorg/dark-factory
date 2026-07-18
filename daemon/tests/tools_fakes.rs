@@ -106,6 +106,10 @@ fn fake_sessions_spawn_attach_stop_quiescent_roundtrip() {
         branch_for: Default::default(),
         terminal_at: Default::default(),
         quiescence_check_error: Default::default(),
+        attach_not_found_for: Default::default(),
+        fail_attach_permanent_for: Default::default(),
+        activity: Default::default(),
+        activity_permanent_error: Default::default(),
         worktree_remote_override: Default::default(),
         transcript_activity_for: Default::default(),
     };

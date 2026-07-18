@@ -3246,6 +3246,24 @@ impl Sessions for CliSessions {
         session_is_quiescent(&data, id)
     }
 
+    /// Bead jleechan-zeij / issue #322 r2: read AO's per-session `activity`
+    /// field directly so the re-roll proceed predicate can tell an idle
+    /// worker (`status=spawning, activity=idle` — safe to supersede jointly
+    /// with a stable HEAD) apart from a running one (never safe). Same
+    /// `ao status --json` parsing shape as `is_quiescent` above; a session
+    /// with no matching status row classifies as `NotFound` (fully reaped).
+    fn session_activity(
+        &self,
+        id: &SessionId,
+    ) -> Result<crate::tools::SessionActivity, DaemonError> {
+        let out = run_tool("ao", &["status", "--json"], 30)?;
+        let json_start = out.find('[').unwrap_or(0);
+        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse ao status: {e}"))
+        })?;
+        session_activity(&data, id)
+    }
+
     /// jleechan-5ia2: `ao status --json` already reports each session's
     /// `branch` field (verified live: `ao status --json | jq '.[].branch'`).
     /// Reuse the same parsing shape as `is_quiescent` above. Any failure to
@@ -3425,6 +3443,36 @@ fn session_is_quiescent(
         .is_some_and(is_terminal_ao_session))
 }
 
+/// Bead jleechan-zeij / issue #322 r2: classify a session's liveness into
+/// [`SessionActivity`]. Ordering matters — a terminal status wins over the
+/// `activity` field (a `killed` session may still carry a stale
+/// `activity=idle`), then `activity=="idle"` distinguishes an alive-but-idle
+/// worker (the #322 signature) from an actively-running one. A session with
+/// no matching row is `NotFound`. Same `ao status --json` shape as
+/// `session_is_quiescent`.
+fn session_activity(
+    data: &serde_json::Value,
+    id: &SessionId,
+) -> Result<crate::tools::SessionActivity, DaemonError> {
+    use crate::tools::SessionActivity;
+    let sessions = data
+        .as_array()
+        .ok_or_else(|| DaemonError::Parse("ao status JSON must be an array".to_string()))?;
+    let Some(entry) = sessions
+        .iter()
+        .find(|entry| entry.get("name").and_then(|value| value.as_str()) == Some(&id.0))
+    else {
+        return Ok(SessionActivity::NotFound);
+    };
+    if is_terminal_ao_session(entry) {
+        return Ok(SessionActivity::Terminal);
+    }
+    if entry.get("activity").and_then(|value| value.as_str()) == Some("idle") {
+        return Ok(SessionActivity::Idle);
+    }
+    Ok(SessionActivity::Running)
+}
+
 fn session_for_branch(
     data: &serde_json::Value,
     branch: &str,
@@ -3505,8 +3553,49 @@ fn active_session_count(data: &serde_json::Value) -> Result<usize, DaemonError> 
 
 #[cfg(test)]
 mod active_session_count_tests {
-    use super::{active_session_count, session_for_branch, session_is_quiescent};
-    use crate::tools::SessionId;
+    use super::{active_session_count, session_activity, session_for_branch, session_is_quiescent};
+    use crate::tools::{SessionActivity, SessionId};
+
+    #[test]
+    fn activity_probe_distinguishes_idle_running_terminal_and_missing() {
+        // The #322 live signature is the `idle` row: NOT terminal (so
+        // `is_quiescent` returns false and the r1 loop stalled), but distinct
+        // from a genuinely running worker. A terminal status wins even when a
+        // stale `activity` lingers.
+        let status = serde_json::json!([
+            {"name": "idle-spawning", "status": "spawning", "activity": "idle"},
+            {"name": "running", "status": "working", "activity": "working"},
+            {"name": "killed-stale-idle", "status": "killed", "activity": "idle"},
+            {"name": "exited", "status": "working", "activity": "exited"},
+            {"name": "done", "status": "done", "activity": "ready"}
+        ]);
+
+        assert_eq!(
+            session_activity(&status, &SessionId("idle-spawning".into())).unwrap(),
+            SessionActivity::Idle
+        );
+        assert_eq!(
+            session_activity(&status, &SessionId("running".into())).unwrap(),
+            SessionActivity::Running
+        );
+        assert_eq!(
+            session_activity(&status, &SessionId("killed-stale-idle".into())).unwrap(),
+            SessionActivity::Terminal
+        );
+        assert_eq!(
+            session_activity(&status, &SessionId("exited".into())).unwrap(),
+            SessionActivity::Terminal
+        );
+        assert_eq!(
+            session_activity(&status, &SessionId("done".into())).unwrap(),
+            SessionActivity::Terminal
+        );
+        assert_eq!(
+            session_activity(&status, &SessionId("gone".into())).unwrap(),
+            SessionActivity::NotFound
+        );
+        assert!(session_activity(&serde_json::json!({}), &SessionId("x".into())).is_err());
+    }
 
     #[test]
     fn global_cap_counts_active_sessions_across_projects_and_unknown_activity() {
