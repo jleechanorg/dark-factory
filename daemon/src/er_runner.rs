@@ -271,11 +271,8 @@ pub fn snapshot_with_comments(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         updated_at_epoch: 0,
         ci_status: "green".into(),
         coderabbit_status: "green".into(),
-        bugbot_status: "green".into(),
         ci_pending: false,
         head_committed_epoch: 0,
-        pending_check_names: vec![],
-        check_names_and_buckets: vec![],
     }
 }
 
@@ -518,8 +515,6 @@ mod tests {
             spec_dir: ".factory/specs/".into(),
             reroll_head_stability_window_secs: 30,
             reroll_death_confirm_secs: 5,
-            held_recheck_cooldown_secs: 900,
-            escalation_refire_secs: 3600,
             repos: std::collections::HashMap::new(),
         }
     }

@@ -52,8 +52,6 @@ fn test_cfg(spec_dir: &std::path::Path) -> Config {
         spec_dir: spec_dir.to_string_lossy().to_string(),
         reroll_head_stability_window_secs: 1,
         reroll_death_confirm_secs: 0,
-        held_recheck_cooldown_secs: 900,
-        escalation_refire_secs: 3600,
         repos: std::collections::HashMap::new(),
     }
 }
