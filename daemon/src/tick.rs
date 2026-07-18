@@ -579,7 +579,39 @@ pub fn run_tick(
                             let transcript_is_active = transcript_epoch
                                 .is_some_and(|t| now_epoch.saturating_sub(t) < 1800);
 
-                            if branch_is_silent && transcript_is_active {
+                            // jleechan-9rkz: third liveness signal — the
+                            // worktree's local HEAD commit timestamp. The
+                            // transcript check (#304) covers the case where
+                            // the coder is mid-tool-call, but a coder
+                            // between tool invocations (or whose bash sub-
+                            // shell exited and is between user prompts)
+                            // can still appear silent on BOTH the remote
+                            // branch AND its own transcript while commits
+                            // keep landing locally. `git log -1 --format=
+                            // %ct` from the worktree is the independent
+                            // third signal that catches this — `Ok(None)`
+                            // means "cannot verify" (no worktree on disk,
+                            // non-zero git exit, unparseable output) and
+                            // is treated as "no positive liveness signal",
+                            // NOT as positive silence.
+                            let worktree_last_commit = deps
+                                .cfg
+                                .resolve_repo(overlay.repo(deps.cfg))
+                                .map(|routing| {
+                                    deps.scm
+                                        .worktree_branch_last_commit(
+                                            &routing.ao_project,
+                                            branch,
+                                        )
+                                })
+                                .transpose()?
+                                .flatten();
+                            let worktree_is_active = worktree_last_commit
+                                .is_some_and(|t| now_epoch.saturating_sub(t) < 1800);
+
+                            if branch_is_silent
+                                && (transcript_is_active || worktree_is_active)
+                            {
                                 emit(
                                     deps.telemetry_log,
                                     &overlay.bead_id,
@@ -592,6 +624,7 @@ pub fn run_tick(
                                         "branch": branch,
                                         "last_commit_epoch": last_commit_epoch,
                                         "transcript_epoch": transcript_epoch,
+                                        "worktree_last_commit": worktree_last_commit,
                                     }),
                                 )?;
                             } else if branch_is_silent {
@@ -605,7 +638,12 @@ pub fn run_tick(
                                     OverlayState::HumanHeld.as_str(),
                                     "PARKED_HUMAN_HELD",
                                     serde_json::json!({}),
-                                    serde_json::json!({"reason": "coder_silent"}),
+                                    serde_json::json!({
+                                        "reason": "coder_silent",
+                                        "remote_last_commit": last_commit_epoch,
+                                        "transcript_epoch": transcript_epoch,
+                                        "worktree_last_commit": worktree_last_commit,
+                                    }),
                                 )?;
                                 let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): coder silent/inactive on branch for 30 minutes.".to_string();
                                 let _ = post_scm_comment_by_bead_id(

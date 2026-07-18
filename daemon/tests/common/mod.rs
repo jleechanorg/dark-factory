@@ -162,6 +162,14 @@ pub struct FakeScm {
     pub permissions: HashMap<String, Permission>,
     pub pr_snapshots: HashMap<u64, PrSnapshot>,
     pub remote_branches: HashMap<String, Option<u64>>,
+    /// jleechan-9rkz: scripted local worktree HEAD commit timestamps, keyed
+    /// by `(ao_project, branch)`. `None` value (or absent key) means
+    /// "no positive liveness signal" (matches the production
+    /// `worktree_branch_last_commit` default impl). Used by the local-HEAD
+    /// regression tests in `tick_integration.rs` to stage the
+    /// stale-remote / cold-transcript / fresh-worktree-HEAD scenario that
+    /// the merged transcript-based check (#304) alone cannot save.
+    pub worktree_last_commits: HashMap<(String, String), Option<u64>>,
     /// jleechan-drive-pr-branch-binding-pcpr: scripted open-PR lookups,
     /// keyed by `(repo, pr_number)`. Absence of a key (the `Default` case)
     /// means `PrHeadBranch::NotFound`, matching the real `CliScm` fail-safe
@@ -175,6 +183,35 @@ pub struct FakeScm {
 impl FakeScm {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// jleechan-9rkz: script a local worktree HEAD commit timestamp for
+    /// `(ao_project, branch)`. Omit to model "worktree on disk but no
+    /// commit yet / git call failed" (the production adapter also
+    /// returns `Ok(None)` in those cases — see
+    /// `Scm::worktree_branch_last_commit`).
+    pub fn set_worktree_last_commit(
+        &mut self,
+        ao_project: &str,
+        branch: &str,
+        epoch: u64,
+    ) {
+        self.worktree_last_commits.insert(
+            (ao_project.to_string(), branch.to_string()),
+            Some(epoch),
+        );
+    }
+
+    /// jleechan-9rkz: explicit absence override — models
+    /// "worktree on disk but no commit yet / git call failed". Use this
+    /// when a test wants to assert that the silence sweep correctly
+    /// falls back to the other two signals when the worktree read
+    /// itself returns `Ok(None)`.
+    pub fn clear_worktree_last_commit(&mut self, ao_project: &str, branch: &str) {
+        self.worktree_last_commits.remove(&(
+            ao_project.to_string(),
+            branch.to_string(),
+        ));
     }
 }
 
@@ -275,6 +312,25 @@ impl Scm for FakeScm {
             .get(&(repo.to_string(), pr))
             .cloned()
             .unwrap_or(PrHeadBranch::NotFound))
+    }
+
+    /// jleechan-9rkz: scripted local worktree HEAD commit timestamp
+    /// lookup. Returns `Ok(None)` for absent keys (matching the production
+    /// default — "no positive liveness signal") and the scripted value
+    /// when present.
+    fn worktree_branch_last_commit(
+        &self,
+        ao_project: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "worktree_branch_last_commit({ao_project},{branch})"
+        ));
+        Ok(self
+            .worktree_last_commits
+            .get(&(ao_project.to_string(), branch.to_string()))
+            .copied()
+            .flatten())
     }
 }
 

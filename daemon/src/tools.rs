@@ -447,6 +447,29 @@ pub trait Scm {
         let _ = repo;
         self.remote_branch_last_commit(branch)
     }
+    /// Local worktree HEAD commit timestamp for `branch` under
+    /// `ao_project`, if a worktree can be located on disk. `None` means
+    /// "no positive liveness signal" — callers must treat that as
+    /// "cannot disprove silence", NOT as "confirmed silent"
+    /// (jleechan-9rkz: the second of three liveness signals used by the
+    /// coder-silence watcher so a long-running Claude coder that has
+    /// landed commits locally but not yet pushed is not false-parked
+    /// `coder_silent`). The transcript-based check in #304 closes the
+    /// common false-park case, but a coder between tool calls can still
+    /// appear silent on both the remote and its own transcript while
+    /// commits keep landing locally — reading the worktree HEAD commit
+    /// time is the independent third signal that catches this.
+    ///
+    /// Default impl returns `Ok(None)` ("cannot verify") so existing impls
+    /// and fakes that predate the field keep their original behavior.
+    fn worktree_branch_last_commit(
+        &self,
+        ao_project: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let _ = (ao_project, branch);
+        Ok(None)
+    }
     /// Resolve the head branch of PR `pr` in `repo`, but ONLY when that PR
     /// is currently OPEN AND its head lives in the SAME repo
     /// (bead jleechan-drive-pr-branch-binding-pcpr). Used at dispatch time
