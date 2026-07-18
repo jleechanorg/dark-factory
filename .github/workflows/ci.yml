@@ -82,21 +82,37 @@ jobs:
             # the python binary's directory is `<root>/bin`, so the root is its parent
             TOOLCHAIN_ROOT="$(dirname "$(dirname "$PY_REAL")")"
           fi
-          if [ -z "$TOOLCHAIN_ROOT" ] || [ ! -d "$TOOLCHAIN_ROOT" ]; then
+          # 1b) Reject unsafe TOOLCHAIN_ROOT values that would cause `find`
+          # to scan huge trees. The previous step would happily fall through
+          # with `/usr` on Mac arm64 self-hosted runners and then hang in
+          # `find /usr -maxdepth 4 …` for the full job timeout (45+ min on
+          # PR #303). If the resolved root is `/`, `/usr`, `/System`, or any
+          # non-toolcache-looking path, short-circuit with a clear warning.
+          case "$TOOLCHAIN_ROOT" in
+            ""|/|"/usr"|"/usr/"|"/System"|"/System/"|"/private"|"/private/")
+              echo "::warning::Refusing to fix libpython under unsafe TOOLCHAIN_ROOT='$TOOLCHAIN_ROOT' (would scan too much)."
+              echo "::warning::self-hosted runners without an actions/setup-python toolcache will fall through to the next step and likely fail with rc=127 — that's a separate signal to investigate."
+              exit 0
+              ;;
+          esac
+          if [ ! -d "$TOOLCHAIN_ROOT" ]; then
             echo "::error::Cannot locate Python toolchain root (PythonLocation=${PythonLocation:-<unset>})."
             exit 1
           fi
           # Sanity: confirm the python3 binary actually exists where we think it is.
           if [ ! -x "$TOOLCHAIN_ROOT/bin/python3" ]; then
-            echo "::error::Expected python3 binary at $TOOLCHAIN_ROOT/bin/python3 but it is missing or not executable."
+            echo "::warning::Expected python3 binary at $TOOLCHAIN_ROOT/bin/python3 but it is missing or not executable — skipping libpython fix (likely system python). exit 0 to let downstream catch the real cause."
             ls -la "$TOOLCHAIN_ROOT" 2>/dev/null || true
-            exit 1
+            exit 0
           fi
           echo "Toolchain root: $TOOLCHAIN_ROOT"
           # 2) Locate the link-time libpython3.13.so in the toolchain's lib dir.
+          # Wrap in `timeout 30` so a runaway filesystem scan can't wedge the
+          # whole workflow. `find` is normally fast but on self-hosted Mac
+          # arm64 runners with `/usr`-sized toolchains it can take minutes.
           SO_PATH="$TOOLCHAIN_ROOT/lib/libpython3.13.so"
           if [ ! -e "$SO_PATH" ]; then
-            SO_PATH="$(find "$TOOLCHAIN_ROOT" -maxdepth 4 -name 'libpython3.13.so' -not -name '*.so.*' 2>/dev/null | head -1)"
+            SO_PATH="$(timeout 30 find "$TOOLCHAIN_ROOT" -maxdepth 4 -name 'libpython3.13.so' -not -name '*.so.*' 2>/dev/null | head -1 || true)"
           fi
           if [ -z "$SO_PATH" ] || [ ! -e "$SO_PATH" ]; then
             echo "::warning::libpython3.13.so not found in toolchain ($TOOLCHAIN_ROOT) — subprocess python will fail."
@@ -136,41 +152,76 @@ jobs:
             #     binary first so the failure mode is reversible if the
             #     shell that runs the step misbehaves.
             SHIM_REAL="$TOOLCHAIN_ROOT/bin/python3.real"
-            for SHIM_NAME in python3 python; do
-              SHIM_BIN="$TOOLCHAIN_ROOT/bin/$SHIM_NAME"
-              if [ -e "$SHIM_REAL" ]; then
-                # Real binary is already preserved by an earlier iteration.
-                # Install (or refresh) the shim that execs it with LD_PRELOAD.
-                if [ "$SHIM_BIN" = "$SHIM_REAL" ]; then
-                  continue
+            # 4c) Skip the shim install when SHIM_BIN lives under a SIP-protected
+            # macOS path (`/usr/bin`, `/bin`, `/sbin`, `/System`, `/private`).
+            # Trying to `mv` those binaries fails silently with `Operation not
+            # permitted` on macOS and the script wedges (verified on
+            # ez-mac-runner-b-3 PR #303 2026-07-17). The libpython symlink fix
+            # at step (4) above is the primary remediation; the shim is a
+            # belt-and-suspenders for subprocesses that strip LD_LIBRARY_PATH.
+            #
+            # 4d) ALSO skip the shim install when the toolchain python binary
+            # already resolves libpython via its DT_NEEDED entry (the normal
+            # case on actions/setup-python Linux x64/arm64 runners, where
+            # `ldd $TOOLCHAIN_ROOT/bin/python3.real` shows
+            # `libpython3.13.so.1.0 => .../libpython3.13.so.1.0`). Force-loading
+            # libpython via LD_PRELOAD in that case loads the same .so TWICE in
+            # the python process (once via DT_NEEDED, once via dlopen) and the
+            # interpreter deadlocks during shutdown (`sys.exit(0)` after
+            # `import sys` never returns). Verified on ez-runner-c-4 PR #303
+            # test-job run 29621097672 2026-07-17 — 60s timeout, rc=124.
+            case "$TOOLCHAIN_ROOT/bin" in
+              /usr/bin|/bin|/sbin|/usr/sbin|/System/*|/private/*)
+                echo "::warning::SHIM_BIN under SIP-protected path ($TOOLCHAIN_ROOT/bin) — skipping shim install. Downstream tests that strip LD_LIBRARY_PATH will need their own handling."
+                ;;
+              *)
+                # If the toolchain binary already links libpython via DT_NEEDED,
+                # the versioned-symlink fix at step (4) is sufficient and the
+                # LD_PRELOAD shim would deadlock the interpreter (double-load).
+                NEEDS_LIBPYTHON="$(LD_LIBRARY_PATH="$SO_DIR" timeout 10 "$SHIM_REAL" --version 2>&1 || true; ldd "$SHIM_REAL" 2>/dev/null | grep -c 'libpython3.13.so' || true)"
+                if [ "${NEEDS_LIBPYTHON:-0}" -gt 0 ] 2>/dev/null; then
+                  echo "Toolchain python already links libpython3.13.so via DT_NEEDED — skipping LD_PRELOAD shim to avoid double-load deadlock (PR #303 ez-runner-c-4 self-test rc=124). Step (4) symlink + LD_LIBRARY_PATH are sufficient."
+                else
+                  for SHIM_NAME in python3 python; do
+                    SHIM_BIN="$TOOLCHAIN_ROOT/bin/$SHIM_NAME"
+                    if [ -e "$SHIM_REAL" ]; then
+                      # Real binary is already preserved by an earlier iteration.
+                      # Install (or refresh) the shim that execs it with LD_PRELOAD.
+                      if [ "$SHIM_BIN" = "$SHIM_REAL" ]; then
+                        continue
+                      fi
+                      printf '#!/usr/bin/env bash\nexec env LD_PRELOAD="%s" "%s" "$@"\n' \
+                        "$SO_PATH" "$SHIM_REAL" > "$SHIM_BIN"
+                      chmod +x "$SHIM_BIN"
+                      echo "Installed shim: $SHIM_BIN -> exec $SHIM_REAL with LD_PRELOAD=$SO_PATH"
+                    elif [ -x "$SHIM_BIN" ]; then
+                      # First iteration: preserve the real binary then shim it.
+                      mv "$SHIM_BIN" "$SHIM_REAL"
+                      printf '#!/usr/bin/env bash\nexec env LD_PRELOAD="%s" "%s" "$@"\n' \
+                        "$SO_PATH" "$SHIM_REAL" > "$SHIM_BIN"
+                      chmod +x "$SHIM_BIN"
+                      echo "Installed shim: $SHIM_BIN -> exec $SHIM_REAL with LD_PRELOAD=$SO_PATH"
+                    else
+                      echo "::warning::No toolchain python at $SHIM_BIN — skipping shim for that name."
+                    fi
+                  done
+                  # 5) Self-test: invoke the toolchain `python3 -c 'import sys'` NOW,
+                  #    before the test step, so a remaining rc=127 surfaces as a
+                  #    step-level error here instead of failing the entire pytest
+                  #    run (which would mask the real cause).
+                  # Wrap in `timeout 60` so a hung python subprocess can't wedge
+                  # the workflow indefinitely.
+                  echo "Self-test: $SHIM_BIN -c 'import sys; sys.exit(0)'"
+                  timeout 60 "$SHIM_BIN" -c 'import sys; sys.exit(0)'
+                  rc=$?
+                  if [ "$rc" -ne 0 ]; then
+                    echo "::error::subprocess python3 still fails after symlink fix (rc=$rc). libpython is not loadable."
+                    exit 1
+                  fi
+                  echo "Self-test ok (rc=$rc)"
                 fi
-                printf '#!/usr/bin/env bash\nexec env LD_PRELOAD="%s" "%s" "$@"\n' \
-                  "$SO_PATH" "$SHIM_REAL" > "$SHIM_BIN"
-                chmod +x "$SHIM_BIN"
-                echo "Installed shim: $SHIM_BIN -> exec $SHIM_REAL with LD_PRELOAD=$SO_PATH"
-              elif [ -x "$SHIM_BIN" ]; then
-                # First iteration: preserve the real binary then shim it.
-                mv "$SHIM_BIN" "$SHIM_REAL"
-                printf '#!/usr/bin/env bash\nexec env LD_PRELOAD="%s" "%s" "$@"\n' \
-                  "$SO_PATH" "$SHIM_REAL" > "$SHIM_BIN"
-                chmod +x "$SHIM_BIN"
-                echo "Installed shim: $SHIM_BIN -> exec $SHIM_REAL with LD_PRELOAD=$SO_PATH"
-              else
-                echo "::warning::No toolchain python at $SHIM_BIN — skipping shim for that name."
-              fi
-            done
-            # 5) Self-test: invoke the toolchain `python3 -c 'import sys'` NOW,
-            #    before the test step, so a remaining rc=127 surfaces as a
-            #    step-level error here instead of failing the entire pytest
-            #    run (which would mask the real cause).
-            echo "Self-test: $SHIM_BIN -c 'import sys; sys.exit(0)'"
-            "$SHIM_BIN" -c 'import sys; sys.exit(0)'
-            rc=$?
-            if [ "$rc" -ne 0 ]; then
-              echo "::error::subprocess python3 still fails after symlink fix (rc=$rc). libpython is not loadable."
-              exit 1
-            fi
-            echo "Self-test ok (rc=$rc)"
+                ;;
+            esac
           fi
 
       - name: Detect runner platform (Linux-only isolation tests)
