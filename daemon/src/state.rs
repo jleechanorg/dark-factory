@@ -302,6 +302,25 @@ pub enum HumanHoldReason {
     Stage1GateNotGreen,
     SpecValidationFailed,
     RouterParse(String),
+    /// jleechan-8jxr: companion to `UnmappedTargetRepo`. Distinct because
+    /// the failure modes differ — `UnmappedTargetRepo` fires when Stage A
+    /// resolved an EXPLICIT but unmappable repo (e.g. the body declared
+    /// `target_repo: someorg/unrelated-repo` but `[repos."someorg/..."]`
+    /// is absent and the daemon's global `cfg.target_repo` does not name
+    /// that repo either). `UnmappedRepo` fires when Stage A could not
+    /// resolve ANY repo for the bead — neither an explicit
+    /// `target_repo:` body field nor a usable `external_ref`
+    /// (`<owner>/<repo>#N` prefix) was available, so `overlay.target_repo`
+    /// is `None` and dispatch's `overlay.repo(cfg)` fallback would
+    /// otherwise silently substitute `cfg.target_repo` and dispatch into
+    /// whatever repo the daemon happens to be configured for. Live
+    /// evidence 2026-07-18: five factory-labeled beads whose work targeted
+    /// `jleechanorg/dark-factory` were unintentionally routed to the
+    /// daemon's `cfg.target_repo` (`jleechanorg/worldarchitect.ai`) because
+    /// both resolvers returned `None`; the fail-closed gate now requires
+    /// an operator or refiling agent to supply an explicit
+    /// `external_ref` or `target_repo:` body field before redispatch.
+    UnmappedRepo,
     UnmappedTargetRepo,
     WorktreeRemoteMismatch,
     WorktreeRemoteUnverifiable,
@@ -341,6 +360,7 @@ impl HumanHoldReason {
                 return format!("{ROUTER_PARSE_PARK_REASON_PREFIX} {reason}");
             }
             Self::UnmappedTargetRepo => "unmapped_target_repo",
+            Self::UnmappedRepo => "unmapped_repo",
             Self::WorktreeRemoteMismatch => "worktree_remote_mismatch",
             Self::WorktreeRemoteUnverifiable => "worktree_remote_unverifiable",
             Self::SpawnCleanupFailed => "spawn_cleanup_failed",

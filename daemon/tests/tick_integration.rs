@@ -401,14 +401,20 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
             title: "first bead".into(),
             description: String::new(),
             file_tree_summary: String::new(),
-            external_ref: None,
+            // jleechan-8jxr: pre-fill `external_ref` so this isolation
+            // test continues to exercise its actual contract (dispatch
+            // success/failure isolation). Beads with `external_ref: None`
+            // now park at the fail-closed `unmapped_repo` gate instead
+            // of dispatching.
+            external_ref: Some("owner/repo#1".into()),
         },
         Bead {
             id: "bead-1".into(),
             title: "second bead".into(),
             description: String::new(),
             file_tree_summary: String::new(),
-            external_ref: None,
+            // jleechan-8jxr: same — see note above.
+            external_ref: Some("owner/repo#2".into()),
         },
     ]);
     let sessions = FakeSessions::new();
@@ -2526,7 +2532,12 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
     };
 
     // Run tick 1: should detect manual bead in tracker, see no overlay,
-    // initialize QUEUED overlay, route it, and dispatch it!
+    // initialize QUEUED overlay, route it, and then the jleechan-8jxr
+    // fail-closed `unmapped_repo` gate parks the bead HUMAN_HELD rather
+    // than silently dispatching it to `cfg.target_repo` (the legacy
+    // behavior — reproduced live 2026-07-18 when 5 factory-labeled beads
+    // whose work targeted `jleechanorg/dark-factory` were routed to
+    // the daemon's `cfg.target_repo` instead).
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
 
     assert_eq!(
@@ -2534,16 +2545,34 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
         "manual bead should be auto-created/initialized in DB"
     );
     assert_eq!(summary.beads_routed, 1, "manual bead should be routed");
+    // jleechan-8jxr: a manual bead (no `external_ref`, no `target_repo:`
+    // body field) MUST NOT silently dispatch to `cfg.target_repo`. The
+    // dispatch path's fail-closed gate parks it HUMAN_HELD with reason
+    // `unmapped_repo`, so `beads_dispatched` is 0 — operator or refiling
+    // agent must supply an explicit `external_ref` or `target_repo:`
+    // body field before redispatch.
     assert_eq!(
-        summary.beads_dispatched, 1,
-        "manual bead should be dispatched"
+        summary.beads_dispatched, 0,
+        "manual beads with no resolvable repo identity MUST NOT dispatch silently — the \
+         jleechan-8jxr fail-closed gate parks them with reason `unmapped_repo`, not dispatch \
+         to cfg.target_repo"
     );
 
     let final_overlay = store.load("manual-bead-123").unwrap().unwrap();
-    assert_eq!(final_overlay.state, OverlayState::Dispatched);
     assert_eq!(
-        final_overlay.branch.as_deref(),
-        Some("factory/manual-bead-123-r1")
+        final_overlay.state,
+        OverlayState::HumanHeld,
+        "jleechan-8jxr: manual bead must be parked HUMAN_HELD by the fail-closed gate"
+    );
+    assert_eq!(
+        final_overlay.park_reason.as_deref(),
+        Some("unmapped_repo"),
+        "jleechan-8jxr: the new `unmapped_repo` reason is distinct from the existing \
+         `unmapped_target_repo` — see HumanHoldReason enum doc"
+    );
+    assert!(
+        final_overlay.branch.is_none(),
+        "no branch should ever be registered for a repo-unresolvable bead"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

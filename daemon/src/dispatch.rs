@@ -247,6 +247,63 @@ pub fn dispatch_ready(
         // entry nor the daemon's global `cfg.target_repo` is unmappable —
         // fail loud and park HUMAN_HELD rather than silently defaulting to
         // the global repo (jleechan-9sh5 discipline: never guess a repo).
+        //
+        // jleechan-8jxr: pre-Stage-B gate. Trigger only on MANUAL beads
+        // (`bead.external_ref.is_none()`) whose `overlay.target_repo`
+        // remains `None` at dispatch time. Without this gate,
+        // `overlay.repo(cfg).to_string()` would silently substitute the
+        // daemon's global `cfg.target_repo` and dispatch into whatever
+        // repo the daemon happens to be configured for, regardless of
+        // which repo the bead actually targets. Live evidence 2026-07-18:
+        // five factory-labeled beads whose work targeted
+        // `jleechanorg/dark-factory` were unintentionally routed to the
+        // daemon's `cfg.target_repo` (`jleechanorg/worldarchitect.ai`)
+        // because both the `target_repo:` body field AND the
+        // `external_ref` were absent — intake's `resolve_target_repo`
+        // returned `None`, the overlay persisted `target_repo = None`,
+        // and dispatch's silent global fallback executed. Beads with a
+        // usable `external_ref` are unchanged — tick/intake's Stage A
+        // extracts the `owner/repo` prefix into `overlay.target_repo`
+        // and the gate correctly lets them through. Fail-closed: park
+        // HUMAN_HELD with reason `unmapped_repo` (a NEW `HumanHoldReason`
+        // distinct from `UnmappedTargetRepo` because the failure modes
+        // are different — see `state.rs`'s `HumanHoldReason` enum doc),
+        // forcing the operator or refiling agent to supply an explicit
+        // `external_ref` or `target_repo:` body field before redispatch.
+        if overlay.target_repo.is_none() && bead.external_ref.is_none() {
+            overlay.state = OverlayState::HumanHeld;
+            set_human_hold_reason(&mut overlay, HumanHoldReason::UnmappedRepo);
+            if let Err(err) = store.save(&overlay) {
+                if err.is_transient() {
+                    report.failures.push(failure(
+                        bead,
+                        overlay.attempt,
+                        None,
+                        "unmapped_repo_park_save",
+                        err,
+                    ));
+                    continue;
+                }
+                return Err(err);
+            }
+            report.failures.push(failure(
+                bead,
+                overlay.attempt,
+                None,
+                "unmapped_repo",
+                DaemonError::Config(format!(
+                    "bead {} has no resolvable repo identity (manual bead with no \
+                     `external_ref` AND no `target_repo:` body field — intake's Stage A \
+                     `resolve_target_repo` returned `None`); refusing to silently fall back \
+                     to the daemon's global `cfg.target_repo` {:?}. Operator or refiling \
+                     agent must supply an explicit `external_ref` (e.g. \
+                     `jleechanorg/dark-factory#306`) or a `target_repo: <owner>/<repo>` \
+                     body field before redispatch.",
+                    bead.id, cfg.target_repo
+                )),
+            ));
+            continue;
+        }
         let repo = overlay.repo(cfg).to_string();
         let routing = match cfg.resolve_repo(&repo) {
             Some(routing) => routing,
@@ -1350,6 +1407,16 @@ mod tests {
     }
 
     fn beads(n: usize) -> Vec<(Bead, RoutingVerdict, DriveBranchDecision)> {
+        // jleechan-8jxr: pre-fill `external_ref` with a well-formed
+        // `<cfg.target_repo>#N` reference. The repo-routing gate added in
+        // bead jleechan-8jxr parks manual beads (no `external_ref`, no
+        // `target_repo:` body field) with reason `unmapped_repo` rather
+        // than silently falling back to the daemon's global
+        // `cfg.target_repo` — `None` here would now trip the gate and
+        // regressions would mask. Tests that exercise the explicit
+        // unmapped-repo failure (e.g.
+        // `dispatch_ready_parks_human_held_when_bead_repo_is_unresolvable`)
+        // override the field back to `None` directly.
         (0..n)
             .map(|i| {
                 (
@@ -1358,7 +1425,7 @@ mod tests {
                         title: format!("title {i}"),
                         description: String::new(),
                         file_tree_summary: String::new(),
-                        external_ref: None,
+                        external_ref: Some("owner/repo#1".into()),
                     },
                     RoutingVerdict::StandardPath,
                     DriveBranchDecision::Generated,
@@ -1438,7 +1505,10 @@ mod tests {
                 title: "fresh work".into(),
                 description: String::new(),
                 file_tree_summary: String::new(),
-                external_ref: None,
+                // jleechan-8jxr: pre-fill `external_ref` so the
+                // new `unmapped_repo` gate (failing MANUAL beads with no
+                // resolver) does not mask this test's actual contract.
+                external_ref: Some("owner/repo#1".into()),
             },
             RoutingVerdict::StandardPath,
             DriveBranchDecision::Generated,
@@ -1678,6 +1748,197 @@ mod tests {
             .filter(|c| c.starts_with("spawn("))
             .count();
         assert_eq!(spawn_calls, 0, "Sessions::spawn must never be called");
+    }
+
+    /// jleechan-8jxr regression test: a manually-created bead (no
+    /// `external_ref`, body content about a repo OTHER than `cfg.target_repo`,
+    /// and no explicit `target_repo:` body field) must NOT silently fall
+    /// through `BeadOverlay::repo`'s `None`-means-global fallback and dispatch
+    /// onto `cfg.target_repo`. Live evidence 2026-07-18: 5 factory-labeled
+    /// beads whose work targeted `jleechanorg/dark-factory` were
+    /// unintentionally routed to the daemon's `cfg.target_repo`
+    /// (`jleechanorg/worldarchitect.ai`) because both the `target_repo:`
+    /// body field AND the `external_ref` were absent — `resolve_target_repo`
+    /// returned `None`, intake persisted `overlay.target_repo = None`, and
+    /// `dispatch_ready`'s `overlay.repo(cfg)` silently substituted
+    /// `cfg.target_repo`. Fail-closed gate: the dispatch path must detect
+    /// the "no resolver survived" shape (overlay `target_repo = None`) and
+    /// park `HUMAN_HELD` with reason `unmapped_repo`, requiring operator or
+    /// refiling agent to supply an explicit `external_ref` or
+    /// `target_repo:` body field before redispatch. Same name as jleechan-9sh5
+    /// discipline ("never guess a repo"), but a different lifecycle reason:
+    /// `unmapped_target_repo` fires when Stage A resolved an EXPLICIT but
+    /// unmappable repo (existing tests); `unmapped_repo` fires when Stage A
+    /// could not resolve ANY repo for this bead.
+    #[test]
+    fn dispatch_ready_parks_human_held_when_bead_repo_is_unresolvable() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        const TEST_BEAD_ID: &str = "jleechan-8jxr-manual-bead";
+        // overlay.target_repo == None is the exact shape intake persists
+        // when both the `target_repo:` body field is absent AND the bead's
+        // `external_ref` is None (manual bead).
+        store
+            .save(&BeadOverlay {
+                bead_id: TEST_BEAD_ID.into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+        // Even with `jleechanorg/worldarchitect.ai` registered in [repos.*]
+        // AND matching `cfg.target_repo` — so the legacy single-repo
+        // silent fallback WOULD have dispatched successfully — the bead's
+        // missing resolver must still trip the gate.
+        let mut cfg = cfg();
+        cfg.target_repo = "jleechanorg/worldarchitect.ai".to_string();
+        cfg.repos.insert(
+            "jleechanorg/worldarchitect.ai".to_string(),
+            crate::config::RepoConfig {
+                ao_project: "worldarchitect".to_string(),
+                push_remote: "origin".to_string(),
+            },
+        );
+        // Manual bead: no `external_ref`, description mentions dark-factory
+        // (would have happily routed there if `external_ref` had been set).
+        let ready = vec![(
+            Bead {
+                id: TEST_BEAD_ID.into(),
+                title: "fix dark-factory daemon pre-push guard".into(),
+                description: "fix a regression in the dark-factory daemon repo.".into(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            0,
+            "repo-unresolvable bead must never spawn"
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(
+            report.failures[0].phase, "unmapped_repo",
+            "must park with the new `unmapped_repo` phase (jleechan-8jxr), NOT the existing \
+             `unmapped_target_repo` phase (which only fires when Stage A resolved an explicit but \
+             unmappable repo — a different failure mode)"
+        );
+        assert!(
+            report.failures[0].error.contains(TEST_BEAD_ID),
+            "error must identify the bead: {}",
+            report.failures[0].error
+        );
+        let overlay = store.load(TEST_BEAD_ID).unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(overlay.park_reason.as_deref(), Some("unmapped_repo"));
+        assert!(
+            overlay.branch.is_none(),
+            "no branch should ever be registered for a repo-unresolvable bead"
+        );
+        assert!(
+            store.branches.borrow().is_empty(),
+            "register_branch must never be called for a repo-unresolvable bead"
+        );
+        let spawn_calls = sessions
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("spawn("))
+            .count();
+        assert_eq!(
+            spawn_calls, 0,
+            "Sessions::spawn must never be called for a repo-unresolvable bead"
+        );
+    }
+
+    /// jleechan-8jxr acceptance criterion #2 (companion to the fail-closed
+    /// park above): a bead WITH an explicit `external_ref="<owner>/<repo>#<N>"`
+    /// must successfully dispatch into that repo. Intake's
+    /// `resolve_target_repo` extracts `owner/repo` from the prefix and
+    /// persists it on `overlay.target_repo`, so the new `unmapped_repo`
+    /// gate correctly lets the bead through (overlay.target_repo is Some,
+    /// not None). Acceptance: this regression guards against the gate
+    /// accidentally over-firing and breaking the well-formed path.
+    #[test]
+    fn dispatch_ready_dispatches_when_external_ref_resolves_target_repo() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        // Overlay carries the explicit target_repo that intake derives
+        // from external_ref — this is the common path. Use id "bead-0" to
+        // mirror the existing repo-table test fixture (dispatch looks up
+        // overlay by bead id).
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("jleechanorg/dark-factory".to_string()),
+            })
+            .unwrap();
+        let mut cfg = cfg();
+        cfg.target_repo = "jleechanorg/worldarchitect.ai".to_string();
+        cfg.repos.insert(
+            "jleechanorg/dark-factory".to_string(),
+            crate::config::RepoConfig {
+                ao_project: "dark-factory".to_string(),
+                push_remote: "origin".to_string(),
+            },
+        );
+        cfg.repos.insert(
+            "jleechanorg/worldarchitect.ai".to_string(),
+            crate::config::RepoConfig {
+                ao_project: "worldarchitect".to_string(),
+                push_remote: "worldai".to_string(),
+            },
+        );
+        // jleechan-bqdv Stage C: spawn-time worktree-remote assertion calls
+        // `Sessions::worktree_remote_url(ao_project, ...)` and parks
+        // `WorktreeRemoteUnverifiable` if the fake returns Ok(None). The
+        // FakeSessions in this module pre-seeds "repo" + "worldarchitect";
+        // dispatch into "dark-factory" needs an explicit scripted URL or
+        // the unrelated worktree-remote check would mask this acceptance
+        // test behind a different (and unrelated) park reason.
+        sessions.set_worktree_remote(
+            "dark-factory",
+            "https://github.com/jleechanorg/dark-factory.git",
+        );
+        let mut ready = beads(1);
+        ready[0].0.title = "fix dark-factory daemon pre-push guard".into();
+        ready[0].0.external_ref = Some("jleechanorg/dark-factory#306".into());
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            1,
+            "an explicit external_ref must dispatch successfully (jleechan-8jxr acceptance #2)"
+        );
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::Dispatched);
+        assert_eq!(overlay.park_reason, None);
     }
 
     /// Companion to the unmapped-repo park test: when the bead's
@@ -2466,7 +2727,10 @@ mod tests {
                 title: "research this".into(),
                 description: "body".into(),
                 file_tree_summary: String::new(),
-                external_ref: None,
+                // jleechan-8jxr: pre-fill `external_ref` so the new
+                // `unmapped_repo` gate does not mask this test's actual
+                // contract (which is the routed-prompt shape).
+                external_ref: Some("owner/repo#1".into()),
             },
             RoutingVerdict::ResearchPath,
             DriveBranchDecision::Generated,
@@ -2495,7 +2759,10 @@ mod tests {
                 title: "small task".into(),
                 description: "acceptance: it works".into(),
                 file_tree_summary: String::new(),
-                external_ref: None,
+                // jleechan-8jxr: pre-fill `external_ref` so the new
+                // `unmapped_repo` gate does not mask this test's actual
+                // contract (which is the enriched-coder-prompt shape).
+                external_ref: Some("owner/repo#1".into()),
             },
             RoutingVerdict::StandardPath,
             DriveBranchDecision::Generated,
