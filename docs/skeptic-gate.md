@@ -98,11 +98,14 @@ This PR does NOT add:
 >    the trusted runner image; this workflow NEVER installs them.**
 > **7. The reviewer subprocess env is allow-list only — no
 >    GITHUB_TOKEN, no HOME, no SSH agent socket, no cloud creds.**
+<<<<<<< HEAD
 > **8. Every verdict MUST include execution-evidence fields
 >    (TEST_RUN_EVIDENCE, LINT_RUN_EVIDENCE, GREP_CITES,
 >    HEAD_COMMIT_VERIFIED) — pattern-matched PASS verdicts without
 >    proof the reviewer ran tests+lint+grep on the PR HEAD are
 >    evidence-free and the gate rejects them (issue #384).**
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 > **8. The published comment is read back with full equality on
 >    all 6 fields; mismatched values fail closed.**
 > **9. A `workflow_dispatch` self-run cannot produce a satisfiable
@@ -176,6 +179,7 @@ python -m runner.skeptic_gate_cli ...
   g. Run codex (sandbox=read-only, --json, sanitized env,
      stdin-delivered prompt) AND gemini (-s, default approval,
      sanitized env, stdin-delivered prompt). 90s default timeout.
+<<<<<<< HEAD
   h. parse_verdict — strict 10-field contract (6 base + 4 execution
      evidence per issue #384), no prose, no code-block smuggling,
      EXACTLY ONCE per field.
@@ -193,6 +197,19 @@ python -m runner.skeptic_gate_cli ...
   n. Post/upsert comment, set commit status. Status failure fails
      closed (not swallowed).
   o. Read back: verify ALL six fields equal what we wrote
+=======
+  h. parse_verdict — strict 6-field contract, no prose, no
+     code-block smuggling, EXACTLY ONCE per field.
+  i. bind_reviewer_identity — codex CLI must declare `codex`,
+     gemini CLI must declare `gemini`.
+  j. verify_provenance — implementation_identity ≠ reviewer_identity.
+  k. aggregate_results — ALL reviewers must PASS; duplicate reviewers
+     rejected.
+  l. Pre-publish API head recheck — abort if changed mid-run.
+  m. Post/upsert comment, set commit status. Status failure fails
+     closed (not swallowed).
+  n. Read back: verify ALL six fields equal what we wrote
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
      byte-for-byte (HEAD_SHA full 40-hex, REPO, PR_NUMBER, VERDICT,
      REVIEWER, IMPLEMENTATION_PROVENANCE). Fail closed if any
      disagree. Verify commit-status state matches.
@@ -250,6 +267,7 @@ closed. **There is no self-PASS path.**
 
 ## Tests
 
+<<<<<<< HEAD
 `tests/test_skeptic_gate.py` covers **109** contract + adversarial cases:
 
 | Case | Test(s) |
@@ -259,6 +277,13 @@ closed. **There is no self-PASS path.**
 | Vacuous regression fixture caught (issue #384 acceptance) | `test_vacuous_regression_fixture_rejected_by_gate`, `test_vacuous_regression_fixture_with_fake_test_counts_still_rejected` |
 | Aggregator rejects vacuous reviewer verdicts (issue #384) | `test_aggregate_results_rejects_when_only_one_reviewer_has_evidence` |
 | Prompt requires execution-evidence fields | `test_build_prompt_requires_execution_evidence_fields` |
+=======
+`tests/test_skeptic_gate.py` covers **79** contract + adversarial cases:
+
+| Case | Test(s) |
+|---|---|
+| Strict 6-field contract, exactly once | `test_parse_verdict_*` |
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 | No-prose / no-code-block contract | `test_adversarial_parse_rejects_*` |
 | Stale SHA PASS rejected | `test_bind_to_pr_rejects_stale_sha` |
 | Full equality read-back | `test_verify_published_comment_*`, `test_adversarial_readback_rejects_*` |
@@ -278,6 +303,7 @@ closed. **There is no self-PASS path.**
 | Workflow strips secrets before reviewer invocation | `test_adversarial_workflow_strips_secrets_before_reviewer_invocation` |
 | CLI end-to-end paths | `test_cli_forced_pass_*`, `test_cli_forced_fail_*`, `test_cli_provenance_fails_self_review` |
 
+<<<<<<< HEAD
 ### Execution-evidence contract (issue #384)
 
 Pattern-matched PASS verdicts slipped vacuous regression tests past the
@@ -309,6 +335,8 @@ reviewer whose `ParsedVerdict` has `test_run_evidence is None`,
 `head_commit_verified` is treated as if it had failed — the PR is
 not promoted.
 
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 Run:
 
 ```bash

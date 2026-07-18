@@ -57,6 +57,7 @@ on:
         required: false
         type: string
         default: ""
+<<<<<<< HEAD
       bead_id:
         description: "Optional bead id (issue #386 r3). When set, the gate loads the contract from `br show --json <id>` instead of running the legacy 10-field contract."
         required: false
@@ -67,6 +68,8 @@ on:
         required: false
         type: string
         default: ""
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 
 # Per-PR concurrency so a new push cancels an in-flight run on
 # the old head (matches the gate's own per-SHA concurrency).
@@ -124,10 +127,13 @@ jobs:
       # so we pass an empty string and the gate's server-side
       # resolution takes over (see gate workflow line 230-246).
       trusted_code_sha: ${{ needs.resolve-caller-sha.outputs.caller_sha || '' }}
+<<<<<<< HEAD
       # r3 (issue #386): forward contract source. Pull from PR
       # body `bead:` label (preferred — auto-detected per PR) or
       # fall back to dispatch inputs.
       bead_id: ${{ inputs.bead_id }}
       contract_file: ${{ inputs.contract_file }}
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     secrets:
       github_token: ${{ secrets.GITHUB_TOKEN }}

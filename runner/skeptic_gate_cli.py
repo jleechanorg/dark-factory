@@ -51,7 +51,10 @@ from typing import List, Optional, Tuple
 
 from runner.skeptic_gate import (
     MARKER,
+<<<<<<< HEAD
     BeadContract,
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     ReadBackCheck,
     SkepticResult,
     aggregate_results,
@@ -60,8 +63,11 @@ from runner.skeptic_gate import (
     evaluate,
     extract_implementation_identity_from_commit,
     format_comment,
+<<<<<<< HEAD
     load_bead_contract,
     load_bead_contract_from_bead,
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     verify_published_comment,
     verify_provenance,
 )
@@ -737,6 +743,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="Disable performance logging under --perf-log-dir.",
     )
+<<<<<<< HEAD
     parser.add_argument(
         "--contract-file",
         default=os.environ.get("SKEPTIC_CONTRACT_FILE", ""),
@@ -778,6 +785,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             "10-field contract, issue #384)."
         )
 
+=======
+    args = parser.parse_args(argv)
+    env = os.environ
+
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     reviewers = _parse_reviewers(args.reviewers_json)
 
     # ---- 1. Resolve PR + SHA, with API equality check ------------------------
@@ -874,6 +886,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         repo, args.pr_number, head_sha
     )
 
+<<<<<<< HEAD
     # ---- 3a. Load bead contract (issue #386 r3) -----------------------------
     # When the workflow operator wires `--contract-file` or `--bead-id`,
     # the gate must enforce per-item verdicts against the bead's
@@ -926,6 +939,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             return 2
 
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     # ---- 4. Build prompt ----------------------------------------------------
     prompt = build_prompt(
         repo=repo,
@@ -934,7 +949,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         base_sha="unknown",
         diff=diff,
         implementation_identity=implementation_identity,
+<<<<<<< HEAD
         contract=contract,
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     )
 
     print(
@@ -972,7 +990,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             base_sha="unknown",
             diff=diff,
             reviewer=reviewer_name,
+<<<<<<< HEAD
             contract=contract,
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
         )
         per_reviewer.append(result)
         print(

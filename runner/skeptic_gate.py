@@ -57,6 +57,7 @@ Public surface
 - `build_prompt(...)`                — pure string assembly. No judgment
                                        calls — the reviewer is the one
                                        that judges the diff.
+<<<<<<< HEAD
 - `BeadContract` / `AcceptanceItem` / `PriorFinding` — the durable
                                        input to the contract-echo step
                                        (issue #386).
@@ -95,6 +96,8 @@ Public surface
                                        that the gate enforces even when
                                        the prior-finding text was
                                        prompt-only in earlier rounds.
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 
 ZFC compliance
 --------------
@@ -111,11 +114,17 @@ diff.
 
 from __future__ import annotations
 
+<<<<<<< HEAD
 import json
 import os
 import re
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional, Tuple, Union
+=======
+import re
+from dataclasses import dataclass
+from typing import List, Literal, Optional, Tuple
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 
 
 # Unique HTML marker used by the GitHub comment upsert logic. Any prior
@@ -167,6 +176,7 @@ class ParsedVerdict:
     other than the headline four is missing in the reviewer's output,
     `parse_verdict` returns `None` rather than producing a partial
     `ParsedVerdict`.
+<<<<<<< HEAD
 
     The execution-evidence fields (`test_run_evidence`,
     `lint_run_evidence`, `grep_cites`, `head_commit_verified`) are the
@@ -175,6 +185,8 @@ class ParsedVerdict:
     the call sites cited in the diff is rejected at parse time. They
     are stored as parsed structures (or `None` on absence — which the
     contract requires never happens for a valid verdict).
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     """
 
     verdict: Literal["PASS", "FAIL"]
@@ -184,6 +196,7 @@ class ParsedVerdict:
     reason: str
     reviewer_identity: str  # the model that emitted the verdict
     raw_excerpt: str
+<<<<<<< HEAD
     # Execution-evidence fields (issue #384):
     test_run_evidence: Optional["ParsedTestRun"] = None
     lint_run_evidence: Optional["ParsedLintRun"] = None
@@ -227,6 +240,8 @@ class ParsedLintRun:
     tool: str
     errors: int
     warnings: int
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 
 
 @dataclass(frozen=True)
@@ -258,6 +273,7 @@ class SkepticResult:
 
 
 # ---------------------------------------------------------------------------
+<<<<<<< HEAD
 # Contract-echo types (issue #386)
 # ---------------------------------------------------------------------------
 #
@@ -398,6 +414,8 @@ class PriorFindingEcho:
 
 
 # ---------------------------------------------------------------------------
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 # Anchored, case-insensitive, multi-match-detecting regexes
 # ---------------------------------------------------------------------------
 #
@@ -429,6 +447,7 @@ _IDENTITY_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
+<<<<<<< HEAD
 # ---------------------------------------------------------------------------
 # Execution-evidence regexes (issue #384)
 # ---------------------------------------------------------------------------
@@ -466,11 +485,14 @@ _HEAD_COMMIT_VERIFIED_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 # Field-name regexes used by the no-prose check. A field line MUST
 # consist only of "<FIELD>: <value>" with nothing else on the line.
 # Case-insensitive to match the per-field regexes (Verdict: Pass is OK).
 _FIELD_LINE_RE = re.compile(r"^[A-Z_]+\s*:.*$", re.MULTILINE | re.IGNORECASE)
 
+<<<<<<< HEAD
 # Required execution-evidence fields (issue #384). The deterministic
 # gate refuses to honor a verdict that does not include all four —
 # pattern-matched PASS verdicts slipped vacuous regression tests and
@@ -960,6 +982,8 @@ def evaluate_contract_echo(
         unaddressed_prior_findings=tuple(unaddressed_prior),
     )
 
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -971,6 +995,7 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
 
     **Strict no-prose contract** (per post-audit comment 4953064910):
 
+<<<<<<< HEAD
     - 10 required fields, each MUST appear EXACTLY ONCE on its own line:
       `VERDICT`, `HEAD_SHA`, `REPO`, `PR_NUMBER`, `REASON`, `IDENTITY`,
       `TEST_RUN_EVIDENCE`, `LINT_RUN_EVIDENCE`, `GREP_CITES`,
@@ -981,12 +1006,23 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     - The output MUST consist ONLY of:
         - up to one comment line (e.g. a leading `# reviewer: codex`)
         - the 10 contract fields, each on its own line
+=======
+    - 6 required fields, each MUST appear EXACTLY ONCE on its own line:
+      `VERDICT`, `HEAD_SHA`, `REPO`, `PR_NUMBER`, `REASON`, `IDENTITY`.
+    - The output MUST consist ONLY of:
+        - up to one comment line (e.g. a leading `# reviewer: codex`)
+        - the 6 contract fields, each on its own line
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
         - any number of blank lines
       No Markdown code blocks, no extra prose, no second VERDICT line
       smuggled inside a triple-backtick fence.
     - Any field appearing more than once → reject (anti-injection).
     - Any required field missing → reject (fail-closed).
+<<<<<<< HEAD
     - The 10 lines themselves MUST be the ONLY non-blank lines (no
+=======
+    - The 6 lines themselves MUST be the ONLY non-blank lines (no
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
       trailing prose, no surrounding commentary).
 
     A reviewer that wraps the contract in a Markdown code block
@@ -1018,10 +1054,17 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
             continue
         if re.match(r"^[A-Z_]+\s*:", stripped, re.IGNORECASE):
             field_lines += 1
+<<<<<<< HEAD
             # Track the field name so we can enforce EXACTLY 10 distinct
             # contract fields. Per post-audit comment 4953116428, the
             # previous version accepted a 7th field. Now any 11th field
             # (or duplicate of any of the 10) → reject.
+=======
+            # Track the field name so we can enforce EXACTLY 6 distinct
+            # contract fields. Per post-audit comment 4953116428, the
+            # previous version accepted a 7th field. Now any 7th field
+            # (or duplicate of any of the 6) → reject.
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
             field_name_match = re.match(r"^([A-Z_]+)\s*:", stripped, re.IGNORECASE)
             if field_name_match:
                 fname = field_name_match.group(1).upper()
@@ -1046,11 +1089,14 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     prs = _PR_RE.findall(output)
     reasons = _REASON_RE.findall(output)
     identities = _IDENTITY_RE.findall(output)
+<<<<<<< HEAD
     # Execution-evidence fields (issue #384):
     test_run_evidence = _TEST_RUN_EVIDENCE_RE.findall(output)
     lint_run_evidence = _LINT_RUN_EVIDENCE_RE.findall(output)
     grep_cites = _GREP_CITES_RE.findall(output)
     head_commit_verified = _HEAD_COMMIT_VERIFIED_RE.findall(output)
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 
     # Full-length SHA is required (40 hex chars). A reviewer that emits
     # only a short SHA hasn't fully bound its verdict.
@@ -1060,17 +1106,23 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         return None
 
+<<<<<<< HEAD
     # All ten required fields must be exactly one each. IDENTITY is
     # required for provenance (refuses self-review). The four
     # execution-evidence fields are required by issue #384 — a
     # verdict without them is a vacuous PASS, and the gate must
     # refuse to honor it.
+=======
+    # All six required fields must be exactly one each. IDENTITY is
+    # required for provenance (refuses self-review).
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     if (
         len(verdicts) != 1
         or len(repos) != 1
         or len(prs) != 1
         or len(reasons) != 1
         or len(identities) != 1
+<<<<<<< HEAD
         or len(test_run_evidence) != 1
         or len(lint_run_evidence) != 1
         or len(grep_cites) != 1
@@ -1082,6 +1134,15 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     # seen_field_names set already enforced no duplicates; here we
     # also enforce that EXACTLY 10 distinct contract fields are
     # present.
+=======
+    ):
+        return None
+
+    # Exact 6-field contract (per post-audit comment 4953116428):
+    # no 7th field allowed. The seen_field_names set already enforced
+    # no duplicates; here we also enforce that EXACTLY 6 distinct
+    # contract fields are present.
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     expected_fields = {
         "VERDICT",
         "HEAD_SHA",
@@ -1089,10 +1150,13 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         "PR_NUMBER",
         "REASON",
         "IDENTITY",
+<<<<<<< HEAD
         "TEST_RUN_EVIDENCE",
         "LINT_RUN_EVIDENCE",
         "GREP_CITES",
         "HEAD_COMMIT_VERIFIED",
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     }
     if seen_field_names != expected_fields:
         return None
@@ -1110,6 +1174,7 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     if len(set(short_shas)) != 1:
         return None
 
+<<<<<<< HEAD
     # ---- Execution-evidence consistency checks (issue #384) ------------
     # A reviewer that claims PASS but reports failed>0, exit!=0, lint
     # errors>0, or an empty GREP_CITES is internally inconsistent and
@@ -1172,6 +1237,8 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         warnings=lint_warnings,
     )
 
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     return ParsedVerdict(
         verdict=verdict_token,  # type: ignore[arg-type]
         head_sha=sha,
@@ -1180,10 +1247,13 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         reason=reasons[0].strip(),
         reviewer_identity=identity_token,
         raw_excerpt=output[:500],
+<<<<<<< HEAD
         test_run_evidence=test_evidence_obj,
         lint_run_evidence=lint_evidence_obj,
         grep_cites=grep_cite_value,
         head_commit_verified=head_verified_sha,
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     )
 
 
@@ -1476,7 +1546,10 @@ def evaluate(
     base_sha: str = "",  # kept for future use
     diff: str = "",  # kept for future use
     reviewer: str = "reviewer",
+<<<<<<< HEAD
     contract: Optional[BeadContract] = None,
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 ) -> SkepticResult:
     """Decide a single reviewer's outcome from its output (or absence).
 
@@ -1516,6 +1589,7 @@ def evaluate(
             reviewer=reviewer,
         )
 
+<<<<<<< HEAD
     # ---- Pre-parse: extract contract-echo block (issue #386) -----------
     # The `parse_verdict` function enforces a strict 10-field
     # no-extra-fields contract (issue #384). When a bead contract is
@@ -1558,6 +1632,16 @@ def evaluate(
                 "inconsistent with VERDICT, or extra prose/code-block "
                 "present — fail-closed)"
             )
+=======
+    parsed = parse_verdict(review_output)
+    if parsed is None:
+        reason = (
+            "reviewer output was unparseable (one or more of "
+            "VERDICT/HEAD_SHA/REPO/PR_NUMBER/REASON/IDENTITY missing, "
+            "duplicated, or HEAD_SHA not 40 hex chars, or extra prose/"
+            "code-block present — fail-closed)"
+        )
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
         body = format_comment(
             verdict="FAIL",
             head_sha=head_sha,
@@ -1603,6 +1687,7 @@ def evaluate(
             reviewer=reviewer,
         )
 
+<<<<<<< HEAD
     # ---- Contract-echo enforcement (issue #386) ------------------------
     # When the gate is invoked with a `contract`, the reviewer's
     # output MUST include a valid `CONTRACT_ECHO:` block that
@@ -1640,6 +1725,8 @@ def evaluate(
                 reviewer=reviewer,
             )
 
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     body = format_comment(
         verdict=parsed.verdict,
         head_sha=parsed.head_sha,
@@ -1781,6 +1868,7 @@ def aggregate_results(
     primary = bound[0] if bound else None
     primary_sha = primary.parsed.head_sha if primary and primary.parsed else head_sha
 
+<<<<<<< HEAD
     # Execution-evidence guard (issue #384): even if a reviewer's
     # `check_state` is 'success', the verdict is invalid if the parsed
     # result is missing execution-evidence fields. A vacuous
@@ -1824,6 +1912,8 @@ def aggregate_results(
             reviewer="(aggregate)",
         )
 
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     extras: List[str] = []
     for r in results:
         marker = "✅ PASS" if r.check_state == "success" else "❌ FAIL"
@@ -1833,9 +1923,14 @@ def aggregate_results(
         agg_verdict = "PASS"
         agg_state = "success"
         agg_reason = (
+<<<<<<< HEAD
             f"all {len(results)} reviewers passed with execution "
             f"evidence; primary reviewer: "
             f"{primary.reviewer if primary else '(unknown)'}"
+=======
+            f"all {len(results)} reviewers passed; "
+            f"primary reviewer: {primary.reviewer if primary else '(unknown)'}"
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
         )
     else:
         agg_verdict = "FAIL"
@@ -1976,8 +2071,11 @@ exact commit SHA you were shown.
 {diff}
 ```
 
+<<<<<<< HEAD
 {contract_block}
 
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 # Output contract — REQUIRED, no extra prose
 
 Emit EXACTLY this format, on its own lines, with the values substituted.
@@ -1990,10 +2088,13 @@ with no extra commentary or code blocks:
     PR_NUMBER: {pr_number}
     REASON: <one-sentence justification>
     IDENTITY: <codex|gemini|claude|unknown>
+<<<<<<< HEAD
     TEST_RUN_EVIDENCE: passed=<N> failed=<N> skipped=<N> exit=<N>
     LINT_RUN_EVIDENCE: tool=<name> errors=<N> warnings=<N>
     GREP_CITES: <file:line;file:line;...>
     HEAD_COMMIT_VERIFIED: <full 40-hex SHA of the local HEAD you actually exercised>
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 
 Rules:
 - The `HEAD_SHA` MUST be the FULL 40-character hex SHA shown above. Not
@@ -2009,6 +2110,7 @@ Rules:
 - Do not include any other text — no extra VERDICT lines, no code
   blocks containing verdict tokens, no commentary. The deterministic
   gate will reject anything that does not match this contract exactly,
+<<<<<<< HEAD
   including outputs where any of the ten lines appears more than once.
 
 # Execution-evidence requirement (issue #384) — NOT optional
@@ -2162,6 +2264,12 @@ def _build_contract_block(contract: BeadContract) -> str:
     )
 
 
+=======
+  including outputs where any of the six lines appears more than once.
+"""
+
+
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 def build_prompt(
     *,
     repo: str,
@@ -2170,12 +2278,16 @@ def build_prompt(
     base_sha: str,
     diff: str,
     implementation_identity: str = "unknown",
+<<<<<<< HEAD
     contract: Optional[BeadContract] = None,
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
 ) -> str:
     """Assemble the prompt sent to the independent reviewer CLI.
 
     Pure string assembly — no model call, no judgment. The reviewer
     model is the one that emits the structured verdict.
+<<<<<<< HEAD
 
     When `contract` is supplied (issue #386), a `# Bead contract`
     section is interpolated into the prompt, documenting the bead's
@@ -2191,6 +2303,9 @@ def build_prompt(
         contract_block = _build_contract_block(contract)
     else:
         contract_block = ""
+=======
+    """
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     return _PROMPT_TEMPLATE.format(
         repo=repo,
         pr_number=pr_number,
@@ -2198,11 +2313,15 @@ def build_prompt(
         base_sha=base_sha,
         diff=diff,
         implementation_identity=implementation_identity,
+<<<<<<< HEAD
         contract_block=contract_block,
+=======
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     )
 
 
 __all__ = [
+<<<<<<< HEAD
     "AcceptanceItem",
     "BeadContract",
     "COMMIT_PREFIX_TO_IDENTITY",
@@ -2219,6 +2338,12 @@ __all__ = [
     "ParsedVerdict",
     "PriorFinding",
     "PriorFindingEcho",
+=======
+    "COMMIT_PREFIX_TO_IDENTITY",
+    "MARKER",
+    "ModelIdentity",
+    "ParsedVerdict",
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     "REVIEWER_CLI_TO_IDENTITY",
     "ReadBackCheck",
     "SkepticResult",
@@ -2229,12 +2354,17 @@ __all__ = [
     "build_prompt",
     "comment_marker",
     "evaluate",
+<<<<<<< HEAD
     "evaluate_contract_echo",
     "extract_implementation_identity_from_commit",
     "format_comment",
     "load_bead_contract",
     "load_bead_contract_from_bead",
     "parse_contract_echo",
+=======
+    "extract_implementation_identity_from_commit",
+    "format_comment",
+>>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     "parse_verdict",
     "verify_published_comment",
     "verify_provenance",
