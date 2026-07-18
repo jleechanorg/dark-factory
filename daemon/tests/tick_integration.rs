@@ -962,28 +962,30 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
     );
     let held = store.load("jleechan-vj89").unwrap().unwrap();
     assert_eq!(held.state, OverlayState::HumanHeld);
-    // jleechan-park-leaves-zombie-session-mh9o: the fix terminates the
-    // leaked AO session and clears the durable session handle so a
-    // future dispatch of THIS bead is not blocked by AO's dedup guard.
-    // The pre-fix invariant `held.session_id == Some("wa-3004")` codified
-    // the BUG: the leaked session ID is the exact token AO's dedup guard
-    // uses to refuse subsequent spawns as "Duplicate session detected".
+    // jleechan-park-leaves-zombie-session-mh9o: `session_branch` just
+    // proved the leaked session belongs to a DIFFERENT bead/branch (the
+    // `jleechan-5ia2` corruption case) — so we MUST NOT call
+    // `sessions.stop()` here. Killing it would terminate another bead's
+    // legitimate worker. The right fix is to drop OUR overlay's bad
+    // handle (the durable record pointing at a session that was never
+    // ours to own) without touching AO.
     assert_eq!(
         held.session_id, None,
-        "session_branch_mismatch park MUST clear session handle so the \
-         leaked AO session is not used to block future redispatches via \
-         the AO dedup guard. Calls: {:?}",
+        "session_branch_mismatch park MUST drop the bad overlay handle so \
+         the leaked record cannot poison future redispatches of THIS bead \
+         via the AO dedup guard. Calls: {:?}",
         sessions.calls.borrow()
     );
     assert!(
-        sessions
+        !sessions
             .calls
             .borrow()
             .iter()
             .any(|call| call == "stop(wa-3004)"),
-        "session_branch_mismatch park MUST terminate the leaked AO \
-         session via sessions.stop; otherwise the AO dedup guard will \
-         block future spawns of this bead. Calls: {:?}",
+        "session_branch_mismatch park MUST NOT kill the leaked session \
+         because session_branch has proven it belongs to a different \
+         bead/branch. Killing it would terminate someone else's \
+         legitimate worker. Calls: {:?}",
         sessions.calls.borrow()
     );
     assert_eq!(
@@ -8344,14 +8346,187 @@ fn session_branch_mismatch_park_kills_associated_ao_session_and_clears_handle() 
         "session_branch_mismatch park MUST clear session handle"
     );
     assert!(
-        sessions
+        !sessions
             .calls
             .borrow()
             .iter()
             .any(|call| call == "stop(df-mh9o-mismatch)"),
-        "session_branch_mismatch park MUST invoke sessions.stop; otherwise \
-         the leaked AO session blocks subsequent spawns of this bead via \
-         the dedup guard. Calls: {:?}",
+        "session_branch_mismatch park MUST NOT kill the leaked session: \
+         session_branch has just proved that session belongs to a \
+         different bead/branch, and killing it would terminate someone \
+         else's legitimate worker. Only the bad overlay handle is \
+         dropped. Calls: {:?}",
+        sessions.calls.borrow()
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// jleechan-park-leaves-zombie-session-mh9o (CodeRabbit P1 follow-up):
+// when `sessions.stop()` fails, the AO session may STILL be live. Clearing
+// the durable handle in that case would let `recover_human_held` requeue
+// the bead and dispatch a second worker that overlaps the existing live
+// one. Retain the handle so (a) recover_human_held cannot requeue and
+// (b) the operator retains the durable session_id for manual cleanup.
+#[test]
+fn autonomy_timebox_park_retains_handle_when_stop_fails() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    sessions.fail_stop_for("df-mh9o-stop-fails");
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.autonomy_timebox_secs = 3600;
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.remote_branches
+        .insert("factory/bead-mh9o-stop-fails-r1".into(), Some(now_epoch));
+
+    store.overlays.borrow_mut().insert(
+        "bead-mh9o-stop-fails".into(),
+        BeadOverlay {
+            bead_id: "bead-mh9o-stop-fails".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 4000, // already > 3600 timebox
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-mh9o-stop-fails-r1".into()),
+            session_id: Some("df-mh9o-stop-fails".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_mh9o_stop_fails.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = FakeVcs::new();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 100).expect("tick should succeed");
+    assert_eq!(summary.beads_parked_human_held, 1);
+
+    let overlay = store.load("bead-mh9o-stop-fails").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        overlay.session_id.as_deref(),
+        Some("df-mh9o-stop-fails"),
+        "on stop() failure the handle MUST be retained so the operator \
+         retains the durable session_id for manual cleanup AND \
+         recover_human_held cannot requeue and dispatch a second worker \
+         that would overlap the still-live session"
+    );
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(
+        logs.contains("BEAD_SESSION_KILL_FAILED"),
+        "stop() failure MUST emit BEAD_SESSION_KILL_FAILED telemetry; logs: {logs}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// jleechan-park-leaves-zombie-session-mh9o (CodeRabbit Major follow-up):
+// adopted-branch remediation parks (history rewrite, append-only check
+// failure) were also leaking their session. Wire the cleanup helper into
+// both sites.
+#[test]
+fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    // Pre-seed an adopted DISPATCHED bead whose pre_session_head_sha is
+    // NOT an ancestor of the live remote head (positive history rewrite).
+    store.overlays.borrow_mut().insert(
+        "bead-mh9o-adopted".into(),
+        BeadOverlay {
+            bead_id: "bead-mh9o-adopted".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-mh9o-adopted-r1".into()),
+            session_id: Some("df-mh9o-adopted".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: Some("aaaaaaaaaaaaaaaa".into()),
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_mh9o_adopted.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut vcs = FakeVcs::new();
+    // Remote HEAD is a totally unrelated commit -> is_ancestor returns
+    // false -> adopted_branch_history_rewrite_detected park.
+    vcs.heads.insert(
+        "factory/bead-mh9o-adopted-r1".into(),
+        "bbbbbbbbbbbbbbbb".into(),
+    );
+    vcs.ancestor_pairs
+        .insert(("aaaaaaaaaaaaaaaa".into(), "bbbbbbbbbbbbbbbb".into()), false);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 10).expect("tick should succeed");
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "bead must be parked adopted_branch_history_rewrite_detected"
+    );
+
+    let overlay = store.load("bead-mh9o-adopted").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("adopted_branch_history_rewrite_detected")
+    );
+    assert!(
+        overlay.session_id.is_none(),
+        "adopted_branch_history_rewrite_detected park MUST clear session handle"
+    );
+    assert!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call == "stop(df-mh9o-adopted)"),
+        "adopted_branch_history_rewrite_detected park MUST terminate the \
+         leaked AO session; otherwise the AO dedup guard blocks future \
+         spawns of this bead. Calls: {:?}",
         sessions.calls.borrow()
     );
 
