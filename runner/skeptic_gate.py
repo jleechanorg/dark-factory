@@ -694,6 +694,15 @@ def evaluate(
     )
 
 
+# Mandatory reviewer identities. Per CodeRabbit CRITICAL finding on
+# PR #281 round 2: the gate MUST aggregate over exactly the
+# Codex-and-Gemini set on every PR. A subset (e.g. only a single
+# successful codex run) is rejected even if it succeeded, because
+# a partial review cannot satisfy the dual-independent-reviewer
+# policy the gate is designed to enforce.
+MANDATORY_REVIEWERS = ("codex", "gemini")
+
+
 def aggregate_results(
     results: List[SkepticResult],
     *,
@@ -709,6 +718,13 @@ def aggregate_results(
     (two codex invocations), the gate fails closed. This is enforced
     even before any reviewer runs, because a single PR is not allowed
     to be reviewed twice by the same model.
+
+    Per CodeRabbit CRITICAL finding on PR #281 round 2: this
+    aggregator also refuses to produce a PASS unless BOTH mandatory
+    reviewer identities (codex and gemini) are present in the input.
+    A single successful reviewer's result (e.g. `[codex_pass]` or
+    `[gemini_pass]`) yields `check_state="failure"` with a reason
+    that names the missing reviewer.
     """
     if not results:
         reason = "no reviewers ran — gate cannot pass without any review"
@@ -746,6 +762,34 @@ def aggregate_results(
         reason = (
             f"duplicate reviewer identities in input list: {sorted(set(duplicates))}; "
             "the gate requires distinct reviewers per PR"
+        )
+        body = format_comment(
+            verdict="FAIL",
+            head_sha=head_sha,
+            expected_head_sha=head_sha,
+            repo=repo,
+            pr_number=pr_number,
+            reviewer="(aggregate)",
+            implementation_provenance=implementation_provenance,
+            reason=reason,
+        )
+        return SkepticResult(
+            check_state="failure",
+            verdict=None,
+            reason=reason,
+            comment_body=body,
+            parsed=None,
+            reviewer="(aggregate)",
+        )
+
+    # Mandatory-set guard: BOTH codex AND gemini must be present.
+    # Per CodeRabbit CRITICAL finding on PR #281 round 2: a single
+    # successful reviewer cannot satisfy the policy.
+    missing = [r for r in MANDATORY_REVIEWERS if r not in seen_reviewers]
+    if missing:
+        reason = (
+            f"mandatory reviewer(s) missing from input list: {missing}; "
+            "the gate requires BOTH codex and gemini on every PR"
         )
         body = format_comment(
             verdict="FAIL",

@@ -117,19 +117,27 @@ REVIEWER_SECRET_ENV_DENY = {
     "GCP_SERVICE_ACCOUNT_KEY",
 }
 
-# Env keys that we DO pass through (reviewer CLIs need them to call
-# the underlying model API). PATH is set by the workflow to a
-# minimal list containing only the pinned reviewer bin dirs.
-REVIEWER_ENV_ALLOWLIST = {
+# Env keys that are SAFE to pass through to EVERY reviewer (PATH,
+# locale, terminal settings). Provider-specific credentials are
+# NOT in this set — they are added per-reviewer in `_reviewer_env`
+# so codex cannot see Google's key and gemini cannot see OpenAI's.
+REVIEWER_ENV_BASE_ALLOWLIST = {
     "PATH",
     "TMPDIR",
     "LANG",
     "LC_ALL",
     "TERM",
     "PWD",
-    "OPENAI_API_KEY",  # codex uses OpenAI
-    "GOOGLE_API_KEY",  # gemini uses Google
-    "ANTHROPIC_API_KEY",
+}
+
+# Per-reviewer provider credential allowlist. Only the reviewer that
+# needs the credential gets it. Per CodeRabbit MAJOR finding on
+# PR #281 round 2: the previous version dumped ANTHROPIC_API_KEY
+# into every reviewer's env, which neither codex nor gemini needs
+# and which broadens the credential blast radius.
+REVIEWER_ENV_PROVIDER_ALLOWLIST = {
+    "codex": {"OPENAI_API_KEY"},
+    "gemini": {"GOOGLE_API_KEY"},
 }
 
 
@@ -138,18 +146,36 @@ REVIEWER_ENV_ALLOWLIST = {
 # ---------------------------------------------------------------------------
 
 
-def _reviewer_env(parent_env: dict) -> dict:
-    """Build a sanitized env dict for the reviewer subprocess.
+def _reviewer_env(parent_env: dict, reviewer: str) -> dict:
+    """Build a sanitized env dict for a specific reviewer's subprocess.
 
-    Pass-through is allowlist-based. Secrets (`REVIEWER_SECRET_ENV_DENY`)
-    are dropped. Everything else from the parent is *forbidden* unless
-    it's on the allowlist.
+    Per CodeRabbit MAJOR finding on PR #281 round 2: the previous
+    implementation used a single global allowlist that included
+    OPENAI_API_KEY, GOOGLE_API_KEY, AND ANTHROPIC_API_KEY, and
+    applied the SAME env to both codex and gemini. That meant:
+
+      - codex received Google's key (no use; broadens exposure).
+      - gemini received OpenAI's key (no use; broadens exposure).
+      - both received Anthropic's key (neither needs it).
+
+    The new implementation constructs the env PER REVIEWER: the
+    base allowlist (PATH, locale, etc.) plus the credentials that
+    reviewer actually needs. ANTHROPIC_API_KEY is dropped entirely
+    — neither reviewer uses it, and shipping it broadens blast
+    radius without any benefit.
+
+    Secrets on `REVIEWER_SECRET_ENV_DENY` are always stripped
+    regardless of reviewer identity.
     """
+    provider_keys = REVIEWER_ENV_PROVIDER_ALLOWLIST.get(reviewer, set())
     out: dict = {}
     for k, v in parent_env.items():
         if k in REVIEWER_SECRET_ENV_DENY:
             continue
-        if k in REVIEWER_ENV_ALLOWLIST:
+        if k in REVIEWER_ENV_BASE_ALLOWLIST:
+            out[k] = v
+            continue
+        if k in provider_keys:
             out[k] = v
     return out
 
@@ -271,11 +297,22 @@ def get_pr_head_sha_via_api(repo: str, pr_number: int) -> str:
 
 
 def get_pr_diff(repo: str, pr_number: int) -> str:
-    """Diff text via `gh pr diff`. Fail-closed if too large."""
+    """Diff text via `gh pr diff`. Fail-closed if too large.
+
+    Per CodeRabbit CRITICAL finding on PR #281 round 2: the previous
+    version omitted `--repo`, so `gh pr diff` resolved the PR against
+    the current checkout — a reusable invocation could therefore
+    review a different repository's PR with the same number while
+    binding the verdict to the requested repository and SHA. The
+    explicit `--repo` arg eliminates that ambiguity, and the
+    `timeout=60` bound prevents a hung `gh` from holding the gate
+    open indefinitely.
+    """
     proc = subprocess.run(
-        ["gh", "pr", "diff", str(pr_number)],
+        ["gh", "pr", "diff", str(pr_number), "--repo", repo],
         capture_output=True,
         text=True,
+        timeout=60,
         check=False,
     )
     if proc.returncode != 0:
@@ -486,7 +523,12 @@ def invoke_reviewer(
     )
     stdin_input = prompt
 
-    env = _reviewer_env(parent_env if parent_env is not None else os.environ)
+    # Per-reviewer env: each reviewer only sees the credentials it
+    # actually needs (codex → OPENAI_API_KEY, gemini → GOOGLE_API_KEY).
+    # See CodeRabbit MAJOR finding on PR #281 round 2.
+    env = _reviewer_env(
+        parent_env if parent_env is not None else os.environ, reviewer
+    )
 
     try:
         proc = subprocess.run(
@@ -516,6 +558,14 @@ def invoke_reviewer(
 # ---------------------------------------------------------------------------
 
 
+# Mandatory reviewer set. Per CodeRabbit CRITICAL finding on
+# PR #281 round 2: the gate MUST run BOTH codex and gemini on
+# every PR. A subset (e.g. only codex, or only gemini) is rejected
+# at every boundary so a misconfigured workflow cannot downgrade
+# the policy by truncating --reviewers-json.
+MANDATORY_REVIEWERS = ("codex", "gemini")
+
+
 def _parse_reviewers(reviewers_json: str) -> List[Tuple[str, str]]:
     """Parse the `--reviewers-json` argument into [(reviewer, model), ...].
 
@@ -523,6 +573,12 @@ def _parse_reviewers(reviewers_json: str) -> List[Tuple[str, str]]:
     in the list are rejected outright — a PR may not be reviewed twice
     by the same model (e.g. `[["codex",""], ["codex","gpt-5"]]` is
     refused).
+
+    Per CodeRabbit CRITICAL finding on PR #281 round 2: the gate
+    requires EXACTLY the mandatory Codex-and-Gemini set. Any subset
+    (only-codex, only-gemini), any superset (codex + claude), or
+    any other ordering is refused outright so the gate cannot be
+    downgraded by misconfiguring the workflow input.
     """
     try:
         parsed = json.loads(reviewers_json)
@@ -543,9 +599,10 @@ def _parse_reviewers(reviewers_json: str) -> List[Tuple[str, str]]:
             raise SystemExit(
                 f"invalid reviewer entry: {item!r}; expected [reviewer, model]"
             )
-        if item[0] not in ("codex", "gemini"):
+        if item[0] not in MANDATORY_REVIEWERS:
             raise SystemExit(
-                f"reviewer {item[0]!r} not allowed; expected 'codex' or 'gemini'"
+                f"reviewer {item[0]!r} not allowed; expected exactly "
+                f"{list(MANDATORY_REVIEWERS)} (the gate requires BOTH)"
             )
         if item[0] in seen:
             raise SystemExit(
@@ -554,6 +611,12 @@ def _parse_reviewers(reviewers_json: str) -> List[Tuple[str, str]]:
             )
         seen.add(item[0])
         out.append((item[0], item[1]))
+    missing = [r for r in MANDATORY_REVIEWERS if r not in seen]
+    if missing:
+        raise SystemExit(
+            f"--reviewers-json is missing mandatory reviewer(s): {missing}; "
+            "the gate requires BOTH codex and gemini on every PR"
+        )
     return out
 
 
@@ -960,15 +1023,34 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"context={args.status_context!r} found on {head_sha[:12]}",
             file=sys.stderr,
         )
+        # Per CodeRabbit CRITICAL finding on PR #281 round 2: if the
+        # matching context is missing, force the status to failure so
+        # merge protection cannot preserve a stale green from a
+        # previous run.
+        _force_failure_status(
+            repo,
+            head_sha,
+            args.status_context,
+            f"read-back mismatch: no status with context={args.status_context!r}",
+        )
         return 1
     found_state = matched[0].get("state")
     if found_state != "pending":
-        # A stale or unexpected status already exists; refuse to write
-        # success and refuse to overwrite (preserves forensic value).
+        # A stale or unexpected status already exists. Per CodeRabbit
+        # CRITICAL finding on PR #281 round 2: the previous version
+        # returned failure without overwriting the status, leaving a
+        # stale `success` green. We now force-fail before returning so
+        # the merge-protection check goes red unconditionally.
         print(
             f"[skeptic-gate] read-back mismatch: pending status was "
-            f"overwritten to {found_state!r}; refusing to write success",
+            f"overwritten to {found_state!r}; forcing failure before return",
             file=sys.stderr,
+        )
+        _force_failure_status(
+            repo,
+            head_sha,
+            args.status_context,
+            f"read-back mismatch: status was {found_state!r}, expected pending",
         )
         return 1
 
@@ -990,6 +1072,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         # post-audit comment 4953116428). The retry below attempts
         # one more time; if that also fails, we return 1 and let
         # the workflow step fail.
+        #
+        # Per CodeRabbit MAJOR finding on PR #281 round 2: the
+        # previous version continued execution after the retry
+        # succeeded, logged `status_state=success`, and returned 0
+        # — a fail-closed path that left the gate green. The new
+        # version explicitly sets `final_state = "failure"` and
+        # returns 1 once the retry succeeds, so the workflow step
+        # fails and merge protection cannot pass.
         print(
             f"[skeptic-gate] final status set failed (will retry as failure): {exc}",
             file=sys.stderr,
@@ -1009,6 +1099,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                 file=sys.stderr,
             )
             return 1
+        final_state = "failure"
+        print(
+            f"[skeptic-gate] read-back partial: success-write failed, "
+            f"failure-write succeeded; treating as FAIL",
+            file=sys.stderr,
+        )
+        return 1
 
     print(
         f"[skeptic-gate] read-back OK: actor={actor} comment_id={comment_id} "
@@ -1095,6 +1192,16 @@ def _extract_field(body: str, name: str) -> Optional[str]:
     Supports the six fields the gate emits (`HEAD_SHA`, `REPO`,
     `PR_NUMBER`, `VERDICT`, `REVIEWER`, `IMPLEMENTATION_PROVENANCE`).
     Returns None when the field is absent or the body is malformed.
+
+    Per CodeRabbit MAJOR finding on PR #281 round 2: the read-back
+    must REJECT bodies that contain more than one occurrence of a
+    contract field (an attacker who controls the API could otherwise
+    inject a second `VERDICT: PASS` or `HEAD_SHA: <their-sha>` inside
+    the reason text and have the read-back take the first match).
+    We enforce the "exactly one occurrence" invariant here; if a
+    body contains 0 matches the field is absent (None), and if it
+    contains >1 matches we raise `ValueError` so the caller fails
+    the read-back closed.
     """
     pat = {
         "HEAD_SHA": _RE_SHA_LINE,
@@ -1106,10 +1213,15 @@ def _extract_field(body: str, name: str) -> Optional[str]:
     }.get(name)
     if pat is None:
         return None
-    m = pat.search(body)
-    if not m:
+    matches = pat.findall(body)
+    if len(matches) == 0:
         return None
-    return m.group(1).strip()
+    if len(matches) > 1:
+        raise ValueError(
+            f"duplicate {name!r} field in published body "
+            f"({len(matches)} occurrences); refusing to read-back"
+        )
+    return matches[0].strip()
 
 
 def _extract_int(body: str, name: str) -> Optional[int]:

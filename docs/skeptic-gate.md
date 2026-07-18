@@ -70,9 +70,12 @@ This PR adds:
 - An equality read-back step that fails closed when ANY of the six
   comment fields (HEAD_SHA, REPO, PR_NUMBER, VERDICT, REVIEWER,
   IMPLEMENTATION_PROVENANCE) disagrees with what we wrote.
-- 67 contract + adversarial integration tests (commit-prefix
+- 79 contract + adversarial integration tests (commit-prefix
   provenance, code-block injection, duplicate reviewer, E2BIG,
-  identity-mismatch, env leakage, status-failure-fail-closed, etc.).
+  identity-mismatch, env leakage, status-failure-fail-closed,
+  per-reviewer credential isolation, mandatory-Codex+Gemini set,
+  read-back stale-status force-fail, duplicate-field rejection,
+  etc.).
 
 This PR does NOT add:
 
@@ -107,29 +110,46 @@ Trusted same-target-repo caller workflow
    pull_request_target on jleechanorg/dark-factory main
         │
         ▼
+   Resolve caller's commit SHA on the default branch
+        │
+        ▼
    uses: jleechanorg/dark-factory/.github/workflows/skeptic-gate.yml@<PINNED-SHA>
-        │  with inputs pr_number, pr_sha; secret github_token
+        │  with inputs pr_number, pr_sha, trusted_code_sha;
+        │  secret github_token
         │
         ▼
    .github/workflows/skeptic-gate.yml
         │  (self-hosted runner; private repo selector
-        │   via fromJson(vars.SELF_HOSTED_RUNNER_LABELS || '["self-hosted","self-hosted-mikey"]'))
+        │   via fromJson(vars.SELF_HOSTED_RUNNER_LABELS))
         ▼
 0. "Verify pinned reviewer binaries"  ← path + version + sha256
    against repo variables. Drift fails the gate (no mutable install).
+   All six SKEPTIC_*_BIN / _VERSION / _SHA256 vars are mandatory —
+   absence is fatal.
         │
         ▼
-1. "Checkout gate code from TRUSTED default branch"  ← sparse-checkout
-   (runner/skeptic_gate.py + runner/skeptic_gate_cli.py from
-   github.event.repository.default_branch; NEVER from PR head)
+1. "Validate trusted_code_sha is a 40-hex string"  ← derives the
+   trusted ref from `inputs.trusted_code_sha` (workflow_call) or
+   `github.sha` (workflow_dispatch). Refuses to proceed otherwise.
         │
         ▼
-2. "Verify caller actor"  ← refuses non-github-actions[bot] actors
+2. "Checkout gate code from IMMUTABLE trusted_code_sha"  ←
+   sparse-checkout (runner/skeptic_gate.py + runner/skeptic_gate_cli.py
+   from the EXACT pinned SHA, NEVER from the moving default branch
+   or PR head).
+        │
+        ▼
+3. "Verify the checked-out HEAD equals trusted_code_sha"  ←
+   defense-in-depth: refuses to run if the local HEAD disagrees with
+   the input.
+        │
+        ▼
+4. "Verify caller actor"  ← refuses non-github-actions[bot] actors
    for self-PASS (a human-dispatched workflow_dispatch cannot satisfy
    the read-back step's actor equality check).
         │
         ▼
-3. "Run skeptic gate" with secrets stripped from the env (HOME,
+5. "Run skeptic gate" with secrets stripped from the env (HOME,
    GITHUB_TOKEN, OPENCLAW_*/HERMES_*/SLACK_*) and PATH reduced to a
    minimal list containing only the pinned reviewer bin dirs.
         │
@@ -203,6 +223,14 @@ python -m runner.skeptic_gate_cli ...
 - `pr_number` (required)
 - `pr_sha` (optional override; if empty, re-resolved via `gh pr view`)
 
+`workflow_dispatch` does **NOT** accept `trusted_code_sha`. Per the
+CodeRabbit MAJOR finding on PR #281 round 2: removing the dispatch
+input closes the path where a manual dispatch could supply an
+arbitrary SHA and have the gate checkout + execute that SHA under
+the gate credentials. The dispatch path derives the trusted SHA
+from the workflow ref itself (the literal `uses: ...@<SHA>` the
+caller pinned), not from any caller-supplied input.
+
 This is intended for **diagnostic verification only**. A diagnostic
 run cannot satisfy gate-7 for a PR because the read-back step
 requires a same-target-repo bot actor; a human-dispatched run's
@@ -211,7 +239,7 @@ closed. **There is no self-PASS path.**
 
 ## Tests
 
-`tests/test_skeptic_gate.py` covers 67 contract + adversarial cases:
+`tests/test_skeptic_gate.py` covers **79** contract + adversarial cases:
 
 | Case | Test(s) |
 |---|---|
@@ -243,30 +271,42 @@ python3 -m pytest tests/test_skeptic_gate.py -v
 
 ## Configuration
 
+All `vars.*` and `inputs.*` listed below are **required** — there are
+no defaults. Absence is fatal at the gate's "Verify mandatory pin
+vars are set" step.
+
 | Env / input | Default | Effect |
 |---|---|---|
-| `SKEPTIC_REVIEWERS_JSON` | `[["codex",""],["gemini","gemini-2.5-pro"]]` | Reviewers that must ALL PASS (must be distinct) |
+| `SKEPTIC_REVIEWERS_JSON` | `[["codex",""],["gemini","gemini-2.5-pro"]]` | Reviewers that must ALL PASS (must be distinct, must be exactly codex + gemini) |
 | `SKEPTIC_STATUS_CONTEXT` | `skeptic` | Commit-status context name (the required-check name) |
 | `SKEPTIC_EXPECTED_ACTOR` | `github-actions[bot]` | Bot actor expected on the published comment |
-| `vars.SELF_HOSTED_RUNNER_LABELS` | unset → `["self-hosted","self-hosted-mikey"]` | Private repo runner selector |
-| `vars.SKEPTIC_CODEX_BIN` | unset → `/opt/reviewers/codex/codex` | Pinned absolute path to codex binary |
-| `vars.SKEPTIC_CODEX_VERSION` | unset → `` | Expected codex version string (e.g. `codex-cli 0.39.0`) |
-| `vars.SKEPTIC_CODEX_SHA256` | unset → `` | Expected SHA256 of the codex binary |
-| `vars.SKEPTIC_GEMINI_BIN` | unset → `/opt/reviewers/gemini/gemini` | Pinned absolute path to gemini binary |
-| `vars.SKEPTIC_GEMINI_VERSION` | unset → `` | Expected gemini version string (e.g. `gemini-cli 0.5.4`) |
-| `vars.SKEPTIC_GEMINI_SHA256` | unset → `` | Expected SHA256 of the gemini binary |
-| `inputs.trusted_ref` | **REMOVED** | (Previously allowed caller to override the code ref; removed per post-audit comment 4953064910.) The code ref is now implicitly pinned by the caller's `uses: ...@<SHA>`. |
+| `vars.SELF_HOSTED_RUNNER_LABELS` | **required** | Private repo runner selector (JSON array; must be wrapped in `fromJson()`) |
+| `vars.SKEPTIC_CODEX_BIN` | **required** | Pinned absolute path to codex binary |
+| `vars.SKEPTIC_CODEX_VERSION` | **required** | Expected codex version string (e.g. `codex-cli 0.39.0`) |
+| `vars.SKEPTIC_CODEX_SHA256` | **required** | Expected SHA256 of the codex binary |
+| `vars.SKEPTIC_GEMINI_BIN` | **required** | Pinned absolute path to gemini binary |
+| `vars.SKEPTIC_GEMINI_VERSION` | **required** | Expected gemini version string (e.g. `gemini-cli 0.5.4`) |
+| `vars.SKEPTIC_GEMINI_SHA256` | **required** | Expected SHA256 of the gemini binary |
+| `inputs.trusted_code_sha` | **required** (workflow_call) | 40-hex SHA the caller pinned the workflow ref to. The "Validate trusted_code_sha" step refuses to proceed unless this is a 40-hex string; for dispatch runs it falls back to `github.sha` (the workflow's own commit SHA on the default branch). |
+| `inputs.trusted_ref` | **REMOVED** | (Previously allowed caller to override the code ref; removed per post-audit comment 4953064910.) The code ref is now implicitly pinned by the caller's `uses: ...@<SHA>` and the gate's own SHA equality check. |
 
 ## Files
 
 - `runner/skeptic_gate.py` — verdict-binding library (strict no-prose
   parser, provenance check, equality read-back, commit-prefix
-  identity derivation)
+  identity derivation, mandatory-Codex+Gemini aggregation)
 - `runner/skeptic_gate_cli.py` — orchestrator (multi-reviewer,
   sanitized env, head-SHA equality, defense-in-depth diff size,
-  stdin-only diff transport)
+  stdin-only diff transport, per-reviewer credential isolation,
+  --repo binding for diff capture)
 - `.github/workflows/skeptic-gate.yml` — workflow (`workflow_call`
   target only; no `pull_request` / `pull_request_target`; pinned
-  reviewer binaries; secrets stripped before reviewer invocation)
-- `tests/test_skeptic_gate.py` — 67 contract + adversarial tests
+  reviewer binaries; secrets stripped before reviewer invocation;
+  no `workflow_dispatch` `trusted_code_sha` input)
+- `.github/workflows/skeptic-gate-caller.yml` — bootstrap caller
+  (`pull_request_target` + `workflow_dispatch`); resolves the
+  caller's commit SHA on the default branch and invokes the gate
+  via `uses: ...@<PINNED-SHA>` at the job level (reusable-workflow
+  reference must be a static literal)
+- `tests/test_skeptic_gate.py` — **79** contract + adversarial tests
 - `docs/skeptic-gate.md` — this file

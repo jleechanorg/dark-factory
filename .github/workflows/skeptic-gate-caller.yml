@@ -8,7 +8,7 @@
 #   `trusted_code_sha` rejects any drift).
 #
 #   The gate workflow (`.github/workflows/skeptic-gate.yml`) is
-#   called via `uses: ./.github/workflows/skeptic-gate.yml@<SHA>`
+#   called via `uses: jleechanorg/dark-factory/.github/workflows/skeptic-gate.yml@<SHA>`
 #   where <SHA> is THIS workflow's commit SHA on the default
 #   branch. This pins the gate's behavior to the immutable
 #   trusted-code-ref invariant the gate enforces (see gate YAML
@@ -23,9 +23,15 @@
 #   workflow_dispatch   — operator manual re-runs on a given PR.
 #
 # WHY pull_request_target IS SAFE HERE:
-#   The caller itself never executes PR-head code. It resolves
-#   the trusted gate SHA from the default branch (which PR-head
-#   cannot edit once merged) and forwards that to the gate via
+#   The caller itself never executes PR-head code. The caller
+#   job is a reusable-workflow invocation only; its `uses:` is a
+#   static literal pinned to the caller's own commit SHA on the
+#   default branch, NOT the moving default branch and NOT the PR
+#   head. The job-level `uses:` is required because GitHub Actions
+#   does not allow reusable-workflow invocations inside a step, and
+#   the ref must be a static literal (no expressions).
+#
+#   The resolved SHA is forwarded to the gate via
 #   `trusted_code_sha`. The gate then sparse-checkouts ONLY its
 #   own Python files at that pinned SHA and refuses to run if
 #   `git rev-parse HEAD` does not equal the input. PR-head
@@ -64,12 +70,14 @@ permissions:
   statuses: write
 
 jobs:
-  call-skeptic-gate:
-    name: Call SHA-bound skeptic gate
+  resolve-caller-sha:
+    name: Resolve caller SHA (immutable ref to pin the gate to)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 2
+    outputs:
+      caller_sha: ${{ steps.resolve.outputs.caller_sha }}
     steps:
-      - name: Resolve caller SHA (immutable ref to pin the gate to)
+      - name: Resolve caller SHA on the default branch
         # We resolve the commit SHA of the caller workflow file on
         # the default branch — NOT the file blob SHA (which is what
         # /contents returns), and NOT the PR head (which is
@@ -80,9 +88,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Get the latest commit SHA on main that touched the caller
-          # workflow file. This is the immutable ref the gate will
-          # be pinned to.
           caller_sha=$(gh api \
             "repos/$GITHUB_REPOSITORY/commits?path=.github/workflows/skeptic-gate-caller.yml&sha=main&per_page=1" \
             --jq '.[0].sha')
@@ -91,18 +96,23 @@ jobs:
             exit 1
           fi
           echo "caller_sha=$caller_sha" >> "$GITHUB_OUTPUT"
-          echo "[skeptic-caller] resolved caller SHA=$caller_sha (gate will checkout at this ref)"
+          echo "[skeptic-caller] resolved caller SHA=$caller_sha (gate will be pinned to this ref)"
 
-      - name: Invoke SHA-bound skeptic gate
-        # Pin the gate workflow to THIS caller workflow's commit SHA
-        # on the default branch. The fully-qualified ref syntax is
-        # required even when invoking a same-repo workflow, because
-        # the bare `./...` form resolves to the moving default
-        # branch, not an immutable SHA.
-        uses: jleechanorg/dark-factory/.github/workflows/skeptic-gate.yml@${{ steps.resolve.outputs.caller_sha }}
-        with:
-          pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
-          pr_sha: ${{ github.event.pull_request.head.sha || inputs.pr_sha }}
-          trusted_code_sha: ${{ steps.resolve.outputs.caller_sha }}
-        secrets:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+  call-skeptic-gate:
+    name: Call SHA-bound skeptic gate
+    needs: resolve-caller-sha
+    # Reusable-workflow invocation MUST live at the job level; the
+    # `uses:` ref MUST be a static literal (no expressions). We
+    # pin to this caller's own commit SHA on the default branch.
+    uses: jleechanorg/dark-factory/.github/workflows/skeptic-gate.yml@4e23f30266ee63d51b194b5a8a02eea0d38b7a7a
+    with:
+      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
+      pr_sha: ${{ github.event.pull_request.head.sha || inputs.pr_sha }}
+      # Forward the server-resolved SHA so the gate can refuse to
+      # run if its checkout disagrees. For workflow_dispatch the
+      # gate derives trusted_code_sha from the workflow ref itself,
+      # so we pass an empty string and the gate's server-side
+      # resolution takes over (see gate workflow line 230-246).
+      trusted_code_sha: ${{ needs.resolve-caller-sha.outputs.caller_sha || '' }}
+    secrets:
+      github_token: ${{ secrets.GITHUB_TOKEN }}
