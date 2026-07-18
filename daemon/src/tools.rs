@@ -403,6 +403,27 @@ pub trait Scm {
         self.pr_snapshot(pr)
     }
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError>;
+    /// Repo-scoped variant of [`close_pr`](Scm::close_pr) (bead jleechan-v6ud
+    /// / issue #340). The factory-fabricated re-roll path
+    /// (`reroll::execute` step 7) used to close the superseded PR via
+    /// `close_pr(pr_number, comment)` — which is bound at `main.rs`
+    /// construction time to `cfg.target_repo`. When a bead's resolved
+    /// `overlay.repo(cfg)` names a DIFFERENT repo (Stage A intake), `gh pr
+    /// close <n> --repo <default>` silently targets the DEFAULT repo's
+    /// PR with the same numeric ID — and if that PR is already merged
+    /// (the live failure for beads 8jxr and 9rkz: a same-numbered PR in
+    /// `jleechanorg/worldarchitect.ai` was already merged at the moment
+    /// the daemon tried to close it against the default repo), `gh` errors
+    /// out with "can't be closed because it was already merged" and the
+    /// bead wedges on a transient tool error. `repo` should always be
+    /// `overlay.repo(cfg)`, not `cfg.target_repo`. Default impl ignores
+    /// `repo` and delegates to `close_pr` so existing test fakes and any
+    /// impl that predates this method keep their original (single-repo)
+    /// behavior; `CliScm` overrides it to retarget via `with_repo`.
+    fn close_pr_for_repo(&self, repo: &str, pr: u64, comment: &str) -> Result<(), DaemonError> {
+        let _ = repo;
+        self.close_pr(pr, comment)
+    }
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError>;
     /// Repo-scoped variant of [`remote_branch_last_commit`](Scm::remote_branch_last_commit)
     /// (bead jleechan-bqdv, Stage C of the multi-repo dispatch fix — see
