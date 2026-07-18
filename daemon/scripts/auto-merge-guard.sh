@@ -13,6 +13,24 @@
 #      all_green=true would deadlock the factory. What must NOT happen is
 #      merging on "was assessed" alone while a gate is red.
 #   3. the per-hour merge budget is not exhausted (cascade blast-radius cap)
+#
+# bead jleechan-goal-unattended-e2e-2026-07-17-bze8.1 (U6b): the legacy
+# no-red merge policy above left four holes that the factory had to close
+# on top of it — disposition notes that substituted for missing evidence,
+# PR293/PR300-class regressions (merged-head CHANGES_REQUESTED, rate-
+# limited reviewer, stale-SHA PASS, status-context-without-review), and
+# silent CodeRabbit gating by a CI check rather than a formal APPROVED
+# review. The merge authority is now fail-closed at the exact PR head
+# SHA: every gate's evidence is SHA-bound to the live PR head, a CodeRabbit
+# record is only honored when `source_id` carries `review:APPROVED`,
+# Bugbot must report zero error-severity findings, and the github-actions
+# Skeptic verdict must bind to the current head. A disposition note
+# (operator assertion) is recorded in the audit telemetry but NEVER
+# overrides a missing or Red gate. Per-gate telemetry — source actor,
+# source URL/check/review ID, observed SHA, timestamp — is emitted on
+# every assessment so the audit trail is reconstructable from one line
+# in the daemon log.
+#
 # On merge: close the bead, transition the overlay to READY via the harness.
 #
 # Usage: daemon/scripts/auto-merge-guard.sh [max_merges_per_hour]   (default 8)
@@ -79,6 +97,40 @@ while read -r num branch; do
   echo "$checks" | grep -qi "fail" && { echo "PR $num: CI FAILED — skip (needs attention)"; continue; }
   verdict="$(latest_assessment_no_red "$num")" || { echo "PR $num: verifier assessment ${verdict:-missing} — refusing merge (green CI is insufficient)"; continue; }
   echo "PR $num: assessment $verdict"
+
+  # bead jleechan-goal-unattended-e2e-2026-07-17-bze8.1 (U6b): fail-closed
+  # exact-head 7-green merge authority. Re-verify every gate at the LIVE
+  # PR head SHA before merging — never trust a stale GATE_ASSESSMENT
+  # line. A disposition note or operator assertion can NEVER bypass a
+  # missing gate; the verdict comes from per-gate evidence at the
+  # exact head only. Per-gate telemetry is emitted on every assessment
+  # so the audit trail is reconstructable.
+  head_sha="$(gh pr view "$num" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null || echo "")"
+  [ -n "$head_sha" ] || { echo "PR $num: could not resolve live head SHA — refusing merge"; continue; }
+  if ! merge_decision="$(python3 -m runner.merge_authority_cli "$num" "$head_sha" "$REPO" 2>/dev/null)"; then
+    echo "PR $num: merge-authority call failed (binary missing or non-zero) — refusing merge (fail-closed)"
+    continue
+  fi
+  auth_verdict="$(printf '%s' "$merge_decision" | python3 -c 'import json,sys
+try:
+    d=json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+print(d.get("verdict",""))')" || auth_verdict=""
+  [ "$auth_verdict" = "MERGE" ] || { echo "PR $num: merge-authority BLOCK (live-head SHA=$head_sha) — refusing merge (fail-closed)"; printf '%s\n' "$merge_decision"; continue; }
+  echo "$merge_decision" | python3 -c 'import json,sys
+try:
+    d=json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+gates=d.get("gate_telemetry",{})
+for name in ["ci_green","no_conflicts","coderabbit","bugbot","comments_resolved","evidence_review","skeptic"]:
+    ev=gates.get(name,{})
+    print("gate",name,"status="+str(ev.get("status","?")),
+          "actor="+str(ev.get("source_actor","")),
+          "sha="+str(ev.get("head_sha","")[:12]),
+          "id="+str(ev.get("source_id","")))'
+
   # mergeable?
   [ "$(gh pr view "$num" --repo "$REPO" --json mergeable --jq .mergeable)" = "MERGEABLE" ] || { echo "PR $num: not MERGEABLE (conflicts) — skip"; continue; }
   echo "PR $num: gates red-free + mergeable — merging"

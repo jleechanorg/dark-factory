@@ -41,11 +41,38 @@ emit_assessment() { # <gates_json>
 }
 
 # Extract the predicate as a standalone command via. Reuses the exact
-# python heredoc block that lives at lines 41-69 of the production
-# script (line 40 is the bash `printf ... | python3 -c '` wrapper and
-# line 70 is the trailing `'` close-quote, neither of which Python
-# accepts inside `-c`).
-predicate_block="$(sed -n '41,69p' "$GUARD")"
+# python heredoc block that lives between the `printf ... | python3 -c '`
+# wrapper (line containing `python3 -c '` inside `latest_assessment_no_red`)
+# and the matching close-quote (`'`) line. Locate the start/end by line
+# number, then extract the predicate body (between them).
+# We use a fixed pattern "python3 -c '" (followed by EOL — the heredoc is
+# on its own line in the production script), grepped via grep -F so the
+# single quote is interpreted literally.
+predicate_start="$(grep -nF "python3 -c '" "$GUARD" | head -1 | cut -d: -f1)"
+if [ -z "$predicate_start" ]; then
+  echo "FAIL: could not locate python3 -c predicate block in $GUARD" >&2
+  exit 1
+fi
+# Walk forward from predicate_start+1 to find the line ending the python3 -c
+# heredoc. The heredoc's close-quote lives at the end of a code line
+# (`sys.exit(0)'`) — so we look for a line whose trailing non-whitespace
+# character is a single quote and whose body is `python`-ish (no bash).
+predicate_end_abs="$(
+  tail -n +"$((predicate_start + 1))" "$GUARD" \
+    | grep -nE "^[[:space:]]*[^#[:space:]].*'[[:space:]]*$" \
+    | head -1 \
+    | cut -d: -f1
+)"
+if [ -n "$predicate_end_abs" ]; then
+  predicate_end_abs=$((predicate_start + predicate_end_abs))
+fi
+if [ -z "$predicate_end_abs" ]; then
+  echo "FAIL: could not locate close-quote for python3 -c predicate (start=$predicate_start)" >&2
+  exit 1
+fi
+# Extract lines strictly between the wrapper and the close-quote (Python
+# does not accept the wrapper or close-quote inside `-c`).
+predicate_block="$(sed -n "$((predicate_start + 1)),$((predicate_end_abs - 1))p" "$GUARD")"
 
 run_predicate() { # <input_json>
   printf '%s' "$1" | python3 -c "$predicate_block"
