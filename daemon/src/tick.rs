@@ -491,6 +491,19 @@ pub fn run_tick(
                         let expected_branch = overlay.branch.clone().unwrap_or_default();
                         if actual_branch != expected_branch {
                             overlay.state = OverlayState::HumanHeld;
+                            // jleechan-t40t: clear the stale `pr_number` for the
+                            // same reason `dispatch_ready`'s
+                            // `spawn_branch_mismatch` arm does — when the
+                            // session's live branch no longer matches the
+                            // bead's recorded branch, the recorded PR no
+                            // longer owns this branch. Leaving the stale
+                            // pr_number in place permanently pins the daemon
+                            // to a closed/migrated PR (the jleechan-t8fd /
+                            // PR #316 case), blocking recovery from finding
+                            // the later correct PR via `gh pr list --head
+                            // <branch>` on the next dispatch.
+                            overlay.pr_number = None;
+                            overlay.branch = None;
                             set_human_hold_reason(
                                 &mut overlay,
                                 HumanHoldReason::SessionBranchMismatch,

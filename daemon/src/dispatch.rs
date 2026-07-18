@@ -520,6 +520,20 @@ pub fn dispatch_ready(
                 }
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                // jleechan-t40t: a stale `pr_number` carried on the overlay
+                // from a previous dispatch attempt is now load-bearing
+                // misleading state — the bead was just bound to a DIFFERENT
+                // branch than its recorded PR, so that recorded PR no longer
+                // (and may never have) owned this branch. Leaving the stale
+                // pr_number in place permanently pins the daemon to a
+                // closed/migrated PR (the jleechan-t8fd / PR #316 case),
+                // blocking recovery from finding the later correct PR on
+                // `gh pr list --head <branch>`. Clear both `pr_number` and
+                // `branch` so the next dispatch can re-resolve from the
+                // bead's `external_ref` (preferred) or fall back to the
+                // generated-branch path that performs the live PR lookup.
+                overlay.pr_number = None;
+                overlay.branch = None;
                 set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnBranchMismatch);
                 store.save(&overlay)?;
                 report.failures.push(failure(
@@ -1813,12 +1827,98 @@ mod tests {
         );
 
         // Never auto-requeue a dispatch whose returned metadata contradicted
-        // the requested branch; preserve the requested branch for diagnosis.
+        // the requested branch; park HUMAN_HELD for diagnosis.
+        //
+        // jleechan-t40t: clear the stale `branch` (and any stale `pr_number`)
+        // on mismatch detection — the bead's recorded branch is now known
+        // wrong, and pinning the next dispatch to it would replay the same
+        // mismatch. The new branch / pr_number will be re-resolved on the
+        // next dispatch attempt from the bead's `external_ref` or a fresh
+        // `gh pr list --head <branch>` lookup. The requested branch
+        // (`factory/bead-0-r1`) is still recorded in the failure report's
+        // `branch` field above for operator diagnosis — it's just not
+        // persisted on the overlay anymore.
         let overlay = store.load("bead-0").unwrap().unwrap();
         assert_eq!(overlay.state, OverlayState::HumanHeld);
         assert_eq!(overlay.session_id, None);
-        assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
+        assert_eq!(
+            overlay.branch, None,
+            "branch must be cleared on spawn_branch_mismatch so the next \
+             dispatch can re-resolve from external_ref or branch lookup \
+             instead of replaying the same mismatch"
+        );
+        assert_eq!(
+            overlay.pr_number, None,
+            "stale pr_number must be cleared on spawn_branch_mismatch so the \
+             next dispatch can discover the current correct PR (jleechan-t40t)"
+        );
         assert_eq!(overlay.park_reason.as_deref(), Some("spawn_branch_mismatch"));
+    }
+
+    /// jleechan-t40t regression test: when `spawn_branch_mismatch` is detected,
+    /// any stale `pr_number` previously recorded on the overlay MUST be
+    /// cleared, so the bead's next dispatch can re-resolve the CURRENT correct
+    /// PR from its branch (`gh pr list --head <branch>`) rather than being
+    /// permanently pinned to a closed/migrated PR that no longer owns the
+    /// branch. Live incident 2026-07-18 (bead jleechan-t8fd / PR #316):
+    /// branch mismatch was detected and the bead parked HUMAN_HELD, but the
+    /// stored `pr_number` survived untouched, so the daemon kept posting
+    /// comments to the closed #316 and never discovered the later correct PR
+    /// on the same branch — leaving the bead DISPATCHED indefinitely and
+    /// blocking convergence on the actual fix.
+    #[test]
+    fn spawn_branch_mismatch_clears_stale_pr_number_so_daemon_can_rediscover_current_pr() {
+        let sessions = FakeSessions::new(0);
+        // Force the same branch-mismatch path as the regression above.
+        sessions.set_session_branch("fake-session-1", "feat/wa-3004-hook-refactor");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        // Pre-seed the overlay with a STALE pr_number (the closed #316) —
+        // this is the durable state that the original code path forgot to
+        // clear on branch-mismatch detection.
+        let mut preloaded = BeadOverlay {
+            bead_id: "bead-0".into(),
+            state: OverlayState::Queued,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(316),
+            branch: None,
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        };
+        // Persist via the store's internal API; FakeStateStore's `save` is
+        // the public seam but it's behind the trait, so use the in-memory
+        // map directly to mirror the live "durable overlay already on disk"
+        // precondition.
+        store.overlays.borrow_mut().insert("bead-0".into(), preloaded.clone());
+        let _ = &mut preloaded; // silence unused mut warning if any
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].phase, "spawn_branch_mismatch");
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("spawn_branch_mismatch")
+        );
+        assert!(
+            overlay.pr_number.is_none(),
+            "branch-mismatch detection MUST clear stale pr_number so the next \
+             dispatch can re-resolve the current correct PR from the branch; \
+             instead the overlay still carried pr_number={:?}, which leaves \
+             the daemon permanently pinned to the closed/migrated PR",
+            overlay.pr_number,
+        );
     }
 
     #[test]
