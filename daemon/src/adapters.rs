@@ -1,5 +1,5 @@
 use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
-use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
+use crate::tools::{resolve_worktree_path, run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -1238,6 +1238,60 @@ impl Scm for CliScm {
         branch: &str,
     ) -> Result<Option<u64>, DaemonError> {
         self.with_repo(repo).remote_branch_last_commit(branch)
+    }
+
+    /// jleechan-coder-silent-false-parks-h92r (PR #307 reconciliation): poll
+    /// the local worktree's HEAD commit timestamp for `branch` under
+    /// `ao_project` — a THIRD liveness signal used by the coder-silence
+    /// watcher, alongside the remote-branch and transcript-mtime signals.
+    ///
+    /// The remote-side check (`remote_branch_last_commit_for_repo`) only
+    /// observes what has already been pushed; long-running Claude coder
+    /// sessions buffer locally between `git push` cycles (5-15 min cadence,
+    /// sometimes longer for non-trivial diffs). On 2026-07-17, all 6 af-drive
+    /// lanes (df-149..154) were parked `coder_silent` with transcripts
+    /// 237-1848 lines each while their coders were ACTIVELY producing work —
+    /// the silence heuristic had no signal to distinguish "pushed and idle"
+    /// from "actively producing locally, not yet pushed". Reading the local
+    /// worktree's HEAD commit time closes the local-commits-no-push gap: any
+    /// coder whose worktree has a fresh commit timestamp is, by definition,
+    /// not silent.
+    ///
+    /// Path resolution: looks at the well-known Agent-Orchestrator worktree
+    /// directory `~/.agent-orchestrator/<ao_project>/<branch>` (the same
+    /// convention AO's `spawn.ts` uses — recorded in
+    /// `agent-orchestrator/packages/cli/src/commands/spawn.ts:160-161`).
+    /// When the worktree is absent on disk we return `Ok(None)` ("cannot
+    /// verify", not a positive liveness signal) so callers do not need to
+    /// distinguish "no worktree yet" from "scm call failed". Any non-zero
+    /// `git` exit is treated the same way: the watcher's principle is "lack
+    /// of evidence ≠ evidence of lack". The default branch worktree name
+    /// (`<display_name> == <branch>` without the `factory/` prefix etc.) is
+    /// matched here verbatim — `resolve_worktree_path` in `tools.rs` only
+    /// needs the directory to exist and to be a git repo.
+    fn worktree_branch_last_commit(
+        &self,
+        ao_project: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let path = resolve_worktree_path(ao_project, branch);
+        if !path.is_dir() {
+            return Ok(None);
+        }
+        let cwd = path.to_string_lossy().into_owned();
+        match run_tool_in_dir("git", &["log", "-1", "--format=%ct"], &cwd, 10) {
+            Ok(out) => {
+                let trimmed = out.trim();
+                if trimmed.is_empty() {
+                    return Ok(None);
+                }
+                match trimmed.parse::<u64>() {
+                    Ok(epoch) => Ok(Some(epoch)),
+                    Err(_) => Ok(None),
+                }
+            }
+            Err(_) => Ok(None),
+        }
     }
 }
 

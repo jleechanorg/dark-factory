@@ -557,29 +557,55 @@ pub fn run_tick(
                             // locally (edit/test/edit) for well over 30
                             // minutes before its next push, so "no remote
                             // commit in 30 minutes" alone is not evidence of
-                            // silence. Consult the coder's own transcript
-                            // mtime as a second, independent liveness
-                            // signal before parking; only park when NEITHER
-                            // signal shows recent activity (fail-closed
-                            // preserved: missing/unresolvable transcript
-                            // evidence does not by itself save a bead from
-                            // parking).
-                            let transcript_epoch = deps
-                                .cfg
-                                .resolve_repo(overlay.repo(deps.cfg))
-                                .and_then(|routing| {
-                                    deps.sessions
-                                        .worktree_transcript_last_activity_epoch(
-                                            &routing.ao_project,
-                                            branch,
-                                        )
-                                        .ok()
-                                        .flatten()
-                                });
+                            // silence. Consult TWO additional liveness signals
+                            // before parking; only park when ALL THREE signals
+                            // (remote branch, local worktree HEAD, transcript
+                            // mtime) show no recent activity (fail-closed
+                            // preserved: missing/unresolvable evidence does
+                            // not by itself save a bead from parking).
+                            //
+                            // Signal 1: local worktree HEAD commit timestamp
+                            // (`worktree_branch_last_commit`). Reads the
+                            // coder's own git log on the AO workspace — a
+                            // fresh local commit is, by definition, evidence
+                            // the coder is not silent. PR #307 reconciliation
+                            // adds this third signal so a coder actively
+                            // committing locally but not yet pushed is not
+                            // false-parked.
+                            let routing = deps.cfg.resolve_repo(overlay.repo(deps.cfg));
+                            let ao_project = routing
+                                .as_ref()
+                                .map(|r| r.ao_project.as_str())
+                                .unwrap_or(overlay.repo(deps.cfg));
+                            let worktree_epoch = deps
+                                .scm
+                                .worktree_branch_last_commit(ao_project, branch)
+                                .ok()
+                                .flatten();
+                            let worktree_is_active = worktree_epoch
+                                .is_some_and(|t| now_epoch.saturating_sub(t) < 1800);
+
+                            // Signal 2: transcript mtime
+                            // (`worktree_transcript_last_activity_epoch`).
+                            // Reads the coder's Claude Code transcript
+                            // directory mtime as a second, independent
+                            // liveness signal sourced from the coder's own
+                            // activity rather than git state.
+                            let transcript_epoch = routing.as_ref().and_then(|routing| {
+                                deps.sessions
+                                    .worktree_transcript_last_activity_epoch(
+                                        &routing.ao_project,
+                                        branch,
+                                    )
+                                    .ok()
+                                    .flatten()
+                            });
                             let transcript_is_active = transcript_epoch
                                 .is_some_and(|t| now_epoch.saturating_sub(t) < 1800);
 
-                            if branch_is_silent && transcript_is_active {
+                            if branch_is_silent
+                                && (worktree_is_active || transcript_is_active)
+                            {
                                 emit(
                                     deps.telemetry_log,
                                     &overlay.bead_id,
@@ -591,6 +617,7 @@ pub fn run_tick(
                                         "reason": "coder_active_grace",
                                         "branch": branch,
                                         "last_commit_epoch": last_commit_epoch,
+                                        "worktree_epoch": worktree_epoch,
                                         "transcript_epoch": transcript_epoch,
                                     }),
                                 )?;
@@ -605,7 +632,12 @@ pub fn run_tick(
                                     OverlayState::HumanHeld.as_str(),
                                     "PARKED_HUMAN_HELD",
                                     serde_json::json!({}),
-                                    serde_json::json!({"reason": "coder_silent"}),
+                                    serde_json::json!({
+                                        "reason": "coder_silent",
+                                        "last_commit_epoch": last_commit_epoch,
+                                        "worktree_epoch": worktree_epoch,
+                                        "transcript_epoch": transcript_epoch,
+                                    }),
                                 )?;
                                 let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): coder silent/inactive on branch for 30 minutes.".to_string();
                                 let _ = post_scm_comment_by_bead_id(

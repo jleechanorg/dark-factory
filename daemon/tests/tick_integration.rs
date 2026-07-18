@@ -877,6 +877,213 @@ fn test_wedge_detection_dispatched_coder_silent_stale_transcript_still_parks() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// jleechan-coder-silent-false-parks-h92r REGRESSION (PR #307 reconciliation;
+///
+/// Companion to `test_wedge_detection_dispatched_coder_silent_saved_by_transcript_activity`:
+/// the silence heuristic must also trust the LOCAL WORKTREE HEAD commit
+/// timestamp, not just the coder's transcript mtime. On 2026-07-17 all 6
+/// af-drive lanes (df-149..154) were parked `coder_silent` while their coders
+/// were ACTIVELY WORKING (transcripts 237-1848 lines, real PRs landed). The
+/// silence heuristic only polled the GitHub-side branch tip via
+/// `gh api .../branches/<branch>`, but long-running Claude coder sessions
+/// buffer locally between `git push` cycles (5-15 min cadence, sometimes
+/// longer for non-trivial diffs) — the remote can appear silent for >30
+/// min while the worktree's local HEAD is moving. Reading the local
+/// worktree's HEAD commit time (`worktree_branch_last_commit`) closes the
+/// local-commits-no-push gap.
+///
+/// RED proof: under the OLD heuristic (remote stale + autonomy >= 1800) the
+/// bead IS parked even when the worktree's local HEAD has a fresh commit.
+/// GREEN: with the worktree liveness signal returning a fresh commit time,
+/// the bead stays DISPATCHED.
+#[test]
+fn test_coder_silent_false_park_respects_worktree_local_activity() {
+    // Scenario: a coder session was dispatched onto `factory/df-150-r1` more
+    // than 30 minutes ago (`autonomy_secs=1900`). It has been writing commits
+    // locally but has NOT pushed in a while. The remote branch's last commit
+    // is older than the silence threshold (or the branch doesn't exist on the
+    // remote yet). Under the old heuristic this bead is parked even though
+    // the coder is actively producing work — false-park.
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "df-150".into(),
+        BeadOverlay {
+            bead_id: "df-150".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 1900, // > 1800 silence threshold
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/df-150-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+
+    // GitHub-side: the remote branch's last commit timestamp is OLDER than the
+    // 1800s silence window (this is exactly what `gh api .../branches/<branch>`
+    // returns for a coder that has been buffering locally between pushes).
+    // Under the OLD heuristic this drives `is_silent = true` -> park.
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let stale_remote_commit = now_epoch.saturating_sub(2400); // 40 minutes old
+    scm.remote_branches.insert(
+        "factory/df-150-r1".into(),
+        Some(stale_remote_commit),
+    );
+
+    // The FIX adds `worktree_branch_last_commit(ao_project, branch)`: the
+    // local HEAD's commit time on the coder's worktree. When fresh, the coder
+    // is by definition not silent (it just hasn't pushed yet). Script the
+    // fake to return a fresh commit time. `ao_project` here must match
+    // `Config::resolve_repo("owner/repo").ao_project` for the test's
+    // `test_cfg()` — i.e. the last path segment of `target_repo` ("repo",
+    // not "dark-factory" — the test config does not name the dark-factory
+    // repo, by design).
+    let fresh_local_commit = now_epoch.saturating_sub(120); // 2 minutes old
+    scm.worktree_branch_commits.insert(
+        ("repo".into(), "factory/df-150-r1".into()),
+        Some(fresh_local_commit),
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_coder_silent_false_park.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = FakeVcs::new();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // Run tick — under the FIX, the bead must STAY DISPATCHED, not get parked.
+    let summary = run_tick(&deps, 1, 10).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "bead whose worktree has a fresh local commit must NOT be parked coder_silent \
+         (jleechan-coder-silent-false-parks-h92r; live 2026-07-17 incident parked 6 \
+         active coders with no worktree-local liveness check)"
+    );
+
+    let o = store.load("df-150").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "bead must remain DISPATCHED when local worktree has a fresh commit"
+    );
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(
+        !logs.contains("PARKED_HUMAN_HELD"),
+        "no PARKED_HUMAN_HELD event must be emitted for a coder with fresh local activity: {logs}"
+    );
+    assert!(
+        !logs.contains("coder_silent"),
+        "no coder_silent park_reason must be set when local worktree is active: {logs}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-coder-silent-false-parks-h92r SYMMETRY GUARD (PR #307
+/// reconciliation):
+///
+/// Companion to `test_coder_silent_false_park_respects_worktree_local_activity`:
+/// when BOTH the remote branch AND the local worktree HEAD confirm silence
+/// (no fresh local commits AND stale remote), the bead MUST still be parked.
+/// This is the negative path of the same fix — proves the liveness check
+/// has not weakened the genuine silence-detection invariant.
+#[test]
+fn test_coder_silent_still_parks_when_both_remote_and_worktree_are_stale() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "df-152".into(),
+        BeadOverlay {
+            bead_id: "df-152".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 1900,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/df-152-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Both remote AND worktree are stale: genuine silence.
+    scm.remote_branches.insert(
+        "factory/df-152-r1".into(),
+        Some(now_epoch.saturating_sub(2400)),
+    );
+    scm.worktree_branch_commits.insert(
+        ("repo".into(), "factory/df-152-r1".into()),
+        Some(now_epoch.saturating_sub(2400)),
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_coder_silent_true_silence.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = FakeVcs::new();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 10).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "bead with stale remote AND stale worktree must still be parked coder_silent"
+    );
+
+    let o = store.load("df-152").unwrap().unwrap();
+    assert_eq!(o.state, OverlayState::HumanHeld);
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(logs.contains("coder_silent"), "logs: {}", logs);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// jleechan-5ia2 regression test: reproduces the LIVE bug this bead tracks.
 /// Bead `jleechan-vj89`'s overlay was observed with `state=DISPATCHED`,
 /// `branch=factory/jleechan-vj89-r1`, and a real, alive `session_id`
