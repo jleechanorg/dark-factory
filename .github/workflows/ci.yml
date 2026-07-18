@@ -6,9 +6,27 @@ on:
   pull_request:
     branches: [main]
 
+# All jobs target the org's self-hosted runner pool via the
+# SELF_HOSTED_RUNNER_LABELS repo variable. The variable is parsed from a JSON
+# array string into a YAML label list using fromJSON(...). When the variable
+# drifts to a selector that matches zero online runners, jobs queue forever —
+# that is why runner-selector-drift.yml runs as a separate, hardcoded-selector
+# cron + push gate to detect the drift before CI becomes invisible.
+#
+# Never set `runs-on: ubuntu-latest` here. GitHub-hosted runners are the
+# explicit fallback we are forbidding under bead jleechan-z284 / issue #286.
+# See docs/self-hosted-runner-selector.md.
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Fork-PR isolation: self-hosted runners are persistent and may carry
+    # org secrets / cached build state. Untrusted fork PR code must not
+    # execute on them — the risk is a persistent compromise of the runner
+    # (see GitHub's secure-use docs for public repos with self-hosted runners).
+    # Same guard as evidence-gate.yml: fork PRs are skipped, not silently
+    # rerouted; the PR author must open from a branch in the same org.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+    runs-on: ${{ fromJSON(vars.SELF_HOSTED_RUNNER_LABELS) }}
     permissions:
       contents: read
     env:
@@ -28,6 +46,178 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
+
+      - name: Fix Python 3.13 shared-library path (self-hosted runners)
+        # actions/setup-python installs Python 3.13 under a toolcache path
+        # (`/home/runner/_work/_tool/Python/<ver>/<arch>/`) and ships
+        # `libpython3.13.so` WITHOUT the versioned soname symlink
+        # (`libpython3.13.so.1.0`). The dynamic linker resolves the soname, not
+        # the link-time name, so any subprocess `python3` invocation fails with
+        # `error while loading shared libraries: libpython3.13.so.1.0` and
+        # rc=127, taking test_preflight.py / test_structural_preflight.py /
+        # test_conformance.py etc. down with it.
+        #
+        # CRITICAL: this step MUST NOT call `python3` for self-discovery
+        # because when the soname symlink is absent, `python3` itself fails
+        # to load and `python3 -c 'import sys; print(sys.prefix)'` returns
+        # 127 BEFORE the remediation runs. Instead, derive the toolchain dir
+        # from `PythonLocation` (exported by actions/setup-python), fall back
+        # to the symlink-resolved `command -v python3`, and explicitly verify
+        # rc=0 on a subprocess `python3 -c 'pass'` invocation BEFORE the test
+        # step runs.
+        run: |
+          set -u
+          # 1) Resolve the toolchain ROOT directory WITHOUT invoking python3.
+          # `pythonLocation` (set by actions/setup-python v5) points at the
+          # toolchain ROOT (e.g. /home/runner/_work/_tool/Python/3.13.14/arm64),
+          # not the bin subdir; the binary lives at `$TOOLCHAIN_ROOT/bin/python3`.
+          TOOLCHAIN_ROOT="${PythonLocation:-${pythonLocation:-}}"
+          if [ -z "$TOOLCHAIN_ROOT" ] && command -v python3 >/dev/null 2>&1; then
+            # `command -v` is a shell builtin; it does not exec the binary, so
+            # it works even when libpython would have failed. Resolve the
+            # symlink chain so we land on the real toolcache root rather than
+            # `/usr/bin/python3` (which on self-hosted runners is a shim).
+            PY_BIN="$(command -v python3)"
+            PY_REAL="$(readlink -f "$PY_BIN" 2>/dev/null || echo "$PY_BIN")"
+            # the python binary's directory is `<root>/bin`, so the root is its parent
+            TOOLCHAIN_ROOT="$(dirname "$(dirname "$PY_REAL")")"
+          fi
+          # 1b) Reject unsafe TOOLCHAIN_ROOT values that would cause `find`
+          # to scan huge trees. The previous step would happily fall through
+          # with `/usr` on Mac arm64 self-hosted runners and then hang in
+          # `find /usr -maxdepth 4 …` for the full job timeout (45+ min on
+          # PR #303). If the resolved root is `/`, `/usr`, `/System`, or any
+          # non-toolcache-looking path, short-circuit with a clear warning.
+          case "$TOOLCHAIN_ROOT" in
+            ""|/|"/usr"|"/usr/"|"/System"|"/System/"|"/private"|"/private/")
+              echo "::warning::Refusing to fix libpython under unsafe TOOLCHAIN_ROOT='$TOOLCHAIN_ROOT' (would scan too much)."
+              echo "::warning::self-hosted runners without an actions/setup-python toolcache will fall through to the next step and likely fail with rc=127 — that's a separate signal to investigate."
+              exit 0
+              ;;
+          esac
+          if [ ! -d "$TOOLCHAIN_ROOT" ]; then
+            echo "::error::Cannot locate Python toolchain root (PythonLocation=${PythonLocation:-<unset>})."
+            exit 1
+          fi
+          # Sanity: confirm the python3 binary actually exists where we think it is.
+          if [ ! -x "$TOOLCHAIN_ROOT/bin/python3" ]; then
+            echo "::warning::Expected python3 binary at $TOOLCHAIN_ROOT/bin/python3 but it is missing or not executable — skipping libpython fix (likely system python). exit 0 to let downstream catch the real cause."
+            ls -la "$TOOLCHAIN_ROOT" 2>/dev/null || true
+            exit 0
+          fi
+          echo "Toolchain root: $TOOLCHAIN_ROOT"
+          # 2) Locate the link-time libpython3.13.so in the toolchain's lib dir.
+          # Wrap in `timeout 30` so a runaway filesystem scan can't wedge the
+          # whole workflow. `find` is normally fast but on self-hosted Mac
+          # arm64 runners with `/usr`-sized toolchains it can take minutes.
+          SO_PATH="$TOOLCHAIN_ROOT/lib/libpython3.13.so"
+          if [ ! -e "$SO_PATH" ]; then
+            SO_PATH="$(timeout 30 find "$TOOLCHAIN_ROOT" -maxdepth 4 -name 'libpython3.13.so' -not -name '*.so.*' 2>/dev/null | head -1 || true)"
+          fi
+          if [ -z "$SO_PATH" ] || [ ! -e "$SO_PATH" ]; then
+            echo "::warning::libpython3.13.so not found in toolchain ($TOOLCHAIN_ROOT) — subprocess python will fail."
+          else
+            SO_DIR="$(dirname "$SO_PATH")"
+            SO_NAME="$(basename "$SO_PATH")"
+            VERSIONED="libpython3.13.so.1.0"
+            # 3) Promote LD_LIBRARY_PATH so subprocess python (the cargo
+            #    daemon-tests job also runs tools that exec python) can find
+            #    the unversioned .so even before the versioned soname is
+            #    resolvable.
+            echo "LD_LIBRARY_PATH=${SO_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+            # 4) Create the versioned soname symlink in the SAME directory as
+            #    the link-time shared object so a bare `python3 -c ...` works
+            #    without depending on LD_LIBRARY_PATH inheritance across steps.
+            if [ ! -e "${SO_DIR}/${VERSIONED}" ]; then
+              ln -s "$SO_NAME" "${SO_DIR}/${VERSIONED}"
+              echo "Created symlink ${SO_DIR}/${VERSIONED} -> ${SO_NAME}"
+            else
+              echo "Versioned symlink ${SO_DIR}/${VERSIONED} already exists"
+            fi
+            # 4b) tests/test_*.py subprocess calls (test_subprocess_fail_exit_code,
+            #     test_subprocess_emits_valid_json, test_cli_subprocess_emits_exact_message,
+            #     test_module_runnable_as_python_m_runner, …) invoke
+            #     sys.executable with an explicit `env=` argument that
+            #     intentionally strips LD_LIBRARY_PATH. The fix at step (4)
+            #     above + the LD_LIBRARY_PATH export do not reach those
+            #     subprocesses. The remaining mechanism is to install a tiny
+            #     `python3` shim at `$TOOLCHAIN_ROOT/bin/python3` that execs
+            #     the original toolchain binary with `LD_PRELOAD` set to the
+            #     link-time `libpython3.13.so`. Force-loading libpython via
+            #     LD_PRELOAD satisfies the python binary's libpython3.13.so.1.0
+            #     soname reference regardless of LD_LIBRARY_PATH inheritance.
+            #
+            #     The shim is installed ONLY if a real toolchain `python3`
+            #     exists at the expected location. It backs up the original
+            #     binary first so the failure mode is reversible if the
+            #     shell that runs the step misbehaves.
+            SHIM_REAL="$TOOLCHAIN_ROOT/bin/python3.real"
+            # Skip the shim install when SHIM_BIN lives under a SIP-protected
+            # macOS path (`/usr/bin`, `/bin`, `/sbin`, `/System`, `/private`).
+            # Trying to `mv` those binaries fails silently with `Operation not
+            # permitted` on macOS and the script wedges (verified on
+            # ez-mac-runner-b-3 PR #303 2026-07-17). The libpython symlink fix
+            # at step (4) above is the primary remediation; the shim is a
+            # belt-and-suspenders for subprocesses that strip LD_LIBRARY_PATH.
+            case "$TOOLCHAIN_ROOT/bin" in
+              /usr/bin|/bin|/sbin|/usr/sbin|/System/*|/private/*)
+                echo "::warning::SHIM_BIN under SIP-protected path ($TOOLCHAIN_ROOT/bin) — skipping shim install. Downstream tests that strip LD_LIBRARY_PATH will need their own handling."
+                ;;
+              *)
+                for SHIM_NAME in python3 python; do
+                  SHIM_BIN="$TOOLCHAIN_ROOT/bin/$SHIM_NAME"
+                  if [ -e "$SHIM_REAL" ]; then
+                    # Real binary is already preserved by an earlier iteration.
+                    # Install (or refresh) the shim that execs it with LD_PRELOAD.
+                    if [ "$SHIM_BIN" = "$SHIM_REAL" ]; then
+                      continue
+                    fi
+                    printf '#!/usr/bin/env bash\nexec env LD_PRELOAD="%s" "%s" "$@"\n' \
+                      "$SO_PATH" "$SHIM_REAL" > "$SHIM_BIN"
+                    chmod +x "$SHIM_BIN"
+                    echo "Installed shim: $SHIM_BIN -> exec $SHIM_REAL with LD_PRELOAD=$SO_PATH"
+                  elif [ -x "$SHIM_BIN" ]; then
+                    # First iteration: preserve the real binary then shim it.
+                    mv "$SHIM_BIN" "$SHIM_REAL"
+                    printf '#!/usr/bin/env bash\nexec env LD_PRELOAD="%s" "%s" "$@"\n' \
+                      "$SO_PATH" "$SHIM_REAL" > "$SHIM_BIN"
+                    chmod +x "$SHIM_BIN"
+                    echo "Installed shim: $SHIM_BIN -> exec $SHIM_REAL with LD_PRELOAD=$SO_PATH"
+                  else
+                    echo "::warning::No toolchain python at $SHIM_BIN — skipping shim for that name."
+                  fi
+                done
+                # 5) Self-test: invoke the toolchain `python3 -c 'import sys'` NOW,
+                #    before the test step, so a remaining rc=127 surfaces as a
+                #    step-level error here instead of failing the entire pytest
+                #    run (which would mask the real cause).
+                # Wrap in `timeout 60` so a hung python subprocess can't wedge
+                # the workflow indefinitely.
+                echo "Self-test: $SHIM_BIN -c 'import sys; sys.exit(0)'"
+                timeout 60 "$SHIM_BIN" -c 'import sys; sys.exit(0)'
+                rc=$?
+                if [ "$rc" -ne 0 ]; then
+                  echo "::error::subprocess python3 still fails after symlink fix (rc=$rc). libpython is not loadable."
+                  exit 1
+                fi
+                echo "Self-test ok (rc=$rc)"
+                ;;
+            esac
+          fi
+
+      - name: Detect runner platform (Linux-only isolation tests)
+        # tests/security/test_agent_isolation.py uses @linux_only markers
+        # and will SKIP on macOS runners. This step surfaces that fact
+        # explicitly so macOS CI runs don't silently omit sandbox coverage.
+        # See docs/self-hosted-runner-selector.md "Adding a platform-specific
+        # job" for the path to a dedicated Linux-only job once a
+        # self-hosted-linux label is available on the org fleet.
+        run: |
+          PLATFORM="$(python3 -c 'import sys; print(sys.platform)')"
+          echo "Runner platform: $PLATFORM"
+          if [ "$PLATFORM" != "linux" ]; then
+            echo "::warning title=Platform coverage gap::Running on $PLATFORM — tests/security/test_agent_isolation.py Linux-only tests will be skipped. Open a follow-up issue to add a self-hosted-linux label to the org runner fleet for mandatory Linux coverage."
+          fi
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
@@ -51,7 +241,10 @@ jobs:
         run: python -m runner.graph_audit pipelines
 
   daemon-tests:
-    runs-on: ubuntu-latest
+    # Fork-PR isolation: same guard as the `test` job above.
+    # Self-hosted runners are persistent — fork PR code must not execute on them.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+    runs-on: ${{ fromJSON(vars.SELF_HOSTED_RUNNER_LABELS) }}
     permissions:
       contents: read
     steps:
@@ -69,6 +262,58 @@ jobs:
         run: |
           git fetch origin main
           git show-ref --verify --quiet refs/heads/main || git branch main origin/main
+
+      - name: Install Rust toolchain (stable)
+        # Self-hosted runners do not ship with `cargo` pre-installed (verified
+        # on jleechanorg org runners 2026-07-12, PR #287 CI run). dtolnay's
+        # rust-toolchain action installs rustup + the requested toolchain in
+        # one step; we then cache the daemon crate's build artifacts so
+        # subsequent runs are fast.
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1 (stable)
+        with:
+          toolchain: stable
+          components: clippy  # required for `cargo clippy` in the lint step
+
+      - name: Cache cargo registry/target for daemon crate
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc  # v2.9.1
+        with:
+          workspaces: daemon -> target
+
+      - name: Provision Node 22.22.0 (for AO bridge tests)
+        # `bridge_test_node()` in `daemon/src/adapters.rs:2063` looks for
+        # `${HOME}/.nvm/versions/node/v22.22.0/bin/node` (the global
+        # CLAUDE.md "Use nvm Node 22 (v22.22.0)" convention) before
+        # falling back to `node` on PATH. Self-hosted runners don't ship
+        # nvm or Node 22 preinstalled — verified on PR #287 CI run
+        # 29549724870 where 5 `adapters::ao_spawn_contract_tests`
+        # panicked with `[Errno 2] No such file or directory` because
+        # the AO bridge python shim `os.execvp`'d a missing
+        # `AO_FAKE_NODE` path. Provision Node 22.22.0 from NodeSource
+        # to the exact nvm path so the bridge tests can find their
+        # runtime.
+        # Short-circuit cleanly when the binary already exists so
+        # cached/ephemeral runners don't re-download ~30MB on every run.
+        # Bead: jleechan-af-drive-pr287-aw9y.
+        run: |
+          NODE_BIN="${HOME}/.nvm/versions/node/v22.22.0/bin"
+          if [ -x "${NODE_BIN}/node" ]; then
+            "${NODE_BIN}/node" --version
+            exit 0
+          fi
+          OS="$(uname -s)"
+          ARCH="$(uname -m)"
+          case "${OS}-${ARCH}" in
+            Darwin-x86_64)  NODE_ARCH=darwin-x64 ;;
+            Darwin-arm64)   NODE_ARCH=darwin-arm64 ;;
+            Linux-x86_64)   NODE_ARCH=linux-x64 ;;
+            Linux-aarch64)  NODE_ARCH=linux-arm64 ;;
+            *) echo "::error::Unsupported Node arch: ${OS}-${ARCH}"; exit 1 ;;
+          esac
+          mkdir -p "${NODE_BIN%/*}"
+          curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/v22.22.0/node-v22.22.0-${NODE_ARCH}.tar.xz"
+          tar -xJf /tmp/node.tar.xz -C /tmp
+          cp -r "/tmp/node-v22.22.0-${NODE_ARCH}/bin" "/tmp/node-v22.22.0-${NODE_ARCH}/lib" "/tmp/node-v22.22.0-${NODE_ARCH}/include" "/tmp/node-v22.22.0-${NODE_ARCH}/share" "${NODE_BIN%/*}/"
+          "${NODE_BIN}/node" --version
 
       - name: cargo test (daemon crate)
         working-directory: daemon

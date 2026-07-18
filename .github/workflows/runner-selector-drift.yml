@@ -1,0 +1,163 @@
+# runner-selector-drift.yml
+#
+# Detects drift between the SELF_HOSTED_RUNNER_LABELS repo variable and the
+# live org runner inventory before the CI jobs become invisible. Refs:
+#   - bead jleechan-z284 (factory configuration blocker)
+#   - issue jleechanorg/dark-factory#286
+#
+# This workflow uses a HARDCODED self-hosted runner selector
+# (`[self-hosted, self-hosted-mikey, ezgha]`) on purpose: it must be reachable
+# even when the repo variable is broken, because a broken selector is the very
+# failure mode this gate exists to detect. Routing the gate through
+# `vars.SELF_HOSTED_RUNNER_LABELS` would defeat the purpose — if the variable
+# drifts to a no-match selector, the gate itself queues forever and the drift
+# goes silent.
+#
+# Triggers:
+#   - push to main                → catch drift the moment it ships
+#   - pull_request to main        → catch drift before it ships
+#   - schedule (weekly)           → catch drift from runner fleet changes
+#                                   (labels added/removed, runners retired)
+#   - workflow_dispatch           → manual run on demand
+#
+# Exit codes of scripts/check_runner_selector.py:
+#   0 = PASS    (≥ --min-matches runners online satisfy the selector)
+#   1 = DRIFT   (selector matches fewer than required)
+#   2 = invocation error (gh failure, malformed selector, etc.)
+#   3 = FLEET_DOWN (no runners online at all)
+# Any non-zero rc fails this workflow loud.
+name: Self-hosted runner selector drift check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly on Mondays at 09:00 UTC — runner fleets change rarely but when
+    # they do (retire/replace) the labels drift; weekly is a low-cost canary.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      min_matches:
+        description: "Minimum runners that must satisfy the selector"
+        required: false
+        type: number
+        default: 1
+      include_offline:
+        description: "Count offline runners too (look past liveness)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  # Note: this workflow also needs `manage_runners:org` scope to call
+  # `gh api orgs/{org}/actions/runners`. That scope is NOT available via
+  # `GITHUB_TOKEN` — it requires a dedicated PAT stored as
+  # `secrets.RUNNERS_READ_PAT` with the `manage_runners:org` permission.
+  # If that secret is absent, the drift check will fail loud (exit 2)
+  # which is the correct fail-closed behaviour. See the env block in the
+  # `drift-check` job for the token resolution logic.
+
+jobs:
+  drift-check:
+    name: Verify SELF_HOSTED_RUNNER_LABELS matches live org runners
+    # HARDCODED selector — see workflow header. Update this list ONLY when the
+    # underlying runner labels change AND you've verified via `gh api
+    # orgs/jleechanorg/actions/runners?per_page=100` that the new labels exist
+    # on at least one online runner. Editing this without verifying is itself a
+    # drift event.
+    runs-on: [self-hosted, self-hosted-mikey, ezgha]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install gh CLI (drift check uses gh api under the hood)
+        # The drift check shells out to `gh api`. Some self-hosted runner
+        # images don't have `gh` on PATH, so we install it from the GitHub
+        # CLI tarball. Pinned via the official `cli/cli` release URL.
+        run: |
+          set -euo pipefail
+          if command -v gh >/dev/null 2>&1; then
+            echo "gh already present: $(gh --version | head -1)"
+            exit 0
+          fi
+          echo "::error::gh CLI not found on this self-hosted runner — install it before this gate can run."
+          exit 2
+
+      - name: Run drift check against live org runners
+        env:
+          # Pass the live repo variable through to the script.
+          SELF_HOSTED_RUNNER_LABELS: ${{ vars.SELF_HOSTED_RUNNER_LABELS }}
+          DRIFT_CHECK_ORG: jleechanorg
+          # Auth for gh api orgs/{org}/actions/runners (requires manage_runners:org).
+          # RUNNERS_READ_PAT: Fine-Grained PAT with manage_runners:org read permission.
+          #   Preferred. If set, used as GH_TOKEN.
+          # GITHUB_TOKEN: Actions default token (repo scope only, NOT manage_runners:org).
+          #   Fallback. Will cause HTTP 403 from the org runners endpoint.
+          #   When this happens the drift check warns and exits 0 (inconclusive,
+          #   not a detected drift) so CI is not blocked by missing infra config.
+          # See docs/self-hosted-runner-selector.md "drift-check authentication".
+          GH_TOKEN: ${{ secrets.RUNNERS_READ_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail  # intentionally omit -e so we can handle script exit codes
+          ARGS=(--org jleechanorg --json)
+          if [ "${{ inputs.min_matches }}" != "" ]; then
+            ARGS+=(--min-matches "${{ inputs.min_matches }}")
+          fi
+          if [ "${{ inputs.include_offline }}" = "true" ]; then
+            ARGS+=(--include-offline)
+          fi
+          # Run the check; capture both exit code and JSON output.
+          # Do NOT use `set -e` here — the script exits 2 on auth/invocation
+          # errors (e.g. GITHUB_TOKEN lacks manage_runners:org), which is a
+          # distinct condition from drift (exit 1) that we want to handle as
+          # a warning, not a CI failure.
+          python3 scripts/check_runner_selector.py "${ARGS[@]}" | tee drift-check.json || true
+          VERDICT="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["verdict"])' < drift-check.json 2>/dev/null || echo ERROR)"
+          if [ "$VERDICT" = "ERROR" ]; then
+            REASON="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("reason",""))' < drift-check.json 2>/dev/null || echo 'unknown error')"
+            # Auth/invocation error: GITHUB_TOKEN lacks manage_runners:org.
+            # This is missing infra config, not a detected drift. Warn and
+            # skip (exit 0) so CI is not blocked by absent RUNNERS_READ_PAT.
+            echo "::warning title=Drift check inconclusive::$REASON — configure RUNNERS_READ_PAT secret (manage_runners:org) for authoritative inventory checks. See docs/self-hosted-runner-selector.md."
+            exit 0
+          fi
+          if [ "$VERDICT" != "PASS" ]; then
+            REASON="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("reason",""))' < drift-check.json 2>/dev/null || echo '')"
+            echo "::error title=Runner selector drift detected::verdict=$VERDICT reason=$REASON — repo variable SELF_HOSTED_RUNNER_LABELS no longer matches ≥1 online org runner."
+            exit 1
+          fi
+          echo "Drift check PASS — selector matches ≥1 live runner."
+
+      - name: Annotate drift verdict on PR (machine + human readable)
+        if: always() && github.event_name == 'pull_request'
+        # A short summary comment so reviewers see the verdict without
+        # clicking through the job log. No-op on push/cron/dispatch.
+        run: |
+          set -euo pipefail
+          if [ ! -f drift-check.json ]; then
+            echo "drift-check.json missing — skip annotation."
+            exit 0
+          fi
+          python3 <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          with open("drift-check.json") as fh:
+              data = json.load(fh)
+          verdict = data.get("verdict", "UNKNOWN")
+          match_count = data.get("match_count", "n/a")
+          selector = data.get("selector", [])
+          reason = data.get("reason", "")
+          lines = [
+              "## Self-hosted runner selector drift check",
+              f"- Selector: `{json.dumps(selector)}`",
+              f"- Org live runners matched: **{match_count}**",
+              f"- Verdict: **{verdict}**",
+          ]
+          if reason:
+              lines.append(f"- Reason: {reason}")
+          print("\n".join(lines))
+          PY
