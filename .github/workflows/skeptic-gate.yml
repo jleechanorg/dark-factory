@@ -1,0 +1,354 @@
+# SHA-bound Skeptic gate — see issue #278 (mandatory redesign v2).
+#
+# TRUST POSTURE (per post-audit comments 4953064910 + 4953116428):
+#
+#   This workflow is a `workflow_call` TARGET, never a `pull_request`
+#   trigger. A pull_request-controlled YAML is forgeable: PR head can
+#   edit it and re-run the gate. The only legitimate bootstrap is a
+#   trusted caller workflow that already lives on the default branch
+#   and calls this file via
+#     `uses: jleechanorg/dark-factory/.github/workflows/skeptic-gate.yml@<PINNED-SHA>`
+#   and ALSO passes a verified `inputs.trusted_code_sha` (the 40-hex
+#   SHA the caller expects the workflow's checkout step to resolve).
+#   This is the immutable-code-ref invariant: the workflow checks out
+#   the EXACT SHA the caller pinned, not the moving default branch.
+#
+#   Same-target-repo caller enforcement is operational: the gate's
+#   caller workflow must live in `jleechanorg/dark-factory` itself.
+#   Cross-repo callers (e.g. `jleechanorg/.github`) cannot post
+#   comments or statuses into a private target repo with the caller-
+#   repo scoped token, so they fail closed at the first API call.
+#
+# INPUTS (workflow_call + workflow_dispatch):
+#   pr_number          — required, PR number to (re-)run skeptic on
+#   pr_sha             — optional, head SHA override; if empty,
+#                        re-resolved via `gh pr view`
+#   trusted_code_sha   — required (workflow_call), optional
+#                        (workflow_dispatch); the 40-hex SHA the
+#                        caller pinned the workflow ref to. The
+#                        checkout step refuses to proceed if the
+#                        resolved ref does not equal this SHA.
+#
+# REVIEWER BINARY PINNING (mandatory):
+#   The reviewer CLIs are NOT installed in this workflow. They are
+#   expected to be pre-installed at pinned absolute paths on the
+#   self-hosted runner image. The "Verify pinned reviewer binaries"
+#   step asserts path + version + SHA256 against repo variables.
+#   ALL THREE (path, version, SHA256) MUST be set as repo
+#   variables — if any is missing or mismatched, the gate refuses
+#   to run (fail-closed). Defaults are NOT used; absence is fatal.
+#
+#   Required repo variables (no defaults — absence = fatal):
+#     vars.SKEPTIC_CODEX_BIN        e.g. /opt/reviewers/codex/codex
+#     vars.SKEPTIC_CODEX_VERSION    e.g. codex-cli 0.39.0
+#     vars.SKEPTIC_CODEX_SHA256     e.g. abc123...64hex
+#     vars.SKEPTIC_GEMINI_BIN       e.g. /opt/reviewers/gemini/gemini
+#     vars.SKEPTIC_GEMINI_VERSION   e.g. gemini-cli 0.5.4
+#     vars.SKEPTIC_GEMINI_SHA256    e.g. def456...64hex
+#     vars.SELF_HOSTED_RUNNER_LABELS e.g. '["self-hosted","self-hosted-mikey"]'
+#
+# TRIGGER POSTURE:
+#   workflow_call       — for trusted default-branch caller workflows
+#                         in jleechanorg/dark-factory itself.
+#   workflow_dispatch   — for manual operator diagnostic re-runs
+#                         (does NOT satisfy gate-7; self-PASS is
+#                         impossible because the runner cannot post
+#                         as github-actions[bot] from a self-dispatch).
+#   pull_request        — INTENTIONALLY ABSENT (forgeable).
+#   pull_request_target — INTENTIONALLY ABSENT (cannot bootstrap).
+#
+# STATUS PUBLISH ORDER (post-audit comment 4953116428 — fail-open fix):
+#   The gate posts a `pending` status BEFORE running reviewers, then
+#   UPGRADES to `success` ONLY after the read-back step verifies the
+#   published comment + status agree with what we wrote. If the
+#   verification step fails, the gate posts `failure` (overwriting
+#   any prior `pending`). `success` is the LAST action, not the
+#   first — verification failure must leave merge protection RED.
+
+name: skeptic
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "PR number to (re-)run skeptic on"
+        required: true
+        type: string
+      pr_sha:
+        description: "Optional PR head SHA override; if empty, re-resolved via gh pr view"
+        required: false
+        type: string
+        default: ""
+      trusted_code_sha:
+        description: "40-hex SHA the caller pinned the workflow ref to (immutable code ref)"
+        required: true
+        type: string
+    secrets:
+      github_token:
+        description: "GitHub token for posting comment + status (default: workflow-provided GITHUB_TOKEN)"
+        required: false
+  workflow_dispatch:
+    # NOTE: `trusted_code_sha` is intentionally NOT a dispatch input.
+    # Per CodeRabbit MAJOR finding on PR #281 round 2: a manual dispatch
+    # could otherwise supply an arbitrary SHA and have the gate check
+    # out + execute that SHA. Dispatch runs only ever invoke the
+    # workflow at its current pinned revision (the caller's literal
+    # `uses: ...@<SHA>`), so the gate's server-side check at
+    # "Validate trusted_code_sha" enforces the immutable-code-ref
+    # invariant via the workflow ref itself, not a caller-supplied
+    # string. A human dispatching this workflow can NEVER redirect the
+    # gate to execute untrusted code.
+    inputs:
+      pr_number:
+        description: "PR number to (re-)run skeptic on"
+        required: true
+        type: string
+      pr_sha:
+        description: "Optional PR head SHA override; if empty, re-resolved via gh pr view"
+        required: false
+        type: string
+      # trusted_code_sha is NOT exposed as a dispatch input. The gate
+      # derives the trusted SHA from the workflow ref (callers pin via
+      # `uses: ...@<SHA>`).
+
+concurrency:
+  group: skeptic-pr-${{ inputs.pr_number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  skeptic:
+    name: Skeptic (SHA-bound PASS/FAIL)
+    runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS) }}
+    timeout-minutes: 30
+    env:
+      SKEPTIC_REVIEWERS_JSON: '[["codex",""],["gemini","gemini-2.5-pro"]]'
+      SKEPTIC_STATUS_CONTEXT: "skeptic"
+      SKEPTIC_EXPECTED_ACTOR: "github-actions[bot]"
+      # Pinned reviewer binary locations + integrity (mandatory — no
+      # defaults; absence = fatal per post-audit comment 4953116428).
+      SKEPTIC_CODEX_BIN: ${{ vars.SKEPTIC_CODEX_BIN }}
+      SKEPTIC_CODEX_VERSION: ${{ vars.SKEPTIC_CODEX_VERSION }}
+      SKEPTIC_CODEX_SHA256: ${{ vars.SKEPTIC_CODEX_SHA256 }}
+      SKEPTIC_GEMINI_BIN: ${{ vars.SKEPTIC_GEMINI_BIN }}
+      SKEPTIC_GEMINI_VERSION: ${{ vars.SKEPTIC_GEMINI_VERSION }}
+      SKEPTIC_GEMINI_SHA256: ${{ vars.SKEPTIC_GEMINI_SHA256 }}
+      # Minimal PATH — only the bin dir containing the pinned binaries.
+      SKEPTIC_REVIEWER_PATH: /opt/reviewers/codex:/opt/reviewers/gemini:/usr/bin:/bin
+      # Mirror the runner-label var so steps under `set -u` see it
+      # (E6 finding C-F2: it was referenced in a bash step but absent
+      # from `env:`, causing an unbound-variable crash).
+      SELF_HOSTED_RUNNER_LABELS: ${{ vars.SELF_HOSTED_RUNNER_LABELS }}
+    steps:
+      - name: Verify mandatory pin vars are set (no defaults)
+        # Per post-audit comment 4953116428: pins were inactive because
+        # vars were absent. Defaulting hid the failure. Refuse to run
+        # if any required pin var is empty.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN || secrets.github_token }}
+        run: |
+          set -euo pipefail
+          fail=0
+          for var in \
+            "$SKEPTIC_CODEX_BIN" "$SKEPTIC_CODEX_VERSION" "$SKEPTIC_CODEX_SHA256" \
+            "$SKEPTIC_GEMINI_BIN" "$SKEPTIC_GEMINI_VERSION" "$SKEPTIC_GEMINI_SHA256" \
+            "$SELF_HOSTED_RUNNER_LABELS"
+          do
+            if [ -z "$var" ]; then
+              echo "[skeptic-gate] FATAL: required pin/label var is empty — refusing to run"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "[skeptic-gate] mandatory pin vars missing — gate cannot proceed"
+            exit 1
+          fi
+
+      - name: Verify pinned reviewer binaries (path + version + sha256)
+        # SHA256 first (the strongest invariant), then version, then
+        # path (per post-audit 4953116428 — version ran before hash).
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN || secrets.github_token }}
+          CODEX_BIN: ${{ env.SKEPTIC_CODEX_BIN }}
+          CODEX_VERSION: ${{ env.SKEPTIC_CODEX_VERSION }}
+          CODEX_SHA256: ${{ env.SKEPTIC_CODEX_SHA256 }}
+          GEMINI_BIN: ${{ env.SKEPTIC_GEMINI_BIN }}
+          GEMINI_VERSION: ${{ env.SKEPTIC_GEMINI_VERSION }}
+          GEMINI_SHA256: ${{ env.SKEPTIC_GEMINI_SHA256 }}
+        run: |
+          set -euo pipefail
+          fail=0
+
+          check_binary() {
+            local label="$1" bin="$2" expected_version="$3" expected_sha="$4"
+            # SHA256 first — strongest invariant.
+            if [ -z "$expected_sha" ]; then
+              echo "[skeptic-gate] FATAL: $label SHA256 not pinned (refuse to run)"
+              fail=1
+              return
+            fi
+            if [ ! -x "$bin" ]; then
+              echo "[skeptic-gate] FAIL: $label binary missing or not executable at $bin"
+              fail=1
+              return
+            fi
+            local got_sha
+            got_sha=$(sha256sum "$bin" | awk '{print $1}')
+            if [ "$got_sha" != "$expected_sha" ]; then
+              echo "[skeptic-gate] FAIL: $label sha256 mismatch: expected $expected_sha, got $got_sha"
+              fail=1
+              return
+            fi
+            # Version check (must include the expected substring).
+            if [ -z "$expected_version" ]; then
+              echo "[skeptic-gate] FATAL: $label version not pinned (refuse to run)"
+              fail=1
+              return
+            fi
+            local got_version
+            got_version=$("$bin" --version 2>&1 || true)
+            if ! echo "$got_version" | grep -qF "$expected_version"; then
+              echo "[skeptic-gate] FAIL: $label version mismatch: expected '$expected_version', got '$got_version'"
+              fail=1
+              return
+            fi
+            # Path canonicalization (must not be a symlink to something else).
+            local real
+            real=$(readlink -f "$bin")
+            if [ "$real" != "$bin" ]; then
+              echo "[skeptic-gate] FAIL: $label $bin is a symlink to $real (must be canonical)"
+              fail=1
+              return
+            fi
+            echo "[skeptic-gate] OK: $label $bin version=$expected_version sha256=${expected_sha:0:12}..."
+          }
+
+          check_binary codex "$CODEX_BIN" "$CODEX_VERSION" "$CODEX_SHA256"
+          check_binary gemini "$GEMINI_BIN" "$GEMINI_VERSION" "$GEMINI_SHA256"
+
+          if [ "$fail" -ne 0 ]; then
+            echo "[skeptic-gate] reviewer binary pinning FAILED — refusing to run"
+            exit 1
+          fi
+
+      - name: Validate trusted_code_sha is a 40-hex string
+        # Immutable-code-ref invariant: refuse to proceed unless the
+        # caller (or the dispatching workflow_run) supplied a 40-hex
+        # SHA. The moving default branch is never used.
+        #
+        # Per CodeRabbit MAJOR finding on PR #281 round 2: a manual
+        # `workflow_dispatch` is no longer able to supply a custom
+        # `trusted_code_sha` (the input is intentionally absent from
+        # `on.workflow_dispatch.inputs`). For a dispatch run we fall
+        # back to `github.sha` (the workflow's own commit SHA on the
+        # default branch); for a workflow_call run the caller pins it.
+        env:
+          TRUSTED_CODE_SHA: ${{ inputs.trusted_code_sha || github.sha }}
+          GITHUB_SHA_FALLBACK: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          effective_sha="$TRUSTED_CODE_SHA"
+          if [ -z "$effective_sha" ]; then
+            effective_sha="$GITHUB_SHA_FALLBACK"
+          fi
+          if [ -z "$effective_sha" ]; then
+            echo "[skeptic-gate] FATAL: trusted_code_sha is empty and github.sha is empty; refusing to run"
+            exit 1
+          fi
+          if ! echo "$effective_sha" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "[skeptic-gate] FATAL: trusted_code_sha is not a 40-hex SHA: $effective_sha"
+            exit 1
+          fi
+          echo "TRUSTED_CODE_SHA=$effective_sha" >> "$GITHUB_ENV"
+          echo "[skeptic-gate] OK: trusted_code_sha=$effective_sha"
+
+      - name: Checkout gate code from IMMUTABLE trusted_code_sha (not PR head)
+        # Immutable code ref: the caller pinned the workflow via
+        # `uses: ...@<SHA>` and forwarded that SHA as
+        # `inputs.trusted_code_sha` (or, for dispatch runs, the
+        # validate step fell back to `github.sha`). Here we check
+        # out the EXACT pinned SHA — NOT the moving default branch.
+        # PR head Python is NEVER executed. The sparse-checkout pulls
+        # ONLY the gate's Python files; nothing else.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN || secrets.github_token }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          ref: ${{ env.TRUSTED_CODE_SHA }}
+          sparse-checkout: |
+            runner/skeptic_gate.py
+            runner/skeptic_gate_cli.py
+          persist-credentials: false
+
+      - name: Verify the checked-out HEAD equals trusted_code_sha
+        # Defense-in-depth: even if `actions/checkout` somehow accepts
+        # a different ref, we verify post-checkout that the local
+        # HEAD SHA equals what the caller pinned.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN || secrets.github_token }}
+          TRUSTED_CODE_SHA: ${{ env.TRUSTED_CODE_SHA }}
+        run: |
+          set -euo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          if [ "$actual_sha" != "$TRUSTED_CODE_SHA" ]; then
+            echo "[skeptic-gate] FATAL: checked-out HEAD $actual_sha does not match trusted_code_sha $TRUSTED_CODE_SHA"
+            exit 1
+          fi
+          echo "[skeptic-gate] OK: checked-out HEAD=$actual_sha matches trusted_code_sha"
+
+      - name: Set up Python
+        uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55  # v5.5.0
+        with:
+          python-version: "3.13"
+
+      - name: Verify caller actor (same-target-repo bot enforcement)
+        # Per post-audit comment 4953116428: the workflow keeps
+        # GH_TOKEN available for the Python gate (which uses `gh`
+        # for every API call). We use GH_TOKEN here to identify the
+        # caller actor. A non-github-actions[bot] caller cannot post
+        # comments into the target repo (token scope mismatch); the
+        # gate's read-back step then refuses PASS.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN || secrets.github_token }}
+        run: |
+          set -euo pipefail
+          caller_login=$(gh api user --jq '.login' 2>/dev/null || echo "")
+          echo "[skeptic-gate] caller actor=$caller_login expected_repo=$GITHUB_REPOSITORY"
+          if [ "$caller_login" != "github-actions[bot]" ]; then
+            echo "[skeptic-gate] WARN: caller actor is '$caller_login' (not github-actions[bot]); gate will refuse to PASS"
+          fi
+
+      - name: Run skeptic gate (Python keeps GH_TOKEN; reviewer subprocess strips it)
+        # Per post-audit comment 4953116428: the previous version
+        # unset GITHUB_TOKEN globally, which broke Python's `gh` API
+        # calls. Now Python keeps GH_TOKEN (scoped to the workflow
+        # run); only the reviewer subprocess env is sanitized via
+        # runner/skeptic_gate_cli._reviewer_env.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN || secrets.github_token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          PR_HEAD_SHA: ${{ inputs.pr_sha }}
+          SKEPTIC_REVIEWERS_JSON: ${{ env.SKEPTIC_REVIEWERS_JSON }}
+          SKEPTIC_STATUS_CONTEXT: ${{ env.SKEPTIC_STATUS_CONTEXT }}
+          SKEPTIC_EXPECTED_ACTOR: ${{ env.SKEPTIC_EXPECTED_ACTOR }}
+          SKEPTIC_CODEX_BIN: ${{ env.SKEPTIC_CODEX_BIN }}
+          SKEPTIC_GEMINI_BIN: ${{ env.SKEPTIC_GEMINI_BIN }}
+          SKEPTIC_REVIEWER_PATH: ${{ env.SKEPTIC_REVIEWER_PATH }}
+          TRUSTED_CODE_SHA: ${{ env.TRUSTED_CODE_SHA }}
+        run: |
+          set -euo pipefail
+          export PATH="$SKEPTIC_REVIEWER_PATH"
+          python -m runner.skeptic_gate_cli \
+            --repo "$GITHUB_REPOSITORY" \
+            --pr-number "${PR_NUMBER}" \
+            --pr-sha "${PR_HEAD_SHA}" \
+            --reviewers-json "${SKEPTIC_REVIEWERS_JSON}" \
+            --status-context "${SKEPTIC_STATUS_CONTEXT}" \
+            --expected-actor "${SKEPTIC_EXPECTED_ACTOR}" \
+            --codex-bin "${SKEPTIC_CODEX_BIN}" \
+            --gemini-bin "${SKEPTIC_GEMINI_BIN}" \
+            --trusted-code-sha "${TRUSTED_CODE_SHA}"
