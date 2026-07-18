@@ -55,6 +55,7 @@ fn adopted_overlay(bead_id: &str) -> BeadOverlay {
         pre_session_head_sha: None,
         park_reason: None,
         target_repo: None,
+        attempt_started_at: None,
     }
 }
 
@@ -124,6 +125,7 @@ fn test_circuit_breaker() {
         pre_session_head_sha: None,
         park_reason: None,
         target_repo: None,
+        attempt_started_at: None,
     };
     store.save(&bead).unwrap();
 
@@ -211,6 +213,7 @@ fn test_reroll_success() {
         pre_session_head_sha: None,
         park_reason: None,
         target_repo: None,
+        attempt_started_at: None,
     };
     store.save(&bead).unwrap();
 
@@ -640,6 +643,7 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
         pre_session_head_sha: None,
         park_reason: None,
         target_repo: None,
+        attempt_started_at: None,
     };
     store.save(&bead).unwrap();
     store
@@ -786,6 +790,7 @@ fn test_reroll_adopted_spawn_failure_parks_human_held() {
         pre_session_head_sha: None,
         park_reason: None,
         target_repo: None,
+        attempt_started_at: None,
     };
     store.save(&bead).unwrap();
     store
@@ -971,6 +976,7 @@ fn test_reroll_adopted_skips_duplicate_spawn_when_session_already_active() {
         pre_session_head_sha: None,
         park_reason: None,
         target_repo: None,
+        attempt_started_at: None,
     };
     store.save(&bead).unwrap();
     store
@@ -1132,6 +1138,7 @@ mod quiescence_timeout_races {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         }
     }
 
@@ -2075,6 +2082,7 @@ fn same_underlying_issue_malformed_reply_is_transient_not_fatal() {
         pre_session_head_sha: None,
         park_reason: None,
         target_repo: None,
+        attempt_started_at: None,
     };
     store.save(&bead).unwrap();
     store

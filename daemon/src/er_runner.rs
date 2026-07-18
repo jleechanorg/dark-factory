@@ -592,6 +592,7 @@ mod tests {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         }
     }
 

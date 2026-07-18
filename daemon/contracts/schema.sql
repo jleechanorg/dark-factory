@@ -133,7 +133,23 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- Pre-existing rows legitimately default to NULL. Older DBs get these via the
   -- idempotent `ensure_claimed_by_columns` migration in `SqliteStateStore::open`.
   claimed_by TEXT,
-  claimed_at INTEGER
+  claimed_at INTEGER,
+  -- Per-attempt wall-clock anchor (bead bze8.3: redispatch must not inherit
+  -- elapsed autonomy from prior attempts). Unix epoch seconds stamped
+  -- atomically when dispatch reservation completes successfully
+  -- (`state = DISPATCHED` save in `dispatch::dispatch_ready`). Nullable:
+  -- NULL means "this attempt has not yet been dispatched" — the timebox
+  -- check in `tick::run_tick` consults this column first and falls back
+  -- to cumulative `autonomy_secs` only when NULL (legacy / pre-fix rows
+  -- that have never been re-dispatched since this column existed). Cleared
+  -- by `recover_human_held` and on every HUMAN_HELD transition so the next
+  -- attempt starts with a fresh anchor. Owned by the dispatch reservation,
+  -- NOT bumped incrementally like `autonomy_secs` — the timebox wall-clock
+  -- check is `now_epoch - attempt_started_at >= cfg.autonomy_timebox_secs`.
+  -- Older DBs pre-date this column and get it via the idempotent
+  -- `ensure_attempt_started_at_column` migration in `SqliteStateStore::open`
+  -- (same guard pattern as `ensure_reroll_deferral_count_column`).
+  attempt_started_at INTEGER
 );
 
 -- Deletion guard: the daemon/skills may delete ONLY refs recorded here (spec §4.2.8).

@@ -298,6 +298,7 @@ fn run_cb_case(case: &CbCase, spec_dir: &std::path::Path, llm: &dyn Llm) -> bool
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
     };
     store.save(&bead).unwrap();
 

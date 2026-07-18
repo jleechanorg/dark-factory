@@ -461,11 +461,8 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
-                // jleechan-8jxr r2: real intake-persisted overlays carry a
-                // resolved `target_repo`; the old `None` here relied on the
-                // pre-fix silent default to `cfg.target_repo`. Update the
-                // test fixture to reflect production reality.
                 target_repo: Some("owner/repo".to_string()),
+                attempt_started_at: None,
             })
             .unwrap();
     }
@@ -576,6 +573,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -640,6 +638,7 @@ fn test_autonomy_budget_warning_crossing() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -698,6 +697,7 @@ fn test_wedge_detection_dispatched_coder_silent() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -771,6 +771,7 @@ fn test_wedge_detection_dispatched_coder_silent_saved_by_transcript_activity() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -864,6 +865,7 @@ fn test_wedge_detection_dispatched_coder_silent_stale_transcript_still_parks() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -945,6 +947,7 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -1065,6 +1068,7 @@ fn test_dispatch_integrity_sweep_leaves_matching_branch_alone() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -1127,6 +1131,7 @@ fn test_dispatch_integrity_sweep_detects_force_push_on_adopted_branch() {
             pre_session_head_sha: Some("pre-session-sha-abc123".into()),
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -1214,6 +1219,7 @@ fn test_dispatch_integrity_sweep_allows_fast_forward_adopted_commit() {
             pre_session_head_sha: Some("pre-session-sha-def456".into()),
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -1283,6 +1289,7 @@ fn test_wedge_detection_attested_session_stalled() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -1399,6 +1406,7 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -1515,6 +1523,7 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -1607,6 +1616,7 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -1726,6 +1736,7 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -2266,6 +2277,7 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         })
         .unwrap();
     store
@@ -3931,6 +3943,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     store
@@ -4023,6 +4036,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     store
@@ -4118,6 +4132,7 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
             pre_session_head_sha: None,
             park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -4208,6 +4223,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     // Also seed one above the cap (defensive — matches the shell overlay)
@@ -4228,6 +4244,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -4576,6 +4593,7 @@ fn capped_human_held_comment_failure_retries_before_recording_escalation() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     *tracker.fail_next_comment.borrow_mut() = Some("transient comment failure".into());
@@ -4794,6 +4812,7 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     tracker.candidates.borrow_mut().push(Bead {
@@ -4908,6 +4927,7 @@ fn capped_human_held_missing_comment_target_records_local_escalation_fallback() 
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     // No candidates registered on the tracker either — this bead's source
@@ -4994,6 +5014,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     store
@@ -5153,6 +5174,7 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     store
@@ -5267,6 +5289,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     scm.pr_snapshots.insert(
@@ -5369,6 +5392,7 @@ fn attested_ci_pending_does_not_timebox_park() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     scm.pr_snapshots.insert(
@@ -5479,6 +5503,7 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
                 "gate assessment not all-green (stage 1: recorded, not executed)".into(),
             ),
             target_repo: None,
+            attempt_started_at: None,
         },
     );
 
@@ -5581,6 +5606,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     scm.pr_snapshots.insert(
@@ -5682,6 +5708,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
+                attempt_started_at: None,
             })
             .unwrap();
         store
@@ -5838,6 +5865,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         })
         .unwrap();
     store
@@ -5861,6 +5889,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         })
         .unwrap();
     store
@@ -6301,6 +6330,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         })
         .unwrap();
     store
@@ -6325,6 +6355,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         })
         .unwrap();
     store
@@ -6483,6 +6514,7 @@ fn qdw_assess_refetch_failure_stays_attested_and_never_closes_pr() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         })
         .unwrap();
     store
@@ -6787,6 +6819,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     store
@@ -6970,6 +7003,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     store
@@ -7181,6 +7215,7 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     store
@@ -7374,6 +7409,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     store
@@ -7662,6 +7698,7 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
             // The bead's OWN resolved repo: a test-pattern placeholder,
             // deliberately DIFFERENT from cfg.target_repo above.
             target_repo: Some("owner/repo".into()),
+            attempt_started_at: None,
         },
     );
     store
@@ -7886,6 +7923,7 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         },
     );
     store
@@ -9344,6 +9382,7 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: None,
+                attempt_started_at: None,
             })
             .unwrap();
         store.register_branch(bead_id, branch).unwrap();
@@ -9754,6 +9793,7 @@ fn seed_attested_red_ci_bead(
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
+            attempt_started_at: None,
         })
         .unwrap();
     store.register_branch(bead_id, &branch).unwrap();

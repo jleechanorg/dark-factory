@@ -667,8 +667,37 @@ pub fn run_tick(
                 }
             }
         }
-        // 1. Time-box envelope check
-        if overlay.autonomy_secs >= deps.cfg.autonomy_timebox_secs {
+        // 1. Time-box envelope check (bead bze8.3: redispatch must not
+        // inherit elapsed autonomy from prior attempts). The active attempt
+        // clock is `now_epoch - attempt_started_at` whenever the anchor is
+        // stamped — `dispatch::dispatch_ready` writes it atomically at the
+        // successful-reservation save, and `recover_human_held` clears it
+        // on requeue so a freshly-recovered bead has no anchor until its
+        // own reservation succeeds. We fall back to cumulative
+        // `autonomy_secs` only when the anchor is absent (legacy / pre-fix
+        // rows that have not been re-dispatched since this column existed)
+        // so the existing behavior is preserved for any row that has
+        // never round-tripped through dispatch reservation.
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let (deadline_epoch, observed_elapsed_secs) = match overlay.attempt_started_at {
+            Some(started_at) => {
+                let elapsed = now_epoch.saturating_sub(started_at);
+                (started_at.saturating_add(deps.cfg.autonomy_timebox_secs), elapsed)
+            }
+            None => {
+                // Legacy fallback: timebox check still works against
+                // `autonomy_secs` so pre-fix rows that have not been
+                // re-dispatched continue to park correctly.
+                let deadline = now_epoch
+                    .saturating_sub(overlay.autonomy_secs)
+                    .saturating_add(deps.cfg.autonomy_timebox_secs);
+                (deadline, overlay.autonomy_secs)
+            }
+        };
+        if observed_elapsed_secs >= deps.cfg.autonomy_timebox_secs {
             overlay.state = OverlayState::HumanHeld;
             // jleechan-park-leaves-zombie-session-mh9o: kill the live AO
             // session and clear the durable handle BEFORE save, so the bead
@@ -679,6 +708,15 @@ pub fn run_tick(
             // and poisons the next redispatch of the same bead.
             kill_session_and_clear_handle(deps, &mut overlay);
             set_human_hold_reason(&mut overlay, HumanHoldReason::AutonomyTimeboxExceeded);
+            // Bead bze8.3 acceptance: record the attempt id, started_at,
+            // deadline, observed_at, and elapsed seconds in the park
+            // telemetry so a future operator can see WHY this attempt was
+            // parked (was it a genuinely over-budget attempt, or did a
+            // prior attempt's elapsed time silently carry through?).
+            let started_at = overlay.attempt_started_at;
+            let park_attempt = overlay.attempt;
+            // Clear the anchor so a future requeue does not inherit it.
+            overlay.attempt_started_at = None;
             deps.store.save(&overlay)?;
             emit(
                 deps.telemetry_log,
@@ -687,7 +725,15 @@ pub fn run_tick(
                 OverlayState::HumanHeld.as_str(),
                 "PARKED_HUMAN_HELD",
                 serde_json::json!({}),
-                serde_json::json!({"reason": "autonomy_timebox_exceeded"}),
+                serde_json::json!({
+                    "reason": "autonomy_timebox_exceeded",
+                    "attempt_id": park_attempt,
+                    "started_at": started_at,
+                    "deadline_epoch": deadline_epoch,
+                    "observed_at": now_epoch,
+                    "elapsed_secs": observed_elapsed_secs,
+                    "budget_secs": deps.cfg.autonomy_timebox_secs,
+                }),
             )?;
             let comment_body = "🤖 **[dark-factory]** Coder session parked (human held): autonomy time-box limit exceeded.".to_string();
             let _ = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
@@ -1507,6 +1553,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo,
+                attempt_started_at: None,
             });
             overlay.state = OverlayState::Attested;
             overlay.pr_number = Some(adopted.pr_number);
@@ -1646,6 +1693,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             pre_session_head_sha: None,
             park_reason: None,
             target_repo,
+            attempt_started_at: None,
         };
         deps.store.save(&overlay)?;
         summary.beads_created += 1;
@@ -1725,6 +1773,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     pre_session_head_sha: None,
                     park_reason: None,
                     target_repo,
+                    attempt_started_at: None,
                 };
                 deps.store.save(&o)?;
                 summary.beads_created += 1;

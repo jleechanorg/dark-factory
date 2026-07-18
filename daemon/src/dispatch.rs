@@ -238,6 +238,7 @@ pub fn dispatch_ready(
             // `tick::run_slow_tier`/`intake::normalize`; this value is
             // only used if the dispatch path runs before any intake.
             target_repo: Some(cfg.target_repo.clone()),
+            attempt_started_at: None,
             },
             Err(err) if err.is_transient() => {
                 report
@@ -726,6 +727,24 @@ pub fn dispatch_ready(
         // transient tool error, ...) has cleared, so the retry-cap counter no
         // longer needs to remember it.
         overlay.spawn_failure_count = 0;
+        // Bead bze8.3: stamp `attempt_started_at` atomically alongside the
+        // DISPATCHED save so a redispatch cannot inherit elapsed autonomy
+        // from the prior attempt. The wall-clock anchor here is the single
+        // moment "this attempt's reservation succeeded" — `tick::run_tick`
+        // computes `now_epoch - attempt_started_at` for the timebox check
+        // and never consults the cumulative `autonomy_secs` once an anchor
+        // exists. `autonomy_secs` is also zeroed here (same atomic save)
+        // because it now exists only as a historical metric; the active
+        // attempt clock lives entirely in `attempt_started_at`. The
+        // cumulative column is preserved (and continues to be bumped
+        // per-tick) so historical reporting still works; the timebox check
+        // is the one place that reads the anchor instead.
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        overlay.attempt_started_at = Some(now_epoch);
+        overlay.autonomy_secs = 0;
         if let Err(save_err) = store.save(&overlay) {
             // The worker process now exists but the daemon failed to
             // durably record it as DISPATCHED. Kill the just-spawned worker
@@ -1792,6 +1811,7 @@ mod tests {
             // (`dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all`)
             // pins. Update the test fixture to reflect production reality.
             target_repo: Some("owner/repo".to_string()),
+            attempt_started_at: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -1836,6 +1856,7 @@ mod tests {
                 // [repos.*] entry (cfg() has an empty repos table) names
                 // this repo.
                 target_repo: Some("someorg/unrelated-repo".to_string()),
+                attempt_started_at: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -2239,6 +2260,7 @@ mod tests {
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
+                attempt_started_at: None,
             })
             .unwrap();
         let mut cfg = cfg();
@@ -3348,6 +3370,7 @@ mod tests {
                 pre_session_head_sha: None,
                 park_reason: None,
                 target_repo: Some("jleechanorg/worldarchitect.ai".to_string()),
+                attempt_started_at: None,
             })
             .unwrap();
         let mut cfg = cfg();
