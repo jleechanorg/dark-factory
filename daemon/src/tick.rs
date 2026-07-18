@@ -940,7 +940,7 @@ fn run_dispatched_recovery_step(
         // the silence-watcher's domain. Skip them here.
         let session_id = match overlay.session_id.as_deref().map(str::trim) {
             None => continue,
-            Some(s) if s.is_empty() => continue,
+            Some("") => continue,
             Some(s) => s.to_string(),
         };
         let should_requeue = match deps.sessions.is_session_dead(&SessionId(session_id.clone())) {

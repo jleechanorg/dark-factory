@@ -58,24 +58,48 @@ jobs:
             Linux-aarch64)
               # No upstream sqlite-tools binary for Linux arm64.  Several
               # bash integration tests (factory-overlay.sh, rollback) shell
-              # out to `sqlite3` directly and require a working binary,
-              # so we MUST install one even on unprivileged runners.  Try
-              # the unprivileged apt-get path first; fall back to
-              # `sudo -n apt-get` (no-interaction) which works on the
-              # dark-factory self-hosted fleet.
+              # out to `sqlite3` directly and require a working binary.
+              # Self-hosted runners run with no-new-privileges, so sudo is
+              # blocked and apt-get install fails. Build from the official
+              # amalgamation (~5MB sqlite3.c + shell.c) using gcc into
+              # $HOME/.local/bin and export on PATH.
               if command -v sqlite3 >/dev/null 2>&1 && sqlite3 ':memory:' 'SELECT 1;' >/dev/null 2>&1; then
                 echo "sqlite3 $(sqlite3 --version) found on PATH (no provision needed)"
                 exit 0
               fi
-              if command -v apt-get >/dev/null 2>&1; then
-                echo "::notice::Installing sqlite3 via apt-get (Linux-aarch64)"
-                (apt-get update -y && apt-get install -y sqlite3) \
-                  || (sudo -n apt-get update -y && sudo -n apt-get install -y sqlite3) \
-                  || echo "::warning::apt-get install sqlite3 failed; tests requiring sqlite3 will fail"
-              else
-                echo "::warning::No apt-get and no sqlite.org binary for Linux-aarch64; bash integration tests that require sqlite3 will fail"
+              SQLITE_VER="3530300"
+              SQLITE_YEAR="2026"
+              AMALG_URL="https://sqlite.org/${SQLITE_YEAR}/sqlite-amalgamation-${SQLITE_VER}.zip"
+              BIN_DIR="${HOME}/.local/bin"
+              mkdir -p "${BIN_DIR}"
+              TMP_DIR="$(mktemp -d)"
+              echo "::notice::Building sqlite3 from amalgamation for Linux-aarch64"
+              if ! command -v gcc >/dev/null 2>&1; then
+                echo "::error::gcc missing on Linux-aarch64 runner; cannot build sqlite3 from amalgamation"
+                rm -rf "${TMP_DIR}"
+                exit 1
               fi
-              command -v sqlite3 >/dev/null 2>&1 && sqlite3 --version
+              curl -fsSL -o "${TMP_DIR}/amalg.zip" "${AMALG_URL}"
+              unzip -qo "${TMP_DIR}/amalg.zip" -d "${TMP_DIR}/amalg"
+              SRC_DIR="$(find "${TMP_DIR}/amalg" -maxdepth 2 -type d -name 'sqlite-amalgamation-*' | head -1)"
+              if [ -z "${SRC_DIR}" ]; then
+                echo "::error::Could not locate sqlite-amalgamation source directory in ${TMP_DIR}/amalg"
+                rm -rf "${TMP_DIR}"
+                exit 1
+              fi
+              gcc -O2 -o "${BIN_DIR}/sqlite3" \
+                "${SRC_DIR}/shell.c" \
+                "${SRC_DIR}/sqlite3.c" \
+                -lpthread -ldl -lm
+              "${BIN_DIR}/sqlite3" ':memory:' 'SELECT 1;' >/dev/null 2>&1 || {
+                echo "::error::Built sqlite3 binary failed sanity check"
+                rm -rf "${TMP_DIR}"
+                exit 1
+              }
+              echo "::notice::sqlite3 $(${BIN_DIR}/sqlite3 --version) built from amalgamation"
+              rm -rf "${TMP_DIR}"
+              echo "${BIN_DIR}" >> "${GITHUB_PATH}"
+              export PATH="${BIN_DIR}:${PATH}"
               exit 0
               ;;
             *)
