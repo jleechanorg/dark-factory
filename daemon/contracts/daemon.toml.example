@@ -24,21 +24,6 @@ spec_dir = ".factory/specs/" # per-repo override via .factory.toml (spec Appendi
 reroll_head_stability_window_secs = 30  # branch HEAD + non-running activity must hold stable this long before superseding a still-present worker
 reroll_death_confirm_secs = 5           # post-stop re-attach must observe continuous SessionNotFound this long to declare positive death (the fast path)
 
-# Held-bead re-assessment cooldown (bead jleechan-zaga / issue #348 r3).
-# OPTIONAL — omitting it defaults to 900s. A bead held DISPOSITION_REQUIRED
-# (blocked only by a structural gate the coder cannot drive — CodeRabbit
-# unavailable, etc.) is re-assessed at most this often, so a hours-long
-# structural condition does not re-hit the SCM API every fast tick.
-held_recheck_cooldown_secs = 900        # 15 minutes between re-assessments of a DISPOSITION_REQUIRED bead
-
-# Pre-gate PR drift validation (bead jleechan-t40t / issue #326). OPTIONAL —
-# omitting it defaults to TRUE. Before each gate assessment the daemon
-# confirms the bead's stored pr_number is an OPEN PR whose head ref matches
-# the bead's branch; on drift it re-resolves by branch (or demotes to
-# DISPATCHED when the branch has no live PR). Set false only for legacy/test
-# deployments that cannot supply open_pr_head_ref data.
-pre_gate_validation_enabled = true
-
 # Multi-repo dispatch routing table (bead jleechan-35y4 Stage B; see
 # docs/multirepo-dispatch-investigation-2026-07-11.md). OPTIONAL — omitting
 # [repos] entirely is fully backward compatible: every bead resolves to the

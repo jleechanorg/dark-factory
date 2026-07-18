@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   bead_id       TEXT PRIMARY KEY,
   state         TEXT NOT NULL CHECK (state IN
                   ('QUEUED','DISPATCHING','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',
-                   'REDISPATCHED','BUDGET_HELD','HUMAN_HELD','DISPOSITION_REQUIRED')),
+                   'REDISPATCHED','BUDGET_HELD','HUMAN_HELD')),
   attempt       INTEGER NOT NULL DEFAULT 1,   -- r<n> counter
   reroll_count  INTEGER NOT NULL DEFAULT 0,
   autonomy_secs INTEGER NOT NULL DEFAULT 0,   -- cumulative; nothing automated resets it
@@ -103,27 +103,7 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- `attempt_er_runner_count`). Older DBs pre-date this column and get it via
   -- the idempotent `ensure_reroll_deferral_count_column` migration in
   -- `SqliteStateStore::open` (same guard pattern as `ensure_is_adopted_column`).
-  reroll_deferral_count INTEGER NOT NULL DEFAULT 0,
-  -- Bead jleechan-zaga / issue #348 r3: earliest unix epoch (seconds) at
-  -- which a bead held at DISPOSITION_REQUIRED may be re-assessed by the fast
-  -- tier. NULL means "no cooldown / re-assess now". Set to now +
-  -- `held_recheck_cooldown_secs` whenever the daemon (re)holds a bead, so a
-  -- persistent structural condition (CodeRabbit unavailable for hours) does
-  -- not re-hit the SCM API every fast tick. Owned by the tick engine via the
-  -- `held_recheck_after`/`set_held_recheck_after` StateStore methods (NOT a
-  -- BeadOverlay field — same decoupling as `reroll_deferral_count`). Older
-  -- DBs pre-date this column and get it via the idempotent
-  -- `ensure_held_recheck_after_column` migration in `SqliteStateStore::open`.
-  held_recheck_after INTEGER,
-  -- Bead jleechan-yoqy / issue #323: hash of the PR body's canonical evidence
-  -- marker (`**Evidence**:` + gist + head) at the bead's last /er run. NULL =
-  -- no run recorded. `er_runner::maybe_run` re-triggers /er when this differs
-  -- from the current body's marker hash (an evidence-only body update, same
-  -- head commit). Owned by the er_runner via the `last_er_evidence_hash`/
-  -- `set_er_evidence_hash` StateStore methods (NOT a BeadOverlay field). Older
-  -- DBs get it via the idempotent `ensure_last_er_evidence_hash_column`
-  -- migration in `SqliteStateStore::open`.
-  last_er_evidence_hash TEXT
+  reroll_deferral_count INTEGER NOT NULL DEFAULT 0
 );
 
 -- Deletion guard: the daemon/skills may delete ONLY refs recorded here (spec §4.2.8).

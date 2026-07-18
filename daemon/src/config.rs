@@ -53,15 +53,6 @@ pub struct Config {
     /// (5s).
     #[serde(default = "default_reroll_death_confirm_secs")]
     pub reroll_death_confirm_secs: u64,
-    /// Bead jleechan-zaga / issue #348 r3: cooldown (seconds) between fast-tier
-    /// re-assessments of a bead held at DISPOSITION_REQUIRED. A structural
-    /// condition (CodeRabbit unavailable, unresolved bot threads) can persist
-    /// for hours; without a cooldown the fast tier would re-fetch the PR
-    /// snapshot every tick, hammering the SCM API for no benefit. Default 15
-    /// minutes. `#[serde(default)]` so every pre-existing `daemon.toml` parses
-    /// unchanged.
-    #[serde(default = "default_held_recheck_cooldown_secs")]
-    pub held_recheck_cooldown_secs: u64,
     /// Multi-repo routing table (bead jleechan-35y4 Stage B). Absent entirely
     /// from a config file (the common case for every pre-existing
     /// `daemon.toml`) deserializes to an empty map via `#[serde(default)]` —
@@ -71,40 +62,12 @@ pub struct Config {
     /// pre-migration config already names.
     #[serde(default)]
     pub repos: HashMap<String, RepoConfig>,
-    /// Bead jleechan-t40t (issue #326): when true, the slow-tier fast loop
-    /// runs a pre-gate validation step before every gate assessment,
-    /// confirming the stored `pr_number`'s PR is OPEN and its head ref
-    /// matches `overlay.branch`. Catches drift between `pr_number` and the
-    /// bead's actual branch for ATTESTED beads whose stored number has not
-    /// been re-resolved this tick (the dispatch→attested path's re-resolution
-    /// only fires when the bead transitions through DISPATCHED).
-    ///
-    /// r12 (issue #326): DEFAULT TRUE. The pre-gate drift check is the
-    /// primary guard against gate-assessing a stale/closed PR (jleechan-t8fd
-    /// / PR #316 wedge), so it must be on out of the box; a pre-#326
-    /// `daemon.toml` that omits the key now gets it enabled. Production
-    /// `CliScm` always returns real `open_pr_head_ref` data. Integration
-    /// tests that don't script `open_pr_head_refs` set it explicitly `false`.
-    #[serde(default = "default_pre_gate_validation_enabled")]
-    pub pre_gate_validation_enabled: bool,
 }
 
 /// Default head-stability window (bead jleechan-zeij / issue #322 r3): 30s,
 /// per the Codex review's "configurable minimum (default ≥30s)".
 fn default_reroll_head_stability_window_secs() -> u64 {
     30
-}
-
-/// Default for `pre_gate_validation_enabled` (bead jleechan-t40t / issue #326
-/// r12): TRUE — the pre-gate PR OPEN/head-match drift check is on by default.
-fn default_pre_gate_validation_enabled() -> bool {
-    true
-}
-
-/// Default held-recheck cooldown (bead jleechan-zaga / issue #348 r3): 15
-/// minutes between re-assessments of a DISPOSITION_REQUIRED bead.
-fn default_held_recheck_cooldown_secs() -> u64 {
-    900
 }
 
 /// Default positive-death confirmation window (bead jleechan-zeij / issue #322
@@ -223,43 +186,6 @@ spec_dir = ".factory/specs/"
         let cfg = load(&p).unwrap();
         assert_eq!(cfg.reroll_head_stability_window_secs, 30);
         assert_eq!(cfg.reroll_death_confirm_secs, 5);
-        // Bead jleechan-zaga / issue #348 r3: the held-recheck cooldown
-        // defaults to 15 minutes and is config-overridable.
-        assert_eq!(cfg.held_recheck_cooldown_secs, 900);
-        // Bead jleechan-t40t / issue #326 r12: pre-gate PR validation is ON by
-        // default — a config that omits the key still gets the drift guard.
-        assert!(
-            cfg.pre_gate_validation_enabled,
-            "pre_gate_validation_enabled must default to true when absent"
-        );
-    }
-
-    #[test]
-    fn pre_gate_validation_can_be_disabled_explicitly() {
-        // The default is true, but an operator (or an integration test) may
-        // still turn it off explicitly.
-        let dir = std::env::temp_dir().join("afd_cfg_test_pre_gate_off");
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("pre_gate_off.toml");
-        std::fs::write(
-            &p,
-            r#"
-target_repo = "owner/repo"
-base_branch = "main"
-stage = 1
-max_workers = 30
-max_batch = 15
-fast_tick_secs = 10
-slow_tick_secs = 30
-autonomy_timebox_secs = 10800
-budget_warn_usd = 20.0
-spec_dir = ".factory/specs/"
-pre_gate_validation_enabled = false
-"#,
-        )
-        .unwrap();
-        let cfg = load(&p).unwrap();
-        assert!(!cfg.pre_gate_validation_enabled);
     }
 
     #[test]
@@ -316,10 +242,7 @@ spec_dir = ".factory/specs/"
         )
         .unwrap();
         let cfg = load(&p).unwrap();
-        assert!(
-            cfg.repos.is_empty(),
-            "repos table must default to empty when absent"
-        );
+        assert!(cfg.repos.is_empty(), "repos table must default to empty when absent");
         assert_eq!(
             cfg.resolve_repo("owner/repo"),
             Some(RepoRouting {
