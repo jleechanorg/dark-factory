@@ -17,6 +17,13 @@ autonomy_timebox_secs = 10800  # 3h cumulative per bead chain
 budget_warn_usd = 20.0       # 80%-threshold telemetry warning; monitoring-only
 spec_dir = ".factory/specs/" # per-repo override via .factory.toml (spec Appendix B)
 
+# Fail-closed re-roll proceed predicate windows (bead jleechan-zeij / issue
+# #322 r3). OPTIONAL — omitting both defaults to the production values below.
+# The re-roll engine supersedes a worker only after positively confirming it
+# is safe to replace; these tune how long that confirmation takes.
+reroll_head_stability_window_secs = 30  # branch HEAD + non-running activity must hold stable this long before superseding a still-present worker
+reroll_death_confirm_secs = 5           # post-stop re-attach must observe continuous SessionNotFound this long to declare positive death (the fast path)
+
 # Multi-repo dispatch routing table (bead jleechan-35y4 Stage B; see
 # docs/multirepo-dispatch-investigation-2026-07-11.md). OPTIONAL — omitting
 # [repos] entirely is fully backward compatible: every bead resolves to the
