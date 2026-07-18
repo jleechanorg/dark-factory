@@ -16,6 +16,7 @@ fn fake_tracker_records_calls_and_returns_scripted_response() {
             id: "b1".into(),
             title: "t".into(),
             description: String::new(),
+            notes: String::new(),
             file_tree_summary: String::new(),
             external_ref: Some("owner/repo#5".into()),
         }]),

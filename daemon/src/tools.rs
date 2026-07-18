@@ -10,12 +10,19 @@ use std::time::{Duration, Instant};
 
 /// A `br` bead candidate (design doc §4, spec §4.2.3).
 ///
-/// `description` and `file_tree_summary` exist so the router's rendered
-/// prompt (router.rs `render_prompt`) can judge routing complexity from more
-/// than just the one-line title (spec Appendix C item 1 says routing must be
-/// based on "the whole shape of the task" — a bare title is not that):
+/// `description`, `notes`, and `file_tree_summary` exist so the router's
+/// rendered prompt (router.rs `render_prompt`) can judge routing complexity
+/// from more than just the one-line title (spec Appendix C item 1 says
+/// routing must be based on "the whole shape of the task" — a bare title is
+/// not that):
 /// * `description` — the bead's full body text as returned by
 ///   `br list --json` (that JSON shape's `description` field); "" if absent.
+/// * `notes` — the bead's `br list --json` `notes` field (operator-authored
+///   per-attempt guidance; populated via `br update --notes`, e.g. when
+///   requeueing with refined scope instructions). "" if absent. Surfaced
+///   into the coder prompt as a distinct, higher-priority-than-description
+///   section (bead jleechan-0hqx, issue #338) so attempt rN coders don't
+///   re-litigate scope that was settled when the bead was requeued.
 /// * `file_tree_summary` — a short, pre-rendered listing of the repo paths
 ///   the bead is expected to touch (see `tools::summarize_file_tree`), so the
 ///   router can weigh blast radius without the LLM having to browse the repo
@@ -25,6 +32,7 @@ pub struct Bead {
     pub id: String,
     pub title: String,
     pub description: String, // full body/description from `br list --json`; "" if absent
+    pub notes: String, // operator-authored `br update --notes` text; "" if absent
     pub file_tree_summary: String, // pre-rendered file-tree text; "" if unavailable
     pub external_ref: Option<String>, // "<owner>/<repo>#<issue_number>", None = manual bead
 }

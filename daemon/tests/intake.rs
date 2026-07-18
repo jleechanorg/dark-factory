@@ -100,6 +100,7 @@ fn already_known_external_ref_is_not_duplicated() {
         id: "existing-bead".into(),
         title: "issue 42".into(),
         description: String::new(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some("owner/repo#42".into()),
     });
@@ -194,6 +195,7 @@ fn mixed_batch_only_creates_bead_for_new_write_tier_issue() {
         id: "existing-bead-3".into(),
         title: "issue 3".into(),
         description: String::new(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some("owner/repo#3".into()),
     });
@@ -371,6 +373,7 @@ fn factory_pr_with_existing_external_ref_reuses_bead() {
         id: "existing-pr-bead".into(),
         title: "pr 52".into(),
         description: String::new(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some("owner/repo#52".into()),
     });
