@@ -913,8 +913,14 @@ fn run_bead_reconciliation_step(
 }
 
 /// jleechan-xsg4 (issue #270): recover stale DISPATCHED overlays whose
-/// session is dead or nonexistent. For each candidate DISPATCHED row:
-/// - If session_id is NULL or trim-blank: requeue immediately.
+/// session is confirmed dead. For each candidate DISPATCHED row:
+/// - If session_id is NULL or trim-blank: leave the bead alone. The
+///   silence-watcher (jleechan-coder-silent-false-parks-h92r, PR #304)
+///   is the authority for beads that never recorded a session id — it
+///   cross-checks the coder's own transcript directory for recent
+///   activity before parking. Pre-empting that path here would
+///   requeue beads whose coder is actively writing locally and trigger
+///   duplicate dispatches.
 /// - If session_id is non-empty: probe `is_session_dead` (authoritative
 ///   live/dead semantics — "ready" is alive, only "exited"/"missing" is dead);
 ///   requeue if confirmed dead. If the probe errors, leave the overlay alone
@@ -930,37 +936,34 @@ fn run_dispatched_recovery_step(
         .store
         .stale_dispatched_candidates(STALE_DISPATCHED_TIMEOUT_SECS)?;
     for overlay in candidates {
-        let (should_requeue, reason) = match &overlay.session_id {
-            None => (true, "empty_session_id"),
-            Some(sid) => {
-                let trimmed = sid.trim();
-                if trimmed.is_empty() {
-                    (true, "blank_session_id")
-                } else {
-                    let session_id = SessionId(sid.clone());
-                    match deps.sessions.is_session_dead(&session_id) {
-                        Ok(true) => (true, "confirmed_dead_session"),
-                        Ok(false) => (false, ""),
-                        Err(e) => {
-                            emit(
-                                deps.telemetry_log,
-                                &overlay.bead_id,
-                                overlay.attempt,
-                                OverlayState::Dispatched.as_str(),
-                                "BEAD_RECONCILIATION_TRANSIENT_ERROR",
-                                serde_json::json!({}),
-                                serde_json::json!({
-                                    "phase": "stale_dispatched_session_check",
-                                    "session_id": sid,
-                                    "error": format!("{e:?}"),
-                                }),
-                            )?;
-                            continue;
-                        }
-                    }
-                }
+        // PR #304 wedge-detection contract: beads with no session_id are
+        // the silence-watcher's domain. Skip them here.
+        let session_id = match overlay.session_id.as_deref().map(str::trim) {
+            None => continue,
+            Some(s) if s.is_empty() => continue,
+            Some(s) => s.to_string(),
+        };
+        let should_requeue = match deps.sessions.is_session_dead(&SessionId(session_id.clone())) {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(e) => {
+                emit(
+                    deps.telemetry_log,
+                    &overlay.bead_id,
+                    overlay.attempt,
+                    OverlayState::Dispatched.as_str(),
+                    "BEAD_RECONCILIATION_TRANSIENT_ERROR",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "phase": "stale_dispatched_session_check",
+                        "session_id": session_id,
+                        "error": format!("{e:?}"),
+                    }),
+                )?;
+                continue;
             }
         };
+        let reason = "confirmed_dead_session";
         if should_requeue {
             // Requeue atomically with the session id observed during the
             // liveness probe. If a concurrent dispatch replaced the row's
