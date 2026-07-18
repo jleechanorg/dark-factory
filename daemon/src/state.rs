@@ -20,6 +20,25 @@ pub enum OverlayState {
     Redispatched, // handed back to the queue
     BudgetHeld,  // budget exhaustion (monitoring-only in Stage 1/2)
     HumanHeld,   // terminal until human action
+    /// Bead jleechan-zaga / issue #348: gate assessment is red but EVERY
+    /// red gate is `Structural` (external reviewer usage-limits, bot
+    /// threads on superseded content, evidence floor owned by a different
+    /// bead). Re-rolling the coder cannot clear any of them, so the
+    /// daemon holds the bead with a per-gate disposition request rather
+    /// than superseding it. Distinct from `HumanHeld` because there is
+    /// no operator-visible blocker to diagnose; the daemon has surfaced
+    /// every red gate's disposition need and is awaiting the conditions
+    /// to change (e.g. external reviewer quota reset, bot thread
+    /// resolution, the other bead landing). The fast tier continues to
+    /// assess on each tick; once any red gate flips `CoderFixable` (or
+    /// to `Green`), the bead leaves this state and re-enters the normal
+    /// flow. Until then, this state is the floor's "no churn" anchor
+    /// that prevents the supersede-→HUMAN_HELD cycle issue #348
+    /// documents (v6ud's CORRECT P0 fix PR #342 was superseded by its
+    /// own reroll ~25 min after opening because every red gate was
+    /// structural — the daemon could never have reached all_green on
+    /// any attempt number).
+    DispositionRequired,
 }
 
 impl OverlayState {
@@ -36,6 +55,7 @@ impl OverlayState {
             OverlayState::Redispatched => "REDISPATCHED",
             OverlayState::BudgetHeld => "BUDGET_HELD",
             OverlayState::HumanHeld => "HUMAN_HELD",
+            OverlayState::DispositionRequired => "DISPOSITION_REQUIRED",
         }
     }
 
@@ -56,6 +76,7 @@ impl OverlayState {
             "REDISPATCHED" => Ok(OverlayState::Redispatched),
             "BUDGET_HELD" => Ok(OverlayState::BudgetHeld),
             "HUMAN_HELD" => Ok(OverlayState::HumanHeld),
+            "DISPOSITION_REQUIRED" => Ok(OverlayState::DispositionRequired),
             other => Err(DaemonError::Parse(format!(
                 "unknown overlay state: {other}"
             ))),

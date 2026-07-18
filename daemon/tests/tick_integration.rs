@@ -2491,6 +2491,225 @@ fn adopted_red_pr_stage2_reroll_spawn_failure_parks_human_held_with_escalation()
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// jleechan-zaga / issue #348: an adopted PR whose only red gate is a
+/// CodeRabbit usage-limit (`coderabbit_status="blocked"`) must be held
+/// at `DISPOSITION_REQUIRED`, NOT rerolled. Without this hold, every
+/// reroll produces an equivalent r2 that hits the same external-blocker
+/// signal and parks `HUMAN_HELD` at the attempt cap (v6ud #342 → r1
+/// was a real production incident of this exact churn).
+///
+/// Acceptance: bead ends in `DISPOSITION_REQUIRED`, telemetry emits
+/// `DISPOSITION_REQUIRED` (not `PARKED_HUMAN_HELD`), the original PR
+/// stays open, and the daemon posted the per-gate disposition comment.
+#[test]
+fn adopted_red_pr_structural_only_red_gates_holds_disposition_required_not_reroll() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 708,
+        title: "Adopted PR with structural-only red gates".into(),
+        body: "CodeRabbit usage limit".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#708".into(),
+        head_ref_name: "alice/structural-only-red".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    let mut snapshot = qdw_green_snapshot(
+        708,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
+    );
+    // Structural-red-only: CodeRabbit usage-limit (the snapshot's
+    // `coderabbit_status="blocked"` is the SCM-emitted signal when CR
+    // is rate-limited; see verifier::classify_red_gate).
+    snapshot.coderabbit_approved = false;
+    snapshot.coderabbit_status = "blocked".into();
+    scm.pr_snapshots.insert(708, snapshot);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2; // Stage 2: reroll normally executes; our new branch must preempt it
+    let vcs = FakeVcs::new();
+    let telemetry_log =
+        std::env::temp_dir().join("afd_structural_only_red_gates.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("structural-only red gate path must not error the tick");
+
+    assert_eq!(summary.beads_created, 1);
+    assert_eq!(summary.gates_assessed, 1);
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "structural-only red gates must NOT park the bead HUMAN_HELD — that's \
+         the exact churn issue #348 documents (v6ud #342)"
+    );
+    assert_eq!(
+        summary.beads_held_disposition_required, 1,
+        "beads_held_disposition_required counter must increment for every \
+         DISPOSITION_REQUIRED placement (operator visibility / dashboard signal)"
+    );
+
+    let overlay = store.load("fake-bead-1").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::DispositionRequired,
+        "bead must be held at DISPOSITION_REQUIRED, not ATTESTED (would \
+         re-trigger the same gate report on next tick) and not HUMAN_HELD \
+         (would cap-circuit)"
+    );
+    assert_eq!(overlay.pr_number, Some(708));
+    assert_eq!(overlay.branch.as_deref(), Some("alice/structural-only-red"));
+
+    // The original PR must remain open — DISPOSITION_REQUIRED is a hold,
+    // not a supersede.
+    let session_calls = sessions.calls.borrow();
+    assert!(
+        session_calls.iter().all(|c| !c.starts_with("spawn(")),
+        "DISPOSITION_REQUIRED hold must not fabricate remediation sessions: {session_calls:?}"
+    );
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls.iter().all(|c| !c.contains("close")),
+        "original PR must not be closed on structural-only red gates: {tracker_calls:?}"
+    );
+
+    // Telemetry must show DISPOSITION_REQUIRED, not PARKED_HUMAN_HELD.
+    let log_contents =
+        std::fs::read_to_string(&telemetry_log).expect("telemetry log must exist");
+    assert!(
+        log_contents.contains("\"DISPOSITION_REQUIRED\""),
+        "DISPOSITION_REQUIRED telemetry event must be emitted; log:\n{log_contents}"
+    );
+    assert!(
+        !log_contents.contains("\"PARKED_HUMAN_HELD\""),
+        "structural-only red gates must not emit PARKED_HUMAN_HELD — that's the \
+         exact regression issue #348 documents; log:\n{log_contents}"
+    );
+    assert!(
+        !log_contents.contains("\"REROLL_VERDICT_RECORDED\""),
+        "structural-only red gates must not trigger reroll; log:\n{log_contents}"
+    );
+
+    // Per-gate disposition comment must name every red gate.
+    assert!(
+        tracker_calls.iter().any(|c| {
+            c.contains("comment_external(owner/repo#708")
+                && c.contains("Disposition required")
+                && c.contains("coderabbit")
+                && c.contains("structural")
+        }),
+        "DISPOSITION_REQUIRED comment must name the structural red gate(s); \
+         tracker_calls: {tracker_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-zaga / issue #348: mixed redness (one structural red + one
+/// coder-fixable red) must keep today's reroll behavior — the issue's
+/// explicit acceptance criterion: "mixed red → reroll as today".
+#[test]
+fn adopted_red_pr_mixed_red_gates_still_rerolls() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 709,
+        title: "Adopted PR with mixed red gates".into(),
+        body: "CI broken + CodeRabbit blocked".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#709".into(),
+        head_ref_name: "alice/mixed-red-gates".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    let mut snapshot = qdw_green_snapshot(
+        709,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
+    );
+    // Mixed: CI fail (coder-fixable) + CodeRabbit blocked (structural).
+    snapshot.ci_success = false;
+    snapshot.ci_status = "failure".into();
+    snapshot.coderabbit_approved = false;
+    snapshot.coderabbit_status = "blocked".into();
+    scm.pr_snapshots.insert(709, snapshot);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert(
+        "alice/mixed-red-gates".into(),
+        "pre-session-sha-mixed".into(),
+    );
+    let telemetry_log =
+        std::env::temp_dir().join("afd_mixed_red_gates_rerolls.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("mixed red gate reroll should not error");
+
+    assert_eq!(
+        summary.beads_held_disposition_required, 0,
+        "mixed red gates must NOT hold DISPOSITION_REQUIRED — only all-structural \
+         redness triggers the hold (issue #348 acceptance: 'mixed red → reroll \
+         as today')"
+    );
+
+    let overlay = store.load("fake-bead-1").unwrap().unwrap();
+    assert_ne!(
+        overlay.state,
+        OverlayState::DispositionRequired,
+        "mixed-red bead must continue the existing reroll flow, not the new hold"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 #[test]
 fn test_manual_bead_input_auto_queued_and_dispatched() {
     let scm = FakeScm::new(); // no issues in SCM

@@ -73,6 +73,11 @@ pub struct TickSummary {
     /// query `bead_overlay` yourself" (2026-07-09 live incident: 45 beads
     /// silently lost with no durable trace anywhere).
     pub beads_escalated_locally: usize,
+    /// jleechan-zaga / issue #348: beads held at `DISPOSITION_REQUIRED`
+    /// because every red gate is structural (re-rolling would be no-op
+    /// churn). The fast tier keeps assessing on each tick; this counter
+    /// just records the holds placed this tick.
+    pub beads_held_disposition_required: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -782,6 +787,7 @@ pub fn run_tick(
             "beadsRecoveredFromHeld": summary.beads_recovered_from_held,
             "beadsEscalated": summary.beads_escalated,
             "beadsEscalatedLocally": summary.beads_escalated_locally,
+            "beadsHeldDispositionRequired": summary.beads_held_disposition_required,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
@@ -2554,6 +2560,64 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     "🤖 **[dark-factory]** Coder session parked (human held): gate assessment failed. Stage 1 configuration prevents re-roll."
                         .to_string()
                 };
+                let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+            } else if deps.cfg.stage == 2
+                && matches!(
+                    verifier::classify_red_gates(&report, &snapshot),
+                    Some(verifier::RedGateClassification::AllStructural)
+                )
+            {
+                // jleechan-zaga / issue #348: every red gate is structural
+                // (external reviewer usage-limit, bot threads on
+                // superseded content, evidence floor owned by a different
+                // bead). Re-rolling the coder cannot clear any of them —
+                // it would just produce an equivalent r2 that hits the
+                // same feedback hash and parks HUMAN_HELD at the attempt
+                // cap. Hold the bead at `DISPOSITION_REQUIRED` instead,
+                // surfacing every red gate's disposition need and
+                // continuing to assess on each tick. The bead leaves
+                // this state the moment any red gate flips
+                // `CoderFixable` (or to `Green`).
+                overlay.state = OverlayState::DispositionRequired;
+                deps.store.save(&overlay)?;
+                let structural_gates: Vec<serde_json::Value> = report
+                    .results
+                    .iter()
+                    .filter_map(|(gate_name, result)| match result {
+                        verifier::GateResult::Red(reason) => Some(serde_json::json!({
+                            "gate": gate_name.as_str(),
+                            "reason": reason,
+                            "disposition": "structural",
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                summary.beads_held_disposition_required += 1;
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::DispositionRequired.as_str(),
+                    "DISPOSITION_REQUIRED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "all red gates classified as structural; reroll would be no-op churn",
+                        "structural_gates": structural_gates,
+                        "pr_number": pr,
+                    }),
+                )?;
+                let gate_lines: Vec<String> = structural_gates
+                    .iter()
+                    .filter_map(|g| {
+                        let gate = g.get("gate")?.as_str()?;
+                        let reason = g.get("reason")?.as_str()?;
+                        Some(format!("- `{gate}`: {reason}"))
+                    })
+                    .collect();
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Disposition required for bead `{bead_id}`: every red gate is structural (re-rolling cannot clear it). Daemon held at `DISPOSITION_REQUIRED` rather than superseding. Per-gate disposition needs:\n\n{}\n\nThe fast tier will continue to assess on each tick; the bead leaves this state the moment any red gate becomes coder-fixable or green.",
+                    gate_lines.join("\n")
+                );
                 let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
             } else {
                 // Stage 2: execute re-roll engine
