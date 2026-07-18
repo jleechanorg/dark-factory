@@ -435,28 +435,67 @@ fn ao_runtime_binding(cfg: &Config) -> Result<(String, String), DaemonError> {
     Ok((ao_project, default_agent))
 }
 
+/// Builds the ordered, deduplicated vendor name list the daemon hands to
+/// `ao spawn` as its full `DARK_FACTORY_REVIEWER_DEFAULT` +
+/// `DARK_FACTORY_REVIEWER_FALLBACK_CHAIN` configuration. Mirrors the chain
+/// `CliSessions::spawn_with_fallback` actually walks at runtime
+/// (including the `aow -> minimax` and `agy -> antigravity` aliases) so
+/// the startup preflight can validate the same set of vendor names the
+/// daemon will later try to spawn -- a mismatch here is the exact
+/// jleechan-agy-vendor-name-drift-9lvs bug (AO renamed
+/// `agy -> antigravity`; the daemon kept listing `agy`).
+fn configured_vendor_list(default_agent: &str) -> Vec<String> {
+    let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
+        .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
+    let mut vendors: Vec<String> = Vec::new();
+    let candidates: Vec<String> = std::iter::once(default_agent.to_string())
+        .chain(
+            fallback_str
+                .split("->")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        )
+        .collect();
+    for candidate in candidates {
+        let mapped = daemon::adapters::canonical_for_alias(&candidate)
+            .map(str::to_string)
+            .unwrap_or(candidate);
+        if !vendors.contains(&mapped) {
+            vendors.push(mapped);
+        }
+    }
+    vendors
+}
+
 fn verify_startup_ao_compatibility(
     args: Args,
     ao_project: &str,
     agent: &str,
-    verify: impl FnOnce(&str, &str) -> Result<(), DaemonError>,
+    configured_vendors: &[String],
+    verify: impl FnOnce(&str, &str, &[String]) -> Result<(), DaemonError>,
 ) -> Result<(), DaemonError> {
     if args.dry_run {
         return Ok(());
     }
-    verify(ao_project, agent)
+    verify(ao_project, agent, configured_vendors)
 }
 
 fn run(args: Args) -> Result<(), DaemonError> {
     let cfg_path = default_config_path();
     let cfg = load_config(&cfg_path)?;
     let (ao_project, default_agent) = ao_runtime_binding(&cfg)?;
+    // jleechan-agy-vendor-name-drift-9lvs: build the same vendor list
+    // `CliSessions::spawn_with_fallback` will walk at runtime, then hand
+    // it to the bridge-compatibility preflight so AO main's plugin
+    // renames (e.g. `agy -> antigravity`) fail loud here instead of
+    // after the per-bead spawn path has already started.
+    let configured_vendors = configured_vendor_list(&default_agent);
     // Fail before opening/reconciling state, advertising READY, or polling a
     // healthy tick when the installed AO/Node adapter is incompatible. The
     // diagnostic exits before AO preflight, locking, workspace creation, or
     // worker launch.
-    verify_startup_ao_compatibility(args, &ao_project, &default_agent, |project, agent| {
-        daemon::adapters::verify_ao_bridge_compatibility(project, agent)
+    verify_startup_ao_compatibility(args, &ao_project, &default_agent, &configured_vendors, |project, agent, vendors| {
+        daemon::adapters::verify_ao_bridge_compatibility(project, agent, vendors)
     })?;
     let telemetry_log = default_telemetry_log();
     let db_path = default_state_db_path();
@@ -651,7 +690,8 @@ mod tests {
             Args::default(),
             "dark-factory",
             "minimax",
-            |project, agent| {
+            &[],
+            |project, agent, _vendors| {
                 observed = Some((project.to_string(), agent.to_string()));
                 Err(DaemonError::Config("incompatible AO runtime".to_string()))
             },
@@ -697,7 +737,8 @@ mod tests {
             },
             "dark-factory",
             "minimax",
-            |_, _| {
+            &[],
+            |_, _, _| {
                 called = true;
                 Ok(())
             },

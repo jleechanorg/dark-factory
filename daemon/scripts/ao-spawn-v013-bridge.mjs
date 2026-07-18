@@ -125,7 +125,30 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
     // Read-only startup/deployment diagnostic: verifies the running Node,
     // AO package version, public core API, config, and plugin resolution
     // without creating a workspace or worker.
+    //
+    // jleechan-agy-vendor-name-drift-9lvs: the diagnostic payload also
+    // enumerates every registered `agent` plugin so the daemon startup
+    // preflight can compare its configured `--agent` values against the
+    // actually-installed plugin set and fail loud when an upstream rename
+    // (e.g. `agy -> antigravity`) has drifted the daemon's hardcoded
+    // fallback chain away from what AO accepts. Without this, the daemon
+    // only learned about the mismatch after `ao spawn` failed at runtime
+    // with `Agent plugin agy not found`, wasting the full dispatch
+    // path on every lane in the chain.
     if (diagnosticMode) {
+      let agentPlugins = [];
+      try {
+        const list = registry.list("agent");
+        agentPlugins = list
+          .map((manifest) => manifest?.name)
+          .filter((name) => typeof name === "string" && name.length > 0)
+          .sort();
+      } catch {
+        // Registry shape may change between AO versions; an empty list is
+        // a safe "skip the preflight" signal rather than crashing the
+        // diagnostic before it returns the runtime markers the daemon
+        // already validates.
+      }
       console.log(
         `AO_BRIDGE_DIAGNOSTIC=${JSON.stringify({
           cliVersion: packageJson.version,
@@ -134,6 +157,7 @@ if (process.env.DARK_FACTORY_AO_V013_BRIDGE === "1") {
           agent,
           branch,
           promptLength: sanitizedPrompt.length,
+          agentPlugins,
         })}`,
       );
       process.exit(0);

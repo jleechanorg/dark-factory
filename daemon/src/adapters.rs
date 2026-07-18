@@ -1537,9 +1537,19 @@ fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonErro
 /// Node major version, package version, core APIs, configured project, and
 /// plugin resolution without performing preflight side effects, acquiring a
 /// spawn lock, creating a workspace, or launching a worker.
+///
+/// `configured_vendors` is the daemon's full set of vendor names (default
+/// `DARK_FACTORY_REVIEWER_DEFAULT` agent plus every entry of
+/// `DARK_FACTORY_REVIEWER_FALLBACK_CHAIN`, normalized for the legacy
+/// `aow -> minimax` alias). After the runtime markers are validated, the
+/// installed agent plugin list returned by the bridge (`agentPlugins`) is
+/// cross-checked against `configured_vendors` so an upstream plugin rename
+/// (jleechan-agy-vendor-name-drift-9lvs: AO main's `agy -> antigravity`)
+/// fails loud at startup instead of burning the per-bead spawn path.
 pub fn verify_ao_bridge_compatibility(
     ao_project: &str,
     agent: &str,
+    configured_vendors: &[String],
 ) -> Result<(), DaemonError> {
     let spec = SpawnSpec {
         bead_id: "daemon-startup-diagnostic".to_string(),
@@ -1590,6 +1600,27 @@ pub fn verify_ao_bridge_compatibility(
         return Err(DaemonError::Config(format!(
             "AO bridge compatibility diagnostic reported an incompatible runtime: {diagnostic}"
         )));
+    }
+    // jleechan-agy-vendor-name-drift-9lvs: bridge returned its runtime
+    // markers cleanly. Now cross-check the daemon's configured vendor
+    // list against the installed `agentPlugins`. A missing key means an
+    // upstream rename (e.g. `agy -> antigravity`) has drifted the daemon's
+    // hardcoded fallback chain. The bridge reports `agentPlugins` as a
+    // sorted JSON array of strings; anything else is treated as an empty
+    // list (safe skip -- the runtime-marker check above already gated
+    // the well-formed case).
+    let installed_plugins: Vec<String> = diagnostic
+        .get("agentPlugins")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !installed_plugins.is_empty() {
+        validate_configured_vendors(&installed_plugins, configured_vendors)?;
     }
     Ok(())
 }
@@ -1795,16 +1826,33 @@ impl CliSessions {
     fn spawn_with_fallback(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
         let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
             .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
-        
+
+        // jleechan-agy-vendor-name-drift-9lvs: every vendor string on this
+        // list is run through `canonical_for_alias` before being handed to
+        // `ao spawn`. The previous code only aliased `aow -> minimax`; the
+        // 2026-07-18 full-dist resync also renamed AO's `agy` plugin to
+        // `antigravity`, so a fallback chain that still says `agy` would
+        // otherwise pass it through verbatim and surface only as
+        // `Agent plugin agy not found` at spawn time. Aliasing at this
+        // stage keeps the canonical plugin name in the argv AND in the
+        // human-readable error chain, so triage sees `antigravity` from
+        // the start instead of having to discover the rename from a
+        // crash.
         let mut fallback_agents = Vec::new();
-        fallback_agents.push(self.agent.clone());
+        let mapped_default = canonical_for_alias(&self.agent)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.agent.clone());
+        if !mapped_default.is_empty() && !fallback_agents.contains(&mapped_default) {
+            fallback_agents.push(mapped_default);
+        }
         for part in fallback_str.split("->") {
-            let part_trimmed = part.trim().to_string();
-            let mapped_agent = if part_trimmed == "aow" {
-                "minimax".to_string()
-            } else {
-                part_trimmed
-            };
+            let part_trimmed = part.trim();
+            if part_trimmed.is_empty() {
+                continue;
+            }
+            let mapped_agent = canonical_for_alias(part_trimmed)
+                .map(str::to_string)
+                .unwrap_or_else(|| part_trimmed.to_string());
             if !mapped_agent.is_empty() && !fallback_agents.contains(&mapped_agent) {
                 fallback_agents.push(mapped_agent);
             }
@@ -1906,6 +1954,208 @@ mod spawn_fallback_tests {
             rendered.contains("Agent plugin agy not found"),
             "agy's specific error must still be visible in the aggregated error, got: {rendered}"
         );
+    }
+}
+
+/// Returns true if `vendor` is an alias the daemon accepts for an AO agent
+/// plugin name. Today `aow` is a legacy alias for `minimax`, and `agy` is a
+/// legacy alias for the plugin that AO main renamed to `antigravity`. The
+/// alias map is the safety net (acceptance criterion (a)) so a config that
+/// still says `agy` keeps working after the upstream rename, while
+/// acceptance criterion (c) — the executable compatibility check — runs in
+/// [`validate_configured_vendors`] below and independently fails loud when
+/// neither the alias nor its canonical replacement is installed.
+fn is_legacy_vendor_alias(vendor: &str) -> bool {
+    matches!(vendor.trim(), "aow" | "agy")
+}
+
+/// Canonical plugin name for a legacy alias, or `None` if `vendor` is not a
+/// known alias. Pairs with [`is_legacy_vendor_alias`]. Public so
+/// `main.rs`'s startup `configured_vendor_list` can apply the same alias
+/// transformation the runtime `spawn_with_fallback` path applies.
+pub fn canonical_for_alias(vendor: &str) -> Option<&'static str> {
+    match vendor.trim() {
+        "aow" => Some("minimax"),
+        "agy" => Some("antigravity"),
+        _ => None,
+    }
+}
+
+/// Validates a set of daemon-configured vendor names against the agent
+/// plugins reported by an `ao` runtime probe (the bridge diagnostic JSON's
+/// `agentPlugins` array). A configured vendor passes when EITHER its
+/// literal name OR the canonical plugin name behind any legacy alias it
+/// uses is registered. The returned error names every missing vendor so
+/// triage can see the whole set at once instead of being shown one vendor
+/// per retry (the same all-attempts-at-once property jleechan-r56m demanded
+/// for fallback failures).
+///
+/// jleechan-agy-vendor-name-drift-9lvs: prior to this check the daemon's
+/// `--agent agy` value was passed through verbatim into `ao spawn`. When AO
+/// main renamed its plugin `agy -> antigravity` the renamed plugin
+/// silently broke every lane whose fallback chain still listed `agy`,
+/// surfacing only as `Agent plugin agy not found` after a full spawn had
+/// already failed. This is the executable compatibility check the bead's
+/// acceptance criteria asked for: the daemon startup must probe the
+/// installed plugin registry and fail loud on mismatch, not after the
+/// per-bead spawn path runs end-to-end.
+fn validate_configured_vendors(
+    installed_plugins: &[String],
+    configured_vendors: &[String],
+) -> Result<(), DaemonError> {
+    let installed: std::collections::HashSet<&str> =
+        installed_plugins.iter().map(String::as_str).collect();
+    let mut missing: Vec<String> = Vec::new();
+    let mut seen_canonical = std::collections::HashSet::new();
+    for vendor in configured_vendors {
+        let trimmed = vendor.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // A vendor passes if its literal name is installed, OR if it's a
+        // known legacy alias whose canonical replacement is installed.
+        let canonical = canonical_for_alias(trimmed);
+        let passes = installed.contains(trimmed)
+            || canonical.is_some_and(|c| installed.contains(c));
+        let canonical_for_dedup = canonical.unwrap_or(trimmed);
+        if !seen_canonical.insert(canonical_for_dedup.to_string()) {
+            continue;
+        }
+        if !passes {
+            missing.push(trimmed.to_string());
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        missing.sort();
+        Err(DaemonError::Config(format!(
+            "configured vendor name drift: AO plugin registry does not contain {}; \
+             installed plugins = [{}]. Update DARK_FACTORY_REVIEWER_DEFAULT and \
+             DARK_FACTORY_REVIEWER_FALLBACK_CHAIN to use a registered vendor name \
+             (or the canonical alias accepted by the daemon).",
+            missing
+                .iter()
+                .map(|v| format!("'{v}'"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            installed_plugins.join(", "),
+        )))
+    }
+}
+
+#[cfg(test)]
+mod vendor_drift_preflight_tests {
+    use super::{canonical_for_alias, is_legacy_vendor_alias, validate_configured_vendors};
+    use crate::errors::DaemonError;
+
+    /// jleechan-agy-vendor-name-drift-9lvs red proof: when AO main renames a
+    /// plugin (here `agy -> antigravity`), the daemon's hardcoded fallback
+    /// chain still passes `--agent agy` and every lane fails at spawn time
+    /// with `Agent plugin agy not found`. The acceptance criterion asks
+    /// the daemon startup to probe the installed plugin registry and fail
+    /// loud. Today's daemon has no such probe: this test asserts the
+    /// validator REJECTS a vendor name when NEITHER the literal name NOR
+    /// its canonical replacement is installed, which is the failure mode
+    /// that burned lane 222 on 2026-07-18.
+    #[test]
+    fn configured_vendor_missing_from_plugin_registry_must_fail_loud() {
+        let installed = vec!["antigravity".to_string(), "claude-code".to_string()];
+        // `stale-agent` is neither a legacy alias nor a registered plugin,
+        // so the validator must reject it outright. This is the
+        // drift-detection behavior the bead acceptance asked for.
+        let configured = vec!["stale-agent".to_string(), "claude-code".to_string()];
+
+        let err = validate_configured_vendors(&installed, &configured)
+            .expect_err("stale-agent must NOT pass when it is neither installed nor a known alias");
+
+        match err {
+            DaemonError::Config(message) => {
+                assert!(
+                    message.contains("'stale-agent'") || message.contains("\"stale-agent\""),
+                    "missing-vendor error must name 'stale-agent' as missing, got: {message}"
+                );
+                assert!(
+                    message.contains("installed plugins"),
+                    "error must show what IS installed so the operator can self-correct, got: {message}"
+                );
+            }
+            other => panic!("expected DaemonError::Config, got {other:?}"),
+        }
+    }
+
+    /// Both legacy aliases must be recognized by the helper functions.
+    /// The `aow -> minimax` alias has been in production since before the
+    /// antigravity rename; the new alias must coexist with it instead of
+    /// replacing it.
+    #[test]
+    fn legacy_aliases_have_canonical_replacements() {
+        assert!(is_legacy_vendor_alias("agy"));
+        assert!(is_legacy_vendor_alias("aow"));
+        assert!(!is_legacy_vendor_alias("antigravity"));
+        assert!(!is_legacy_vendor_alias("minimax"));
+        assert_eq!(canonical_for_alias("agy"), Some("antigravity"));
+        assert_eq!(canonical_for_alias("aow"), Some("minimax"));
+        assert_eq!(canonical_for_alias("antigravity"), None);
+        assert_eq!(canonical_for_alias(""), None);
+    }
+
+    /// A config listing the legacy alias MUST pass when the canonical
+    /// plugin name is the only one installed -- this is the explicit
+    /// acceptance criterion (a): "daemon vendor list uses 'antigravity'
+    /// (or maps agy->antigravity)". Without the alias a stale config that
+    /// still says `agy` would fail even after AO restored the canonical
+    /// name.
+    #[test]
+    fn legacy_agy_alias_validates_against_canonical_antigravity_plugin() {
+        let installed = vec!["antigravity".to_string(), "minimax".to_string()];
+        let configured = vec!["agy".to_string(), "aow".to_string()];
+
+        validate_configured_vendors(&installed, &configured)
+            .expect("agy alias must validate against antigravity plugin; aow must validate against minimax");
+    }
+
+    /// The validator must report ALL missing vendors at once, not just the
+    /// first. jleechan-r56m's aggregation property: if the operator's
+    /// entire fallback chain is misconfigured, the error must show the
+    /// full set so a single fix can cover every lane.
+    #[test]
+    fn multiple_missing_vendors_are_all_named_in_one_error() {
+        let installed = vec!["antigravity".to_string()];
+        // `agy` IS a recognized alias whose canonical name (antigravity) IS
+        // installed, so it must pass. `minimax` and `codex` are neither
+        // aliases nor installed, so both must be named as missing.
+        let configured = vec![
+            "agy".to_string(),
+            "minimax".to_string(),
+            "codex".to_string(),
+        ];
+
+        let err = validate_configured_vendors(&installed, &configured)
+            .expect_err("minimax + codex missing should fail");
+
+        match err {
+            DaemonError::Config(message) => {
+                assert!(message.contains("'minimax'") || message.contains("\"minimax\""), "minimax missing: {message}");
+                assert!(message.contains("'codex'") || message.contains("\"codex\""), "codex missing: {message}");
+                assert!(!message.contains("agy") || message.contains("\"agy\"") || message.contains("'agy'"),
+                    "agy must NOT be reported as missing when its canonical replacement is installed, got: {message}");
+            }
+            other => panic!("expected DaemonError::Config, got {other:?}"),
+        }
+    }
+
+    /// The validator must dedupe: if the same vendor appears in both the
+    /// default env var and the fallback chain, the canonical form should
+    /// only be checked once. Here `agy` and `antigravity` collapse to the
+    /// same canonical name (`antigravity`) which IS installed.
+    #[test]
+    fn duplicate_configured_vendors_are_deduplicated_before_validation() {
+        let installed = vec!["antigravity".to_string()];
+        let configured = vec!["agy".to_string(), "agy".to_string(), "antigravity".to_string()];
+
+        validate_configured_vendors(&installed, &configured)
+            .expect("agy + agy + antigravity dedupes to one antigravity check; must pass");
     }
 }
 
