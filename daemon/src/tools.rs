@@ -426,6 +426,59 @@ pub trait Scm {
         let _ = repo;
         self.remote_branch_last_commit(branch)
     }
+    /// Resolve the head branch of PR `pr` in `repo`, but ONLY when that PR
+    /// is currently OPEN AND its head lives in the SAME repo
+    /// (bead jleechan-drive-pr-branch-binding-pcpr). Used at dispatch time
+    /// to distinguish "drive an existing open PR" beads (whose
+    /// `external_ref` names a live, same-repo PR — the coder MUST land work
+    /// on the PR's own head branch, or AO's fail-closed branch validation
+    /// parks the bead `session_branch_mismatch` when it reuses the session
+    /// already bound to that branch) from ordinary create-new-work beads
+    /// (which always get a fresh generated `factory/<bead>-r<attempt>`
+    /// branch).
+    ///
+    /// `PrHeadBranch::Fork` is the fail-closed guard mirroring
+    /// `intake::same_repo_pr`: a PR whose head lives on a FORK must never
+    /// be bound to by name — the base repo has no such branch, so binding
+    /// would create an unrelated same-named branch there and silently never
+    /// touch the actual PR. `PrHeadBranch::NotFound` is the fail-safe
+    /// default for every case that must fall back to the generated-branch
+    /// path: a closed/merged/missing PR, an `external_ref` number that
+    /// isn't actually a pull request, or any lookup failure (transient
+    /// `gh` error, malformed response). Neither variant lets an
+    /// inconclusive lookup fabricate a branch binding it can't positively
+    /// confirm — see `CliScm`'s override for the real `gh api` lookup.
+    /// Default impl returns `Ok(PrHeadBranch::NotFound)` unconditionally so
+    /// every existing test fake and any impl that predates this method
+    /// keeps behaving exactly as before (always the generated-branch path)
+    /// without needing to implement it.
+    fn open_pr_head_ref_for_repo(&self, repo: &str, pr: u64) -> Result<PrHeadBranch, DaemonError> {
+        let _ = (repo, pr);
+        Ok(PrHeadBranch::NotFound)
+    }
+}
+
+/// Resolution of an [`Scm::open_pr_head_ref_for_repo`] lookup (bead
+/// jleechan-drive-pr-branch-binding-pcpr). A three-way result rather than
+/// `Option<String>` so callers can tell "confirmed open PR, but its head is
+/// on a fork — fail-closed, do not bind" apart from "no open PR found at
+/// all" — the two have the same fallback (generated branch) but very
+/// different causes, and dispatch-time telemetry needs to distinguish them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrHeadBranch {
+    /// PR `pr` is OPEN and its head repo matches the queried `repo` —
+    /// safe to bind the coder branch to this ref.
+    SameRepo(String),
+    /// PR `pr` is OPEN but its head lives in a DIFFERENT repo (a fork, or
+    /// a deleted-fork PR whose `head.repo` GitHub no longer reports).
+    /// Binding to this branch name in the queried repo would create an
+    /// unrelated same-named branch there and never touch the actual PR —
+    /// mirrors the fail-closed fork guard `intake::same_repo_pr` already
+    /// applies to PR adoption.
+    Fork,
+    /// Closed/merged/missing PR, a `pr` number that isn't a pull request,
+    /// or a lookup/parse failure.
+    NotFound,
 }
 
 /// `ao` / `aow` CLIs.
