@@ -26,6 +26,23 @@ pub enum RerollOutcome {
     Rerolled { new_branch: String },
     Aborted(String),
     Held(String),
+    /// Bead jleechan-zaga / issue #348: every red gate was classified
+    /// [`crate::verifier::GateFixability::Structural`] — no coder action
+    /// on the current branch can flip the gate green, so supersede +
+    /// PR-close would only churn the bead (and historically pushed the
+    /// circuit-breaker into an attempt-2 HUMAN_HELD loop on beads whose
+    /// only red gates were CodeRabbit usage-limit / Bugbot external /
+    /// evidence-floor pre-#323 / unresolved threads on superseded
+    /// content). The caller (gate-routing in `tick::run_fast_tier`) MUST
+    /// hold the bead in `DISPOSITION_REQUIRED` rather than supersede it
+    /// — distinct from `Held` (terminal human park) and `Aborted`
+    /// (state changed out from under us). The per-gate disposition
+    /// record is the operator-facing "what does each red gate need"
+    /// payload, surfaced both as telemetry and as a structured comment
+    /// on the bead's PR.
+    DispositionRequired {
+        per_gate: Vec<crate::verifier::DispositionEntry>,
+    },
     /// Bead jleechan-zeij / issue #322 r2: the fail-closed proceed predicate
     /// could NOT positively confirm the previous worker is safe to supersede
     /// this tick (an active session, a moving branch HEAD, or a failed

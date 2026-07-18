@@ -82,6 +82,161 @@ impl GateResult {
     }
 }
 
+/// Whether a red gate is something a coder can plausibly fix on the current
+/// branch vs a structural blocker the reroll engine cannot unblock by
+/// superseding the worker (bead jleechan-zaga / issue #348).
+///
+/// **CODER-FIXABLE** — a code change on the current branch's diff could
+/// plausibly flip the gate green (Skeptic code findings, CI failure,
+/// mergeable state, evidence floor the coder can satisfy by adding the
+/// integration marker or splitting the diff).
+///
+/// **STRUCTURAL** — the gate's red verdict is driven by something a coder
+/// cannot fix in this branch's diff: external service unavailable
+/// (CodeRabbit / Bugbot), unresolved bot threads on superseded content
+/// (`CommentsResolved` when the reason names supersede-comments), a
+/// floor-gate whose fix is a different bead (e.g. evidence runner
+/// "pre-#323" not-yet-shipped state).
+///
+/// Classification is a pure function of `GateName` and the gate's `Red`
+/// reason text. The mapping is intentionally gate-vocabulary-driven
+/// (the same vocabulary that `GateName::as_str` exports and that
+/// `daemon/scripts/auto-merge-guard.sh` reads back from GATE_ASSESSMENT
+/// telemetry) so adding a new structural-by-definition gate requires
+/// editing exactly ONE switch in `classify_gate_fixability`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GateFixability {
+    CoderFixable,
+    Structural,
+}
+
+/// Classify a single red gate's fixability from its name and reason text.
+/// See [`GateFixability`] for the contract.
+pub fn classify_gate_fixability(gate: GateName, reason: &str) -> GateFixability {
+    let reason_lower = reason.to_ascii_lowercase();
+    match gate {
+        // External services whose approval / cleanness is not in the
+        // coder's control — the canonical "usage limit" / "external
+        // service unavailable" structural class. A coder fix cannot
+        // unblock a CodeRabbit or Bugbot rate-limit; only an operator
+        // (different plan / different external account / lifted outage)
+        // can.
+        GateName::CodeRabbitApproved | GateName::BugbotClean => GateFixability::Structural,
+        // Evidence floor: the floor itself (LOC > 100 with no marker) IS
+        // coder-fixable (add the marker, or split the diff). The gate
+        // becomes structural ONLY when the reason text names an external
+        // / cross-bead blocker — the canonical case is "pre-#323" (a
+        // prerequisite bead that is itself blocked), per the issue:
+        // "floor gates whose fix is a different bead". Without such a
+        // marker, treat it as coder-fixable so the classifier does not
+        // falsely suppress a legitimate re-roll on a bead whose only
+        // floor-gate defect is "you forgot the integration marker".
+        GateName::EvidenceFloor => {
+            if reason_lower.contains("pre-#")
+                || reason_lower.contains("pre-bead-")
+                || reason_lower.contains("blocked on")
+                || reason_lower.contains("not yet available")
+                || reason_lower.contains("not yet shipped")
+            {
+                GateFixability::Structural
+            } else {
+                GateFixability::CoderFixable
+            }
+        }
+        // Comments-resolved: a coder can fix this by replying to / resolving
+        // the threads, EXCEPT when the unresolved threads are on
+        // superseded content (the canonical case: a CodeRabbit "supersede
+        // comment" left on a bead whose previous attempt was already
+        // superseded — the bead's own current-branch diff has nothing to
+        // resolve against those threads).
+        GateName::CommentsResolved => {
+            if reason_lower.contains("supersede")
+                || reason_lower.contains("superseded")
+                || reason_lower.contains("stale thread")
+            {
+                GateFixability::Structural
+            } else {
+                GateFixability::CoderFixable
+            }
+        }
+        // Skeptic / Ci / NoConflicts: a coder can fix all of these on the
+        // current branch's diff. The remaining gates are the only
+        // coder-fixable cases — every other gate is structural-by-design
+        // or structural-by-reason above.
+        GateName::Skeptic | GateName::Ci | GateName::NoConflicts => GateFixability::CoderFixable,
+    }
+}
+
+/// Per-gate disposition entry returned by [`classify_red_gates`]. The
+/// tuple shape `(gate_name, reason, fixability)` is the single source of
+/// truth for the per-gate "what does this gate need" payload — it is
+/// surfaced to operators via `RerollOutcome::DispositionRequired`,
+/// recorded in `DISPOSITION_REQUIRED` telemetry, and posted as a
+/// structured comment on the bead's PR.
+pub type DispositionEntry = (GateName, String, GateFixability);
+
+/// The classification of an entire red-gate set (bead jleechan-zaga /
+/// issue #348). Holds the per-gate disposition list and exposes the two
+/// predicates the reroll gate-routing uses: `is_all_structural` (returns
+/// `DispositionRequired`, do NOT supersede / close) and
+/// `has_any_coder_fixable` (reroll as today, at least one real defect
+/// to fix).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedGateClassification {
+    entries: Vec<DispositionEntry>,
+}
+
+impl RedGateClassification {
+    /// True iff every red gate is classified [`GateFixability::Structural`]
+    /// — i.e. NO coder action on the current branch can flip the gate
+    /// green. The gate-routing call site MUST short-circuit to
+    /// `RerollOutcome::DispositionRequired` and MUST NOT supersede the
+    /// previous worker or close the PR.
+    pub fn is_all_structural(&self) -> bool {
+        !self.entries.is_empty()
+            && self
+                .entries
+                .iter()
+                .all(|(_, _, fix)| *fix == GateFixability::Structural)
+    }
+
+    /// True iff at least one red gate is classified
+    /// [`GateFixability::CoderFixable`] — i.e. there is a real defect
+    /// the reroll engine should dispatch a fresh attempt for.
+    pub fn has_any_coder_fixable(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|(_, _, fix)| *fix == GateFixability::CoderFixable)
+    }
+
+    /// The per-gate disposition entries, in input order. Use for
+    /// telemetry / comments — the operator-facing "what does each red
+    /// gate need" record.
+    pub fn per_gate(&self) -> &[DispositionEntry] {
+        &self.entries
+    }
+}
+
+/// Classify a set of red gates (issue #348). Skips `Green` and `Unknown`
+/// entries; only `Red` gates are classified (an `Unknown` gate is not a
+/// defect, it is "the verifier could not evaluate this gate" — handled
+/// elsewhere as a different reroll path).
+pub fn classify_red_gates(
+    red_gates: &[(GateName, GateResult)],
+) -> RedGateClassification {
+    let mut entries = Vec::new();
+    for (name, result) in red_gates {
+        if let GateResult::Red(reason) = result {
+            entries.push((
+                *name,
+                reason.clone(),
+                classify_gate_fixability(*name, reason),
+            ));
+        }
+    }
+    RedGateClassification { entries }
+}
+
 /// Full assessment for one PR: every gate's verdict plus the aggregate
 /// `all_green` flag. `all_green` is `true` only when every one of the 7
 /// gates is `Green` — a single `Unknown` gate forces `all_green=false` in

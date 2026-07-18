@@ -19,6 +19,18 @@ pub enum OverlayState {
     Recovery,    // spec mutated, awaiting re-dispatch (Stage 2)
     Redispatched, // handed back to the queue
     BudgetHeld,  // budget exhaustion (monitoring-only in Stage 1/2)
+    /// Bead jleechan-zaga / issue #348: every red gate was classified
+    /// structural (CodeRabbit usage-limit, Bugbot external, evidence
+    /// floor pre-#323, unresolved threads on superseded content) and
+    /// the reroll engine therefore short-circuited. The bead is held
+    /// here (NOT `HUMAN_HELD` and NOT superseded) until the structural
+    /// blocker clears — operator-visible, not in the auto-recover
+    /// allow-list, and `run_fast_tier` does not re-select it for
+    /// re-roll. The next tick re-evaluates gates against the same
+    /// branch: if the structural blocker has cleared, the bead is
+    /// re-selected and the normal reroll path runs; if it has not,
+    /// the bead remains in DISPOSITION_REQUIRED with no churn.
+    DispositionRequired,
     HumanHeld,   // terminal until human action
 }
 
@@ -35,6 +47,7 @@ impl OverlayState {
             OverlayState::Recovery => "RECOVERY",
             OverlayState::Redispatched => "REDISPATCHED",
             OverlayState::BudgetHeld => "BUDGET_HELD",
+            OverlayState::DispositionRequired => "DISPOSITION_REQUIRED",
             OverlayState::HumanHeld => "HUMAN_HELD",
         }
     }
@@ -55,6 +68,7 @@ impl OverlayState {
             "RECOVERY" => Ok(OverlayState::Recovery),
             "REDISPATCHED" => Ok(OverlayState::Redispatched),
             "BUDGET_HELD" => Ok(OverlayState::BudgetHeld),
+            "DISPOSITION_REQUIRED" => Ok(OverlayState::DispositionRequired),
             "HUMAN_HELD" => Ok(OverlayState::HumanHeld),
             other => Err(DaemonError::Parse(format!(
                 "unknown overlay state: {other}"
@@ -1571,7 +1585,7 @@ mod tests {
     }
 
     #[test]
-    fn all_ten_overlay_states_accepted_by_schema() {
+    fn all_eleven_overlay_states_accepted_by_schema() {
         let s = store();
         for (i, state) in [
             OverlayState::Queued,
@@ -1583,6 +1597,7 @@ mod tests {
             OverlayState::Recovery,
             OverlayState::Redispatched,
             OverlayState::BudgetHeld,
+            OverlayState::DispositionRequired,
             OverlayState::HumanHeld,
         ]
         .into_iter()

@@ -2557,6 +2557,83 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
             } else {
                 // Stage 2: execute re-roll engine
+
+                // Bead jleechan-zaga / issue #348: classify every red gate
+                // as CODER-FIXABLE (a code change on the current branch
+                // could flip the gate green) vs STRUCTURAL (CodeRabbit
+                // usage-limit, Bugbot external, evidence floor pre-#323,
+                // unresolved threads on superseded content). When ALL red
+                // gates are structural, supersede + PR-close can NEVER
+                // unblock the bead — every cycle the same structural
+                // feedback is re-recorded, the circuit breaker trips on
+                // attempt 2, and the operator has to hand-merge the r1
+                // fix (live cost: v6ud's P0 fix, PR #342, was superseded
+                // by its own r1 ~25 min after opening because the only
+                // red gates were structural). Short-circuit to a
+                // DISPOSITION_REQUIRED hold with the per-gate disposition
+                // preserved in telemetry, and post a structured
+                // "needs operator disposition" comment. NO supersede, NO
+                // PR close, NO circuit-breaker churn.
+                let gate_classification = verifier::classify_red_gates(&report.results);
+                if gate_classification.is_all_structural() {
+                    let per_gate = gate_classification.per_gate().to_vec();
+                    // Persist DISPOSITION_REQUIRED before any side effects so
+                    // a partial failure (e.g. SCM comment blow-up) cannot
+                    // leave the bead in ATTESTED to churn.
+                    overlay.state = OverlayState::DispositionRequired;
+                    deps.store.save(&overlay)?;
+                    // DISPOSITION_REQUIRED is NOT a HUMAN_HELD park and
+                    // does not increment the terminal-park counter — it
+                    // is a structural-bloker hold that the next tick
+                    // re-evaluates against the same branch.
+
+                    let per_gate_json: Vec<serde_json::Value> = per_gate
+                        .iter()
+                        .map(|(gate, reason, fix)| {
+                            serde_json::json!({
+                                "gate": gate.as_str(),
+                                "reason": reason,
+                                "fixability": match fix {
+                                    verifier::GateFixability::CoderFixable => "coder_fixable",
+                                    verifier::GateFixability::Structural => "structural",
+                                },
+                            })
+                        })
+                        .collect();
+
+                    emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::DispositionRequired.as_str(),
+                        "DISPOSITION_REQUIRED",
+                        serde_json::json!({"structuralGateCount": per_gate.len()}),
+                        serde_json::json!({
+                            "reason": "all_structural_red_gates",
+                            "perGateDisposition": per_gate_json,
+                            "prNumber": pr,
+                        }),
+                    )?;
+
+                    let mut per_gate_lines = String::new();
+                    for (gate, reason, fix) in &per_gate {
+                        per_gate_lines.push_str(&format!(
+                            "\n- **{gate}** ({fix:?}): {reason}",
+                            gate = gate.as_str(),
+                            fix = match fix {
+                                verifier::GateFixability::CoderFixable => "coder_fixable",
+                                verifier::GateFixability::Structural => "structural",
+                            },
+                        ));
+                    }
+                    let comment_body = format!(
+                        "🤖 **[dark-factory]** Disposition required for bead `{bead_id}`: every red gate is structural (no coder action on the current branch can flip it green). Automation is holding the bead DISPOSITION_REQUIRED — the existing PR stays open, the previous worker is NOT superseded, and no circuit-breaker churn is initiated. Per-gate disposition:{per_gate_lines}\n\nResolve the structural blockers (e.g. external-service usage limit, cross-bead prerequisite) and re-run gate assessment; the bead will re-enter the normal path automatically once at least one red gate is coder-fixable or all gates are green.",
+                    );
+                    let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+                    continue;
+                }
+
+                // Mixed or all-coder-fixable red gates: today's reroll path.
                 let mut reviewer = "verifier".to_string();
                 for (gate_name, result) in &report.results {
                     if let verifier::GateResult::Red(_) = result {
@@ -2696,6 +2773,20 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         )?;
                     }
                     Ok(crate::reroll::RerollOutcome::Aborted(_)) => {}
+                    Ok(crate::reroll::RerollOutcome::DispositionRequired { per_gate: _ }) => {
+                        // Defensive arm: the gate-routing short-circuit at
+                        // the top of this `else` branch handles the
+                        // all-structural case BEFORE `reroll::execute` is
+                        // called, so today `execute` never returns
+                        // `DispositionRequired`. If a future refactor
+                        // moves the classifier INSIDE `execute`, the
+                        // routing here remains correct (the bead's state
+                        // was already persisted inside `execute`, and the
+                        // per-gate disposition was already recorded in
+                        // telemetry). Move on to the next bead; do not
+                        // double-emit / double-comment.
+                        continue;
+                    }
                     Err(e) if e.is_transient() => {
                         // jleechan-cq8r: per-bead isolation, matching the
                         // jleechan-qdw pattern used elsewhere in this same

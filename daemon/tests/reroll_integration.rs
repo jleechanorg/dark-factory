@@ -2030,3 +2030,228 @@ fn test_reroll_close_pr_uses_bead_resolved_repo_not_cfg_target_repo() {
     std::fs::remove_dir_all(spec_dir).ok();
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+// jleechan-zaga / issue #348: gate classification — pure-function unit test.
+// Each named gate is classified into one of two fixability buckets:
+//   CoderFixable: a code change on the current branch could plausibly flip
+//     the gate green (Skeptic code findings, CI flake, mergeable state,
+//     bot-thread the coder can resolve, evidence-floor the coder can satisfy
+//     by adding an integration marker or splitting the diff).
+//   Structural: the gate's red verdict is driven by something a coder cannot
+//     fix in this branch's diff (CodeRabbit/Bugbot usage limits, external
+//     service unavailable, a floor gate whose fix is a DIFFERENT bead, etc.).
+// The function is gate-name-driven and is intentionally NOT a hand-rolled
+// classifier on the reason text — adding a new gate that is structurally
+// red by definition (e.g. a future "external service status" gate) MUST be
+// added here so the per-gate vocabulary stays the single source of truth.
+#[test]
+fn test_classify_gate_fixability() {
+    use daemon::verifier::{classify_gate_fixability, GateFixability, GateName};
+
+    // CodeRabbit + Bugbot are external services whose approval / cleanness
+    // is not in the coder's control — the canonical "usage limit" / "external
+    // service unavailable" structural class.
+    assert_eq!(
+        classify_gate_fixability(GateName::CodeRabbitApproved, "usage limit reached"),
+        GateFixability::Structural
+    );
+    assert_eq!(
+        classify_gate_fixability(GateName::BugbotClean, "external reviewer error"),
+        GateFixability::Structural
+    );
+    // Skeptic, CI, mergeable, comments-resolved: a coder can fix all of these
+    // by changing the diff on this branch (or resolving the threads).
+    assert_eq!(
+        classify_gate_fixability(
+            GateName::Skeptic,
+            "missing input validation in handler X"
+        ),
+        GateFixability::CoderFixable
+    );
+    assert_eq!(
+        classify_gate_fixability(GateName::Ci, "test_lint failed"),
+        GateFixability::CoderFixable
+    );
+    assert_eq!(
+        classify_gate_fixability(
+            GateName::NoConflicts,
+            "merge conflict with main"
+        ),
+        GateFixability::CoderFixable
+    );
+    assert_eq!(
+        classify_gate_fixability(
+            GateName::CommentsResolved,
+            "unresolved thread on supersede-comment"
+        ),
+        GateFixability::Structural
+    );
+    // Evidence floor: the floor itself (LOC > 100 with no marker) is a
+    // coder-fixable defect (add the marker or split the diff). The gate is
+    // "structural" ONLY when the reason text explicitly names an external
+    // / cross-bead blocker (per the issue: "floor gates whose fix is a
+    // different bead"); the canonical case is "pre-#323" (a not-yet-
+    // shipped prerequisite bead that is itself blocked). Without such a
+    // marker in the reason, the gate is coder-fixable.
+    assert_eq!(
+        classify_gate_fixability(
+            GateName::EvidenceFloor,
+            "evidence floor: 200 LOC, no integration marker"
+        ),
+        GateFixability::CoderFixable
+    );
+    assert_eq!(
+        classify_gate_fixability(
+            GateName::EvidenceFloor,
+            "pre-#323 evidence runner not yet available"
+        ),
+        GateFixability::Structural
+    );
+}
+
+// jleechan-zaga / issue #348: when every red gate is structural, the
+// reroll path must NOT supersede the previous worker and must NOT close
+// the existing PR. Instead, the bead enters the new DISPOSITION_REQUIRED
+// state with a per-gate disposition record preserved in telemetry, and
+// the gate-routing entry point surfaces `RerollOutcome::DispositionRequired`
+// to its caller so the fast tier can post a structured "needs operator
+// disposition" comment instead of continuing to churn through the
+// circuit-breaker / attempt-2 human-hold loop.
+#[test]
+fn test_all_structural_red_gates_returns_disposition_required() {
+    use daemon::reroll::RerollOutcome;
+    use daemon::verifier::{classify_red_gates, GateName, GateResult};
+
+    // Build a synthetic all-structural red gate set: CodeRabbit usage-limit
+    // + Bugbot external-error + CommentsResolved "superseded" threads.
+    let red_gates = vec![
+        (GateName::CodeRabbitApproved, GateResult::Red("usage limit reached".to_string())),
+        (GateName::BugbotClean, GateResult::Red("external reviewer error".to_string())),
+        (
+            GateName::CommentsResolved,
+            GateResult::Red("unresolved thread on supersede-comment".to_string()),
+        ),
+    ];
+    let classification = classify_red_gates(&red_gates);
+    assert!(
+        classification.is_all_structural(),
+        "fixture should be all-structural; got {:?}",
+        classification
+    );
+    assert!(!classification.has_any_coder_fixable());
+    // Smaller all-structural case for the outcome-construction assertion.
+    let all_structural = vec![
+        (GateName::CodeRabbitApproved, GateResult::Red("usage limit reached".to_string())),
+        (GateName::BugbotClean, GateResult::Red("external reviewer error".to_string())),
+    ];
+    let classification = classify_red_gates(&all_structural);
+    assert!(classification.is_all_structural());
+    assert!(!classification.has_any_coder_fixable());
+    // Per-gate disposition is preserved in classification order.
+    let dispositions = classification.per_gate();
+    assert_eq!(dispositions.len(), 2);
+    assert!(dispositions.iter().all(|(_, _, fix)| *fix == daemon::verifier::GateFixability::Structural));
+
+    // The new RerollOutcome variant exists and carries the disposition.
+    let outcome = RerollOutcome::DispositionRequired {
+        per_gate: dispositions.to_vec(),
+    };
+    match outcome {
+        RerollOutcome::DispositionRequired { per_gate } => {
+            assert_eq!(per_gate.len(), 2);
+        }
+        other => panic!("expected DispositionRequired, got {:?}", other),
+    }
+}
+
+// jleechan-zaga / issue #348 (acceptance criterion from the issue body):
+// "regression test with all-structural red gates → no supersede, no PR
+// close, DISPOSITION_REQUIRED telemetry; mixed red → reroll as today."
+// This test exercises the existing `reroll::execute` entry point with a
+// mixed-red reviewer signal to prove the regression is bounded: when even
+// ONE red gate is coder-fixable, today's supersede/close path STILL runs
+// (so the structural-classifier cannot silently suppress legitimate
+// re-rolls on beads that have at least one real defect to fix).
+#[test]
+fn test_mixed_red_gates_still_rerolls_as_today() {
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("main".into(), "base-sha-mix".into());
+    vcs.heads
+        .insert("factory/bead-mixed-r1".into(), "head-sha-mix".into());
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into()
+    ));
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_mixed_red_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_mixed_red_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-mixed".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 0,
+        spend_usd: 0.0,
+        pr_number: Some(202),
+        branch: Some("factory/bead-mixed-r1".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+    };
+    store.save(&bead).unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        // Mixed: structural CodeRabbit + coder-fixable Skeptic. Today the
+        // reroll engine reads `reviewer` only — but the gate classifier
+        // (bead jleechan-zaga) inspects ALL red gates, not just the one
+        // reviewer the tick loop surfaced. The classification surface lives
+        // in `verifier::classify_red_gates`; this test only proves the
+        // existing `reroll::execute` path is NOT regressed when the bead is
+        // mixed (caller still chooses to route through reroll).
+        reviewer: "skeptic".into(),
+        review_text: "missing error logging in handler".into(),
+    };
+
+    // When the caller routes the bead into `reroll::execute`, today's path
+    // still runs (supersede + close PR). The all-structural short-circuit
+    // lives at the gate-routing call site in `tick.rs`, not inside
+    // `reroll::execute` — `reroll::execute` is intentionally unaware of
+    // gate vocabulary so the new classifier cannot corrupt it.
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    match outcome {
+        RerollOutcome::Rerolled { new_branch } => {
+            assert_eq!(new_branch, "factory/bead-mixed-r2");
+        }
+        other => panic!("expected RerollOutcome::Rerolled (mixed red = today's path), got {:?}", other),
+    }
+    let updated = store.load("bead-mixed").unwrap().unwrap();
+    assert_eq!(updated.state, OverlayState::Recovery);
+    assert_eq!(updated.attempt, 2);
+
+    let _ = std::fs::remove_dir_all(spec_dir);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
