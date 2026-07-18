@@ -1,5 +1,5 @@
 use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
-use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
+use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -1123,39 +1123,17 @@ impl Scm for CliScm {
 
     /// jleechan-drive-pr-branch-binding-pcpr: single REST lookup
     /// (`repos/{repo}/pulls/{pr}`) used at dispatch time to decide whether
-    /// a bead's `external_ref` names a live open PR that dispatch must bind
-    /// to instead of fabricating `factory/<bead>-r<attempt>`. Every failure
-    /// mode here — tool error, unparseable body, closed/merged state, or a
-    /// `pr` number that isn't a pull request at all (the REST `pulls`
-    /// endpoint 404s for a plain issue number) — resolves to `Ok(None)`,
-    /// the fail-safe documented on the trait method: dispatch must never
-    /// guess a branch it could not positively confirm is an open PR's own
-    /// head.
-    fn open_pr_head_ref_for_repo(&self, repo: &str, pr: u64) -> Result<Option<String>, DaemonError> {
+    /// a bead's `external_ref` names a live, SAME-REPO open PR that
+    /// dispatch must bind to instead of fabricating
+    /// `factory/<bead>-r<attempt>`. Parsing is delegated to
+    /// `parse_open_pr_head_ref` (a pure, unit-testable seam) so the fork
+    /// guard can be exercised directly without a `gh` subprocess.
+    fn open_pr_head_ref_for_repo(&self, repo: &str, pr: u64) -> Result<PrHeadBranch, DaemonError> {
         let out = match run_tool("gh", &["api", &format!("repos/{repo}/pulls/{pr}")], 15) {
             Ok(out) => out,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(PrHeadBranch::NotFound),
         };
-        #[derive(serde::Deserialize)]
-        struct RestPullView {
-            state: String,
-            head: RestPullViewHead,
-        }
-        #[derive(serde::Deserialize)]
-        struct RestPullViewHead {
-            #[serde(rename = "ref")]
-            ref_name: String,
-        }
-        let json_start = out.find('{').unwrap_or(0);
-        let parsed: RestPullView = match serde_json::from_str(&out[json_start..]) {
-            Ok(p) => p,
-            Err(_) => return Ok(None),
-        };
-        if parsed.state.eq_ignore_ascii_case("open") {
-            Ok(Some(parsed.head.ref_name))
-        } else {
-            Ok(None)
-        }
+        Ok(parse_open_pr_head_ref(&out, repo))
     }
 
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
@@ -1260,6 +1238,112 @@ impl Scm for CliScm {
         branch: &str,
     ) -> Result<Option<u64>, DaemonError> {
         self.with_repo(repo).remote_branch_last_commit(branch)
+    }
+}
+
+/// Pure parser behind [`Scm::open_pr_head_ref_for_repo`] (unit-testable
+/// seam — no `gh` subprocess needed to exercise the fork guard).
+///
+/// Fork guard (codex cross-model review of PR #305): binding to a FORK PR's
+/// head branch name and then pushing to the queried repo creates an
+/// unrelated same-named branch there and never touches the actual PR —
+/// silent wrong behavior. A fork head (`head.repo.full_name != repo`), or a
+/// missing/deleted head repo (`head.repo: null` — GitHub omits it once the
+/// fork has been deleted), therefore resolves to `PrHeadBranch::Fork`, not
+/// `SameRepo`, mirroring the intake-side cross-repository guard
+/// (`intake::same_repo_pr`).
+pub(crate) fn parse_open_pr_head_ref(out: &str, repo: &str) -> PrHeadBranch {
+    #[derive(serde::Deserialize)]
+    struct RestPullView {
+        state: String,
+        head: RestPullViewHead,
+    }
+    #[derive(serde::Deserialize)]
+    struct RestPullViewHead {
+        #[serde(rename = "ref")]
+        ref_name: String,
+        repo: Option<RestPullViewHeadRepo>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RestPullViewHeadRepo {
+        full_name: Option<String>,
+    }
+    let json_start = out.find('{').unwrap_or(0);
+    let parsed: RestPullView = match serde_json::from_str(&out[json_start..]) {
+        Ok(p) => p,
+        Err(_) => return PrHeadBranch::NotFound,
+    };
+    if !parsed.state.eq_ignore_ascii_case("open") {
+        return PrHeadBranch::NotFound;
+    }
+    let same_repo = parsed
+        .head
+        .repo
+        .as_ref()
+        .and_then(|r| r.full_name.as_deref())
+        .map(|full| full.eq_ignore_ascii_case(repo))
+        .unwrap_or(false);
+    if same_repo {
+        PrHeadBranch::SameRepo(parsed.head.ref_name)
+    } else {
+        PrHeadBranch::Fork
+    }
+}
+
+#[cfg(test)]
+mod open_pr_head_ref_tests {
+    // Codex cross-model review of PR #305: direct unit coverage of the pure
+    // REST-parsing seam, using real GitHub REST PR-view JSON shapes — the
+    // fake-Scm-level tests in dispatch.rs/tick_integration.rs prove the
+    // CONTRACT (fork PR -> ForkFallback -> generated branch); these prove
+    // the actual `gh api repos/{repo}/pulls/{pr}` JSON parsing that feeds it.
+    use super::parse_open_pr_head_ref;
+    use crate::tools::PrHeadBranch;
+
+    #[test]
+    fn open_same_repo_pr_resolves_same_repo_with_head_ref() {
+        let json = r#"{"state":"open","head":{"ref":"factory/jleechan-xa99-r1","repo":{"full_name":"owner/repo"}}}"#;
+        assert_eq!(
+            parse_open_pr_head_ref(json, "owner/repo"),
+            PrHeadBranch::SameRepo("factory/jleechan-xa99-r1".to_string())
+        );
+    }
+
+    #[test]
+    fn open_fork_pr_resolves_fork_not_same_repo_head_ref() {
+        // The fork's OWN branch happens to be named identically to what a
+        // generated branch would look like — proving the guard checks
+        // `head.repo.full_name`, not just PR openness or the ref string.
+        let json = r#"{"state":"open","head":{"ref":"factory/jleechan-xa99-r1","repo":{"full_name":"someone-else/repo"}}}"#;
+        assert_eq!(parse_open_pr_head_ref(json, "owner/repo"), PrHeadBranch::Fork);
+    }
+
+    #[test]
+    fn open_pr_with_case_different_same_repo_name_still_matches() {
+        let json = r#"{"state":"OPEN","head":{"ref":"factory/x","repo":{"full_name":"Owner/Repo"}}}"#;
+        assert_eq!(
+            parse_open_pr_head_ref(json, "owner/repo"),
+            PrHeadBranch::SameRepo("factory/x".to_string())
+        );
+    }
+
+    #[test]
+    fn open_pr_with_deleted_fork_head_repo_resolves_fork_not_same_repo() {
+        // GitHub omits `head.repo` entirely once the source fork has been
+        // deleted — must NOT default to "assume same repo".
+        let json = r#"{"state":"open","head":{"ref":"factory/x","repo":null}}"#;
+        assert_eq!(parse_open_pr_head_ref(json, "owner/repo"), PrHeadBranch::Fork);
+    }
+
+    #[test]
+    fn closed_same_repo_pr_resolves_not_found() {
+        let json = r#"{"state":"closed","head":{"ref":"factory/x","repo":{"full_name":"owner/repo"}}}"#;
+        assert_eq!(parse_open_pr_head_ref(json, "owner/repo"), PrHeadBranch::NotFound);
+    }
+
+    #[test]
+    fn malformed_json_resolves_not_found() {
+        assert_eq!(parse_open_pr_head_ref("not json", "owner/repo"), PrHeadBranch::NotFound);
     }
 }
 

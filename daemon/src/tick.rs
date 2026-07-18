@@ -27,7 +27,7 @@ use crate::state::{
     set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
 };
 use crate::telemetry::{self, TelemetryEvent};
-use crate::tools::{Bead, Llm, Scm, SessionId, Sessions, Tracker, Vcs};
+use crate::tools::{Bead, Llm, PrHeadBranch, Scm, SessionId, Sessions, Tracker, Vcs};
 use crate::verifier::{self, PrEvidence};
 use std::collections::HashSet;
 use std::path::Path;
@@ -1092,7 +1092,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         }
     }
 
-    let mut ready: Vec<(Bead, RoutingVerdict, Option<String>)> = Vec::new();
+    let mut ready: Vec<(Bead, RoutingVerdict, dispatch::DriveBranchDecision)> = Vec::new();
     for bead in &routing_candidates {
         let overlay = match deps.store.load(&bead.id)? {
             Some(o) => {
@@ -1172,9 +1172,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // live 2026-07-17 incident this closes happened on a
                 // redispatch, not just the first attempt.
                 let resolved_repo = overlay.repo(deps.cfg).to_string();
-                let pr_head_branch =
+                let drive_branch =
                     resolve_drive_pr_head_branch(deps.scm, deps.cfg, bead, &resolved_repo);
-                ready.push((bead.clone(), verdict, pr_head_branch));
+                ready.push((bead.clone(), verdict, drive_branch));
             }
             Err(DaemonError::Parse(reason)) => {
                 // ZFC: an unparseable routing verdict is never guessed at —
@@ -2758,28 +2758,47 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
 ///   stray/contradictory `target_repo:` body field) must never bind to
 ///   that other repo's PR,
 /// * `owner/repo` is a configured repo (`cfg.resolve_repo`), and
-/// * `Scm::open_pr_head_ref_for_repo` positively confirms PR `N` is OPEN.
+/// * `Scm::open_pr_head_ref_for_repo` positively confirms PR `N` is OPEN
+///   AND same-repo (`PrHeadBranch::SameRepo`) -> `DriveBranchDecision::PrHead`.
+///
+/// An OPEN PR whose head lives on a fork (`PrHeadBranch::Fork`) resolves to
+/// `DriveBranchDecision::ForkFallback` — the fail-closed guard mirroring
+/// `intake::same_repo_pr`; dispatch still falls back to the generated
+/// branch, but telemetry records WHY (`branch_mode:
+/// "generated_fork_fallback"`) instead of conflating it with "no drive-PR
+/// signal at all".
 ///
 /// Every other case — closed/merged/missing PR, malformed `external_ref`,
 /// unconfigured repo, repo mismatch, or a transient lookup failure — is
-/// `None` (fail-safe: dispatch falls back to the generated-branch path
-/// exactly as before this bead).
+/// `DriveBranchDecision::Generated` (fail-safe: dispatch falls back to the
+/// generated-branch path exactly as before this bead).
 fn resolve_drive_pr_head_branch(
     scm: &dyn Scm,
     cfg: &Config,
     bead: &Bead,
     resolved_repo: &str,
-) -> Option<String> {
-    let ext_ref = bead.external_ref.as_deref()?;
-    let (owner_repo, num_str) = parse_external_ref(ext_ref)?;
+) -> dispatch::DriveBranchDecision {
+    use dispatch::DriveBranchDecision;
+    let Some(ext_ref) = bead.external_ref.as_deref() else {
+        return DriveBranchDecision::Generated;
+    };
+    let Some((owner_repo, num_str)) = parse_external_ref(ext_ref) else {
+        return DriveBranchDecision::Generated;
+    };
     if owner_repo != resolved_repo {
-        return None;
+        return DriveBranchDecision::Generated;
     }
-    cfg.resolve_repo(&owner_repo)?;
-    let pr_num = num_str.parse::<u64>().ok()?;
-    scm.open_pr_head_ref_for_repo(&owner_repo, pr_num)
-        .ok()
-        .flatten()
+    if cfg.resolve_repo(&owner_repo).is_none() {
+        return DriveBranchDecision::Generated;
+    }
+    let Ok(pr_num) = num_str.parse::<u64>() else {
+        return DriveBranchDecision::Generated;
+    };
+    match scm.open_pr_head_ref_for_repo(&owner_repo, pr_num) {
+        Ok(PrHeadBranch::SameRepo(head_ref)) => DriveBranchDecision::PrHead(head_ref),
+        Ok(PrHeadBranch::Fork) => DriveBranchDecision::ForkFallback,
+        Ok(PrHeadBranch::NotFound) | Err(_) => DriveBranchDecision::Generated,
+    }
 }
 
 fn post_scm_comment_by_bead_id(
