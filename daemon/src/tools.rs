@@ -678,6 +678,57 @@ pub trait Sessions {
 pub trait Vcs {
     fn base_head(&self, base_branch: &str) -> Result<String, DaemonError>;
     fn create_branch_at(&self, name: &str, sha: &str) -> Result<(), DaemonError>;
+    /// Repo-scoped variant of [`base_head`](Vcs::base_head) (bead
+    /// jleechan-wuts / issue #349, r2). The factory-fabricated re-roll
+    /// path (`reroll::execute` step 4) used to compute the new attempt's
+    /// base SHA via `base_head(base_branch)` — which is bound at
+    /// `main.rs` construction time to the daemon process's CWD (its
+    /// systemd `WorkingDirectory`, the daemon's own source-repo
+    /// checkout). When a bead's resolved `overlay.repo(cfg)` names a
+    /// DIFFERENT repo (Stage A intake — the live failure for the
+    /// 8jxr / 9rkz class), `git rev-parse <branch>` runs against the
+    /// daemon's own repo's same-named branch (or fails outright), never
+    /// against the routed target repo — silently wrong for any
+    /// cross-repo bead. `repo` should always be `overlay.repo(cfg)`, not
+    /// `cfg.target_repo` directly. Default impl ignores `repo` and
+    /// delegates to `base_head` so existing test fakes and any impl that
+    /// predates this method keep their original (single-repo) behavior;
+    /// `CliVcs` overrides it to retarget via `gh api
+    /// repos/<repo>/git/ref/heads/<branch>` (the same `gh api` plumbing
+    /// `remote_head_sha` already uses).
+    fn base_head_for_repo(&self, repo: &str, base_branch: &str) -> Result<String, DaemonError> {
+        let _ = repo;
+        self.base_head(base_branch)
+    }
+    /// Repo-scoped variant of [`create_branch_at`](Vcs::create_branch_at)
+    /// (bead jleechan-wuts / issue #349, r2). The factory-fabricated
+    /// re-roll path (`reroll::execute` step 5) used to create the new
+    /// attempt's branch via `create_branch_at(name, sha)` — which
+    /// shells out to LOCAL `git branch <name> <sha>` in the daemon
+    /// process's CWD (the daemon's own source-repo checkout). When a
+    /// bead's resolved `overlay.repo(cfg)` names a DIFFERENT repo (the
+    /// live failure for the 8jxr / 9rkz class), the new
+    /// `factory/<bead>-r<n>` branch is created in the daemon's own
+    /// repo, never in the routed target repo where the worker will
+    /// actually push — meaning the worker's first `git push` either
+    /// lands on a branch the daemon never made, or is forced to create
+    /// its own branch out-of-band, depending on the branch-protection
+    /// rules. `repo` should always be `overlay.repo(cfg)`, not
+    /// `cfg.target_repo` directly. Default impl ignores `repo` and
+    /// delegates to `create_branch_at` so existing test fakes and any
+    /// impl that predates this method keep their original (single-repo)
+    /// behavior; `CliVcs` overrides it to POST a `refs/heads/<name>`
+    /// ref via `gh api repos/<repo>/git/refs` (cross-repo ref creation
+    /// that does NOT depend on the daemon's local checkout at all).
+    fn create_branch_at_for_repo(
+        &self,
+        repo: &str,
+        name: &str,
+        sha: &str,
+    ) -> Result<(), DaemonError> {
+        let _ = repo;
+        self.create_branch_at(name, sha)
+    }
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError>;
     /// Budget-bounded [`head_sha`](Vcs::head_sha) (bead jleechan-zeij / issue
     /// #322 r4 P2). Default delegates to the unbounded method; the real

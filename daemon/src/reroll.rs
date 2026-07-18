@@ -395,8 +395,24 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         )?;
     }
 
-    // 4. Compute baseline
-    let base_sha = deps.vcs.base_head(&deps.cfg.base_branch)?;
+    // 4. Compute baseline. jleechan-wuts / issue #349 (r2): was
+    // `deps.vcs.base_head(&deps.cfg.base_branch)` — which is CWD-bound
+    // (the `git rev-parse` shellout runs in the daemon's own cwd, its
+    // systemd `WorkingDirectory`, the daemon's own source-repo
+    // checkout). When the bead's resolved `overlay.repo(cfg)` names a
+    // DIFFERENT repo from `cfg.target_repo`, that lookup computes the
+    // baseline against the daemon's own repo's same-named branch
+    // instead of the routed target repo's branch — the git-side
+    // sibling of the PR #342 v6ud gh-side bug. The `*_for_repo`
+    // variant goes through `gh api` against the bead's resolved repo,
+    // identical to the rest of the routed-reroll plumbing already in
+    // place (cf. `close_pr_for_repo` at step 7). `bead_repo` is
+    // computed once here and reused at step 7 so both ops target the
+    // same routed repo for the same bead on the same tick.
+    let bead_repo = bead.repo(deps.cfg).to_string();
+    let base_sha = deps
+        .vcs
+        .base_head_for_repo(&bead_repo, &deps.cfg.base_branch)?;
     emit_telemetry(
         deps.telemetry_log,
         &bead.bead_id,
@@ -412,7 +428,16 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     bead.attempt += 1;
     bead.reroll_count += 1;
     let new_branch = format!("factory/{}-r{}", bead.bead_id, bead.attempt);
-    deps.vcs.create_branch_at(&new_branch, &base_sha)?;
+    // jleechan-wuts / issue #349 (r2): was `deps.vcs.create_branch_at(...)`
+    // — CWD-bound (the `git branch <name> <sha>` shellout runs in the
+    // daemon's own cwd). For a cross-repo bead that would create the
+    // new attempt's branch in the daemon's own source-repo checkout,
+    // never in the routed target repo where the worker will actually
+    // push. `create_branch_at_for_repo` POSTs a `refs/heads/<name>`
+    // ref via `gh api repos/<repo>/git/refs` — cross-repo ref creation
+    // that does NOT depend on the daemon's local checkout.
+    deps.vcs
+        .create_branch_at_for_repo(&bead_repo, &new_branch, &base_sha)?;
 
     emit_telemetry(
         deps.telemetry_log,
@@ -440,6 +465,13 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         // `gh` errors with "can't be closed because it was already merged" and
         // wedges the bead on a transient tool error. `close_pr_for_repo` retargets
         // the close at the bead's OWN resolved repo.
+        //
+        // jleechan-wuts / issue #349 (r2): `bead_repo` is computed once
+        // at step 4 and reused here so both the git-side baseline /
+        // branch-creation ops (steps 4 & 5) and the gh-side PR close
+        // (this step) target the SAME routed repo for the same bead
+        // on the same tick. Re-computing it here is fine, but the
+        // explicit shared binding makes the invariant visible.
         let bead_repo = bead.repo(deps.cfg).to_string();
         deps.scm.close_pr_for_repo(&bead_repo, pr_number, &comment)?;
         bead.pr_number = None;
