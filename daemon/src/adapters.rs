@@ -1175,7 +1175,34 @@ impl Scm for CliScm {
     /// repo's PR. Fresh `with_repo` instance (not a cache-sharing clone)
     /// so a cross-repo call can never evict another repo's cached
     /// `pr_snapshot_cache` entry under a colliding PR-number key.
+    ///
+    /// r2 hardening (skeptic P2 from PR #342): the cache eviction MUST
+    /// happen on the GLOBAL `self` instance, not on the fresh
+    /// `with_repo(repo)` instance, because the daemon-global
+    /// `pr_snapshot_cache[pr]` is what subsequent verifier ticks consult
+    /// when they re-snapshot the bead's PR after the reroll closed it.
+    /// If we only evicted the fresh instance's cache, the global cache
+    /// would retain a stale `PrSnapshot` (with `state: OPEN`, the old
+    /// head SHA, etc.) for up to 60s (the cache TTL) — and the verifier
+    /// would park the bead on a gate that is actually green, because
+    /// the cached snapshot still describes the pre-close state. Doing
+    /// the eviction on `self` BEFORE delegating to the fresh
+    /// `with_repo(repo)` instance is the only correct ordering: any
+    /// later `pr_snapshot(pr)` call on the global instance must re-read
+    /// from `gh` (or offline) and observe the post-close state.
     fn close_pr_for_repo(&self, repo: &str, pr: u64, comment: &str) -> Result<(), DaemonError> {
+        // Evict the GLOBAL cache on `self` before delegating to the fresh
+        // `with_repo(repo)` instance. The fresh instance is empty-cache
+        // (per the with_repo contract); the actual close work happens
+        // there. The eviction here guarantees that the next
+        // `pr_snapshot(pr)` call on the global instance cannot return a
+        // stale cached snapshot.
+        {
+            let mut pr_cache = self.pr_snapshot_cache.lock().unwrap();
+            pr_cache.remove(&pr);
+            let mut issues_cache = self.labeled_issues_cache.lock().unwrap();
+            issues_cache.clear();
+        }
         self.with_repo(repo).close_pr(pr, comment)
     }
 

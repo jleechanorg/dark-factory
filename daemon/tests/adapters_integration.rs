@@ -361,6 +361,249 @@ fn test_cli_scm_offline_fallback() {
     let _ = std::fs::remove_file(pr_file);
 }
 
+/// jleechan-v6ud / issue #340 / r2 hardening (skeptic P2 from PR #342):
+/// `close_pr_for_repo` MUST evict the cache on the GLOBAL `CliScm`, not just
+/// on the fresh `with_repo(repo)` instance it delegates to. Without this,
+/// the daemon-global `pr_snapshot_cache[pr]` retains a stale PrSnapshot for
+/// up to 60s (the cache TTL) after the reroll closes the bead's PR — so
+/// the next verifier tick sees an OPEN/cached snapshot even though the PR
+/// is now CLOSED, and may park the bead on a gate that is actually green.
+///
+/// Failure mode this test pins: build the live 8jxr/9rkz scenario (`self`
+/// = global CliScm bound to `cfg.target_repo = worldarchitect.ai`,
+/// `close_pr_for_repo(bead_repo, pr, ...)` = `dark-factory`); the global
+/// instance's cache must be evicted even though the close ran on a fresh
+/// `with_repo(bead_repo)` instance.
+///
+/// The test uses a `PR_VIEW_SHA` env-controlled fake `gh` shim: the shim
+/// returns one head_sha on the FIRST `gh pr view` call and a DIFFERENT
+/// head_sha on subsequent calls. The test:
+///   1. Snapshots PR (call #1) — fake `gh` returns `pre_close_sha`, cache
+///      populated.
+///   2. Re-snapshots — cache hit returns `pre_close_sha` (no second gh call).
+///   3. Calls `close_pr_for_repo(other_repo, pr, ...)` — the fresh CliScm
+///      runs `gh pr close` (not `gh pr view`); the global cache is the
+///      pre-fix bug.
+///   4. Re-snapshots (call #2) — pre-fix returns cached `pre_close_sha`
+///      (BUG); post-fix cache is empty, fake `gh` runs again returning
+///      `post_close_sha` (FIX).
+///
+/// The fake shim is also written to return a parseable GraphQL response
+/// (empty review threads) and an empty check-runs list, so `pr_snapshot`
+/// completes its full path without rate-limiting noise.
+#[cfg(unix)]
+fn write_close_pr_for_repo_cache_shim(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // Per-test view-call counter stored in a sentinel file so the shim
+    // can flip its response after the first `gh pr view` call. The shim
+    // uses a globally unique sentinel path keyed on nanos+pid to avoid
+    // colliding with any other concurrent test.
+    let sentinel = std::env::temp_dir().join(format!(
+        "afd_v6ud_r2_view_count_{}_{nanos}",
+        std::process::id()
+    ));
+    let sentinel_str = sentinel.to_string_lossy().to_string();
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -u
+SENTINEL="{sentinel_str}"
+view_count=0
+if [ -f "$SENTINEL" ]; then
+  view_count=$(cat "$SENTINEL" 2>/dev/null || echo 0)
+fi
+case "$1 $2" in
+  "pr view")
+    view_count=$((view_count + 1))
+    echo "$view_count" > "$SENTINEL"
+    if [ "$view_count" = "1" ]; then
+      head_sha="pre_close_sha_aaaa"
+    else
+      head_sha="post_close_sha_bbbb"
+    fi
+    cat <<JSON
+{{"mergeable":"MERGEABLE","reviews":[],"headRefOid":"$head_sha","body":"shim body for $head_sha","comments":[],"files":[],"updatedAt":"2026-07-18T00:00:00Z"}}
+JSON
+    exit 0
+    ;;
+  "pr checks")
+    echo '[]'
+    exit 0
+    ;;
+  "pr close")
+    # Always succeed — the close is the r1 fix's mainline behavior.
+    exit 0
+    ;;
+esac
+case "$1" in
+  api)
+    url=""
+    for arg in "$@"; do
+      case "$arg" in
+        api) continue ;;
+        -*) continue ;;
+        *) url="$arg"; break ;;
+      esac
+    done
+    case "$url" in
+      *check-runs*) echo '{{"check_runs": []}}'; exit 0 ;;
+      *statuses*) echo '[]'; exit 0 ;;
+      graphql) echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'; exit 0 ;;
+      *) echo "{{}}"; exit 0 ;;
+    esac
+    ;;
+esac
+echo "v6ud_r2 shim: unhandled: $*" >&2
+exit 1
+"#
+    );
+    std::fs::write(path, script).expect("write fake gh shim");
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
+#[cfg(unix)]
+fn install_close_pr_for_repo_cache_shim() -> (std::path::PathBuf, std::ffi::OsString) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "afd_v6ud_r2_shim_{}_{nanos}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write_close_pr_for_repo_cache_shim(&dir.join("bin").join("gh"));
+    let prior_path = std::env::var_os("PATH");
+    let mut new_path = std::ffi::OsString::from(dir.join("bin").to_str().unwrap());
+    if let Some(prior) = prior_path.as_ref() {
+        new_path.push(":");
+        new_path.push(prior);
+    }
+    // SAFETY: serialized by ENV_LOCK below.
+    unsafe {
+        std::env::set_var("PATH", &new_path);
+    }
+    (dir, prior_path.unwrap_or_default())
+}
+
+#[cfg(unix)]
+fn restore_path(prior: std::ffi::OsString, dir: &std::path::Path) {
+    if prior.is_empty() {
+        unsafe {
+            std::env::remove_var("PATH");
+        }
+    } else {
+        unsafe {
+            std::env::set_var("PATH", &prior);
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_close_pr_for_repo_evicts_global_pr_snapshot_cache() {
+    use daemon::errors::DaemonError;
+    let _guard = FAKE_GH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let (shim_dir, prior_path) = install_close_pr_for_repo_cache_shim();
+
+    // Daemon-global instance: worldarchitect.ai (the live 8jxr/9rkz
+    // default repo). Bead's resolved repo: dark-factory.
+    let scm = CliScm::new("jleechanorg/worldarchitect.ai".to_string());
+
+    // First pr_snapshot — fake gh returns head_sha = pre_close_sha_aaaa.
+    // The cache is populated with this value.
+    let pre = scm
+        .pr_snapshot(314)
+        .expect("first pr_snapshot should succeed against fake gh shim");
+    assert_eq!(pre.head_sha, "pre_close_sha_aaaa");
+
+    // Second pr_snapshot — must hit the cache (TTL is 60s) and NOT
+    // re-call gh. This proves the cache is populated.
+    let pre_again = scm
+        .pr_snapshot(314)
+        .expect("second pr_snapshot should be a cache hit");
+    assert_eq!(pre_again.head_sha, "pre_close_sha_aaaa");
+
+    // The reroll's PR-close. Bead's resolved repo is dark-factory;
+    // daemon-global is worldarchitect.ai. r1 fix: close retargets at
+    // the bead's repo via with_repo.
+    scm.close_pr_for_repo("jleechanorg/dark-factory", 314, "superseded")
+        .expect("close_pr_for_repo against bead repo must succeed");
+
+    // Third pr_snapshot. Pre-fix (bug): the GLOBAL cache is still
+    // populated with pre_close_sha_aaaa, so this returns the stale
+    // cached value (the verifier sees an OPEN PR for up to 60s after
+    // the reroll closed it). Post-fix: the GLOBAL cache is evicted,
+    // so this re-calls fake gh, which (view_count now 2) returns
+    // post_close_sha_bbbb.
+    let post = scm
+        .pr_snapshot(314)
+        .expect("third pr_snapshot should succeed (cache miss → fake gh)");
+    assert_eq!(
+        post.head_sha, "post_close_sha_bbbb",
+        "global CliScm.pr_snapshot_cache[314] was not evicted by \
+         close_pr_for_repo — verifier will see the stale pre-close \
+         snapshot (head_sha={:?}) for up to 60s after the reroll \
+         closes the bead's PR, mirroring the jleechan-8jxr / \
+         jleechan-9rkz cache-staleness class",
+        post.head_sha
+    );
+
+    restore_path(prior_path, &shim_dir);
+    // Suppress unused warning for the DaemonError import — the type
+    // is referenced by the (intentionally-omitted) error match arms
+    // for completeness, but in the success path we only need its name
+    // to be importable.
+    let _ = std::marker::PhantomData::<DaemonError>;
+}
+
+/// Same scenario as `test_close_pr_for_repo_evicts_global_pr_snapshot_cache`
+/// but with the SAME repo for `self` and `close_pr_for_repo` — confirms
+/// the eviction still happens on the global instance when there's no
+/// `with_repo` re-targeting. This guards against a regression where a
+/// future refactor of `close_pr_for_repo` only evicts the cache in the
+/// `repo != self.repo` branch.
+#[test]
+#[cfg(unix)]
+fn test_close_pr_for_repo_same_repo_still_evicts_global_pr_snapshot_cache() {
+    let _guard = FAKE_GH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let (shim_dir, prior_path) = install_close_pr_for_repo_cache_shim();
+
+    let scm = CliScm::new("jleechanorg/dark-factory".to_string());
+
+    let pre = scm.pr_snapshot(777).expect("first snapshot must succeed");
+    assert_eq!(pre.head_sha, "pre_close_sha_aaaa");
+    let pre_again = scm.pr_snapshot(777).expect("second snapshot must be a cache hit");
+    assert_eq!(pre_again.head_sha, "pre_close_sha_aaaa");
+
+    scm.close_pr_for_repo("jleechanorg/dark-factory", 777, "superseded")
+        .expect("close_pr_for_repo same-repo must succeed");
+
+    let post = scm.pr_snapshot(777).expect("third snapshot must succeed (cache miss → fake gh)");
+    assert_eq!(
+        post.head_sha, "post_close_sha_bbbb",
+        "close_pr_for_repo must evict the global cache even when \
+         repo == self.repo — but verifier still sees the stale \
+         pre-close snapshot (head_sha={:?})",
+        post.head_sha
+    );
+
+    restore_path(prior_path, &shim_dir);
+}
+
 // ============================================================================
 // Tests for jleechan-kk64: GraphQL failure must report Unknown, not Green
 // ============================================================================
