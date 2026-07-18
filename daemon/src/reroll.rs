@@ -431,7 +431,17 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     // 7. Old PR closure
     if let Some(pr_number) = bead.pr_number {
         let comment = format!("Superseded by new attempt branch {}", new_branch);
-        deps.scm.close_pr(pr_number, &comment)?;
+        // jleechan-v6ud / issue #340: was `deps.scm.close_pr(pr_number, &comment)` —
+        // bound at construction time to `cfg.target_repo`. When a bead's resolved
+        // `overlay.repo(cfg)` names a DIFFERENT repo (Stage A intake), `gh pr close`
+        // would silently target the DEFAULT repo's same-numbered PR — and if that
+        // PR was already merged (live failure for beads 8jxr/9rkz: the same `#315`
+        // and `#314` had ALREADY merged in `jleechanorg/worldarchitect.ai`),
+        // `gh` errors with "can't be closed because it was already merged" and
+        // wedges the bead on a transient tool error. `close_pr_for_repo` retargets
+        // the close at the bead's OWN resolved repo.
+        let bead_repo = bead.repo(deps.cfg).to_string();
+        deps.scm.close_pr_for_repo(&bead_repo, pr_number, &comment)?;
         bead.pr_number = None;
 
         emit_telemetry(
@@ -441,7 +451,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
             bead.state.as_str(),
             "REROLL_PR_CLOSED",
             serde_json::json!({}),
-            serde_json::json!({"prNumber": pr_number, "comment": comment}),
+            serde_json::json!({"prNumber": pr_number, "comment": comment, "repo": bead_repo}),
         )?;
     }
 

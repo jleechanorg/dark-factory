@@ -243,6 +243,19 @@ impl Scm for FakeScm {
         Ok(())
     }
 
+    /// jleechan-v6ud / issue #340 regression coverage: records the
+    /// repo-scoped close with the bead's resolved `target_repo` argument
+    /// distinctly from the plain `close_pr({pr},{comment})` call log
+    /// entry, so the regression test can prove reroll closes the bead's
+    /// OWN PR (in its resolved repo) rather than `cfg.target_repo`'s
+    /// same-numbered PR.
+    fn close_pr_for_repo(&self, repo: &str, pr: u64, comment: &str) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("close_pr_for_repo({repo},{pr},{comment})"));
+        Ok(())
+    }
+
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError> {
         self.calls
             .borrow_mut()

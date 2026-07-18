@@ -1214,6 +1214,22 @@ impl Scm for CliScm {
         Ok(())
     }
 
+    /// jleechan-v6ud / issue #340: retarget `gh pr close` at `repo` via
+    /// `with_repo` instead of always closing against `self.repo` (the
+    /// daemon's global `cfg.target_repo`, bound at construction time in
+    /// `main.rs`). Without this override, a same-numbered PR that already
+    /// merged in the default repo (beads 8jxr and 9rkz: the same `#315`
+    /// and `#314` had ALREADY merged in `jleechanorg/worldarchitect.ai` at
+    /// the moment the reroll closed them) makes `gh pr close` error with
+    /// "can't be closed because it was already merged", wedging the bead
+    /// on a transient tool error instead of mutating the bead's actual
+    /// repo's PR. Fresh `with_repo` instance (not a cache-sharing clone)
+    /// so a cross-repo call can never evict another repo's cached
+    /// `pr_snapshot_cache` entry under a colliding PR-number key.
+    fn close_pr_for_repo(&self, repo: &str, pr: u64, comment: &str) -> Result<(), DaemonError> {
+        self.with_repo(repo).close_pr(pr, comment)
+    }
+
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError> {
         let offline_path = std::path::Path::new(".beads/offline").join(format!("branch_{}.json", branch));
         if offline_path.exists() {
