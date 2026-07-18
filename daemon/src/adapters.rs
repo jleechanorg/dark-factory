@@ -3254,15 +3254,21 @@ impl Sessions for CliSessions {
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
         })?;
-        if let Some(arr) = data.as_array() {
-            for entry in arr {
-                if entry.get("name").and_then(|v| v.as_str()) == Some(&id.0) {
-                    if let Some(activity) = entry.get("activity").and_then(|v| v.as_str()) {
-                        return Ok(activity == "exited" || activity == "missing");
-                    }
-                }
+        let arr = data.as_array().ok_or_else(|| {
+            DaemonError::Parse("ao status response is not a JSON array".to_string())
+        })?;
+        for entry in arr {
+            if entry.get("name").and_then(|v| v.as_str()) == Some(&id.0) {
+                let activity = entry.get("activity").and_then(|v| v.as_str()).ok_or_else(|| {
+                    DaemonError::Parse(format!(
+                        "ao status entry for {} is missing string activity",
+                        id.0
+                    ))
+                })?;
+                return Ok(activity == "exited" || activity == "missing");
             }
         }
+        // No matching entry: cannot prove alive, fail closed (skip recovery)
         Ok(true)
     }
 

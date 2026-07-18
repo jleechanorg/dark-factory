@@ -267,6 +267,11 @@ pub struct FakeSessions {
     pub active_count: usize,
     pub next_session_id: String,
     pub quiescent: bool,
+    /// jleechan-xsg4 (CodeRabbit nitpick): independent dead/liveness
+    /// scripting so tests can model a ready or quiescent session that is
+    /// still alive (or vice versa). When unset, falls back to `quiescent`
+    /// to preserve pre-existing behavior.
+    pub dead: bool,
     pub fail_spawn_for: RefCell<Vec<String>>,
     pub panic_after_spawn_for: RefCell<Vec<String>>,
     pub fail_spawn_cleanup_for: RefCell<Vec<String>>,
@@ -315,6 +320,7 @@ impl Default for FakeSessions {
             active_count: 0,
             next_session_id: "fake-session-1".into(),
             quiescent: false,
+            dead: false,
             fail_spawn_for: RefCell::new(Vec::new()),
             panic_after_spawn_for: RefCell::new(Vec::new()),
             fail_spawn_cleanup_for: RefCell::new(Vec::new()),
@@ -504,7 +510,7 @@ impl Sessions for FakeSessions {
         if let Some(at) = *self.terminal_at.borrow() {
             return Ok(std::time::Instant::now() >= at);
         }
-        Ok(self.quiescent)
+        Ok(self.dead)
     }
 
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
@@ -1023,10 +1029,13 @@ impl StateStore for FakeStateStore {
     fn requeue_stale_dispatched(
         &self,
         bead_id: &str,
+        observed_session_id: Option<&str>,
     ) -> Result<BeadOverlay, DaemonError> {
         self.calls
             .borrow_mut()
-            .push(format!("requeue_stale_dispatched({bead_id})"));
+            .push(format!(
+                "requeue_stale_dispatched({bead_id}, observed={observed_session_id:?})"
+            ));
         let mut overlays = self.overlays.borrow_mut();
         let overlay = overlays
             .get_mut(bead_id)
@@ -1041,6 +1050,16 @@ impl StateStore for FakeStateStore {
                 rc: -1,
                 stderr: format!("requeue_stale_dispatched: bead {bead_id} not in DISPATCHED state"),
             });
+        }
+        // Null-safe session_id match: if the caller observed a non-empty
+        // session_id during the liveness probe, the live row must still
+        // match; if the caller observed NULL/blank, the live row must
+        // also be NULL/blank. Mismatch is contention: return row
+        // untouched.
+        let observed_trimmed = observed_session_id.map(str::trim).filter(|s| !s.is_empty());
+        let live_trimmed = overlay.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        if observed_trimmed != live_trimmed {
+            return Ok(overlay.clone());
         }
         overlay.state = OverlayState::Queued;
         overlay.session_id = None;

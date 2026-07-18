@@ -333,6 +333,47 @@ pub enum BeadStatus {
     Closed,
 }
 
+/// Pure syntax transform (no judgment call, ZFC-exempt), bead
+/// jleechan-coder-silent-false-parks-h92r: Claude Code CLI names each
+/// session's transcript directory under `~/.claude/projects/` after the
+/// absolute cwd it was launched in, with every `/` and `.` replaced by `-`
+/// (observed convention, e.g. `/home/jleechan/.worktrees/dark-factory/df-100`
+/// -> `-home-jleechan--worktrees-dark-factory-df-100`). This lets the
+/// coder-silence watcher locate a dispatched coder's own transcript
+/// directory from the absolute worktree path AO already reports at spawn
+/// time, without guessing at session identity.
+pub fn claude_project_slug(worktree_path: &std::path::Path) -> String {
+    worktree_path
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+#[cfg(test)]
+mod claude_project_slug_tests {
+    use super::claude_project_slug;
+    use std::path::Path;
+
+    #[test]
+    fn replaces_slashes_and_dots_with_dashes() {
+        let path = Path::new("/home/jleechan/.worktrees/dark-factory/df-100");
+        assert_eq!(
+            claude_project_slug(path),
+            "-home-jleechan--worktrees-dark-factory-df-100"
+        );
+    }
+
+    #[test]
+    fn handles_plain_projects_path_without_leading_dotdir() {
+        let path = Path::new("/home/jleechan/projects/dark-factory");
+        assert_eq!(
+            claude_project_slug(path),
+            "-home-jleechan-projects-dark-factory"
+        );
+    }
+}
+
 /// `br` CLI. `fetch_candidates` == `br list --status open --label factory --json`.
 pub trait Tracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError>;
@@ -426,7 +467,10 @@ pub trait Sessions {
     /// live session).
     fn is_session_dead(&self, id: &SessionId) -> Result<bool, DaemonError> {
         let _ = id;
-        Ok(false)
+        Err(DaemonError::Config(format!(
+            "is_session_dead({}) not implemented for this session adapter",
+            id.0
+        )))
     }
     /// Returns the live branch AO reports for a given session, if known.
     ///

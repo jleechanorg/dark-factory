@@ -660,7 +660,14 @@ fn adopted_spawn_failures_never_leave_an_untracked_or_recoverable_live_worker() 
     for case in ["typed-cleanup", "save-stop-ok", "save-stop-fails"] {
         let bead_id = format!("adopted-{case}");
         let scm = FakeScm::new();
-        let sessions = FakeSessions::new();
+        let mut sessions = FakeSessions::new();
+        // jleechan-xsg4: default `quiescent: false` makes the
+        // adopted-duplicate-spawn guard (execute_adopted attach +
+        // is_quiescent) treat the existing session as actively working
+        // and park the bead `AdoptedSessionAlreadyActive` before the
+        // spawn-under-test can run. Force the test fixture to report
+        // quiescent so the guard falls through to the spawn.
+        sessions.quiescent = true;
         if case == "typed-cleanup" {
             sessions.fail_spawn_cleanup_for(&bead_id);
         } else {
@@ -826,7 +833,11 @@ fn test_reroll_adopted_skips_duplicate_spawn_when_session_already_active() {
 fn adopted_spawn_crash_is_reconciled_without_duplicate_redispatch() {
     let bead_id = "adopted-crash-after-spawn";
     let scm = FakeScm::new();
-    let sessions = FakeSessions::new();
+    let mut sessions = FakeSessions::new();
+    // jleechan-xsg4: see `adopted_spawn_failures_*` — default `quiescent: false`
+    // parks the bead on the adopted-duplicate-spawn guard before the
+    // scripted spawn panic can run.
+    sessions.quiescent = true;
     sessions.panic_after_spawn_for(bead_id);
     let mut vcs = FakeVcs::new();
     vcs.heads.insert(

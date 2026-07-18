@@ -277,11 +277,18 @@ pub trait StateStore {
     /// clearing session_id and branch. Returns the updated overlay for
     /// telemetry. Must only be called after confirming the session is dead
     /// or absent — the caller owns session-liveness verification.
+    ///
+    /// `observed_session_id` is the session id the caller observed during
+    /// the liveness probe. The UPDATE guards on a null-safe equality match
+    /// against the live `session_id` column so a concurrent live dispatch
+    /// (which replaced the session) is not wiped. A zero-row outcome is
+    /// treated as contention: the current row is returned untouched.
     fn requeue_stale_dispatched(
         &self,
         bead_id: &str,
+        observed_session_id: Option<&str>,
     ) -> Result<BeadOverlay, DaemonError> {
-        let _ = bead_id;
+        let _ = (bead_id, observed_session_id);
         Err(DaemonError::Tool {
             tool: "state_store".into(),
             rc: -1,
@@ -818,17 +825,72 @@ impl StateStore for SqliteStateStore {
     fn requeue_stale_dispatched(
         &self,
         bead_id: &str,
+        observed_session_id: Option<&str>,
     ) -> Result<BeadOverlay, DaemonError> {
-        let affected = self
-            .conn
-            .execute(
-                "UPDATE bead_overlay \
-                 SET state = 'QUEUED', session_id = NULL, branch = NULL, \
-                     autonomy_secs = 0, updated_at = ?2 \
-                 WHERE bead_id = ?1 AND state = 'DISPATCHED'",
-                params![bead_id, now_iso8601()],
-            )
-            .map_err(|e| tool_err("requeue_stale_dispatched", e))?;
+        // Null-safe session_id equality predicate: when the caller observed
+        // a non-empty session_id during the liveness probe, we only requeue
+        // if the live row's session_id still matches; when the caller
+        // observed NULL/blank, we only requeue if the live row's session_id
+        // is also NULL or blank. This protects a concurrent live dispatch
+        // (which would have replaced the session) from being wiped.
+        let (sid_clause, sid_value): (&str, Option<&str>) = match observed_session_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(observed) => (
+                "AND (session_id IS NOT NULL AND TRIM(session_id) = ?3)",
+                Some(observed),
+            ),
+            None => (
+                "AND (session_id IS NULL OR TRIM(session_id) = '')",
+                None,
+            ),
+        };
+        let sql = format!(
+            "UPDATE bead_overlay \
+             SET state = 'QUEUED', session_id = NULL, branch = NULL, \
+                 autonomy_secs = 0, updated_at = ?2 \
+             WHERE bead_id = ?1 AND state = 'DISPATCHED' {}",
+            sid_clause
+        );
+        let affected = match sid_value {
+            Some(observed) => self
+                .conn
+                .execute(&sql, params![bead_id, now_iso8601(), observed])
+                .map_err(|e| tool_err("requeue_stale_dispatched", e))?,
+            None => self
+                .conn
+                .execute(&sql, params![bead_id, now_iso8601()])
+                .map_err(|e| tool_err("requeue_stale_dispatched", e))?,
+        };
+        if affected == 0 {
+            // The session-id predicate or the DISPATCHED-state guard
+            // rejected the row. Distinguish contention (session_id was
+            // replaced by a concurrent dispatch — return current row
+            // untouched) from a hard state mismatch (row exists but is
+            // not DISPATCHED — caller violated the precondition; error).
+            return match self.load(bead_id)? {
+                None => Err(DaemonError::Tool {
+                    tool: "sqlite".into(),
+                    rc: -1,
+                    stderr: format!("requeue_stale_dispatched: bead {bead_id} not found"),
+                }),
+                Some(overlay) if overlay.state == OverlayState::Dispatched => {
+                    // Still DISPATCHED but session-id predicate rejected it
+                    // — a concurrent live dispatch replaced the session.
+                    // Return current row untouched (contention path).
+                    Ok(overlay)
+                }
+                Some(overlay) => Err(DaemonError::Tool {
+                    tool: "sqlite".into(),
+                    rc: -1,
+                    stderr: format!(
+                        "requeue_stale_dispatched: bead {bead_id} is in state {}, expected DISPATCHED",
+                        overlay.state.as_str()
+                    ),
+                }),
+            };
+        }
         if affected != 1 {
             return Err(DaemonError::Tool {
                 tool: "sqlite".into(),
@@ -2771,7 +2833,9 @@ mod tests {
             })
             .unwrap();
 
-        let requeued = store.requeue_stale_dispatched("target").unwrap();
+        let requeued = store
+            .requeue_stale_dispatched("target", Some("dead-session"))
+            .unwrap();
         assert_eq!(requeued.state, OverlayState::Queued);
         assert_eq!(requeued.session_id, None);
         assert_eq!(requeued.branch, None);
@@ -2825,7 +2889,7 @@ mod tests {
             })
             .unwrap();
 
-        let result = store.requeue_stale_dispatched("not-dispatched");
+        let result = store.requeue_stale_dispatched("not-dispatched", None);
         assert!(
             result.is_err(),
             "requeue_stale_dispatched must error when row is not DISPATCHED"
@@ -2835,7 +2899,7 @@ mod tests {
     #[test]
     fn requeue_stale_dispatched_errors_when_bead_not_found() {
         let store = store();
-        let result = store.requeue_stale_dispatched("nonexistent");
+        let result = store.requeue_stale_dispatched("nonexistent", None);
         assert!(
             result.is_err(),
             "requeue_stale_dispatched must error when bead does not exist"
@@ -2867,7 +2931,9 @@ mod tests {
             })
             .unwrap();
 
-        let requeued = store.requeue_stale_dispatched("preserve-target").unwrap();
+        let requeued = store
+            .requeue_stale_dispatched("preserve-target", Some("sess-old-dead"))
+            .unwrap();
 
         // Reset assertions
         assert_eq!(requeued.state, OverlayState::Queued);

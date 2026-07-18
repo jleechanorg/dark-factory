@@ -733,7 +733,7 @@ fn test_wedge_detection_dispatched_coder_silent_saved_by_transcript_activity() {
             spend_usd: 0.0,
             pr_number: None,
             branch: Some("factory/bead-active-r1".into()),
-            session_id: None,
+            session_id: Some("sess-wedge-active".into()),
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -826,7 +826,7 @@ fn test_wedge_detection_dispatched_coder_silent_stale_transcript_still_parks() {
             spend_usd: 0.0,
             pr_number: None,
             branch: Some("factory/bead-stale-r1".into()),
-            session_id: None,
+            session_id: Some("sess-wedge-stale".into()),
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -8258,7 +8258,7 @@ fn dispatched_recovery_dead_session_requeues() {
     let scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let mut sessions = FakeSessions::new();
-    sessions.quiescent = true; // is_session_dead returns true
+    sessions.dead = true; // is_session_dead returns true
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let cfg = test_cfg();

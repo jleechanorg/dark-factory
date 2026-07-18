@@ -885,6 +885,13 @@ fn run_bead_reconciliation_step(
             }
             Ok(Some(BeadStatus::Open | BeadStatus::Active)) => {}
             Err(e) => {
+                if !e.is_transient() {
+                    // Non-transient errors (Config, malformed-response Parse)
+                    // are not retryable: a missing or structurally invalid
+                    // tracker response must NOT be downgraded to a transient
+                    // tick-and-continue. Propagate so the operator sees it.
+                    return Err(e);
+                }
                 emit(
                     deps.telemetry_log,
                     &overlay.bead_id,
@@ -953,7 +960,10 @@ fn run_dispatched_recovery_step(
             }
         };
         if should_requeue {
-            let requeued = deps.store.requeue_stale_dispatched(&overlay.bead_id)?;
+            let observed = overlay.session_id.as_deref();
+            let requeued = deps
+                .store
+                .requeue_stale_dispatched(&overlay.bead_id, observed)?;
             summary.beads_recovered_stale_dispatched += 1;
             emit(
                 deps.telemetry_log,
