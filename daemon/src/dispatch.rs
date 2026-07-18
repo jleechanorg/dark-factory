@@ -841,6 +841,14 @@ fn render_coder_prompt(
          - Do NOT merge anything and do NOT close the PR or the bead — the \
          factory's verifier gates (/green, /er, skeptic) decide promotion.\n\
          - Do NOT force-push over commits you did not author.\n\
+         - Do NOT edit `.beads/issues.jsonl` directly. All bead state changes \
+         (create / update / close / reprioritize) go through the `br` CLI \
+         (`br create`, `br update`, `br close`, `br sync --flush-only`). A \
+         direct edit to `.beads/issues.jsonl` will be rejected by the factory's \
+         pre-push guard on `factory/*` branches and corrupts the tracking \
+         invariant `br` is responsible for. If `br` appears broken, file a \
+         follow-up bead rather than bypassing it. (bead jleechan-cnf9, issue \
+         #308 — df-160 was the original violation.)\n\
          - Work only within the task's scope; file follow-up notes rather \
          than expanding scope.\n\
          {tree_block}",
