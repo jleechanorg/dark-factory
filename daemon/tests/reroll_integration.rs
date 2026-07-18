@@ -9,7 +9,7 @@ use daemon::errors::DaemonError;
 use daemon::reroll::{self, RerollDeps, RerollOutcome};
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{run_tick, TickDeps};
-use daemon::tools::{Issue, Llm, Permission, PrSnapshot};
+use daemon::tools::{Issue, Llm, Permission, PrHeadBranch, PrSnapshot};
 
 fn test_cfg() -> Config {
     Config {
@@ -329,6 +329,17 @@ fn test_tick_stage2_integration() {
     let mut overlay = overlay1;
     overlay.pr_number = Some(15);
     store.save(&overlay).unwrap();
+
+    // jleechan-t8fd (PR #310, issue dark-factory#310): the fast-tier
+    // DISPATCHED -> ATTESTED promotion now verifies the PR's actual head
+    // branch matches the authorized branch. Script the matching head ref
+    // here so the reroll-gate-assessment path actually fires (otherwise
+    // the daemon stays DISPATCHED with BRANCH_AUTH_CHECK_TRANSIENT_ERROR
+    // on every tick, gates_assessed stays 0, and this test breaks).
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".to_string(), 15),
+        PrHeadBranch::SameRepo("factory/fake-bead-1-r1".to_string()),
+    );
 
     scm.pr_snapshots.insert(
         15,

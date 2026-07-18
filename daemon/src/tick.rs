@@ -2117,6 +2117,99 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
 
             if let Some(pr) = overlay.pr_number {
+                // jleechan-t8fd (PR #310, issue dark-factory#310): the daemon
+                // previously trusted `gh pr list --head <authorized_branch>`
+                // as evidence that a PR was opened against the authorized
+                // branch. df-157 (2026-07-17) demonstrated the gap: a coder
+                // pushed to a PR's existing head branch anyway, a new PR
+                // opened against that other branch, and the daemon silently
+                // transitioned to ATTESTED. The fix is to verify the PR's
+                // ACTUAL head ref (via `Scm::open_pr_head_ref_for_repo`,
+                // already used for drive-PR binding) against `overlay.branch`
+                // before promoting. On mismatch: emit a distinct telemetry
+                // event and stay DISPATCHED — never silently ATTEST against
+                // a branch the coder was never authorized to push to. On
+                // NotFound / transient error: also stay DISPATCHED so a
+                // later tick can retry (preserves the jleechan-qdw per-bead
+                // isolation principle; a single transient lookup must not
+                // strand the bead).
+                let authorized_branch = overlay.branch.clone();
+                if let Some(ref auth_branch) = authorized_branch {
+                    match deps.scm.open_pr_head_ref_for_repo(&repo, pr) {
+                        Ok(PrHeadBranch::SameRepo(actual_head)) => {
+                            if actual_head != *auth_branch {
+                                emit(
+                                    deps.telemetry_log,
+                                    bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Dispatched.as_str(),
+                                    "BRANCH_AUTH_MISMATCH",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "authorized_branch": auth_branch,
+                                        "actual_head_ref": actual_head,
+                                        "pr_number": pr,
+                                    }),
+                                )?;
+                                // Do NOT transition to ATTESTED; leave the
+                                // bead DISPATCHED so the next tick re-checks
+                                // (the coder may push the missing commits to
+                                // the authorized branch, or a human may take
+                                // over). The PR number is preserved so the
+                                // mismatch check still has something to
+                                // consult on the next tick.
+                                continue;
+                            }
+                        }
+                        Ok(PrHeadBranch::Fork) => {
+                            // A fork PR cannot legitimately have head on the
+                            // authorized branch in the queried repo; treat
+                            // as a mismatch (same shape: daemon must not
+                            // attest against a coder's unauthorized push).
+                            emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::Dispatched.as_str(),
+                                "BRANCH_AUTH_MISMATCH",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "authorized_branch": auth_branch,
+                                    "actual_head_ref": "fork",
+                                    "pr_number": pr,
+                                }),
+                            )?;
+                            continue;
+                        }
+                        Ok(PrHeadBranch::NotFound) => {
+                            // Transient / inconclusive lookup — preserve the
+                            // bead's DISPATCHED state, retry next tick.
+                            continue;
+                        }
+                        Err(err) => {
+                            // Transient `gh`/GraphQL hiccup — never silently
+                            // ATTEST, never silently promote. Surface in
+                            // telemetry and retry on the next tick (matches
+                            // the jleechan-qdw per-bead isolation contract
+                            // used elsewhere in this loop).
+                            let _ = emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::Dispatched.as_str(),
+                                "BRANCH_AUTH_CHECK_TRANSIENT_ERROR",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "authorized_branch": auth_branch,
+                                    "pr_number": pr,
+                                    "error": format!("{err:?}"),
+                                }),
+                            );
+                            continue;
+                        }
+                    }
+                }
+
                 // Adopted-branch remediation reuses DISPATCHED with
                 // `pr_number` already set from adoption time. Gate promotion
                 // on the remediation coder session having quiesced so the

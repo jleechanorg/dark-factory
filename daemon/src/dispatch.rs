@@ -828,9 +828,14 @@ fn render_coder_prompt(
          REMOTE: {remote} — this is the EXACT remote name to push to; do not \
          guess, do not assume `origin`, and do not use any other remote your \
          worktree happens to have configured, even if one exists.\n\
-         BRANCH: {branch} — the daemon watches this exact branch on \
-         {target_repo} for your commits. Push to it after EVERY green unit of \
-         work; never hold more than ~30 minutes of uncommitted changes.\n\
+         AUTHORIZED BRANCH: {branch} — you are authorized to push ONLY to \
+         this branch. Pushing to any other branch (including a PR's existing \
+         head branch) is a protocol violation: the daemon verifies the PR's \
+         actual head branch against the AUTHORIZED BRANCH during attestation \
+         and refuses to ATTEST on a mismatch. The daemon watches this exact \
+         branch on {target_repo} for your commits. Push to it after EVERY \
+         green unit of work; never hold more than ~30 minutes of uncommitted \
+         changes.\n\
          PUSH COMMAND (run this verbatim, never a bare `git push`): git push {remote} {branch}\n\
          \n\
          DELIVERABLE: a pull request from {branch} to the default branch of \
@@ -838,6 +843,8 @@ fn render_coder_prompt(
          change (red→green where feasible).\n\
          \n\
          RULES:\n\
+         - Push ONLY to the AUTHORIZED BRANCH — never to a PR's existing \
+         head branch, a fork, or any other ref.\n\
          - Do NOT merge anything and do NOT close the PR or the bead — the \
          factory's verifier gates (/green, /er, skeptic) decide promotion.\n\
          - Do NOT force-push over commits you did not author.\n\
@@ -2305,6 +2312,54 @@ mod tests {
             "external ref missing"
         );
         assert!(prompt.contains("flux.rs"), "file-tree orientation missing");
+    }
+
+    // jleechan-t8fd (PR #310, issue dark-factory#310): the coder prompt's
+    // branch contract must be EXPLICIT, not advisory. Live incident df-157
+    // (2026-07-17) read the surrounding prompt and pushed to PR #288's head
+    // branch anyway — the daemon silently accepted it. The prompt must now
+    // state the authorized branch by name, declare pushing anywhere else a
+    // protocol violation, AND add a matching RULES bullet.
+    #[test]
+    fn coder_prompt_declares_authorized_branch_explicitly_and_rules_no_push_elsewhere() {
+        let bead = Bead {
+            id: "jleechan-t8fd".into(),
+            title: "Enforce authorized branch".into(),
+            description: String::new(),
+            file_tree_summary: String::new(),
+            external_ref: None,
+        };
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/jleechan-t8fd-r1",
+            "jleechanorg/dark-factory",
+            "origin",
+        );
+
+        assert!(
+            prompt.contains("AUTHORIZED BRANCH: factory/jleechan-t8fd-r1"),
+            "the prompt must state the authorized branch by name with the \
+             AUTHORIZED BRANCH marker — \"BRANCH:\" alone is advisory and \
+             was the literal failure mode of df-157; got prompt:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("you are authorized to push ONLY to this branch"),
+            "the prompt must tell the coder the authorized branch is the \
+             ONLY acceptable push target — using \"ONLY\" + \"this branch\" \
+             with the branch value stated earlier on the AUTHORIZED BRANCH \
+             line; got prompt:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Pushing to any other branch") && prompt.contains("protocol violation"),
+            "the prompt must name the misroute as a protocol violation, not \
+             a soft suggestion; got prompt:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- Push ONLY to the AUTHORIZED BRANCH"),
+            "the prompt must add an explicit RULES bullet — same constraint \
+             as the explanatory paragraph, in the rules block where the \
+             coder's RULES-following code path reads from; got prompt:\n{prompt}"
+        );
     }
 
     #[test]

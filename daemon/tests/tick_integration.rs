@@ -132,6 +132,15 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
     let mut overlay = overlay_after_tick1;
     overlay.pr_number = Some(101);
     store.save(&overlay).unwrap();
+    // jleechan-t8fd (PR #310, issue dark-factory#310): the fast-tier
+    // DISPATCHED -> ATTESTED promotion now verifies the PR's actual head
+    // branch matches the authorized branch before promoting. Script the
+    // matching head ref here so the existing canonical "one full tick
+    // cycle" test still reaches ATTESTED + gate assessment.
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".to_string(), 101),
+        PrHeadBranch::SameRepo("factory/fake-bead-1-r1".to_string()),
+    );
     scm.pr_snapshots.insert(
         101,
         PrSnapshot {
@@ -1032,6 +1041,196 @@ fn test_dispatch_integrity_sweep_leaves_matching_branch_alone() {
 
     let o = store.load("bead-ok").unwrap().unwrap();
     assert_eq!(o.state, OverlayState::Dispatched);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-t8fd (PR #310, issue dark-factory#310): the fast-tier DISPATCHED
+/// -> ATTESTED promotion must VERIFY that the PR's actual head branch matches
+/// the authorized branch (`overlay.branch`), not just that some PR happened to
+/// open with that name as `--head`. df-157 (2026-07-17) pushed to PR #288's
+/// head branch (`feat/pr-288-arm-stack`) even though its authorized branch
+/// was `factory/jleechan-df-157-r1`; the daemon silently transitioned to
+/// Attested on the bogus PR. The fix is a distinct, non-attest telemetry
+/// event on mismatch — the bead must STAY DISPATCHED, never silently ATTEST
+/// against a branch it was never authorized to push to.
+#[test]
+fn dispatched_to_attested_promotion_emits_branch_auth_mismatch_when_pr_head_differs() {
+    let mut scm = FakeScm::new();
+    // The PR the (misbehaving) coder opened, with a head branch that does NOT
+    // match the authorized branch — this is the df-157 reproduction in
+    // miniature. `open_pr_head_ref_for_repo` is the daemon's own lookup
+    // (already used for drive-PR binding) and is the right seam to extend
+    // with this check — its return is a known-good same-repo string when
+    // the PR is open and the head repo matches.
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".to_string(), 288),
+        PrHeadBranch::SameRepo("feat/pr-288-arm-stack".to_string()),
+    );
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    // Pre-seed the overlay as DISPATCHED with a known authorized branch and
+    // a PR that the (misbehaving) coder opened against a DIFFERENT branch —
+    // mirroring the exact df-157 contamination shape. No coder session is
+    // alive here; this test exercises only the fast-tier promotion step.
+    store
+        .save(&BeadOverlay {
+            bead_id: "jleechan-df-157".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(288),
+            branch: Some("factory/jleechan-df-157-r1".into()),
+            session_id: Some("wa-9999".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store
+        .register_branch("jleechan-df-157", "factory/jleechan-df-157-r1")
+        .unwrap();
+
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log =
+        std::env::temp_dir().join("afd_test_branch_auth_mismatch_at_promotion.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let _summary = run_tick(&deps, 1, 0).unwrap();
+
+    // The bead must NOT silently reach ATTESTED against the wrong branch.
+    let overlay = store.load("jleechan-df-157").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Dispatched,
+        "a bead whose PR's head branch does not match the authorized branch \
+         must stay DISPATCHED; the fix's whole point is to refuse a silent \
+         ATTEST. overlay: {overlay:?}"
+    );
+    assert_eq!(
+        overlay.pr_number,
+        Some(288),
+        "pr_number must be preserved so a later tick can retry the check"
+    );
+    assert_eq!(
+        overlay.branch.as_deref(),
+        Some("factory/jleechan-df-157-r1"),
+        "the authorized branch must be preserved durably"
+    );
+
+    // A distinct telemetry event must be emitted (NOT a generic PR_OPENED /
+    // READY_FOR_MERGE / PARKED_HUMAN_HELD — the protocol-violation signal
+    // lives in its own event so the operator can grep for it specifically).
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        logs.contains("BRANCH_AUTH_MISMATCH"),
+        "expected a distinct BRANCH_AUTH_MISMATCH telemetry event, got:\n{logs}"
+    );
+    assert!(
+        logs.contains("factory/jleechan-df-157-r1"),
+        "the mismatch event must name the authorized branch it expected"
+    );
+    assert!(
+        logs.contains("feat/pr-288-arm-stack"),
+        "the mismatch event must name the actual head branch the PR opened against"
+    );
+    assert!(
+        !logs.contains("\"eventType\":\"PR_OPENED\"")
+            || !logs.contains("\"pr_number\":288"),
+        "the bead must not have been promoted to ATTESTED — no PR_OPENED \
+         event should reference PR 288 against this bead: {logs}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Companion to the mismatch test: a DISPATCHED bead whose PR's actual head
+/// branch matches the authorized branch must reach ATTESTED exactly as
+/// before — the new branch-auth check must not regress the happy path.
+#[test]
+fn dispatched_to_attested_promotion_proceeds_when_pr_head_matches_authorized_branch() {
+    let mut scm = FakeScm::new();
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".to_string(), 410),
+        PrHeadBranch::SameRepo("factory/jleechan-t8fd-r1".to_string()),
+    );
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    store
+        .save(&BeadOverlay {
+            bead_id: "jleechan-t8fd".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(410),
+            branch: Some("factory/jleechan-t8fd-r1".into()),
+            session_id: Some("wa-t8fd".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store
+        .register_branch("jleechan-t8fd", "factory/jleechan-t8fd-r1")
+        .unwrap();
+
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_test_branch_auth_match.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let _summary = run_tick(&deps, 1, 0).unwrap();
+
+    let overlay = store.load("jleechan-t8fd").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Attested,
+        "a matching authorized branch must promote DISPATCHED -> ATTESTED \
+         exactly as before; overlay: {overlay:?}"
+    );
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !logs.contains("BRANCH_AUTH_MISMATCH"),
+        "the matching case must NEVER emit the mismatch telemetry: {logs}"
+    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
