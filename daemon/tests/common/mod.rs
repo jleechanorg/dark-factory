@@ -1034,6 +1034,10 @@ pub struct FakeStateStore {
     /// `reroll_deferral_count` SQLite column), so the fail-closed defer/cap
     /// path can be driven across repeated `reroll::execute` calls in a test.
     pub reroll_deferrals: RefCell<HashMap<String, u32>>,
+    /// Bead jleechan-zaga / issue #348 r3: per-bead held-recheck cooldown
+    /// epoch (mirrors the `held_recheck_after` SQLite column), stored
+    /// independently of `BeadOverlay`.
+    pub held_recheck_after: RefCell<HashMap<String, u64>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -1229,6 +1233,20 @@ impl StateStore for FakeStateStore {
             .borrow_mut()
             .push(format!("reset_reroll_deferral({bead_id})"));
         self.reroll_deferrals.borrow_mut().insert(bead_id.to_string(), 0);
+        Ok(())
+    }
+
+    fn held_recheck_after(&self, bead_id: &str) -> Result<Option<u64>, DaemonError> {
+        Ok(self.held_recheck_after.borrow().get(bead_id).copied())
+    }
+
+    fn set_held_recheck_after(&self, bead_id: &str, epoch: u64) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("set_held_recheck_after({bead_id},{epoch})"));
+        self.held_recheck_after
+            .borrow_mut()
+            .insert(bead_id.to_string(), epoch);
         Ok(())
     }
 
