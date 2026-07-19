@@ -33,6 +33,35 @@ pub struct Config {
     pub autonomy_timebox_secs: u64,
     pub budget_warn_usd: f64,
     pub spec_dir: String,
+    /// Bead jleechan-zeij / issue #322 r3: the head-stability window (seconds)
+    /// the fail-closed re-roll proceed predicate requires before superseding a
+    /// worker whose AO session is still present but non-running (terminal, or
+    /// idle with a quiet transcript). Codex r3 review: a ~500ms two-read
+    /// stability check does not prove a mid-tool-call worker won't push again;
+    /// the window must be wide enough that an active worker's next push lands
+    /// inside it. `#[serde(default)]` (30s) so every pre-existing `daemon.toml`
+    /// parses unchanged. The positive-death path (a re-attach loop confirming
+    /// `SessionNotFound`) is the fast path and is NOT gated by this window.
+    #[serde(default = "default_reroll_head_stability_window_secs")]
+    pub reroll_head_stability_window_secs: u64,
+    /// Bead jleechan-zeij / issue #322 r3: how long (seconds) the post-stop
+    /// re-attach probe must observe a CONTINUOUS `SessionNotFound` before
+    /// declaring the previous worker positively dead. `ao session kill`
+    /// swallows tmux-destruction failures, so a single `SessionNotFound` right
+    /// after stop() is not proof of death — requiring it to hold for this
+    /// window guards against a momentary `ao status` omission. `#[serde(default)]`
+    /// (5s).
+    #[serde(default = "default_reroll_death_confirm_secs")]
+    pub reroll_death_confirm_secs: u64,
+    /// Bead jleechan-zaga / issue #348 r3: cooldown (seconds) between fast-tier
+    /// re-assessments of a bead held at DISPOSITION_REQUIRED. A structural
+    /// condition (CodeRabbit unavailable, unresolved bot threads) can persist
+    /// for hours; without a cooldown the fast tier would re-fetch the PR
+    /// snapshot every tick, hammering the SCM API for no benefit. Default 15
+    /// minutes. `#[serde(default)]` so every pre-existing `daemon.toml` parses
+    /// unchanged.
+    #[serde(default = "default_held_recheck_cooldown_secs")]
+    pub held_recheck_cooldown_secs: u64,
     /// Multi-repo routing table (bead jleechan-35y4 Stage B). Absent entirely
     /// from a config file (the common case for every pre-existing
     /// `daemon.toml`) deserializes to an empty map via `#[serde(default)]` —
@@ -42,6 +71,24 @@ pub struct Config {
     /// pre-migration config already names.
     #[serde(default)]
     pub repos: HashMap<String, RepoConfig>,
+}
+
+/// Default head-stability window (bead jleechan-zeij / issue #322 r3): 30s,
+/// per the Codex review's "configurable minimum (default ≥30s)".
+fn default_reroll_head_stability_window_secs() -> u64 {
+    30
+}
+
+/// Default held-recheck cooldown (bead jleechan-zaga / issue #348 r3): 15
+/// minutes between re-assessments of a DISPOSITION_REQUIRED bead.
+fn default_held_recheck_cooldown_secs() -> u64 {
+    900
+}
+
+/// Default positive-death confirmation window (bead jleechan-zeij / issue #322
+/// r3): 5s, per the Codex review's "3 attempts over ≥5s".
+fn default_reroll_death_confirm_secs() -> u64 {
+    5
 }
 
 impl Config {
@@ -127,6 +174,38 @@ mod tests {
             Err(crate::errors::DaemonError::Config(_))
         ));
     }
+    #[test]
+    fn reroll_predicate_windows_default_when_absent() {
+        // Bead jleechan-zeij / issue #322 r3: a legacy daemon.toml with no
+        // reroll-predicate keys must parse and default to the production
+        // fail-closed windows (30s stability, 5s positive-death).
+        let dir = std::env::temp_dir().join("afd_cfg_test_reroll_windows_default");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("legacy_no_reroll_windows.toml");
+        std::fs::write(
+            &p,
+            r#"
+target_repo = "owner/repo"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+"#,
+        )
+        .unwrap();
+        let cfg = load(&p).unwrap();
+        assert_eq!(cfg.reroll_head_stability_window_secs, 30);
+        assert_eq!(cfg.reroll_death_confirm_secs, 5);
+        // Bead jleechan-zaga / issue #348 r3: the held-recheck cooldown
+        // defaults to 15 minutes and is config-overridable.
+        assert_eq!(cfg.held_recheck_cooldown_secs, 900);
+    }
+
     #[test]
     fn ao_project_is_optional_for_legacy_configs() {
         let dir = std::env::temp_dir().join("afd_cfg_test_ao_project_optional");

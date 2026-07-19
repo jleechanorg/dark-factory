@@ -55,6 +55,14 @@ impl Tracker for CliTracker {
             id: String,
             title: String,
             description: Option<String>,
+            // jleechan-0hqx (issue #338): operator-authored per-attempt
+            // guidance, set via `br update --notes`. Surfaced into the coder
+            // prompt as the higher-priority-than-description
+            // OPERATOR GUIDANCE section so attempt rN coders stop
+            // re-litigating scope the operator already settled on requeue.
+            // `Option` because beads predating this field, or with no notes
+            // set, omit it from the `br list --json` payload.
+            notes: Option<String>,
             external_ref: Option<String>,
         }
         let data: BrListOutput = serde_json::from_str(&out[json_start..]).map_err(|e| {
@@ -72,6 +80,7 @@ impl Tracker for CliTracker {
             id: issue.id,
             title: issue.title,
             description: issue.description.unwrap_or_default(),
+            notes: issue.notes.unwrap_or_default(),
             file_tree_summary: file_tree_summary.clone(),
             external_ref: issue.external_ref,
         }).collect();
@@ -1277,6 +1286,22 @@ impl Scm for CliScm {
             issues_cache.clear();
         }
         Ok(())
+    }
+
+    /// jleechan-v6ud / issue #340: retarget `gh pr close` at `repo` via
+    /// `with_repo` instead of always closing against `self.repo` (the
+    /// daemon's global `cfg.target_repo`, bound at construction time in
+    /// `main.rs`). Without this override, a same-numbered PR that already
+    /// merged in the default repo (beads 8jxr and 9rkz: the same `#315`
+    /// and `#314` had ALREADY merged in `jleechanorg/worldarchitect.ai` at
+    /// the moment the reroll closed them) makes `gh pr close` error with
+    /// "can't be closed because it was already merged", wedging the bead
+    /// on a transient tool error instead of mutating the bead's actual
+    /// repo's PR. Fresh `with_repo` instance (not a cache-sharing clone)
+    /// so a cross-repo call can never evict another repo's cached
+    /// `pr_snapshot_cache` entry under a colliding PR-number key.
+    fn close_pr_for_repo(&self, repo: &str, pr: u64, comment: &str) -> Result<(), DaemonError> {
+        self.with_repo(repo).close_pr(pr, comment)
     }
 
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError> {
@@ -3340,7 +3365,20 @@ impl Sessions for CliSessions {
     /// verbatim in telemetry a human reads, so the message names the branch
     /// and bead explicitly instead of a generic "not found".
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
-        let out = run_tool("ao", &["status", "--json"], 30)?;
+        self.attach_within(branch, bead_id, 30)
+    }
+
+    /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded `attach` — the
+    /// re-roll poll passes the time remaining until its window deadline so a
+    /// single poll cannot block for multiples of the window on stacked ~30s
+    /// `ao status` timeouts.
+    fn attach_within(
+        &self,
+        branch: &str,
+        bead_id: &str,
+        timeout_secs: u64,
+    ) -> Result<SessionId, DaemonError> {
+        let out = run_tool("ao", &["status", "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -3403,6 +3441,34 @@ impl Sessions for CliSessions {
         // "missing" state); this preserves the live-state default where an
         // absent entry proves the session is gone.
         Ok(true)
+    }
+
+    /// Bead jleechan-zeij / issue #322 r2: read AO's per-session `activity`
+    /// field directly so the re-roll proceed predicate can tell an idle
+    /// worker (`status=spawning, activity=idle` — safe to supersede jointly
+    /// with a stable HEAD) apart from a running one (never safe). Same
+    /// `ao status --json` parsing shape as `is_quiescent` above; a session
+    /// with no matching status row classifies as `NotFound` (fully reaped).
+    fn session_activity(
+        &self,
+        id: &SessionId,
+    ) -> Result<crate::tools::SessionActivity, DaemonError> {
+        self.session_activity_within(id, 30)
+    }
+
+    /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded
+    /// `session_activity` — same rationale as `attach_within`.
+    fn session_activity_within(
+        &self,
+        id: &SessionId,
+        timeout_secs: u64,
+    ) -> Result<crate::tools::SessionActivity, DaemonError> {
+        let out = run_tool("ao", &["status", "--json"], timeout_secs)?;
+        let json_start = out.find('[').unwrap_or(0);
+        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse ao status: {e}"))
+        })?;
+        session_activity(&data, id)
     }
 
     /// jleechan-5ia2: `ao status --json` already reports each session's
@@ -3584,6 +3650,36 @@ fn session_is_quiescent(
         .is_some_and(is_terminal_ao_session))
 }
 
+/// Bead jleechan-zeij / issue #322 r2: classify a session's liveness into
+/// [`SessionActivity`]. Ordering matters — a terminal status wins over the
+/// `activity` field (a `killed` session may still carry a stale
+/// `activity=idle`), then `activity=="idle"` distinguishes an alive-but-idle
+/// worker (the #322 signature) from an actively-running one. A session with
+/// no matching row is `NotFound`. Same `ao status --json` shape as
+/// `session_is_quiescent`.
+fn session_activity(
+    data: &serde_json::Value,
+    id: &SessionId,
+) -> Result<crate::tools::SessionActivity, DaemonError> {
+    use crate::tools::SessionActivity;
+    let sessions = data
+        .as_array()
+        .ok_or_else(|| DaemonError::Parse("ao status JSON must be an array".to_string()))?;
+    let Some(entry) = sessions
+        .iter()
+        .find(|entry| entry.get("name").and_then(|value| value.as_str()) == Some(&id.0))
+    else {
+        return Ok(SessionActivity::NotFound);
+    };
+    if is_terminal_ao_session(entry) {
+        return Ok(SessionActivity::Terminal);
+    }
+    if entry.get("activity").and_then(|value| value.as_str()) == Some("idle") {
+        return Ok(SessionActivity::Idle);
+    }
+    Ok(SessionActivity::Running)
+}
+
 fn session_for_branch(
     data: &serde_json::Value,
     branch: &str,
@@ -3664,8 +3760,49 @@ fn active_session_count(data: &serde_json::Value) -> Result<usize, DaemonError> 
 
 #[cfg(test)]
 mod active_session_count_tests {
-    use super::{active_session_count, session_for_branch, session_is_quiescent};
-    use crate::tools::SessionId;
+    use super::{active_session_count, session_activity, session_for_branch, session_is_quiescent};
+    use crate::tools::{SessionActivity, SessionId};
+
+    #[test]
+    fn activity_probe_distinguishes_idle_running_terminal_and_missing() {
+        // The #322 live signature is the `idle` row: NOT terminal (so
+        // `is_quiescent` returns false and the r1 loop stalled), but distinct
+        // from a genuinely running worker. A terminal status wins even when a
+        // stale `activity` lingers.
+        let status = serde_json::json!([
+            {"name": "idle-spawning", "status": "spawning", "activity": "idle"},
+            {"name": "running", "status": "working", "activity": "working"},
+            {"name": "killed-stale-idle", "status": "killed", "activity": "idle"},
+            {"name": "exited", "status": "working", "activity": "exited"},
+            {"name": "done", "status": "done", "activity": "ready"}
+        ]);
+
+        assert_eq!(
+            session_activity(&status, &SessionId("idle-spawning".into())).unwrap(),
+            SessionActivity::Idle
+        );
+        assert_eq!(
+            session_activity(&status, &SessionId("running".into())).unwrap(),
+            SessionActivity::Running
+        );
+        assert_eq!(
+            session_activity(&status, &SessionId("killed-stale-idle".into())).unwrap(),
+            SessionActivity::Terminal
+        );
+        assert_eq!(
+            session_activity(&status, &SessionId("exited".into())).unwrap(),
+            SessionActivity::Terminal
+        );
+        assert_eq!(
+            session_activity(&status, &SessionId("done".into())).unwrap(),
+            SessionActivity::Terminal
+        );
+        assert_eq!(
+            session_activity(&status, &SessionId("gone".into())).unwrap(),
+            SessionActivity::NotFound
+        );
+        assert!(session_activity(&serde_json::json!({}), &SessionId("x".into())).is_err());
+    }
 
     #[test]
     fn global_cap_counts_active_sessions_across_projects_and_unknown_activity() {
@@ -4071,13 +4208,95 @@ impl Vcs for CliVcs {
         Ok(out.trim().to_string())
     }
 
+    /// jleechan-wuts / issue #349: routed-repo variant of [`base_head`].
+    /// `gh api repos/<repo>/git/ref/heads/<branch>` returns the SHA at
+    /// the HEAD of `<branch>` in `<repo>`. Equivalent in shape to
+    /// `remote_head_sha` (`repos/<repo>/commits/<branch>` returns the
+    /// same SHA, but `git/ref/heads/<branch>` is the Git Data API's
+    /// canonical "branch HEAD" lookup and is what `gh` itself uses
+    /// internally for branch refs). Decoupled from the daemon's own
+    /// cwd (its systemd `WorkingDirectory`, the daemon's own source-repo
+    /// checkout), so a bead whose `overlay.repo(cfg)` names a DIFFERENT
+    /// repo from `cfg.target_repo` resolves the baseline against the
+    /// routed repo instead of the daemon's own repo's same-named branch.
+    ///
+    /// Branches containing `/` (e.g. `release/2026-q3`) survive intact:
+    /// the `git/ref/heads/` prefix accepts embedded slashes the same
+    /// way `commits/<branch>` already does (cf. the doc comment on
+    /// `remote_head_sha`).
+    fn base_head_for_repo(&self, repo: &str, base_branch: &str) -> Result<String, DaemonError> {
+        let path = format!("repos/{}/git/ref/heads/{}", repo, base_branch);
+        let out = run_tool("gh", &["api", &path, "--jq", ".object.sha"], 30)?;
+        let sha = out.trim();
+        // `gh api ... --jq .object.sha` exits 0 with the literal string
+        // `null` when the branch doesn't exist in the target repo --
+        // treat that as an error rather than a valid SHA, mirroring the
+        // `remote_head_sha` policy above.
+        if sha.is_empty() || sha == "null" {
+            return Err(DaemonError::Tool {
+                tool: "gh".to_string(),
+                rc: 0,
+                stderr: format!(
+                    "gh api {path} returned no sha for branch '{base_branch}' in {repo}"
+                ),
+            });
+        }
+        Ok(sha.to_string())
+    }
+
     fn create_branch_at(&self, name: &str, sha: &str) -> Result<(), DaemonError> {
         run_tool("git", &["branch", name, sha], 30)?;
         Ok(())
     }
 
+    /// jleechan-wuts / issue #349: routed-repo variant of
+    /// [`create_branch_at`]. POSTs a `refs/heads/<name>` ref via the
+    /// Git Data API at `repos/<repo>/git/refs`. Decoupled from the
+    /// daemon's own cwd (its systemd `WorkingDirectory`, the daemon's
+    /// own source-repo checkout), so the new attempt's
+    /// `factory/<bead>-r<n>` branch lands in the routed target repo
+    /// where the worker will actually push -- not in the daemon's own
+    /// source-repo checkout, where the old CWD-bound `git branch
+    /// <name> <sha>` would have silently created it (and where the
+    /// worker's first `git push` would then race or be rejected).
+    ///
+    /// The endpoint rejects a ref that already exists in `<repo>`
+    /// with HTTP 422 -- the reroll path always passes a freshly
+    /// formatted `factory/<bead>-r<attempt>` branch (incremented per
+    /// attempt), so a collision in the routed repo is structurally
+    /// impossible absent a stale `register_branch`/gh-state mismatch;
+    /// the underlying `DaemonError::Tool` with the HTTP body as
+    /// stderr surfaces that case to the operator for the same reason
+    /// the old CWD-bound `git branch <name> <sha>` did.
+    fn create_branch_at_for_repo(&self, repo: &str, name: &str, sha: &str) -> Result<(), DaemonError> {
+        let path = format!("repos/{}/git/refs", repo);
+        let ref_path = format!("refs/heads/{name}");
+        let out = run_tool(
+            "gh",
+            &[
+                "api",
+                "--method",
+                "POST",
+                &path,
+                "-f",
+                &format!("ref={ref_path}"),
+                "-f",
+                &format!("sha={sha}"),
+            ],
+            30,
+        )?;
+        let _ = out; // POST success returns the created ref object; we don't need its body.
+        Ok(())
+    }
+
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError> {
-        let out = run_tool("git", &["rev-parse", branch], 30)?;
+        self.head_sha_within(branch, 30)
+    }
+
+    /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded `head_sha` — the
+    /// re-roll poll caps this `git rev-parse` at the remaining window budget.
+    fn head_sha_within(&self, branch: &str, timeout_secs: u64) -> Result<String, DaemonError> {
+        let out = run_tool("git", &["rev-parse", branch], timeout_secs)?;
         Ok(out.trim().to_string())
     }
 

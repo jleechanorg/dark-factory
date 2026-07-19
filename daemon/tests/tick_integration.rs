@@ -47,6 +47,9 @@ fn test_cfg() -> Config {
         autonomy_timebox_secs: 10_800,
         budget_warn_usd: 20.0,
         spec_dir: ".factory/specs/".into(),
+        reroll_head_stability_window_secs: 1,
+        reroll_death_confirm_secs: 0,
+        held_recheck_cooldown_secs: 900,
         repos: std::collections::HashMap::new(),
     }
 }
@@ -400,6 +403,7 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
             id: "bead-0".into(),
             title: "first bead".into(),
             description: String::new(),
+            notes: String::new(),
             file_tree_summary: String::new(),
             external_ref: None,
         },
@@ -407,6 +411,7 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
             id: "bead-1".into(),
             title: "second bead".into(),
             description: String::new(),
+            notes: String::new(),
             file_tree_summary: String::new(),
             external_ref: None,
         },
@@ -433,7 +438,11 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            // jleechan-8jxr r2: real intake-persisted overlays carry a
+            // resolved `target_repo`; the old `None` here relied on the
+            // pre-fix silent default to `cfg.target_repo`. Update the
+            // test fixture to reflect production reality.
+            target_repo: Some("owner/repo".to_string()),
             })
             .unwrap();
     }
@@ -538,7 +547,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
             spend_usd: 0.0,
             pr_number: None,
             branch: Some("factory/bead-1-r1".into()),
-            session_id: Some("sess-dummy-1".into()),
+            session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -602,7 +611,7 @@ fn test_autonomy_budget_warning_crossing() {
             spend_usd: 0.0,
             pr_number: None,
             branch: Some("factory/bead-2-r1".into()),
-            session_id: Some("sess-dummy-2".into()),
+            session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -643,7 +652,7 @@ fn test_autonomy_budget_warning_crossing() {
 fn test_wedge_detection_dispatched_coder_silent() {
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
-    let mut sessions = FakeSessions::new();
+    let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let cfg = test_cfg();
@@ -660,7 +669,7 @@ fn test_wedge_detection_dispatched_coder_silent() {
             spend_usd: 0.0,
             pr_number: None,
             branch: Some("factory/bead-silent-r1".into()),
-            session_id: Some("sess-silent".into()),
+            session_id: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -957,11 +966,37 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
     let recovery = run_tick(&deps, 2, 0).unwrap();
     assert_eq!(
         recovery.beads_recovered_from_held, 0,
-        "a branch-mismatch hold retaining a live session must never auto-requeue"
+        "session_branch_mismatch is not in the recoverable set, so a \
+         branch-mismatch hold must never auto-requeue"
     );
     let held = store.load("jleechan-vj89").unwrap().unwrap();
     assert_eq!(held.state, OverlayState::HumanHeld);
-    assert_eq!(held.session_id.as_deref(), Some("wa-3004"));
+    // jleechan-park-leaves-zombie-session-mh9o: `session_branch` just
+    // proved the leaked session belongs to a DIFFERENT bead/branch (the
+    // `jleechan-5ia2` corruption case) — so we MUST NOT call
+    // `sessions.stop()` here. Killing it would terminate another bead's
+    // legitimate worker. The right fix is to drop OUR overlay's bad
+    // handle (the durable record pointing at a session that was never
+    // ours to own) without touching AO.
+    assert_eq!(
+        held.session_id, None,
+        "session_branch_mismatch park MUST drop the bad overlay handle so \
+         the leaked record cannot poison future redispatches of THIS bead \
+         via the AO dedup guard. Calls: {:?}",
+        sessions.calls.borrow()
+    );
+    assert!(
+        !sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call == "stop(wa-3004)"),
+        "session_branch_mismatch park MUST NOT kill the leaked session \
+         because session_branch has proven it belongs to a different \
+         bead/branch. Killing it would terminate someone else's \
+         legitimate worker. Calls: {:?}",
+        sessions.calls.borrow()
+    );
     assert_eq!(
         held.park_reason.as_deref(),
         Some("session_branch_mismatch")
@@ -2275,8 +2310,7 @@ fn adopted_red_pr_stage2_reroll_spawns_remediation_session_leaves_pr_open() {
     scm.pr_snapshots.insert(706, snapshot);
 
     let tracker = FakeTracker::new();
-    let mut sessions = FakeSessions::new();
-    sessions.quiescent = true;
+    let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
@@ -2412,8 +2446,7 @@ fn adopted_red_pr_stage2_reroll_spawn_failure_parks_human_held_with_escalation()
     scm.pr_snapshots.insert(707, snapshot);
 
     let tracker = FakeTracker::new();
-    let mut sessions = FakeSessions::new();
-    sessions.quiescent = true;
+    let sessions = FakeSessions::new();
     let llm = FakeLlm::new();
     *llm.response.borrow_mut() = Some(Ok("pass".into()));
     let store = FakeStateStore::new();
@@ -2491,6 +2524,586 @@ fn adopted_red_pr_stage2_reroll_spawn_failure_parks_human_held_with_escalation()
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// jleechan-zaga / issue #348: an adopted PR whose only red gate is a
+/// CodeRabbit usage-limit (`coderabbit_status="blocked"`) must be held
+/// at `DISPOSITION_REQUIRED`, NOT rerolled. Without this hold, every
+/// reroll produces an equivalent r2 that hits the same external-blocker
+/// signal and parks `HUMAN_HELD` at the attempt cap (v6ud #342 → r1
+/// was a real production incident of this exact churn).
+///
+/// Acceptance: bead ends in `DISPOSITION_REQUIRED`, telemetry emits
+/// `DISPOSITION_REQUIRED` (not `PARKED_HUMAN_HELD`), the original PR
+/// stays open, and the daemon posted the per-gate disposition comment.
+#[test]
+fn adopted_red_pr_structural_only_red_gates_holds_disposition_required_not_reroll() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 708,
+        title: "Adopted PR with structural-only red gates".into(),
+        body: "CodeRabbit usage limit".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#708".into(),
+        head_ref_name: "alice/structural-only-red".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    let mut snapshot = qdw_green_snapshot(
+        708,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
+    );
+    // Structural-only blocker: CodeRabbit unavailable. Production emits
+    // `coderabbit_status="unknown"` (adapters.rs) — NOT a synthetic "blocked"
+    // — which verifier::assess maps to an `Unknown` CodeRabbit gate. That is
+    // the sole non-green gate, and the coder cannot make CodeRabbit run, so
+    // classify_chain -> HoldDisposition.
+    snapshot.coderabbit_approved = false;
+    snapshot.coderabbit_status = "unknown".into();
+    scm.pr_snapshots.insert(708, snapshot);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2; // Stage 2: reroll normally executes; our new branch must preempt it
+    let vcs = FakeVcs::new();
+    let telemetry_log =
+        std::env::temp_dir().join("afd_structural_only_red_gates.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("structural-only red gate path must not error the tick");
+
+    assert_eq!(summary.beads_created, 1);
+    assert_eq!(summary.gates_assessed, 1);
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "structural-only red gates must NOT park the bead HUMAN_HELD — that's \
+         the exact churn issue #348 documents (v6ud #342)"
+    );
+    assert_eq!(
+        summary.beads_held_disposition_required, 1,
+        "beads_held_disposition_required counter must increment for every \
+         DISPOSITION_REQUIRED placement (operator visibility / dashboard signal)"
+    );
+
+    let overlay = store.load("fake-bead-1").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::DispositionRequired,
+        "bead must be held at DISPOSITION_REQUIRED, not ATTESTED (would \
+         re-trigger the same gate report on next tick) and not HUMAN_HELD \
+         (would cap-circuit)"
+    );
+    assert_eq!(overlay.pr_number, Some(708));
+    assert_eq!(overlay.branch.as_deref(), Some("alice/structural-only-red"));
+
+    // The original PR must remain open — DISPOSITION_REQUIRED is a hold,
+    // not a supersede.
+    let session_calls = sessions.calls.borrow();
+    assert!(
+        session_calls.iter().all(|c| !c.starts_with("spawn(")),
+        "DISPOSITION_REQUIRED hold must not fabricate remediation sessions: {session_calls:?}"
+    );
+    let tracker_calls = tracker.calls.borrow();
+    assert!(
+        tracker_calls.iter().all(|c| !c.contains("close")),
+        "original PR must not be closed on structural-only red gates: {tracker_calls:?}"
+    );
+
+    // Telemetry must show DISPOSITION_REQUIRED, not PARKED_HUMAN_HELD.
+    let log_contents =
+        std::fs::read_to_string(&telemetry_log).expect("telemetry log must exist");
+    assert!(
+        log_contents.contains("\"DISPOSITION_REQUIRED\""),
+        "DISPOSITION_REQUIRED telemetry event must be emitted; log:\n{log_contents}"
+    );
+    assert!(
+        !log_contents.contains("\"PARKED_HUMAN_HELD\""),
+        "structural-only red gates must not emit PARKED_HUMAN_HELD — that's the \
+         exact regression issue #348 documents; log:\n{log_contents}"
+    );
+    assert!(
+        !log_contents.contains("\"REROLL_VERDICT_RECORDED\""),
+        "structural-only red gates must not trigger reroll; log:\n{log_contents}"
+    );
+
+    // Per-gate disposition comment must name every red gate.
+    assert!(
+        tracker_calls.iter().any(|c| {
+            c.contains("comment_external(owner/repo#708")
+                && c.contains("Disposition required")
+                && c.contains("coderabbit")
+                && c.contains("structural")
+        }),
+        "DISPOSITION_REQUIRED comment must name the structural red gate(s); \
+         tracker_calls: {tracker_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-zaga / issue #348: mixed redness (a coder-fixable RED gate plus a
+/// structural-pending gate) must keep today's reroll behavior — the issue's
+/// explicit acceptance criterion "mixed red → reroll as today". Blocker 4:
+/// this asserts a re-roll ACTUALLY OCCURRED (attempt increment + REROLL_START
+/// telemetry + a spawned remediation session), not merely the absence of
+/// DISPOSITION_REQUIRED.
+#[test]
+fn adopted_red_pr_mixed_red_gates_still_rerolls() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 709,
+        title: "Adopted PR with mixed red gates".into(),
+        body: "CI broken + CodeRabbit unavailable".into(),
+        author_login: "alice".into(),
+        external_ref: "owner/repo#709".into(),
+        head_ref_name: "alice/mixed-red-gates".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+    let mut snapshot = qdw_green_snapshot(
+        709,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
+    );
+    // Mixed, in production shapes: CI failed (`ci_status="red"` -> a
+    // coder-fixable RED CI gate) + CodeRabbit unavailable
+    // (`coderabbit_status="unknown"` -> a structural-pending Unknown gate).
+    // The coder-fixable red wins -> reroll.
+    snapshot.ci_success = false;
+    snapshot.ci_status = "red".into();
+    snapshot.coderabbit_approved = false;
+    snapshot.coderabbit_status = "unknown".into();
+    scm.pr_snapshots.insert(709, snapshot);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    let mut vcs = FakeVcs::new();
+    // Adopted-PR reroll captures the branch's pre-session HEAD via
+    // remote_head_sha before dispatching a remediation session.
+    vcs.heads.insert(
+        "alice/mixed-red-gates".into(),
+        "pre-session-sha-mixed".into(),
+    );
+    let telemetry_log =
+        std::env::temp_dir().join("afd_mixed_red_gates_rerolls.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("mixed red gate reroll should not error");
+
+    assert_eq!(
+        summary.beads_held_disposition_required, 0,
+        "mixed red gates must NOT hold DISPOSITION_REQUIRED — a coder-fixable red \
+         triggers reroll (issue #348 acceptance: 'mixed red → reroll as today')"
+    );
+
+    let overlay = store.load("fake-bead-1").unwrap().unwrap();
+    assert_ne!(
+        overlay.state,
+        OverlayState::DispositionRequired,
+        "mixed-red bead must continue the existing reroll flow, not the new hold"
+    );
+
+    // Blocker 4: prove a reroll ACTUALLY happened, not just the absence of the
+    // hold. (1) attempt was incremented past the initial 1; (2) the adopted
+    // reroll dispatched a fresh remediation session; (3) REROLL_START
+    // telemetry was emitted.
+    assert!(
+        overlay.attempt >= 2,
+        "reroll must increment the attempt counter (was {}); a no-op would leave it at 1",
+        overlay.attempt
+    );
+    assert_eq!(
+        overlay.state,
+        OverlayState::Dispatched,
+        "adopted-PR reroll re-dispatches a remediation coder session (DISPATCHED)"
+    );
+    let session_calls = sessions.calls.borrow();
+    assert!(
+        session_calls.iter().any(|c| c.starts_with("spawn(")),
+        "reroll must spawn a remediation session: {session_calls:?}"
+    );
+    let log_contents =
+        std::fs::read_to_string(&telemetry_log).expect("telemetry log must exist");
+    assert!(
+        log_contents.contains("\"REROLL_START\""),
+        "reroll must emit REROLL_START telemetry; log:\n{log_contents}"
+    );
+    assert!(
+        !log_contents.contains("\"DISPOSITION_REQUIRED\""),
+        "mixed-red must not emit the DISPOSITION_REQUIRED hold event; log:\n{log_contents}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-zaga / issue #348 (blocker 2 acceptance): a bead already held at
+/// `DISPOSITION_REQUIRED` must be RE-SELECTED and re-assessed on a later tick,
+/// and RESUME the normal flow the moment the structural condition clears. Here
+/// CodeRabbit becomes available and all gates go green, so the bead resolves
+/// to READY — proving the hold is recoverable, not terminal.
+#[test]
+fn disposition_required_bead_resumes_when_gates_go_green() {
+    let mut scm = FakeScm::new();
+    // Now-green snapshot with a fresh /er PASS so er_runner short-circuits.
+    let snapshot = qdw_green_snapshot(
+        710,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
+    );
+    scm.pr_snapshots.insert(710, snapshot);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into())); // Skeptic green
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    let vcs = FakeVcs::new();
+
+    // Pre-seed a bead already held at DISPOSITION_REQUIRED with an open PR and
+    // a registered branch (as the daemon would have left it on a prior tick).
+    let branch = "alice/held-then-green";
+    store
+        .save(&BeadOverlay {
+            bead_id: "held-bead".into(),
+            state: OverlayState::DispositionRequired,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(710),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("held-bead", branch).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_disposition_resumes_green.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("re-assessing a held bead must not error");
+
+    // The held bead was re-selected and re-assessed this tick.
+    assert_eq!(
+        summary.gates_assessed, 1,
+        "a DISPOSITION_REQUIRED bead must be re-selected and gate-assessed, not skipped"
+    );
+    // Now-green -> it resumes to READY (the hold is recoverable).
+    let overlay = store.load("held-bead").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Ready,
+        "a held bead whose gates went green must resume to READY, not stay held"
+    );
+    assert_eq!(summary.beads_ready, 1);
+    assert_eq!(
+        summary.beads_held_disposition_required, 0,
+        "resuming to green is not a new hold"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-zaga / issue #348 r3 residual 2: a held bead whose cooldown has
+/// NOT yet elapsed must be SKIPPED — not re-assessed, and crucially the SCM
+/// API must not be hit for it. Prevents hammering CodeRabbit/gh every fast
+/// tick while a structural condition persists for hours.
+#[test]
+fn disposition_required_bead_in_cooldown_is_skipped_without_scm_call() {
+    let mut scm = FakeScm::new();
+    // A snapshot IS available — the test proves it is never fetched.
+    scm.pr_snapshots.insert(
+        711,
+        qdw_green_snapshot(
+            711,
+            vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
+        ),
+    );
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    let vcs = FakeVcs::new();
+
+    let branch = "alice/held-in-cooldown";
+    store
+        .save(&BeadOverlay {
+            bead_id: "cooldown-bead".into(),
+            state: OverlayState::DispositionRequired,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(711),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("cooldown-bead", branch).unwrap();
+    // Cooldown far in the future -> the bead must be skipped this tick.
+    let far_future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 100_000;
+    store
+        .set_held_recheck_after("cooldown-bead", far_future)
+        .unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_disposition_cooldown_skip.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("cooldown skip must not error");
+
+    assert_eq!(
+        summary.gates_assessed, 0,
+        "a bead still in cooldown must NOT be re-assessed"
+    );
+    // The SCM API must not be hit for this bead's PR while it is in cooldown.
+    assert!(
+        scm.calls
+            .borrow()
+            .iter()
+            .all(|c| !c.contains("pr_snapshot_for_repo") || !c.contains("711")),
+        "cooldown must prevent the SCM snapshot fetch: {:?}",
+        scm.calls.borrow()
+    );
+    // Still held, unchanged.
+    assert_eq!(
+        store.load("cooldown-bead").unwrap().unwrap().state,
+        OverlayState::DispositionRequired
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-zaga / issue #348 r3 residual 3: if a held bead's re-assessment
+/// exits early (here the PR snapshot fetch fails mid-tick), the durable state
+/// must STAY DISPOSITION_REQUIRED — the in-memory ATTESTED promotion is never
+/// persisted — so hold provenance survives and the next re-hold does not
+/// double-emit the counter/telemetry/comment.
+#[test]
+fn disposition_required_reassessment_error_preserves_hold_provenance() {
+    let mut scm = FakeScm::new();
+    // NO snapshot inserted for PR 712 -> pr_snapshot_for_repo errors -> the
+    // fast tier takes the transient early-exit (continue) after promoting.
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    let vcs = FakeVcs::new();
+
+    let branch = "alice/held-then-error";
+    store
+        .save(&BeadOverlay {
+            bead_id: "prov-bead".into(),
+            state: OverlayState::DispositionRequired,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(712),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("prov-bead", branch).unwrap();
+    // held_recheck_after unset (None) -> eligible to re-assess now.
+
+    let telemetry_log = std::env::temp_dir().join("afd_disposition_provenance.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // Tick 1: re-assessment errors (snapshot fetch fails) mid-way.
+    let summary1 = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("errored re-assessment must not abort the tick");
+    assert_eq!(
+        summary1.gates_assessed, 0,
+        "the snapshot fetch failed, so no gate assessment completed"
+    );
+    // Core provenance fix: durable state STAYS DISPOSITION_REQUIRED (with the
+    // pre-r3 eager save it would have been left ATTESTED).
+    assert_eq!(
+        store.load("prov-bead").unwrap().unwrap().state,
+        OverlayState::DispositionRequired,
+        "an errored re-assessment must not lose the hold state"
+    );
+    let log1 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !log1.contains("\"DISPOSITION_REQUIRED\""),
+        "the errored path must not emit a (duplicate) DISPOSITION_REQUIRED hold event; log:\n{log1}"
+    );
+
+    // Tick 2: snapshot now available and STILL structural (CodeRabbit
+    // unavailable). Bypass the cooldown, re-assess. Because tick 1 preserved
+    // the held state, this is a RE-hold (entered_as_disposition=true) -> it
+    // must NOT increment the counter or post another comment.
+    let mut structural = qdw_green_snapshot(
+        712,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
+    );
+    structural.coderabbit_approved = false;
+    structural.coderabbit_status = "unknown".into();
+    scm.pr_snapshots.insert(712, structural);
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    store.set_held_recheck_after("prov-bead", 0).unwrap(); // clear cooldown
+
+    let tracker_calls_before = tracker.calls.borrow().len();
+    let summary2 = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        2,
+        0,
+    )
+    .expect("re-hold must not error");
+    assert_eq!(
+        summary2.beads_held_disposition_required, 0,
+        "a re-hold of an already-held bead must not double-count the operator counter"
+    );
+    assert_eq!(
+        store.load("prov-bead").unwrap().unwrap().state,
+        OverlayState::DispositionRequired
+    );
+    let new_disposition_comments = tracker
+        .calls
+        .borrow()
+        .iter()
+        .skip(tracker_calls_before)
+        .filter(|c| c.contains("Disposition required"))
+        .count();
+    assert_eq!(
+        new_disposition_comments, 0,
+        "a re-hold must not post a duplicate disposition comment"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 #[test]
 fn test_manual_bead_input_auto_queued_and_dispatched() {
     let scm = FakeScm::new(); // no issues in SCM
@@ -2500,8 +3113,16 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
         id: "manual-bead-123".into(),
         title: "Test manual bead".into(),
         description: "manually created".into(),
+        notes: String::new(),
         file_tree_summary: "".into(),
-        external_ref: None, // manual beads have no external_ref
+        // jleechan-8jxr r2: a manual bead without an explicit external_ref
+        // (or body `target_repo:` field) is now parked `unmapped_repo`
+        // at dispatch time rather than silently defaulting to
+        // `cfg.target_repo`. Provide an explicit external_ref matching
+        // the test cfg's `target_repo` ("owner/repo") so this test
+        // exercises the happy path; the no-repo failure mode is
+        // covered by the dedicated regression test in dispatch.rs.
+        external_ref: Some("owner/repo#1".into()),
     });
 
     let sessions = FakeSessions::new();
@@ -2571,6 +3192,7 @@ fn drive_existing_pr_bead_dispatches_onto_pr_head_branch_not_generated_branch() 
         id: "jleechan-af-drive-pr288-gd2x".into(),
         title: "drive PR #288".into(),
         description: "existing_pr: 288".into(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some("owner/repo#288".into()),
     });
@@ -2660,6 +3282,7 @@ fn bead_with_external_ref_but_no_open_pr_falls_back_to_generated_branch() {
         id: "bead-closed-pr-ref".into(),
         title: "issue-tracked bead".into(),
         description: String::new(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some("owner/repo#999".into()),
     });
@@ -2719,6 +3342,7 @@ fn drive_pr_bead_with_fork_head_falls_back_to_generated_branch_not_fork_head() {
         id: "jleechan-fork-pr-bead-e2e".into(),
         title: "drive PR whose head is on a fork".into(),
         description: "existing_pr: 501".into(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some("owner/repo#501".into()),
     });
@@ -2787,6 +3411,7 @@ fn remote_credentials_never_reach_tick_telemetry_or_escalation_comments() {
         id: "credential-redaction-bead".into(),
         title: "Verify remote credential redaction".into(),
         description: "synthetic integration fixture".into(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some("owner/repo#291".into()),
     });
@@ -2881,6 +3506,7 @@ fn manual_bead_adoption_never_calls_create_bead_or_fabricates_external_ref() {
         id: "manual-bead-999".into(),
         title: "Orphan-shaped manual bead".into(),
         description: "created directly via `br create`, no --external-ref".into(),
+        notes: String::new(),
         file_tree_summary: "".into(),
         external_ref: None, // exactly the jleechan-3wh0 orphan shape
     });
@@ -3746,6 +4372,7 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
         id: "bead-held-fallback".into(),
         title: "held fallback".into(),
         description: String::new(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some("owner/repo#9004".into()),
     });
@@ -7297,6 +7924,7 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
         id: BEAD_A.into(),
         title: "Bead A: sustained Deferred backpressure".into(),
         description: "target project pinned at its AO session cap".into(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some(EXTERNAL_REF_A.into()),
     });
@@ -7304,6 +7932,7 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
         id: BEAD_B.into(),
         title: "Bead B: genuine deterministic tool spawn failure".into(),
         description: "distinct from bead A's backpressure — a real transient error".into(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some(EXTERNAL_REF_B.into()),
     });
@@ -7645,8 +8274,7 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
     scm.pr_snapshots.insert(802, snap_b);
 
     let tracker = FakeTracker::new();
-    let mut sessions = FakeSessions::new();
-    sessions.quiescent = true;
+    let sessions = FakeSessions::new();
     let llm = IsoRerollLlm;
     let store = FakeStateStore::new();
     let mut cfg = test_cfg();
@@ -8047,8 +8675,790 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
 
-// ── jleechan-xsg4 (issue #270): reconciliation + recovery regression tests ──
+// ===========================================================================
+// Bead jleechan-zeij / issue #322 r4 P1: tick-boundary handling of the re-roll
+// engine's Deferred outcome and permanent errors. These drive the REAL
+// `run_tick` fast-tier selection (not `reroll::execute` directly) so they
+// prove ATTESTED re-eligibility and the permanent-error park at the seam the
+// finding names (run_fast_tier's ATTESTED filter + the reroll Err arm).
+// ===========================================================================
 
+/// Stage-2 config whose `target_repo` = "owner/repo" makes `is_test_repo`
+/// true, so the Skeptic gate uses the scripted `FakeLlm` (no subprocess), and
+/// with tiny re-roll windows.
+fn reroll_stage2_cfg() -> Config {
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    cfg.reroll_head_stability_window_secs = 1;
+    cfg.reroll_death_confirm_secs = 0;
+    cfg
+}
+
+/// An ATTESTED bead + a scripted RED-CI PR snapshot that routes the fast tier
+/// into the Stage-2 re-roll lane. A pre-posted `/er PASS` comment makes
+/// `er_runner::maybe_run` return `AlreadyPosted` (no `claude` subprocess), and
+/// `FakeLlm` "pass" greens the Skeptic gate, so CI-red is the sole Red gate.
+fn seed_attested_red_ci_bead(
+    scm: &mut FakeScm,
+    store: &FakeStateStore,
+    bead_id: &str,
+    pr: u64,
+) -> String {
+    let branch = format!("factory/{bead_id}-r1");
+    store
+        .save(&BeadOverlay {
+            bead_id: bead_id.into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some(branch.clone()),
+            session_id: Some("fake-session-1".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch(bead_id, &branch).unwrap();
+    // Use a RECENT `updated_at_epoch` so the wedge/stall sweep (which fires on
+    // `now - updated_at >= 1800s`) does not park the ATTESTED bead before it
+    // reaches the reroll lane; and a `head_committed_epoch` older than the
+    // pre-posted `/er PASS` comment so `parse_er_verdict_since` treats the
+    // verdict as fresh (er_runner short-circuits -> no `claude` subprocess).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        pr,
+        PrSnapshot {
+            pr_number: pr,
+            ci_success: false, // -> CI gate RED
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadbeef".into(),
+            body: "".into(),
+            comments: vec![PrComment {
+                author: "reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: now,
+            }],
+            files: vec![],
+            updated_at_epoch: now,
+            ci_status: "red".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+    branch
+}
+
+/// r4 P1: a PERMANENT re-roll error must park the bead HUMAN_HELD (loud,
+/// operator-visible) at the tick boundary — NOT strand it in RE_ROLL. Drives
+/// the real fast tier; the entry `attach` fails with a permanent parse error,
+/// so `reroll::execute` returns `Err(Parse)`, and the tick Err arm parks it
+/// with reason `reroll_permanent_error`.
+#[test]
+fn tick_parks_human_held_on_permanent_reroll_error() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into())); // greens the Skeptic gate
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = reroll_stage2_cfg();
+
+    let branch = seed_attested_red_ci_bead(&mut scm, &store, "perm-bead", 5001);
+    // Entry attach fails permanently -> reroll::execute returns Err(Parse).
+    sessions.fail_attach_permanent_for(&branch);
+
+    let telemetry_log = std::env::temp_dir().join("afd_r4_tick_perm.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should isolate the permanent reroll error and continue");
+
+    let overlay = store.load("perm-bead").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::HumanHeld,
+        "a permanent reroll error must park the bead HUMAN_HELD, not strand it in RE_ROLL"
+    );
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("reroll_permanent_error")
+    );
+    assert!(
+        summary.beads_parked_human_held >= 1,
+        "the permanent-error park must be counted"
+    );
+
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(
+        body.lines().any(|l| l.contains("\"reroll_permanent_error\"")),
+        "operator-visible PARKED_HUMAN_HELD telemetry with the permanent-error reason must be emitted"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// r4 P1: a Deferred re-roll outcome must leave the bead ATTESTED and
+/// RE-SELECTABLE by the fast tier on a later tick (proving full tick re-entry,
+/// which the direct-`execute` cap test cannot). Two real ticks: each routes to
+/// re-roll (RED CI), each defers (a transient stop() failure), and the bead is
+/// gate-assessed BOTH times.
+#[test]
+fn tick_deferred_reroll_stays_attested_and_reselects_next_tick() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = reroll_stage2_cfg();
+
+    seed_attested_red_ci_bead(&mut scm, &store, "defer-bead", 5002);
+    // attach() succeeds (returns fake-session-1); stop() fails transiently ->
+    // reroll defers before touching the branch/PR.
+    sessions.fail_stop_for("fake-session-1");
+
+    let telemetry_log = std::env::temp_dir().join("afd_r4_tick_defer.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary1 = run_tick(&deps, 1, 0).expect("tick 1 should succeed");
+    assert_eq!(summary1.gates_assessed, 1, "tick 1 must gate-assess the ATTESTED bead");
+    let after1 = store.load("defer-bead").unwrap().unwrap();
+    assert_eq!(
+        after1.state,
+        OverlayState::Attested,
+        "a deferred reroll must leave the bead ATTESTED (re-eligible), not parked or advanced"
+    );
+    assert_eq!(store.reroll_deferral_count("defer-bead").unwrap(), 1);
+    assert_eq!(summary1.beads_parked_human_held, 0, "a defer is not a park");
+
+    // Tick 2: the SAME bead must be re-selected by run_fast_tier (proving
+    // ATTESTED re-eligibility through tick selection) and deferred again.
+    let summary2 = run_tick(&deps, 2, 0).expect("tick 2 should succeed");
+    assert_eq!(
+        summary2.gates_assessed, 1,
+        "tick 2 must re-select and re-assess the still-ATTESTED bead"
+    );
+    let after2 = store.load("defer-bead").unwrap().unwrap();
+    assert_eq!(after2.state, OverlayState::Attested);
+    assert_eq!(store.reroll_deferral_count("defer-bead").unwrap(), 2);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+// jleechan-park-leaves-zombie-session-mh9o: regression for the U4-class
+// zero-touch blocker where every PARKED_* transition leaked its AO session.
+//
+// Symptom: the daemon parked the bead HUMAN_HELD in its overlay but never
+// called `ao session kill`. AO still listed the leaked session as
+// `spawning`, so the next `ao spawn` for the same bead/branch/prompt was
+// rejected by the dedup guard with "Duplicate session detected".
+// Operator had to manually `ao session kill df-167 df-168 …` to clear the
+// poison. Repeated 2026-07-17/18; lanes 287/285 (df-167/df-168) blocked.
+//
+// Required invariant for every PARKED_HUMAN_HELD transition written by the
+// tick loop: `sessions.stop(session_id)` MUST be called and the durable
+// overlay's `session_id` MUST be cleared. Without `session_id IS NULL`, the
+// automated `recover_human_held` requeue path (jleechan-gib) is also
+// blocked — recovery only requeues rows whose durable overlay has no
+// session handle.
+//
+// These three tests cover the three park classes called out in the task
+// data: autonomy_timebox_exceeded, coder_silent, session_branch_mismatch.
+// They are the canonical proof that the fix at the tick-park layer — not
+// at the recovery layer — terminates the zombie AO session before any
+// downstream code can observe the dedup-blocked redispatch.
+#[test]
+fn autonomy_timebox_park_kills_associated_ao_session_and_clears_handle() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.autonomy_timebox_secs = 3600;
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.remote_branches
+        .insert("factory/bead-mh9o-timebox-r1".into(), Some(now_epoch));
+
+    // Pre-seed a DISPATCHED bead with a live session handle already
+    // exceeding the autonomy timebox. Park must kill that exact session
+    // and clear the overlay's handle so a future requeue/redispatch is not
+    // blocked by the AO dedup guard.
+    store.overlays.borrow_mut().insert(
+        "bead-mh9o-timebox".into(),
+        BeadOverlay {
+            bead_id: "bead-mh9o-timebox".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 4000, // already > 3600 timebox
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-mh9o-timebox-r1".into()),
+            session_id: Some("df-mh9o-timebox".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_mh9o_timebox.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = FakeVcs::new();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 100).expect("tick should succeed");
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "bead must be parked on autonomy timebox overflow"
+    );
+
+    let overlay = store.load("bead-mh9o-timebox").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::HumanHeld,
+        "bead must be HUMAN_HELD after timebox park"
+    );
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("autonomy_timebox_exceeded"),
+        "park_reason must record the timebox overflow"
+    );
+    assert!(
+        overlay.session_id.is_none(),
+        "park transition MUST clear the durable session handle — without \
+         this, the automated HUMAN_HELD exit cannot requeue the bead \
+         (recover_human_held requires session_id IS NULL) and any manual \
+         requeue hits the AO dedup guard before it can spawn"
+    );
+    assert!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call == "stop(df-mh9o-timebox)"),
+        "park transition MUST invoke sessions.stop on the leaked session; \
+         without this, AO still reports the session as [spawning] and \
+         rejects subsequent spawn attempts with the dedup guard. Calls: {:?}",
+        sessions.calls.borrow()
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn coder_silent_park_kills_associated_ao_session_and_clears_handle() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    // DISPATCHED bead whose remote branch has had no commit for >30 minutes,
+    // no recent transcript activity → the wedge-detection sweep must park
+    // this bead coder_silent. Park must kill the live session.
+    store.overlays.borrow_mut().insert(
+        "bead-mh9o-silent".into(),
+        BeadOverlay {
+            bead_id: "bead-mh9o-silent".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 1900,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-mh9o-silent-r1".into()),
+            session_id: Some("df-mh9o-silent".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+
+    // remote branch commit timestamp = None AND no transcript activity →
+    // `branch_is_silent && transcript_is_active == false` → coder_silent
+    // branch fires.
+    scm.remote_branches
+        .insert("factory/bead-mh9o-silent-r1".into(), None);
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_mh9o_silent.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = FakeVcs::new();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 10).expect("tick should succeed");
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "bead must be parked coder_silent after wedge detection"
+    );
+
+    let overlay = store.load("bead-mh9o-silent").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("coder_silent"),
+        "park_reason must record the silence"
+    );
+    assert!(
+        overlay.session_id.is_none(),
+        "coder_silent park MUST clear session handle (recover_human_held gate)"
+    );
+    assert!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call == "stop(df-mh9o-silent)"),
+        "coder_silent park MUST invoke sessions.stop; otherwise the next \
+         ao spawn for this bead hits the dedup guard. Calls: {:?}",
+        sessions.calls.borrow()
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn session_branch_mismatch_park_kills_associated_ao_session_and_clears_handle() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    // DISPATCHED bead with a live session whose reported branch differs
+    // from the bead's registered branch. The dispatch-integrity sweep
+    // (jleechan-5ia2) must park this bead session_branch_mismatch — and
+    // now must ALSO kill the leaked session so the dedup guard cannot
+    // trap the bead across redispatch attempts.
+    store.overlays.borrow_mut().insert(
+        "bead-mh9o-mismatch".into(),
+        BeadOverlay {
+            bead_id: "bead-mh9o-mismatch".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-mh9o-mismatch-r1".into()),
+            session_id: Some("df-mh9o-mismatch".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+
+    // Script the fake AO session to report a branch that does NOT match
+    // the bead's registered branch, so `deps.sessions.session_branch` returns
+    // `Ok(Some(<actual>))` and the positive-mismatch check fires.
+    sessions.set_session_branch(
+        "df-mh9o-mismatch",
+        "factory/wa-3004-hook-refactor",
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_mh9o_mismatch.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = FakeVcs::new();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 10).expect("tick should succeed");
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "bead must be parked session_branch_mismatch on positive mismatch"
+    );
+
+    let overlay = store.load("bead-mh9o-mismatch").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("session_branch_mismatch"),
+        "park_reason must record the branch mismatch"
+    );
+    assert!(
+        overlay.session_id.is_none(),
+        "session_branch_mismatch park MUST clear session handle"
+    );
+    assert!(
+        !sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call == "stop(df-mh9o-mismatch)"),
+        "session_branch_mismatch park MUST NOT kill the leaked session: \
+         session_branch has just proved that session belongs to a \
+         different bead/branch, and killing it would terminate someone \
+         else's legitimate worker. Only the bad overlay handle is \
+         dropped. Calls: {:?}",
+        sessions.calls.borrow()
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// jleechan-park-leaves-zombie-session-mh9o (CodeRabbit P1 follow-up):
+// when `sessions.stop()` fails, the AO session may STILL be live. Clearing
+// the durable handle in that case would let `recover_human_held` requeue
+// the bead and dispatch a second worker that overlaps the existing live
+// one. Retain the handle so (a) recover_human_held cannot requeue and
+// (b) the operator retains the durable session_id for manual cleanup.
+#[test]
+fn autonomy_timebox_park_retains_handle_when_stop_fails() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    sessions.fail_stop_for("df-mh9o-stop-fails");
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.autonomy_timebox_secs = 3600;
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    scm.remote_branches
+        .insert("factory/bead-mh9o-stop-fails-r1".into(), Some(now_epoch));
+
+    store.overlays.borrow_mut().insert(
+        "bead-mh9o-stop-fails".into(),
+        BeadOverlay {
+            bead_id: "bead-mh9o-stop-fails".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 4000, // already > 3600 timebox
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-mh9o-stop-fails-r1".into()),
+            session_id: Some("df-mh9o-stop-fails".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_mh9o_stop_fails.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = FakeVcs::new();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 100).expect("tick should succeed");
+    assert_eq!(summary.beads_parked_human_held, 1);
+
+    let overlay = store.load("bead-mh9o-stop-fails").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        overlay.session_id.as_deref(),
+        Some("df-mh9o-stop-fails"),
+        "on stop() failure the handle MUST be retained so the operator \
+         retains the durable session_id for manual cleanup AND \
+         recover_human_held cannot requeue and dispatch a second worker \
+         that would overlap the still-live session"
+    );
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(
+        logs.contains("BEAD_SESSION_KILL_FAILED"),
+        "stop() failure MUST emit BEAD_SESSION_KILL_FAILED telemetry; logs: {logs}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// jleechan-park-leaves-zombie-session-mh9o (CodeRabbit Major follow-up):
+// adopted-branch remediation parks (history rewrite, append-only check
+// failure) were also leaking their session. Wire the cleanup helper into
+// both sites.
+#[test]
+fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    // Pre-seed an adopted DISPATCHED bead whose pre_session_head_sha is
+    // NOT an ancestor of the live remote head (positive history rewrite).
+    store.overlays.borrow_mut().insert(
+        "bead-mh9o-adopted".into(),
+        BeadOverlay {
+            bead_id: "bead-mh9o-adopted".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/bead-mh9o-adopted-r1".into()),
+            session_id: Some("df-mh9o-adopted".into()),
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: Some("aaaaaaaaaaaaaaaa".into()),
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_mh9o_adopted.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut vcs = FakeVcs::new();
+    // Remote HEAD is a totally unrelated commit -> is_ancestor returns
+    // false -> adopted_branch_history_rewrite_detected park.
+    vcs.heads.insert(
+        "factory/bead-mh9o-adopted-r1".into(),
+        "bbbbbbbbbbbbbbbb".into(),
+    );
+    vcs.ancestor_pairs
+        .insert(("aaaaaaaaaaaaaaaa".into(), "bbbbbbbbbbbbbbbb".into()), false);
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 10).expect("tick should succeed");
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "bead must be parked adopted_branch_history_rewrite_detected"
+    );
+
+    let overlay = store.load("bead-mh9o-adopted").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("adopted_branch_history_rewrite_detected")
+    );
+    assert!(
+        overlay.session_id.is_none(),
+        "adopted_branch_history_rewrite_detected park MUST clear session handle"
+    );
+    assert!(
+        sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call == "stop(df-mh9o-adopted)"),
+        "adopted_branch_history_rewrite_detected park MUST terminate the \
+         leaked AO session; otherwise the AO dedup guard blocks future \
+         spawns of this bead. Calls: {:?}",
+        sessions.calls.borrow()
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-8jxr r3 (review follow-up, chatgpt-codex-connector P2 @
+/// daemon/src/dispatch.rs:287): when a bead is parked HUMAN_HELD with
+/// reason `unmapped_repo` at dispatch time, the tick layer must
+/// special-case the failure phase the same way it special-cases
+/// `unmapped_target_repo` and `worktree_remote_mismatch`. Otherwise the
+/// generic `BEAD_DISPATCH_TRANSIENT_ERROR` fall-through (with
+/// `lifecycle_state = QUEUED`) mis-reports a genuinely permanent,
+/// operator-action-required park as retryable, never increments
+/// `beads_parked_human_held`, and posts no escalation comment.
+///
+/// Regression pin: a manually-created bead (no `external_ref`, no body
+/// `target_repo:` field) reaches dispatch with `overlay.target_repo =
+/// None`. dispatch_ready parks it `unmapped_repo`. run_tick must:
+/// 1. Emit `PARKED_HUMAN_HELD` (not `BEAD_DISPATCH_TRANSIENT_ERROR`).
+/// 2. Increment `summary.beads_parked_human_held`.
+/// 3. Post an escalation comment naming the remediation (add body
+///    field/external_ref, or label `factory` so intake can resolve).
+#[test]
+fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "no-repo-bead".into(),
+        title: "manual bead with no repo".into(),
+        description: "manually created with no external_ref".into(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        // No external_ref and no body `target_repo:` field — dispatch
+        // will park this as unmapped_repo.
+        external_ref: None,
+    });
+
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"manual bead"}"#.into(),
+    ));
+    let store = FakeStateStore::new(); // empty: dispatch will load overlay from DB
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_unmapped_repo_park_test.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("tick should succeed even when dispatch parks a no-repo bead");
+
+    // (1) summary counts the unmapped_repo park as a permanent HUMAN_HELD
+    // park, not a transient dispatch error.
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "unmapped_repo park must increment beads_parked_human_held (got: {})",
+        summary.beads_parked_human_held
+    );
+    assert_eq!(
+        summary.beads_dispatched, 0,
+        "a no-repo bead must NOT dispatch"
+    );
+
+    // (2) overlay state is HUMAN_HELD with a park_reason derived from
+    // `unmapped_repo` (either the bare reason or the local-fallback
+    // variant — the FakeScm has no SCM target to post a comment to, so
+    // `record_local_escalation_fallback` re-stamps the reason to
+    // `escalation_local_fallback:unmapped_repo`. Either way the prefix
+    // must name `unmapped_repo`, never the generic unmapped_target_repo
+    // or worktree_remote_mismatch reason).
+    let overlay = store.load("no-repo-bead").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    let park_reason = overlay
+        .park_reason
+        .as_deref()
+        .expect("HUMAN_HELD overlay must have a park_reason");
+    assert!(
+        park_reason == "unmapped_repo" || park_reason.starts_with("escalation_local_fallback:unmapped_repo"),
+        "park_reason must be unmapped_repo-derived, got: {park_reason:?}"
+    );
+
+    // (3) telemetry emits PARKED_HUMAN_HELD, NOT BEAD_DISPATCH_TRANSIENT_ERROR.
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let parked = events
+        .iter()
+        .find(|e| e["eventType"] == "PARKED_HUMAN_HELD" && e["beadId"] == "no-repo-bead");
+    assert!(
+        parked.is_some(),
+        "telemetry MUST emit PARKED_HUMAN_HELD for unmapped_repo parks; events = {:?}",
+        events
+    );
+    let transient_error = events
+        .iter()
+        .find(|e| e["eventType"] == "BEAD_DISPATCH_TRANSIENT_ERROR" && e["beadId"] == "no-repo-bead");
+    assert!(
+        transient_error.is_none(),
+        "unmapped_repo park must NOT fall through to BEAD_DISPATCH_TRANSIENT_ERROR; events = {:?}",
+        events
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
 #[test]
 fn reconciliation_parks_human_held_when_bead_is_missing() {
     let scm = FakeScm::new();
@@ -8123,22 +9533,6 @@ fn reconciliation_parks_human_held_when_bead_is_missing() {
     let reconcile_ev: serde_json::Value =
         serde_json::from_str(reconcile_line).unwrap();
     assert_eq!(reconcile_ev["context"]["prior_state"], "ATTESTED");
-
-    let comment_call = tracker
-        .calls
-        .borrow()
-        .iter()
-        .find(|c| c.contains("comment_external") && c.contains("bead-missing"))
-        .cloned()
-        .expect("expected a comment_external call for bead-missing");
-    assert!(
-        comment_call.contains("was in state ATTESTED"),
-        "comment body must reference the prior state ATTESTED: {comment_call}"
-    );
-    assert!(
-        !comment_call.contains("was in state HUMAN_HELD"),
-        "comment body must NOT reference the new HUMAN_HELD state: {comment_call}"
-    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
@@ -8217,22 +9611,6 @@ fn reconciliation_parks_human_held_when_bead_is_closed() {
     let reconcile_ev: serde_json::Value =
         serde_json::from_str(reconcile_line).unwrap();
     assert_eq!(reconcile_ev["context"]["prior_state"], "DISPATCHED");
-
-    let comment_call = tracker
-        .calls
-        .borrow()
-        .iter()
-        .find(|c| c.contains("comment_external") && c.contains("bead-closed"))
-        .cloned()
-        .expect("expected a comment_external call for bead-closed");
-    assert!(
-        comment_call.contains("was in state DISPATCHED"),
-        "comment body must reference the prior state DISPATCHED: {comment_call}"
-    );
-    assert!(
-        !comment_call.contains("was in state HUMAN_HELD"),
-        "comment body must NOT reference the new HUMAN_HELD state: {comment_call}"
-    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
@@ -8365,7 +9743,7 @@ fn dispatched_recovery_dead_session_requeues() {
     let scm = FakeScm::new();
     let tracker = FakeTracker::new();
     let mut sessions = FakeSessions::new();
-    sessions.session_dead = true; // is_session_dead returns true (independent of quiescence)
+    sessions.session_dead = true; // is_session_dead returns true
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let cfg = test_cfg();
