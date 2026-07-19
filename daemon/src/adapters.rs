@@ -1557,14 +1557,100 @@ fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonErro
     ao_spawn_command_with_mode(agent, spec, false)
 }
 
+/// Maps legacy vendor aliases onto their canonical AO plugin names. The
+/// runtime and startup paths consult this single source so a renamed plugin
+/// never silently disappears from `--agent` argv or preflight checks.
+///
+/// `aow -> minimax` predates this PR (legacy minimax-by-AO alias).
+/// `agy -> antigravity` covers AO main's 2026-07-18 rename of the
+/// antigravity plugin; lane 222 burned a full spawn cycle before the
+/// jleechan-agy-vendor-name-drift-9lvs regression exposed the mismatch.
+pub fn canonical_for_alias(vendor: &str) -> Option<&'static str> {
+    match vendor {
+        "aow" => Some("minimax"),
+        "agy" => Some("antigravity"),
+        _ => None,
+    }
+}
+
+/// Fail-closed preflight over the daemon's configured vendor set against
+/// the bridge-reported AO plugin registry. This runs on EVERY startup —
+/// skipping it because the registry is empty/missing/malformed is what let
+/// the jleechan-9lvs drift class reach a per-bead spawn cycle in the first
+/// place. Distinct error messages keep triage cheap:
+///
+/// * registry error → `VendorRegistryError` (registry reachable, list broken)
+/// * empty registry → `VendorRegistryEmpty` (registry reachable, no plugins)
+/// * missing canonical vendor → `VendorNotInstalled` (each missing name listed)
+pub fn validate_configured_vendors(
+    installed_plugins: Result<&[String], &str>,
+    configured_vendors: &[String],
+) -> Result<(), DaemonError> {
+    let installed = match installed_plugins {
+        Ok(list) => list,
+        Err(message) => {
+            return Err(DaemonError::Config(format!(
+                "AO bridge reported a registry error while enumerating agent plugins ({}); refusing to start because the daemon cannot prove any configured vendor is installed",
+                message
+            )));
+        }
+    };
+    if installed.is_empty() {
+        return Err(DaemonError::Config(format!(
+            "AO bridge reported zero installed agent plugins (configured vendors: {}); refusing to start because a factory with zero coder plugins cannot dispatch",
+            configured_vendors.join(", ")
+        )));
+    }
+
+    // Dedup configured_vendors by their canonical form so that e.g.
+    // ['agy', 'antigravity'] is treated as a single vendor before we
+    // ask the registry whether it's installed.
+    let mut seen = std::collections::HashSet::new();
+    let mut canonical_chain: Vec<String> = Vec::new();
+    for vendor in configured_vendors {
+        let canonical = canonical_for_alias(vendor)
+            .map(str::to_string)
+            .unwrap_or_else(|| vendor.clone());
+        if canonical.is_empty() {
+            continue;
+        }
+        if seen.insert(canonical.clone()) {
+            canonical_chain.push(canonical);
+        }
+    }
+
+    let mut missing: Vec<String> = Vec::new();
+    for canonical in &canonical_chain {
+        if !installed.iter().any(|name| name == canonical) {
+            missing.push(canonical.clone());
+        }
+    }
+    if !missing.is_empty() {
+        return Err(DaemonError::Config(format!(
+            "AO plugin registry is missing configured vendor(s) {} (installed: {}); refusing to start so a renamed plugin cannot burn a full spawn cycle",
+            missing.join(", "),
+            installed.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// Runs the AO v0.1.3 preload in its read-only diagnostic mode. This checks
 /// the actual `ao` executable selected by the daemon's production PATH, its
 /// Node major version, package version, core APIs, configured project, and
 /// plugin resolution without performing preflight side effects, acquiring a
 /// spawn lock, creating a workspace, or launching a worker.
+///
+/// `configured_vendors` is the daemon's full deduped canonical vendor list
+/// (default + fallback chain, after alias resolution). The bridge diagnostic
+/// payload distinguishes three registry states via distinct JSON keys:
+/// `agentPlugins` (sorted array of installed plugin names) when the registry
+/// answered, `agentPluginsError` (string message) when the registry threw.
+/// An absent key is treated as a malformed payload and rejected.
 pub fn verify_ao_bridge_compatibility(
     ao_project: &str,
     agent: &str,
+    configured_vendors: &[String],
 ) -> Result<(), DaemonError> {
     let spec = SpawnSpec {
         bead_id: "daemon-startup-diagnostic".to_string(),
@@ -1616,6 +1702,55 @@ pub fn verify_ao_bridge_compatibility(
             "AO bridge compatibility diagnostic reported an incompatible runtime: {diagnostic}"
         )));
     }
+    // Three mutually-exclusive registry states, distinguished by separate
+    // JSON keys so the daemon cannot confuse "registry reachable but empty"
+    // (hard failure: factory cannot dispatch) with "registry threw" (also a
+    // hard failure, but the message names the underlying exception so the
+    // operator knows to fix the AO install, not the daemon config).
+    let registry_state: Result<Vec<String>, String> = match (
+        diagnostic.get("agentPlugins"),
+        diagnostic.get("agentPluginsError"),
+    ) {
+        (Some(_), Some(_)) => Err(
+            "AO bridge diagnostic carried BOTH agentPlugins and agentPluginsError; payload is malformed"
+                .to_string(),
+        ),
+        (Some(value), None) => match value.as_array() {
+            Some(array) => {
+                let mut names: Vec<String> = array
+                    .iter()
+                    .filter_map(|entry| entry.as_str().map(str::to_string))
+                    .collect();
+                names.sort();
+                names.dedup();
+                Ok(names)
+            }
+            None => Err(
+                "AO bridge diagnostic agentPlugins is not a JSON array".to_string(),
+            ),
+        },
+        (None, Some(value)) => Err(value
+            .as_str()
+            .unwrap_or("non-string agentPluginsError in bridge diagnostic")
+            .to_string()),
+        (None, None) => Err(
+            "AO bridge diagnostic payload omitted both agentPlugins and agentPluginsError; \
+             refusing to start because the daemon cannot prove any configured vendor is installed"
+                .to_string(),
+        ),
+    };
+    let installed_slice: Result<&[String], &str> = match &registry_state {
+        Ok(list) => Ok(list.as_slice()),
+        Err(message) => Err(message.as_str()),
+    };
+    validate_configured_vendors(installed_slice, configured_vendors).map_err(|error| {
+        match error {
+            DaemonError::Config(message) => DaemonError::Config(format!(
+                "AO bridge compatibility preflight failed: {message}"
+            )),
+            other => other,
+        }
+    })?;
     Ok(())
 }
 
@@ -5564,5 +5699,134 @@ exit 1
             )),
             "ancestor_sha == descendant_sha must short-circuit to Ok(true)"
         );
+    }
+}
+
+// jleechan-agy-vendor-name-drift-9lvs (operator guidance, r2): the original
+// skeptic P1 from PR #321's head 7ade4ef2 was that
+// adapters.rs::verify_ao_bridge_compatibility skipped
+// validate_configured_vendors when `agentPlugins` was empty/missing/malformed
+// and the bridge deliberately emitted `[]` on registry errors, so startup
+// passed without proving resolved agents exist. r2 closes all three paths.
+#[cfg(test)]
+mod vendor_drift_preflight_r2_tests {
+    use super::{canonical_for_alias, validate_configured_vendors};
+
+    // jleechan-9lvs red proof #1: legacy `agy` must alias onto the renamed
+    // `antigravity` plugin name (AO main 2026-07-18 rename).
+    #[test]
+    fn legacy_agy_alias_resolves_to_canonical_antigravity_plugin() {
+        assert_eq!(canonical_for_alias("agy"), Some("antigravity"));
+    }
+
+    // Pre-existing legacy alias must still resolve.
+    #[test]
+    fn legacy_aow_alias_resolves_to_canonical_minimax_plugin() {
+        assert_eq!(canonical_for_alias("aow"), Some("minimax"));
+    }
+
+    // Non-legacy vendor names pass through unchanged so the bridge sees the
+    // exact plugin name the registry has.
+    #[test]
+    fn unknown_vendor_name_returns_no_alias() {
+        assert_eq!(canonical_for_alias("claude-code"), None);
+        assert_eq!(canonical_for_alias("antigravity"), None);
+        assert_eq!(canonical_for_alias(""), None);
+    }
+
+    // jleechan-9lvs acceptance: valid list with the agy alias resolves and
+    // the daemon accepts it as installed (the alias IS the configuration).
+    #[test]
+    fn valid_list_with_legacy_agy_alias_passes_preflight() {
+        let installed = vec!["antigravity".to_string(), "claude-code".to_string()];
+        let configured = vec!["agy".to_string(), "claude-code".to_string()];
+        assert!(validate_configured_vendors(Ok(&installed), &configured).is_ok());
+    }
+
+    // jleechan-9lvs r2 P1: genuine empty registry is a HARD failure. A
+    // factory with zero coder plugins cannot dispatch, so passing the
+    // preflight and only failing on the first bead is the exact bug class
+    // this PR is closing.
+    #[test]
+    fn empty_installed_plugin_list_fails_preflight_loud() {
+        let installed: Vec<String> = Vec::new();
+        let configured = vec!["minimax".to_string()];
+        let error = validate_configured_vendors(Ok(&installed), &configured)
+            .expect_err("empty registry must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("zero installed agent plugins"),
+            "empty-list error must name the registry state, got: {message}"
+        );
+        assert!(
+            message.contains("cannot dispatch"),
+            "empty-list error must call out that the factory cannot dispatch, got: {message}"
+        );
+    }
+
+    // jleechan-9lvs r2 P1: a registry error (list reachable but threw) is a
+    // distinct state from a genuinely-empty list. The error message must
+    // surface the underlying exception so the operator knows to fix the
+    // AO install (or restart AO), not the daemon config.
+    #[test]
+    fn registry_error_fails_preflight_with_distinct_message() {
+        let configured = vec!["minimax".to_string()];
+        let error = validate_configured_vendors(
+            Err("TypeError: registry.list is not a function"),
+            &configured,
+        )
+        .expect_err("registry error must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("registry error"),
+            "registry-error path must call out registry error, got: {message}"
+        );
+        assert!(
+            message.contains("TypeError"),
+            "registry-error path must propagate the underlying exception, got: {message}"
+        );
+        assert!(
+            !message.contains("zero installed agent plugins"),
+            "registry-error message must NOT be confused with empty-list, got: {message}"
+        );
+    }
+
+    // When the registry reports a non-empty list but the configured vendor
+    // (after alias) is missing, every missing name is reported in one error
+    // so a single fix covers every lane (jleechan-r56m aggregation property).
+    #[test]
+    fn missing_canonical_vendor_is_reported_alongside_installed_set() {
+        let installed = vec!["antigravity".to_string()];
+        let configured = vec!["agy".to_string(), "claude-code".to_string()];
+        let error = validate_configured_vendors(Ok(&installed), &configured)
+            .expect_err("missing claude-code must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("claude-code"),
+            "missing vendor must be named in the error, got: {message}"
+        );
+        assert!(
+            message.contains("antigravity"),
+            "installed set must be enumerated in the error, got: {message}"
+        );
+    }
+
+    // The configured vendor chain (default + fallback) is deduped by
+    // canonical form so a config that names both `agy` and `antigravity`
+    // does not double-list a vendor that aliases to the same plugin.
+    #[test]
+    fn duplicate_canonical_vendors_are_deduplicated_before_validation() {
+        // Both canonical targets must be installed for the dedup test —
+        // the assertion is that `agy`/`antigravity` collapse into ONE
+        // canonical entry, and `aow`/`minimax` collapse into ANOTHER, not
+        // that an incomplete installed set passes validation.
+        let installed = vec!["antigravity".to_string(), "minimax".to_string()];
+        let configured = vec![
+            "agy".to_string(),
+            "antigravity".to_string(),
+            "aow".to_string(),
+            "minimax".to_string(),
+        ];
+        assert!(validate_configured_vendors(Ok(&installed), &configured).is_ok());
     }
 }
