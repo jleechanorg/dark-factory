@@ -28,7 +28,9 @@ use daemon::er_runner;
 use daemon::errors::DaemonError;
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
-use daemon::tools::{Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrHeadBranch, PrSnapshot, Scm};
+use daemon::tools::{
+    Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrHeadBranch, PrSnapshot, Scm,
+};
 use daemon::verifier::SkepticVerdict;
 
 fn test_cfg() -> Config {
@@ -51,6 +53,7 @@ fn test_cfg() -> Config {
         reroll_death_confirm_secs: 0,
         held_recheck_cooldown_secs: 900,
         repos: std::collections::HashMap::new(),
+        pre_gate_validation_enabled: false,
     }
 }
 
@@ -135,6 +138,14 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
     let mut overlay = overlay_after_tick1;
     overlay.pr_number = Some(101);
     store.save(&overlay).unwrap();
+    // jleechan-t40t r6: the slow-tier branch→PR re-resolution now
+    // fail-closed-clears stale pr_number when the branch has no live PR.
+    // Script the fake branch→PR lookup so the gate-assessment path
+    // proceeds against the live PR 101 (not None).
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), "factory/fake-bead-1-r1".into()),
+        Some(101),
+    );
     scm.pr_snapshots.insert(
         101,
         PrSnapshot {
@@ -436,13 +447,13 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            // jleechan-8jxr r2: real intake-persisted overlays carry a
-            // resolved `target_repo`; the old `None` here relied on the
-            // pre-fix silent default to `cfg.target_repo`. Update the
-            // test fixture to reflect production reality.
-            target_repo: Some("owner/repo".to_string()),
+                pre_session_head_sha: None,
+                park_reason: None,
+                // jleechan-8jxr r2: real intake-persisted overlays carry a
+                // resolved `target_repo`; the old `None` here relied on the
+                // pre-fix silent default to `cfg.target_repo`. Update the
+                // test fixture to reflect production reality.
+                target_repo: Some("owner/repo".to_string()),
             })
             .unwrap();
     }
@@ -979,7 +990,8 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
     // handle (the durable record pointing at a session that was never
     // ours to own) without touching AO.
     assert_eq!(
-        held.session_id, None,
+        held.session_id,
+        None,
         "session_branch_mismatch park MUST drop the bad overlay handle so \
          the leaked record cannot poison future redispatches of THIS bead \
          via the AO dedup guard. Calls: {:?}",
@@ -997,10 +1009,7 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
          legitimate worker. Calls: {:?}",
         sessions.calls.borrow()
     );
-    assert_eq!(
-        held.park_reason.as_deref(),
-        Some("session_branch_mismatch")
-    );
+    assert_eq!(held.park_reason.as_deref(), Some("session_branch_mismatch"));
     assert!(
         !sessions
             .calls
@@ -2317,7 +2326,10 @@ fn adopted_red_pr_stage2_reroll_spawns_remediation_session_leaves_pr_open() {
     let mut cfg = test_cfg();
     cfg.stage = 2; // Stage 2: actually execute reroll() rather than just recording the verdict
     let mut vcs = FakeVcs::new();
-    vcs.heads.insert("alice/my-cool-feature".into(), "pre-session-sha-abc123".into());
+    vcs.heads.insert(
+        "alice/my-cool-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
     let telemetry_log = std::env::temp_dir().join("afd_adopted_stage2_success.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -2453,7 +2465,10 @@ fn adopted_red_pr_stage2_reroll_spawn_failure_parks_human_held_with_escalation()
     let mut cfg = test_cfg();
     cfg.stage = 2;
     let mut vcs = FakeVcs::new();
-    vcs.heads.insert("alice/my-conflicted-feature".into(), "pre-session-sha-abc123".into());
+    vcs.heads.insert(
+        "alice/my-conflicted-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
     sessions.fail_spawn_for("fake-bead-1");
     let telemetry_log = std::env::temp_dir().join("afd_adopted_stage2_conflict.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -2574,8 +2589,7 @@ fn adopted_red_pr_structural_only_red_gates_holds_disposition_required_not_rerol
     let mut cfg = test_cfg();
     cfg.stage = 2; // Stage 2: reroll normally executes; our new branch must preempt it
     let vcs = FakeVcs::new();
-    let telemetry_log =
-        std::env::temp_dir().join("afd_structural_only_red_gates.jsonl");
+    let telemetry_log = std::env::temp_dir().join("afd_structural_only_red_gates.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
     let summary = run_tick(
@@ -2632,8 +2646,7 @@ fn adopted_red_pr_structural_only_red_gates_holds_disposition_required_not_rerol
     );
 
     // Telemetry must show DISPOSITION_REQUIRED, not PARKED_HUMAN_HELD.
-    let log_contents =
-        std::fs::read_to_string(&telemetry_log).expect("telemetry log must exist");
+    let log_contents = std::fs::read_to_string(&telemetry_log).expect("telemetry log must exist");
     assert!(
         log_contents.contains("\"DISPOSITION_REQUIRED\""),
         "DISPOSITION_REQUIRED telemetry event must be emitted; log:\n{log_contents}"
@@ -2716,8 +2729,7 @@ fn adopted_red_pr_mixed_red_gates_still_rerolls() {
         "alice/mixed-red-gates".into(),
         "pre-session-sha-mixed".into(),
     );
-    let telemetry_log =
-        std::env::temp_dir().join("afd_mixed_red_gates_rerolls.jsonl");
+    let telemetry_log = std::env::temp_dir().join("afd_mixed_red_gates_rerolls.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
     let summary = run_tick(
@@ -2768,8 +2780,7 @@ fn adopted_red_pr_mixed_red_gates_still_rerolls() {
         session_calls.iter().any(|c| c.starts_with("spawn(")),
         "reroll must spawn a remediation session: {session_calls:?}"
     );
-    let log_contents =
-        std::fs::read_to_string(&telemetry_log).expect("telemetry log must exist");
+    let log_contents = std::fs::read_to_string(&telemetry_log).expect("telemetry log must exist");
     assert!(
         log_contents.contains("\"REROLL_START\""),
         "reroll must emit REROLL_START telemetry; log:\n{log_contents}"
@@ -3222,7 +3233,10 @@ fn drive_existing_pr_bead_dispatches_onto_pr_head_branch_not_generated_branch() 
     };
 
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
-    assert_eq!(summary.beads_dispatched, 1, "the drive-PR bead must dispatch");
+    assert_eq!(
+        summary.beads_dispatched, 1,
+        "the drive-PR bead must dispatch"
+    );
 
     let final_overlay = store
         .load("jleechan-af-drive-pr288-gd2x")
@@ -3258,7 +3272,8 @@ fn drive_existing_pr_bead_dispatches_onto_pr_head_branch_not_generated_branch() 
         .find(|e| e["eventType"] == "TASK_DISPATCHED")
         .expect("TASK_DISPATCHED event must be emitted");
     assert_eq!(
-        dispatched["context"]["branch"], "factory/jleechan-xa99-reconciliation-rebased"
+        dispatched["context"]["branch"],
+        "factory/jleechan-xa99-reconciliation-rebased"
     );
     assert_eq!(
         dispatched["context"]["branch_mode"], "pr_head",
@@ -3623,12 +3638,16 @@ fn newly_intaken_bead_dispatch_uses_real_tracker_title() {
     // tracker title reaches the coder, not an empty stub — is preserved as a
     // containment check, plus the tracker-supplied description.
     assert!(
-        prompts[0].1.contains("Wire a durable Linux trigger (owner/repo)"),
+        prompts[0]
+            .1
+            .contains("Wire a durable Linux trigger (owner/repo)"),
         "new intake must dispatch the real tracker title, not an empty stub prompt: {}",
         prompts[0].1
     );
     assert!(
-        prompts[0].1.contains("systemd user unit acceptance criteria"),
+        prompts[0]
+            .1
+            .contains("systemd user unit acceptance criteria"),
         "tracker-supplied description must reach the coder prompt: {}",
         prompts[0].1
     );
@@ -3899,9 +3918,16 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
         log.contains("\"prior_state\":\"HUMAN_HELD\""),
         "telemetry metadata must record the prior HUMAN_HELD state; got: {log}"
     );
+    // jleechan-t40t r6: production state.rs::recover_human_held clears
+    // pr_number = NULL on recovery (line ~1239) so the recovered overlay
+    // does NOT carry the dead PR from the prior attempt into the new
+    // dispatch. FakeStateStore mirrors that contract, so the RECOVERED
+    // telemetry event reports `pr_number: null` — the prior PR number is
+    // intentionally NOT carried forward.
     assert!(
-        log.contains("\"pr_number\":4242"),
-        "telemetry metadata must carry the recovered PR number; got: {log}"
+        log.contains("\"pr_number\":null"),
+        "telemetry metadata must record the cleared (null) pr_number after \
+         recover_human_held clears it (mirrors production contract); got: {log}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -5084,7 +5110,16 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
         overlay.autonomy_secs, 0,
         "autonomy_secs must reset (matches shell `recover-held`); the next dispatch starts fresh"
     );
-    assert_eq!(overlay.pr_number, Some(5050));
+    assert_eq!(
+        overlay.pr_number, None,
+        "recover_human_held must clear pr_number so the recovered bead does \
+         NOT carry the dead PR from the prior attempt into the new dispatch \
+         (mirrors production state.rs::recover_human_held)"
+    );
+    assert_eq!(
+        overlay.session_id, None,
+        "recover_human_held must clear session_id (mirror production contract)"
+    );
     assert_eq!(
         summary.beads_recovered_from_held, 1,
         "summary must reflect the recovery (no shell `recover-held` was invoked)"
@@ -5232,9 +5267,9 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
                 session_id: Some("sess-1".into()),
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             })
             .unwrap();
         store
@@ -6926,10 +6961,8 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         },
     );
 
-    let telemetry_log = std::env::temp_dir().join(format!(
-        "afd_wzgl_gate_report_{}.jsonl",
-        std::process::id()
-    ));
+    let telemetry_log =
+        std::env::temp_dir().join(format!("afd_wzgl_gate_report_{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&telemetry_log);
 
     let summary = run_tick(
@@ -6948,15 +6981,20 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     )
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
-    assert_eq!(summary.beads_ready, 1, "bead should reach READY via the agy fallback verdict");
+    assert_eq!(
+        summary.beads_ready, 1,
+        "bead should reach READY via the agy fallback verdict"
+    );
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
     let gate_assessment_line = telemetry
         .lines()
         .find(|line| line.contains("\"eventType\":\"GATE_ASSESSMENT\""))
         .unwrap_or_else(|| panic!("no GATE_ASSESSMENT line found; telemetry:\n{telemetry}"));
-    let parsed: serde_json::Value = serde_json::from_str(gate_assessment_line)
-        .unwrap_or_else(|e| panic!("GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(gate_assessment_line).unwrap_or_else(|e| {
+            panic!("GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}")
+        });
     let context = &parsed["context"];
 
     // jleechan-wzgl (PR #239 review round 1): `gates` MUST be a
@@ -6992,9 +7030,9 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         );
     }
 
-    let skeptic_reviewers = context["skeptic_reviewers"]
-        .as_array()
-        .unwrap_or_else(|| panic!("GATE_ASSESSMENT context.skeptic_reviewers must be an array; context:\n{context}"));
+    let skeptic_reviewers = context["skeptic_reviewers"].as_array().unwrap_or_else(|| {
+        panic!("GATE_ASSESSMENT context.skeptic_reviewers must be an array; context:\n{context}")
+    });
     let skeptic_reviewers: Vec<&str> = skeptic_reviewers
         .iter()
         .filter_map(|v| v.as_str())
@@ -7152,8 +7190,7 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
     snapshot.ci_status = "failure".into();
     scm.pr_snapshots.insert(pr, snapshot);
 
-    let telemetry_log =
-        std::env::temp_dir().join("afd_9xrs_cross_repo_verification_loop.jsonl");
+    let telemetry_log = std::env::temp_dir().join("afd_9xrs_cross_repo_verification_loop.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
     let summary = run_tick(
@@ -7243,7 +7280,9 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
     let skeptic_prompt = llm_calls
         .iter()
         .find(|c| c.contains("Stage-1 Skeptic"))
-        .unwrap_or_else(|| panic!("expected a Stage-1 Skeptic prompt among judge() calls, got: {llm_calls:?}"));
+        .unwrap_or_else(|| {
+            panic!("expected a Stage-1 Skeptic prompt among judge() calls, got: {llm_calls:?}")
+        });
     assert!(
         skeptic_prompt.contains("owner/repo"),
         "skeptic prompt must embed the bead's own repo, got: {skeptic_prompt:?}"
@@ -8259,7 +8298,11 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
     let mut scm = FakeScm::new();
     let mut snap_a = qdw_green_snapshot(
         801,
-        vec![PrComment { author: "dark-factory-er".into(), body: "/er PASS".into(), created_at_epoch: 0 }],
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
     );
     snap_a.ci_success = false;
     snap_a.ci_status = "failure".into();
@@ -8267,7 +8310,11 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
 
     let mut snap_b = qdw_green_snapshot(
         802,
-        vec![PrComment { author: "dark-factory-er".into(), body: "/er PASS".into(), created_at_epoch: 0 }],
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
     );
     snap_b.ci_success = false;
     snap_b.ci_status = "failure".into();
@@ -8291,8 +8338,18 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
         .insert("bob/cq8r-bead-b-branch".into(), "bead-b-head-sha".into());
 
     for (bead_id, pr, branch, prior_text) in [
-        ("cq8r-bead-a", 801u64, "alice/cq8r-bead-a-branch", "BEAD-A-PRIOR-MARKER"),
-        ("cq8r-bead-b", 802u64, "bob/cq8r-bead-b-branch", "bead-b-prior-text"),
+        (
+            "cq8r-bead-a",
+            801u64,
+            "alice/cq8r-bead-a-branch",
+            "BEAD-A-PRIOR-MARKER",
+        ),
+        (
+            "cq8r-bead-b",
+            802u64,
+            "bob/cq8r-bead-b-branch",
+            "bead-b-prior-text",
+        ),
     ] {
         store
             .save(&BeadOverlay {
@@ -8477,8 +8534,7 @@ fn write_fake_gh_capturing_repo_arg(
         expect_num = expect_num,
         capture = capture_file.display()
     );
-    std::fs::write(&path, script)
-        .unwrap_or_else(|e| panic!("failed to write fake gh: {e}"));
+    std::fs::write(&path, script).unwrap_or_else(|e| panic!("failed to write fake gh: {e}"));
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).unwrap();
@@ -8859,7 +8915,10 @@ fn tick_deferred_reroll_stays_attested_and_reselects_next_tick() {
     };
 
     let summary1 = run_tick(&deps, 1, 0).expect("tick 1 should succeed");
-    assert_eq!(summary1.gates_assessed, 1, "tick 1 must gate-assess the ATTESTED bead");
+    assert_eq!(
+        summary1.gates_assessed, 1,
+        "tick 1 must gate-assess the ATTESTED bead"
+    );
     let after1 = store.load("defer-bead").unwrap().unwrap();
     assert_eq!(
         after1.state,
@@ -9120,10 +9179,7 @@ fn session_branch_mismatch_park_kills_associated_ao_session_and_clears_handle() 
     // Script the fake AO session to report a branch that does NOT match
     // the bead's registered branch, so `deps.sessions.session_branch` returns
     // `Ok(Some(<actual>))` and the positive-mismatch check fires.
-    sessions.set_session_branch(
-        "df-mh9o-mismatch",
-        "factory/wa-3004-hook-refactor",
-    );
+    sessions.set_session_branch("df-mh9o-mismatch", "factory/wa-3004-hook-refactor");
 
     let telemetry_log = std::env::temp_dir().join("afd_test_mh9o_mismatch.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -9301,8 +9357,10 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
         "factory/bead-mh9o-adopted-r1".into(),
         "bbbbbbbbbbbbbbbb".into(),
     );
-    vcs.ancestor_pairs
-        .insert(("aaaaaaaaaaaaaaaa".into(), "bbbbbbbbbbbbbbbb".into()), false);
+    vcs.ancestor_pairs.insert(
+        ("aaaaaaaaaaaaaaaa".into(), "bbbbbbbbbbbbbbbb".into()),
+        false,
+    );
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -9430,7 +9488,8 @@ fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
         .as_deref()
         .expect("HUMAN_HELD overlay must have a park_reason");
     assert!(
-        park_reason == "unmapped_repo" || park_reason.starts_with("escalation_local_fallback:unmapped_repo"),
+        park_reason == "unmapped_repo"
+            || park_reason.starts_with("escalation_local_fallback:unmapped_repo"),
         "park_reason must be unmapped_repo-derived, got: {park_reason:?}"
     );
 
@@ -9448,9 +9507,9 @@ fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
         "telemetry MUST emit PARKED_HUMAN_HELD for unmapped_repo parks; events = {:?}",
         events
     );
-    let transient_error = events
-        .iter()
-        .find(|e| e["eventType"] == "BEAD_DISPATCH_TRANSIENT_ERROR" && e["beadId"] == "no-repo-bead");
+    let transient_error = events.iter().find(|e| {
+        e["eventType"] == "BEAD_DISPATCH_TRANSIENT_ERROR" && e["beadId"] == "no-repo-bead"
+    });
     assert!(
         transient_error.is_none(),
         "unmapped_repo park must NOT fall through to BEAD_DISPATCH_TRANSIENT_ERROR; events = {:?}",
@@ -9663,6 +9722,11 @@ fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
     // Branch→PR lookup agrees with the stored pr_number — no drift.
     scm.pr_numbers_for_branch
         .insert(("owner/repo".into(), branch.into()), Some(4001));
+    // Pre-gate validation: stored pr 4001 is OPEN on the same branch.
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 4001),
+        PrHeadBranch::SameRepo(branch.into()),
+    );
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9720,5 +9784,259 @@ fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
     );
     let after = store.load("clean-pr-bead").unwrap().unwrap();
     assert_eq!(after.pr_number, Some(4001));
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-t40t r6 contract: a DISPATCHED bead whose stored `pr_number`
+/// points at a PR that has MERGED (or otherwise no longer exists for the
+/// bead's branch) must NOT promote to ATTESTED against the stale number.
+/// The pre-fix path treated `Ok(None)` from `pr_number_for_branch` as
+/// "no drift — keep the stored value", which let a stale `pr_number`
+/// ride through DISPATCHED→ATTESTED against a PR the branch was no
+/// longer bound to, leaving the bead stuck against a closed/merged PR
+/// forever. Fail-closed: clear the stale `pr_number`, stay DISPATCHED,
+/// emit `PR_NUMBER_REREZOLVED_NO_OPEN_PR` so the operator can grep it.
+#[test]
+fn slow_tier_dispatched_branch_mismatch_clears_stale_pr_number_when_branch_has_no_open_pr() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    // Repro: bead's branch is a FRESH -rN (no open PR exists yet), but
+    // a stale `pr_number` from a prior attempt (or a PR that already
+    // merged and was reopened under a new number) is recorded on the
+    // overlay. Pre-fix: bead promoted to ATTESTED against the stale PR.
+    // Post-fix: stale `pr_number` cleared, bead stays DISPATCHED.
+    let branch = "factory/merged-prior-pr-r2";
+    store
+        .save(&BeadOverlay {
+            bead_id: "merged-prior-pr".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(6001), // stale: prior PR merged/closed
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("merged-prior-pr", branch).unwrap();
+
+    // Branch→PR lookup returns Ok(None): the branch has no open PR.
+    // (Mirrors the post-merge "fresh -rN" repro: the stale PR is closed,
+    // and the new branch has nothing bound yet.)
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), None);
+
+    // No scripted snapshot for the stale 6001 — it must never be queried.
+    let telemetry_log = std::env::temp_dir().join("afd_t40t_branch_mismatch_no_open_pr.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let _ = run_tick(&deps, 1, 0).expect("tick should succeed");
+    let after = store.load("merged-prior-pr").unwrap().unwrap();
+
+    // Fail-closed contract: stale pr_number MUST be cleared and bead MUST
+    // stay DISPATCHED. Promoting to ATTESTED against a closed/merged PR
+    // would route every gate assessment at a dead PR — exactly the
+    // jleechan-t8fd / PR #316 wedge the r6 guidance addresses.
+    assert_eq!(
+        after.pr_number, None,
+        "stale pr_number must be cleared when branch→PR resolves to Ok(None); \
+         the merged-PRIor-PR repro keeps the bead wedged otherwise"
+    );
+    assert_eq!(
+        after.state,
+        OverlayState::Dispatched,
+        "bead must stay DISPATCHED when no live PR exists for its branch; \
+         promotion to ATTESTED against a stale/closed PR is the r6 defect"
+    );
+
+    // Auditability: the daemon log carries PR_NUMBER_REREZOLVED_NO_OPEN_PR
+    // so the operator can grep for it without reading code.
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let no_open_pr = events
+        .iter()
+        .find(|e| e["eventType"].as_str() == Some("PR_NUMBER_REREZOLVED_NO_OPEN_PR"))
+        .expect(
+            "expected PR_NUMBER_REREZOLVED_NO_OPEN_PR telemetry when stale pr_number is cleared",
+        );
+    let ctx = &no_open_pr["context"];
+    assert_eq!(ctx["branch"].as_str(), Some(branch));
+    assert_eq!(ctx["previous_pr_number"].as_u64(), Some(6001));
+    assert_eq!(ctx["reason"].as_str(), Some("branch_mismatch_no_open_pr"));
+
+    // Sanity: the stale pr 6001 must NEVER be queried for a snapshot.
+    let calls = scm.calls.borrow();
+    assert!(
+        !calls.iter().any(|c| c.contains(",6001)")),
+        "no gate assessment may target the stale pr 6001 after it's cleared: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == &format!("pr_number_for_branch(owner/repo,{branch})")),
+        "expected pr_number_for_branch lookup on this branch: {calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-t40t r6: gate assessment must NOT proceed against a stored
+/// `pr_number` whose underlying PR is no longer OPEN, or whose head ref
+/// has drifted off the bead's recorded branch. Mismatches re-resolve by
+/// head branch; inconclusive lookups DEFER (do NOT promote, do NOT
+/// gate-assess against the stale pr).
+#[test]
+fn slow_tier_pre_gate_validation_re_resolves_when_stored_pr_no_longer_open() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let mut cfg = test_cfg();
+    // Pre-gate validation is opt-in (default false) so legacy tests
+    // aren't disturbed. This test exercises pre-gate drift detection,
+    // so enable it.
+    cfg.pre_gate_validation_enabled = true;
+
+    // Bead reached ATTESTED via the slow tier, but the stored pr 7001
+    // is now CLOSED. Branch has a NEW live PR (7002) bound to it.
+    // Gate assessment must NOT query the closed 7001.
+    let branch = "factory/drifted-pr-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "drifted-pr".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(7001),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("drifted-pr", branch).unwrap();
+
+    // Stored pr 7001 is CLOSED (not OPEN) — head ref differs from bead's branch.
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 7001),
+        PrHeadBranch::NotFound, // closed -> NotFound
+    );
+    // Branch→PR re-resolution succeeds with the current 7002.
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(7002));
+
+    // Script the new PR's snapshot.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        7002,
+        PrSnapshot {
+            pr_number: 7002,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadbeef".into(),
+            body: "".into(),
+            comments: vec![PrComment {
+                author: "reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: now,
+            }],
+            files: vec![],
+            updated_at_epoch: now,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_t40t_pre_gate_validation_drift.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let _ = run_tick(&deps, 1, 0).expect("tick should succeed");
+    let after = store.load("drifted-pr").unwrap().unwrap();
+
+    // The stale pr_number must have been re-resolved to 7002, and gate
+    // assessment must have queried 7002 (not the stale 7001).
+    assert_eq!(
+        after.pr_number,
+        Some(7002),
+        "pre-gate validation must re-resolve pr_number from the branch when \
+         the stored pr is no longer OPEN"
+    );
+    let calls = scm.calls.borrow();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == "pr_snapshot_for_repo(owner/repo,7002)"),
+        "gate assessment must query the re-resolved 7002: {calls:?}"
+    );
+    // Pre-gate probes (ci_pending_for_attested, active-overlay wedge loop)
+    // ARE allowed to query the stale 7001 BEFORE the re-resolution runs.
+    // What MUST NOT happen is any pr_snapshot_for_repo call AFTER the
+    // `pr_number_for_branch` re-resolution that still targets 7001 — that
+    // would mean a gate-assessment landed on the closed PR.
+    let pr_reresolve_idx = calls
+        .iter()
+        .position(|c| c == "pr_number_for_branch(owner/repo,factory/drifted-pr-r1)")
+        .expect("expected a pr_number_for_branch re-resolution call");
+    let post_reresolve_calls = &calls[pr_reresolve_idx + 1..];
+    assert!(
+        !post_reresolve_calls.iter().any(|c| c.contains(",7001)")),
+        "no pr_snapshot_for_repo targeting the stale 7001 may fire AFTER \
+         pre-gate validation re-resolved to 7002; got: {post_reresolve_calls:?}"
+    );
+
     let _ = std::fs::remove_file(&telemetry_log);
 }
