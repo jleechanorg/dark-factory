@@ -4049,8 +4049,84 @@ impl Vcs for CliVcs {
         Ok(out.trim().to_string())
     }
 
+    /// jleechan-wuts / issue #349: routed-repo variant of [`base_head`].
+    /// `gh api repos/<repo>/git/ref/heads/<branch>` returns the SHA at
+    /// the HEAD of `<branch>` in `<repo>`. Equivalent in shape to
+    /// `remote_head_sha` (`repos/<repo>/commits/<branch>` returns the
+    /// same SHA, but `git/ref/heads/<branch>` is the Git Data API's
+    /// canonical "branch HEAD" lookup and is what `gh` itself uses
+    /// internally for branch refs). Decoupled from the daemon's own
+    /// cwd (its systemd `WorkingDirectory`, the daemon's own source-repo
+    /// checkout), so a bead whose `overlay.repo(cfg)` names a DIFFERENT
+    /// repo from `cfg.target_repo` resolves the baseline against the
+    /// routed repo instead of the daemon's own repo's same-named branch.
+    ///
+    /// Branches containing `/` (e.g. `release/2026-q3`) survive intact:
+    /// the `git/ref/heads/` prefix accepts embedded slashes the same
+    /// way `commits/<branch>` already does (cf. the doc comment on
+    /// `remote_head_sha`).
+    fn base_head_for_repo(&self, repo: &str, base_branch: &str) -> Result<String, DaemonError> {
+        let path = format!("repos/{}/git/ref/heads/{}", repo, base_branch);
+        let out = run_tool("gh", &["api", &path, "--jq", ".object.sha"], 30)?;
+        let sha = out.trim();
+        // `gh api ... --jq .object.sha` exits 0 with the literal string
+        // `null` when the branch doesn't exist in the target repo --
+        // treat that as an error rather than a valid SHA, mirroring the
+        // `remote_head_sha` policy above.
+        if sha.is_empty() || sha == "null" {
+            return Err(DaemonError::Tool {
+                tool: "gh".to_string(),
+                rc: 0,
+                stderr: format!(
+                    "gh api {path} returned no sha for branch '{base_branch}' in {repo}"
+                ),
+            });
+        }
+        Ok(sha.to_string())
+    }
+
     fn create_branch_at(&self, name: &str, sha: &str) -> Result<(), DaemonError> {
         run_tool("git", &["branch", name, sha], 30)?;
+        Ok(())
+    }
+
+    /// jleechan-wuts / issue #349: routed-repo variant of
+    /// [`create_branch_at`]. POSTs a `refs/heads/<name>` ref via the
+    /// Git Data API at `repos/<repo>/git/refs`. Decoupled from the
+    /// daemon's own cwd (its systemd `WorkingDirectory`, the daemon's
+    /// own source-repo checkout), so the new attempt's
+    /// `factory/<bead>-r<n>` branch lands in the routed target repo
+    /// where the worker will actually push -- not in the daemon's own
+    /// source-repo checkout, where the old CWD-bound `git branch
+    /// <name> <sha>` would have silently created it (and where the
+    /// worker's first `git push` would then race or be rejected).
+    ///
+    /// The endpoint rejects a ref that already exists in `<repo>`
+    /// with HTTP 422 -- the reroll path always passes a freshly
+    /// formatted `factory/<bead>-r<attempt>` branch (incremented per
+    /// attempt), so a collision in the routed repo is structurally
+    /// impossible absent a stale `register_branch`/gh-state mismatch;
+    /// the underlying `DaemonError::Tool` with the HTTP body as
+    /// stderr surfaces that case to the operator for the same reason
+    /// the old CWD-bound `git branch <name> <sha>` did.
+    fn create_branch_at_for_repo(&self, repo: &str, name: &str, sha: &str) -> Result<(), DaemonError> {
+        let path = format!("repos/{}/git/refs", repo);
+        let ref_path = format!("refs/heads/{name}");
+        let out = run_tool(
+            "gh",
+            &[
+                "api",
+                "--method",
+                "POST",
+                &path,
+                "-f",
+                &format!("ref={ref_path}"),
+                "-f",
+                &format!("sha={sha}"),
+            ],
+            30,
+        )?;
+        let _ = out; // POST success returns the created ref object; we don't need its body.
         Ok(())
     }
 
