@@ -491,6 +491,7 @@ impl SqliteStateStore {
         Self::ensure_park_reason_column(&conn)?;
         Self::ensure_target_repo_column(&conn)?;
         Self::ensure_reroll_deferral_count_column(&conn)?;
+        Self::ensure_disposition_required_state(&conn)?;
         Ok(Self { conn })
     }
 
@@ -508,6 +509,7 @@ impl SqliteStateStore {
         Self::ensure_park_reason_column(&conn)?;
         Self::ensure_target_repo_column(&conn)?;
         Self::ensure_reroll_deferral_count_column(&conn)?;
+        Self::ensure_disposition_required_state(&conn)?;
         Ok(Self { conn })
     }
 
@@ -690,6 +692,86 @@ impl SqliteStateStore {
                 [],
             )
             .map_err(|e| tool_err("ensure_reroll_deferral_count_column: add column", e))?;
+        }
+        Ok(())
+    }
+
+    /// Bead jleechan-zaga / issue #348: migrate the `bead_overlay.state` CHECK
+    /// constraint to allow `'DISPOSITION_REQUIRED'`. Unlike every other
+    /// migration above (which add nullable/defaulted COLUMNS via `ALTER TABLE
+    /// … ADD COLUMN`), this changes a CHECK constraint — and SQLite supports
+    /// no `ALTER TABLE … DROP/ALTER CONSTRAINT`. `CREATE TABLE IF NOT EXISTS`
+    /// in `schema.sql` is a NO-OP on a live DB that already has the table, so
+    /// it never updates the constraint: a live daemon started against a
+    /// pre-#348 DB would hit `CHECK constraint failed` the first time it tried
+    /// to persist a `DISPOSITION_REQUIRED` bead. The only portable fix is the
+    /// documented SQLite table-rebuild dance (create-copy-drop-rename).
+    ///
+    /// Runs LAST (after every `ensure_*_column` migration) so the live table
+    /// already carries the full current column set; the rebuild derives the
+    /// new table definition by editing the live table's OWN
+    /// `sqlite_master.sql` (only the state CHECK list changes), so column
+    /// names, order, types, and defaults are preserved EXACTLY and the copy is
+    /// a positional `SELECT *`. Idempotent: once the stored DDL already lists
+    /// `DISPOSITION_REQUIRED` (a fresh `schema.sql` DB, or a previously
+    /// migrated one), it early-returns.
+    fn ensure_disposition_required_state(conn: &Connection) -> Result<(), DaemonError> {
+        let existing_ddl: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'bead_overlay'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| tool_err("ensure_disposition_required_state: read ddl", e))?;
+        let Some(ddl) = existing_ddl else {
+            // No table at all (should not happen: schema.sql created it) —
+            // nothing to migrate; the fresh CREATE already carries the state.
+            return Ok(());
+        };
+        if ddl.contains("DISPOSITION_REQUIRED") {
+            // Fresh schema.sql DB, or an already-migrated live DB.
+            return Ok(());
+        }
+        // Derive the new table DDL from the live one: rename the table and
+        // extend the state CHECK list with the new value. `'HUMAN_HELD'` is
+        // the last state in the IN-list and appears only inside this CHECK, so
+        // the two targeted replacements are unambiguous.
+        if !ddl.contains("'HUMAN_HELD')") {
+            // No recognizable state CHECK list to extend (e.g. a very old
+            // legacy DB whose `state` column carries no CHECK at all — some
+            // predate the constraint). In that case `DISPOSITION_REQUIRED` is
+            // already insertable, so there is nothing to migrate; leave the
+            // table untouched rather than guessing at an unrecognized shape.
+            return Ok(());
+        }
+        let rebuilt_ddl = ddl
+            .replacen(
+                "CREATE TABLE bead_overlay",
+                "CREATE TABLE bead_overlay_disposition_migrated",
+                1,
+            )
+            .replacen(
+                "'HUMAN_HELD')",
+                "'HUMAN_HELD','DISPOSITION_REQUIRED')",
+                1,
+            );
+        // Atomic create-copy-drop-rename. A positional `SELECT *` is safe
+        // because the new table is the old table's own DDL with only the
+        // CHECK list changed — identical column set and order.
+        let batch = format!(
+            "BEGIN IMMEDIATE;\n\
+             {rebuilt_ddl};\n\
+             INSERT INTO bead_overlay_disposition_migrated SELECT * FROM bead_overlay;\n\
+             DROP TABLE bead_overlay;\n\
+             ALTER TABLE bead_overlay_disposition_migrated RENAME TO bead_overlay;\n\
+             COMMIT;"
+        );
+        if let Err(e) = conn.execute_batch(&batch) {
+            // Best-effort rollback so a half-applied rebuild doesn't wedge the
+            // next open; surface the original error either way.
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(tool_err("ensure_disposition_required_state: rebuild", e));
         }
         Ok(())
     }
@@ -1446,6 +1528,103 @@ mod tests {
         // Incrementing/reading a bead with no overlay row is a no-op read of 0
         // (the UPDATE matches nothing) rather than an error.
         assert_eq!(s.reroll_deferral_count("no-such-bead").unwrap(), 0);
+    }
+
+    /// Bead jleechan-zaga / issue #348: a live DB created before the
+    /// DISPOSITION_REQUIRED CHECK migration must (a) reject the new state on
+    /// the legacy constraint, (b) be rebuilt by
+    /// `ensure_disposition_required_state` preserving existing rows, (c) then
+    /// accept the new state, and (d) be idempotent on a second run.
+    #[test]
+    fn disposition_required_migration_rebuilds_check_and_preserves_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The pre-#348 schema: identical to the shipped schema.sql except the
+        // state CHECK list omits DISPOSITION_REQUIRED (synthesized by undoing
+        // the one-token addition so the test tracks the real DDL).
+        let legacy = include_str!("../contracts/schema.sql")
+            .replace("'HUMAN_HELD','DISPOSITION_REQUIRED')", "'HUMAN_HELD')");
+        assert!(
+            !legacy.contains("DISPOSITION_REQUIRED"),
+            "legacy schema fixture must not already carry the new state"
+        );
+        conn.execute_batch(&legacy).unwrap();
+
+        // A pre-existing row written under the legacy constraint.
+        conn.execute(
+            "INSERT INTO bead_overlay (bead_id, state, updated_at) \
+             VALUES ('b-legacy', 'ATTESTED', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // The legacy CHECK rejects the new state — this is the exact live
+        // failure the migration exists to fix.
+        assert!(
+            conn.execute(
+                "INSERT INTO bead_overlay (bead_id, state, updated_at) \
+                 VALUES ('b-new', 'DISPOSITION_REQUIRED', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .is_err(),
+            "legacy CHECK must reject DISPOSITION_REQUIRED before migration"
+        );
+
+        // Run the migration.
+        SqliteStateStore::ensure_disposition_required_state(&conn).unwrap();
+
+        // (b) existing rows preserved through the rebuild.
+        let preserved: String = conn
+            .query_row(
+                "SELECT state FROM bead_overlay WHERE bead_id = 'b-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, "ATTESTED");
+        // (c) the new state is now accepted.
+        conn.execute(
+            "INSERT INTO bead_overlay (bead_id, state, updated_at) \
+             VALUES ('b-new', 'DISPOSITION_REQUIRED', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("post-migration CHECK must accept DISPOSITION_REQUIRED");
+
+        // (d) idempotent: a second run is a no-op and preserves both rows.
+        SqliteStateStore::ensure_disposition_required_state(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bead_overlay", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    /// End-to-end via the public open path: a store opened against a
+    /// legacy-constraint schema string can persist and reload a
+    /// DISPOSITION_REQUIRED overlay (the migration runs inside
+    /// `open_in_memory_with_schema`).
+    #[test]
+    fn open_migrates_legacy_check_and_persists_disposition_required_overlay() {
+        let legacy = include_str!("../contracts/schema.sql")
+            .replace("'HUMAN_HELD','DISPOSITION_REQUIRED')", "'HUMAN_HELD')");
+        let s = SqliteStateStore::open_in_memory_with_schema(&legacy).unwrap();
+        let o = BeadOverlay {
+            bead_id: "held-bead".into(),
+            state: OverlayState::DispositionRequired,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(708),
+            branch: Some("alice/feature".into()),
+            session_id: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        };
+        s.save(&o).expect("DISPOSITION_REQUIRED must persist after open-time migration");
+        let got = s.load("held-bead").unwrap().unwrap();
+        assert_eq!(got.state, OverlayState::DispositionRequired);
+        assert_eq!(got.pr_number, Some(708));
     }
 
     #[test]

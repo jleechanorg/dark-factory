@@ -2524,11 +2524,13 @@ fn adopted_red_pr_structural_only_red_gates_holds_disposition_required_not_rerol
             created_at_epoch: 0,
         }],
     );
-    // Structural-red-only: CodeRabbit usage-limit (the snapshot's
-    // `coderabbit_status="blocked"` is the SCM-emitted signal when CR
-    // is rate-limited; see verifier::classify_red_gate).
+    // Structural-only blocker: CodeRabbit unavailable. Production emits
+    // `coderabbit_status="unknown"` (adapters.rs) — NOT a synthetic "blocked"
+    // — which verifier::assess maps to an `Unknown` CodeRabbit gate. That is
+    // the sole non-green gate, and the coder cannot make CodeRabbit run, so
+    // classify_chain -> HoldDisposition.
     snapshot.coderabbit_approved = false;
-    snapshot.coderabbit_status = "blocked".into();
+    snapshot.coderabbit_status = "unknown".into();
     scm.pr_snapshots.insert(708, snapshot);
 
     let tracker = FakeTracker::new();
@@ -2628,16 +2630,19 @@ fn adopted_red_pr_structural_only_red_gates_holds_disposition_required_not_rerol
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
-/// jleechan-zaga / issue #348: mixed redness (one structural red + one
-/// coder-fixable red) must keep today's reroll behavior — the issue's
-/// explicit acceptance criterion: "mixed red → reroll as today".
+/// jleechan-zaga / issue #348: mixed redness (a coder-fixable RED gate plus a
+/// structural-pending gate) must keep today's reroll behavior — the issue's
+/// explicit acceptance criterion "mixed red → reroll as today". Blocker 4:
+/// this asserts a re-roll ACTUALLY OCCURRED (attempt increment + REROLL_START
+/// telemetry + a spawned remediation session), not merely the absence of
+/// DISPOSITION_REQUIRED.
 #[test]
 fn adopted_red_pr_mixed_red_gates_still_rerolls() {
     let mut scm = FakeScm::new();
     scm.prs.push(LabeledPr {
         number: 709,
         title: "Adopted PR with mixed red gates".into(),
-        body: "CI broken + CodeRabbit blocked".into(),
+        body: "CI broken + CodeRabbit unavailable".into(),
         author_login: "alice".into(),
         external_ref: "owner/repo#709".into(),
         head_ref_name: "alice/mixed-red-gates".into(),
@@ -2654,11 +2659,14 @@ fn adopted_red_pr_mixed_red_gates_still_rerolls() {
             created_at_epoch: 0,
         }],
     );
-    // Mixed: CI fail (coder-fixable) + CodeRabbit blocked (structural).
+    // Mixed, in production shapes: CI failed (`ci_status="red"` -> a
+    // coder-fixable RED CI gate) + CodeRabbit unavailable
+    // (`coderabbit_status="unknown"` -> a structural-pending Unknown gate).
+    // The coder-fixable red wins -> reroll.
     snapshot.ci_success = false;
-    snapshot.ci_status = "failure".into();
+    snapshot.ci_status = "red".into();
     snapshot.coderabbit_approved = false;
-    snapshot.coderabbit_status = "blocked".into();
+    snapshot.coderabbit_status = "unknown".into();
     scm.pr_snapshots.insert(709, snapshot);
 
     let tracker = FakeTracker::new();
@@ -2669,6 +2677,8 @@ fn adopted_red_pr_mixed_red_gates_still_rerolls() {
     let mut cfg = test_cfg();
     cfg.stage = 2;
     let mut vcs = FakeVcs::new();
+    // Adopted-PR reroll captures the branch's pre-session HEAD via
+    // remote_head_sha before dispatching a remediation session.
     vcs.heads.insert(
         "alice/mixed-red-gates".into(),
         "pre-session-sha-mixed".into(),
@@ -2695,9 +2705,8 @@ fn adopted_red_pr_mixed_red_gates_still_rerolls() {
 
     assert_eq!(
         summary.beads_held_disposition_required, 0,
-        "mixed red gates must NOT hold DISPOSITION_REQUIRED — only all-structural \
-         redness triggers the hold (issue #348 acceptance: 'mixed red → reroll \
-         as today')"
+        "mixed red gates must NOT hold DISPOSITION_REQUIRED — a coder-fixable red \
+         triggers reroll (issue #348 acceptance: 'mixed red → reroll as today')"
     );
 
     let overlay = store.load("fake-bead-1").unwrap().unwrap();
@@ -2705,6 +2714,127 @@ fn adopted_red_pr_mixed_red_gates_still_rerolls() {
         overlay.state,
         OverlayState::DispositionRequired,
         "mixed-red bead must continue the existing reroll flow, not the new hold"
+    );
+
+    // Blocker 4: prove a reroll ACTUALLY happened, not just the absence of the
+    // hold. (1) attempt was incremented past the initial 1; (2) the adopted
+    // reroll dispatched a fresh remediation session; (3) REROLL_START
+    // telemetry was emitted.
+    assert!(
+        overlay.attempt >= 2,
+        "reroll must increment the attempt counter (was {}); a no-op would leave it at 1",
+        overlay.attempt
+    );
+    assert_eq!(
+        overlay.state,
+        OverlayState::Dispatched,
+        "adopted-PR reroll re-dispatches a remediation coder session (DISPATCHED)"
+    );
+    let session_calls = sessions.calls.borrow();
+    assert!(
+        session_calls.iter().any(|c| c.starts_with("spawn(")),
+        "reroll must spawn a remediation session: {session_calls:?}"
+    );
+    let log_contents =
+        std::fs::read_to_string(&telemetry_log).expect("telemetry log must exist");
+    assert!(
+        log_contents.contains("\"REROLL_START\""),
+        "reroll must emit REROLL_START telemetry; log:\n{log_contents}"
+    );
+    assert!(
+        !log_contents.contains("\"DISPOSITION_REQUIRED\""),
+        "mixed-red must not emit the DISPOSITION_REQUIRED hold event; log:\n{log_contents}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-zaga / issue #348 (blocker 2 acceptance): a bead already held at
+/// `DISPOSITION_REQUIRED` must be RE-SELECTED and re-assessed on a later tick,
+/// and RESUME the normal flow the moment the structural condition clears. Here
+/// CodeRabbit becomes available and all gates go green, so the bead resolves
+/// to READY — proving the hold is recoverable, not terminal.
+#[test]
+fn disposition_required_bead_resumes_when_gates_go_green() {
+    let mut scm = FakeScm::new();
+    // Now-green snapshot with a fresh /er PASS so er_runner short-circuits.
+    let snapshot = qdw_green_snapshot(
+        710,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
+    );
+    scm.pr_snapshots.insert(710, snapshot);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into())); // Skeptic green
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    let vcs = FakeVcs::new();
+
+    // Pre-seed a bead already held at DISPOSITION_REQUIRED with an open PR and
+    // a registered branch (as the daemon would have left it on a prior tick).
+    let branch = "alice/held-then-green";
+    store
+        .save(&BeadOverlay {
+            bead_id: "held-bead".into(),
+            state: OverlayState::DispositionRequired,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(710),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("held-bead", branch).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_disposition_resumes_green.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("re-assessing a held bead must not error");
+
+    // The held bead was re-selected and re-assessed this tick.
+    assert_eq!(
+        summary.gates_assessed, 1,
+        "a DISPOSITION_REQUIRED bead must be re-selected and gate-assessed, not skipped"
+    );
+    // Now-green -> it resumes to READY (the hold is recoverable).
+    let overlay = store.load("held-bead").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Ready,
+        "a held bead whose gates went green must resume to READY, not stay held"
+    );
+    assert_eq!(summary.beads_ready, 1);
+    assert_eq!(
+        summary.beads_held_disposition_required, 0,
+        "resuming to green is not a new hold"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

@@ -671,152 +671,133 @@ pub fn assess(
     Ok(GateReport { results, all_green })
 }
 
-// --- jleechan-zaga: structural red gate classification (issue #348) ---
+// --- jleechan-zaga: structured gate-block classification (issue #348) ---
 //
-// The daemon's gate assessment can produce a mix of `Red` and `Unknown`
-// gates. Some red gates reflect defects in the diff itself (CI failures,
-// merge conflicts, evidence-floor LOC violations) — those are
-// `CoderFixable`, and re-rolling the worker can plausibly clear them.
-// Others reflect conditions OUTSIDE the diff's authority: external
-// reviewer usage-limits, unresolved bot threads on superseded content,
-// floor gates whose fix is a different bead (e.g. an evidence floor
-// tied to a different spec). Re-rolling a coder on those gates cannot
-// change the outcome — it just produces an equivalent r2 that hits
-// the same feedback hash and parks HUMAN_HELD at the attempt cap.
+// A not-all-green gate report is blocked by one of three kinds of condition,
+// and the daemon must react differently to each:
 //
-// `RedGateDisposition` (per-gate) + `RedGateClassification` (aggregate)
-// separate the two so the tick path can reroll on coder-fixable
-// redness but hold `DISPOSITION_REQUIRED` when ALL red gates are
-// structural.
+//   * CODER-FIXABLE — a RED gate the worker can plausibly clear by editing
+//     the diff: CI failure, merge conflicts, unresolved review threads,
+//     Bugbot errors, a CodeRabbit review that requested changes, an
+//     evidence-floor violation (a coder CAN publish a gist — bead cnf9 proved
+//     it live), a skeptic rejection. → re-roll as today.
+//   * STRUCTURAL-PENDING — a gate held non-green by an EXTERNAL verifier that
+//     has produced no verdict and that the coder cannot make produce one:
+//     CodeRabbit unavailable/rate-limited, or Bugbot absent/neutral. Under
+//     the daemon's own gate logic (verifier::assess) these surface as
+//     `Unknown` gates (e.g. `coderabbit_status == "unknown"` -> CodeRabbit
+//     `Unknown`), NOT `Red`. Re-rolling cannot change the outcome — it just
+//     produces an equivalent r2 that hits the same feedback hash and parks
+//     HUMAN_HELD at the attempt cap (issue #348: v6ud's correct P0 fix #342
+//     superseded by its own reroll). → hold DISPOSITION_REQUIRED, keep
+//     re-assessing.
+//   * TRANSIENT — every other `Unknown` gate (CI still running, review-thread
+//     count GraphQL-unverifiable). Resolves on its own. → stay ATTESTED,
+//     re-assess next tick (existing behavior).
 //
-// Structural detection needs more than the per-gate reason text: the
-// `CodeRabbitApproved` gate's reason is always the generic
-// "CodeRabbit review is not APPROVED" regardless of WHY it isn't
-// approved (diff defect vs. external usage-limit). The richer signal
-// lives on `PrSnapshot::{coderabbit_status, ci_status, …}`, so the
-// classifier takes the snapshot alongside the report.
+// ZFC: the classification keys ONLY on STRUCTURED signals — the gate's
+// `GateResult` variant (`Green`/`Red`/`Unknown`, itself derived by
+// `verifier::assess` from `PrSnapshot`'s structured fields) plus the gate
+// name. It does NOT free-text-match reason strings and does NOT depend on
+// synthetic `coderabbit_status` values that production never emits
+// (`adapters.rs` emits only `green`/`red`/`unknown`).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RedGateDisposition {
-    /// Coder can plausibly clear this gate by editing the diff (CI fix,
-    /// conflict resolution, evidence marker, unresolved-review-thread
-    /// resolution, etc.).
+pub enum GateBlock {
+    /// A RED gate the worker can plausibly clear by editing the diff.
     CoderFixable,
-    /// External/service-side blockage: CodeRabbit usage-limit, unresolved
-    /// bot threads on superseded content, or an evidence floor whose fix
-    /// is a different bead. Re-rolling the coder cannot clear this.
+    /// A gate held `Unknown` by an external verifier the coder cannot drive
+    /// (CodeRabbit unavailable, Bugbot absent/neutral).
     Structural,
+    /// A gate held `Unknown` by a condition that resolves on its own (CI still
+    /// running, review-thread count temporarily unverifiable, or a whole-
+    /// snapshot SCM fetch outage). Wait and re-assess — do NOT hold.
+    Transient,
 }
 
-/// Classify a single red gate as `CoderFixable` or `Structural` based on
-/// the gate name, reason text, AND the `PrSnapshot` fields that drive
-/// the gate (needed because the per-gate reason string is intentionally
-/// generic for some gates — the `coderabbit_status`/`ci_status`
-/// companion field carries the real signal).
-///
-/// Conservative default: any pattern the classifier does NOT explicitly
-/// recognize as structural stays `CoderFixable` (so today's "reroll on
-/// every red gate" behavior is preserved for the long tail of gates
-/// the classifier hasn't been taught about yet — better than flipping
-/// them all to `Structural` and losing coder-fixable churn detection).
-///
-/// Structural patterns today:
-///   - CodeRabbit: `coderabbit_status` is one of the known
-///     external-usage-limit values OR the reason mentions
-///     `usage limit`/`rate limit`/`quota exceeded` (issue #348's
-///     exemplar).
-///   - CommentsResolved: reason contains `unresolved bot thread` (the
-///     known cross-attempt pattern: bot threads on superseded content
-///     that never resolve on their own).
-///   - EvidenceFloor: reason contains `different bead` (a floor gate
-///     whose fix is owned by a separate bead, not this one).
-///   - Skeptic: reason contains `usage limit`, `rate limit`, or
-///     `quota exceeded` (external-reviewer usage-limits hitting the
-///     Stage-1 /er vendor path).
-///   - CI: `ci_status` is `unknown` (no signal yet) → not in this
-///     function's domain; that's `Unknown`, not `Red`. A red CI gate
-///     is always `CoderFixable` today.
-pub fn classify_red_gate(
-    name: GateName,
-    reason: &str,
-    snapshot: &crate::tools::PrSnapshot,
-) -> RedGateDisposition {
-    let lower = reason.to_ascii_lowercase();
-    let external_usage_phrase = matches!(
-        name,
-        GateName::CodeRabbitApproved | GateName::Skeptic
-    ) && (lower.contains("usage limit")
-        || lower.contains("rate limit")
-        || lower.contains("quota exceeded"));
-    // CodeRabbit's per-gate reason is always the generic "not
-    // APPROVED" string, so the real signal is the snapshot's
-    // `coderabbit_status` companion field. Treat the
-    // external-usage-limit values reported by `tools.rs` as
-    // `Structural`; everything else stays `CoderFixable`.
-    let coderabbit_external_blocked = name == GateName::CodeRabbitApproved
-        && matches!(
-            snapshot.coderabbit_status.to_ascii_lowercase().as_str(),
-            "usage_limit" | "rate_limit" | "quota_exceeded" | "blocked"
-        );
-    let structural_bot_threads =
-        name == GateName::CommentsResolved && lower.contains("unresolved bot thread");
-    let structural_other_bead =
-        name == GateName::EvidenceFloor && lower.contains("different bead");
-    if external_usage_phrase
-        || coderabbit_external_blocked
-        || structural_bot_threads
-        || structural_other_bead
-    {
-        RedGateDisposition::Structural
-    } else {
-        RedGateDisposition::CoderFixable
+/// Classify a single non-green gate on STRUCTURED signals only (the
+/// `GateResult` variant + gate name — no reason-text keyword matching).
+/// Returns `None` only for a `Green` gate.
+pub fn classify_nongreen_gate(name: GateName, result: &GateResult) -> Option<GateBlock> {
+    match result {
+        GateResult::Green => None,
+        // Every RED gate is coder-fixable — see the module comment above.
+        GateResult::Red(_) => Some(GateBlock::CoderFixable),
+        // An `Unknown` gate is structural-pending ONLY for the external
+        // verifiers a coder cannot drive: CodeRabbit (unavailable /
+        // rate-limited) and Bugbot (absent / neutral). Every other `Unknown`
+        // (CI still running, unverifiable thread count, or a whole-snapshot
+        // SCM outage that turns EVERY gate Unknown) is transient.
+        GateResult::Unknown(_) => match name {
+            GateName::CodeRabbitApproved | GateName::BugbotClean => Some(GateBlock::Structural),
+            _ => Some(GateBlock::Transient),
+        },
     }
 }
 
-/// Aggregate classification of a `GateReport`'s red gates. Returns
-/// `AllStructural` iff there is at least one red gate AND every red
-/// gate is `Structural` per `classify_red_gate`. A report with NO red
-/// gates (`all_green == true`) is `None` — there is nothing to classify.
-/// A report mixing coder-fixable + structural redness is `Mixed` —
-/// today's reroll behavior applies (a coder can clear the
-/// coder-fixable subset and, if it does, the structural reds get
-/// re-classified on the next tick).
+/// What the tick path should do with a NOT-all-green report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RedGateClassification {
-    AllStructural,
-    Mixed,
-    AllCoderFixable,
+pub enum ChainDisposition {
+    /// At least one coder-fixable RED gate — re-roll can plausibly help.
+    Reroll,
+    /// No coder-fixable red gate, but at least one structural-pending gate —
+    /// hold `DISPOSITION_REQUIRED` and keep re-assessing.
+    HoldDisposition,
+    /// Only transient `Unknown` gates remain — stay ATTESTED, re-assess.
+    TransientOnly,
 }
 
-/// Classify all red gates in `report`, using `snapshot` for the
-/// companion-field signal (CodeRabbit's per-gate reason is generic).
-/// Returns `None` when the report has no red gates.
-pub fn classify_red_gates(
-    report: &GateReport,
-    snapshot: &crate::tools::PrSnapshot,
-) -> Option<RedGateClassification> {
-    let mut has_red = false;
-    let mut has_structural = false;
+/// Aggregate a report into a [`ChainDisposition`]. Precedence:
+///   1. any coder-fixable RED gate → `Reroll` (a coder can act now);
+///   2. else any TRANSIENT unknown → `TransientOnly` (the picture is not yet
+///      settled — e.g. CI still running, or a whole-snapshot SCM outage that
+///      turned every gate Unknown — so WAIT and re-assess rather than hold on
+///      an incomplete signal);
+///   3. else any STRUCTURAL-pending gate → `HoldDisposition` (the ONLY
+///      remaining blockers are external verifiers the coder cannot drive);
+///   4. else `TransientOnly` (all green — the caller handles that separately).
+///
+/// The transient-before-structural ordering is deliberate: a report must be
+/// classified `HoldDisposition` only when structural gates are the SOLE
+/// blockers, never when a transient unknown might still resolve into a
+/// coder-fixable red or a green.
+pub fn classify_chain(report: &GateReport) -> ChainDisposition {
     let mut has_coder_fixable = false;
+    let mut has_structural = false;
+    let mut has_transient = false;
     for (name, result) in &report.results {
-        if let GateResult::Red(reason) = result {
-            has_red = true;
-            match classify_red_gate(*name, reason, snapshot) {
-                RedGateDisposition::Structural => has_structural = true,
-                RedGateDisposition::CoderFixable => has_coder_fixable = true,
-            }
+        match classify_nongreen_gate(*name, result) {
+            Some(GateBlock::CoderFixable) => has_coder_fixable = true,
+            Some(GateBlock::Structural) => has_structural = true,
+            Some(GateBlock::Transient) => has_transient = true,
+            None => {}
         }
     }
-    if !has_red {
-        return None;
+    if has_coder_fixable {
+        ChainDisposition::Reroll
+    } else if has_transient {
+        ChainDisposition::TransientOnly
+    } else if has_structural {
+        ChainDisposition::HoldDisposition
+    } else {
+        ChainDisposition::TransientOnly
     }
-    Some(match (has_structural, has_coder_fixable) {
-        (true, false) => RedGateClassification::AllStructural,
-        (true, true) => RedGateClassification::Mixed,
-        (false, true) => RedGateClassification::AllCoderFixable,
-        // (false, false) is unreachable when has_red is true.
-        (false, false) => RedGateClassification::AllCoderFixable,
-    })
+}
+
+/// The structural-pending gates in a report as `(gate, reason)` pairs, for the
+/// operator-facing DISPOSITION_REQUIRED comment/telemetry.
+pub fn structural_pending_gates(report: &GateReport) -> Vec<(GateName, &str)> {
+    report
+        .results
+        .iter()
+        .filter_map(|(name, result)| match classify_nongreen_gate(*name, result) {
+            Some(GateBlock::Structural) => match result {
+                GateResult::Unknown(reason) => Some((*name, reason.as_str())),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1844,195 +1825,186 @@ mod tests {
         assert!(matches!(evidence_floor_gate(&non_prod_inconclusive), GateResult::Red(_)));
     }
 
-    // --- jleechan-zaga: structural red gate classification tests (issue #348) ---
-    // Tests live in this module; the types + functions themselves are at
-    // module top-level (above this `mod tests`) so `tick.rs` can import
-    // them.
+    // --- jleechan-zaga: structured gate-block classification tests (#348) ---
+    // The classifier keys ONLY on the `GateResult` variant + gate name (the
+    // structured signal), NOT on reason-text keywords or synthetic
+    // `coderabbit_status` values production never emits. These tests use real
+    // production evidence shapes: a CodeRabbit stall is `coderabbit_status =
+    // "unknown"` (→ an `Unknown` CodeRabbit gate), never a fabricated
+    // "blocked"/"usage_limit".
 
     #[test]
-    fn classify_coderabbit_usage_limit_is_structural() {
-        // Direct reason-text match (issue #348's exemplar: CodeRabbit
-        // "usage limit" — the human-visible phrase).
-        let snapshot = all_green_snapshot(7);
-        let disp = classify_red_gate(
-            GateName::CodeRabbitApproved,
-            "CodeRabbit usage limit reached",
-            &snapshot,
+    fn classify_green_gate_is_none() {
+        assert_eq!(
+            classify_nongreen_gate(GateName::Ci, &GateResult::Green),
+            None
         );
-        assert_eq!(disp, RedGateDisposition::Structural);
     }
 
     #[test]
-    fn classify_coderabbit_status_blocked_is_structural() {
-        // Companion-field match: the generic "not APPROVED" reason +
-        // `coderabbit_status="blocked"` (the actual SCM-emitted signal
-        // when CodeRabbit is rate-limited) must be classified structural
-        // even though the reason text alone does not say "usage limit".
-        let mut snapshot = all_green_snapshot(7);
-        snapshot.coderabbit_status = "blocked".to_string();
-        let disp = classify_red_gate(
+    fn classify_every_red_gate_is_coder_fixable() {
+        for name in [
+            GateName::Ci,
+            GateName::NoConflicts,
             GateName::CodeRabbitApproved,
-            "CodeRabbit review is not APPROVED",
-            &snapshot,
-        );
-        assert_eq!(disp, RedGateDisposition::Structural);
-    }
-
-    #[test]
-    fn classify_coderabbit_generic_red_is_coder_fixable() {
-        // The same generic reason text, but `coderabbit_status="green"`
-        // (i.e. CR just hasn't approved the diff yet) → coder-fixable,
-        // because a reroll that addresses the underlying review comment
-        // can plausibly flip the gate.
-        let snapshot = all_green_snapshot(7);
-        let disp = classify_red_gate(
-            GateName::CodeRabbitApproved,
-            "CodeRabbit review is not APPROVED",
-            &snapshot,
-        );
-        assert_eq!(disp, RedGateDisposition::CoderFixable);
-    }
-
-    #[test]
-    fn classify_skeptic_usage_limit_is_structural() {
-        let snapshot = all_green_snapshot(7);
-        let disp = classify_red_gate(GateName::Skeptic, "skeptic vendor rate limit hit", &snapshot);
-        assert_eq!(disp, RedGateDisposition::Structural);
-    }
-
-    #[test]
-    fn classify_skeptic_generic_red_is_coder_fixable() {
-        let snapshot = all_green_snapshot(7);
-        let disp = classify_red_gate(GateName::Skeptic, "skeptic rejected: missing tests", &snapshot);
-        assert_eq!(disp, RedGateDisposition::CoderFixable);
-    }
-
-    #[test]
-    fn classify_comments_resolved_bot_threads_is_structural() {
-        let snapshot = all_green_snapshot(7);
-        let disp = classify_red_gate(
+            GateName::BugbotClean,
             GateName::CommentsResolved,
-            "3 unresolved bot thread(s) on superseded content",
-            &snapshot,
-        );
-        assert_eq!(disp, RedGateDisposition::Structural);
-    }
-
-    #[test]
-    fn classify_comments_resolved_generic_red_is_coder_fixable() {
-        let snapshot = all_green_snapshot(7);
-        let disp = classify_red_gate(
-            GateName::CommentsResolved,
-            "5 unresolved review thread(s)",
-            &snapshot,
-        );
-        assert_eq!(disp, RedGateDisposition::CoderFixable);
-    }
-
-    #[test]
-    fn classify_evidence_floor_other_bead_is_structural() {
-        let snapshot = all_green_snapshot(7);
-        let disp = classify_red_gate(
             GateName::EvidenceFloor,
-            "evidence floor: fix is a different bead",
-            &snapshot,
+            GateName::Skeptic,
+        ] {
+            assert_eq!(
+                classify_nongreen_gate(name, &GateResult::Red("whatever".into())),
+                Some(GateBlock::CoderFixable),
+                "red {name:?} must be coder-fixable"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_coderabbit_unknown_is_structural() {
+        // Production shape: coderabbit_status == "unknown" makes the gate
+        // `Unknown` (verifier::assess). A coder cannot make CodeRabbit run.
+        assert_eq!(
+            classify_nongreen_gate(
+                GateName::CodeRabbitApproved,
+                &GateResult::Unknown("CodeRabbit review is still pending/unknown".into())
+            ),
+            Some(GateBlock::Structural)
         );
-        assert_eq!(disp, RedGateDisposition::Structural);
     }
 
     #[test]
-    fn classify_evidence_floor_generic_red_is_coder_fixable() {
-        let snapshot = all_green_snapshot(7);
-        let disp = classify_red_gate(GateName::EvidenceFloor, "evidence floor", &snapshot);
-        assert_eq!(disp, RedGateDisposition::CoderFixable);
+    fn classify_bugbot_unknown_is_structural() {
+        assert_eq!(
+            classify_nongreen_gate(
+                GateName::BugbotClean,
+                &GateResult::Unknown("Bugbot absent".into())
+            ),
+            Some(GateBlock::Structural)
+        );
     }
 
     #[test]
-    fn classify_ci_fail_is_coder_fixable() {
-        let snapshot = all_green_snapshot(7);
-        let disp = classify_red_gate(GateName::Ci, "CI check-run(s) not all success", &snapshot);
-        assert_eq!(disp, RedGateDisposition::CoderFixable);
+    fn classify_transient_unknowns_are_transient() {
+        // CI still running and an unverifiable review-thread count are
+        // transient — neither structural nor a reroll trigger. They resolve on
+        // their own, so they must classify `Transient` (which keeps a chain in
+        // the wait/re-assess path, NOT the DISPOSITION_REQUIRED hold).
+        for name in [
+            GateName::Ci,
+            GateName::CommentsResolved,
+            GateName::Skeptic,
+            GateName::NoConflicts,
+            GateName::EvidenceFloor,
+        ] {
+            assert_eq!(
+                classify_nongreen_gate(name, &GateResult::Unknown("pending".into())),
+                Some(GateBlock::Transient),
+                "unknown {name:?} must be transient, not structural"
+            );
+        }
     }
 
     #[test]
-    fn classify_conflicts_red_is_coder_fixable() {
-        let snapshot = all_green_snapshot(7);
-        let disp =
-            classify_red_gate(GateName::NoConflicts, "PR is not mergeable (conflicts)", &snapshot);
-        assert_eq!(disp, RedGateDisposition::CoderFixable);
+    fn classify_chain_total_scm_outage_is_transient_not_hold() {
+        // A whole-snapshot SCM fetch failure turns EVERY gate Unknown —
+        // including CodeRabbit and Bugbot. That is a transient outage, NOT a
+        // structural CodeRabbit-unavailable condition, so the chain must WAIT
+        // (TransientOnly), never hold DISPOSITION_REQUIRED. Regression guard
+        // for qdw_assess_refetch_failure_stays_attested_and_never_closes_pr.
+        let report = GateReport {
+            all_green: false,
+            results: [
+                (GateName::Ci, GateResult::Unknown("fetch failed".into())),
+                (GateName::NoConflicts, GateResult::Unknown("fetch failed".into())),
+                (
+                    GateName::CodeRabbitApproved,
+                    GateResult::Unknown("fetch failed".into()),
+                ),
+                (GateName::BugbotClean, GateResult::Unknown("fetch failed".into())),
+                (
+                    GateName::CommentsResolved,
+                    GateResult::Unknown("fetch failed".into()),
+                ),
+                (GateName::EvidenceFloor, GateResult::Unknown("fetch failed".into())),
+                (GateName::Skeptic, GateResult::Unknown("fetch failed".into())),
+            ],
+        };
+        assert_eq!(classify_chain(&report), ChainDisposition::TransientOnly);
     }
 
     #[test]
-    fn classify_red_gates_all_green_returns_none() {
+    fn classify_chain_all_green_is_transient_only() {
         let mut scm = FakeScm::default();
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
-        let report =
-            assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
         assert!(report.all_green);
-        let snapshot = scm.snapshots.get(&7).cloned().unwrap();
-        assert_eq!(classify_red_gates(&report, &snapshot), None);
+        assert_eq!(classify_chain(&report), ChainDisposition::TransientOnly);
     }
 
     #[test]
-    fn classify_red_gates_all_structural() {
-        // All-red-but-everyone-structural scenario: CodeRabbit
-        // `coderabbit_status=blocked` (external usage limit) AND Skeptic
-        // reason text contains "rate limit". No coder-fixable redness at
-        // all → `AllStructural` → tick path must hold DISPOSITION_REQUIRED,
-        // not supersede.
+    fn classify_chain_coderabbit_unknown_only_holds_disposition() {
+        // The #348 production scenario: CodeRabbit unavailable
+        // (coderabbit_status="unknown" -> Unknown gate) is the ONLY non-green
+        // gate. No coder-fixable red -> HoldDisposition.
         let mut scm = FakeScm::default();
         let mut snapshot = all_green_snapshot(7);
         snapshot.coderabbit_approved = false;
-        snapshot.coderabbit_status = "blocked".to_string();
+        snapshot.coderabbit_status = "unknown".to_string();
         scm.snapshots.insert(7, snapshot);
         let cfg = test_cfg();
-        let evidence = PrEvidence {
-            skeptic_verdict: Some(SkepticVerdict::Fail(
-                "skeptic vendor rate limit hit".to_string(),
-            )),
-            ..all_green_evidence()
-        };
-        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
-        let snapshot = scm.snapshots.get(&7).cloned().unwrap();
-        let class = classify_red_gates(&report, &snapshot);
-        assert_eq!(class, Some(RedGateClassification::AllStructural));
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+        assert!(!report.all_green);
+        assert_eq!(classify_chain(&report), ChainDisposition::HoldDisposition);
+
+        // The structural gate is surfaced for the operator comment.
+        let structural = structural_pending_gates(&report);
+        assert_eq!(structural.len(), 1);
+        assert_eq!(structural[0].0, GateName::CodeRabbitApproved);
     }
 
     #[test]
-    fn classify_red_gates_mixed() {
-        // Mixed: one structural red (CodeRabbit blocked) + one
-        // coder-fixable red (CI fail). Classification must be `Mixed`
-        // (tick path keeps today's reroll behavior for mixed redness —
-        // issue #348 acceptance: "mixed red → reroll as today").
+    fn classify_chain_mixed_red_plus_structural_rerolls() {
+        // CI red (coder-fixable) + CodeRabbit unknown (structural). A
+        // coder-fixable red wins -> Reroll (issue #348: "mixed red → reroll").
         let mut scm = FakeScm::default();
         let mut snapshot = all_green_snapshot(7);
         snapshot.ci_success = false;
+        snapshot.ci_status = "red".to_string();
         snapshot.coderabbit_approved = false;
-        snapshot.coderabbit_status = "blocked".to_string();
+        snapshot.coderabbit_status = "unknown".to_string();
         scm.snapshots.insert(7, snapshot);
         let cfg = test_cfg();
-        let report =
-            assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
-        let snapshot = scm.snapshots.get(&7).cloned().unwrap();
-        let class = classify_red_gates(&report, &snapshot);
-        assert_eq!(class, Some(RedGateClassification::Mixed));
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+        assert_eq!(classify_chain(&report), ChainDisposition::Reroll);
     }
 
     #[test]
-    fn classify_red_gates_all_coder_fixable() {
-        // All-red-but-everyone-coder-fixable: CI fail + merge conflict.
-        // Today's reroll behavior must be preserved.
+    fn classify_chain_all_coder_fixable_rerolls() {
         let mut scm = FakeScm::default();
         let mut snapshot = all_green_snapshot(7);
         snapshot.ci_success = false;
+        snapshot.ci_status = "red".to_string();
         snapshot.mergeable = false;
         scm.snapshots.insert(7, snapshot);
         let cfg = test_cfg();
-        let report =
-            assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
-        let snapshot = scm.snapshots.get(&7).cloned().unwrap();
-        let class = classify_red_gates(&report, &snapshot);
-        assert_eq!(class, Some(RedGateClassification::AllCoderFixable));
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+        assert_eq!(classify_chain(&report), ChainDisposition::Reroll);
+    }
+
+    #[test]
+    fn classify_chain_ci_unknown_only_is_transient() {
+        // CI still running is transient, NOT structural — it must not hold
+        // DISPOSITION_REQUIRED (that's for external verifiers a coder can't
+        // drive, not for a check that resolves on its own).
+        let mut scm = FakeScm::default();
+        let mut snapshot = all_green_snapshot(7);
+        snapshot.ci_success = false;
+        snapshot.ci_status = "unknown".to_string();
+        scm.snapshots.insert(7, snapshot);
+        let cfg = test_cfg();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+        assert_eq!(classify_chain(&report), ChainDisposition::TransientOnly);
     }
 }
