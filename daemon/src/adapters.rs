@@ -1502,7 +1502,6 @@ impl Scm for CliScm {
         let total: u64 = out.trim().parse().unwrap_or(0);
         Ok(Some(total > 0))
     }
-
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
         let offline_path = std::path::Path::new(".beads/offline").join(format!("pr_{}.json", pr));
         if offline_path.exists() {

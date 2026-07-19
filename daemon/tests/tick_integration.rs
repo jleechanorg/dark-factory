@@ -10821,7 +10821,6 @@ fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
     assert_eq!(after.pr_number, Some(4001));
     let _ = std::fs::remove_file(&telemetry_log);
 }
-
 /// jleechan-t40t r6 contract: a DISPATCHED bead whose stored `pr_number`
 /// points at a PR that has MERGED (or otherwise no longer exists for the
 /// bead's branch) must NOT promote to ATTESTED against the stale number.
@@ -12677,3 +12676,5 @@ fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_e
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+=======
+>>>>>>> 5d6c86b771 (claude/fable: fix(daemon): re-resolve stale pr_number from branch on drift detection)

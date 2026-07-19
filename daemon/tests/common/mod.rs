@@ -178,10 +178,6 @@ pub struct FakeScm {
     /// to that branch in that repo; absence of a key means "no open PR
     /// bound" (`Ok(None)`), mirroring the real `CliScm` resolution path.
     pub pr_numbers_for_branch: HashMap<(String, String), Option<u64>>,
-    /// jleechan-t40t r12 (issue #326): scripted TRANSIENT failure of
-    /// `pr_number_for_branch`, keyed by `(repo, branch)`. When present the
-    /// method returns `DaemonError::Tool` (the `gh` failure shape), used to
-    /// prove the fail-closed "keep DISPATCHED, do not promote" path.
     pub pr_number_for_branch_errors: HashMap<(String, String), String>,
     /// jleechan-drive-pr-branch-binding-pcpr: scripted open-PR lookups,
     /// keyed by `(repo, pr_number)`. Absence of a key (the `Default` case)
