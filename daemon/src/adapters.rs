@@ -1955,23 +1955,38 @@ impl CliSessions {
     fn spawn_with_fallback(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
         let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
             .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
-        
-        let mut fallback_agents = Vec::new();
-        fallback_agents.push(self.agent.clone());
-        for part in fallback_str.split("->") {
-            let part_trimmed = part.trim().to_string();
-            let mapped_agent = if part_trimmed == "aow" {
-                "minimax".to_string()
-            } else {
-                part_trimmed
-            };
-            if !mapped_agent.is_empty() && !fallback_agents.contains(&mapped_agent) {
-                fallback_agents.push(mapped_agent);
-            }
-        }
-
+        let fallback_agents = build_runtime_fallback_chain(&self.agent, &fallback_str);
         fallback_spawn(&fallback_agents, |agent| self.run_spawn_process(agent, spec))
     }
+}
+
+/// Pure helper used by `CliSessions::spawn_with_fallback` (and unit-tested
+/// directly) that canonicalizes the runtime vendor chain through the same
+/// `canonical_for_alias` map the startup preflight uses. Dedup is by
+/// canonical form so a config that names both `agy` and `antigravity`
+/// doesn't try the same plugin twice.
+fn build_runtime_fallback_chain(default_agent: &str, fallback_str: &str) -> Vec<String> {
+    let canonicalize = |vendor: &str| -> String {
+        canonical_for_alias(vendor)
+            .map(str::to_string)
+            .unwrap_or_else(|| vendor.to_string())
+    };
+    let mut chain: Vec<String> = Vec::new();
+    let default_canonical = canonicalize(default_agent);
+    if !default_canonical.is_empty() {
+        chain.push(default_canonical);
+    }
+    for part in fallback_str.split("->") {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let canonical = canonicalize(trimmed);
+        if !canonical.is_empty() && !chain.contains(&canonical) {
+            chain.push(canonical);
+        }
+    }
+    chain
 }
 
 /// Walks `agents` in order, calling `attempt_spawn` for each until one
@@ -2011,8 +2026,54 @@ where
 
 #[cfg(test)]
 mod spawn_fallback_tests {
-    use super::fallback_spawn;
+    use super::{build_runtime_fallback_chain, fallback_spawn};
     use crate::errors::DaemonError;
+
+    // jleechan-9lvs r2 (CodeRabbit blocker on PR #362): the runtime --agent
+    // argv must canonicalize through the SAME alias map the startup
+    // preflight uses, otherwise preflight passes for `agy`->`antigravity`
+    // and runtime still spawns `--agent agy` and reproduces the failure
+    // mode this PR is meant to eliminate. This test exercises the helper
+    // directly so we never have to spin up a subprocess to assert
+    // argv-shape behavior.
+    #[test]
+    fn runtime_fallback_chain_never_emits_legacy_alias_after_agy_rename() {
+        // Default `agy` (legacy alias) plus a fallback chain that names
+        // both `agy` and `antigravity`. After canonicalization + dedup the
+        // chain must contain ONLY canonical plugin names; no literal
+        // `agy` or `aow` may survive.
+        let chain = build_runtime_fallback_chain("agy", "antigravity->agy->aow->minimax");
+
+        assert!(
+            !chain.iter().any(|v| v == "agy"),
+            "legacy alias `agy` must be canonicalized to `antigravity`; got: {chain:?}"
+        );
+        assert!(
+            !chain.iter().any(|v| v == "aow"),
+            "legacy alias `aow` must be canonicalized to `minimax`; got: {chain:?}"
+        );
+        // Both canonical plugins appear, order preserved (default first).
+        assert_eq!(
+            chain,
+            vec!["antigravity".to_string(), "minimax".to_string()]
+        );
+    }
+
+    #[test]
+    fn runtime_fallback_chain_preserves_passthrough_when_no_alias_matches() {
+        let chain = build_runtime_fallback_chain(
+            "minimax",
+            "claude-code->antigravity->agy",
+        );
+        assert_eq!(
+            chain,
+            vec![
+                "minimax".to_string(),
+                "claude-code".to_string(),
+                "antigravity".to_string(),
+            ]
+        );
+    }
 
     /// jleechan-r56m red proof: simulate all 3 vendors in a fallback chain
     /// failing with DIFFERENT, distinguishable errors. Today's aggregation
