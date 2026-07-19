@@ -2078,6 +2078,10 @@ mod tests {
                 ),
                 (GateName::EvidenceFloor, GateResult::Unknown("fetch failed".into())),
                 (GateName::Skeptic, GateResult::Unknown("fetch failed".into())),
+                (
+                    GateName::VacuousRedGreen,
+                    GateResult::Unknown("fetch failed".into()),
+                ),
             ],
         };
         assert_eq!(classify_chain(&report), ChainDisposition::TransientOnly);

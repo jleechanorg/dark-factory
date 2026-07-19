@@ -1785,8 +1785,18 @@ mod tests {
     /// the global repo (the jleechan-9sh5 discipline this spec explicitly
     /// calls out). No branch registration, no spawn attempt.
     #[test]
-    fn dispatch_ready_parks_human_held_when_target_repo_is_unmapped() {
-        let sessions = FakeSessions::new(0);
+    fn dispatch_ready_derives_for_unmapped_repo() {
+        // Bead jleechan-87ea / PR #289 AC #2: a syntactically valid but
+        // unmapped `owner/repo` (not in [repos.*], not the global target_repo)
+        // DERIVES safe routing (last path segment as ao_project) and dispatches
+        // successfully. The daemon logs an eprintln! warn at resolve_repo
+        // time. The unmapped-only fail-closed path is reserved for
+        // syntactically-invalid repos or true AO-project collisions.
+        let sessions = FakeSessions::new(1);
+        sessions
+            .scripted_worktree_remote
+            .borrow_mut()
+            .insert("unrelated-repo".to_string(), "https://github.com/someorg/unrelated-repo.git".to_string());
         let store = FakeStateStore::new();
         store
             .save(&BeadOverlay {
@@ -1803,9 +1813,10 @@ mod tests {
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
-                // Neither cfg().target_repo ("owner/repo") nor any
-                // [repos.*] entry (cfg() has an empty repos table) names
-                // this repo.
+                // Syntactically valid owner/repo, neither cfg().target_repo
+                // ("owner/repo") nor any [repos.*] entry names it. With
+                // PR #289, resolve_repo now derives ao_project="unrelated-repo"
+                // and dispatch proceeds (with an eprintln! warn).
                 target_repo: Some("someorg/unrelated-repo".to_string()),
             })
             .unwrap();
@@ -1814,33 +1825,23 @@ mod tests {
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
-        assert_eq!(report.success_count(), 0, "unmapped repo must never spawn");
-        assert_eq!(report.failures.len(), 1);
-        assert_eq!(report.failures[0].phase, "unmapped_target_repo");
-        assert!(
-            report.failures[0].error.contains("someorg/unrelated-repo"),
-            "error should name the unmapped repo: {}",
-            report.failures[0].error
+        assert_eq!(
+            report.success_count(),
+            1,
+            "a syntactically-valid unseen repo must derive routing and dispatch"
+        );
+        assert_eq!(
+            report.failures.len(),
+            0,
+            "no failures expected for a derived dispatch"
         );
 
         let overlay = store.load("bead-0").unwrap().unwrap();
-        assert_eq!(overlay.state, OverlayState::HumanHeld);
-        assert_eq!(overlay.park_reason.as_deref(), Some("unmapped_target_repo"));
+        assert_eq!(overlay.state, OverlayState::Dispatched);
         assert!(
-            overlay.branch.is_none(),
-            "no branch should ever be registered/assigned for an unmappable bead"
+            overlay.branch.is_some(),
+            "derived dispatch must register a branch"
         );
-        assert!(
-            store.branches.borrow().is_empty(),
-            "register_branch must never be called for an unmapped repo"
-        );
-        let spawn_calls = sessions
-            .calls
-            .borrow()
-            .iter()
-            .filter(|c| c.starts_with("spawn("))
-            .count();
-        assert_eq!(spawn_calls, 0, "Sessions::spawn must never be called");
     }
 
     /// jleechan-8jxr r2 acceptance criterion #1: a manually-created factory
@@ -2005,6 +2006,7 @@ mod tests {
                 id: "bead-0".into(),
                 title: "title 0".into(),
                 description: String::new(),
+                notes: String::new(),
                 file_tree_summary: String::new(),
                 external_ref: Some("someorg/other-repo#42".to_string()),
             },
@@ -2072,6 +2074,7 @@ mod tests {
                 id: "bead-0".into(),
                 title: "title 0".into(),
                 description: "fix scope.\ntarget_repo: jleechanorg/some-repo\n".into(),
+                notes: String::new(),
                 file_tree_summary: String::new(),
                 external_ref: None,
             },

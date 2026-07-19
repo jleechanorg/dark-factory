@@ -849,7 +849,6 @@ impl SqliteStateStore {
         Ok(())
     }
 
-    <<<
     /// Idempotent migration for the `held_recheck_after` column (bead
     /// jleechan-zaga / issue #348 r3). Same probe-then-`ALTER` pattern as
     /// `ensure_reroll_deferral_count_column`. Nullable (NULL = "re-assess

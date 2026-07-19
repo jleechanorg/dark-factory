@@ -8836,6 +8836,9 @@ fn seed_attested_red_ci_bead(
             coderabbit_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: now.saturating_sub(60),
+            bugbot_status: "green".to_string(),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
     branch
@@ -9451,6 +9454,7 @@ fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
         id: "no-repo-bead".into(),
         title: "manual bead with no repo".into(),
         description: "manually created with no external_ref".into(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         // No external_ref and no body `target_repo:` field — dispatch
         // will park this as unmapped_repo.
