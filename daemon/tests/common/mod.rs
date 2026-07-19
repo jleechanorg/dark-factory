@@ -132,6 +132,7 @@ impl Tracker for FakeTracker {
                 id: id.clone(),
                 title: title.to_string(),
                 description: body.to_string(),
+                notes: String::new(),
                 file_tree_summary: String::new(),
                 external_ref: Some(external_ref.to_string()),
             });
@@ -845,6 +846,50 @@ impl Vcs for FakeVcs {
         Ok(())
     }
 
+    /// jleechan-wuts / issue #349: per-repo variant of `base_head`.
+    /// Default trait impl would delegate to `base_head`, which is keyed
+    /// on branch name only — that collides across repos (a `main` in
+    /// repo A and a `main` in repo B both resolve to the same key).
+    /// The fake looks up `"<repo>@<branch>"` first (the form
+    /// cross-repo tests seed) and falls back to the bare `<branch>`
+    /// key (the form single-repo tests seed) — preserves existing
+    /// test scripts without forcing a sweeping rewrite, while letting
+    /// cross-repo tests opt into distinct per-repo fixtures.
+    fn base_head_for_repo(&self, repo: &str, base_branch: &str) -> Result<String, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("base_head_for_repo({repo},{base_branch})"));
+        let scoped_key = format!("{repo}@{base_branch}");
+        if let Some(sha) = self.heads.get(&scoped_key) {
+            return Ok(sha.clone());
+        }
+        self.heads
+            .get(base_branch)
+            .cloned()
+            .ok_or_else(|| DaemonError::Tool {
+                tool: "git".into(),
+                rc: 1,
+                stderr: format!("no scripted head for {scoped_key}"),
+            })
+    }
+
+    /// jleechan-wuts / issue #349: per-repo variant of `create_branch_at`.
+    /// Default trait impl would delegate to `create_branch_at` (which
+    /// shells out to the daemon's local git), masking the cross-repo bug.
+    /// The fake simply records the call so tests can assert that reroll
+    /// routed through the per-repo entry point with the bead's repo.
+    fn create_branch_at_for_repo(
+        &self,
+        repo: &str,
+        name: &str,
+        sha: &str,
+    ) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("create_branch_at_for_repo({repo},{name},{sha})"));
+        Ok(())
+    }
+
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError> {
         self.calls.borrow_mut().push(format!("head_sha({branch})"));
         if let Some(msg) = self.fail_head_sha_for.borrow().get(branch) {
@@ -989,6 +1034,10 @@ pub struct FakeStateStore {
     /// `reroll_deferral_count` SQLite column), so the fail-closed defer/cap
     /// path can be driven across repeated `reroll::execute` calls in a test.
     pub reroll_deferrals: RefCell<HashMap<String, u32>>,
+    /// Bead jleechan-zaga / issue #348 r3: per-bead held-recheck cooldown
+    /// epoch (mirrors the `held_recheck_after` SQLite column), stored
+    /// independently of `BeadOverlay`.
+    pub held_recheck_after: RefCell<HashMap<String, u64>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -1184,6 +1233,20 @@ impl StateStore for FakeStateStore {
             .borrow_mut()
             .push(format!("reset_reroll_deferral({bead_id})"));
         self.reroll_deferrals.borrow_mut().insert(bead_id.to_string(), 0);
+        Ok(())
+    }
+
+    fn held_recheck_after(&self, bead_id: &str) -> Result<Option<u64>, DaemonError> {
+        Ok(self.held_recheck_after.borrow().get(bead_id).copied())
+    }
+
+    fn set_held_recheck_after(&self, bead_id: &str, epoch: u64) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("set_held_recheck_after({bead_id},{epoch})"));
+        self.held_recheck_after
+            .borrow_mut()
+            .insert(bead_id.to_string(), epoch);
         Ok(())
     }
 

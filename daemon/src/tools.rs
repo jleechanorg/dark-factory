@@ -10,12 +10,19 @@ use std::time::{Duration, Instant};
 
 /// A `br` bead candidate (design doc §4, spec §4.2.3).
 ///
-/// `description` and `file_tree_summary` exist so the router's rendered
-/// prompt (router.rs `render_prompt`) can judge routing complexity from more
-/// than just the one-line title (spec Appendix C item 1 says routing must be
-/// based on "the whole shape of the task" — a bare title is not that):
+/// `description`, `notes`, and `file_tree_summary` exist so the router's
+/// rendered prompt (router.rs `render_prompt`) can judge routing complexity
+/// from more than just the one-line title (spec Appendix C item 1 says
+/// routing must be based on "the whole shape of the task" — a bare title is
+/// not that):
 /// * `description` — the bead's full body text as returned by
 ///   `br list --json` (that JSON shape's `description` field); "" if absent.
+/// * `notes` — the bead's `br list --json` `notes` field (operator-authored
+///   per-attempt guidance; populated via `br update --notes`, e.g. when
+///   requeueing with refined scope instructions). "" if absent. Surfaced
+///   into the coder prompt as a distinct, higher-priority-than-description
+///   section (bead jleechan-0hqx, issue #338) so attempt rN coders don't
+///   re-litigate scope that was settled when the bead was requeued.
 /// * `file_tree_summary` — a short, pre-rendered listing of the repo paths
 ///   the bead is expected to touch (see `tools::summarize_file_tree`), so the
 ///   router can weigh blast radius without the LLM having to browse the repo
@@ -25,6 +32,7 @@ pub struct Bead {
     pub id: String,
     pub title: String,
     pub description: String, // full body/description from `br list --json`; "" if absent
+    pub notes: String, // operator-authored `br update --notes` text; "" if absent
     pub file_tree_summary: String, // pre-rendered file-tree text; "" if unavailable
     pub external_ref: Option<String>, // "<owner>/<repo>#<issue_number>", None = manual bead
 }
@@ -678,6 +686,52 @@ pub trait Sessions {
 pub trait Vcs {
     fn base_head(&self, base_branch: &str) -> Result<String, DaemonError>;
     fn create_branch_at(&self, name: &str, sha: &str) -> Result<(), DaemonError>;
+    /// Repo-scoped variant of [`base_head`](Vcs::base_head) (bead
+    /// jleechan-wuts / issue #349). The factory-fabricated re-roll path
+    /// (`reroll::execute` step 4) used to compute the new attempt's
+    /// base SHA via `base_head(base_branch)` — which is bound at
+    /// `main.rs` construction time to the daemon process's CWD
+    /// (its systemd `WorkingDirectory`, the daemon's own source-repo
+    /// checkout). When a bead's resolved `overlay.repo(cfg)` names a
+    /// DIFFERENT repo (Stage A intake — the live failure for the 8jxr /
+    /// 9rkz class), `git rev-parse <branch>` runs against the daemon's
+    /// own repo's same-named branch (or fails outright), never against
+    /// the routed target repo — silently wrong for any cross-repo
+    /// bead. `repo` should always be `overlay.repo(cfg)`, not
+    /// `cfg.target_repo` directly. Default impl ignores `repo` and
+    /// delegates to `base_head` so existing test fakes and any impl that
+    /// predates this method keep their original (single-repo) behavior;
+    /// `CliVcs` overrides it to retarget via `gh api
+    /// repos/<repo>/git/ref/heads/<branch>` (the same `gh api` plumbing
+    /// `remote_head_sha` already uses).
+    fn base_head_for_repo(&self, repo: &str, base_branch: &str) -> Result<String, DaemonError> {
+        let _ = repo;
+        self.base_head(base_branch)
+    }
+    /// Repo-scoped variant of [`create_branch_at`](Vcs::create_branch_at)
+    /// (bead jleechan-wuts / issue #349). The factory-fabricated re-roll
+    /// path (`reroll::execute` step 5) used to create the new attempt's
+    /// branch via `create_branch_at(name, sha)` — which shells out to
+    /// LOCAL `git branch <name> <sha>` in the daemon process's CWD
+    /// (the daemon's own source-repo checkout). When a bead's resolved
+    /// `overlay.repo(cfg)` names a DIFFERENT repo (the live failure
+    /// for the 8jxr / 9rkz class), the new `factory/<bead>-r<n>` branch
+    /// is created in the daemon's own repo, never in the routed target
+    /// repo where the worker will actually push — meaning the worker's
+    /// first `git push` either lands on a branch the daemon never made,
+    /// or is forced to create its own branch out-of-band, depending on
+    /// the branch-protection rules. `repo` should always be
+    /// `overlay.repo(cfg)`, not `cfg.target_repo` directly. Default
+    /// impl ignores `repo` and delegates to `create_branch_at` so
+    /// existing test fakes and any impl that predates this method keep
+    /// their original (single-repo) behavior; `CliVcs` overrides it to
+    /// POST a `refs/heads/<name>` ref via `gh api repos/<repo>/git/refs`
+    /// (cross-repo ref creation that does NOT depend on the daemon's
+    /// local checkout at all).
+    fn create_branch_at_for_repo(&self, repo: &str, name: &str, sha: &str) -> Result<(), DaemonError> {
+        let _ = repo;
+        self.create_branch_at(name, sha)
+    }
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError>;
     /// Budget-bounded [`head_sha`](Vcs::head_sha) (bead jleechan-zeij / issue
     /// #322 r4 P2). Default delegates to the unbounded method; the real
