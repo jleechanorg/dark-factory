@@ -175,6 +175,16 @@ pub struct FakeScm {
     /// same-repo open PR, or `PrHeadBranch::Fork` for a confirmed open PR
     /// whose head lives on a fork (the fail-closed guard).
     pub open_pr_head_refs: HashMap<(String, u64), PrHeadBranch>,
+    /// jleechan-znmh (issue #341, reroll PR-already-terminal tolerance):
+    /// scripted close failure keyed by `(repo, pr_number)`. When present,
+    /// `close_pr_for_repo` / `close_pr` returns
+    /// `DaemonError::Tool { tool: "gh", rc: 1, stderr }` — the exact shape
+    /// `gh pr close --repo <x> <n>` produces when the PR is already merged,
+    /// already closed, or in a closed state. A reroll must classify this
+    /// signature as a tolerant supersede (clear `pr_number`, emit
+    /// `REROLL_PR_ALREADY_MERGED` telemetry, continue), not wedge the bead
+    /// on a transient tool error.
+    pub pr_already_terminal: HashMap<(String, u64), String>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -245,6 +255,16 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("close_pr({pr},{comment})"));
+        if let Some(stderr) = self
+            .pr_already_terminal
+            .get(&("default".to_string(), pr))
+        {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: stderr.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -254,10 +274,25 @@ impl Scm for FakeScm {
     /// entry, so the regression test can prove reroll closes the bead's
     /// OWN PR (in its resolved repo) rather than `cfg.target_repo`'s
     /// same-numbered PR.
+    ///
+    /// jleechan-znmh / issue #341: when the bead's PR has been merged
+    /// or closed out-of-band (e.g. a prior failed reroll closed it, or
+    /// an external process force-closed it), `gh pr close --repo <x> <n>`
+    /// exits 1 with "cannot close: pull request #<n> is already merged"
+    /// or "is already in a closed state". The reroll must treat that as
+    /// a tolerant supersede (clear pr_number, continue) rather than
+    /// wedging the bead on a transient tool error.
     fn close_pr_for_repo(&self, repo: &str, pr: u64, comment: &str) -> Result<(), DaemonError> {
         self.calls
             .borrow_mut()
             .push(format!("close_pr_for_repo({repo},{pr},{comment})"));
+        if let Some(stderr) = self.pr_already_terminal.get(&(repo.to_string(), pr)) {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: stderr.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -780,6 +815,16 @@ pub struct FakeVcs {
     /// exercises the adopted-branch "needs a human" path (bead jleechan-tfs1)
     /// without ever touching a real `git` subprocess.
     pub fail_push_fix_commit_for: RefCell<Vec<String>>,
+    /// jleechan-znmh (issue #341, reroll branch-create idempotency): scripted
+    /// stale-branch-exists lookup keyed by `(repo, branch_name)`. When
+    /// present, the fake's `create_branch_at_for_repo` returns
+    /// `DaemonError::Tool { tool: "gh", rc: 1, stderr }` — the exact shape
+    /// `gh api --method POST repos/<repo>/git/refs` produces when the GH
+    /// Data API replies HTTP 422 with "Reference already exists". A reroll
+    /// must classify this signature as a stale local `-rN` branch left
+    /// behind by a prior failed attempt, delete-and-retry the create,
+    /// and continue — not wedge the bead on a transient tool error.
+    pub stale_branch_exists_at: RefCell<HashMap<(String, String), String>>,
     pub calls: RefCell<Vec<String>>,
     /// Real-wall-clock HEAD SHA scripting for the reroll quiescence-timeout
     /// race tests: `(branch, [(instant, sha), ...])` sorted ascending by
@@ -889,6 +934,15 @@ impl Vcs for FakeVcs {
     /// shells out to the daemon's local git), masking the cross-repo bug.
     /// The fake simply records the call so tests can assert that reroll
     /// routed through the per-repo entry point with the bead's repo.
+    ///
+    /// jleechan-znmh / issue #341: when `stale_branch_exists_at` has an
+    /// entry for `(repo, name)`, the fake returns the scripted 422-shaped
+    /// error so the reroll's delete-and-retry path can be exercised
+    /// without a real git subprocess. The entry is consumed on first
+    /// use — modeling the real `gh` behaviour where the stale ref has
+    /// been deleted by the reroll's `delete_branch_at_for_repo` call,
+    /// so a subsequent create POST succeeds. Tests that do not script a
+    /// stale branch get a clean success (the default legacy behaviour).
     fn create_branch_at_for_repo(
         &self,
         repo: &str,
@@ -898,6 +952,34 @@ impl Vcs for FakeVcs {
         self.calls
             .borrow_mut()
             .push(format!("create_branch_at_for_repo({repo},{name},{sha})"));
+        if let Some(stderr) = self
+            .stale_branch_exists_at
+            .borrow_mut()
+            .remove(&(repo.to_string(), name.to_string()))
+        {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr,
+            });
+        }
+        Ok(())
+    }
+
+    /// jleechan-znmh / issue #341: stub for the new delete-and-retry
+    /// entry point. The default trait impl is a no-op; tests that need
+    /// to assert the reroll called this method with the routed repo can
+    /// override via a wrapper. Recording the call here lets us verify
+    /// the reroll reached the recovery branch on a scripted stale
+    /// `create_branch_at_for_repo` 422.
+    fn delete_branch_at_for_repo(
+        &self,
+        repo: &str,
+        name: &str,
+    ) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("delete_branch_at_for_repo({repo},{name})"));
         Ok(())
     }
 
