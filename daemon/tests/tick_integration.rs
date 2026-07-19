@@ -981,6 +981,91 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// jleechan-t40t companion to `test_dispatch_integrity_sweep_parks_session_branch_mismatch`:
+/// when the dispatch-integrity sweep detects a `session_branch_mismatch` AND
+/// the overlay carries a stale `pr_number` from a previous dispatch (the
+/// jleechan-t8fd / PR #316 case), the sweep MUST clear that stale pr_number.
+/// Leaving the stale pr_number in place permanently pins the daemon to the
+/// closed/migrated PR — every subsequent gate assessment, comment, and PR
+/// lookup would target a PR that no longer owns this branch, blocking the
+/// bead from ever discovering the later correct PR. The fix is the same as
+/// the dispatch-side `spawn_branch_mismatch` arm: clear both `pr_number` and
+/// `branch` on detection so the next dispatch can re-resolve from the
+/// bead's `external_ref` or perform a fresh `gh pr list --head <branch>`
+/// lookup.
+#[test]
+fn test_dispatch_integrity_sweep_clears_stale_pr_number_on_session_branch_mismatch() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    sessions.set_session_branch("wa-3004", "feat/wa-3004-hook-refactor");
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    // Stale pr_number (the closed PR #316 from the live incident) is
+    // durably recorded on the overlay — the original buggy code path left
+    // this field untouched on branch-mismatch detection, permanently
+    // pinning the daemon to the wrong PR.
+    store.overlays.borrow_mut().insert(
+        "jleechan-t8fd".into(),
+        BeadOverlay {
+            bead_id: "jleechan-t8fd".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(316),
+            branch: Some("factory/jleechan-t8fd-r1".into()),
+            session_id: Some("wa-3004".into()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+
+    let telemetry_log =
+        std::env::temp_dir().join("afd_test_dispatch_integrity_sweep_clear_pr.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = FakeVcs::new();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 1).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 1);
+
+    let o = store.load("jleechan-t8fd").unwrap().unwrap();
+    assert_eq!(o.state, OverlayState::HumanHeld);
+    assert_eq!(o.park_reason.as_deref(), Some("session_branch_mismatch"));
+    assert!(
+        o.pr_number.is_none(),
+        "session_branch_mismatch detection MUST clear stale pr_number so the \
+         next dispatch can re-resolve the current correct PR from the \
+         bead's branch or external_ref; instead the overlay still carried \
+         pr_number={:?}",
+        o.pr_number,
+    );
+    assert!(
+        o.branch.is_none(),
+        "branch must be cleared alongside pr_number so the next dispatch \
+         is not pinned to the now-mismatched recorded branch"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// Companion test: a DISPATCHED row whose session_id's live branch DOES
 /// match must be left completely untouched by the integrity sweep (no
 /// false positives on legitimate in-flight dispatches).
