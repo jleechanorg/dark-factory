@@ -412,6 +412,21 @@ pub enum HumanHoldReason {
     UnknownOnlyGateCapped,
     CircuitBreaker,
     EscalationLocalFallback(String),
+    /// Bead jleechan-t8fd / issue #310: during attestation the daemon
+    /// detected that the coder pushed commits to one or more branches
+    /// OTHER than the bead's authorized `overlay.branch` (live precedent:
+    /// df-157 pushed to a PR head branch despite factory-branch-only
+    /// authorization — the prompt's BRANCH: line alone was read as
+    /// informational, not as binding). Fail-closed park: distinct from
+    /// `WorktreeRemoteMismatch` (which fires at dispatch time on a
+    /// wrong-remote worktree) and `SessionBranchMismatch` (which fires
+    /// when AO's session is bound to a different branch than the one
+    /// requested at spawn). This reason fires POST-spawn, during the
+    /// DISPATCHED -> ATTESTED promotion, when the rendered list of pushed
+    /// remote branches contains any branch the daemon did not authorize.
+    /// Permanent — silent requeue would replay the same violation, and the
+    /// operator needs to inspect the actual push list before any recovery.
+    BranchAuthorizationViolation,
 }
 
 impl HumanHoldReason {
@@ -455,6 +470,7 @@ impl HumanHoldReason {
             Self::EscalationLocalFallback(reason) => {
                 return format!("escalation_local_fallback:{reason}");
             }
+            Self::BranchAuthorizationViolation => "branch_authorization_violation",
         }
         .to_string()
     }

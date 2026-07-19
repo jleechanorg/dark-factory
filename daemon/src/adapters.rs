@@ -1264,6 +1264,47 @@ impl Scm for CliScm {
     ) -> Result<Option<u64>, DaemonError> {
         self.with_repo(repo).remote_branch_last_commit(branch)
     }
+
+    /// Bead jleechan-t8fd / issue #310: list every branch currently pushed
+    /// to `repo`'s default remote via `gh api repos/<repo>/branches
+    /// --paginate --jq '.[].name'`. Distinct from
+    /// `remote_branch_last_commit_for_repo` (which fetches a single
+    /// branch's tip SHA) — attestation needs the FULL list so it can
+    /// detect a coder who pushed to ANY branch other than the one
+    /// `overlay.branch` authorized (df-157 root cause: pushed to PR #288's
+    /// head branch despite factory-branch-only authorization). Repo-scoped
+    /// via `with_repo` so a cross-repo bead is checked against its OWN
+    /// repo, not `cfg.target_repo`'s branch list.
+    ///
+    /// Returns `Ok(vec![])` on transient `gh` failures rather than
+    /// propagating an error: attestation is fail-CLOSED-on-positive-mismatch
+    /// but fail-OPEN-on-transient-inspection (an unreadable branch list is
+    /// not the same evidence as a confirmed violation — gating a coder on
+    /// every transient `gh` hiccup would mass-park every healthy bead on
+    /// the next GitHub rate-limit blip, which is a worse outcome than
+    /// silently accepting the attestation when we genuinely cannot verify).
+    /// Live trade-off: a coder who exploits a transient `gh` outage to
+    /// slip a wrong-branch push past attestation gets one window of
+    /// unauthorized work — the next tick (post-recovery) re-runs
+    /// attestation against the persistent branch list and will catch any
+    /// leftover extra branch then.
+    fn pushed_branches_for_repo(&self, repo: &str) -> Result<Vec<String>, DaemonError> {
+        let path = format!("repos/{repo}/branches");
+        let out = match run_tool(
+            "gh",
+            &["api", &path, "--paginate", "--jq", ".[].name"],
+            30,
+        ) {
+            Ok(o) => o,
+            Err(_) => return Ok(Vec::new()),
+        };
+        // Output is JSON-array of strings: `["main","feat/x",...]`. Each
+        // element is already a branch name — no struct decode needed.
+        match serde_json::from_str::<Vec<String>>(&out) {
+            Ok(names) => Ok(names),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
 }
 
 /// Pure parser behind [`Scm::open_pr_head_ref_for_repo`] (unit-testable

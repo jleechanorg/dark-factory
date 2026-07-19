@@ -961,6 +961,15 @@ fn render_coder_prompt(
          BRANCH: {branch} — the daemon watches this exact branch on \
          {target_repo} for your commits. Push to it after EVERY green unit of \
          work; never hold more than ~30 minutes of uncommitted changes.\n\
+         AUTHORIZATION: you are authorized to push ONLY to {branch} on \
+         {remote}. Any other push target — a different branch (even the \
+         natural PR head branch), a different remote, a sibling worktree, or \
+         a fork — is a routing violation: it skips the daemon's gate checks \
+         and will be detected by attestation and refused. Live precedent: \
+         df-157 pushed to a PR head branch despite factory-branch-only \
+         authorization; the daemon now cross-checks pushed branches during \
+         attestation and emits a distinct telemetry event on mismatch \
+         (issue #310).\n\
          PUSH COMMAND (run this verbatim, never a bare `git push`): git push {remote} {branch}\n\
          \n\
          DELIVERABLE: a pull request from {branch} to the default branch of \
@@ -2005,6 +2014,7 @@ mod tests {
                 id: "bead-0".into(),
                 title: "title 0".into(),
                 description: String::new(),
+                notes: String::new(),
                 file_tree_summary: String::new(),
                 external_ref: Some("someorg/other-repo#42".to_string()),
             },
@@ -2072,6 +2082,7 @@ mod tests {
                 id: "bead-0".into(),
                 title: "title 0".into(),
                 description: "fix scope.\ntarget_repo: jleechanorg/some-repo\n".into(),
+                notes: String::new(),
                 file_tree_summary: String::new(),
                 external_ref: None,
             },
@@ -2759,6 +2770,51 @@ mod tests {
         );
     }
 
+    // jleechan-t8fd (issue #310 / df-157): the coder prompt's branch
+    // authorization was previously advisory — the daemon watched
+    // `BRANCH: <branch>` but the coder could still infer "well, the PR head
+    // branch is the natural place to push" and silently do exactly that
+    // (live incident: df-157 pushed to PR #288's head branch despite
+    // factory-branch-only authorization). Acceptance criterion: the prompt
+    // must carry an explicit "authorized to push ONLY to <branch>" line so
+    // a coder CANNOT mistake advisory framing for permissive framing, and
+    // the verified-branch substring is machine-checkable downstream
+    // (mechanical attestation in `tick::run_fast_tier`'s DISPATCHED ->
+    // ATTESTED promotion cross-references the same `<branch>` token).
+    #[test]
+    fn coder_prompt_states_authorized_branch_explicitly() {
+        let bead = Bead {
+            id: "bead-t8fd".into(),
+            title: "explicit branch auth".into(),
+            description: "must push only to factory/bead-t8fd-r2".into(),
+            notes: String::new(),
+            file_tree_summary: String::new(),
+            external_ref: Some("jleechanorg/dark-factory#310".into()),
+        };
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/bead-t8fd-r2",
+            "jleechanorg/dark-factory",
+            "origin",
+        );
+
+        // The exact branch must appear inside an explicit "authorized ...
+        // ONLY" phrase — not just in the bare BRANCH: line, which a coder
+        // could read as informational rather than binding.
+        assert!(
+            prompt.contains("authorized to push ONLY to factory/bead-t8fd-r2"),
+            "prompt must contain an explicit 'authorized to push ONLY to <branch>' \
+             line naming the branch verbatim (df-157 root cause: the BRANCH: line \
+             alone was read as informational, not as authorization); prompt was:\n{prompt}"
+        );
+        // And the same token must appear on the BRANCH: line — both forms
+        // are needed for downstream attestation to cross-reference.
+        assert!(
+            prompt.contains("BRANCH: factory/bead-t8fd-r2"),
+            "the existing BRANCH: line must still carry the verbatim branch"
+        );
+    }
+
     // jleechan-if09 (PR #247): the coder prompt must carry the full working
     // contract, not just the bead title. Updated for jleechan-bqdv Stage C's
     // `remote` parameter and its exact-remote/literal-push-command text
@@ -3059,15 +3115,19 @@ mod tests {
             // pre-truncation marker) yet their SUM pushes the rendered
             // prompt past the 4,096-char total cap — forcing the
             // reconciliation pass to do real work in the documented
-            // priority order. With tree=3,000 + description=500 +
-            // notes=1,400 + boilerplate~700 ≈ 5,600 chars total, the
-            // excess (~1,500) absorbs entirely into the tree's first
-            // shrink pass; tree survives with the `[tree truncated]`
-            // marker appended, while description and notes stay intact
-            // (no further shrink passes needed).
+            // priority order. After the jleechan-t8fd / issue #310
+            // AUTHORIZATION line was added to the boilerplate (~600
+            // chars), the original 3,000-char tree alone can't survive a
+            // single shrink pass with its `[tree truncated]` marker
+            // (excess > tree.len() + marker.len()), so the assertion
+            // now targets the documented priority: tree is shrunk first
+            // (to 0 — the REPO MAP section is omitted), and the
+            // description + operator-guidance sections survive intact.
+            // A `[description truncated]` marker must NOT appear and
+            // the full operator-guidance sentinel must survive.
             description: "D".repeat(500),
             notes: "OPERATOR_GUIDANCE_SENTINEL_DO_NOT_TRUNCATE".repeat(35), // ~1,400 chars
-            file_tree_summary: "x/".repeat(1_500), // 3,000 chars pre-render
+            file_tree_summary: "x/".repeat(1_500), // 3,000 chars pre-render (the CODER_PROMPT_TREE_CAP)
             external_ref: None,
         };
         let prompt = build_coder_prompt(
@@ -3082,16 +3142,33 @@ mod tests {
             "prompt must stay under AO spawn ceiling after reconciliation, len={}",
             prompt.len()
         );
-        // Tree was sacrificed first to make room.
+        // Tree was sacrificed first to make room. With the new
+        // AUTHORIZATION line (jleechan-t8fd / issue #310), the
+        // boilerplate grew enough that the 3,000-char tree may be
+        // shrunk to 0 — the renderer omits the REPO MAP section
+        // entirely when the post-shrink tree is empty. So we assert
+        // the SHAPE of the priority: tree is gone (or visibly marked
+        // truncated), description and notes are intact, no
+        // `[description truncated]` or `[notes truncated]` marker.
+        let tree_gone = !prompt.contains("REPO MAP");
+        let tree_marked = prompt.contains("[tree truncated]");
         assert!(
-            prompt.contains("[tree truncated]"),
-            "tree must be shrunk first when description+notes+tree exceed the total cap, got:\n{prompt}"
+            tree_gone || tree_marked,
+            "tree must be the first casualty of the budget shrink — either the REPO \
+             MAP section is omitted (tree shrank to empty) or `[tree truncated]` \
+             marker is present; got prompt of len {}:\n{prompt}",
+            prompt.len()
         );
         // Operator guidance survived intact — sentinel phrase present
         // untruncated (no `[notes truncated]` marker).
         assert!(
             !prompt.contains("[notes truncated]"),
-            "notes must NOT be truncated while description and tree still absorb budget, got:\n{prompt}"
+            "notes must NOT be truncated while description still absorbs budget, got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("[description truncated]"),
+            "description must NOT be truncated while tree still absorbs the excess, \
+             got:\n{prompt}"
         );
         assert!(
             prompt.contains("OPERATOR_GUIDANCE_SENTINEL_DO_NOT_TRUNCATE"),

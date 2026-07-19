@@ -433,6 +433,20 @@ pub trait Scm {
         self.close_pr(pr, comment)
     }
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError>;
+    /// Bead jleechan-t8fd / issue #310: list every branch currently pushed
+    /// to `repo`'s default remote, as the post-spawn attestation source of
+    /// truth. Default impl returns `Ok(vec![])` so existing test fakes and
+    /// any impl that predates this method keep their original (no-op)
+    /// behavior — only `CliScm` and the regression test below populate it.
+    /// The attestation path (`tick::run_fast_tier` DISPATCHED -> ATTESTED
+    /// promotion, post-spawn) compares this list against
+    /// `overlay.branch`: any extra branch is treated as a routing
+    /// violation and the bead is parked `HUMAN_HELD` with reason
+    /// `branch_authorization_violation` instead of being silently promoted.
+    fn pushed_branches_for_repo(&self, repo: &str) -> Result<Vec<String>, DaemonError> {
+        let _ = repo;
+        Ok(Vec::new())
+    }
     /// Repo-scoped variant of [`remote_branch_last_commit`](Scm::remote_branch_last_commit)
     /// (bead jleechan-bqdv, Stage C of the multi-repo dispatch fix — see
     /// `docs/multirepo-dispatch-investigation-2026-07-11.md`). The daemon's

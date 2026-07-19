@@ -9370,6 +9370,7 @@ fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
         id: "no-repo-bead".into(),
         title: "manual bead with no repo".into(),
         description: "manually created with no external_ref".into(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         // No external_ref and no body `target_repo:` field — dispatch
         // will park this as unmapped_repo.
@@ -9454,6 +9455,358 @@ fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
         transient_error.is_none(),
         "unmapped_repo park must NOT fall through to BEAD_DISPATCH_TRANSIENT_ERROR; events = {:?}",
         events
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// ============================================================================
+// Bead jleechan-t8fd / issue #310 (df-157 routing-violation regression):
+// attestation cross-checks pushed branches against `overlay.branch` before
+// promoting DISPATCHED -> ATTESTED. Three tests cover the matrix:
+//   1. positive-mismatch (extra branch present) -> HUMAN_HELD park + distinct
+//      BRANCH_AUTHORIZATION_VIOLATION telemetry
+//   2. compliant case (only the authorized branch is pushed) -> ATTESTED as
+//      before, no park, no extra telemetry
+//   3. fail-OPEN on transient inspection (`pushed_branches_for_repo` returns
+//      empty for any reason) -> attestation proceeds normally, no false-park
+// ============================================================================
+
+fn telemetry_events(log: &std::path::Path) -> Vec<serde_json::Value> {
+    let body = std::fs::read_to_string(log).unwrap_or_default();
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("telemetry line must be valid JSON"))
+        .collect()
+}
+
+/// Helper: build the minimal DISPATCHED-with-open-PR scenario one tick
+/// ahead of the fast-tier promotion path, then return the state needed to
+/// drive a fast-only tick that exercises attestation.
+fn dispatched_with_pr(
+    scm: &mut FakeScm,
+    pr_number: u64,
+) -> (FakeStateStore, std::path::PathBuf, Config, FakeSessions, FakeTracker, FakeLlm, FakeVcs) {
+    scm.pr_snapshots.insert(
+        pr_number,
+        PrSnapshot {
+            pr_number,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadbeef".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 0,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+    let store = FakeStateStore::new();
+    store
+        .save(&BeadOverlay {
+            bead_id: "fake-bead-t8fd".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(pr_number),
+            branch: Some("factory/jleechan-t8fd-r2".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("jleechanorg/dark-factory".into()),
+        })
+        .unwrap();
+    let cfg = test_cfg();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    // Skeptic is "pass" so the attestation path (gating DISPATCHED ->
+    // ATTESTED promotion) is the only thing under test — once promoted,
+    // the gate assessment runs cleanly with no Red gates and reports an
+    // unknown-only verdict (gate 6 /er is Absent in Stage 1 — see the
+    // pattern test above).
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let tracker = FakeTracker::new();
+    let vcs = FakeVcs::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_t8fd_attestation_test");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!(
+        "daemon-t8fd-{}-{}.jsonl",
+        pr_number,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // Pre-register the bead's branch so the fast tier's branch-registry
+    // discovery picks it up (mirrors the production flow where
+    // `dispatch_ready::register_branch` is the writer).
+    store
+        .register_branch("fake-bead-t8fd", "factory/jleechan-t8fd-r2")
+        .unwrap();
+
+    (
+        store,
+        telemetry_log,
+        cfg,
+        sessions,
+        tracker,
+        llm,
+        vcs,
+    )
+}
+
+#[test]
+fn attestation_parks_branch_authorization_violation_on_extra_pushed_branch() {
+    // Live precedent: df-157 (2026-07-15) pushed to PR #288's head branch
+    // despite factory-branch-only authorization. The fix lives at the
+    // DISPATCHED -> ATTESTED promotion (tick::run_fast_tier): if
+    // `pushed_branches_for_repo` returns a list containing any branch
+    // OTHER than `overlay.branch`, refuse to promote, emit a distinct
+    // `BRANCH_AUTHORIZATION_VIOLATION` telemetry event, park
+    // `HUMAN_HELD` with reason `branch_authorization_violation`, and do
+    // NOT silently ATTEST.
+    let mut scm = FakeScm::new();
+    // Scripted push list: the authorized factory branch IS present, but
+    // the coder ALSO pushed to `feat/some-pr-head` (the df-157 pattern).
+    scm.pushed_branches_by_repo.insert(
+        "jleechanorg/dark-factory".into(),
+        vec![
+            "factory/jleechan-t8fd-r2".into(),
+            "feat/some-pr-head".into(),
+        ],
+    );
+    let (store, telemetry_log, cfg, sessions, tracker, llm, vcs) =
+        dispatched_with_pr(&mut scm, 2001);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1, // fast tier only (slow tier would re-route)
+        0,
+    )
+    .expect("tick must succeed");
+
+    // The bead must be parked, NOT attested, and NOT gate-assessed.
+    // Summary counters (`beads_ready` is the terminal-promotion counter):
+    // a violation bead must NEVER reach `beads_ready` regardless of how
+    // many other beads in the same tick did.
+    assert_eq!(
+        summary.beads_ready, 0,
+        "a routing-violation bead must NEVER reach READY (terminal promotion); \
+         df-157 root cause was silent ATTESTED -> READY promotion; the fix is \
+         fail-closed park. Summary: {:?}",
+        summary
+    );
+    assert_eq!(
+        summary.gates_assessed, 0,
+        "a routing-violation bead must skip the fast-tier gate loop entirely"
+    );
+
+    let final_overlay = store
+        .load("fake-bead-t8fd")
+        .unwrap()
+        .expect("overlay must persist");
+    assert_eq!(
+        final_overlay.state,
+        OverlayState::HumanHeld,
+        "the bead must be parked HUMAN_HELD, not silently promoted"
+    );
+    assert_eq!(
+        final_overlay.park_reason.as_deref(),
+        Some("branch_authorization_violation"),
+        "the park reason must be the new `branch_authorization_violation` value, \
+         not a generic spawn/reroll reason"
+    );
+
+    // Distinct telemetry event (NOT a generic failure) so an operator
+    // can grep for it without sifting through the full daemon.jsonl.
+    let events = telemetry_events(&telemetry_log);
+    let violation_event = events
+        .iter()
+        .find(|e| e["eventType"] == "BRANCH_AUTHORIZATION_VIOLATION")
+        .expect("a distinct BRANCH_AUTHORIZATION_VIOLATION telemetry event must be emitted on violation");
+    assert_eq!(violation_event["beadId"], "fake-bead-t8fd");
+    assert_eq!(
+        violation_event["context"]["authorized_branch"],
+        "factory/jleechan-t8fd-r2"
+    );
+    assert_eq!(violation_event["context"]["authorized_present"], true);
+    let extra_branches = violation_event["context"]["extra_branches"]
+        .as_array()
+        .expect("extra_branches must be a JSON array");
+    assert!(
+        extra_branches
+            .iter()
+            .any(|b| b.as_str() == Some("feat/some-pr-head")),
+        "telemetry context must name the extra unauthorized branch (df-157 pattern: \
+         pushed to a PR head branch alongside the authorized factory branch); got: {:?}",
+        extra_branches
+    );
+    assert_eq!(
+        violation_event["context"]["repo"],
+        "jleechanorg/dark-factory"
+    );
+
+    // The push-list lookup must have used the bead's RESOLVED repo, not
+    // `cfg.target_repo` ("owner/repo") — proves the cross-repo Stage D
+    // routing applies here too, not just `pr_snapshot_for_repo`.
+    let scm_calls = scm.calls.borrow().join("\n");
+    assert!(
+        scm_calls.contains("pushed_branches_for_repo(jleechanorg/dark-factory)"),
+        "attestation must scope the push-list lookup to the bead's resolved repo, got calls:\n{scm_calls}"
+    );
+    assert!(
+        !scm_calls.contains("pushed_branches_for_repo(owner/repo)"),
+        "attestation must NOT default to cfg.target_repo for a bead whose resolved repo differs"
+    );
+
+    // Belt-and-suspenders: a `PR_OPENED` event would mean the bead was
+    // silently ATTESTED before the branch check fired — the exact bug
+    // we're fixing.
+    assert!(
+        events.iter().all(|e| e["eventType"] != "PR_OPENED"),
+        "a violation bead must NOT emit PR_OPENED (the old silent-promotion signal); events: {:?}",
+        events
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn attestation_promotes_to_attested_when_only_authorized_branch_is_pushed() {
+    // Compliant case: the push list contains EXACTLY the authorized
+    // factory branch (no extras). The bead must promote DISPATCHED ->
+    // ATTESTED as before, with no park and no
+    // BRANCH_AUTHORIZATION_VIOLATION event.
+    let mut scm = FakeScm::new();
+    scm.pushed_branches_by_repo.insert(
+        "jleechanorg/dark-factory".into(),
+        vec!["factory/jleechan-t8fd-r2".into()],
+    );
+    let (store, telemetry_log, cfg, sessions, tracker, llm, vcs) =
+        dispatched_with_pr(&mut scm, 2002);
+
+    let _summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick must succeed");
+
+    // Compliant bead promotes normally. The same fast tier then runs the
+    // gate loop; gate 6 (/er) is Unknown in Stage 1 so the terminal
+    // state may be HUMAN_HELD with "gate assessment not all-green" —
+// but the ATTESTED promotion itself MUST have fired (PR_OPENED
+// telemetry) and the branch-authorization gate MUST NOT be the
+// reason. The test pins the positive outcome: NO
+// BRANCH_AUTHORIZATION_VIOLATION telemetry, NO
+// branch_authorization_violation park_reason.
+    let final_overlay = store
+        .load("fake-bead-t8fd")
+        .unwrap()
+        .expect("overlay must persist");
+    assert_ne!(
+        final_overlay.park_reason.as_deref(),
+        Some("branch_authorization_violation"),
+        "compliant attestation must NOT park with branch_authorization_violation; \
+         actual park_reason = {:?}",
+        final_overlay.park_reason
+    );
+
+    let events = telemetry_events(&telemetry_log);
+    assert!(
+        events
+            .iter()
+            .all(|e| e["eventType"] != "BRANCH_AUTHORIZATION_VIOLATION"),
+        "compliant attestation must NOT emit BRANCH_AUTHORIZATION_VIOLATION; events: {:?}",
+        events
+    );
+    // The pre-existing PR_OPENED signal must still fire — proves the new
+    // check did not regress the happy path.
+    assert!(
+        events.iter().any(|e| e["eventType"] == "PR_OPENED"),
+        "compliant attestation must emit the normal PR_OPENED event; events: {:?}",
+        events
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn attestation_fails_open_on_empty_push_list() {
+    // Fail-OPEN-on-transient-inspection: when `pushed_branches_for_repo`
+    // returns an empty list (either no pushes yet, or a transient `gh`
+    // hiccup — the real adapter collapses both into `Ok(vec![])`), the
+    // attestation must NOT park the bead. The next tick re-runs
+    // attestation against the persistent branch list, so a transient
+    // outage cannot be used to slip a wrong-branch push past
+    // attestation for more than one tick.
+    let mut scm = FakeScm::new();
+    // Empty list = no pushed_branches_by_repo entry; FakeScm returns
+    // `Ok(vec![])` for unknown repos.
+    let (store, telemetry_log, cfg, sessions, tracker, llm, vcs) =
+        dispatched_with_pr(&mut scm, 2003);
+
+    let _summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick must succeed");
+
+    let final_overlay = store
+        .load("fake-bead-t8fd")
+        .unwrap()
+        .expect("overlay must persist");
+    assert_ne!(
+        final_overlay.park_reason.as_deref(),
+        Some("branch_authorization_violation"),
+        "fail-open attestation must NOT park with branch_authorization_violation; \
+         actual park_reason = {:?}",
+        final_overlay.park_reason
+    );
+
+    let events = telemetry_events(&telemetry_log);
+    assert!(
+        events
+            .iter()
+            .all(|e| e["eventType"] != "BRANCH_AUTHORIZATION_VIOLATION"),
+        "fail-open path must NOT emit a false BRANCH_AUTHORIZATION_VIOLATION event"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

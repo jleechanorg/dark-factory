@@ -163,6 +163,14 @@ pub struct FakeScm {
     pub permissions: HashMap<String, Permission>,
     pub pr_snapshots: HashMap<u64, PrSnapshot>,
     pub remote_branches: HashMap<String, Option<u64>>,
+    /// Bead jleechan-t8fd / issue #310: scripted per-repo pushed-branch
+    /// list returned by `Scm::pushed_branches_for_repo`. Absence (default)
+    /// means `Ok(vec![])` — matching the real `CliScm` fail-OPEN-on-
+    /// transient behavior so every pre-existing test keeps accepting the
+    /// attestation path unconditionally. Populate with a non-empty list to
+    /// exercise the positive-mismatch detection path
+    /// (`branch_authorization_violation` park).
+    pub pushed_branches_by_repo: HashMap<String, Vec<String>>,
     /// jleechan-drive-pr-branch-binding-pcpr: scripted open-PR lookups,
     /// keyed by `(repo, pr_number)`. Absence of a key (the `Default` case)
     /// means `PrHeadBranch::NotFound`, matching the real `CliScm` fail-safe
@@ -265,6 +273,18 @@ impl Scm for FakeScm {
         } else {
             Ok(None)
         }
+    }
+
+    /// Bead jleechan-t8fd / issue #310: scripted per-repo branch list for
+    /// attestation. Records the call so tests can assert attestation ran
+    /// against the bead's resolved repo (not `cfg.target_repo`) and returns
+    /// the pre-seeded list, or `vec![]` (the real adapter's fail-OPEN
+    /// behavior on transient inspection failure) when no list is scripted.
+    fn pushed_branches_for_repo(&self, repo: &str) -> Result<Vec<String>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("pushed_branches_for_repo({repo})"));
+        Ok(self.pushed_branches_by_repo.get(repo).cloned().unwrap_or_default())
     }
 
     fn open_pr_head_ref_for_repo(&self, repo: &str, pr: u64) -> Result<PrHeadBranch, DaemonError> {

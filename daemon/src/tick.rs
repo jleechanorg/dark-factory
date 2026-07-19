@@ -2338,6 +2338,90 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 };
 
                 if ready_to_promote {
+                    // Bead jleechan-t8fd / issue #310 (df-157 root cause):
+                    // cross-check the bead's authorized branch against the
+                    // actually-pushed branches in the bead's resolved repo.
+                    // If the coder pushed to ANY branch other than
+                    // `overlay.branch`, refuse to promote DISPATCHED ->
+                    // ATTESTED, emit a distinct `BRANCH_AUTHORIZATION_VIOLATION`
+                    // telemetry event, and park the bead `HUMAN_HELD` with
+                    // reason `branch_authorization_violation`. Distinct from
+                    // `worktree_remote_mismatch` (dispatch-time wrong remote)
+                    // and `session_branch_mismatch` (AO session bound to the
+                    // wrong branch at spawn) — this is a POST-spawn,
+                    // push-list-driven attestation gate.
+                    //
+                    // `pushed_branches_for_repo` is fail-OPEN on transient
+                    // inspection errors (returns `Ok(vec![])` on `gh`
+                    // failures — see `daemon/src/adapters.rs`'s impl), so a
+                    // real `Ok(vec![])` here means either "no branches pushed
+                    // yet" or "transient gh outage" — BOTH are NO-OP for the
+                    // mismatch check (extra_branches stays empty, no park).
+                    // A positive mismatch (non-empty list, authorized branch
+                    // absent OR extra branches present) is the only signal
+                    // that triggers the park.
+                    if let Some(ref authorized_branch) = overlay.branch {
+                        let authorized_branch_str = authorized_branch.clone();
+                        match deps.scm.pushed_branches_for_repo(&repo) {
+                            Ok(pushed) if !pushed.is_empty() => {
+                                let extra: Vec<String> = pushed
+                                    .iter()
+                                    .filter(|b| b.as_str() != authorized_branch_str.as_str())
+                                    .cloned()
+                                    .collect();
+                                let authorized_present =
+                                    pushed.iter().any(|b| b == &authorized_branch_str);
+                                if !extra.is_empty() || !authorized_present {
+                                    overlay.state = OverlayState::HumanHeld;
+                                    set_human_hold_reason(
+                                        &mut overlay,
+                                        HumanHoldReason::BranchAuthorizationViolation,
+                                    );
+                                    deps.store.save(&overlay)?;
+                                    emit(
+                                        deps.telemetry_log,
+                                        bead_id,
+                                        overlay.attempt,
+                                        OverlayState::HumanHeld.as_str(),
+                                        "BRANCH_AUTHORIZATION_VIOLATION",
+                                        serde_json::json!({}),
+                                        serde_json::json!({
+                                            "authorized_branch": authorized_branch_str,
+                                            "authorized_present": authorized_present,
+                                            "extra_branches": extra,
+                                            "repo": &repo,
+                                            "pr_number": pr,
+                                        }),
+                                    )?;
+                                    let comment_body = format!(
+                                        "🤖 **[dark-factory]** Attestation refused to promote bead `{}` to ATTESTED: \
+                                         the daemon detected branches pushed to `{}` other than the authorized \
+                                         `{}` (extra: `{:?}`; authorized present: `{}`). Parked \
+                                         `HUMAN_HELD` with reason `branch_authorization_violation`. Operator \
+                                         action required — this matches the df-157 routing-violation pattern; \
+                                         inspect the listed branches, verify the coder's push intent, and either \
+                                         recover the authorized branch's work or file a follow-up bead to \
+                                         supersede these pushes. (issue #310 / bead jleechan-t8fd.)",
+                                        bead_id,
+                                        repo,
+                                        authorized_branch_str,
+                                        extra,
+                                        authorized_present,
+                                    );
+                                    let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+                                    continue;
+                                }
+                            }
+                            // Transient inspection failure (empty list from
+                            // `gh` hiccup) or genuine no-pushes-yet state —
+                            // neither is a positive mismatch, so no park.
+                            // The push-list-driven attestation is bypassed
+                            // for this tick; the next tick re-runs it.
+                            Ok(_) => {}
+                            Err(_) => {}
+                        }
+                    }
+
                     overlay.state = OverlayState::Attested;
                     deps.store.save(&overlay)?;
                     let event_type = if overlay.is_adopted {
