@@ -2294,27 +2294,58 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 
         // Promote DISPATCHED -> ATTESTED once a PR is open (spec §4.2.7).
         if overlay.state == OverlayState::Dispatched {
-            if overlay.pr_number.is_none() {
-                if let Some(ref branch) = overlay.branch {
-                    if let Ok(out) = crate::tools::run_tool(
-                        "gh",
-                        &[
-                            "pr",
-                            "list",
-                            "--head",
-                            branch,
-                            "--repo",
-                            &repo,
-                            "--json",
-                            "number",
-                            "--jq",
-                            ".[0].number",
-                        ],
-                        30,
-                    ) {
-                        if let Ok(pr) = out.trim().parse::<u64>() {
-                            overlay.pr_number = Some(pr);
-                        }
+            if let Some(ref branch) = overlay.branch {
+                // jleechan-t40t (issue #326): re-resolve `pr_number` from the
+                // bead's CURRENT branch every slow-tier tick (not just when
+                // it's `None`). The pre-fix code only ran this lookup when
+                // `pr_number.is_none()`, which meant a stale `pr_number` —
+                // e.g. set from an AO session that was later superseded by
+                // a different PR on the same branch, or written out-of-band
+                // — kept the bead DISPATCHED indefinitely against the wrong
+                // PR (every gate-assessment query targeted a PR the bead's
+                // branch was no longer bound to). The new path runs every
+                // tick when a `branch` is recorded, treats `Ok(None)` as
+                // "branch has no open PR right now — keep the existing
+                // `pr_number` until one appears", and on `Ok(Some(discovered))`
+                // either fills in the missing `pr_number` (first-discovery)
+                // or supersedes a stale one (drift detection), emitting
+                // `PR_NUMBER_REREZOLVED` so the transition is auditable
+                // from the daemon log alone. A hard `Err` is logged and
+                // skipped — the next tick re-attempts the lookup.
+                match deps.scm.pr_number_for_branch(&repo, branch) {
+                    Ok(Some(discovered)) if Some(discovered) != overlay.pr_number => {
+                        let previous = overlay.pr_number;
+                        overlay.pr_number = Some(discovered);
+                        deps.store.save(&overlay)?;
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Dispatched.as_str(),
+                            "PR_NUMBER_REREZOLVED",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "branch": branch,
+                                "previous_pr_number": previous,
+                                "current_pr_number": discovered,
+                                "reason": "branch_mismatch_stale_state",
+                            }),
+                        )?;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Dispatched.as_str(),
+                            "PR_NUMBER_REREZOLVE_TRANSIENT_ERROR",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "branch": branch,
+                                "error": format!("{e:?}"),
+                            }),
+                        );
                     }
                 }
             }
