@@ -34,6 +34,7 @@ fn test_cfg() -> Config {
         reroll_death_confirm_secs: 0,
         held_recheck_cooldown_secs: 900,
         repos: std::collections::HashMap::new(),
+        pre_gate_validation_enabled: false,
     }
 }
 
@@ -119,9 +120,9 @@ fn test_circuit_breaker() {
         session_id: None,
         is_adopted: false,
         spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
     };
     store.save(&bead).unwrap();
 
@@ -206,9 +207,9 @@ fn test_reroll_success() {
         session_id: None,
         is_adopted: false,
         spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
     };
     store.save(&bead).unwrap();
 
@@ -325,8 +326,10 @@ fn test_reroll_routes_vcs_ops_through_bead_repo_for_cross_repo_bead() {
     // path is deliberately NOT seeded, so a regression to the
     // CWD-bound `base_head(main)` call fails the reroll with
     // `DaemonError::Tool` and the bead never reaches Recovery state.
-    vcs.heads
-        .insert("jleechanorg/other-repo@main".into(), "cross-repo-base-sha".into());
+    vcs.heads.insert(
+        "jleechanorg/other-repo@main".into(),
+        "cross-repo-base-sha".into(),
+    );
     // Seed the prior attempt's head in the bare `heads` map: reroll's
     // pre-quiescence `head_sha_within` (a separate code path, unchanged
     // by this fix) reads `heads[branch]` directly. Without this entry
@@ -505,6 +508,15 @@ fn test_tick_stage2_integration() {
     overlay.pr_number = Some(15);
     store.save(&overlay).unwrap();
 
+    // jleechan-t40t r6: the slow-tier branch→PR re-resolution now
+    // fail-closed-clears stale pr_number when the branch has no live PR.
+    // Script the fake branch→PR lookup so the gate-assessment path
+    // proceeds against the live PR 15.
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), "factory/fake-bead-1-r1".into()),
+        Some(15),
+    );
+
     scm.pr_snapshots.insert(
         15,
         PrSnapshot {
@@ -599,7 +611,10 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
     let scm = FakeScm::new();
     let sessions = FakeSessions::new();
     let mut vcs = FakeVcs::new();
-    vcs.heads.insert("alice/my-cool-feature".into(), "pre-session-sha-abc123".into());
+    vcs.heads.insert(
+        "alice/my-cool-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
     let store = FakeStateStore::new();
     let llm = FakeLlm::new();
     let cfg = test_cfg();
@@ -724,7 +739,9 @@ fn test_reroll_adopted_success_spawns_remediation_session_leaves_pr_open() {
     // (c) Never closes the original PR:
     let scm_calls = scm.calls.borrow();
     assert!(
-        scm_calls.iter().all(|c| !c.starts_with("close_pr_for_repo(") && !c.starts_with("close_pr(")),
+        scm_calls
+            .iter()
+            .all(|c| !c.starts_with("close_pr_for_repo(") && !c.starts_with("close_pr(")),
         "adopted remediation must never close the contributor's PR: {scm_calls:?}"
     );
 
@@ -743,7 +760,10 @@ fn test_reroll_adopted_spawn_failure_parks_human_held() {
     let sessions = FakeSessions::new();
     sessions.fail_spawn_for("bead-adopted-conflict");
     let mut vcs = FakeVcs::new();
-    vcs.heads.insert("alice/my-cool-feature".into(), "pre-session-sha-abc123".into());
+    vcs.heads.insert(
+        "alice/my-cool-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
     let store = FakeStateStore::new();
     let llm = FakeLlm::new();
     let cfg = test_cfg();
@@ -820,7 +840,9 @@ fn test_reroll_adopted_spawn_failure_parks_human_held() {
     );
     let scm_calls = scm.calls.borrow();
     assert!(
-        scm_calls.iter().all(|c| !c.starts_with("close_pr_for_repo(") && !c.starts_with("close_pr(")),
+        scm_calls
+            .iter()
+            .all(|c| !c.starts_with("close_pr_for_repo(") && !c.starts_with("close_pr(")),
         "a failed adopted remediation must never close the contributor's PR: {scm_calls:?}"
     );
 
@@ -882,7 +904,10 @@ fn adopted_spawn_failures_never_leave_an_untracked_or_recoverable_live_worker() 
                     held.session_id.as_deref(),
                     Some(format!("leaked-{bead_id}").as_str())
                 );
-                assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })));
+                assert!(matches!(
+                    result,
+                    Err(DaemonError::SpawnCleanupFailed { .. })
+                ));
             }
             "save-stop-ok" => {
                 assert_eq!(held.session_id, None);
@@ -894,7 +919,10 @@ fn adopted_spawn_failures_never_leave_an_untracked_or_recoverable_live_worker() 
             }
             "save-stop-fails" => {
                 assert_eq!(held.session_id.as_deref(), Some("fake-session-1"));
-                assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })));
+                assert!(matches!(
+                    result,
+                    Err(DaemonError::SpawnCleanupFailed { .. })
+                ));
             }
             _ => unreachable!(),
         }
@@ -939,9 +967,9 @@ fn test_reroll_adopted_skips_duplicate_spawn_when_session_already_active() {
         session_id: None,
         is_adopted: true,
         spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
     };
     store.save(&bead).unwrap();
     store
@@ -1032,7 +1060,10 @@ fn adopted_spawn_crash_is_reconciled_without_duplicate_redispatch() {
             &mut bead,
         );
     }));
-    assert!(result.is_err(), "the fake must simulate process death after spawn");
+    assert!(
+        result.is_err(),
+        "the fake must simulate process death after spawn"
+    );
 
     let durable_intent = store.load(bead_id).unwrap().unwrap();
     assert_eq!(durable_intent.state, OverlayState::Dispatching);
@@ -1247,7 +1278,10 @@ mod quiescence_timeout_races {
             RerollOutcome::Rerolled { new_branch } => {
                 assert_eq!(new_branch, "factory/bead-race-nf-r2");
             }
-            other => panic!("expected Rerolled on the no-live-session fast path, got {:?}", other),
+            other => panic!(
+                "expected Rerolled on the no-live-session fast path, got {:?}",
+                other
+            ),
         }
 
         let updated = store.load("bead-race-nf").unwrap().unwrap();
@@ -1256,8 +1290,9 @@ mod quiescence_timeout_races {
 
         let calls = sessions.calls.borrow();
         assert!(
-            calls.iter().all(|c| !c.starts_with("stop(")
-                && !c.starts_with("session_activity(")),
+            calls
+                .iter()
+                .all(|c| !c.starts_with("stop(") && !c.starts_with("session_activity(")),
             "the entry-SessionNotFound fast path must skip stop/liveness polling, got {calls:?}"
         );
 
@@ -1308,7 +1343,10 @@ mod quiescence_timeout_races {
             RerollOutcome::Rerolled { new_branch } => {
                 assert_eq!(new_branch, "factory/bead-race-tw-r2");
             }
-            other => panic!("expected Rerolled via stable-window terminal, got {:?}", other),
+            other => panic!(
+                "expected Rerolled via stable-window terminal, got {:?}",
+                other
+            ),
         }
         let elapsed = start.elapsed();
         // Must span the full 1s window (proving it is not a ~500ms check), but
@@ -1439,9 +1477,13 @@ mod quiescence_timeout_races {
         assert_eq!(updated.state, OverlayState::Attested);
         assert_eq!(updated.session_id.as_deref(), Some("fake-session-1"));
         let vcs_calls = vcs.calls.borrow();
-        assert!(vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")));
+        assert!(vcs_calls
+            .iter()
+            .all(|c| !c.starts_with("create_branch_at(")));
         let scm_calls = scm.calls.borrow();
-        assert!(scm_calls.iter().all(|c| !c.starts_with("close_pr_for_repo(") && !c.starts_with("close_pr(")));
+        assert!(scm_calls
+            .iter()
+            .all(|c| !c.starts_with("close_pr_for_repo(") && !c.starts_with("close_pr(")));
 
         let _ = std::fs::remove_file(&telemetry_log);
     }
@@ -1493,7 +1535,10 @@ mod quiescence_timeout_races {
             RerollOutcome::Deferred(reason) => {
                 assert_eq!(reason, "unconfirmed_live_or_moving_head");
             }
-            other => panic!("expected Deferred on a live+pushing worker, got {:?}", other),
+            other => panic!(
+                "expected Deferred on a live+pushing worker, got {:?}",
+                other
+            ),
         }
 
         let updated = store.load("bead-race-live").unwrap().unwrap();
@@ -1501,9 +1546,13 @@ mod quiescence_timeout_races {
         assert_eq!(updated.session_id.as_deref(), Some("fake-session-1"));
         assert_eq!(store.reroll_deferral_count("bead-race-live").unwrap(), 1);
         let vcs_calls = vcs.calls.borrow();
-        assert!(vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")));
+        assert!(vcs_calls
+            .iter()
+            .all(|c| !c.starts_with("create_branch_at(")));
         let scm_calls = scm.calls.borrow();
-        assert!(scm_calls.iter().all(|c| !c.starts_with("close_pr_for_repo(") && !c.starts_with("close_pr(")));
+        assert!(scm_calls
+            .iter()
+            .all(|c| !c.starts_with("close_pr_for_repo(") && !c.starts_with("close_pr(")));
 
         let _ = std::fs::remove_file(&telemetry_log);
     }
@@ -1556,7 +1605,10 @@ mod quiescence_timeout_races {
 
         match reroll::execute(&deps, &mut bead).unwrap() {
             RerollOutcome::Deferred(_) => {}
-            other => panic!("expected Deferred when a push lands mid-window, got {:?}", other),
+            other => panic!(
+                "expected Deferred when a push lands mid-window, got {:?}",
+                other
+            ),
         }
 
         // Proves head_sha was sampled every poll (not once): the moving HEAD
@@ -1616,7 +1668,10 @@ mod quiescence_timeout_races {
 
         match reroll::execute(&deps, &mut bead).unwrap() {
             RerollOutcome::Deferred(reason) => assert_eq!(reason, "stop_failed"),
-            other => panic!("expected Deferred on a transient stop() failure, got {:?}", other),
+            other => panic!(
+                "expected Deferred on a transient stop() failure, got {:?}",
+                other
+            ),
         }
 
         let updated = store.load("bead-race-sf").unwrap().unwrap();
@@ -1624,7 +1679,9 @@ mod quiescence_timeout_races {
         assert_eq!(updated.session_id.as_deref(), Some("fake-session-1"));
         assert_eq!(store.reroll_deferral_count("bead-race-sf").unwrap(), 1);
         let vcs_calls = vcs.calls.borrow();
-        assert!(vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")));
+        assert!(vcs_calls
+            .iter()
+            .all(|c| !c.starts_with("create_branch_at(")));
 
         let _ = std::fs::remove_file(&telemetry_log);
     }
@@ -1756,7 +1813,10 @@ mod quiescence_timeout_races {
 
         match reroll::execute(&deps, &mut bead).unwrap() {
             RerollOutcome::Deferred(reason) => assert_eq!(reason, "attach_transient"),
-            other => panic!("expected Deferred on a transient attach error, got {:?}", other),
+            other => panic!(
+                "expected Deferred on a transient attach error, got {:?}",
+                other
+            ),
         }
         let updated = store.load("bead-race-at").unwrap().unwrap();
         assert_eq!(updated.state, OverlayState::Attested);
@@ -1853,7 +1913,10 @@ mod quiescence_timeout_races {
             let mut b = store.load("bead-race-cap").unwrap().unwrap();
             match reroll::execute(&deps, &mut b).unwrap() {
                 RerollOutcome::Deferred(_) => {}
-                other => panic!("tick {tick}: expected Deferred below the cap, got {:?}", other),
+                other => panic!(
+                    "tick {tick}: expected Deferred below the cap, got {:?}",
+                    other
+                ),
             }
             assert_eq!(store.reroll_deferral_count("bead-race-cap").unwrap(), tick);
             assert_eq!(
@@ -1961,7 +2024,9 @@ mod quiescence_timeout_races {
         assert_eq!(updated.session_id.as_deref(), Some("fake-session-1"));
         let vcs_calls = vcs.calls.borrow();
         assert!(
-            vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")),
+            vcs_calls
+                .iter()
+                .all(|c| !c.starts_with("create_branch_at(")),
             "a NotFound flap must not fabricate a branch: {vcs_calls:?}"
         );
 
@@ -2012,7 +2077,13 @@ fn same_underlying_issue_malformed_reply_is_transient_not_fatal() {
     };
     store.save(&bead).unwrap();
     store
-        .save_rejection("cq8r-bead", 1, "verifier", "deadbeefdeadbeef", "prior rejection text")
+        .save_rejection(
+            "cq8r-bead",
+            1,
+            "verifier",
+            "deadbeefdeadbeef",
+            "prior rejection text",
+        )
         .unwrap();
 
     let deps = RerollDeps {
