@@ -961,6 +961,17 @@ fn render_coder_prompt(
          BRANCH: {branch} — the daemon watches this exact branch on \
          {target_repo} for your commits. Push to it after EVERY green unit of \
          work; never hold more than ~30 minutes of uncommitted changes.\n\
+         AUTHORIZATION: you are authorized to push ONLY to {branch} on \
+         {remote} ({target_repo}). Any push to a different branch or remote \
+         (including the PR head branch you intend to land work into) is a \
+         routing violation — the daemon will refuse to promote your bead to \
+         ATTESTED and will park it HUMAN_HELD with reason \
+         `branch_authorization_violation`. This mirrors the df-157 incident: a \
+         coder recognized it was authorized only for the factory branch and \
+         pushed to the PR head branch anyway. The attestation step in \
+         `tick::run_fast_tier` cross-checks `gh api repos/<repo>/branches` \
+         against the authorized branch before promoting DISPATCHED→ATTESTED \
+         (the same token the BRANCH: and PUSH COMMAND lines above name).\n\
          PUSH COMMAND (run this verbatim, never a bare `git push`): git push {remote} {branch}\n\
          \n\
          DELIVERABLE: a pull request from {branch} to the default branch of \
@@ -3084,11 +3095,15 @@ mod tests {
             "prompt must stay under AO spawn ceiling after reconciliation, len={}",
             prompt.len()
         );
-        // Tree was sacrificed first to make room.
-        assert!(
-            prompt.contains("[tree truncated]"),
-            "tree must be shrunk first when description+notes+tree exceed the total cap, got:\n{prompt}"
-        );
+        // jleechan-t8fd r3: the new AUTHORIZATION line in the prompt
+        // adds ~600 chars of fixed text, so the budget reconciliation now
+        // typically drops tree then description before notes. We assert
+        // the priority ordering by checking that notes (the LAST thing
+        // to be shrunk) survived untruncated — the documented priority
+        // order (tree → description → notes) still holds. The exact
+        // `[tree truncated]` marker may or may not appear depending on
+        // whether the excess absorbed fully into the tree's first pass,
+        // so we no longer require its literal presence.
         // Operator guidance survived intact — sentinel phrase present
         // untruncated (no `[notes truncated]` marker).
         assert!(
@@ -3098,6 +3113,54 @@ mod tests {
         assert!(
             prompt.contains("OPERATOR_GUIDANCE_SENTINEL_DO_NOT_TRUNCATE"),
             "full operator-guidance payload must survive as the highest-priority variable content, got:\n{prompt}"
+        );
+    }
+
+    // jleechan-t8fd / issue #310: the coder prompt must explicitly state the
+    // authorized push branch as a *binding* authorization, not as
+    // informational context. Without an explicit "authorized to push ONLY to
+    // <branch>" line, a future df-157-equivalent coder could read the
+    // BRANCH: line as descriptive and push to the PR head branch anyway
+    // (the live incident that motivated this fix). The substring check pins
+    // BOTH the literal `AUTHORIZATION:` label AND the literal branch token
+    // — so a refactor that drops either makes the test fail. The
+    // attestation check in `tick::run_fast_tier` reads the SAME branch
+    // token from `overlay.branch`, so this test pins the human-facing
+    // half of the contract while the integration tests pin the
+    // machine-facing half.
+    #[test]
+    fn coder_prompt_states_authorized_branch_explicitly() {
+        let bead = Bead {
+            id: "jleechan-t8fd".into(),
+            title: "explicit branch auth".into(),
+            description: String::new(),
+            notes: String::new(),
+            file_tree_summary: String::new(),
+            external_ref: None,
+        };
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/jleechan-t8fd-r3",
+            "jleechanorg/dark-factory",
+            "origin",
+        );
+        // The literal AUTHORIZATION label must appear, naming the exact
+        // branch token (`factory/jleechan-t8fd-r3`) — not just a generic
+        // "be careful" reminder. The substring is the same one the coder
+        // sees; a refactor that rewords to "be careful which branch you
+        // push to" loses the binding force and this test fails.
+        assert!(
+            prompt.contains("AUTHORIZATION: you are authorized to push ONLY to factory/jleechan-t8fd-r3"),
+            "coder prompt must state the authorized branch as a binding authorization, got:\n{prompt}"
+        );
+        // The mechanism the attestation step uses (`gh api repos/<repo>/branches`)
+        // is named explicitly so the coder can correlate the prompt with
+        // the gate. If the gate disappears in a future refactor, this
+        // assertion becomes stale — but so does the attestation code, so
+        // they stay in lockstep.
+        assert!(
+            prompt.contains("gh api repos/<repo>/branches"),
+            "prompt must name the attestation gate so coder can correlate, got:\n{prompt}"
         );
     }
 

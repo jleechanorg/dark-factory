@@ -412,6 +412,19 @@ pub enum HumanHoldReason {
     UnknownOnlyGateCapped,
     CircuitBreaker,
     EscalationLocalFallback(String),
+    /// Bead jleechan-t8fd / issue #310: the DISPATCHED→ATTESTED promotion in
+    /// `tick::run_fast_tier` cross-checked `Scm::pushed_branches_for_repo(repo)`
+    /// against `overlay.branch` (the authorized token the coder prompt's
+    /// `AUTHORIZATION:` line names) and found either (a) the authorized
+    /// branch is missing from the list, or (b) the list contains one or
+    /// more extra branches the bead never had authority to push to. This
+    /// is the df-157 pattern in machine form: a coder recognized it was
+    /// authorized only for the factory branch and pushed to a different
+    /// branch (typically the PR head branch) anyway. Fail-CLOSED — park
+    /// the bead so an operator can inspect the extra branches before any
+    /// re-dispatch. Permanent (NOT in `recoverable_exact_values()`):
+    /// silent requeue would replay the same violation on the next tick.
+    BranchAuthorizationViolation,
 }
 
 impl HumanHoldReason {
@@ -452,6 +465,7 @@ impl HumanHoldReason {
             Self::AdoptedSpawnFailed => "adopted_spawn_failed",
             Self::UnknownOnlyGateCapped => "unknown_only_gate_report_with_er_runner_capped",
             Self::CircuitBreaker => CIRCUIT_BREAKER_PARK_REASON,
+            Self::BranchAuthorizationViolation => "branch_authorization_violation",
             Self::EscalationLocalFallback(reason) => {
                 return format!("escalation_local_fallback:{reason}");
             }

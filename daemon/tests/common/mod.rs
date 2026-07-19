@@ -175,6 +175,13 @@ pub struct FakeScm {
     /// same-repo open PR, or `PrHeadBranch::Fork` for a confirmed open PR
     /// whose head lives on a fork (the fail-closed guard).
     pub open_pr_head_refs: HashMap<(String, u64), PrHeadBranch>,
+    /// jleechan-t8fd / issue #310: scripted `pushed_branches_for_repo`
+    /// lookups, keyed by repo. The value is the FULL list of branches the
+    /// fake reports for that repo — the attestation cross-check compares
+    /// this list against the bead's `overlay.branch` (the authorized
+    /// token). Absence of a key means `Ok(vec![])` — the fail-OPEN default,
+    /// mirroring `Scm::pushed_branches_for_repo`'s trait default.
+    pub pushed_branches_by_repo: HashMap<String, Vec<String>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -296,6 +303,23 @@ impl Scm for FakeScm {
             .get(&(repo.to_string(), branch.to_string()))
             .copied()
             .flatten())
+    }
+
+    /// jleechan-t8fd / issue #310: records the `repo` argument distinctly
+    /// from the (nonexistent) repo-less form so integration tests can
+    /// assert the attestation cross-check queried the bead's OWN resolved
+    /// repo, not `cfg.target_repo`. Returns the scripted branch list
+    /// (empty list = fail-OPEN "no extra branches", matching the trait
+    /// default).
+    fn pushed_branches_for_repo(&self, repo: &str) -> Result<Vec<String>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("pushed_branches_for_repo({repo})"));
+        Ok(self
+            .pushed_branches_by_repo
+            .get(repo)
+            .cloned()
+            .unwrap_or_default())
     }
 }
 

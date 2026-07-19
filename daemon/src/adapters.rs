@@ -1315,6 +1315,55 @@ impl Scm for CliScm {
     ) -> Result<Option<u64>, DaemonError> {
         self.with_repo(repo).remote_branch_last_commit(branch)
     }
+
+    /// jleechan-t8fd / issue #310: list every branch that currently exists
+    /// in `repo`, retargeted via `with_repo` so cross-repo beads query
+    /// their OWN repo (Stage D discipline, not `cfg.target_repo`). The
+    /// attestation step in `tick::run_fast_tier` cross-checks this list
+    /// against `overlay.branch` (the authorized token); an entry that is
+    /// neither the authorized branch nor a branch the operator pre-seeded
+    /// is an `extra_branches` violation and parks the bead
+    /// `HUMAN_HELD` with `branch_authorization_violation`.
+    ///
+    /// **Fail-OPEN contract**: a transient `gh` error (auth blip, network
+    /// hiccup, GitHub 5xx) returns `Ok(vec![])` rather than `Err(_)` so the
+    /// attestation step treats the next tick as "compliant" and lets the
+    /// bead through. This is intentional — a `gh` outage must never
+    /// mass-park healthy beads (the next tick re-runs the check, so a
+    /// transient outage gives at most one window of unauthorized work,
+    /// which is the lesser evil). The contract is mirrored in the trait
+    /// default impl and in `FakeScm`, so callers can rely on
+    /// `pushed_branches_for_repo` being non-`Err` whenever the upstream is
+    /// also non-`Err`.
+    ///
+    /// `--paginate` is required: GitHub's default branch listing caps at
+    /// 30 entries; a busy repo with hundreds of branches would silently
+    /// miss the violation in the un-paginated tail. `--jq '.[].name'`
+    /// yields one branch name per line; an empty stdout means "no
+    /// branches", which the fail-OPEN contract treats identically to "gh
+    /// outage".
+    fn pushed_branches_for_repo(&self, repo: &str) -> Result<Vec<String>, DaemonError> {
+        let out = match run_tool(
+            "gh",
+            &[
+                "api",
+                &format!("repos/{repo}/branches"),
+                "--paginate",
+                "--jq",
+                ".[].name",
+            ],
+            30,
+        ) {
+            Ok(o) => o,
+            Err(_) => return Ok(Vec::new()), // fail-OPEN on transient errors.
+        };
+        Ok(out
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
 }
 
 /// Pure parser behind [`Scm::open_pr_head_ref_for_repo`] (unit-testable

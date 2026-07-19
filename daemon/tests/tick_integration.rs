@@ -9722,3 +9722,356 @@ fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
     assert_eq!(after.pr_number, Some(4001));
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+// jleechan-t8fd / issue #310: regression coverage for the three terminal
+// branches of the attestation cross-check in `tick::run_fast_tier`:
+//
+// 1. `attestation_parks_branch_authorization_violation_on_extra_pushed_branch`
+//    — positive mismatch: extra branch present, authorized branch also
+//    present → park HUMAN_HELD with `branch_authorization_violation`,
+//    emit `BRANCH_AUTHORIZATION_VIOLATION`, do NOT promote to ATTESTED.
+// 2. `attestation_promotes_to_attested_when_only_authorized_branch_is_pushed`
+//    — compliant case: only the authorized branch is in the push list →
+//    the existing DISPATCHED→ATTESTED promotion runs as before.
+// 3. `attestation_fails_open_on_empty_push_list`
+//    — fail-OPEN contract: empty push list (mirrors a `gh` outage or a
+//    fresh repo with no branches yet) must NOT park the bead.
+
+/// Test 1: positive mismatch (df-157 pattern — extra branch present).
+/// The cross-check must park HUMAN_HELD with `branch_authorization_violation`,
+/// emit the distinct `BRANCH_AUTHORIZATION_VIOLATION` telemetry event,
+/// and refuse to promote the bead to ATTESTED. The PR comment posted to
+/// the bead must name the extra branches so an operator can investigate.
+#[test]
+fn attestation_parks_branch_authorization_violation_on_extra_pushed_branch() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_t8fd_branch_auth_violation");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let authorized = "factory/jleechan-t8fd-badbead-r1";
+    let extra = "drive-pr/jleechan-t8fd-badbead";
+    // Seed a DISPATCHED bead with the authorized branch and a PR — the
+    // attestation cross-check fires when `pr_number.is_some()` AND
+    // `overlay.branch.is_some()`, mirroring the real `run_fast_tier`
+    // conditions.
+    store
+        .save(&BeadOverlay {
+            bead_id: "jleechan-t8fd-badbead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(9001),
+            branch: Some(authorized.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store
+        .register_branch("jleechan-t8fd-badbead", authorized)
+        .unwrap();
+    // df-157 pattern: the coder pushed to BOTH the authorized factory
+    // branch AND the PR head branch. The cross-check must catch the extra
+    // and park HUMAN_HELD.
+    scm.pushed_branches_by_repo.insert(
+        "owner/repo".into(),
+        vec![authorized.to_string(), extra.to_string()],
+    );
+    scm.pr_snapshots.insert(
+        9001,
+        PrSnapshot {
+            pr_number: 9001,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "abcdef".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 0,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    let after = store.load("jleechan-t8fd-badbead").unwrap().unwrap();
+    assert_eq!(
+        after.state,
+        OverlayState::HumanHeld,
+        "extra branch must park HUMAN_HELD, not promote to ATTESTED"
+    );
+    assert_eq!(
+        after.park_reason.as_deref(),
+        Some("branch_authorization_violation"),
+        "park_reason must be the typed-policy value, not a free-form string"
+    );
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "summary must count this as a park"
+    );
+
+    // Telemetry: a `BRANCH_AUTHORIZATION_VIOLATION` event fires with the
+    // structured context the spec promises — `authorized_branch`,
+    // `extra_branches`, `repo`. `grep BRANCH_AUTHORIZATION_VIOLATION
+    // daemon.jsonl` must find every instance.
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let violation = events
+        .iter()
+        .find(|e| e["eventType"].as_str() == Some("BRANCH_AUTHORIZATION_VIOLATION"))
+        .expect("expected a BRANCH_AUTHORIZATION_VIOLATION telemetry event");
+    assert_eq!(violation["context"]["authorized_branch"], authorized);
+    assert_eq!(
+        violation["context"]["extra_branches"],
+        serde_json::json!([extra])
+    );
+    assert_eq!(violation["context"]["repo"], "owner/repo");
+    assert_eq!(violation["context"]["authorized_present"], true);
+
+    // FakeScm recorded the call with the repo-scoped form — proves the
+    // cross-check used the bead's resolved repo, not `cfg.target_repo`.
+    assert!(
+        scm.calls
+            .borrow()
+            .iter()
+            .any(|c| c == "pushed_branches_for_repo(owner/repo)"),
+        "attestation cross-check must query the bead's resolved repo: {:?}",
+        scm.calls.borrow()
+    );
+    // No `PR_OPENED` event — the bead was never promoted, so the verifier
+    // never gate-assessed it.
+    assert!(
+        !events.iter().any(|e| e["eventType"].as_str() == Some("PR_OPENED")),
+        "a parked bead must not emit PR_OPENED, got: {events:#?}"
+    );
+}
+
+/// Test 2: compliant case. Only the authorized branch is in the push
+/// list — the existing DISPATCHED→ATTESTED promotion runs and the bead
+/// reaches ATTESTED. This is the regression guard against the
+/// cross-check ever blocking legitimate dispatches.
+#[test]
+fn attestation_promotes_to_attested_when_only_authorized_branch_is_pushed() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_t8fd_branch_auth_compliant");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let authorized = "factory/jleechan-t8fd-goodbead-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "jleechan-t8fd-goodbead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(9002),
+            branch: Some(authorized.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store
+        .register_branch("jleechan-t8fd-goodbead", authorized)
+        .unwrap();
+    // Compliant: ONLY the authorized branch in the push list.
+    scm.pushed_branches_by_repo
+        .insert("owner/repo".into(), vec![authorized.to_string()]);
+    scm.pr_snapshots.insert(
+        9002,
+        PrSnapshot {
+            pr_number: 9002,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadc0de".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 0,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let _summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    let after = store.load("jleechan-t8fd-goodbead").unwrap().unwrap();
+    assert_eq!(
+        after.state,
+        OverlayState::Attested,
+        "compliant push must promote to ATTESTED, not park: state={:?}",
+        after.state
+    );
+    assert_eq!(after.park_reason, None);
+    // No violation telemetry — the cross-check passed.
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(
+        !body.contains("BRANCH_AUTHORIZATION_VIOLATION"),
+        "compliant case must not emit violation telemetry, got:\n{body}"
+    );
+}
+
+/// Test 3: fail-OPEN contract. The push list is empty (mirrors a `gh`
+/// outage — `CliScm` returns `Ok(vec![])` on transient errors, and the
+/// trait default also returns `Ok(vec![])`). The cross-check must
+/// treat empty as "compliant" and let the bead through, NOT park. A
+/// single transient outage must not mass-park healthy beads.
+#[test]
+fn attestation_fails_open_on_empty_push_list() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_dir = std::env::temp_dir().join("afd_t8fd_branch_auth_failopen");
+    std::fs::create_dir_all(&telemetry_dir).unwrap();
+    let telemetry_log = telemetry_dir.join(format!("daemon-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let authorized = "factory/jleechan-t8fd-openbead-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "jleechan-t8fd-openbead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(9003),
+            branch: Some(authorized.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store
+        .register_branch("jleechan-t8fd-openbead", authorized)
+        .unwrap();
+    // Empty push list — `gh` outage or fresh repo. Trait default would
+    // produce this; here we explicitly script it to prove the contract.
+    scm.pushed_branches_by_repo
+        .insert("owner/repo".into(), vec![]);
+    scm.pr_snapshots.insert(
+        9003,
+        PrSnapshot {
+            pr_number: 9003,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "openbeef".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 0,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let _summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    let after = store.load("jleechan-t8fd-openbead").unwrap().unwrap();
+    assert_eq!(
+        after.state,
+        OverlayState::Attested,
+        "empty push list must fail-OPEN (not park), state={:?}",
+        after.state
+    );
+    assert_eq!(after.park_reason, None);
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(
+        !body.contains("BRANCH_AUTHORIZATION_VIOLATION"),
+        "fail-OPEN case must not emit violation telemetry, got:\n{body}"
+    );
+}

@@ -509,6 +509,32 @@ pub trait Scm {
         let _ = (repo, branch);
         Ok(None)
     }
+    /// jleechan-t8fd / issue #310: return the names of every branch that
+    /// currently exists in `repo`. Used by the DISPATCHED→ATTESTED
+    /// attestation step in `tick::run_fast_tier` to cross-check whether
+    /// the coder pushed ONLY to the authorized `overlay.branch` (the
+    /// literal token the coder prompt's `AUTHORIZATION:` line names) — a
+    /// df-157-equivalent push to a different branch (e.g. the PR head
+    /// branch) shows up here as an `extra_branches` entry that has nothing
+    /// to do with the authorized token, and the attestation step parks the
+    /// bead `HUMAN_HELD` with `branch_authorization_violation` instead of
+    /// silently promoting it.
+    ///
+    /// `repo` should be `overlay.repo(cfg)`, not `cfg.target_repo`, so
+    /// cross-repo beads are observable. Default impl returns `Ok(vec![])`
+    /// unconditionally — fail-OPEN behavior: an empty branch list cannot
+    /// distinguish "no extra branches exist" from "lookup failed", so the
+    /// attestation step treats empty as "compliant" and lets the bead
+    /// through. This is intentional — a `gh` outage must never mass-park
+    /// healthy beads (the next tick re-runs the check, so a transient
+    /// outage gives at most one window of unauthorized work). Existing
+    /// test fakes and any impl that predates this method keep their
+    /// original behavior; `CliScm` overrides it to actually call
+    /// `gh api repos/<repo>/branches --paginate --jq '.[].name'`.
+    fn pushed_branches_for_repo(&self, repo: &str) -> Result<Vec<String>, DaemonError> {
+        let _ = repo;
+        Ok(Vec::new())
+    }
 }
 
 /// Resolution of an [`Scm::open_pr_head_ref_for_repo`] lookup (bead

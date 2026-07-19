@@ -2368,6 +2368,105 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     true
                 };
 
+                // jleechan-t8fd / issue #310: BEFORE promoting DISPATCHED to
+                // ATTESTED, cross-check that the bead actually pushed to its
+                // authorized branch (`overlay.branch` — the same literal
+                // token the coder prompt's `AUTHORIZATION:` line names)
+                // and to nothing else. Closes the df-157 gap where the
+                // coder pushed to the PR head branch while authorized only
+                // for the factory branch. The push-list lookup uses
+                // `Scm::pushed_branches_for_repo(&repo)` — repo-scoped,
+                // not `cfg.target_repo` (Stage D discipline), and
+                // fail-OPEN (transient `gh` errors return `Ok(vec![])`,
+                // which this check treats as "no extra branches"). The
+                // check classifies the result into three outcomes:
+                //   - authorized branch MISSING (e.g. the coder pushed
+                //     nowhere — failure elsewhere) → no attestation
+                //     promotion; do not park (this is a different
+                //     failure mode that the existing coder-silent watcher
+                //     already covers).
+                //   - extra branches PRESENT → routing violation → park
+                //     HUMAN_HELD with `branch_authorization_violation`
+                //     and emit `BRANCH_AUTHORIZATION_VIOLATION` telemetry
+                //     so `grep BRANCH_AUTHORIZATION_VIOLATION daemon.jsonl`
+                //     finds every instance without sifting the full
+                //     stream. Do NOT promote to ATTESTED.
+                //   - only the authorized branch is present (or the list
+                //     is empty, the fail-OPEN contract) → proceed with
+                //     the existing promotion logic.
+                if let Some(authorized_branch_ref) = overlay.branch.as_deref() {
+                    let authorized_branch = authorized_branch_ref.to_string();
+                    match deps.scm.pushed_branches_for_repo(&repo) {
+                        Ok(pushed) if !pushed.is_empty() => {
+                            let authorized_present =
+                                pushed.iter().any(|b| b == &authorized_branch);
+                            let extra_branches: Vec<String> = pushed
+                                .iter()
+                                .filter(|b| b.as_str() != authorized_branch.as_str())
+                                .cloned()
+                                .collect();
+                            if !authorized_present || !extra_branches.is_empty() {
+                                let event_type = if !authorized_present {
+                                    "BRANCH_AUTHORIZATION_VIOLATION_AUTHORIZED_MISSING"
+                                } else {
+                                    "BRANCH_AUTHORIZATION_VIOLATION"
+                                };
+                                emit(
+                                    deps.telemetry_log,
+                                    bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Dispatched.as_str(),
+                                    event_type,
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "authorized_branch": authorized_branch,
+                                        "authorized_present": authorized_present,
+                                        "extra_branches": extra_branches,
+                                        "repo": repo,
+                                        "pr_number": pr,
+                                    }),
+                                )?;
+                                set_human_hold_reason(
+                                    &mut overlay,
+                                    HumanHoldReason::BranchAuthorizationViolation,
+                                );
+                                overlay.state = OverlayState::HumanHeld;
+                                deps.store.save(&overlay)?;
+                                summary.beads_parked_human_held += 1;
+                                let comment_body = format!(
+                                    "🤖 **[dark-factory]** Detected a branch-authorization violation for bead `{bead_id}`: authorized branch `{authorized_branch}` is {}; extra branches pushed to `{repo}`: {extra_branches:?}. The bead has been parked `HUMAN_HELD` with `branch_authorization_violation` and will not be promoted to ATTESTED until an operator inspects the routing. This is the df-157 pattern: pushing to a branch other than the one the `AUTHORIZATION:` line in the coder prompt names.",
+                                    if authorized_present { "present" } else { "MISSING" },
+                                );
+                                let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+                                continue; // skip the ATTESTED promotion.
+                            }
+                        }
+                        Ok(_) => {} // empty list — fail-OPEN, treat as compliant.
+                        Err(e) => {
+                            // `pushed_branches_for_repo` is documented as
+                            // fail-OPEN (`CliScm` swallows transient
+                            // errors, the trait default returns `Ok(vec![])`),
+                            // so an `Err` here is a programming error from
+                            // a custom impl — surface it loudly but do not
+                            // park: a malformed test fake shouldn't wedge
+                            // production beads.
+                            let _ = emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::Dispatched.as_str(),
+                                "BRANCH_AUTHORIZATION_LOOKUP_ERROR",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "authorized_branch": authorized_branch,
+                                    "repo": repo,
+                                    "error": format!("{e:?}"),
+                                }),
+                            );
+                        }
+                    }
+                }
+
                 if ready_to_promote {
                     overlay.state = OverlayState::Attested;
                     deps.store.save(&overlay)?;
