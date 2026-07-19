@@ -230,14 +230,21 @@ pub fn dispatch_ready(
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            // jleechan-8jxr r2: pre-fill with cfg.target_repo so this
-            // defensive fallback (no overlay row in the store yet —
-            // should be dead code in production since intake always
-            // persists before dispatch) survives the no-repo park. The
-            // bead's "real" repo would normally be set by
-            // `tick::run_slow_tier`/`intake::normalize`; this value is
-            // only used if the dispatch path runs before any intake.
-            target_repo: Some(cfg.target_repo.clone()),
+            // jleechan-8jxr r4: pre-fill with `None`, NOT
+            // `cfg.target_repo`. Pre-r4 pre-fill silently masked the
+            // fail-closed `unmapped_repo` park (r3's recovery path
+            // checks `if overlay.target_repo.is_none()`, which was
+            // always false for the synthetic overlay — the recovery
+            // path became dead code, and the bead would have dispatched
+            // against `cfg.target_repo` even when no repo identity was
+            // resolvable). With `None`, the r3 recovery path runs, and
+            // when it still can't find a repo, the `unmapped_repo`
+            // park below is the single authoritative fail-closed
+            // decision (matching
+            // `dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all`).
+            // Should never fire in production since `intake::normalize`
+            // always persists the overlay before dispatch runs.
+            target_repo: None,
             },
             Err(err) if err.is_transient() => {
                 report
@@ -1060,7 +1067,7 @@ mod tests {
     use crate::state::OverlayState;
     use crate::tools::SessionId;
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
 
     /// Local unit-test fake mirroring `tests/common/mod.rs`'s `FakeSessions`
     /// (same call-log shape) without the `daemon::` crate-qualified imports
@@ -1319,13 +1326,23 @@ mod tests {
     /// plus a `fail_save_for_state` hook so rollback-on-save-failure tests can
     /// script the SECOND save (the DISPATCHED confirmation) to fail while the
     /// first save (the DISPATCHING intent) still succeeds.
+    ///
+    /// jleechan-8jxr r4: `fail_save_for_state` is now a `VecDeque` consumed
+    /// FIFO rather than an unbounded `Vec` that matched forever. This
+    /// matters for tests where the SAME overlay-state transition fires
+    /// multiple times in the same dispatch (e.g. recovery save at QUEUED
+    /// followed by rollback requeue save at QUEUED) — the old fake would
+    /// fail BOTH and produce a non-deterministic `unmapped_repo_recover_save`
+    /// phase instead of the `save_dispatched`/`spawn` rollback path the test
+    /// is pinning. Callers that want the old "fail forever" behavior can
+    /// push the same entry N times (or use `failing_on(state)`).
     #[derive(Default)]
     struct FakeStateStore {
         overlays: RefCell<HashMap<String, BeadOverlay>>,
         branches: RefCell<Vec<String>>,
         branch_beads: RefCell<HashMap<String, String>>,
         rejections: RefCell<HashMap<(String, u32), (String, String)>>,
-        fail_save_for_state: RefCell<Vec<(String, OverlayState)>>,
+        fail_save_for_state: RefCell<VecDeque<(String, OverlayState)>>,
     }
 
     impl FakeStateStore {
@@ -1338,14 +1355,14 @@ mod tests {
             store
                 .fail_save_for_state
                 .borrow_mut()
-                .push(("*".into(), state));
+                .push_back(("*".into(), state));
             store
         }
 
         fn fail_save_for(&self, bead_id: &str, state: OverlayState) {
             self.fail_save_for_state
                 .borrow_mut()
-                .push((bead_id.to_string(), state));
+                .push_back((bead_id.to_string(), state));
         }
     }
 
@@ -1355,20 +1372,25 @@ mod tests {
         }
 
         fn save(&self, overlay: &BeadOverlay) -> Result<(), DaemonError> {
-            if self
-                .fail_save_for_state
-                .borrow()
-                .iter()
-                .any(|(bead_id, state)| {
-                    (bead_id == "*" || bead_id == &overlay.bead_id) && *state == overlay.state
-                })
-            {
+            // jleechan-8jxr r4: pop the FIRST matching entry rather than
+            // matching the whole list — lets tests script a specific
+            // save-call sequence (e.g. "the second QUEUED save fails,
+            // not the first") without coupling unrelated tests to a
+            // permanent failure on that state. See the FakeStateStore
+            // doc comment for the full rationale.
+            let mut fail_queue = self.fail_save_for_state.borrow_mut();
+            let pos = fail_queue.iter().position(|(bead_id, state)| {
+                (bead_id == "*" || bead_id == &overlay.bead_id) && *state == overlay.state
+            });
+            if let Some(idx) = pos {
+                fail_queue.remove(idx);
                 return Err(DaemonError::Tool {
                     tool: "sqlite".into(),
                     rc: -1,
                     stderr: format!("scripted save failure for {}", overlay.state.as_str()),
                 });
             }
+            drop(fail_queue);
             self.overlays
                 .borrow_mut()
                 .insert(overlay.bead_id.clone(), overlay.clone());
@@ -1503,6 +1525,22 @@ mod tests {
     }
 
     fn beads(n: usize) -> Vec<(Bead, RoutingVerdict, DriveBranchDecision)> {
+        // jleechan-8jxr r4: each fixture bead now carries a parseable
+        // `external_ref` so the r3 recovery path resolves its repo
+        // identity and dispatch can proceed (the OLD helper created
+        // beads with `external_ref: None` and `description: ""`, which
+        // pre-r4 dispatched against `cfg.target_repo` via the
+        // synthetic-overlay's silent pre-fill — i.e. the bug site (3).
+        // Post-r4 those beads would correctly park `unmapped_repo`,
+        // which would break every batch-cap test in this module. The
+        // short-form `cfg.target_repo#N` external_ref matches the
+        // global default so the existing assertions (max_batch,
+        // max_workers, branch registration, ...) still test what they
+        // were written to test — not the no-resolvable-repo park
+        // (which is pinned by
+        // `dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all`
+        // and the new
+        // `dispatch_ready_synthetic_overlay_parks_human_held_when_bead_has_no_repo_identity`).
         (0..n)
             .map(|i| {
                 (
@@ -1512,7 +1550,7 @@ mod tests {
                         description: String::new(),
                         notes: String::new(),
                         file_tree_summary: String::new(),
-                        external_ref: None,
+                        external_ref: Some(format!("owner/repo#{i}")),
                     },
                     RoutingVerdict::StandardPath,
                     DriveBranchDecision::Generated,
@@ -1582,8 +1620,21 @@ mod tests {
     // create-new-work bead, or a bead whose external_ref pointed at a
     // closed/missing PR — the caller already applied the fail-safe and
     // passed `None`) keeps today's generated-branch behavior exactly.
+    //
+    // jleechan-8jxr r4: this test was originally written when the
+    // synthetic-overlay construction pre-filled `target_repo =
+    // Some(cfg.target_repo.clone())` — so the bead dispatched against the
+    // global default even though no `target_repo:` body field and no
+    // parseable `external_ref` existed. That silent default IS the bug
+    // site (3). Post-r4: the synthetic overlay's `target_repo = None`,
+    // so the bead hits the `unmapped_repo` park below and does NOT
+    // spawn. The test was renamed and rewritten to pin the new
+    // fail-closed behavior (the previous "generates branch as before"
+    // assertion pinned the BUG, not the contract — see the sibling test
+    // `dispatch_ready_synthetic_overlay_parks_human_held_when_bead_has_no_repo_identity`
+    // which is the canonical regression for this site).
     #[test]
-    fn ready_bead_without_resolved_pr_head_branch_generates_branch_as_before() {
+    fn ready_bead_without_resolved_pr_head_branch_parks_unmapped_repo_synthetic_overlay() {
         let sessions = FakeSessions::new(0);
         let store = FakeStateStore::new();
         let cfg = cfg();
@@ -1602,14 +1653,31 @@ mod tests {
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
-        assert_eq!(report.success_count(), 1);
-        assert_eq!(report.successes[0].branch, "factory/bead-fresh-r1");
+        // jleechan-8jxr r4: a bead with no resolvable repo (no body
+        // field, no external_ref) hits the synthetic-overlay code path
+        // and now parks `unmapped_repo` instead of silently defaulting
+        // to `cfg.target_repo` (the r2/r3/r4 fail-closed chain).
+        assert_eq!(
+            report.success_count(),
+            0,
+            "no-resolvable-repo bead must NOT dispatch against cfg.target_repo (r4)"
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].phase, "unmapped_repo");
         let overlay = store
             .overlays
             .borrow()
             .get("bead-fresh")
             .cloned()
             .expect("overlay must be persisted");
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(overlay.park_reason.as_deref(), Some("unmapped_repo"));
+        assert!(
+            overlay.target_repo.is_none(),
+            "synthetic overlay for a no-resolvable-repo bead must NOT \
+             have cfg.target_repo pre-filled (r4 site 3 fix): {:?}",
+            overlay.target_repo
+        );
         assert!(!overlay.is_adopted);
     }
 
@@ -1885,7 +1953,28 @@ mod tests {
             })
             .unwrap();
         let cfg = cfg();
-        let ready = beads(1);
+        // jleechan-8jxr r4: this test specifically exercises the
+        // persisted-overlay-with-None case (overlay.target_repo = None
+        // pre-r3, or any future regression that lets an overlay reach
+        // dispatch with no resolved repo). The bead itself must also
+        // have no resolvable repo identity so the r3 recovery path
+        // does NOT back-fill it (which would mask the bug this test
+        // is pinning). Use a custom Bead with no `external_ref` and no
+        // `target_repo:` body field — NOT the `beads(1)` helper, which
+        // gives the bead a parseable external_ref to keep batch-cap
+        // tests focused.
+        let ready = vec![(
+            Bead {
+                id: "bead-0".into(),
+                title: "title 0".into(),
+                description: String::new(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
@@ -1932,6 +2021,99 @@ mod tests {
         assert!(
             store.branches.borrow().is_empty(),
             "register_branch must never be called for a no-repo bead"
+        );
+        let spawn_calls = sessions
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("spawn("))
+            .count();
+        assert_eq!(spawn_calls, 0, "Sessions::spawn must never be called");
+    }
+
+    /// jleechan-8jxr r4 (cursor-agent P0 review follow-up, PR #359): the
+    /// synthetic-overlay construction path (when `store.load(bead.id)` returns
+    /// `Ok(None)` — i.e. the dispatch path runs BEFORE intake has persisted
+    /// an overlay row, which should be dead code in production but is still
+    /// defended against here) MUST NOT pre-fill `target_repo` with
+    /// `cfg.target_repo`. Pre-r4 behavior: the synthetic overlay's
+    /// `target_repo = Some(cfg.target_repo.clone())` made the r3 recovery
+    /// check (`if overlay.target_repo.is_none()`) a no-op, so a bead with
+    /// no resolvable repo identity that hit this path would silently
+    /// dispatch against `cfg.target_repo` instead of being parked
+    /// `unmapped_repo`. Post-r4: the synthetic overlay's `target_repo` is
+    /// `None`, the r3 recovery path runs against the current bead's
+    /// body/external_ref, and the `unmapped_repo` park is the single
+    /// authoritative fail-closed decision — matching the existing
+    /// persisted-overlay path. Companion to
+    /// `dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all`
+    /// (which covers the persisted-overlay case); this test pins the
+    /// synthetic-overlay case.
+    #[test]
+    fn dispatch_ready_synthetic_overlay_parks_human_held_when_bead_has_no_repo_identity() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        // Intentionally NO pre-seeded overlay row — `store.load` returns
+        // `Ok(None)`, exercising the synthetic-overlay construction path.
+        let cfg = cfg();
+        let ready = vec![(
+            Bead {
+                id: "bead-synthetic-no-repo".into(),
+                title: "fresh bead with no repo identity".into(),
+                description: "no body field, no external_ref".into(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            0,
+            "a synthetic-overlay bead with no repo identity must never spawn"
+        );
+        assert_eq!(
+            report.failures.len(),
+            1,
+            "exactly one failure (the unmapped_repo park)"
+        );
+        assert_eq!(
+            report.failures[0].phase, "unmapped_repo",
+            "the synthetic-overlay path must use the same `unmapped_repo` \
+             phase as the persisted-overlay path (single authoritative \
+             fail-closed decision)"
+        );
+        // The overlay that WAS persisted (the r3 recovery's empty save path,
+        // or the unmapped_repo park's save) should reflect the fail-closed
+        // state.
+        let overlay = store
+            .load("bead-synthetic-no-repo")
+            .unwrap()
+            .expect("overlay must be persisted after the unmapped_repo park");
+        assert_eq!(
+            overlay.state,
+            OverlayState::HumanHeld,
+            "no-repo synthetic-overlay bead must be parked, not dispatched"
+        );
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("unmapped_repo"),
+            "park_reason must be the new `unmapped_repo` value"
+        );
+        assert!(
+            overlay.target_repo.is_none(),
+            "no-repo synthetic-overlay must NOT have cfg.target_repo \
+             pre-filled in its target_repo (the bug site (3) fix): \
+             overlay.target_repo = {:?}",
+            overlay.target_repo
+        );
+        assert!(
+            store.branches.borrow().is_empty(),
+            "register_branch must never be called for a synthetic no-repo bead"
         );
         let spawn_calls = sessions
             .calls
@@ -2407,10 +2589,27 @@ mod tests {
         assert_eq!(report.failures[0].bead_id, "bead-0");
         assert_eq!(report.failures[0].phase, "save_dispatching");
 
-        assert!(
-            store.load("bead-0").unwrap().is_none(),
-            "DISPATCHING save failed before spawn, so no overlay mutation is durable"
+        // jleechan-8jxr r4: post-r4, the r3 recovery path
+        // (`intake::resolve_target_repo`) will persist the overlay with
+        // the resolved repo identity at state=QUEUED before the
+        // Dispatching save is attempted. So a `load("bead-0")` after
+        // the Dispatching save failure now returns Some(overlay)
+        // (persisted by the recovery save), not None as the original
+        // test asserted. What MUST still be true is that the overlay
+        // is NOT in state Dispatching or Dispatched — only the
+        // recovery save is durable, and the bead has not yet been
+        // dispatched.
+        let bead_0 = store.load("bead-0").unwrap().expect(
+            "post-r4, the r3 recovery save (state=QUEUED) is durable \
+             even when the subsequent Dispatching save fails",
         );
+        assert_eq!(
+            bead_0.state,
+            OverlayState::Queued,
+            "the bead must remain QUEUED (recovery save) since the \
+             Dispatching save failed before spawn"
+        );
+        assert_eq!(bead_0.branch, None, "no branch should have been assigned yet");
         let bead_1 = store.load("bead-1").unwrap().unwrap();
         assert_eq!(bead_1.state, OverlayState::Dispatched);
 
@@ -2706,6 +2905,60 @@ mod tests {
     fn requeue_save_failure_after_rollback_is_fatal() {
         let sessions = FakeSessions::new(0);
         let store = FakeStateStore::new();
+        // jleechan-8jxr r4: the r3 recovery path now saves at QUEUED
+        // before spawn. With the VecDeque-based fail queue, the
+        // recovery save matches the first QUEUED entry and aborts
+        // the test before the actual rollback requeue runs. To test
+        // the rollback path specifically, register the failures in
+        // the order they fire:
+        //   1. (Dispatched, bead-0) — the post-spawn Dispatched save.
+        //   2. (Queued, bead-0) — the rollback requeue save.
+        // The recovery save at QUEUED has no failure entry and
+        // succeeds normally.
+        // jleechan-8jxr r4: pre-seed BOTH bead overlays BEFORE registering
+        // the failure entries, so the QUEUED failure entry doesn't
+        // catch the pre-seeds themselves. Pre-seeding skips the r3
+        // recovery path (target_repo already set) and lets the
+        // failure queue entries stay aligned with the original
+        // semantics:
+        //   - Dispatched save (after spawn) — entry 1
+        //   - Rollback requeue QUEUED save — entry 2
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".into()),
+            })
+            .unwrap();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-1".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".into()),
+            })
+            .unwrap();
         store.fail_save_for("bead-0", OverlayState::Dispatched);
         store.fail_save_for("bead-0", OverlayState::Queued);
         let cfg = cfg();
@@ -3116,7 +3369,12 @@ mod tests {
                 description: "body".into(),
                 notes: String::new(),
                 file_tree_summary: String::new(),
-                external_ref: None,
+                // jleechan-8jxr r4: parseable external_ref so the r3
+                // recovery path resolves the repo (the test predates
+                // the r2 fail-closed chain and originally relied on the
+                // synthetic-overlay's silent `cfg.target_repo`
+                // pre-fill — i.e. the bug site 3).
+                external_ref: Some("owner/repo#1".into()),
             },
             RoutingVerdict::ResearchPath,
             DriveBranchDecision::Generated,
@@ -3146,7 +3404,12 @@ mod tests {
                 description: "acceptance: it works".into(),
                 notes: String::new(),
                 file_tree_summary: String::new(),
-                external_ref: None,
+                // jleechan-8jxr r4: parseable external_ref so the r3
+                // recovery path resolves the repo (the test predates
+                // the r2 fail-closed chain and originally relied on the
+                // synthetic-overlay's silent `cfg.target_repo`
+                // pre-fill — i.e. the bug site 3).
+                external_ref: Some("owner/repo#1".into()),
             },
             RoutingVerdict::StandardPath,
             DriveBranchDecision::Generated,

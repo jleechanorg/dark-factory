@@ -1165,8 +1165,26 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             // list — corrupting any multi-repo E2E proof
                             // that depends on this check landing on the
                             // bead's own repo.
-                            let probe_repo =
-                                target_repo.as_deref().unwrap_or(&deps.cfg.target_repo);
+                            //
+                            // jleechan-8jxr r4 (cursor-agent review):
+                            // when `target_repo` is `None` (no body
+                            // field, no parseable `external_ref` prefix),
+                            // SKIP the probe entirely instead of falling
+                            // back to `cfg.target_repo`. A bead with no
+                            // resolvable repo has no defensible target
+                            // for a `gh pr view --repo ...` call — probing
+                            // the daemon's global default would silently
+                            // hit the wrong repo for any fixture whose
+                            // global default differs from the bead's
+                            // intended target. The downstream dispatch
+                            // path already parks such beads
+                            // `unmapped_repo` (PR #306, r3); the intake
+                            // probe must not pre-empt that decision with a
+                            // probe against the wrong repo.
+                            let probe_repo = match target_repo.as_deref() {
+                                Some(repo) => repo,
+                                None => continue,
+                            };
                             if crate::tools::run_tool(
                                 "gh",
                                 &[
@@ -2249,12 +2267,30 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             None => continue,
         };
         // jleechan-9xrs Stage D: resolve THIS bead's own repo once per
-        // iteration (`overlay.repo(cfg)` — `None` falls back to
-        // `cfg.target_repo`, so legacy beads are unaffected) and thread it
-        // through every verification-loop call below instead of reading
-        // `deps.cfg.target_repo` directly. See
+        // iteration and thread it through every verification-loop call
+        // below instead of reading `deps.cfg.target_repo` directly. See
         // docs/multirepo-dispatch-investigation-2026-07-11.md Stage D.
-        let repo = overlay.repo(deps.cfg).to_string();
+        //
+        // jleechan-8jxr r4 (cursor-agent P0 review follow-up, PR #359):
+        // the post-dispatch fast tier MUST NOT silently fall back to
+        // `cfg.target_repo` via the lenient `overlay.repo(cfg)` accessor
+        // (bug site 1 at state.rs:174). A legacy overlay with
+        // `target_repo = None` would otherwise pollute every
+        // `scm.pr_snapshot_for_repo(&repo, ...)`, `cfg.resolve_repo(&repo)`,
+        // and `remote_branch_last_commit_for_repo(&repo, ...)` call below
+        // with the daemon's global default — silently checking the wrong
+        // repo's PR list, PR snapshot, and branch history. Use the strict
+        // `overlay.repo_opt()` (returns `None` on missing identity) and
+        // `continue` past this bead when it's `None`. The dispatch layer
+        // (PR #306 / #359 r3) already parks no-repo beads as
+        // `unmapped_repo`; this `continue` is the symmetric
+        // post-dispatch guard for the rare legacy-row case where a
+        // None-target_repo overlay slipped past dispatch (e.g. an old
+        // overlay from before the `target_repo` column was added).
+        let repo = match overlay.repo_opt() {
+            Some(repo) => repo.to_string(),
+            None => continue,
+        };
 
         if overlay.state == OverlayState::Dispatched && overlay.pr_number.is_none() {
             let is_test_repo =

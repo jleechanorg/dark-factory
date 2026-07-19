@@ -91,13 +91,33 @@ pub fn resolve_target_repo(body: &str, external_ref: Option<&str>) -> Option<Str
 /// Same `owner/repo#N` split as the private `parse_external_ref` helpers in
 /// `adapters.rs`/`tick.rs` (each module keeps its own copy rather than
 /// sharing a `pub(crate)` — matches the existing duplication pattern in this
-/// crate). Strict: exactly one `#`, else `None` rather than guessing.
+/// crate). Accepts both shapes `adapters::parse_external_ref` accepts so
+/// intake's repo-resolution sees the same identity dispatch sees:
+///
+/// * Short form: exactly one `#`, e.g. `owner/repo#42`.
+/// * GitHub URL form: `https://github.com/<owner>/<repo>/pull/<N>` or
+///   `.../issues/<N>`.
+///
+/// Anything else is `None` rather than guessed. Bead jleechan-8jxr r4:
+/// before this fix, `parse_external_ref` (adapters) recognized the URL form
+/// but this helper did not — so a bead whose `external_ref` was a GitHub URL
+/// resolved to `None` here and dispatch silently fell back to
+/// `cfg.target_repo`, landing work on the wrong repo. (See PR #359 follow-up
+/// notes from cursor-agent review.)
 fn parse_owner_repo_from_external_ref(external_ref: &str) -> Option<(String, String)> {
     let parts: Vec<&str> = external_ref.split('#').collect();
     if parts.len() == 2 {
-        Some((parts[0].to_string(), parts[1].to_string()))
-    } else {
-        None
+        return Some((parts[0].to_string(), parts[1].to_string()));
+    }
+    let url_parts: Vec<&str> = external_ref
+        .strip_prefix("https://github.com/")?
+        .split('/')
+        .collect();
+    match url_parts.as_slice() {
+        [owner, repo, kind, number] if matches!(*kind, "pull" | "issues") => {
+            Some((format!("{owner}/{repo}"), number.to_string()))
+        }
+        _ => None,
     }
 }
 
@@ -469,5 +489,69 @@ mod tests {
         // through to None rather than guessing.
         let got = resolve_target_repo("no structured fields here", Some("not-a-valid-ref"));
         assert_eq!(got, None);
+    }
+
+    // jleechan-8jxr r4 (review follow-up, cursor-agent P1): `resolve_target_repo`
+    // must accept the GitHub-URL shapes `adapters::parse_external_ref` accepts
+    // (`https://github.com/<owner>/<repo>/pull/<N>` and `.../issues/<N>`),
+    // not only the short `owner/repo#N` form. Pre-fix asymmetry: a bead whose
+    // `external_ref` was set to a GitHub URL (e.g. via `gh pr create` output,
+    // or a tracker bug) parsed as None here even though `adapters::parse_external_ref`
+    // recognized it — dispatch then saw `target_repo = None` and either
+    // (a) parked the bead as `unmapped_repo` for a perfectly parseable URL
+    // or (b) fell back to `cfg.target_repo` via `BeadOverlay::repo()`'s
+    // None-means-global default. Either way the bead landed on the wrong
+    // repo. Unify so intake sees the SAME repo identity dispatch sees.
+    #[test]
+    fn resolve_target_repo_accepts_github_pull_url_when_no_body_field() {
+        let got = resolve_target_repo(
+            "no body field",
+            Some("https://github.com/jleechanorg/dark-factory/pull/306"),
+        );
+        assert_eq!(
+            got.as_deref(),
+            Some("jleechanorg/dark-factory"),
+            "must accept the exact GitHub PR URL form adapters::parse_external_ref accepts"
+        );
+    }
+
+    #[test]
+    fn resolve_target_repo_accepts_github_issue_url_when_no_body_field() {
+        let got = resolve_target_repo(
+            "no body field",
+            Some("https://github.com/jleechanorg/worldarchitect.ai/issues/8424"),
+        );
+        assert_eq!(got.as_deref(), Some("jleechanorg/worldarchitect.ai"));
+    }
+
+    #[test]
+    fn resolve_target_repo_body_field_still_wins_over_github_url() {
+        // Body field has the highest precedence (Stage A rule #1) — even
+        // when external_ref is a parseable GitHub URL, the explicit
+        // body field takes priority.
+        let got = resolve_target_repo(
+            "fix scope.\ntarget_repo: jleechanorg/dark-factory\n",
+            Some("https://github.com/jleechanorg/worldarchitect.ai/pull/8424"),
+        );
+        assert_eq!(
+            got.as_deref(),
+            Some("jleechanorg/dark-factory"),
+            "explicit body field must still win over a parseable GitHub URL"
+        );
+    }
+
+    #[test]
+    fn resolve_target_repo_rejects_unrecognized_github_url_shape() {
+        // GitHub URL with a non-pull/non-issues path segment is malformed
+        // (e.g. /commits/, /actions/, /blob/...). Must return None rather
+        // than guessing.
+        let got = resolve_target_repo(
+            "no body field",
+            Some("https://github.com/jleechanorg/worldarchitect.ai/blob/main/README.md"),
+        );
+        assert_eq!(
+            got, None,
+            "non-pull/non-issues GitHub URLs must not be treated as parseable external_refs"
+        );
     }
 }

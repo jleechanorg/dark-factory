@@ -359,7 +359,13 @@ fn attested_overlay(bead_id: &str, pr: u64) -> BeadOverlay {
         spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            // jleechan-8jxr r4: the post-dispatch fast-tier now uses
+            // the strict `overlay.repo_opt()` (PR #359 r4) and
+            // `continue`s past any overlay with `target_repo = None`
+            // — so the er_runner would never run for these fixtures.
+            // Pin a real repo identity so the fast-tier keeps
+            // dispatching the verification work as it did pre-r4.
+            target_repo: Some("owner/repo".into()),
     }
 }
 

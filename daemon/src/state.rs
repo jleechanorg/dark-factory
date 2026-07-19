@@ -170,8 +170,31 @@ impl BeadOverlay {
     /// instead (that full call-site sweep is Stage D / bead jleechan-9xrs —
     /// this accessor is the capability those call sites will adopt one at a
     /// time, not a call-site migration itself).
+    ///
+    /// jleechan-8jxr r4: callers that must NEVER silently default to
+    /// `cfg.target_repo` (the post-dispatch verifier/fast-tier paths,
+    /// where a legacy `target_repo = None` overlay would silently
+    /// leak the daemon-global default and probe the wrong repo) should
+    /// use [`BeadOverlay::repo_opt`] instead and handle `None` as a
+    /// fail-closed condition. The existing `repo()` accessor stays
+    /// lenient for the call sites that genuinely intend the
+    /// `None` → `cfg.target_repo` fallback (legacy/global beads that
+    /// predate the column).
     pub fn repo<'a>(&'a self, cfg: &'a crate::config::Config) -> &'a str {
         self.target_repo.as_deref().unwrap_or(&cfg.target_repo)
+    }
+
+    /// Strict (no-fallback) variant of [`BeadOverlay::repo`]. Returns
+    /// `None` when the overlay has no explicit `target_repo` set,
+    /// regardless of `cfg.target_repo`. Used by post-dispatch
+    /// verification/fast-tier paths that must NOT silently default to
+    /// the daemon's global repo — those callers should park the bead
+    /// `unmapped_repo` on `None` rather than probe the wrong repo.
+    /// Companion to `dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all`
+    /// (PR #306 / #359) — closes the same fail-closed gap at the
+    /// verification layer that the dispatch layer already protects.
+    pub fn repo_opt(&self) -> Option<&str> {
+        self.target_repo.as_deref()
     }
 }
 
@@ -1701,6 +1724,101 @@ mod tests {
         assert_eq!(s.held_recheck_after("held-bead").unwrap(), Some(1_800_000_000));
         // No overlay row -> None, not an error.
         assert_eq!(s.held_recheck_after("no-such-bead").unwrap(), None);
+    }
+
+    // jleechan-8jxr r4 (cursor-agent P0 review follow-up, PR #359):
+    // `BeadOverlay::repo()` silently returns `cfg.target_repo` when the
+    // overlay's `target_repo` is `None`. That default is the documented
+    // behavior for legacy/global beads (pre-multi-repo), but it IS the
+    // bug site (1) for any post-dispatch verification/fast-tier call
+    // site that doesn't explicitly distinguish a legacy bead from a
+    // misrouted one. `repo_opt()` closes that gap by returning `Option<&str>`
+    // — `None` when the overlay has no explicit `target_repo`, never
+    // silently falling back to `cfg.target_repo`. Callers that must
+    // fail closed on missing identity use this; legacy-tolerant callers
+    // keep using `repo(cfg)`.
+    fn sample_overlay(target_repo: Option<&str>) -> BeadOverlay {
+        BeadOverlay {
+            bead_id: "test-bead".into(),
+            state: OverlayState::Queued,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: None,
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: target_repo.map(String::from),
+        }
+    }
+
+    fn sample_config() -> crate::config::Config {
+        crate::config::Config {
+            target_repo: "owner/cfg-global".into(),
+            ao_project: None,
+            base_branch: "main".into(),
+            stage: 1,
+            max_workers: 30,
+            max_batch: 15,
+            fast_tick_secs: 60,
+            slow_tick_secs: 600,
+            autonomy_timebox_secs: 10_800,
+            budget_warn_usd: 0.0,
+            spec_dir: ".factory/specs/".into(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn repo_opt_returns_explicit_target_repo_when_set() {
+        let overlay = sample_overlay(Some("jleechanorg/dark-factory"));
+        assert_eq!(overlay.repo_opt(), Some("jleechanorg/dark-factory"));
+    }
+
+    #[test]
+    fn repo_opt_returns_none_when_target_repo_missing_not_global_default() {
+        // jleechan-8jxr r4: this is the load-bearing assertion — a
+        // missing `target_repo` MUST surface as `None` (so the
+        // post-dispatch verifier can fail closed), NOT silently
+        // default to the daemon's global `cfg.target_repo`.
+        let overlay = sample_overlay(None);
+        let cfg = sample_config();
+        assert_eq!(
+            overlay.repo_opt(),
+            None,
+            "a None overlay.target_repo must NOT silently fall back to \
+             the daemon's global default ({:?}) — that's exactly the \
+             silent-default bug site (1) at state.rs:174",
+            cfg.target_repo
+        );
+    }
+
+    #[test]
+    fn repo_returns_legacy_fallback_for_none_overlay() {
+        // Pre-r4 behavior: legacy/global beads with `target_repo = None`
+        // got `cfg.target_repo` from `repo(cfg)`. Post-r4: that
+        // accessor is unchanged — the strict alternative is `repo_opt`.
+        // This test pins the unchanged behavior so a future refactor
+        // can't accidentally tighten `repo()` and break legacy
+        // single-repo fixtures.
+        let overlay = sample_overlay(None);
+        let cfg = sample_config();
+        assert_eq!(overlay.repo(&cfg), "owner/cfg-global");
+    }
+
+    #[test]
+    fn repo_returns_explicit_target_repo_when_set() {
+        // Sanity: explicit `target_repo` wins over the global default.
+        let overlay = sample_overlay(Some("jleechanorg/dark-factory"));
+        let cfg = sample_config();
+        assert_eq!(overlay.repo(&cfg), "jleechanorg/dark-factory");
     }
 
     /// Bead jleechan-zaga / issue #348 r3: the CHECK migration must be robust

@@ -552,7 +552,7 @@ fn test_autonomy_increment_and_timebox_envelope() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -616,7 +616,7 @@ fn test_autonomy_budget_warning_crossing() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -674,7 +674,7 @@ fn test_wedge_detection_dispatched_coder_silent() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -747,7 +747,7 @@ fn test_wedge_detection_dispatched_coder_silent_saved_by_transcript_activity() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -840,7 +840,7 @@ fn test_wedge_detection_dispatched_coder_silent_stale_transcript_still_parks() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -921,7 +921,7 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -1043,7 +1043,7 @@ fn test_dispatch_integrity_sweep_leaves_matching_branch_alone() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -1105,7 +1105,7 @@ fn test_dispatch_integrity_sweep_detects_force_push_on_adopted_branch() {
             spawn_failure_count: 0,
             pre_session_head_sha: Some("pre-session-sha-abc123".into()),
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -1192,7 +1192,7 @@ fn test_dispatch_integrity_sweep_allows_fast_forward_adopted_commit() {
             spawn_failure_count: 0,
             pre_session_head_sha: Some("pre-session-sha-def456".into()),
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -1261,7 +1261,7 @@ fn test_wedge_detection_attested_session_stalled() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -1360,7 +1360,7 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -1476,7 +1476,7 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -1568,7 +1568,7 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -1683,7 +1683,7 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -2021,7 +2021,7 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         })
         .unwrap();
     store
@@ -2828,7 +2828,7 @@ fn disposition_required_bead_resumes_when_gates_go_green() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         })
         .unwrap();
     store.register_branch("held-bead", branch).unwrap();
@@ -2916,7 +2916,7 @@ fn disposition_required_bead_in_cooldown_is_skipped_without_scm_call() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         })
         .unwrap();
     store.register_branch("cooldown-bead", branch).unwrap();
@@ -3005,7 +3005,7 @@ fn disposition_required_reassessment_error_preserves_hold_provenance() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         })
         .unwrap();
     store.register_branch("prov-bead", branch).unwrap();
@@ -3664,7 +3664,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
     store
@@ -3756,7 +3756,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
     store
@@ -3851,7 +3851,7 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: Some("transient_spawn_retry_cap_exceeded".into()),
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -3934,7 +3934,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
     // Also seed one above the cap (defensive — matches the shell overlay)
@@ -3954,7 +3954,7 @@ fn recover_human_held_does_not_touch_bead_at_or_above_max_attempt() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -4279,7 +4279,7 @@ fn capped_human_held_comment_failure_retries_before_recording_escalation() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
     *tracker.fail_next_comment.borrow_mut() = Some("transient comment failure".into());
@@ -4365,7 +4365,7 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
     tracker.candidates.borrow_mut().push(Bead {
@@ -4469,7 +4469,7 @@ fn capped_human_held_missing_comment_target_records_local_escalation_fallback() 
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
     // No candidates registered on the tracker either — this bead's source
@@ -4555,7 +4555,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
     store
@@ -4714,7 +4714,7 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
     store
@@ -4828,7 +4828,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
     scm.pr_snapshots.insert(
@@ -4930,7 +4930,7 @@ fn attested_ci_pending_does_not_timebox_park() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
     scm.pr_snapshots.insert(
@@ -5040,7 +5040,7 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
             park_reason: Some(
                 "gate assessment not all-green (stage 1: recorded, not executed)".into(),
             ),
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -5133,7 +5133,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
     scm.pr_snapshots.insert(
@@ -5234,7 +5234,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
             })
             .unwrap();
         store
@@ -5390,7 +5390,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         })
         .unwrap();
     store
@@ -5413,7 +5413,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         })
         .unwrap();
     store
@@ -5853,7 +5853,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         })
         .unwrap();
     store
@@ -5877,7 +5877,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         })
         .unwrap();
     store
@@ -6035,7 +6035,7 @@ fn qdw_assess_refetch_failure_stays_attested_and_never_closes_pr() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         })
         .unwrap();
     store
@@ -6339,7 +6339,13 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            // jleechan-8jxr r4: must match cfg.target_repo (set above
+            // to "myorg/myrepo") so the bead's repo != "owner/repo"
+            // and the dual-vendor subprocess path is exercised.
+            // Pre-r4 the lenient `overlay.repo(cfg)` would have
+            // picked up `myorg/myrepo` via the `None`-fallback; the
+            // strict `repo_opt()` now requires an explicit value.
+            target_repo: Some("myorg/myrepo".into()),
         },
     );
     store
@@ -6522,7 +6528,11 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            // jleechan-8jxr r4: pin cfg.target_repo's value
+            // ("myorg/myrepo") so the dual-vendor subprocess path
+            // (`repo != "owner/repo"`) is exercised. Pre-r4 this was
+            // implicit via the lenient `overlay.repo(cfg)` fallback.
+            target_repo: Some("myorg/myrepo".into()),
         },
     );
     store
@@ -6723,7 +6733,11 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            // jleechan-8jxr r4: pin cfg.target_repo's value
+            // ("myorg/myrepo") so the dual-vendor subprocess path
+            // (`repo != "owner/repo"`) is exercised. Pre-r4 this was
+            // implicit via the lenient `overlay.repo(cfg)` fallback.
+            target_repo: Some("myorg/myrepo".into()),
         },
     );
     store
@@ -6886,7 +6900,11 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            // jleechan-8jxr r4: pin cfg.target_repo's value
+            // ("myorg/myrepo") so the dual-vendor subprocess path
+            // (`repo != "owner/repo"`) is exercised. Pre-r4 this was
+            // implicit via the lenient `overlay.repo(cfg)` fallback.
+            target_repo: Some("myorg/myrepo".into()),
         },
     );
     store
@@ -7349,7 +7367,17 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            // jleechan-8jxr r4: this fixture pre-r4 relied on the
+            // (now-removed) lenient `overlay.repo(cfg)` fallback to
+            // derive `repo` from `cfg.target_repo` (`myorg/myrepo` in
+            // this test) so the dual-vendor subprocess path (which
+            // `is_test_repo = repo == "owner/repo"` gates on) was
+            // exercised. Post-r4 the fast-tier uses the strict
+            // `overlay.repo_opt()` and skips `None` overlays; pin the
+            // explicit `myorg/myrepo` target_repo so the dual-vendor
+            // path still runs AND the `repo != "owner/repo"` gate
+            // still classifies this as a non-test-repo bead.
+            target_repo: Some("myorg/myrepo".into()),
         },
     );
     store
@@ -8309,7 +8337,7 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
-                target_repo: None,
+                target_repo: Some("owner/repo".into()),
             })
             .unwrap();
         store.register_branch(bead_id, branch).unwrap();
@@ -8675,6 +8703,154 @@ fn run_slow_tier_pr_existence_probe_unchanged_for_single_repo_legacy_bead() {
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
 
+// Bead jleechan-8jxr r4 (cursor-agent P0 review follow-up, PR #359): the
+// intake-time PR-existence probe at `tick::run_slow_tier` must NOT silently
+// fall back to `cfg.target_repo` when a bead's `target_repo` is `None` (no
+// `target_repo:` body field, no parseable `external_ref` prefix). Pre-fix
+// behavior: `target_repo.as_deref().unwrap_or(&deps.cfg.target_repo)` would
+// hit the global default repo with a `gh pr view --repo cfg.target_repo ...`
+// call, even though the downstream dispatch path correctly parks the bead
+// as `unmapped_repo` (PR #306 r3) for having no repo identity. The two
+// layers disagreed: intake probed the wrong repo, then dispatch parked.
+// Post-fix: the probe is SKIPPED when `target_repo == None` (the `None =>
+// continue` branch), so no `gh pr view` subprocess is ever invoked for
+// no-repo beads — letting dispatch's `unmapped_repo` park be the single
+// authoritative fail-closed decision. The probe skip is the
+// accept-shaped counterpart of `dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all`
+// at the intake layer.
+#[test]
+#[cfg(unix)]
+fn run_slow_tier_pr_existence_probe_skipped_when_bead_has_no_resolvable_repo() {
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_8jxr_r4_no_probe_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    // Counter file the fake `gh` will increment every time it runs, so the
+    // test can distinguish "gh was never invoked" (counter missing/0) from
+    // "gh was invoked with a different --repo" (counter > 0). This is the
+    // strongest possible assertion that the probe is unconditionally
+    // skipped: a counter file the fake writes regardless of argv means the
+    // absence of the file proves the daemon never even spawned `gh`.
+    let call_counter = fake_bin_dir.join("gh_call_count.txt");
+    let script = format!(
+        "#!/bin/sh\n\
+         prev=\"\"\n\
+         match=0\n\
+         for arg in \"$@\"; do\n\
+           if [ \"$arg\" = \"77\" ]; then\n\
+             match=1\n\
+           fi\n\
+           prev=\"$arg\"\n\
+         done\n\
+         echo 1 >> {counter}\n\
+         echo '{{\"number\": 1}}'\n",
+        counter = call_counter.display()
+    );
+    let path = fake_bin_dir.join("gh");
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let _env_guard = EnvVarGuard::set(&[("PATH", &new_path)]);
+
+    let mut scm = FakeScm::new();
+    // external_ref is unparseable: no `#` (so `parse_external_ref` returns
+    // None) and no `target_repo:` body field — so `intake::resolve_target_repo`
+    // returns None. Pre-fix, the probe would silently fall back to
+    // `cfg.target_repo` ("owner/repo") and run `gh pr view 77 --repo
+    // owner/repo`. Post-fix, the probe is skipped entirely.
+    scm.issues.push(Issue {
+        number: 77,
+        title: "No-resolvable-repo bead".into(),
+        body: "please fix the thing — no target_repo: field, no parseable external_ref".into(),
+        author_login: "alice".into(),
+        external_ref: "no-hash-prefix".into(),
+    });
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = RealLlmForRepoProbe {
+        response: std::cell::RefCell::new(Some(Ok(
+            r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+        ))),
+    };
+    let store = FakeStateStore::new();
+    let cfg = test_cfg(); // target_repo == "owner/repo"
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_8jxr_r4_no_probe_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("tick should succeed");
+
+    assert_eq!(summary.beads_created, 1, "one bead should still be created");
+
+    // The bead is created and queued. Dispatch (next slow tick) will park
+    // it `unmapped_repo` because `overlay.target_repo` is None — that's
+    // r3's contract and is already pinned by
+    // `dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all`.
+    let overlay = store
+        .load("fake-bead-1")
+        .unwrap()
+        .expect("overlay must exist");
+    assert_eq!(
+        overlay.target_repo, None,
+        "no-resolvable-repo bead's overlay.target_repo must remain None \
+         at intake (so dispatch's `unmapped_repo` park is the single \
+         authoritative fail-closed decision)"
+    );
+
+    // The strong assertion: the fake `gh` counter file must be absent or
+    // empty, because the daemon must never have invoked `gh pr view ...`
+    // for a bead with no resolvable repo. Pre-fix: the probe hit
+    // `cfg.target_repo` and the counter would be at least 1.
+    let counter_present = call_counter.exists();
+    let counter_contents = if counter_present {
+        std::fs::read_to_string(&call_counter).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    assert!(
+        !counter_present || counter_contents.trim().is_empty(),
+        "the daemon must NOT invoke `gh pr view` for a no-resolvable-repo \
+         bead (the probe must be skipped, not silently fall back to \
+         cfg.target_repo); fake gh was called {counter_contents:?} times"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
 // ===========================================================================
 // Bead jleechan-zeij / issue #322 r4 P1: tick-boundary handling of the re-roll
 // engine's Deferred outcome and permanent errors. These drive the REAL
@@ -8720,7 +8896,7 @@ fn seed_attested_red_ci_bead(
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         })
         .unwrap();
     store.register_branch(bead_id, &branch).unwrap();
@@ -8941,7 +9117,7 @@ fn autonomy_timebox_park_kills_associated_ao_session_and_clears_handle() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -9027,7 +9203,7 @@ fn coder_silent_park_kills_associated_ao_session_and_clears_handle() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -9113,7 +9289,7 @@ fn session_branch_mismatch_park_kills_associated_ao_session_and_clears_handle() 
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -9214,7 +9390,7 @@ fn autonomy_timebox_park_retains_handle_when_stop_fails() {
             spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
@@ -9287,7 +9463,7 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
             spawn_failure_count: 0,
             pre_session_head_sha: Some("aaaaaaaaaaaaaaaa".into()),
             park_reason: None,
-            target_repo: None,
+            target_repo: Some("owner/repo".into()),
         },
     );
 
