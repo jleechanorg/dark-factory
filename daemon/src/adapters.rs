@@ -4043,6 +4043,55 @@ impl CliVcs {
     }
 }
 
+/// Heuristic for the GitHub API "Reference already exists" / "branch
+/// already exists" response shape. Pure string match against the captured
+/// stderr (the body of the 422) — ZFC-clean because this is a
+/// deterministic transformation of an HTTP error envelope, not a
+/// semantic judgment. Both shapes are observed in the wild:
+/// `gh api repos/<repo>/git/refs` POST emits the JSON body verbatim
+/// through stderr, which contains either the GitHub API message
+/// ("Reference already exists") or a `gh`-prefixed variant ("a branch
+/// named '...' already exists") when the CLI translates the underlying
+/// git call. The original local `git branch <name> <sha>` failure shape
+/// is also kept here so the legacy `create_branch_at` (and any adapter
+/// that runs against the daemon's own source-repo checkout) gets the
+/// same recovery.
+///
+/// `pub(crate)` because the reroll layer needs to consult it directly
+/// (bead jleechan-znmh / issue #341) — the retry happens in
+/// `reroll::execute` step 5 so the recovery telemetry
+/// (`REROLL_BRANCH_RESET`) is emitted at the same layer as the rest of
+/// the reroll observability, not buried inside an adapter.
+pub(crate) fn is_already_exists_error(err: &DaemonError) -> bool {
+    let DaemonError::Tool { stderr, .. } = err else {
+        return false;
+    };
+    stderr.contains("Reference already exists")
+        || stderr.contains("already exists")
+        || stderr.contains("Validation Failed")
+}
+
+/// Heuristic for the `gh pr close` "already merged" / "already closed"
+/// terminal-PR response shape. Pure string match — ZFC-clean because
+/// this is a deterministic transformation of an HTTP error envelope,
+/// not a semantic judgment. Two observed shapes:
+///   * `gh pr close` on a merged PR:  "! cannot close pull request
+///     #N: ...already merged"
+///   * `gh pr close` on a closed PR:  "! cannot close pull request
+///     #N: ...already closed"
+///
+/// Both are reported through the daemon's `DaemonError::Tool { stderr,
+/// .. }` and must be tolerated as a successful supersede in the reroll
+/// path — otherwise the bead wedges on a transient tool error that
+/// can never succeed (the PR is in a terminal state and will not
+/// un-merge/un-close). Bead jleechan-znmh / issue #341.
+pub(crate) fn is_pr_already_terminal_error(err: &DaemonError) -> bool {
+    let DaemonError::Tool { stderr, .. } = err else {
+        return false;
+    };
+    stderr.contains("already merged") || stderr.contains("already closed")
+}
+
 impl Vcs for CliVcs {
     fn base_head(&self, base_branch: &str) -> Result<String, DaemonError> {
         let out = run_tool("git", &["rev-parse", base_branch], 30)?;
@@ -4101,14 +4150,13 @@ impl Vcs for CliVcs {
     /// <name> <sha>` would have silently created it (and where the
     /// worker's first `git push` would then race or be rejected).
     ///
-    /// The endpoint rejects a ref that already exists in `<repo>`
-    /// with HTTP 422 -- the reroll path always passes a freshly
-    /// formatted `factory/<bead>-r<attempt>` branch (incremented per
-    /// attempt), so a collision in the routed repo is structurally
-    /// impossible absent a stale `register_branch`/gh-state mismatch;
-    /// the underlying `DaemonError::Tool` with the HTTP body as
-    /// stderr surfaces that case to the operator for the same reason
-    /// the old CWD-bound `git branch <name> <sha>` did.
+    /// The endpoint rejects a ref that already exists in `<repo>` with
+    /// HTTP 422 ("Reference already exists"). The reroll layer
+    /// (`reroll::execute` step 5) treats this specific failure shape
+    /// as a stale-`-rN`-branch retry signal — see
+    /// [`is_already_exists_error`] and the `REROLL_BRANCH_RESET`
+    /// telemetry event. Non-422 errors propagate to the caller as
+    /// before so genuine failures (network, auth, etc.) still surface.
     fn create_branch_at_for_repo(&self, repo: &str, name: &str, sha: &str) -> Result<(), DaemonError> {
         let path = format!("repos/{}/git/refs", repo);
         let ref_path = format!("refs/heads/{name}");
@@ -4130,6 +4178,46 @@ impl Vcs for CliVcs {
         Ok(())
     }
 
+    /// PATCH-updates `refs/heads/<name>` in `<repo>` to point at `sha`.
+    /// Bead jleechan-znmh / issue #341: paired with
+    /// [`create_branch_at_for_repo`](Self::create_branch_at_for_repo)
+    /// to make branch creation reuse-or-reset-idempotent — if a stale
+    /// `-rN` branch exists from a prior failed attempt (the live
+    /// failure on 9rkz), reset it to the freshly computed baseline
+    /// instead of fatal'ing. `gh api repos/<repo>/git/refs/heads/<name>`
+    /// PATCH accepts a new `sha` form field and is idempotent by
+    /// construction — no 422 on a re-call.
+    fn update_branch_ref_for_repo(&self, repo: &str, name: &str, sha: &str) -> Result<(), DaemonError> {
+        let path = format!("repos/{repo}/git/refs/heads/{name}");
+        let out = run_tool(
+            "gh",
+            &[
+                "api",
+                "--method",
+                "PATCH",
+                &path,
+                "-f",
+                &format!("sha={sha}"),
+            ],
+            30,
+        )?;
+        let _ = out;
+        Ok(())
+    }
+
+    /// Heuristic for the GitHub API "Reference already exists" / "branch
+    /// already exists" response shape. Pure string match against the
+    /// captured stderr (the body of the 422) — ZFC-clean because this is
+    /// a deterministic transformation of an HTTP error envelope, not a
+    /// semantic judgment. Both shapes are observed in the wild:
+    /// `gh api repos/<repo>/git/refs` POST emits the JSON body
+    /// verbatim through stderr, which contains either the GitHub API
+    /// message ("Reference already exists") or a `gh`-prefixed variant
+    /// ("a branch named '...' already exists") when the CLI translates
+    /// the underlying git call. The original local `git branch
+    /// <name> <sha>` failure shape is also kept here so the legacy
+    /// `create_branch_at` (and any adapter that runs against the
+    /// daemon's own source-repo checkout) gets the same recovery.
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError> {
         self.head_sha_within(branch, 30)
     }

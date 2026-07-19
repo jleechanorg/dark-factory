@@ -6,6 +6,7 @@ use crate::state::{
 use crate::tools::{Llm, Scm, SessionActivity, Sessions, SpawnSpec, Vcs};
 use crate::telemetry::{self, TelemetryEvent};
 use crate::constraints;
+use crate::adapters::{is_already_exists_error, is_pr_already_terminal_error};
 use std::path::Path;
 use std::hash::{Hash, Hasher};
 
@@ -434,8 +435,45 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     // push. `create_branch_at_for_repo` POSTs a `refs/heads/<name>`
     // ref via `gh api repos/<repo>/git/refs` — cross-repo ref
     // creation that does NOT depend on the daemon's local checkout.
-    deps.vcs
-        .create_branch_at_for_repo(&bead_repo, &new_branch, &base_sha)?;
+    //
+    // **Bead jleechan-znmh / issue #341 — reuse-or-reset idempotency.**
+    // The POST is non-idempotent — a previous failed reroll that left
+    // `<new_branch>` dangling in the daemon's local worktree (or the
+    // routed target repo) makes the API return HTTP 422 with
+    // "Reference already exists". Pre-fix this fatal'd the bead in
+    // `RE_ROLL` (live failure on 8jxr / 9rkz — the same branch name
+    // could never be re-created). Post-fix: catch the 422 shape here
+    // and call `update_branch_ref_for_repo` to PATCH-reset the
+    // existing ref to the freshly computed baseline SHA. That
+    // achieves the same final state (the ref points at the new
+    // baseline) without a delete-then-recreate TOCTOU race, and
+    // emits `REROLL_BRANCH_RESET` so operators can observe the
+    // recovery in telemetry without grepping raw `gh` stderr.
+    match deps
+        .vcs
+        .create_branch_at_for_repo(&bead_repo, &new_branch, &base_sha)
+    {
+        Ok(()) => {}
+        Err(e) if is_already_exists_error(&e) => {
+            emit_telemetry(
+                deps.telemetry_log,
+                &bead.bead_id,
+                bead.attempt,
+                bead.state.as_str(),
+                "REROLL_BRANCH_RESET",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "newBranch": new_branch,
+                    "baseCommit": base_sha,
+                    "previousError": format!("{e}"),
+                    "repo": bead_repo,
+                }),
+            )?;
+            deps.vcs
+                .update_branch_ref_for_repo(&bead_repo, &new_branch, &base_sha)?;
+        }
+        Err(e) => return Err(e),
+    }
 
     emit_telemetry(
         deps.telemetry_log,
@@ -466,7 +504,40 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         // jleechan-wuts / issue #349: `bead_repo` is shared with step 4
         // (above) so both git-side and gh-side reroll ops target the
         // same routed repo for the same bead on the same tick.
-        deps.scm.close_pr_for_repo(&bead_repo, pr_number, &comment)?;
+        //
+        // **Bead jleechan-znmh / issue #341 — already-terminal PR tolerance.**
+        // If the PR is already merged or already closed (either because
+        // the companion cross-repo bug (#340 / PR #342) is fixed and
+        // the bead's actual PR had merged in the meantime, or because
+        // of any future idempotency case), `gh pr close` errors and
+        // that error is genuinely permanent — retrying will never
+        // succeed. We tolerate the failure shape as a successful
+        // supersede and emit `REROLL_PR_ALREADY_TERMINAL` so the
+        // recovery is observable. The bead advances to Recovery
+        // normally — the operator / Healer sees the telemetry event
+        // instead of a transient-tool-error wedge.
+        match deps
+            .scm
+            .close_pr_for_repo(&bead_repo, pr_number, &comment)
+        {
+            Ok(()) => {}
+            Err(e) if is_pr_already_terminal_error(&e) => {
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_PR_ALREADY_TERMINAL",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "prNumber": pr_number,
+                        "repo": bead_repo,
+                        "toleratedError": format!("{e}"),
+                    }),
+                )?;
+            }
+            Err(e) => return Err(e),
+        }
         bead.pr_number = None;
 
         emit_telemetry(

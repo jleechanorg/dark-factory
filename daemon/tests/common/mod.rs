@@ -170,6 +170,13 @@ pub struct FakeScm {
     /// same-repo open PR, or `PrHeadBranch::Fork` for a confirmed open PR
     /// whose head lives on a fork (the fail-closed guard).
     pub open_pr_head_refs: HashMap<(String, u64), PrHeadBranch>,
+    /// Bead jleechan-znmh / issue #341: scripts `close_pr` /
+    /// `close_pr_for_repo` to return an "already merged" / "already closed"
+    /// tool error for the listed PR numbers, simulating the live 8jxr/9rkz
+    /// failure where `gh pr close` errors out because the PR is in a
+    /// terminal state. The reroll path must treat this as a successful
+    /// supersede (not a transient tool error that wedges the bead).
+    pub fail_close_pr_already_terminal_for: RefCell<Vec<u64>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -240,6 +247,23 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("close_pr({pr},{comment})"));
+        // Bead jleechan-znmh / issue #341: scripts "already terminal" PR
+        // closure. The first call returns the simulated gh error so the
+        // reroll path is observed exercising its recovery branch; tests
+        // that need a clean close should leave the list empty.
+        if self
+            .fail_close_pr_already_terminal_for
+            .borrow()
+            .contains(&pr)
+        {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: format!(
+                    "! cannot close pull request #{pr}: already merged (scripted already-terminal error)"
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -253,6 +277,23 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("close_pr_for_repo({repo},{pr},{comment})"));
+        // Bead jleechan-znmh / issue #341: the same already-terminal
+        // scripting applies on the routed-repo entry point — a real
+        // production fix must work on the call site the reroll actually
+        // uses, not just the legacy `close_pr`.
+        if self
+            .fail_close_pr_already_terminal_for
+            .borrow()
+            .contains(&pr)
+        {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: format!(
+                    "! cannot close pull request #{pr}: already merged (scripted already-terminal error)"
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -792,6 +833,20 @@ pub struct FakeVcs {
     /// "no rewrite detected") so tests that don't exercise the force-push
     /// detector don't have to script it.
     pub ancestor_pairs: HashMap<(String, String), bool>,
+    /// Bead jleechan-znmh / issue #341: scripts `create_branch_at_for_repo`
+    /// to return a "branch already exists" failure for the listed branch
+    /// names, simulating the stale `-rN` branch left behind by an earlier
+    /// failed reroll attempt (live failure on 9rkz). After the first call
+    /// for that branch name the fake remembers the call and flips to
+    /// success on subsequent invocations — modeling the production fix
+    /// ("reset the ref to the freshly computed baseline") without forcing
+    /// the test to script the delete+recreate dance separately.
+    pub fail_create_branch_already_exists_for: RefCell<Vec<String>>,
+    /// Records every `(repo, name, sha)` tuple the fake's
+    /// `create_branch_at_for_repo` was called with, so tests can assert
+    /// on the retry sequence (e.g. one POST-then-PATCH cycle) without
+    /// parsing the textual `calls` log.
+    pub create_branch_for_repo_calls: RefCell<Vec<(String, String, String)>>,
 }
 
 impl FakeVcs {
@@ -878,6 +933,16 @@ impl Vcs for FakeVcs {
     /// shells out to the daemon's local git), masking the cross-repo bug.
     /// The fake simply records the call so tests can assert that reroll
     /// routed through the per-repo entry point with the bead's repo.
+    ///
+    /// Bead jleechan-znmh / issue #341: also models the
+    /// stale-`-rN`-already-exists failure. The FIRST call for a branch
+    /// name listed in `fail_create_branch_already_exists_for` returns
+    /// the simulated `git` "branch named ... already exists" tool error
+    /// (the live failure on 9rkz). Subsequent calls succeed — modeling
+    /// the production fix ("reset the ref to the freshly computed
+    /// baseline"). Every (repo, name, sha) call is also recorded in
+    /// `create_branch_for_repo_calls` so tests can assert on the exact
+    /// retry sequence without parsing the textual `calls` log.
     fn create_branch_at_for_repo(
         &self,
         repo: &str,
@@ -887,6 +952,50 @@ impl Vcs for FakeVcs {
         self.calls
             .borrow_mut()
             .push(format!("create_branch_at_for_repo({repo},{name},{sha})"));
+        self.create_branch_for_repo_calls
+            .borrow_mut()
+            .push((repo.to_string(), name.to_string(), sha.to_string()));
+        if self
+            .fail_create_branch_already_exists_for
+            .borrow()
+            .iter()
+            .any(|n| n == name)
+        {
+            // Bead jleechan-znmh / issue #341: simulate the live 9rkz
+            // failure shape exactly — `git` (or `gh api`) returns
+            // "branch already exists" with rc=128. The reroll layer's
+            // recovery code in `reroll::execute` step 5 catches this
+            // shape and calls `update_branch_ref_for_repo(...)` to
+            // reset the ref; see that trait method below for the
+            // happy-path retry path.
+            return Err(DaemonError::Tool {
+                tool: "git".into(),
+                rc: 128,
+                stderr: format!(
+                    "fatal: a branch named '{name}' already exists (scripted already-exists failure)"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Bead jleechan-znmh / issue #341: paired with the reroll-layer
+    /// retry contract. Records the call and clears the scriptable
+    /// already-exists flag for the branch name (since after a
+    /// successful reset the branch is no longer "stale" — the
+    /// production PATCH update succeeds).
+    fn update_branch_ref_for_repo(
+        &self,
+        repo: &str,
+        name: &str,
+        sha: &str,
+    ) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("update_branch_ref_for_repo({repo},{name},{sha})"));
+        self.fail_create_branch_already_exists_for
+            .borrow_mut()
+            .retain(|n| n != name);
         Ok(())
     }
 

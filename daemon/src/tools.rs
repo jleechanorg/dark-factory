@@ -732,6 +732,30 @@ pub trait Vcs {
         let _ = repo;
         self.create_branch_at(name, sha)
     }
+    /// Reset an existing `refs/heads/<name>` ref in `<repo>` to point at
+    /// `sha`. Bead jleechan-znmh / issue #341: the factory-fabricated
+    /// reroll path (`reroll::execute` step 5, `vcs.create_branch_at_for_repo`)
+    /// is non-idempotent — `gh api repos/<repo>/git/refs` POST returns
+    /// HTTP 422 "Reference already exists" when an earlier failed reroll
+    /// attempt left the local daemon worktree (or the routed target repo)
+    /// with the same `-rN` branch name dangling. The live failure wedged
+    /// beads 8jxr / 9rkz permanently in `RE_ROLL`. The production fix
+    /// uses `gh api repos/<repo>/git/refs/heads/<name>` PATCH to reset
+    /// the existing ref to the freshly computed baseline — semantically
+    /// the same outcome (the ref points at `base_sha`) without the
+    /// delete-then-recreate TOCTOU race. Default impl ignores `repo` and
+    /// delegates to `create_branch_at` so legacy fakes keep working;
+    /// `CliVcs` overrides it to PATCH-update via the Git Data API.
+    ///
+    /// This is paired with [`create_branch_at_for_repo`](Vcs::create_branch_at_for_repo):
+    /// that method is the primary entry point and MUST internally detect
+    /// the 422 already-exists case and fall back to this one. Callers do
+    /// NOT need to call both — see `CliVcs::create_branch_at_for_repo`'s
+    /// doc comment for the full retry contract.
+    fn update_branch_ref_for_repo(&self, repo: &str, name: &str, sha: &str) -> Result<(), DaemonError> {
+        let _ = repo;
+        self.create_branch_at(name, sha)
+    }
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError>;
     /// Budget-bounded [`head_sha`](Vcs::head_sha) (bead jleechan-zeij / issue
     /// #322 r4 P2). Default delegates to the unbounded method; the real
