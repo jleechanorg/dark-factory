@@ -284,6 +284,42 @@ pub struct CliScm {
     branch_commit_cache: Mutex<HashMap<String, (Option<u64>, Instant)>>,
 }
 
+/// Worktree directory name AO derives from a `factory/<bead>-r<n>` branch:
+/// the `factory/` prefix stripped. Shared by CliScm's
+/// `worktree_branch_last_commit` (bead jleechan-coder-silent-false-parks-h92r)
+/// so the path resolver can never drift from the actual `ao spawn` layout.
+fn worktree_display_name(branch: &str) -> &str {
+    branch.strip_prefix("factory/").unwrap_or(branch)
+}
+
+/// Root directory AO clones per-session worktrees under. Matches the global
+/// `worktreeDir: ~/.worktrees` default in `~/.agent-orchestrator.yaml`;
+/// overridable via `DARK_FACTORY_AO_WORKTREE_DIR` for tests and non-standard
+/// installs. AO itself remains the sole source of truth for the actual path
+/// it created — this is the daemon's best-effort reconstruction used ONLY
+/// for the spawn-time remote assertion (bead jleechan-bqdv Stage C) and the
+/// worktree-local-HEAD liveness probe
+/// (jleechan-coder-silent-false-parks-h92r); every caller treats "path
+/// doesn't exist" as "cannot verify", never as a positive mismatch or a
+/// positive silence signal.
+fn ao_worktree_root() -> String {
+    if let Ok(dir) = std::env::var("DARK_FACTORY_AO_WORKTREE_DIR") {
+        return dir;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    format!("{home}/.worktrees")
+}
+
+/// `<worktree_root>/<ao_project>/<display_name>` — the path a just-spawned
+/// session's worktree is expected to live at. Used by CliScm's
+/// `worktree_branch_last_commit` to read the local git HEAD commit time as a
+/// CLI-agnostic liveness signal.
+fn resolve_worktree_path(ao_project: &str, branch: &str) -> std::path::PathBuf {
+    std::path::Path::new(&ao_worktree_root())
+        .join(ao_project)
+        .join(worktree_display_name(branch))
+}
+
 impl CliScm {
     pub fn new(repo: String) -> Self {
         Self {
@@ -1263,6 +1299,45 @@ impl Scm for CliScm {
         branch: &str,
     ) -> Result<Option<u64>, DaemonError> {
         self.with_repo(repo).remote_branch_last_commit(branch)
+    }
+
+    /// jleechan-coder-silent-false-parks-h92r: poll the local worktree's HEAD
+    /// commit timestamp for `branch` under `ao_project` — the third liveness
+    /// signal used by the coder-silence watcher. While
+    /// `worktree_transcript_last_activity_epoch` (on `Sessions`) only
+    /// observes Claude Code transcript mtime, this method reads the
+    /// worktree's git HEAD — a CLI-agnostic liveness proof that advances on
+    /// every committed local change regardless of which CLI (Codex, AGY,
+    /// Cursor, raw `git commit`) is in use. Path resolution:
+    /// `<worktree_root>/<ao_project>/<display_name>` (matching the layout
+    /// `ao spawn` lays out under `$HOME/.worktrees` by default). When the
+    /// worktree is absent on disk we return `Ok(None)` ("cannot verify"),
+    /// never a positive silence signal — same defensive contract as
+    /// `worktree_transcript_last_activity_epoch`. Any non-zero `git` exit is
+    /// treated the same way: lack of evidence is not evidence of lack.
+    fn worktree_branch_last_commit(
+        &self,
+        ao_project: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let path = resolve_worktree_path(ao_project, branch);
+        if !path.is_dir() {
+            return Ok(None);
+        }
+        let cwd = path.to_string_lossy().into_owned();
+        match run_tool_in_dir("git", &["log", "-1", "--format=%ct"], &cwd, 10) {
+            Ok(out) => {
+                let trimmed = out.trim();
+                if trimmed.is_empty() {
+                    return Ok(None);
+                }
+                match trimmed.parse::<u64>() {
+                    Ok(epoch) => Ok(Some(epoch)),
+                    Err(_) => Ok(None),
+                }
+            }
+            Err(_) => Ok(None),
+        }
     }
 }
 

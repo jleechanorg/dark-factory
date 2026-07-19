@@ -163,6 +163,15 @@ pub struct FakeScm {
     pub permissions: HashMap<String, Permission>,
     pub pr_snapshots: HashMap<u64, PrSnapshot>,
     pub remote_branches: HashMap<String, Option<u64>>,
+    /// jleechan-coder-silent-false-parks-h92r: scripted local worktree HEAD
+    /// commit timestamps keyed by `(ao_project, branch)`. `None` here mirrors
+    /// `remote_branches`: either "no worktree yet" or "missing key in the
+    /// fake" both map to a non-positive silence signal. Tests that exercise
+    /// the coder-silence watcher must script this explicitly so the fix's
+    /// behavior is observable (default `None` = "no local liveness signal",
+    /// which is a legitimate "cannot disprove silence" result and lets the
+    /// remote-only check still drive parking).
+    pub worktree_branch_commits: HashMap<(String, String), Option<u64>>,
     /// jleechan-drive-pr-branch-binding-pcpr: scripted open-PR lookups,
     /// keyed by `(repo, pr_number)`. Absence of a key (the `Default` case)
     /// means `PrHeadBranch::NotFound`, matching the real `CliScm` fail-safe
@@ -261,6 +270,29 @@ impl Scm for FakeScm {
             .borrow_mut()
             .push(format!("remote_branch_last_commit({branch})"));
         if let Some(&res) = self.remote_branches.get(branch) {
+            Ok(res)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// jleechan-coder-silent-false-parks-h92r: scripted local worktree HEAD
+    /// commit timestamp for the coder-silence watcher. Returns `None` (i.e.
+    /// "no positive liveness signal") when the test did not script this
+    /// explicitly — same default as `remote_branch_last_commit`, so existing
+    /// tests that pre-date this field are unaffected.
+    fn worktree_branch_last_commit(
+        &self,
+        ao_project: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("worktree_branch_last_commit({ao_project},{branch})"));
+        if let Some(&res) = self
+            .worktree_branch_commits
+            .get(&(ao_project.into(), branch.into()))
+        {
             Ok(res)
         } else {
             Ok(None)

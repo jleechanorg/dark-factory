@@ -684,7 +684,34 @@ pub fn run_tick(
                             let transcript_is_active = transcript_epoch
                                 .is_some_and(|t| now_epoch.saturating_sub(t) < 1800);
 
-                            if branch_is_silent && transcript_is_active {
+                            // jleechan-coder-silent-false-parks-h92r: third
+                            // independent liveness signal — the local
+                            // worktree's git HEAD commit timestamp. While
+                            // transcript mtime only updates when a Claude
+                            // Code transcript file is touched, the worktree
+                            // HEAD advances on every committed local change
+                            // regardless of which CLI is in use (Claude Code,
+                            // Codex, AGY, Cursor, or raw `git commit`). The
+                            // watcher treats a coder as LIVE if ANY of the
+                            // three signals (remote branch tip, transcript,
+                            // local worktree HEAD) is fresh. Only when ALL
+                            // three are stale/missing do we park; missing
+                            // evidence is never treated as positive silence.
+                            let worktree_epoch = {
+                                let ao_project = deps
+                                    .cfg
+                                    .resolve_repo(overlay.repo(deps.cfg))
+                                    .map(|r| r.ao_project)
+                                    .unwrap_or_else(|| overlay.repo(deps.cfg).to_string());
+                                deps.scm
+                                    .worktree_branch_last_commit(&ao_project, branch)
+                                    .ok()
+                                    .flatten()
+                            };
+                            let worktree_is_active = worktree_epoch
+                                .is_some_and(|t| now_epoch.saturating_sub(t) < 1800);
+
+                            if branch_is_silent && (transcript_is_active || worktree_is_active) {
                                 emit(
                                     deps.telemetry_log,
                                     &overlay.bead_id,
@@ -697,6 +724,7 @@ pub fn run_tick(
                                         "branch": branch,
                                         "last_commit_epoch": last_commit_epoch,
                                         "transcript_epoch": transcript_epoch,
+                                        "worktree_epoch": worktree_epoch,
                                     }),
                                 )?;
                             } else if branch_is_silent {

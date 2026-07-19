@@ -886,6 +886,202 @@ fn test_wedge_detection_dispatched_coder_silent_stale_transcript_still_parks() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// jleechan-coder-silent-false-parks-h92r REGRESSION (live 2026-07-17 incident,
+/// `Scm::worktree_branch_last_commit` arm).
+///
+/// Replays the 2026-07-17 false-park incident for coders using a CLI whose
+/// transcript is NOT touched by every local commit (Codex, AGY, Cursor, raw
+/// `git commit`). The remote branch tip is stale (coder hasn't pushed in
+/// 40 minutes) AND no Claude Code transcript activity is recorded (coder
+/// isn't running inside Claude Code), but the worktree's local git HEAD is
+/// fresh — the coder is actively producing work. Under the FIX, the bead
+/// must stay DISPATCHED and emit a `CODER_ACTIVE_GRACE` event citing the
+/// fresh `worktree_epoch`. Before the fix (no `worktree_branch_last_commit`
+/// signal in the OR), this bead would be parked `coder_silent` even while
+/// the coder was actively committing locally.
+#[test]
+fn test_coder_silent_false_park_respects_worktree_local_activity() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "df-worktree-active".into(),
+        BeadOverlay {
+            bead_id: "df-worktree-active".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 1900, // > 1800 silence threshold
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/df-worktree-active-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+
+    // Remote branch's last commit is OLDER than the 1800s silence window:
+    // exactly what `gh api .../branches/<branch>` returns for a coder that
+    // has been iterating locally between pushes.
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let stale_remote_commit = now_epoch.saturating_sub(2400); // 40 minutes old
+    scm.remote_branches.insert(
+        "factory/df-worktree-active-r1".into(),
+        Some(stale_remote_commit),
+    );
+
+    // The coder's transcript is stale too (e.g. the coder is using Codex /
+    // AGY / raw `git commit`, not Claude Code). Only the worktree HEAD
+    // proves liveness.
+    // (FakeSessions::new() leaves transcript activity un-set, so the
+    // `transcript_is_active` flag is false.)
+
+    // Worktree HEAD is FRESH — the coder committed locally 2 minutes ago.
+    // `test_cfg()` leaves `target_repo: "owner/repo"`, so
+    // `Config::resolve_repo` derives `ao_project = "repo"`.
+    let fresh_local_commit = now_epoch.saturating_sub(120); // 2 minutes old
+    scm.worktree_branch_commits.insert(
+        ("repo".into(), "factory/df-worktree-active-r1".into()),
+        Some(fresh_local_commit),
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_coder_silent_false_park_worktree.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = FakeVcs::new();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 10).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "bead whose worktree has a fresh local commit must NOT be parked coder_silent \
+         (jleechan-coder-silent-false-parks-h92r; live 2026-07-17 incident parked 6 \
+         active coders with no worktree-local liveness check)"
+    );
+
+    let o = store.load("df-worktree-active").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "bead must remain DISPATCHED when local worktree has a fresh commit"
+    );
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(
+        logs.contains("CODER_ACTIVE_GRACE"),
+        "telemetry must record the grace decision citing the fresh worktree: {logs}"
+    );
+    assert!(
+        !logs.contains("PARKED_HUMAN_HELD"),
+        "no PARKED_HUMAN_HELD event must be emitted for a coder with fresh local activity: {logs}"
+    );
+    assert!(
+        !logs.contains("coder_silent"),
+        "no coder_silent park_reason must be set when local worktree is active: {logs}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Companion to `test_coder_silent_false_park_respects_worktree_local_activity`:
+/// when ALL THREE signals agree the coder is silent (stale remote + stale
+/// transcript + stale worktree HEAD), the bead MUST still be parked. This is
+/// the negative path of the fix — proves adding `worktree_branch_last_commit`
+/// to the OR has not weakened the genuine silence-detection invariant.
+#[test]
+fn test_coder_silent_still_parks_when_remote_transcript_and_worktree_all_stale() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "df-truly-silent".into(),
+        BeadOverlay {
+            bead_id: "df-truly-silent".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 1900,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/df-truly-silent-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // All three signals are stale: genuine silence.
+    scm.remote_branches.insert(
+        "factory/df-truly-silent-r1".into(),
+        Some(now_epoch.saturating_sub(2400)),
+    );
+    scm.worktree_branch_commits.insert(
+        ("repo".into(), "factory/df-truly-silent-r1".into()),
+        Some(now_epoch.saturating_sub(2400)),
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_coder_silent_true_silence.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let vcs = FakeVcs::new();
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 10).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "bead with stale remote + stale transcript + stale worktree must still be parked coder_silent"
+    );
+
+    let o = store.load("df-truly-silent").unwrap().unwrap();
+    assert_eq!(o.state, OverlayState::HumanHeld);
+
+    let logs = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(logs.contains("coder_silent"), "logs: {}", logs);
+    assert!(logs.contains("PARKED_HUMAN_HELD"), "logs: {}", logs);
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// jleechan-5ia2 regression test: reproduces the LIVE bug this bead tracks.
 /// Bead `jleechan-vj89`'s overlay was observed with `state=DISPATCHED`,
 /// `branch=factory/jleechan-vj89-r1`, and a real, alive `session_id`
@@ -9370,6 +9566,7 @@ fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
         id: "no-repo-bead".into(),
         title: "manual bead with no repo".into(),
         description: "manually created with no external_ref".into(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         // No external_ref and no body `target_repo:` field — dispatch
         // will park this as unmapped_repo.

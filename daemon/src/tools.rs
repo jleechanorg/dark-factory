@@ -433,6 +433,38 @@ pub trait Scm {
         self.close_pr(pr, comment)
     }
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError>;
+
+    /// Local worktree HEAD commit timestamp for `branch` under `ao_project`,
+    /// if a worktree can be located on disk. `None` means "no positive
+    /// liveness signal" — the caller treats it as "cannot disprove silence",
+    /// NOT as "confirmed silent". Used by the coder-silence watcher
+    /// (`tick.rs`'s `Dispatched` autonomy check, bead
+    /// jleechan-coder-silent-false-parks-h92r) as a SECOND independent
+    /// liveness signal complementing `worktree_transcript_last_activity_epoch`
+    /// on `Sessions`: the worktree's git HEAD advances on every committed
+    /// local change regardless of which CLI (Claude Code, Codex, AGY,
+    /// Cursor) is in use, while transcript mtime only updates when a Claude
+    /// Code transcript file is touched. A coder iterating in Cursor or via
+    /// direct `git commit` (no transcript activity, but commits landing)
+    /// still shows fresh here. The watcher treats a coder as LIVE if EITHER
+    /// the remote branch tip, the transcript, or the local worktree HEAD
+    /// shows fresh activity inside the 1800s silence window; only when ALL
+    /// three are stale/missing do we park `coder_silent`.
+    ///
+    /// Default impl returns `Ok(None)` ("cannot verify") so existing impls
+    /// and fakes that predate the field keep their original behavior. The
+    /// production `CliScm` impl runs `git -C <worktree> log -1 --format=%ct`
+    /// against `<worktree_root>/<ao_project>/<display_name>` where
+    /// `<worktree_root>` is `DARK_FACTORY_AO_WORKTREE_DIR` if set, else
+    /// `$HOME/.worktrees`.
+    fn worktree_branch_last_commit(
+        &self,
+        ao_project: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let _ = (ao_project, branch);
+        Ok(None)
+    }
     /// Repo-scoped variant of [`remote_branch_last_commit`](Scm::remote_branch_last_commit)
     /// (bead jleechan-bqdv, Stage C of the multi-repo dispatch fix — see
     /// `docs/multirepo-dispatch-investigation-2026-07-11.md`). The daemon's
