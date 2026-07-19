@@ -49,6 +49,7 @@ fn test_cfg() -> Config {
         spec_dir: ".factory/specs/".into(),
         reroll_head_stability_window_secs: 1,
         reroll_death_confirm_secs: 0,
+        held_recheck_cooldown_secs: 900,
         repos: std::collections::HashMap::new(),
     }
 }
@@ -2835,6 +2836,237 @@ fn disposition_required_bead_resumes_when_gates_go_green() {
     assert_eq!(
         summary.beads_held_disposition_required, 0,
         "resuming to green is not a new hold"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-zaga / issue #348 r3 residual 2: a held bead whose cooldown has
+/// NOT yet elapsed must be SKIPPED — not re-assessed, and crucially the SCM
+/// API must not be hit for it. Prevents hammering CodeRabbit/gh every fast
+/// tick while a structural condition persists for hours.
+#[test]
+fn disposition_required_bead_in_cooldown_is_skipped_without_scm_call() {
+    let mut scm = FakeScm::new();
+    // A snapshot IS available — the test proves it is never fetched.
+    scm.pr_snapshots.insert(
+        711,
+        qdw_green_snapshot(
+            711,
+            vec![PrComment {
+                author: "dark-factory-er".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
+        ),
+    );
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    let vcs = FakeVcs::new();
+
+    let branch = "alice/held-in-cooldown";
+    store
+        .save(&BeadOverlay {
+            bead_id: "cooldown-bead".into(),
+            state: OverlayState::DispositionRequired,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(711),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("cooldown-bead", branch).unwrap();
+    // Cooldown far in the future -> the bead must be skipped this tick.
+    let far_future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 100_000;
+    store
+        .set_held_recheck_after("cooldown-bead", far_future)
+        .unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_disposition_cooldown_skip.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("cooldown skip must not error");
+
+    assert_eq!(
+        summary.gates_assessed, 0,
+        "a bead still in cooldown must NOT be re-assessed"
+    );
+    // The SCM API must not be hit for this bead's PR while it is in cooldown.
+    assert!(
+        scm.calls
+            .borrow()
+            .iter()
+            .all(|c| !c.contains("pr_snapshot_for_repo") || !c.contains("711")),
+        "cooldown must prevent the SCM snapshot fetch: {:?}",
+        scm.calls.borrow()
+    );
+    // Still held, unchanged.
+    assert_eq!(
+        store.load("cooldown-bead").unwrap().unwrap().state,
+        OverlayState::DispositionRequired
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-zaga / issue #348 r3 residual 3: if a held bead's re-assessment
+/// exits early (here the PR snapshot fetch fails mid-tick), the durable state
+/// must STAY DISPOSITION_REQUIRED — the in-memory ATTESTED promotion is never
+/// persisted — so hold provenance survives and the next re-hold does not
+/// double-emit the counter/telemetry/comment.
+#[test]
+fn disposition_required_reassessment_error_preserves_hold_provenance() {
+    let mut scm = FakeScm::new();
+    // NO snapshot inserted for PR 712 -> pr_snapshot_for_repo errors -> the
+    // fast tier takes the transient early-exit (continue) after promoting.
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2;
+    let vcs = FakeVcs::new();
+
+    let branch = "alice/held-then-error";
+    store
+        .save(&BeadOverlay {
+            bead_id: "prov-bead".into(),
+            state: OverlayState::DispositionRequired,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(712),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("prov-bead", branch).unwrap();
+    // held_recheck_after unset (None) -> eligible to re-assess now.
+
+    let telemetry_log = std::env::temp_dir().join("afd_disposition_provenance.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // Tick 1: re-assessment errors (snapshot fetch fails) mid-way.
+    let summary1 = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("errored re-assessment must not abort the tick");
+    assert_eq!(
+        summary1.gates_assessed, 0,
+        "the snapshot fetch failed, so no gate assessment completed"
+    );
+    // Core provenance fix: durable state STAYS DISPOSITION_REQUIRED (with the
+    // pre-r3 eager save it would have been left ATTESTED).
+    assert_eq!(
+        store.load("prov-bead").unwrap().unwrap().state,
+        OverlayState::DispositionRequired,
+        "an errored re-assessment must not lose the hold state"
+    );
+    let log1 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !log1.contains("\"DISPOSITION_REQUIRED\""),
+        "the errored path must not emit a (duplicate) DISPOSITION_REQUIRED hold event; log:\n{log1}"
+    );
+
+    // Tick 2: snapshot now available and STILL structural (CodeRabbit
+    // unavailable). Bypass the cooldown, re-assess. Because tick 1 preserved
+    // the held state, this is a RE-hold (entered_as_disposition=true) -> it
+    // must NOT increment the counter or post another comment.
+    let mut structural = qdw_green_snapshot(
+        712,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
+    );
+    structural.coderabbit_approved = false;
+    structural.coderabbit_status = "unknown".into();
+    scm.pr_snapshots.insert(712, structural);
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    store.set_held_recheck_after("prov-bead", 0).unwrap(); // clear cooldown
+
+    let tracker_calls_before = tracker.calls.borrow().len();
+    let summary2 = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        2,
+        0,
+    )
+    .expect("re-hold must not error");
+    assert_eq!(
+        summary2.beads_held_disposition_required, 0,
+        "a re-hold of an already-held bead must not double-count the operator counter"
+    );
+    assert_eq!(
+        store.load("prov-bead").unwrap().unwrap().state,
+        OverlayState::DispositionRequired
+    );
+    let new_disposition_comments = tracker
+        .calls
+        .borrow()
+        .iter()
+        .skip(tracker_calls_before)
+        .filter(|c| c.contains("Disposition required"))
+        .count();
+    assert_eq!(
+        new_disposition_comments, 0,
+        "a re-hold must not post a duplicate disposition comment"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

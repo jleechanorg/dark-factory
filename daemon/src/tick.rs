@@ -2174,21 +2174,42 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
         }
 
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         // jleechan-zaga / issue #348: a `DISPOSITION_REQUIRED` bead must
-        // KEEP being re-assessed on each tick — otherwise it is a terminal
-        // hold (the fast tier's ATTESTED-only filter would never look at it
-        // again, so the chain could never resume when the structural
-        // condition clears). Re-drive it through the exact same ATTESTED
-        // assessment path. Promote it back to ATTESTED first so the shared
-        // downstream logic (and `reroll::execute`'s ATTESTED/RE_ROLL freshness
-        // guard) treats it as a normal in-flight bead; if it is still
-        // structural-only it will be re-held below. `entered_as_disposition`
-        // suppresses duplicate hold telemetry / operator comments / counter
-        // increments on a re-hold (only a NEW placement is counted).
+        // KEEP being re-assessed — otherwise it is a terminal hold (the fast
+        // tier's ATTESTED-only filter would never look at it again, so the
+        // chain could never resume when the structural condition clears).
+        //
+        // r3 residual 2 (cooldown): a structural condition can persist for
+        // hours; re-fetching the PR snapshot every fast tick would hammer the
+        // SCM API. Skip re-assessment until the durable per-bead
+        // `held_recheck_after` cooldown elapses, and stamp the NEXT recheck now
+        // (before any SCM fetch) so the cooldown holds regardless of how this
+        // re-assessment exits (resume / reroll / re-hold / transient error).
+        //
+        // r3 residual 3 (provenance): the promotion back to ATTESTED is
+        // IN-MEMORY only and is NOT persisted here. The stored state stays
+        // DISPOSITION_REQUIRED until assessment reaches a terminal decision
+        // (READY / reroll / re-hold), so an early-exit (snapshot fetch failure,
+        // ci_pending, transient) leaves hold provenance intact and does not
+        // let the next re-hold double-emit the counter/telemetry/comment. The
+        // reroll branch persists the ATTESTED promotion just before calling
+        // `reroll::execute` (whose freshness guard requires ATTESTED/RE_ROLL).
         let entered_as_disposition = overlay.state == OverlayState::DispositionRequired;
         if entered_as_disposition {
-            overlay.state = OverlayState::Attested;
-            deps.store.save(&overlay)?;
+            if let Some(recheck_after) = deps.store.held_recheck_after(bead_id)? {
+                if now_epoch < recheck_after {
+                    continue; // still in cooldown — do not touch the SCM API.
+                }
+            }
+            deps.store.set_held_recheck_after(
+                bead_id,
+                now_epoch.saturating_add(deps.cfg.held_recheck_cooldown_secs),
+            )?;
+            overlay.state = OverlayState::Attested; // in-memory only (NOT saved)
         }
         if overlay.state != OverlayState::Attested {
             continue;
@@ -2465,6 +2486,12 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     // event, and posts the comment — a bead re-assessed and
                     // still structural must not spam the PR every tick.
                     if !entered_as_disposition {
+                        // A first hold starts the re-assessment cooldown (a
+                        // re-hold already stamped it at re-assessment start).
+                        deps.store.set_held_recheck_after(
+                            bead_id,
+                            now_epoch.saturating_add(deps.cfg.held_recheck_cooldown_secs),
+                        )?;
                         summary.beads_held_disposition_required += 1;
                         emit(
                             deps.telemetry_log,
@@ -2645,6 +2672,16 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // Stage 2: execute re-roll engine (there is at least one
                 // coder-fixable RED gate; the structural-only hold is handled
                 // in the no-red branch above, before the transient path).
+                //
+                // r3 residual 3: if this bead was held DISPOSITION_REQUIRED,
+                // its stored state is still DISPOSITION_REQUIRED (the promotion
+                // above was in-memory only). Persist the ATTESTED promotion now
+                // — assessment has completed and produced a coder-fixable red —
+                // so `reroll::execute`'s ATTESTED/RE_ROLL freshness guard
+                // accepts it instead of aborting.
+                if entered_as_disposition {
+                    deps.store.save(&overlay)?;
+                }
                 let mut reviewer = "verifier".to_string();
                 for (gate_name, result) in &report.results {
                     if let verifier::GateResult::Red(_) = result {

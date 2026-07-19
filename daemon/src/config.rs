@@ -53,6 +53,15 @@ pub struct Config {
     /// (5s).
     #[serde(default = "default_reroll_death_confirm_secs")]
     pub reroll_death_confirm_secs: u64,
+    /// Bead jleechan-zaga / issue #348 r3: cooldown (seconds) between fast-tier
+    /// re-assessments of a bead held at DISPOSITION_REQUIRED. A structural
+    /// condition (CodeRabbit unavailable, unresolved bot threads) can persist
+    /// for hours; without a cooldown the fast tier would re-fetch the PR
+    /// snapshot every tick, hammering the SCM API for no benefit. Default 15
+    /// minutes. `#[serde(default)]` so every pre-existing `daemon.toml` parses
+    /// unchanged.
+    #[serde(default = "default_held_recheck_cooldown_secs")]
+    pub held_recheck_cooldown_secs: u64,
     /// Multi-repo routing table (bead jleechan-35y4 Stage B). Absent entirely
     /// from a config file (the common case for every pre-existing
     /// `daemon.toml`) deserializes to an empty map via `#[serde(default)]` —
@@ -68,6 +77,12 @@ pub struct Config {
 /// per the Codex review's "configurable minimum (default ≥30s)".
 fn default_reroll_head_stability_window_secs() -> u64 {
     30
+}
+
+/// Default held-recheck cooldown (bead jleechan-zaga / issue #348 r3): 15
+/// minutes between re-assessments of a DISPOSITION_REQUIRED bead.
+fn default_held_recheck_cooldown_secs() -> u64 {
+    900
 }
 
 /// Default positive-death confirmation window (bead jleechan-zeij / issue #322
@@ -186,6 +201,9 @@ spec_dir = ".factory/specs/"
         let cfg = load(&p).unwrap();
         assert_eq!(cfg.reroll_head_stability_window_secs, 30);
         assert_eq!(cfg.reroll_death_confirm_secs, 5);
+        // Bead jleechan-zaga / issue #348 r3: the held-recheck cooldown
+        // defaults to 15 minutes and is config-overridable.
+        assert_eq!(cfg.held_recheck_cooldown_secs, 900);
     }
 
     #[test]

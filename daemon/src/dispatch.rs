@@ -1347,6 +1347,7 @@ mod tests {
             spec_dir: ".factory/specs/".into(),
             reroll_head_stability_window_secs: 30,
             reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
             repos: std::collections::HashMap::new(),
         }
     }
