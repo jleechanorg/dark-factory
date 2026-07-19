@@ -55,6 +55,14 @@ impl Tracker for CliTracker {
             id: String,
             title: String,
             description: Option<String>,
+            // jleechan-0hqx (issue #338): operator-authored per-attempt
+            // guidance, set via `br update --notes`. Surfaced into the coder
+            // prompt as the higher-priority-than-description
+            // OPERATOR GUIDANCE section so attempt rN coders stop
+            // re-litigating scope the operator already settled on requeue.
+            // `Option` because beads predating this field, or with no notes
+            // set, omit it from the `br list --json` payload.
+            notes: Option<String>,
             external_ref: Option<String>,
         }
         let data: BrListOutput = serde_json::from_str(&out[json_start..]).map_err(|e| {
@@ -72,6 +80,7 @@ impl Tracker for CliTracker {
             id: issue.id,
             title: issue.title,
             description: issue.description.unwrap_or_default(),
+            notes: issue.notes.unwrap_or_default(),
             file_tree_summary: file_tree_summary.clone(),
             external_ref: issue.external_ref,
         }).collect();
