@@ -57,6 +57,23 @@ Operational rules:
 6. Treat `.dot` graphs as the durable process code. Runner code is disposable;
    graph shape, specs, holdouts, and scoring contracts are the important assets.
 
+## Beads tracking — br is the only writer
+
+`.beads/issues.jsonl` is owned by the `br` CLI. **Never edit it directly** —
+not to "fix" a `br` error, not to deduplicate rows, not to bypass a hang.
+Direct edits silently diverge from the SQLite DB (`daemon/.beads/beads.db`)
+and corrupt the next `br sync --flush-only`. If `br` reports `Duplicate
+external_ref` or similar, capture the error and file a follow-up bead via
+`br create`; never hand-edit the JSONL. The pre-push guard
+`.githooks/pre-push-beads-guard.sh` will reject any push from a
+`factory/*` branch that includes a `.beads/issues.jsonl` change. Bypass
+only with `git push --no-verify` (emergency JSONL repair only).
+
+Incident: 2026-07-17 — the df-160 session in dark-factory hand-edited
+`.beads/issues.jsonl` to work around a `Duplicate external_ref` `br`
+error, bypassing the entire br-only tracking contract. Bead jleechan-cnf9
+/ issue #308.
+
 ## Setup
 
 ```bash
