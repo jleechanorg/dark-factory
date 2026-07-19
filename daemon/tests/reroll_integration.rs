@@ -262,12 +262,23 @@ fn test_reroll_success() {
     // bead jleechan-tfs1 regression guard: a factory-fabricated bead
     // (is_adopted=false) must still use today's create-branch-at path and
     // must NEVER go through the adopted-branch append-only push path.
+    // jleechan-wuts / issue #349: the reroll now routes through
+    // `create_branch_at_for_repo(<bead.repo(cfg)>, ...)` instead of the
+    // legacy CWD-bound `create_branch_at(...)`. The assertion below
+    // pins both that the routed-repo entry point was used AND that the
+    // legacy local-cwd method was NOT used.
     let vcs_calls = vcs.calls.borrow();
+    assert!(
+        vcs_calls.iter().any(|c| c.contains(
+            "create_branch_at_for_repo(owner/repo,factory/bead-success-r2"
+        )),
+        "factory-fabricated reroll must fabricate a new branch via the routed-repo entry point: {vcs_calls:?}"
+    );
     assert!(
         vcs_calls
             .iter()
-            .any(|c| c.contains("create_branch_at(factory/bead-success-r2")),
-        "factory-fabricated reroll must fabricate a new branch: {vcs_calls:?}"
+            .all(|c| !c.starts_with("create_branch_at(")),
+        "factory-fabricated reroll must NEVER use the legacy CWD-bound create_branch_at (issue #349): {vcs_calls:?}"
     );
     assert!(
         vcs_calls.iter().all(|c| !c.starts_with("push_fix_commit(")),
@@ -281,6 +292,154 @@ fn test_reroll_success() {
     assert!(spec_content.contains("reviewer = \"skeptic\""));
     assert!(spec_content.contains("inhibition_specs = ["));
     assert!(spec_content.contains("\"no print\""));
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Regression test for issue #349 / bead jleechan-wuts — the
+/// factory-fabricated reroll path in `reroll.rs::execute` (steps 4 & 5:
+/// `deps.vcs.base_head(...)` and `deps.vcs.create_branch_at(...)`) used to
+/// shell out to the LOCAL `git` binary in the daemon process's CWD (its
+/// systemd `WorkingDirectory`, the daemon's own source-repo checkout) --
+/// structurally incapable of succeeding for any bead whose
+/// `overlay.target_repo` names a DIFFERENT repo from `cfg.target_repo`.
+///
+/// This test seeds the bead with `target_repo = Some("jleechanorg/other-repo")`
+/// (NOT the `cfg.target_repo` of "owner/repo") and asserts that the reroll
+/// VCS calls route through the per-repo variant with that routed repo as
+/// the first arg, AND that the legacy CWD-bound `base_head(...)` /
+/// `create_branch_at(...)` calls are NOT issued. The fake's
+/// `base_head_for_repo` is the only call site that returns a valid base SHA
+/// for the cross-repo bead -- the legacy `base_head(...)` deliberately
+/// returns Err for `main` in this test, so a regression to the old
+/// code path fails the reroll outright.
+#[test]
+fn test_reroll_routes_vcs_ops_through_bead_repo_for_cross_repo_bead() {
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let mut vcs = FakeVcs::new();
+    // Pre-seed only the cross-repo base branch. The legacy `base_head`
+    // path is deliberately NOT seeded, so a regression to the
+    // CWD-bound `base_head(main)` call fails the reroll with
+    // `DaemonError::Tool` and the bead never reaches Recovery state.
+    vcs.heads
+        .insert("jleechanorg/other-repo@main".into(), "cross-repo-base-sha".into());
+    // Seed the prior attempt's head in the bare `heads` map: reroll's
+    // pre-quiescence `head_sha_within` (a separate code path, unchanged
+    // by this fix) reads `heads[branch]` directly. Without this entry
+    // the reroll defers before reaching the per-repo base lookup.
+    vcs.heads
+        .insert("factory/bead-cross-repo-r1".into(), "head-sha-cross".into());
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into()
+    ));
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_cross_repo_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_reroll_cross_repo_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-cross-repo".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 20,
+        spend_usd: 0.5,
+        pr_number: Some(4242),
+        branch: Some("factory/bead-cross-repo-r1".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        // Cross-repo: bead's resolved repo DIFFERS from `cfg.target_repo`.
+        // This is the exact shape of the live failure (8jxr / 9rkz class):
+        // daemon's default repo is `jleechanorg/worldarchitect.ai`, the
+        // bead's reroll target repo is something else.
+        target_repo: Some("jleechanorg/other-repo".into()),
+    };
+    store.save(&bead).unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "Don't print to stdout, log errors.".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    match outcome {
+        RerollOutcome::Rerolled { new_branch } => {
+            assert_eq!(new_branch, "factory/bead-cross-repo-r2");
+        }
+        other => panic!("expected RerollOutcome::Rerolled, got {:?}", other),
+    }
+
+    // Verify overlay update.
+    let updated = store.load("bead-cross-repo").unwrap().unwrap();
+    assert_eq!(updated.state, OverlayState::Recovery);
+    assert_eq!(updated.attempt, 2);
+    assert_eq!(updated.reroll_count, 1);
+    assert_eq!(updated.branch, Some("factory/bead-cross-repo-r2".into()));
+    assert_eq!(updated.pr_number, None);
+
+    // The whole point: VCS ops routed through the bead's resolved repo,
+    // NOT through the CWD-bound legacy methods. The repo qualifier
+    // "jleechanorg/other-repo" is what the bead's `overlay.repo(cfg)`
+    // returns; `cfg.target_repo` ("owner/repo") would silently target
+    // the daemon's default repo's same-named branches (the original bug).
+    let vcs_calls = vcs.calls.borrow();
+    assert!(
+        vcs_calls.iter().any(|c| c.contains(
+            "base_head_for_repo(jleechanorg/other-repo,main)"
+        )),
+        "reroll must resolve base SHA via base_head_for_repo with the bead's repo; got: {vcs_calls:?}"
+    );
+    assert!(
+        vcs_calls.iter().any(|c| c.contains(
+            "create_branch_at_for_repo(jleechanorg/other-repo,factory/bead-cross-repo-r2"
+        )),
+        "reroll must create the new branch via create_branch_at_for_repo with the bead's repo; got: {vcs_calls:?}"
+    );
+    // No call to the legacy CWD-bound methods for cross-repo beads --
+    // those would have computed the baseline / created the branch in the
+    // daemon's own cwd (the daemon's source-repo checkout) instead of the
+    // routed target repo.
+    assert!(
+        vcs_calls.iter().all(|c| !c.starts_with("base_head(")),
+        "reroll must never call legacy CWD-bound base_head for a cross-repo bead; got: {vcs_calls:?}"
+    );
+    assert!(
+        vcs_calls.iter().all(|c| !c.starts_with("create_branch_at(")),
+        "reroll must never call legacy CWD-bound create_branch_at for a cross-repo bead; got: {vcs_calls:?}"
+    );
+
+    // PR close mirrors the bead's repo (PR #342 v6ud fix already covered
+    // the gh-side; this test pins the git-side sibling).
+    let scm_calls = scm.calls.borrow();
+    assert!(
+        scm_calls.iter().any(|c| c.contains(
+            "close_pr_for_repo(jleechanorg/other-repo,4242"
+        )),
+        "reroll must close the old PR via close_pr_for_repo with the bead's repo; got: {scm_calls:?}"
+    );
 
     std::fs::remove_dir_all(spec_dir).ok();
     let _ = std::fs::remove_file(&telemetry_log);
