@@ -1160,6 +1160,19 @@ impl Scm for CliScm {
         repo: &str,
         branch: &str,
     ) -> Result<Option<u64>, DaemonError> {
+        // jleechan-t40t (issue #326) r6: filter the lookup to SAME-REPO
+        // PRs only. `--repo owner/repo` scopes the LIST to that repo, but
+        // `--head <branch>` matches against `headRefName` which can
+        // collide with a fork PR's head branch name (r6 lesson from
+        // PR #305 — `gh pr list --head X --repo owner/repo` may surface
+        // a fork PR whose `headRefName == X` because the JSON payload
+        // includes `headRepository.nameWithOwner`). The jq filter
+        // selects only entries whose headRepository matches the queried
+        // repo, mirroring the same-repo guard `intake::same_repo_pr`
+        // already applies to PR adoption.
+        let jq_filter = format!(
+            ".[] | select(.headRepository.nameWithOwner == \"{repo}\") | .number"
+        );
         let out = match run_tool(
             "gh",
             &[
@@ -1170,9 +1183,9 @@ impl Scm for CliScm {
                 "--repo",
                 repo,
                 "--json",
-                "number",
+                "number,headRepository",
                 "--jq",
-                ".[0].number",
+                &jq_filter,
             ],
             30,
         ) {

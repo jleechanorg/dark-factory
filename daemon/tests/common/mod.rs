@@ -283,11 +283,7 @@ impl Scm for FakeScm {
             .unwrap_or(PrHeadBranch::NotFound))
     }
 
-    fn pr_number_for_branch(
-        &self,
-        repo: &str,
-        branch: &str,
-    ) -> Result<Option<u64>, DaemonError> {
+    fn pr_number_for_branch(&self, repo: &str, branch: &str) -> Result<Option<u64>, DaemonError> {
         self.calls
             .borrow_mut()
             .push(format!("pr_number_for_branch({repo},{branch})"));
@@ -441,9 +437,7 @@ impl FakeSessions {
     }
 
     pub fn fail_stop_for(&self, session_id: &str) {
-        self.fail_stop_for
-            .borrow_mut()
-            .push(session_id.to_string());
+        self.fail_stop_for.borrow_mut().push(session_id.to_string());
     }
 
     pub fn fail_spawn_deferred_for(&self, bead_id: &str) {
@@ -561,7 +555,10 @@ impl Sessions for FakeSessions {
             .borrow_mut()
             .push(format!("spawn({})", spec.bead_id));
         if self.panic_after_spawn_for.borrow().contains(&spec.bead_id) {
-            panic!("scripted process death after external spawn for {}", spec.bead_id);
+            panic!(
+                "scripted process death after external spawn for {}",
+                spec.bead_id
+            );
         }
         if self.fail_spawn_for.borrow().contains(&spec.bead_id) {
             return Err(DaemonError::Tool {
@@ -570,16 +567,10 @@ impl Sessions for FakeSessions {
                 stderr: format!("scripted spawn failure for {}", spec.bead_id),
             });
         }
-        if self
-            .fail_spawn_cleanup_for
-            .borrow()
-            .contains(&spec.bead_id)
-        {
+        if self.fail_spawn_cleanup_for.borrow().contains(&spec.bead_id) {
             return Err(DaemonError::SpawnCleanupFailed {
                 session: format!("leaked-{}", spec.bead_id),
-                spawn_error: Box::new(DaemonError::Parse(
-                    "scripted invalid spawn metadata".into(),
-                )),
+                spawn_error: Box::new(DaemonError::Parse("scripted invalid spawn metadata".into())),
                 cleanup_error: Box::new(DaemonError::Tool {
                     tool: "ao".into(),
                     rc: 1,
@@ -1191,8 +1182,17 @@ impl StateStore for FakeStateStore {
         for overlay in self.overlays.borrow_mut().values_mut() {
             // Mirror the production allow-list and its durable no-session
             // proof so integration fakes cannot hide duplicate-spawn bugs.
-            let is_permanent =
-                is_permanent_human_hold_reason(overlay.park_reason.as_deref());
+            // jleechan-t40t r6: production `state.rs::recover_human_held`
+            // (line ~1239) clears `pr_number = NULL` and
+            // `session_id = NULL` so the recovered overlay does NOT carry
+            // the dead PR/session from the prior (failed) attempt into
+            // the new dispatch — `dispatch_ready` overwrites `branch`
+            // but leaves the other fields, so the fast tier would
+            // otherwise treat the freshly-QUEUED row as already ATTESTED
+            // against the dead PR and re-park on the same gate. Mirror
+            // this contract exactly so integration tests exercise the
+            // SAME recovery semantics the production daemon ships with.
+            let is_permanent = is_permanent_human_hold_reason(overlay.park_reason.as_deref());
             if overlay.state == OverlayState::HumanHeld
                 && overlay.attempt < max_attempt
                 && !is_permanent
@@ -1202,6 +1202,8 @@ impl StateStore for FakeStateStore {
                 overlay.attempt += 1;
                 overlay.autonomy_secs = 0;
                 overlay.park_reason = None;
+                overlay.pr_number = None;
+                overlay.session_id = None;
                 recovered.push(overlay.clone());
             }
         }
@@ -1252,7 +1254,9 @@ impl StateStore for FakeStateStore {
         self.calls
             .borrow_mut()
             .push(format!("reset_reroll_deferral({bead_id})"));
-        self.reroll_deferrals.borrow_mut().insert(bead_id.to_string(), 0);
+        self.reroll_deferrals
+            .borrow_mut()
+            .insert(bead_id.to_string(), 0);
         Ok(())
     }
 

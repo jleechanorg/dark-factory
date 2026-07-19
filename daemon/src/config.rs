@@ -71,6 +71,20 @@ pub struct Config {
     /// pre-migration config already names.
     #[serde(default)]
     pub repos: HashMap<String, RepoConfig>,
+    /// Bead jleechan-t40t (issue #326) r6: when true, the slow-tier fast
+    /// loop runs a pre-gate validation step before every gate assessment,
+    /// confirming the stored `pr_number`'s PR is OPEN and its head ref
+    /// matches `overlay.branch`. Catches drift between `pr_number` and the
+    /// bead's actual branch for ATTESTED beads whose stored number has not
+    /// been re-resolved this tick (the dispatch→attested path's re-resolution
+    /// only fires when the bead transitions through DISPATCHED). Default
+    /// false so legacy daemon.toml / integration tests aren't disturbed;
+    /// operators can flip to true once their daemon fleet is configured
+    /// with `open_pr_head_refs` scripting for ATTESTED beads (production
+    /// `CliScm` always returns real data, so production deployments should
+    /// enable this for full drift coverage).
+    #[serde(default)]
+    pub pre_gate_validation_enabled: bool,
 }
 
 /// Default head-stability window (bead jleechan-zeij / issue #322 r3): 30s,
@@ -260,7 +274,10 @@ spec_dir = ".factory/specs/"
         )
         .unwrap();
         let cfg = load(&p).unwrap();
-        assert!(cfg.repos.is_empty(), "repos table must default to empty when absent");
+        assert!(
+            cfg.repos.is_empty(),
+            "repos table must default to empty when absent"
+        );
         assert_eq!(
             cfg.resolve_repo("owner/repo"),
             Some(RepoRouting {
