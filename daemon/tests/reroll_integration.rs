@@ -32,6 +32,7 @@ fn test_cfg() -> Config {
         // Individual tests override these when they need a specific window.
         reroll_head_stability_window_secs: 1,
         reroll_death_confirm_secs: 0,
+        held_recheck_cooldown_secs: 900,
         repos: std::collections::HashMap::new(),
     }
 }
