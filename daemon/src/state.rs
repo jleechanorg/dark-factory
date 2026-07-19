@@ -20,6 +20,25 @@ pub enum OverlayState {
     Redispatched, // handed back to the queue
     BudgetHeld,  // budget exhaustion (monitoring-only in Stage 1/2)
     HumanHeld,   // terminal until human action
+    /// Bead jleechan-zaga / issue #348: gate assessment is red but EVERY
+    /// red gate is `Structural` (external reviewer usage-limits, bot
+    /// threads on superseded content, evidence floor owned by a different
+    /// bead). Re-rolling the coder cannot clear any of them, so the
+    /// daemon holds the bead with a per-gate disposition request rather
+    /// than superseding it. Distinct from `HumanHeld` because there is
+    /// no operator-visible blocker to diagnose; the daemon has surfaced
+    /// every red gate's disposition need and is awaiting the conditions
+    /// to change (e.g. external reviewer quota reset, bot thread
+    /// resolution, the other bead landing). The fast tier continues to
+    /// assess on each tick; once any red gate flips `CoderFixable` (or
+    /// to `Green`), the bead leaves this state and re-enters the normal
+    /// flow. Until then, this state is the floor's "no churn" anchor
+    /// that prevents the supersede-→HUMAN_HELD cycle issue #348
+    /// documents (v6ud's CORRECT P0 fix PR #342 was superseded by its
+    /// own reroll ~25 min after opening because every red gate was
+    /// structural — the daemon could never have reached all_green on
+    /// any attempt number).
+    DispositionRequired,
 }
 
 impl OverlayState {
@@ -36,6 +55,7 @@ impl OverlayState {
             OverlayState::Redispatched => "REDISPATCHED",
             OverlayState::BudgetHeld => "BUDGET_HELD",
             OverlayState::HumanHeld => "HUMAN_HELD",
+            OverlayState::DispositionRequired => "DISPOSITION_REQUIRED",
         }
     }
 
@@ -56,6 +76,7 @@ impl OverlayState {
             "REDISPATCHED" => Ok(OverlayState::Redispatched),
             "BUDGET_HELD" => Ok(OverlayState::BudgetHeld),
             "HUMAN_HELD" => Ok(OverlayState::HumanHeld),
+            "DISPOSITION_REQUIRED" => Ok(OverlayState::DispositionRequired),
             other => Err(DaemonError::Parse(format!(
                 "unknown overlay state: {other}"
             ))),
@@ -302,6 +323,18 @@ pub trait StateStore {
     /// a confirmed proceed so a later, unrelated re-roll starts fresh. Default
     /// `Ok(())` (no-op) for fakes that don't persist the counter.
     fn reset_reroll_deferral(&self, _bead_id: &str) -> Result<(), DaemonError> {
+        Ok(())
+    }
+    /// Read the earliest epoch at which a bead held `DISPOSITION_REQUIRED` may
+    /// be re-assessed (bead jleechan-zaga / issue #348 r3). `None` = no
+    /// cooldown recorded (re-assess now). Default `Ok(None)` so fakes that
+    /// don't exercise the hold-cooldown path see "re-assess now".
+    fn held_recheck_after(&self, _bead_id: &str) -> Result<Option<u64>, DaemonError> {
+        Ok(None)
+    }
+    /// Record the earliest epoch at which `bead_id` may be re-assessed while
+    /// held. Default no-op for fakes.
+    fn set_held_recheck_after(&self, _bead_id: &str, _epoch: u64) -> Result<(), DaemonError> {
         Ok(())
     }
     fn reconcile_dispatching(&self) -> Result<(), DaemonError> {
@@ -1934,6 +1967,32 @@ impl StateStore for SqliteStateStore {
             Err(e) => Err(tool_err("reset_reroll_deferral", e)),
         }
     }
+
+    fn held_recheck_after(&self, bead_id: &str) -> Result<Option<u64>, DaemonError> {
+        let row: Result<Option<i64>, rusqlite::Error> = self.conn.query_row(
+            "SELECT held_recheck_after FROM bead_overlay WHERE bead_id = ?1",
+            params![bead_id],
+            |row| row.get(0),
+        );
+        match row {
+            Ok(v) => Ok(v.map(|n| n.max(0) as u64)),
+            Err(e) if no_such_column(&e) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(tool_err("held_recheck_after", e)),
+        }
+    }
+
+    fn set_held_recheck_after(&self, bead_id: &str, epoch: u64) -> Result<(), DaemonError> {
+        let res = self.conn.execute(
+            "UPDATE bead_overlay SET held_recheck_after = ?2, updated_at = ?3 WHERE bead_id = ?1",
+            params![bead_id, epoch as i64, now_iso8601()],
+        );
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) if no_such_column(&e) => Ok(()),
+            Err(e) => Err(tool_err("set_held_recheck_after", e)),
+        }
+    }
 }
 
 
@@ -2043,6 +2102,179 @@ mod tests {
         // Incrementing/reading a bead with no overlay row is a no-op read of 0
         // (the UPDATE matches nothing) rather than an error.
         assert_eq!(s.reroll_deferral_count("no-such-bead").unwrap(), 0);
+    }
+
+    /// Bead jleechan-zaga / issue #348 r3: the held-recheck cooldown epoch must
+    /// round-trip through the REAL SqliteStateStore column.
+    #[test]
+    fn held_recheck_after_round_trips() {
+        let s = store();
+        let o = BeadOverlay {
+            bead_id: "held-bead".into(),
+            state: OverlayState::DispositionRequired,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(42),
+            branch: Some("alice/feature".into()),
+            session_id: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        };
+        s.save(&o).unwrap();
+        // Unset by default.
+        assert_eq!(s.held_recheck_after("held-bead").unwrap(), None);
+        s.set_held_recheck_after("held-bead", 1_800_000_000).unwrap();
+        assert_eq!(s.held_recheck_after("held-bead").unwrap(), Some(1_800_000_000));
+        // No overlay row -> None, not an error.
+        assert_eq!(s.held_recheck_after("no-such-bead").unwrap(), None);
+    }
+
+    /// Bead jleechan-zaga / issue #348 r3: the CHECK migration must be robust
+    /// to ANY legal DDL formatting, because the r3 detection is a PROBE (a
+    /// rolled-back INSERT), not a string-match on the stored DDL. Runs one
+    /// legacy `bead_overlay` DDL through the migration and asserts: (a) the
+    /// pre-existing row is preserved, (b) DISPOSITION_REQUIRED is accepted
+    /// afterward, (c) a second run is idempotent. `expect_rejected_before`
+    /// asserts the legacy CHECK rejected the new state pre-migration (false for
+    /// the already-migrated fixture, which accepts it from the start).
+    fn run_disposition_migration_case(bead_overlay_ddl: &str, expect_rejected_before: bool) {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(bead_overlay_ddl).unwrap();
+        conn.execute(
+            "INSERT INTO bead_overlay (bead_id, state, updated_at) \
+             VALUES ('b-legacy', 'ATTESTED', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let insert_new = |c: &Connection| {
+            c.execute(
+                "INSERT INTO bead_overlay (bead_id, state, updated_at) \
+                 VALUES ('b-new', 'DISPOSITION_REQUIRED', '2026-01-01T00:00:00Z')",
+                [],
+            )
+        };
+        if expect_rejected_before {
+            assert!(
+                insert_new(&conn).is_err(),
+                "legacy CHECK must reject DISPOSITION_REQUIRED before migration"
+            );
+        }
+
+        SqliteStateStore::ensure_disposition_required_state(&conn).unwrap();
+
+        // (a) row preserved.
+        let preserved: String = conn
+            .query_row(
+                "SELECT state FROM bead_overlay WHERE bead_id = 'b-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, "ATTESTED");
+        // (b) new state accepted.
+        insert_new(&conn).expect("post-migration CHECK must accept DISPOSITION_REQUIRED");
+        // (c) idempotent second run preserves both rows and the usable CHECK.
+        SqliteStateStore::ensure_disposition_required_state(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bead_overlay", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        conn.execute(
+            "INSERT INTO bead_overlay (bead_id, state, updated_at) \
+             VALUES ('b-new2', 'DISPOSITION_REQUIRED', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("CHECK must remain usable after an idempotent second migration");
+    }
+
+    #[test]
+    fn disposition_migration_exact_production_ddl() {
+        run_disposition_migration_case(
+            "CREATE TABLE bead_overlay (\
+               bead_id TEXT PRIMARY KEY, \
+               state TEXT NOT NULL CHECK (state IN \
+                 ('QUEUED','DISPATCHING','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',\
+                  'REDISPATCHED','BUDGET_HELD','HUMAN_HELD')), \
+               attempt INTEGER NOT NULL DEFAULT 1, \
+               updated_at TEXT NOT NULL)",
+            true,
+        );
+    }
+
+    #[test]
+    fn disposition_migration_whitespace_variant_ddl() {
+        // Newlines and irregular spacing inside the CHECK — a string-edit of
+        // `'HUMAN_HELD')` would silently miss this; the probe does not.
+        run_disposition_migration_case(
+            "CREATE TABLE bead_overlay (\n  bead_id TEXT PRIMARY KEY,\n  state TEXT NOT NULL\n    CHECK ( state IN (\n      'QUEUED', 'DISPATCHING', 'DISPATCHED', 'ATTESTED', 'READY',\n      'RE_ROLL', 'RECOVERY', 'REDISPATCHED', 'BUDGET_HELD', 'HUMAN_HELD'\n    ) ),\n  updated_at TEXT NOT NULL\n)",
+            true,
+        );
+    }
+
+    #[test]
+    fn disposition_migration_quoted_identifier_ddl() {
+        // Quoted table/column identifiers — `CREATE TABLE "bead_overlay"` and
+        // `"state"` would break a `replacen("CREATE TABLE bead_overlay", …)`.
+        run_disposition_migration_case(
+            "CREATE TABLE \"bead_overlay\" (\
+               \"bead_id\" TEXT PRIMARY KEY, \
+               \"state\" TEXT NOT NULL CHECK (\"state\" IN \
+                 ('QUEUED','DISPATCHING','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',\
+                  'REDISPATCHED','BUDGET_HELD','HUMAN_HELD')), \
+               \"updated_at\" TEXT NOT NULL)",
+            true,
+        );
+    }
+
+    #[test]
+    fn disposition_migration_already_migrated_ddl_is_noop() {
+        // A DB whose CHECK already lists DISPOSITION_REQUIRED: the probe
+        // succeeds, so the migration is a no-op and the table stays usable.
+        run_disposition_migration_case(
+            "CREATE TABLE bead_overlay (\
+               bead_id TEXT PRIMARY KEY, \
+               state TEXT NOT NULL CHECK (state IN \
+                 ('QUEUED','DISPATCHING','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',\
+                  'REDISPATCHED','BUDGET_HELD','HUMAN_HELD','DISPOSITION_REQUIRED')), \
+               updated_at TEXT NOT NULL)",
+            false,
+        );
+    }
+
+    /// End-to-end via the public open path: a store opened against a
+    /// legacy-constraint schema string can persist and reload a
+    /// DISPOSITION_REQUIRED overlay (the migration runs inside
+    /// `open_in_memory_with_schema`).
+    #[test]
+    fn open_migrates_legacy_check_and_persists_disposition_required_overlay() {
+        let legacy = include_str!("../contracts/schema.sql")
+            .replace("'HUMAN_HELD','DISPOSITION_REQUIRED')", "'HUMAN_HELD')");
+        let s = SqliteStateStore::open_in_memory_with_schema(&legacy).unwrap();
+        let o = BeadOverlay {
+            bead_id: "held-bead".into(),
+            state: OverlayState::DispositionRequired,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(708),
+            branch: Some("alice/feature".into()),
+            session_id: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        };
+        s.save(&o).expect("DISPOSITION_REQUIRED must persist after open-time migration");
+        let got = s.load("held-bead").unwrap().unwrap();
+        assert_eq!(got.state, OverlayState::DispositionRequired);
+        assert_eq!(got.pr_number, Some(708));
     }
 
     #[test]

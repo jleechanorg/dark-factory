@@ -1252,6 +1252,20 @@ impl StateStore for FakeStateStore {
         Ok(())
     }
 
+    fn held_recheck_after(&self, bead_id: &str) -> Result<Option<u64>, DaemonError> {
+        Ok(self.held_recheck_after.borrow().get(bead_id).copied())
+    }
+
+    fn set_held_recheck_after(&self, bead_id: &str, epoch: u64) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("set_held_recheck_after({bead_id},{epoch})"));
+        self.held_recheck_after
+            .borrow_mut()
+            .insert(bead_id.to_string(), epoch);
+        Ok(())
+    }
+
     fn save_rejection(
         &self,
         bead_id: &str,

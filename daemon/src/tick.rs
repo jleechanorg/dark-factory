@@ -73,6 +73,11 @@ pub struct TickSummary {
     /// query `bead_overlay` yourself" (2026-07-09 live incident: 45 beads
     /// silently lost with no durable trace anywhere).
     pub beads_escalated_locally: usize,
+    /// jleechan-zaga / issue #348: beads held at `DISPOSITION_REQUIRED`
+    /// because every red gate is structural (re-rolling would be no-op
+    /// churn). The fast tier keeps assessing on each tick; this counter
+    /// just records the holds placed this tick.
+    pub beads_held_disposition_required: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -919,6 +924,7 @@ pub fn run_tick(
             "beadsRecoveredFromHeld": summary.beads_recovered_from_held,
             "beadsEscalated": summary.beads_escalated,
             "beadsEscalatedLocally": summary.beads_escalated_locally,
+            "beadsHeldDispositionRequired": summary.beads_held_disposition_required,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
@@ -2343,6 +2349,43 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
         }
 
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // jleechan-zaga / issue #348: a `DISPOSITION_REQUIRED` bead must
+        // KEEP being re-assessed — otherwise it is a terminal hold (the fast
+        // tier's ATTESTED-only filter would never look at it again, so the
+        // chain could never resume when the structural condition clears).
+        //
+        // r3 residual 2 (cooldown): a structural condition can persist for
+        // hours; re-fetching the PR snapshot every fast tick would hammer the
+        // SCM API. Skip re-assessment until the durable per-bead
+        // `held_recheck_after` cooldown elapses, and stamp the NEXT recheck now
+        // (before any SCM fetch) so the cooldown holds regardless of how this
+        // re-assessment exits (resume / reroll / re-hold / transient error).
+        //
+        // r3 residual 3 (provenance): the promotion back to ATTESTED is
+        // IN-MEMORY only and is NOT persisted here. The stored state stays
+        // DISPOSITION_REQUIRED until assessment reaches a terminal decision
+        // (READY / reroll / re-hold), so an early-exit (snapshot fetch failure,
+        // ci_pending, transient) leaves hold provenance intact and does not
+        // let the next re-hold double-emit the counter/telemetry/comment. The
+        // reroll branch persists the ATTESTED promotion just before calling
+        // `reroll::execute` (whose freshness guard requires ATTESTED/RE_ROLL).
+        let entered_as_disposition = overlay.state == OverlayState::DispositionRequired;
+        if entered_as_disposition {
+            if let Some(recheck_after) = deps.store.held_recheck_after(bead_id)? {
+                if now_epoch < recheck_after {
+                    continue; // still in cooldown — do not touch the SCM API.
+                }
+            }
+            deps.store.set_held_recheck_after(
+                bead_id,
+                now_epoch.saturating_add(deps.cfg.held_recheck_cooldown_secs),
+            )?;
+            overlay.state = OverlayState::Attested; // in-memory only (NOT saved)
+        }
         if overlay.state != OverlayState::Attested {
             continue;
         }
@@ -2832,6 +2875,76 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 })
                 .collect();
             if red_reasons.is_empty() {
+                // jleechan-zaga / issue #348: no coder-fixable RED gate, but
+                // is the chain blocked by a STRUCTURAL-pending gate (an
+                // external verifier a coder cannot drive — CodeRabbit
+                // unavailable, Bugbot absent)? If so, hold
+                // DISPOSITION_REQUIRED and keep re-assessing, rather than
+                // silently churning the ATTESTED transient path forever (which
+                // eventually cap-parks HUMAN_HELD — the exact regression #348
+                // documents). A purely TRANSIENT report (CI still running,
+                // unverifiable thread count) falls through to the existing
+                // transient handling below.
+                if deps.cfg.stage == 2
+                    && matches!(
+                        verifier::classify_chain(&report),
+                        verifier::ChainDisposition::HoldDisposition
+                    )
+                {
+                    let structural_gates: Vec<serde_json::Value> =
+                        verifier::structural_pending_gates(&report)
+                            .into_iter()
+                            .map(|(gate_name, reason)| {
+                                serde_json::json!({
+                                    "gate": gate_name.as_str(),
+                                    "reason": reason,
+                                    "disposition": "structural",
+                                })
+                            })
+                            .collect();
+                    overlay.state = OverlayState::DispositionRequired;
+                    deps.store.save(&overlay)?;
+                    // Only a NEW hold (not a re-hold of an already-held bead)
+                    // increments the operator counter, emits the telemetry
+                    // event, and posts the comment — a bead re-assessed and
+                    // still structural must not spam the PR every tick.
+                    if !entered_as_disposition {
+                        // A first hold starts the re-assessment cooldown (a
+                        // re-hold already stamped it at re-assessment start).
+                        deps.store.set_held_recheck_after(
+                            bead_id,
+                            now_epoch.saturating_add(deps.cfg.held_recheck_cooldown_secs),
+                        )?;
+                        summary.beads_held_disposition_required += 1;
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::DispositionRequired.as_str(),
+                            "DISPOSITION_REQUIRED",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "chain blocked only by structural-pending gate(s) (external verifier the coder cannot drive); reroll would be no-op churn",
+                                "structural_gates": structural_gates,
+                                "pr_number": pr,
+                            }),
+                        )?;
+                        let gate_lines: Vec<String> = structural_gates
+                            .iter()
+                            .filter_map(|g| {
+                                let gate = g.get("gate")?.as_str()?;
+                                let reason = g.get("reason")?.as_str()?;
+                                Some(format!("- `{gate}`: {reason}"))
+                            })
+                            .collect();
+                        let comment_body = format!(
+                            "🤖 **[dark-factory]** Disposition required for bead `{bead_id}`: the only remaining blockers are structural (an external verifier the coder cannot drive — re-rolling cannot clear them). Daemon held at `DISPOSITION_REQUIRED` rather than superseding. Per-gate disposition needs:\n\n{}\n\nThe fast tier will continue to assess on each tick; the bead resumes the moment any gate becomes coder-fixable or green.",
+                            gate_lines.join("\n")
+                        );
+                        let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+                    }
+                    continue;
+                }
                 if let Some(count) = er_runner_capped_count {
                     if escalation_already_recorded(deps, bead_id)? {
                         continue;
@@ -2979,7 +3092,19 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 };
                 let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
             } else {
-                // Stage 2: execute re-roll engine
+                // Stage 2: execute re-roll engine (there is at least one
+                // coder-fixable RED gate; the structural-only hold is handled
+                // in the no-red branch above, before the transient path).
+                //
+                // r3 residual 3: if this bead was held DISPOSITION_REQUIRED,
+                // its stored state is still DISPOSITION_REQUIRED (the promotion
+                // above was in-memory only). Persist the ATTESTED promotion now
+                // — assessment has completed and produced a coder-fixable red —
+                // so `reroll::execute`'s ATTESTED/RE_ROLL freshness guard
+                // accepts it instead of aborting.
+                if entered_as_disposition {
+                    deps.store.save(&overlay)?;
+                }
                 let mut reviewer = "verifier".to_string();
                 for (gate_name, result) in &report.results {
                     if let verifier::GateResult::Red(_) = result {
