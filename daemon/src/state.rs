@@ -470,6 +470,22 @@ pub enum HumanHoldReason {
     SpecValidationFailed,
     RouterParse(String),
     UnmappedTargetRepo,
+    /// Bead jleechan-8jxr r2: a manually-created factory bead whose intake
+    /// could not resolve ANY repo identity (no `target_repo:` body field,
+    /// no `external_ref` with a parseable `owner/repo#N` prefix, and no
+    /// adopted-PR context) reached `dispatch_ready` with `overlay.target_repo
+    /// = None`. `BeadOverlay::repo()` previously fell back to
+    /// `cfg.target_repo`, so the bead silently dispatched into the daemon's
+    /// global default repo — even when the bead's body content was
+    /// unambiguously about a DIFFERENT repo (e.g. dark-factory internals
+    /// while `cfg.target_repo = jleechanorg/worldarchitect.ai`). Confirmed
+    /// 5x on 2026-07-18 (beads yvfe/vmy2/46dk/s9ba/txtd → worldarchitect.ai
+    /// PRs #8424-#8427 and session wa-3294). Fail-closed: park the bead so
+    /// an operator or refiling agent can supply an explicit
+    /// `external_ref` or `target_repo:` body field before any worker is
+    /// spawned. Permanent (NOT in `recoverable_exact_values()`) — silent
+    /// requeue would just re-park with the same failure mode forever.
+    UnmappedRepo,
     WorktreeRemoteMismatch,
     WorktreeRemoteUnverifiable,
     SpawnCleanupFailed,
@@ -526,6 +542,7 @@ impl HumanHoldReason {
                 return format!("{ROUTER_PARSE_PARK_REASON_PREFIX} {reason}");
             }
             Self::UnmappedTargetRepo => "unmapped_target_repo",
+            Self::UnmappedRepo => "unmapped_repo",
             Self::WorktreeRemoteMismatch => "worktree_remote_mismatch",
             Self::WorktreeRemoteUnverifiable => "worktree_remote_unverifiable",
             Self::SpawnCleanupFailed => "spawn_cleanup_failed",
@@ -3028,6 +3045,91 @@ mod tests {
         assert_eq!(
             unmapped.park_reason.as_deref(),
             Some("unmapped_target_repo"),
+            "park_reason must survive an excluded recovery pass"
+        );
+
+        let transient = store.load("transient-stalled").unwrap().unwrap();
+        assert_eq!(transient.state, OverlayState::Queued);
+        assert_eq!(transient.attempt, 3);
+    }
+
+    /// jleechan-8jxr r2: a bead parked HUMAN_HELD with
+    /// `park_reason = "unmapped_repo"` (dispatch.rs's "no repo identity at
+    /// all" gate — distinct from `unmapped_target_repo` which means "I
+    /// resolved a repo and it's not in [repos]") must NOT be auto-requeued.
+    /// Requeueing would re-park with the same reason forever (intake did
+    /// not change `overlay.target_repo`), burning recovery cycles without
+    /// making progress until an operator supplies an explicit
+    /// `target_repo:` body field or `external_ref` on the bead. A
+    /// transient park (`session_stalled`) at the same attempt must still
+    /// recover normally — same shape as the `unmapped_target_repo` /
+    /// `worktree_remote_mismatch` exclusion tests.
+    #[test]
+    fn recover_human_held_excludes_unmapped_repo_parks_but_recovers_transient_parks() {
+        let schema = include_str!("../contracts/schema.sql");
+        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
+
+        let mut overlays = HashMap::new();
+        overlays.insert(
+            "no-identity".to_string(),
+            BeadOverlay {
+                bead_id: "no-identity".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 2,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some("unmapped_repo".to_string()),
+                target_repo: None,
+            },
+        );
+        overlays.insert(
+            "transient-stalled".to_string(),
+            BeadOverlay {
+                bead_id: "transient-stalled".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 2,
+                reroll_count: 0,
+                autonomy_secs: 1800,
+                spend_usd: 0.0,
+                pr_number: Some(99),
+                branch: Some("factory/transient-stalled-r2".into()),
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some("session_stalled".to_string()),
+                target_repo: Some("owner/repo".to_string()),
+            },
+        );
+        for overlay in overlays.values() {
+            store.save(overlay).unwrap();
+        }
+
+        let recovered = store.recover_human_held(10).unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "only the transient park should be recovered; the unmapped_repo park must be excluded"
+        );
+        assert_eq!(recovered[0].bead_id, "transient-stalled");
+
+        let no_identity = store.load("no-identity").unwrap().unwrap();
+        assert_eq!(
+            no_identity.state,
+            OverlayState::HumanHeld,
+            "unmapped_repo park must NOT be auto-requeued"
+        );
+        assert_eq!(no_identity.attempt, 2, "attempt must not be bumped");
+        assert_eq!(
+            no_identity.park_reason.as_deref(),
+            Some("unmapped_repo"),
             "park_reason must survive an excluded recovery pass"
         );
 

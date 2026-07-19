@@ -1489,6 +1489,96 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 continue;
             }
 
+            if failure.phase == "unmapped_repo" {
+                // jleechan-8jxr r3 (review follow-up, chatgpt-codex-connector
+                // P2 @ daemon/src/dispatch.rs:287): mirror the
+                // `unmapped_target_repo` idiom below. `dispatch_ready`
+                // already parked the bead HUMAN_HELD with reason
+                // `unmapped_repo` (jleechan-8jxr r2) — distinct from
+                // `unmapped_target_repo` ("I resolved a repo and it's not
+                // in [repos]") so operators can tell which remediation
+                // applies: add a `[repos.*]` entry vs. add a
+                // `target_repo:`/`external_ref` field on the bead body or
+                // label the source issue `factory` so intake can resolve
+                // it. Without this branch, the fall-through at the bottom
+                // of this loop labels a genuinely permanent,
+                // operator-action-required park as retryable, emits
+                // `BEAD_DISPATCH_TRANSIENT_ERROR` (not `PARKED_HUMAN_HELD`),
+                // never increments `summary.beads_parked_human_held`, and
+                // posts no escalation comment — exactly the anti-pattern
+                // the `unmapped_target_repo` and `worktree_remote_mismatch`
+                // branches were added to fix.
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "unmapped_repo",
+                        "error": failure.error.as_str(),
+                    }),
+                )?;
+                if escalation_already_recorded(deps, &failure.bead_id)? {
+                    continue;
+                }
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: bead `{}` had no resolvable repo identity at dispatch time (no `target_repo:` body field, no `external_ref` with a parseable `owner/repo#N` prefix, no adopted-PR context, and no other intake-side repo signal). Automation parked it HUMAN_HELD rather than silently defaulting to the daemon's global `target_repo` (which would have routed it to a wrong repo — confirmed 5x on 2026-07-18: yvfe/vmy2/46dk/s9ba/txtd). Operator action: supply an explicit `target_repo: <owner>/<repo>` line in the bead body, set `external_ref = \"<owner>/<repo>#NNN\"`, or file under an issue/PR labeled `factory` so intake can resolve the repo from the GitHub external_ref.",
+                    failure.bead_id
+                );
+                if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
+                {
+                    if is_missing_scm_target_error(&err) {
+                        record_local_escalation_fallback(
+                            deps,
+                            &failure.bead_id,
+                            "unmapped_repo",
+                        )?;
+                        summary.beads_escalated_locally += 1;
+                        emit(
+                            deps.telemetry_log,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "ESCALATED_LOCALLY",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "unmapped_repo",
+                                "scm_error": err.to_string(),
+                            }),
+                        )?;
+                        continue;
+                    }
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_NOTIFICATION_FAILED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "unmapped_repo",
+                            "error": err.to_string(),
+                        }),
+                    )?;
+                    continue;
+                }
+                record_escalation(deps, &failure.bead_id, "unmapped_repo")?;
+                summary.beads_escalated += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "ESCALATION_REQUIRED",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "unmapped_repo"}),
+                )?;
+                continue;
+            }
+
             if failure.phase == "unmapped_target_repo" {
                 // jleechan-35y4 (adversarial review of PR #245): this phase
                 // (from `dispatch::dispatch_ready`'s fail-loud park) was
