@@ -230,7 +230,14 @@ pub fn dispatch_ready(
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            // jleechan-8jxr r2: pre-fill with cfg.target_repo so this
+            // defensive fallback (no overlay row in the store yet —
+            // should be dead code in production since intake always
+            // persists before dispatch) survives the no-repo park. The
+            // bead's "real" repo would normally be set by
+            // `tick::run_slow_tier`/`intake::normalize`; this value is
+            // only used if the dispatch path runs before any intake.
+            target_repo: Some(cfg.target_repo.clone()),
             },
             Err(err) if err.is_transient() => {
                 report
@@ -241,8 +248,92 @@ pub fn dispatch_ready(
             Err(err) => return Err(err),
         };
 
-        // jleechan-35y4 Stage B: resolve this bead's repo BEFORE touching
-        // branch registration or dispatching state. A bead whose resolved
+        // jleechan-8jxr r2: handle the "no repo identity at all" case
+        // BEFORE the `BeadOverlay::repo()` fallback can mask it. A
+        // manually-created factory bead (`br create --type task` with no
+        // `target_repo:` body field and no parseable `external_ref`) leaves
+        // `overlay.target_repo = None`, which `overlay.repo(cfg)` would
+        // happily paper over with `cfg.target_repo`. That default landed
+        // work on `jleechanorg/worldarchitect.ai` five times in one day
+        // (2026-07-18: yvfe/vmy2/46dk/s9ba/txtd → PRs #8424-#8427 + a
+        // dispatched session) because the bead bodies were unambiguously
+        // about dark-factory internals but never resolved to that repo at
+        // intake. Distinguish this from `UnmappedTargetRepo` ("I resolved a
+        // repo and it's not in config") — both are config/operator-fix
+        // problems and both fail closed, but the operator's remediation is
+        // different: add a `[repos.*]` entry vs. add a `target_repo:` field
+        // or an `external_ref` to the bead body.
+        //
+        // jleechan-8jxr r3 (review follow-up, chatgpt-codex-connector P2):
+        // before declaring `unmapped_repo`, attempt to recover the repo
+        // from the CURRENT `Bead`'s body/external_ref. A legacy overlay
+        // (one that predates the `target_repo` column or was written
+        // before any `external_ref`/body-field resolution ran) can have
+        // `overlay.target_repo = None` while the bead itself still has a
+        // perfectly parseable repo identity today. Re-derive it via
+        // `intake::resolve_target_repo` (Stage A precedence — body field,
+        // then external_ref prefix, then None), persist the recovered
+        // value on the overlay, and continue normal dispatch. This is the
+        // same `Bead` the original intake path would have looked at; we
+        // are just giving it a second chance on the legacy overlay
+        // recovery path.
+        if overlay.target_repo.is_none() {
+            let recovered = crate::intake::resolve_target_repo(
+                bead.description.as_str(),
+                bead.external_ref.as_deref(),
+            );
+            if let Some(repo) = recovered {
+                overlay.target_repo = Some(repo);
+                if let Err(err) = store.save(&overlay) {
+                    if err.is_transient() {
+                        report.failures.push(failure(
+                            bead,
+                            overlay.attempt,
+                            None,
+                            "unmapped_repo_recover_save",
+                            err,
+                        ));
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        if overlay.target_repo.is_none() {
+            overlay.state = OverlayState::HumanHeld;
+            set_human_hold_reason(&mut overlay, HumanHoldReason::UnmappedRepo);
+            if let Err(err) = store.save(&overlay) {
+                if err.is_transient() {
+                    report.failures.push(failure(
+                        bead,
+                        overlay.attempt,
+                        None,
+                        "unmapped_repo_park_save",
+                        err,
+                    ));
+                    continue;
+                }
+                return Err(err);
+            }
+            report.failures.push(failure(
+                bead,
+                overlay.attempt,
+                None,
+                "unmapped_repo",
+                DaemonError::Config(format!(
+                    "bead {} has no resolvable repo identity at dispatch time (overlay.target_repo = None; \
+                     no `target_repo:` body field, no `external_ref` with a parseable `owner/repo#N` prefix, \
+                     and no adopted-PR context). The daemon's global cfg.target_repo ({:?}) cannot be assumed \
+                     for this bead — parking HUMAN_HELD rather than silently defaulting to it. Operator action: \
+                     either supply an explicit `target_repo: owner/repo` line in the bead body, or set \
+                     `external_ref = \"owner/repo#NNN\"`, or file under an issue/PR with the `factory` label \
+                     so intake can resolve the repo from the GitHub external_ref.",
+                    bead.id, cfg.target_repo
+                )),
+            ));
+            continue;
+        }
+        // jleechan-35y4 Stage B (unchanged): a bead whose resolved
         // `target_repo` (Stage A) names neither an explicit `[repos.*]`
         // entry nor the daemon's global `cfg.target_repo` is unmappable —
         // fail loud and park HUMAN_HELD rather than silently defaulting to
@@ -1665,7 +1756,13 @@ mod tests {
                 spawn_failure_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
-            target_repo: None,
+            // jleechan-8jxr r2: a real intake-persisted overlay carries a
+            // resolved `target_repo`. The old test left this `None` and
+            // relied on the pre-fix silent default to `cfg.target_repo` —
+            // which is exactly the bug this bead's regression test
+            // (`dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all`)
+            // pins. Update the test fixture to reflect production reality.
+            target_repo: Some("owner/repo".to_string()),
             })
             .unwrap();
         let cfg = cfg();
@@ -1744,6 +1841,346 @@ mod tests {
             .filter(|c| c.starts_with("spawn("))
             .count();
         assert_eq!(spawn_calls, 0, "Sessions::spawn must never be called");
+    }
+
+    /// jleechan-8jxr r2 acceptance criterion #1: a manually-created factory
+    /// bead (no `target_repo:` body field, no parseable `external_ref`)
+    /// whose intake left `overlay.target_repo = None` MUST NOT silently
+    /// default to `cfg.target_repo` at dispatch time. The pre-fix code
+    /// routed these beads to whichever repo `cfg.target_repo` named
+    /// (`jleechanorg/worldarchitect.ai` in production), even when the bead
+    /// body was unambiguously about a different repo (dark-factory
+    /// internals). Confirmed 5x on 2026-07-18 (beads yvfe/vmy2/46dk/s9ba/
+    /// txtd → worldarchitect.ai PRs #8424-#8427 + dispatched session
+    /// wa-3294). This test pins the fail-closed behavior with reason
+    /// `unmapped_repo`, distinct from `unmapped_target_repo` (which means
+    /// "I resolved a repo and it's not in [repos]") so an operator can
+    /// tell which remediation to apply.
+    #[test]
+    fn dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                // The failure mode bead jleechan-8jxr r2 fixes: intake
+                // could not resolve any repo identity (no body field,
+                // no external_ref, no adopted-PR context). Prior to the
+                // fix this `None` would be papered over with
+                // `cfg.target_repo` and the bead would silently dispatch
+                // into the wrong repo.
+                target_repo: None,
+            })
+            .unwrap();
+        let cfg = cfg();
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            0,
+            "a bead with no repo identity must never spawn"
+        );
+        assert_eq!(
+            report.failures.len(),
+            1,
+            "exactly one failure (the unmapped_repo park)"
+        );
+        assert_eq!(
+            report.failures[0].phase, "unmapped_repo",
+            "distinct reason from unmapped_target_repo so operators can tell which remediation to apply"
+        );
+        assert!(
+            report.failures[0].error.contains("no resolvable repo identity"),
+            "error must explain why the bead was parked: {}",
+            report.failures[0].error
+        );
+        assert!(
+            report.failures[0].error.contains(&cfg.target_repo),
+            "error must name cfg.target_repo so the operator knows which repo the daemon would have silently defaulted to: {}",
+            report.failures[0].error
+        );
+
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            overlay.state,
+            OverlayState::HumanHeld,
+            "no-repo bead must be parked, not dispatched"
+        );
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("unmapped_repo"),
+            "park_reason must be the new `unmapped_repo` value"
+        );
+        assert!(
+            overlay.branch.is_none(),
+            "no branch should ever be registered/assigned for a no-repo bead"
+        );
+        assert!(
+            store.branches.borrow().is_empty(),
+            "register_branch must never be called for a no-repo bead"
+        );
+        let spawn_calls = sessions
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("spawn("))
+            .count();
+        assert_eq!(spawn_calls, 0, "Sessions::spawn must never be called");
+    }
+
+    /// jleechan-8jxr r3 (review follow-up): a legacy `QUEUED`/`REDISPATCHED`
+    /// overlay whose `target_repo` column is `None` (predates the column, or
+    /// was written before any `external_ref`/body-field resolution ran) MUST
+    /// NOT be parked `unmapped_repo` if the underlying `Bead` still has a
+    /// parseable repo identity today. Reviewer point (chatgpt-codex-connector
+    /// P2 @ daemon/src/dispatch.rs:266, PR #359): "When an existing
+    /// QUEUED/REDISPATCHED overlay predates the `target_repo` column (or
+    /// otherwise has it NULL), `run_tick` reuses that overlay without
+    /// recomputing `target_repo` from the current `Bead`
+    /// description/external_ref. This new check therefore parks any such
+    /// row as `unmapped_repo` even if the bead still has a parseable
+    /// `external_ref` like `owner/repo#123` or a `target_repo:` body
+    /// field, which is exactly the case the routing fix is supposed to
+    /// dispatch via the bead's explicit repo instead of the global
+    /// default." Resolution: before the unmapped_repo park, recompute
+    /// `target_repo` via `intake::resolve_target_repo(body, external_ref)`
+    /// (Stage A precedence — body field, then external_ref prefix, then
+    /// None). If a repo resolves, persist it to the overlay and continue
+    /// normal dispatch.
+    #[test]
+    fn dispatch_ready_recovers_legacy_overlay_repo_from_bead_before_parking_unmapped_repo() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        // Legacy overlay: target_repo is None (column didn't exist or was
+        // never populated). The dispatch path must NOT park this as
+        // unmapped_repo when the bead has a parseable repo identity.
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+        // Add a [repos.*] entry for the bead's resolved repo so dispatch
+        // can proceed (mirrors the setup in
+        // `dispatch_ready_routes_bead_via_external_ref_prefix_not_global_default`).
+        let mut cfg = cfg();
+        cfg.repos.insert(
+            "someorg/other-repo".to_string(),
+            crate::config::RepoConfig {
+                ao_project: "other-project".to_string(),
+                push_remote: "origin".to_string(),
+            },
+        );
+        // Bead has a parseable `external_ref` (Stage A fallback) — the
+        // legacy overlay predates the column, but the bead itself is
+        // well-formed.
+        let ready = vec![(
+            Bead {
+                id: "bead-0".into(),
+                title: "title 0".into(),
+                description: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: Some("someorg/other-repo#42".to_string()),
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert!(
+            report
+                .failures
+                .iter()
+                .all(|f| f.phase != "unmapped_repo"),
+            "a bead with a parseable external_ref MUST NOT park as unmapped_repo; \
+             the legacy overlay's None should be back-filled from the bead. failures = {:?}",
+            report.failures
+        );
+        // The overlay's target_repo must now reflect the resolved repo
+        // (so subsequent dispatches and recover_human_held pass-throughs
+        // see the recovered identity).
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            overlay.target_repo.as_deref(),
+            Some("someorg/other-repo"),
+            "legacy overlay's target_repo must be back-filled from the bead's external_ref prefix"
+        );
+    }
+
+    /// Companion to the test above: legacy overlay + body-field
+    /// `target_repo:` (the higher-precedence Stage A source). Same
+    /// recovery expectation — never park when the bead's body still
+    /// resolves the repo.
+    #[test]
+    fn dispatch_ready_recovers_legacy_overlay_repo_from_body_field_before_parking_unmapped_repo() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            })
+            .unwrap();
+        let mut cfg = cfg();
+        cfg.repos.insert(
+            "jleechanorg/some-repo".to_string(),
+            crate::config::RepoConfig {
+                ao_project: "some-project".to_string(),
+                push_remote: "origin".to_string(),
+            },
+        );
+        let ready = vec![(
+            Bead {
+                id: "bead-0".into(),
+                title: "title 0".into(),
+                description: "fix scope.\ntarget_repo: jleechanorg/some-repo\n".into(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert!(
+            report
+                .failures
+                .iter()
+                .all(|f| f.phase != "unmapped_repo"),
+            "a bead with a body `target_repo:` field MUST NOT park as unmapped_repo; \
+             legacy overlay's None must be back-filled from the bead body. failures = {:?}",
+            report.failures
+        );
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(
+            overlay.target_repo.as_deref(),
+            Some("jleechanorg/some-repo"),
+            "legacy overlay's target_repo must be back-filled from the bead body's target_repo: field"
+        );
+    }
+
+    /// jleechan-8jxr r2 acceptance criterion #2: a bead with an explicit
+    /// `external_ref = "jleechanorg/dark-factory#NNN"` and `cfg.target_repo
+    /// = "jleechanorg/worldarchitect.ai"` MUST dispatch to dark-factory
+    /// (per Stage A's external_ref-prefix resolution), not the global
+    /// default. Pins the cross-repo routing fix that the no-repo park
+    /// above is designed to protect — without this assertion, the
+    /// existing `dispatch_ready_uses_repos_table_entry_for_non_global_mapped_repo`
+    /// could regress on a future config change.
+    #[test]
+    fn dispatch_ready_routes_bead_via_external_ref_prefix_not_global_default() {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        store
+            .save(&BeadOverlay {
+                bead_id: "bead-0".into(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                // Stage A: `external_ref` prefix "someorg/other-repo" becomes the
+                // bead's resolved repo, even though the daemon's global
+                // default is `cfg().target_repo` ("owner/repo"). The
+                // [repos.*] entry below is what makes dispatch possible —
+                // without it, dispatch would park with `unmapped_target_repo`
+                // (the Stage B failure mode), not dispatch.
+                target_repo: Some("someorg/other-repo".to_string()),
+            })
+            .unwrap();
+        let cfg = cfg();
+        // Stage B: add an explicit [repos.*] entry so the bead's resolved
+        // repo CAN dispatch. (Adding the entry makes the test mirror
+        // `dispatch_ready_uses_repos_table_entry_for_non_global_mapped_repo`,
+        // which is the pre-existing acceptance criterion — this test
+        // specifically pins that `unmapped_repo` (None) does NOT park
+        // when the overlay actually has a resolved repo, even one that
+        // differs from `cfg.target_repo`.)
+        let mut cfg = cfg;
+        cfg.repos.insert(
+            "someorg/other-repo".to_string(),
+            crate::config::RepoConfig {
+                ao_project: "other-project".to_string(),
+                push_remote: "origin".to_string(),
+            },
+        );
+        let ready = beads(1);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        // This test's purpose is to pin jleechan-8jxr r2's
+        // fail-closed-on-no-repo gate: when an overlay HAS a resolved
+        // repo (even one distinct from cfg.target_repo), dispatch must
+        // NOT park with `unmapped_repo` or `unmapped_target_repo`. The
+        // full spawn path is exercised by
+        // `dispatch_ready_uses_repos_table_entry_for_non_global_mapped_repo`;
+        // we don't need to retest worktree verification here.
+        assert!(
+            report
+                .failures
+                .iter()
+                .all(|f| f.phase != "unmapped_repo" && f.phase != "unmapped_target_repo"),
+            "a bead with a resolvable repo must not park on the no-repo gates; failures = {:?}",
+            report.failures
+        );
+        // Pin the overlay state too: it should NOT be HUMAN_HELD with the
+        // unmapped-repo reasons. (It MAY be HUMAN_HELD for unrelated
+        // reasons like `worktree_remote_unverifiable` when the test
+        // harness's fake session has no scripted remote URL — that's
+        // irrelevant to this test's regression pin.)
+        let overlay = store.load("bead-0").unwrap().unwrap();
+        if overlay.state == OverlayState::HumanHeld {
+            assert!(
+                overlay.park_reason.as_deref() != Some("unmapped_repo")
+                    && overlay.park_reason.as_deref() != Some("unmapped_target_repo"),
+                "a bead with a resolvable repo must not park with the no-repo reasons; park_reason = {:?}",
+                overlay.park_reason
+            );
+        }
     }
 
     /// Companion to the unmapped-repo park test: when the bead's
