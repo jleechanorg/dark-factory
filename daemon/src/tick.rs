@@ -1224,6 +1224,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             id: bead_id.clone(),
             title: bead_id.clone(),
             description: String::new(),
+            notes: String::new(),
             file_tree_summary: String::new(),
             external_ref: None,
         }));
