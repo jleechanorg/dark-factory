@@ -8752,3 +8752,117 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// jleechan-8jxr r3 (review follow-up, chatgpt-codex-connector P2 @
+/// daemon/src/dispatch.rs:287): when a bead is parked HUMAN_HELD with
+/// reason `unmapped_repo` at dispatch time, the tick layer must
+/// special-case the failure phase the same way it special-cases
+/// `unmapped_target_repo` and `worktree_remote_mismatch`. Otherwise the
+/// generic `BEAD_DISPATCH_TRANSIENT_ERROR` fall-through (with
+/// `lifecycle_state = QUEUED`) mis-reports a genuinely permanent,
+/// operator-action-required park as retryable, never increments
+/// `beads_parked_human_held`, and posts no escalation comment.
+///
+/// Regression pin: a manually-created bead (no `external_ref`, no body
+/// `target_repo:` field) reaches dispatch with `overlay.target_repo =
+/// None`. dispatch_ready parks it `unmapped_repo`. run_tick must:
+/// 1. Emit `PARKED_HUMAN_HELD` (not `BEAD_DISPATCH_TRANSIENT_ERROR`).
+/// 2. Increment `summary.beads_parked_human_held`.
+/// 3. Post an escalation comment naming the remediation (add body
+///    field/external_ref, or label `factory` so intake can resolve).
+#[test]
+fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "no-repo-bead".into(),
+        title: "manual bead with no repo".into(),
+        description: "manually created with no external_ref".into(),
+        file_tree_summary: String::new(),
+        // No external_ref and no body `target_repo:` field — dispatch
+        // will park this as unmapped_repo.
+        external_ref: None,
+    });
+
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"manual bead"}"#.into(),
+    ));
+    let store = FakeStateStore::new(); // empty: dispatch will load overlay from DB
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_unmapped_repo_park_test.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        0,
+        0,
+    )
+    .expect("tick should succeed even when dispatch parks a no-repo bead");
+
+    // (1) summary counts the unmapped_repo park as a permanent HUMAN_HELD
+    // park, not a transient dispatch error.
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "unmapped_repo park must increment beads_parked_human_held (got: {})",
+        summary.beads_parked_human_held
+    );
+    assert_eq!(
+        summary.beads_dispatched, 0,
+        "a no-repo bead must NOT dispatch"
+    );
+
+    // (2) overlay state is HUMAN_HELD with a park_reason derived from
+    // `unmapped_repo` (either the bare reason or the local-fallback
+    // variant — the FakeScm has no SCM target to post a comment to, so
+    // `record_local_escalation_fallback` re-stamps the reason to
+    // `escalation_local_fallback:unmapped_repo`. Either way the prefix
+    // must name `unmapped_repo`, never the generic unmapped_target_repo
+    // or worktree_remote_mismatch reason).
+    let overlay = store.load("no-repo-bead").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    let park_reason = overlay
+        .park_reason
+        .as_deref()
+        .expect("HUMAN_HELD overlay must have a park_reason");
+    assert!(
+        park_reason == "unmapped_repo" || park_reason.starts_with("escalation_local_fallback:unmapped_repo"),
+        "park_reason must be unmapped_repo-derived, got: {park_reason:?}"
+    );
+
+    // (3) telemetry emits PARKED_HUMAN_HELD, NOT BEAD_DISPATCH_TRANSIENT_ERROR.
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let parked = events
+        .iter()
+        .find(|e| e["eventType"] == "PARKED_HUMAN_HELD" && e["beadId"] == "no-repo-bead");
+    assert!(
+        parked.is_some(),
+        "telemetry MUST emit PARKED_HUMAN_HELD for unmapped_repo parks; events = {:?}",
+        events
+    );
+    let transient_error = events
+        .iter()
+        .find(|e| e["eventType"] == "BEAD_DISPATCH_TRANSIENT_ERROR" && e["beadId"] == "no-repo-bead");
+    assert!(
+        transient_error.is_none(),
+        "unmapped_repo park must NOT fall through to BEAD_DISPATCH_TRANSIENT_ERROR; events = {:?}",
+        events
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
