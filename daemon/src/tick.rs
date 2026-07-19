@@ -270,6 +270,73 @@ fn emit_intake_outcome(telemetry_log: &Path, outcome: &IntakeOutcome) -> Result<
 ///
 /// Stage gate: `deps.cfg.stage` must be `1` — this function only implements
 /// the Stage-1 substitution rule (re-roll verdicts recorded, never executed).
+///
+/// jleechan-park-leaves-zombie-session-mh9o: best-effort terminate the live
+/// AO session bound to `overlay` and clear the durable session handle, so
+/// every PARKED_* transition (a) does not leave a zombie session listed as
+/// `[spawning]` in AO's state — which the AO dedup guard rejects as a
+/// "Duplicate session detected" on the next `ao spawn` for the same bead —
+/// and (b) lets the automated HUMAN_HELD exit (`recover_human_held`'s
+/// `session_id IS NULL` predicate) requeue the bead if its
+/// `park_reason` is in the recoverable set.
+///
+/// Fail-soft by design, with an important asymmetry: the durable handle is
+/// cleared ONLY on a successful `stop()` (the session is provably dead) or
+/// when there is no handle to begin with. On a `stop()` failure the
+/// session may still be live, so the handle is RETAINED on disk — this
+/// (i) prevents `recover_human_held` from requeueing a bead whose live
+/// worker could overlap a freshly-spawned replacement, and (ii) gives
+/// operators the durable evidence they need to retry cleanup or kill the
+/// session manually. The `BEAD_SESSION_KILL_FAILED` telemetry event
+/// preserves visibility into the still-leaked session.
+fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
+    let Some(session_id_str) = overlay.session_id.clone() else {
+        return;
+    };
+    let session_id = SessionId(session_id_str.clone());
+    match deps.sessions.stop(&session_id) {
+        Ok(()) => {
+            let _ = emit(
+                deps.telemetry_log,
+                &overlay.bead_id,
+                overlay.attempt,
+                OverlayState::HumanHeld.as_str(),
+                "BEAD_SESSION_KILLED",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "session_id": session_id_str,
+                    "phase": "park_transition",
+                }),
+            );
+            // Proven dead — safe to clear the handle. Unblocks both
+            // recover_human_held and any operator-driven requeue without
+            // risking a duplicate worker or AO dedup collision.
+            overlay.session_id = None;
+        }
+        Err(stop_err) => {
+            // Stop failed: the session may still be live. RETAIN the handle
+            // so (a) recover_human_held cannot requeue and dispatch a second
+            // worker that would overlap the existing live one and (b) the
+            // operator retains the durable session_id needed to retry
+            // `ao session kill <id>` once AO recovers. Failure is logged
+            // but never escalated — the park itself stands.
+            let _ = emit(
+                deps.telemetry_log,
+                &overlay.bead_id,
+                overlay.attempt,
+                OverlayState::HumanHeld.as_str(),
+                "BEAD_SESSION_KILL_FAILED",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "session_id": session_id_str,
+                    "error": format!("{stop_err:?}"),
+                    "phase": "park_transition",
+                }),
+            );
+        }
+    }
+}
+
 pub fn run_tick(
     deps: &TickDeps,
     tick_index: u64,
@@ -344,6 +411,14 @@ pub fn run_tick(
         // 1. Time-box envelope check
         if overlay.autonomy_secs >= deps.cfg.autonomy_timebox_secs {
             overlay.state = OverlayState::HumanHeld;
+            // jleechan-park-leaves-zombie-session-mh9o: kill the live AO
+            // session and clear the durable handle BEFORE save, so the bead
+            // is not stranded with a live session_id that (a) the AO dedup
+            // guard still reports as [spawning] and (b) recover_human_held's
+            // `session_id IS NULL` predicate cannot requeue through. Without
+            // this, every autonomy_timebox_exceeded park leaks its session
+            // and poisons the next redispatch of the same bead.
+            kill_session_and_clear_handle(deps, &mut overlay);
             set_human_hold_reason(&mut overlay, HumanHoldReason::AutonomyTimeboxExceeded);
             deps.store.save(&overlay)?;
             emit(
@@ -416,6 +491,12 @@ pub fn run_tick(
                             Ok((true, _)) => {}
                             Ok((false, post_sha)) => {
                                 overlay.state = OverlayState::HumanHeld;
+                                // jleechan-park-leaves-zombie-session-mh9o:
+                                // adopted-branch remediation parks also leak
+                                // their session if we don't terminate it.
+                                // Wire the same cleanup helper as the other
+                                // PARKED_* sites.
+                                kill_session_and_clear_handle(deps, &mut overlay);
                                 set_human_hold_reason(
                                     &mut overlay,
                                     HumanHoldReason::AdoptedBranchHistoryRewriteDetected,
@@ -456,6 +537,12 @@ pub fn run_tick(
                             }
                             Err(e) => {
                                 overlay.state = OverlayState::HumanHeld;
+                                // jleechan-park-leaves-zombie-session-mh9o:
+                                // adopted-branch append-only check failure
+                                // also leaks its session. Wire the same
+                                // cleanup helper as the other PARKED_*
+                                // sites.
+                                kill_session_and_clear_handle(deps, &mut overlay);
                                 set_human_hold_reason(
                                     &mut overlay,
                                     HumanHoldReason::AdoptedBranchAppendOnlyCheckFailed,
@@ -522,6 +609,19 @@ pub fn run_tick(
                         let expected_branch = overlay.branch.clone().unwrap_or_default();
                         if actual_branch != expected_branch {
                             overlay.state = OverlayState::HumanHeld;
+                            // jleechan-park-leaves-zombie-session-mh9o:
+                            // `session_branch` just proved the live session
+                            // belongs to a DIFFERENT bead/branch (the
+                            // `jleechan-5ia2` corruption case), so we MUST
+                            // NOT call `sessions.stop()` here — that would
+                            // terminate another bead's legitimate worker.
+                            // The right fix is to drop OUR overlay's bad
+                            // handle (the durable record pointing at a
+                            // session that was never ours to own) without
+                            // touching AO. The leaked overlay can then
+                            // never poison a future redispatch of THIS
+                            // bead via the AO dedup guard.
+                            overlay.session_id = None;
                             set_human_hold_reason(
                                 &mut overlay,
                                 HumanHoldReason::SessionBranchMismatch,
@@ -627,6 +727,12 @@ pub fn run_tick(
                                 )?;
                             } else if branch_is_silent {
                                 overlay.state = OverlayState::HumanHeld;
+                                // jleechan-park-leaves-zombie-session-mh9o:
+                                // mirror the autonomy_timebox fix above —
+                                // the wedge-detection sweep also leaks its
+                                // session if we save() without first calling
+                                // `ao session kill` and clearing the handle.
+                                kill_session_and_clear_handle(deps, &mut overlay);
                                 set_human_hold_reason(&mut overlay, HumanHoldReason::CoderSilent);
                                 deps.store.save(&overlay)?;
                                 emit(
