@@ -133,6 +133,7 @@ impl Tracker for FakeTracker {
                 id: id.clone(),
                 title: title.to_string(),
                 description: body.to_string(),
+                notes: String::new(),
                 file_tree_summary: String::new(),
                 external_ref: Some(external_ref.to_string()),
             });

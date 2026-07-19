@@ -406,6 +406,7 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
             id: "bead-0".into(),
             title: "first bead".into(),
             description: String::new(),
+            notes: String::new(),
             file_tree_summary: String::new(),
             external_ref: None,
         },
@@ -413,6 +414,7 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
             id: "bead-1".into(),
             title: "second bead".into(),
             description: String::new(),
+            notes: String::new(),
             file_tree_summary: String::new(),
             external_ref: None,
         },
@@ -2550,6 +2552,7 @@ fn test_manual_bead_input_auto_queued_and_dispatched() {
         id: "manual-bead-123".into(),
         title: "Test manual bead".into(),
         description: "manually created".into(),
+        notes: String::new(),
         file_tree_summary: "".into(),
         external_ref: None, // manual beads have no external_ref
     });
@@ -2621,6 +2624,7 @@ fn drive_existing_pr_bead_dispatches_onto_pr_head_branch_not_generated_branch() 
         id: "jleechan-af-drive-pr288-gd2x".into(),
         title: "drive PR #288".into(),
         description: "existing_pr: 288".into(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some("owner/repo#288".into()),
     });
@@ -2710,6 +2714,7 @@ fn bead_with_external_ref_but_no_open_pr_falls_back_to_generated_branch() {
         id: "bead-closed-pr-ref".into(),
         title: "issue-tracked bead".into(),
         description: String::new(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some("owner/repo#999".into()),
     });
@@ -2769,6 +2774,7 @@ fn drive_pr_bead_with_fork_head_falls_back_to_generated_branch_not_fork_head() {
         id: "jleechan-fork-pr-bead-e2e".into(),
         title: "drive PR whose head is on a fork".into(),
         description: "existing_pr: 501".into(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some("owner/repo#501".into()),
     });
@@ -2837,6 +2843,7 @@ fn remote_credentials_never_reach_tick_telemetry_or_escalation_comments() {
         id: "credential-redaction-bead".into(),
         title: "Verify remote credential redaction".into(),
         description: "synthetic integration fixture".into(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some("owner/repo#291".into()),
     });
@@ -2931,6 +2938,7 @@ fn manual_bead_adoption_never_calls_create_bead_or_fabricates_external_ref() {
         id: "manual-bead-999".into(),
         title: "Orphan-shaped manual bead".into(),
         description: "created directly via `br create`, no --external-ref".into(),
+        notes: String::new(),
         file_tree_summary: "".into(),
         external_ref: None, // exactly the jleechan-3wh0 orphan shape
     });
@@ -3804,6 +3812,7 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
         id: "bead-held-fallback".into(),
         title: "held fallback".into(),
         description: String::new(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some("owner/repo#9004".into()),
     });
@@ -7404,6 +7413,7 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
         id: BEAD_A.into(),
         title: "Bead A: sustained Deferred backpressure".into(),
         description: "target project pinned at its AO session cap".into(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some(EXTERNAL_REF_A.into()),
     });
@@ -7411,6 +7421,7 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
         id: BEAD_B.into(),
         title: "Bead B: genuine deterministic tool spawn failure".into(),
         description: "distinct from bead A's backpressure — a real transient error".into(),
+        notes: String::new(),
         file_tree_summary: String::new(),
         external_ref: Some(EXTERNAL_REF_B.into()),
     });
