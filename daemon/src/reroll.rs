@@ -1,13 +1,11 @@
 use crate::config::Config;
-use crate::errors::DaemonError;
-use crate::state::{
-    set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
-};
-use crate::tools::{Llm, Scm, SessionActivity, Sessions, SpawnSpec, Vcs};
-use crate::telemetry::{self, TelemetryEvent};
 use crate::constraints;
-use std::path::Path;
+use crate::errors::DaemonError;
+use crate::state::{set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore};
+use crate::telemetry::{self, TelemetryEvent};
+use crate::tools::{Llm, Scm, SessionActivity, Sessions, SpawnSpec, Vcs};
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 
 pub struct RerollDeps<'a> {
     pub scm: &'a dyn Scm,
@@ -23,7 +21,9 @@ pub struct RerollDeps<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RerollOutcome {
-    Rerolled { new_branch: String },
+    Rerolled {
+        new_branch: String,
+    },
     Aborted(String),
     Held(String),
     /// Bead jleechan-zeij / issue #322 r2: the fail-closed proceed predicate
@@ -113,15 +113,19 @@ fn emit_telemetry(
 /// hand-rolled as a scoring function) — mirrors the trailing-JSON-object
 /// parsing contract `constraints::extract` already uses against the same
 /// `Llm` trait.
-fn same_underlying_issue(llm: &dyn Llm, prior_text: &str, new_text: &str) -> Result<bool, DaemonError> {
+fn same_underlying_issue(
+    llm: &dyn Llm,
+    prior_text: &str,
+    new_text: &str,
+) -> Result<bool, DaemonError> {
     let prompt = format!(
         "You are the Circuit-Breaker Semantic Comparator for an autonomous coding factory (spec §4.2.6).\n\
           Two consecutive rejection review comments were left by the SAME reviewer on re-roll attempts of \
           the same bead. Judge whether they describe the SAME underlying issue / root cause, even if \
           reworded, paraphrased, reformatted, or extended with extra commentary — as opposed to two \
           genuinely DIFFERENT issues.\n\n\
-          PRIOR REJECTION:\n\"\"\"\n{prior_text}\n\"\"\"\n\n\
-          NEW REJECTION:\n\"\"\"\n{new_text}\n\"\"\"\n\n\
+          PRIOR REJECTION:\n\"\"\n{prior_text}\n\"\"\"\n\n\
+          NEW REJECTION:\n\"\"\n{new_text}\n\"\"\"\n\n\
           Respond with exactly one JSON object as the last thing in your reply, in this format:\n\
           {{\"sameUnderlyingIssue\": true|false}}"
     );
@@ -136,11 +140,15 @@ fn same_underlying_issue(llm: &dyn Llm, prior_text: &str, new_text: &str) -> Res
     // through this call site. `ComparatorUnparseable` is transient by
     // design -- see its doc comment in errors.rs.
     let last_close = reply.rfind('}').ok_or_else(|| {
-        DaemonError::ComparatorUnparseable(format!("no JSON object found in circuit-breaker comparator reply: {reply:?}"))
+        DaemonError::ComparatorUnparseable(format!(
+            "no JSON object found in circuit-breaker comparator reply: {reply:?}"
+        ))
     })?;
     let prefix = &reply[..=last_close];
     let last_open = prefix.rfind('{').ok_or_else(|| {
-        DaemonError::ComparatorUnparseable(format!("no JSON object found in circuit-breaker comparator reply: {reply:?}"))
+        DaemonError::ComparatorUnparseable(format!(
+            "no JSON object found in circuit-breaker comparator reply: {reply:?}"
+        ))
     })?;
     let candidate = &prefix[last_open..=last_close];
 
@@ -157,6 +165,42 @@ fn same_underlying_issue(llm: &dyn Llm, prior_text: &str, new_text: &str) -> Res
     })?;
 
     Ok(parsed.same_underlying_issue)
+}
+
+/// Bead jleechan-znmh / issue #341: classify a branch-create failure as
+/// the "branch already exists" recovery case (GH Data API HTTP 422 →
+/// `gh` exits 1 with `Reference already exists <refs/heads/<name>>`).
+/// This is a structural string match against `gh`'s canonical stderr —
+/// no LLM judgment involved, so it is NOT a ZFC violation. The
+/// `gh api … POST repos/<repo>/git/refs` command serialized its 422
+/// body to stderr verbatim; the same shape is preserved by the daemon's
+/// `CliVcs::run_tool` wrapper, so matching `stderr.contains(...)` is a
+/// deterministic shape check, not a routing/semantic inference.
+fn is_ref_already_exists(err: &DaemonError) -> bool {
+    let DaemonError::Tool { stderr, .. } = err else {
+        return false;
+    };
+    stderr.contains("Reference already exists") || stderr.contains("already exists")
+}
+
+/// Bead jleechan-znmh / issue #341: classify a `gh pr close` failure
+/// as the "PR already terminated" tolerance case. `gh` exits 1 with
+/// one of:
+///
+/// * `cannot close: pull request #<n> is already merged`
+/// * `cannot close: pull request #<n> is already closed`
+/// * `could not close: ...` (the v1 form before `gh` 2.x)
+///
+/// Either way, the live invariant is the same: the PR is no longer the
+/// bead's active work; reroll's step-7 close is a NO-OP rather than a
+/// hard failure.
+fn is_pr_already_terminal(err: &DaemonError) -> bool {
+    let DaemonError::Tool { stderr, .. } = err else {
+        return false;
+    };
+    stderr.contains("already merged")
+        || stderr.contains("already closed")
+        || stderr.contains("is already in a closed state")
 }
 
 pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcome, DaemonError> {
@@ -191,9 +235,13 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     };
 
     if bead.attempt > 1 {
-        if let Some((prev_reviewer, _prev_hash)) = deps.store.load_rejection(&bead.bead_id, bead.attempt - 1)? {
+        if let Some((prev_reviewer, _prev_hash)) =
+            deps.store.load_rejection(&bead.bead_id, bead.attempt - 1)?
+        {
             if prev_reviewer == deps.reviewer {
-                let prev_text = deps.store.load_rejection_text(&bead.bead_id, bead.attempt - 1)?;
+                let prev_text = deps
+                    .store
+                    .load_rejection_text(&bead.bead_id, bead.attempt - 1)?;
                 let same_issue = match prev_text {
                     Some(ref prev) if *prev == deps.review_text => true,
                     Some(ref prev) => same_underlying_issue(deps.llm, prev, &deps.review_text)?,
@@ -246,7 +294,13 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     }
 
     // Save current rejection for future circuit-breaker checks
-    deps.store.save_rejection(&bead.bead_id, bead.attempt, &deps.reviewer, &feedback_hash, &deps.review_text)?;
+    deps.store.save_rejection(
+        &bead.bead_id,
+        bead.attempt,
+        &deps.reviewer,
+        &feedback_hash,
+        &deps.review_text,
+    )?;
 
     // Adopted-PR remediation (bead jleechan-tfs1, Option A + hard safety
     // amendment): `bead.branch` for an adopted bead is the external
@@ -434,8 +488,47 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     // push. `create_branch_at_for_repo` POSTs a `refs/heads/<name>`
     // ref via `gh api repos/<repo>/git/refs` — cross-repo ref
     // creation that does NOT depend on the daemon's local checkout.
-    deps.vcs
-        .create_branch_at_for_repo(&bead_repo, &new_branch, &base_sha)?;
+    //
+    // jleechan-znmh / issue #341: a previous failed reroll attempt
+    // may have left a stale `-rN` branch behind (live failure for
+    // `jleechan-9rkz`). `gh api POST repos/<repo>/git/refs` rejects
+    // the ref-create with HTTP 422 "Reference already exists" if the
+    // routed repo already has that ref, returning a `DaemonError::Tool`
+    // that used to wedge the bead in `RE_ROLL` permanently. Recovery:
+    // detect that stderr signature, DELETE the existing ref via
+    // `delete_branch_at_for_repo` (cross-repo, not local), then retry
+    // the create. ANY OTHER failure still propagates (a non-422
+    // stderr is a genuine infra/auth problem worth parking).
+    if let Err(err) = deps
+        .vcs
+        .create_branch_at_for_repo(&bead_repo, &new_branch, &base_sha)
+    {
+        if is_ref_already_exists(&err) {
+            emit_telemetry(
+                deps.telemetry_log,
+                &bead.bead_id,
+                bead.attempt,
+                bead.state.as_str(),
+                "REROLL_STALE_BRANCH_DETECTED",
+                serde_json::json!({}),
+                serde_json::json!({"repo": bead_repo, "branch": new_branch, "error": format!("{err}")}),
+            )?;
+            // DELETE the existing ref via the routed-repo entry point
+            // (a local `git branch -D` would silently target the
+            // daemon's own cwd and leave the routed repo untouched —
+            // the cross-repo bug #349 already fixed for create).
+            deps.vcs
+                .delete_branch_at_for_repo(&bead_repo, &new_branch)?;
+            // Retry the create against a routed repo that no longer
+            // has the ref. The HTTP 422 / "Reference already exists"
+            // signature is gone now; any error here surfaces up the
+            // chain as a genuine infra failure (auth, network).
+            deps.vcs
+                .create_branch_at_for_repo(&bead_repo, &new_branch, &base_sha)?;
+        } else {
+            return Err(err);
+        }
+    }
 
     emit_telemetry(
         deps.telemetry_log,
@@ -466,18 +559,57 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         // jleechan-wuts / issue #349: `bead_repo` is shared with step 4
         // (above) so both git-side and gh-side reroll ops target the
         // same routed repo for the same bead on the same tick.
-        deps.scm.close_pr_for_repo(&bead_repo, pr_number, &comment)?;
-        bead.pr_number = None;
-
-        emit_telemetry(
-            deps.telemetry_log,
-            &bead.bead_id,
-            bead.attempt,
-            bead.state.as_str(),
-            "REROLL_PR_CLOSED",
-            serde_json::json!({}),
-            serde_json::json!({"prNumber": pr_number, "comment": comment, "repo": bead_repo}),
-        )?;
+        // jleechan-znmh / issue #341: even with the routed-repo close,
+        // the bead's own resolved repo may STILL have the PR in a
+        // merged or closed state when step 7 runs (e.g. a separate
+        // process merged it between reroll dispatch and step execution,
+        // or the PR was force-closed by a codeowner's manual review).
+        // `gh pr close` then exits 1 with "cannot close: pull request
+        // #<n> is already merged" / "...already closed". The pre-fix
+        // reroll propagated this as a `DaemonError::Tool` and exited
+        // with `Err`, permanently wedging the bead. Acceptance: the
+        // bead's PR IS effectively superseded regardless (the new -rN
+        // branch is the active work), so this stderr classifies as a
+        // TOLERANT supersede — clear `bead.pr_number`, emit a dedicated
+        // `REROLL_PR_ALREADY_MERGED` telemetry event so the operator
+        // sees the no-op-vs-real-close distinction, and continue to
+        // step 8. Anything else (network, auth, real close failure)
+        // still propagates as before.
+        match deps.scm.close_pr_for_repo(&bead_repo, pr_number, &comment) {
+            Ok(()) => {
+                bead.pr_number = None;
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_PR_CLOSED",
+                    serde_json::json!({}),
+                    serde_json::json!({"prNumber": pr_number, "comment": comment, "repo": bead_repo}),
+                )?;
+            }
+            Err(err) if is_pr_already_terminal(&err) => {
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_PR_ALREADY_MERGED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "prNumber": pr_number,
+                        "repo": bead_repo,
+                        "toleratedAs": "successful_supersede",
+                        "error": format!("{err}"),
+                    }),
+                )?;
+                // Successful supersede: the prior PR is no longer the
+                // bead's active work — clear it so a future dispatcher
+                // doesn't try to re-close something already gone.
+                bead.pr_number = None;
+            }
+            Err(err) => return Err(err),
+        }
     }
 
     // 8. Constraint Extraction & Spec Mutation
@@ -681,45 +813,48 @@ fn evaluate_proceed(
         // `death_window`), never as a `stable_window_terminal` shortcut — so it
         // is folded into `gone` here, and any successful non-`NotFound`
         // re-attach below resets `not_found_since`, killing the streak.
-        let (gone, activity): (bool, Option<SessionActivity>) =
-            match deps.sessions.attach_within(branch, &bead.bead_id, budget_or_defer!()) {
-                Err(DaemonError::SessionNotFound { .. }) => (true, None),
-                Err(e) if e.is_transient() => {
-                    emit_telemetry(
-                        deps.telemetry_log,
-                        &bead.bead_id,
-                        bead.attempt,
-                        bead.state.as_str(),
-                        "REROLL_QUIESCENCE_CHECK_TRANSIENT",
-                        serde_json::json!({}),
-                        serde_json::json!({"reason": "quiescence_check_transient", "error": format!("{e}")}),
-                    )?;
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
-                Ok(session_id) => {
-                    match deps
-                        .sessions
-                        .session_activity_within(&session_id, budget_or_defer!())
-                    {
-                        Ok(SessionActivity::NotFound) => (true, None),
-                        Ok(a) => (false, Some(a)),
-                        Err(e) if e.is_transient() => {
-                            emit_telemetry(
-                                deps.telemetry_log,
-                                &bead.bead_id,
-                                bead.attempt,
-                                bead.state.as_str(),
-                                "REROLL_QUIESCENCE_CHECK_TRANSIENT",
-                                serde_json::json!({}),
-                                serde_json::json!({"reason": "quiescence_check_transient", "error": format!("{e}")}),
-                            )?;
-                            return Ok(None);
-                        }
-                        Err(e) => return Err(e),
+        let (gone, activity): (bool, Option<SessionActivity>) = match deps.sessions.attach_within(
+            branch,
+            &bead.bead_id,
+            budget_or_defer!(),
+        ) {
+            Err(DaemonError::SessionNotFound { .. }) => (true, None),
+            Err(e) if e.is_transient() => {
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_QUIESCENCE_CHECK_TRANSIENT",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "quiescence_check_transient", "error": format!("{e}")}),
+                )?;
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+            Ok(session_id) => {
+                match deps
+                    .sessions
+                    .session_activity_within(&session_id, budget_or_defer!())
+                {
+                    Ok(SessionActivity::NotFound) => (true, None),
+                    Ok(a) => (false, Some(a)),
+                    Err(e) if e.is_transient() => {
+                        emit_telemetry(
+                            deps.telemetry_log,
+                            &bead.bead_id,
+                            bead.attempt,
+                            bead.state.as_str(),
+                            "REROLL_QUIESCENCE_CHECK_TRANSIENT",
+                            serde_json::json!({}),
+                            serde_json::json!({"reason": "quiescence_check_transient", "error": format!("{e}")}),
+                        )?;
+                        return Ok(None);
                     }
+                    Err(e) => return Err(e),
                 }
-            };
+            }
+        };
 
         if gone {
             // Positive death: absent continuously for the confirmation window.
@@ -971,10 +1106,7 @@ fn execute_adopted(
             // quiescent above; persist that no-live-session proof with the
             // recoverable pre-spawn hold.
             bead.session_id = None;
-            set_human_hold_reason(
-                bead,
-                HumanHoldReason::AdoptedPreSessionShaCaptureFailed,
-            );
+            set_human_hold_reason(bead, HumanHoldReason::AdoptedPreSessionShaCaptureFailed);
             deps.store.save(bead)?;
             emit_telemetry(
                 deps.telemetry_log,
@@ -1002,16 +1134,17 @@ fn execute_adopted(
     // keeps this path inert if that restriction is ever lifted before the
     // Stage C/D call-site sweep reaches this function.
     let adopted_repo = bead.repo(deps.cfg).to_string();
-    let adopted_routing = deps.cfg.resolve_repo(&adopted_repo).unwrap_or_else(|| {
-        crate::config::RepoRouting {
-            ao_project: deps
-                .cfg
-                .ao_project
-                .clone()
-                .unwrap_or_else(|| adopted_repo.clone()),
-            push_remote: "origin".to_string(),
-        }
-    });
+    let adopted_routing =
+        deps.cfg
+            .resolve_repo(&adopted_repo)
+            .unwrap_or_else(|| crate::config::RepoRouting {
+                ao_project: deps
+                    .cfg
+                    .ao_project
+                    .clone()
+                    .unwrap_or_else(|| adopted_repo.clone()),
+                push_remote: "origin".to_string(),
+            });
     let spec = SpawnSpec {
         bead_id: bead.bead_id.clone(),
         branch: branch.clone(),

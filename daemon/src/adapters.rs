@@ -1,7 +1,10 @@
 use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
-use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
-use std::process::{Command, Stdio};
+use crate::tools::{
+    run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot,
+    Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs,
+};
 use std::collections::HashMap;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -31,7 +34,6 @@ fn gh_env_test_lock() -> &'static Mutex<()> {
     GH_ENV_TEST_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-
 pub struct CliTracker;
 
 impl Tracker for CliTracker {
@@ -40,7 +42,9 @@ impl Tracker for CliTracker {
         // the queue once open beads exceed one page (jleechan-v09l).
         let out = run_tool(
             "br",
-            &["list", "--status", "open", "--label", "factory", "--json", "--limit", "0"],
+            &[
+                "list", "--status", "open", "--label", "factory", "--json", "--limit", "0",
+            ],
             30,
         )?;
         let json_start = out.find('{').unwrap_or(0);
@@ -65,9 +69,8 @@ impl Tracker for CliTracker {
             notes: Option<String>,
             external_ref: Option<String>,
         }
-        let data: BrListOutput = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse br list JSON: {e}"))
-        })?;
+        let data: BrListOutput = serde_json::from_str(&out[json_start..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse br list JSON: {e}")))?;
         // Fail closed on truncated output: a partial candidate queue silently
         // starves beads beyond page one (jleechan-v09l).
         if data.has_more {
@@ -76,14 +79,18 @@ impl Tracker for CliTracker {
             ));
         }
         let file_tree_summary = crate::tools::summarize_file_tree(std::path::Path::new("."), 100);
-        let beads = data.issues.into_iter().map(|issue| Bead {
-            id: issue.id,
-            title: issue.title,
-            description: issue.description.unwrap_or_default(),
-            notes: issue.notes.unwrap_or_default(),
-            file_tree_summary: file_tree_summary.clone(),
-            external_ref: issue.external_ref,
-        }).collect();
+        let beads = data
+            .issues
+            .into_iter()
+            .map(|issue| Bead {
+                id: issue.id,
+                title: issue.title,
+                description: issue.description.unwrap_or_default(),
+                notes: issue.notes.unwrap_or_default(),
+                file_tree_summary: file_tree_summary.clone(),
+                external_ref: issue.external_ref,
+            })
+            .collect();
         Ok(beads)
     }
 
@@ -140,7 +147,11 @@ impl Tracker for CliTracker {
 
     fn comment_external(&self, external_ref: &str, body: &str) -> Result<(), DaemonError> {
         if let Some((repo, issue)) = canonicalize_external_ref_for_comment(external_ref) {
-            run_tool("gh", &["issue", "comment", &issue, "--repo", &repo, "--body", body], 30)?;
+            run_tool(
+                "gh",
+                &["issue", "comment", &issue, "--repo", &repo, "--body", body],
+                30,
+            )?;
             Ok(())
         } else {
             Err(DaemonError::Parse(format!(
@@ -165,9 +176,8 @@ pub(crate) fn parse_external_refs_from_br_list(
     struct BrIssue {
         external_ref: Option<String>,
     }
-    let data: BrListOutput = serde_json::from_str(&out[json_start..]).map_err(|e| {
-        DaemonError::Parse(format!("failed to parse br list JSON: {e}"))
-    })?;
+    let data: BrListOutput = serde_json::from_str(&out[json_start..])
+        .map_err(|e| DaemonError::Parse(format!("failed to parse br list JSON: {e}")))?;
     // Fail closed on truncated output: a partial dedup set means the daemon
     // re-creates beads for already-tracked issues (jleechan-v09l).
     if data.has_more {
@@ -262,12 +272,13 @@ fn unresolved_thread_count_from_gql(gql_out: &str) -> Result<u32, DaemonError> {
     }
 
     let json_start = gql_out.find('{').unwrap_or(0);
-    let gql: GhGqlResponse = serde_json::from_str(&gql_out[json_start..]).map_err(|e| {
-        DaemonError::Parse(format!("failed to parse gh graphql JSON: {e}"))
-    })?;
-    let pr_data = gql.data.repository.pull_request.ok_or_else(|| {
-        DaemonError::Parse("gh graphql response omitted pullRequest".into())
-    })?;
+    let gql: GhGqlResponse = serde_json::from_str(&gql_out[json_start..])
+        .map_err(|e| DaemonError::Parse(format!("failed to parse gh graphql JSON: {e}")))?;
+    let pr_data = gql
+        .data
+        .repository
+        .pull_request
+        .ok_or_else(|| DaemonError::Parse("gh graphql response omitted pullRequest".into()))?;
     Ok(pr_data
         .review_threads
         .nodes
@@ -358,7 +369,10 @@ impl CliScm {
         })?;
         let mut prs = Vec::new();
         let target_owner = self.repo.split('/').next().unwrap_or_default();
-        for issue in issues.into_iter().filter(|issue| issue.pull_request.is_some()) {
+        for issue in issues
+            .into_iter()
+            .filter(|issue| issue.pull_request.is_some())
+        {
             let pull_out = run_tool(
                 "gh",
                 &[
@@ -409,10 +423,10 @@ impl CliScm {
     }
 }
 
-
 impl Scm for CliScm {
     fn labeled_issues(&self, label: &str) -> Result<Vec<Issue>, DaemonError> {
-        let offline_path = std::path::Path::new(".beads/offline").join(format!("labeled_issues_{}.json", label));
+        let offline_path =
+            std::path::Path::new(".beads/offline").join(format!("labeled_issues_{}.json", label));
         if offline_path.exists() {
             if let Ok(raw) = std::fs::read_to_string(&offline_path) {
                 #[derive(serde::Deserialize)]
@@ -423,13 +437,16 @@ impl Scm for CliScm {
                     author_login: String,
                 }
                 if let Ok(issues_raw) = serde_json::from_str::<Vec<OfflineIssue>>(&raw) {
-                    let issues = issues_raw.into_iter().map(|issue| Issue {
-                        number: issue.number,
-                        title: issue.title,
-                        body: issue.body,
-                        author_login: issue.author_login,
-                        external_ref: format!("{}#{}", self.repo, issue.number),
-                    }).collect();
+                    let issues = issues_raw
+                        .into_iter()
+                        .map(|issue| Issue {
+                            number: issue.number,
+                            title: issue.title,
+                            body: issue.body,
+                            author_login: issue.author_login,
+                            external_ref: format!("{}#{}", self.repo, issue.number),
+                        })
+                        .collect();
                     return Ok(issues);
                 }
             }
@@ -490,13 +507,15 @@ impl Scm for CliScm {
             login: String,
         }
         let json_start_issues = out_issues.find('[').unwrap_or(0);
-        let gh_issues: Vec<GhIssue> = serde_json::from_str(&out_issues[json_start_issues..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse gh issue list: {e}"))
-        })?;
+        let gh_issues: Vec<GhIssue> = serde_json::from_str(&out_issues[json_start_issues..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse gh issue list: {e}")))?;
         let mut issues: Vec<Issue> = Vec::new();
         for item in gh_issues {
             if !issues.iter().any(|i| i.number == item.number) {
-                let author_login = item.author.as_ref().or(item.user.as_ref())
+                let author_login = item
+                    .author
+                    .as_ref()
+                    .or(item.user.as_ref())
                     .map(|a| a.login.clone())
                     .unwrap_or_default();
                 issues.push(Issue {
@@ -556,9 +575,8 @@ impl Scm for CliScm {
             login: String,
         }
         let json_start = out.find('[').unwrap_or(0);
-        let prs: Vec<GhPr> = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse gh pr list: {e}"))
-        })?;
+        let prs: Vec<GhPr> = serde_json::from_str(&out[json_start..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse gh pr list: {e}")))?;
         Ok(prs
             .into_iter()
             .map(|pr| LabeledPr {
@@ -575,9 +593,9 @@ impl Scm for CliScm {
             .collect())
     }
 
-
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError> {
-        let offline_path = std::path::Path::new(".beads/offline").join(format!("permission_{}.json", login));
+        let offline_path =
+            std::path::Path::new(".beads/offline").join(format!("permission_{}.json", login));
         if offline_path.exists() {
             if let Ok(raw) = std::fs::read_to_string(&offline_path) {
                 #[derive(serde::Deserialize)]
@@ -612,7 +630,9 @@ impl Scm for CliScm {
         }
         let json_start = out.find('{').unwrap_or(0);
         let resp: GhPermissionResponse = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse collaborator permission response: {e}"))
+            DaemonError::Parse(format!(
+                "failed to parse collaborator permission response: {e}"
+            ))
         })?;
         let perm = match resp.permission.as_str() {
             "admin" => Permission::Admin,
@@ -627,7 +647,6 @@ impl Scm for CliScm {
         }
         Ok(perm)
     }
-
 
     fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError> {
         let offline_path = std::path::Path::new(".beads/offline").join(format!("pr_{}.json", pr));
@@ -648,8 +667,16 @@ impl Scm for CliScm {
                     head_committed_epoch: Option<u64>,
                 }
                 if let Ok(snap) = serde_json::from_str::<OfflinePrSnapshot>(&raw) {
-                    let ci_status = if snap.ci_success { "green".to_string() } else { "red".to_string() };
-                    let coderabbit_status = if snap.coderabbit_approved { "green".to_string() } else { "red".to_string() };
+                    let ci_status = if snap.ci_success {
+                        "green".to_string()
+                    } else {
+                        "red".to_string()
+                    };
+                    let coderabbit_status = if snap.coderabbit_approved {
+                        "green".to_string()
+                    } else {
+                        "red".to_string()
+                    };
                     return Ok(PrSnapshot {
                         pr_number: pr,
                         ci_success: snap.ci_success,
@@ -740,7 +767,7 @@ impl Scm for CliScm {
                 // REST Fallback!
                 let pr_url = format!("repos/{}/pulls/{}", self.repo, pr);
                 let pr_json = run_tool("gh", &["api", &pr_url], 30)?;
-                
+
                 #[derive(serde::Deserialize)]
                 struct RestPr {
                     mergeable: Option<bool>,
@@ -757,7 +784,8 @@ impl Scm for CliScm {
                 })?;
 
                 let reviews_url = format!("repos/{}/pulls/{}/reviews", self.repo, pr);
-                let reviews_json = run_tool("gh", &["api", &reviews_url], 30).unwrap_or_else(|_| "[]".to_string());
+                let reviews_json =
+                    run_tool("gh", &["api", &reviews_url], 30).unwrap_or_else(|_| "[]".to_string());
                 #[derive(serde::Deserialize)]
                 struct RestReview {
                     user: Option<RestUser>,
@@ -767,10 +795,12 @@ impl Scm for CliScm {
                 struct RestUser {
                     login: String,
                 }
-                let rest_reviews: Vec<RestReview> = serde_json::from_str(&reviews_json).unwrap_or_default();
+                let rest_reviews: Vec<RestReview> =
+                    serde_json::from_str(&reviews_json).unwrap_or_default();
 
                 let comments_url = format!("repos/{}/issues/{}/comments", self.repo, pr);
-                let comments_json = run_tool("gh", &["api", &comments_url], 30).unwrap_or_else(|_| "[]".to_string());
+                let comments_json = run_tool("gh", &["api", &comments_url], 30)
+                    .unwrap_or_else(|_| "[]".to_string());
                 #[derive(serde::Deserialize)]
                 struct RestComment {
                     user: Option<RestUser>,
@@ -778,32 +808,65 @@ impl Scm for CliScm {
                     #[serde(default)]
                     created_at: String,
                 }
-                let rest_comments: Vec<RestComment> = serde_json::from_str(&comments_json).unwrap_or_default();
+                let rest_comments: Vec<RestComment> =
+                    serde_json::from_str(&comments_json).unwrap_or_default();
 
                 let files_url = format!("repos/{}/pulls/{}/files", self.repo, pr);
-                let files_json = run_tool("gh", &["api", &files_url], 30).unwrap_or_else(|_| "[]".to_string());
+                let files_json =
+                    run_tool("gh", &["api", &files_url], 30).unwrap_or_else(|_| "[]".to_string());
                 #[derive(serde::Deserialize)]
                 struct RestFile {
                     filename: String,
                     additions: u32,
                     deletions: u32,
                 }
-                let rest_files: Vec<RestFile> = serde_json::from_str(&files_json).unwrap_or_default();
+                let rest_files: Vec<RestFile> =
+                    serde_json::from_str(&files_json).unwrap_or_default();
 
                 GhPrView {
-                    mergeable: if rest_pr.mergeable.unwrap_or(false) { "MERGEABLE".to_string() } else { "CONFLICTING".to_string() },
-                    reviews: rest_reviews.into_iter().map(|r| GhReview { author: GhAuthor { login: r.user.map(|u| u.login).unwrap_or_default() }, state: r.state }).collect(),
+                    mergeable: if rest_pr.mergeable.unwrap_or(false) {
+                        "MERGEABLE".to_string()
+                    } else {
+                        "CONFLICTING".to_string()
+                    },
+                    reviews: rest_reviews
+                        .into_iter()
+                        .map(|r| GhReview {
+                            author: GhAuthor {
+                                login: r.user.map(|u| u.login).unwrap_or_default(),
+                            },
+                            state: r.state,
+                        })
+                        .collect(),
                     head_ref_oid: rest_pr.head.sha,
                     body: rest_pr.body.unwrap_or_default(),
-                    comments: rest_comments.into_iter().map(|c| GhComment { author: GhAuthor { login: c.user.map(|u| u.login).unwrap_or_default() }, body: c.body, created_at: c.created_at }).collect(),
-                    files: rest_files.into_iter().map(|f| GhFile { path: f.filename, additions: f.additions, deletions: f.deletions }).collect(),
+                    comments: rest_comments
+                        .into_iter()
+                        .map(|c| GhComment {
+                            author: GhAuthor {
+                                login: c.user.map(|u| u.login).unwrap_or_default(),
+                            },
+                            body: c.body,
+                            created_at: c.created_at,
+                        })
+                        .collect(),
+                    files: rest_files
+                        .into_iter()
+                        .map(|f| GhFile {
+                            path: f.filename,
+                            additions: f.additions,
+                            deletions: f.deletions,
+                        })
+                        .collect(),
                     updated_at: rest_pr.updated_at,
                 }
             }
         };
         let mergeable = view.mergeable == "MERGEABLE";
 
-        let last_coderabbit_review = view.reviews.iter()
+        let last_coderabbit_review = view
+            .reviews
+            .iter()
             .rfind(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED");
 
         let coderabbit_status = match last_coderabbit_review {
@@ -828,13 +891,24 @@ impl Scm for CliScm {
         }
         let checks_out = match run_tool(
             "gh",
-            &["pr", "checks", &pr_str, "--repo", &self.repo, "--json", "state,bucket,name"],
+            &[
+                "pr",
+                "checks",
+                &pr_str,
+                "--repo",
+                &self.repo,
+                "--json",
+                "state,bucket,name",
+            ],
             30,
         ) {
             Ok(out) => out,
             Err(primary_err) => {
                 // REST Fallback!
-                let ref_url = format!("repos/{}/commits/{}/check-runs", self.repo, view.head_ref_oid);
+                let ref_url = format!(
+                    "repos/{}/commits/{}/check-runs",
+                    self.repo, view.head_ref_oid
+                );
                 // jleechan-e7lp: the primary GraphQL `gh pr checks` call
                 // failed (commonly a GraphQL rate limit). If the REST
                 // fallback ALSO fails to execute, or returns a body that
@@ -886,32 +960,46 @@ impl Scm for CliScm {
                     }
                 })?;
 
-                let mut legacy_checks: Vec<GhCheck> = rest_cr.check_runs.into_iter().map(|cr| {
-                    let (state, bucket) = if cr.status == "completed" {
-                        match cr.conclusion.as_deref() {
-                            Some("success") | Some("neutral") => ("SUCCESS".to_string(), "pass".to_string()),
-                            Some("cancelled") => ("CANCELLED".to_string(), "cancel".to_string()),
-                            _ => ("FAILURE".to_string(), "fail".to_string()),
+                let mut legacy_checks: Vec<GhCheck> = rest_cr
+                    .check_runs
+                    .into_iter()
+                    .map(|cr| {
+                        let (state, bucket) = if cr.status == "completed" {
+                            match cr.conclusion.as_deref() {
+                                Some("success") | Some("neutral") => {
+                                    ("SUCCESS".to_string(), "pass".to_string())
+                                }
+                                Some("cancelled") => {
+                                    ("CANCELLED".to_string(), "cancel".to_string())
+                                }
+                                _ => ("FAILURE".to_string(), "fail".to_string()),
+                            }
+                        } else {
+                            ("PENDING".to_string(), "pending".to_string())
+                        };
+                        GhCheck {
+                            state,
+                            bucket,
+                            name: cr.name,
                         }
-                    } else {
-                        ("PENDING".to_string(), "pending".to_string())
-                    };
-                    GhCheck { state, bucket, name: cr.name }
-                }).collect();
+                    })
+                    .collect();
 
                 // Some third-party CI (and older GitHub Apps) still post via
                 // the legacy Commit Status API instead of the Checks API —
                 // merge `/commits/{sha}/statuses` in too so those don't
                 // silently vanish from `checks` when the GraphQL `gh pr
                 // checks` call is rate-limited.
-                let statuses_url = format!("repos/{}/commits/{}/statuses", self.repo, view.head_ref_oid);
+                let statuses_url =
+                    format!("repos/{}/commits/{}/statuses", self.repo, view.head_ref_oid);
                 if let Ok(statuses_json) = run_tool("gh", &["api", &statuses_url], 30) {
                     #[derive(serde::Deserialize)]
                     struct RestStatus {
                         context: String,
                         state: String,
                     }
-                    let rest_statuses: Vec<RestStatus> = serde_json::from_str(&statuses_json).unwrap_or_default();
+                    let rest_statuses: Vec<RestStatus> =
+                        serde_json::from_str(&statuses_json).unwrap_or_default();
                     for s in rest_statuses {
                         let bucket = match s.state.as_str() {
                             "success" => "pass",
@@ -929,9 +1017,8 @@ impl Scm for CliScm {
             }
         };
         let json_start_c = checks_out.find('[').unwrap_or(0);
-        let checks: Vec<GhCheck> = serde_json::from_str(&checks_out[json_start_c..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse gh pr checks JSON: {e}"))
-        })?;
+        let checks: Vec<GhCheck> = serde_json::from_str(&checks_out[json_start_c..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse gh pr checks JSON: {e}")))?;
         let mut any_pending = false;
         let mut any_failed = false;
         for c in &checks {
@@ -949,8 +1036,7 @@ impl Scm for CliScm {
             "green".to_string()
         };
 
-        let iteration_stub =
-            std::env::var("DARK_FACTORY_ITERATION_STUB").as_deref() == Ok("1");
+        let iteration_stub = std::env::var("DARK_FACTORY_ITERATION_STUB").as_deref() == Ok("1");
         let ci_success = ci_success_from_check_buckets(
             &checks.iter().map(|c| c.bucket.as_str()).collect::<Vec<_>>(),
             iteration_stub,
@@ -1031,11 +1117,15 @@ impl Scm for CliScm {
             }
         };
 
-        let mut pr_comments: Vec<crate::tools::PrComment> = view.comments.into_iter().map(|c| crate::tools::PrComment {
-            author: c.author.login,
-            body: c.body,
-            created_at_epoch: crate::tools::iso8601_to_epoch(&c.created_at).unwrap_or(0),
-        }).collect();
+        let mut pr_comments: Vec<crate::tools::PrComment> = view
+            .comments
+            .into_iter()
+            .map(|c| crate::tools::PrComment {
+                author: c.author.login,
+                body: c.body,
+                created_at_epoch: crate::tools::iso8601_to_epoch(&c.created_at).unwrap_or(0),
+            })
+            .collect();
 
         let updated_at_epoch = crate::tools::iso8601_to_epoch(&view.updated_at).unwrap_or(0);
 
@@ -1061,11 +1151,15 @@ impl Scm for CliScm {
             }
         }
 
-        let pr_files = view.files.into_iter().map(|f| crate::tools::PrFile {
-            path: f.path,
-            additions: f.additions,
-            deletions: f.deletions,
-        }).collect();
+        let pr_files = view
+            .files
+            .into_iter()
+            .map(|f| crate::tools::PrFile {
+                path: f.path,
+                additions: f.additions,
+                deletions: f.deletions,
+            })
+            .collect();
 
         // jleechan-nplh: the head commit's committer date is the freshness
         // floor for `/er` verdict comments. Failure tolerated (epoch 0 =
@@ -1155,11 +1249,7 @@ impl Scm for CliScm {
     /// callers can distinguish "transient tool error" (retry next tick)
     /// from "the branch really has no open PR right now" (legitimate —
     /// keep using the existing `pr_number` until one appears).
-    fn pr_number_for_branch(
-        &self,
-        repo: &str,
-        branch: &str,
-    ) -> Result<Option<u64>, DaemonError> {
+    fn pr_number_for_branch(&self, repo: &str, branch: &str) -> Result<Option<u64>, DaemonError> {
         let out = match run_tool(
             "gh",
             &[
@@ -1240,7 +1330,8 @@ impl Scm for CliScm {
     }
 
     fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError> {
-        let offline_path = std::path::Path::new(".beads/offline").join(format!("branch_{}.json", branch));
+        let offline_path =
+            std::path::Path::new(".beads/offline").join(format!("branch_{}.json", branch));
         if offline_path.exists() {
             if let Ok(raw) = std::fs::read_to_string(&offline_path) {
                 #[derive(serde::Deserialize)]
@@ -1263,7 +1354,11 @@ impl Scm for CliScm {
         let path = format!("repos/{}/branches/{}", self.repo, branch);
         let out = match run_tool("gh", &["api", &path], 30) {
             Ok(o) => o,
-            Err(DaemonError::Tool { stderr, .. }) if stderr.contains("404") || stderr.contains("Not Found") || stderr.contains("not found") => {
+            Err(DaemonError::Tool { stderr, .. })
+                if stderr.contains("404")
+                    || stderr.contains("Not Found")
+                    || stderr.contains("not found") =>
+            {
                 {
                     let mut cache = self.branch_commit_cache.lock().unwrap();
                     cache.insert(branch.to_string(), (None, Instant::now()));
@@ -1292,9 +1387,14 @@ impl Scm for CliScm {
         let resp: GhBranch = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse branch commit response: {e}"))
         })?;
-        let epoch = crate::tools::iso8601_to_epoch(&resp.commit.commit.committer.date).ok_or_else(|| {
-            DaemonError::Parse(format!("failed to parse date: {}", resp.commit.commit.committer.date))
-        })?;
+        let epoch = crate::tools::iso8601_to_epoch(&resp.commit.commit.committer.date).ok_or_else(
+            || {
+                DaemonError::Parse(format!(
+                    "failed to parse date: {}",
+                    resp.commit.commit.committer.date
+                ))
+            },
+        )?;
         {
             let mut cache = self.branch_commit_cache.lock().unwrap();
             cache.insert(branch.to_string(), (Some(epoch), Instant::now()));
@@ -1391,12 +1491,16 @@ mod open_pr_head_ref_tests {
         // generated branch would look like — proving the guard checks
         // `head.repo.full_name`, not just PR openness or the ref string.
         let json = r#"{"state":"open","head":{"ref":"factory/jleechan-xa99-r1","repo":{"full_name":"someone-else/repo"}}}"#;
-        assert_eq!(parse_open_pr_head_ref(json, "owner/repo"), PrHeadBranch::Fork);
+        assert_eq!(
+            parse_open_pr_head_ref(json, "owner/repo"),
+            PrHeadBranch::Fork
+        );
     }
 
     #[test]
     fn open_pr_with_case_different_same_repo_name_still_matches() {
-        let json = r#"{"state":"OPEN","head":{"ref":"factory/x","repo":{"full_name":"Owner/Repo"}}}"#;
+        let json =
+            r#"{"state":"OPEN","head":{"ref":"factory/x","repo":{"full_name":"Owner/Repo"}}}"#;
         assert_eq!(
             parse_open_pr_head_ref(json, "owner/repo"),
             PrHeadBranch::SameRepo("factory/x".to_string())
@@ -1408,18 +1512,28 @@ mod open_pr_head_ref_tests {
         // GitHub omits `head.repo` entirely once the source fork has been
         // deleted — must NOT default to "assume same repo".
         let json = r#"{"state":"open","head":{"ref":"factory/x","repo":null}}"#;
-        assert_eq!(parse_open_pr_head_ref(json, "owner/repo"), PrHeadBranch::Fork);
+        assert_eq!(
+            parse_open_pr_head_ref(json, "owner/repo"),
+            PrHeadBranch::Fork
+        );
     }
 
     #[test]
     fn closed_same_repo_pr_resolves_not_found() {
-        let json = r#"{"state":"closed","head":{"ref":"factory/x","repo":{"full_name":"owner/repo"}}}"#;
-        assert_eq!(parse_open_pr_head_ref(json, "owner/repo"), PrHeadBranch::NotFound);
+        let json =
+            r#"{"state":"closed","head":{"ref":"factory/x","repo":{"full_name":"owner/repo"}}}"#;
+        assert_eq!(
+            parse_open_pr_head_ref(json, "owner/repo"),
+            PrHeadBranch::NotFound
+        );
     }
 
     #[test]
     fn malformed_json_resolves_not_found() {
-        assert_eq!(parse_open_pr_head_ref("not json", "owner/repo"), PrHeadBranch::NotFound);
+        assert_eq!(
+            parse_open_pr_head_ref("not json", "owner/repo"),
+            PrHeadBranch::NotFound
+        );
     }
 }
 
@@ -1613,10 +1727,7 @@ fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonErro
 /// Node major version, package version, core APIs, configured project, and
 /// plugin resolution without performing preflight side effects, acquiring a
 /// spawn lock, creating a workspace, or launching a worker.
-pub fn verify_ao_bridge_compatibility(
-    ao_project: &str,
-    agent: &str,
-) -> Result<(), DaemonError> {
+pub fn verify_ao_bridge_compatibility(ao_project: &str, agent: &str) -> Result<(), DaemonError> {
     let spec = SpawnSpec {
         bead_id: "daemon-startup-diagnostic".to_string(),
         branch: "factory/daemon-startup-diagnostic".to_string(),
@@ -1657,7 +1768,10 @@ pub fn verify_ao_bridge_compatibility(
             "AO bridge compatibility diagnostic marker was invalid JSON: {error}"
         ))
     })?;
-    if diagnostic.get("cliVersion").and_then(|value| value.as_str()) != Some("0.1.3")
+    if diagnostic
+        .get("cliVersion")
+        .and_then(|value| value.as_str())
+        != Some("0.1.3")
         || !diagnostic
             .get("nodeVersion")
             .and_then(|value| value.as_str())
@@ -1706,7 +1820,11 @@ impl CliSessions {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = cmd.output().map_err(|e| DaemonError::Tool {
-            tool: if std::env::consts::OS == "macos" { "sandbox-exec".to_string() } else { "ao".to_string() },
+            tool: if std::env::consts::OS == "macos" {
+                "sandbox-exec".to_string()
+            } else {
+                "ao".to_string()
+            },
             rc: -1,
             stderr: format!("execution failed: {e}"),
         })?;
@@ -1749,10 +1867,7 @@ impl CliSessions {
         self.spawned_worktrees
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                (spec.ao_project.clone(), spec.branch.clone()),
-                workspace,
-            );
+            .insert((spec.ao_project.clone(), spec.branch.clone()), workspace);
         Ok(session)
     }
 
@@ -1812,7 +1927,10 @@ impl CliSessions {
             // failure whose stderr echoes the bare phrase to be misclassified
             // as retry-safe backpressure. The longer anchor still tolerates
             // the variable `'<project-id>'` in the AO-thrown message.
-            if err_msg.to_lowercase().contains("spawn queue is full for project") {
+            if err_msg
+                .to_lowercase()
+                .contains("spawn queue is full for project")
+            {
                 return Err(DaemonError::Deferred(format!(
                     "ao spawn --agent {agent} rejected: admission queue full ({})",
                     err_msg.trim()
@@ -1830,7 +1948,11 @@ impl CliSessions {
             if line.starts_with("SESSION=") {
                 sess_name = Some(line.split('=').nth(1).unwrap_or("").trim().to_string());
             } else if line.starts_with("spawned session ") {
-                let parts: Vec<&str> = line.strip_prefix("spawned session ").unwrap_or("").split_whitespace().collect();
+                let parts: Vec<&str> = line
+                    .strip_prefix("spawned session ")
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .collect();
                 if !parts.is_empty() {
                     sess_name = Some(parts[0].to_string());
                 }
@@ -1871,7 +1993,7 @@ impl CliSessions {
     fn spawn_with_fallback(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
         let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
             .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
-        
+
         let mut fallback_agents = Vec::new();
         fallback_agents.push(self.agent.clone());
         for part in fallback_str.split("->") {
@@ -1886,7 +2008,9 @@ impl CliSessions {
             }
         }
 
-        fallback_spawn(&fallback_agents, |agent| self.run_spawn_process(agent, spec))
+        fallback_spawn(&fallback_agents, |agent| {
+            self.run_spawn_process(agent, spec)
+        })
     }
 }
 
@@ -2166,7 +2290,10 @@ mod ao_spawn_contract_tests {
             .unwrap();
 
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "legacy bypass unexpectedly worked");
+        assert!(
+            !output.status.success(),
+            "legacy bypass unexpectedly worked"
+        );
         assert!(stderr.contains("requires Node 22, got 24.15.0"), "{stderr}");
     }
 
@@ -2286,7 +2413,10 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
 
         let (spawn_result, calls) = with_fake_ao("branch_mismatch", bindings, |log| {
             let saved = [
-                ("AO_FAKE_RETURN_BRANCH", std::env::var("AO_FAKE_RETURN_BRANCH").ok()),
+                (
+                    "AO_FAKE_RETURN_BRANCH",
+                    std::env::var("AO_FAKE_RETURN_BRANCH").ok(),
+                ),
                 (
                     "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
                     std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok(),
@@ -2312,14 +2442,8 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(
-            rows.iter().filter(|row| row["kind"] == "spawn").count(),
-            1
-        );
-        assert_eq!(
-            rows.iter().filter(|row| row["kind"] == "kill").count(),
-            1
-        );
+        assert_eq!(rows.iter().filter(|row| row["kind"] == "spawn").count(), 1);
+        assert_eq!(rows.iter().filter(|row| row["kind"] == "kill").count(), 1);
     }
 
     #[test]
@@ -2408,15 +2532,16 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
         });
 
         assert!(batch_result.is_err(), "second spawn must fail");
-        let rows: Vec<serde_json::Value> = calls.lines()
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        let successful_spawns: Vec<&serde_json::Value> = rows.iter()
+        let successful_spawns: Vec<&serde_json::Value> = rows
+            .iter()
             .filter(|row| row["kind"] == "spawn" && row["args"][6] == first.prompt)
             .collect();
-        let kills: Vec<&serde_json::Value> = rows.iter()
-            .filter(|row| row["kind"] == "kill")
-            .collect();
+        let kills: Vec<&serde_json::Value> =
+            rows.iter().filter(|row| row["kind"] == "kill").collect();
         assert_eq!(successful_spawns.len(), 1, "calls={calls}");
         assert_eq!(kills.len(), successful_spawns.len(), "calls={calls}");
         assert_eq!(
@@ -2472,14 +2597,21 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
         assert_eq!(cleanup_errors.len(), 1);
         assert_eq!(cleanup_errors[0].bead_id, first.bead_id);
         assert_eq!(cleanup_errors[0].branch, first.branch);
-        assert!(rendered.contains("scripted second spawn failure"), "{rendered}");
-        assert!(rendered.contains("scripted batch cleanup failure"), "{rendered}");
+        assert!(
+            rendered.contains("scripted second spawn failure"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("scripted batch cleanup failure"),
+            "{rendered}"
+        );
         assert!(rendered.contains("jleechan-contract-test"), "{rendered}");
         assert!(
             rendered.contains("factory/jleechan-contract-batch-cleanup-error-first-r1"),
             "{rendered}"
         );
-        let rows: Vec<serde_json::Value> = calls.lines()
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         assert_eq!(
@@ -2575,12 +2707,16 @@ raise SystemExit(9)
             calls.last().unwrap(),
             &serde_json::json!(["session", "kill", "missing-worktree-session"])
         );
-        assert!(!calls.iter().any(|call| call == &serde_json::json!(["stop", "missing-worktree-session"])));
+        assert!(!calls
+            .iter()
+            .any(|call| call == &serde_json::json!(["stop", "missing-worktree-session"])));
     }
 
     #[test]
     fn missing_worktree_kill_failure_does_not_spawn_fallback_vendor() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = gh_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "afd_ao_missing_worktree_kill_failure_{}",
             std::process::id()
@@ -2605,7 +2741,8 @@ if sys.argv[1:] == ["session", "kill", "untracked-session"]:
     raise SystemExit(8)
 raise SystemExit(9)
 "#,
-        ).unwrap();
+        )
+        .unwrap();
         let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&fake_ao, permissions).unwrap();
@@ -2614,7 +2751,10 @@ raise SystemExit(9)
         let old_fallback = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
         std::env::set_var("PATH", format!("{}:{old_path}", root.display()));
         std::env::set_var("AO_FAKE_CLEANUP_LOG", &log);
-        std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax->claude-code");
+        std::env::set_var(
+            "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
+            "minimax->claude-code",
+        );
 
         let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
         let result = sessions.spawn(&spec(
@@ -2637,7 +2777,10 @@ raise SystemExit(9)
             .collect();
         let _ = std::fs::remove_dir_all(&root);
 
-        assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })));
+        assert!(matches!(
+            result,
+            Err(DaemonError::SpawnCleanupFailed { .. })
+        ));
         assert_eq!(
             calls.iter().filter(|call| call[0] == "spawn").count(),
             1,
@@ -2676,8 +2819,7 @@ raise SystemExit(9)
             std::env::set_var("AO_FAKE_WORKTREE", &workspace);
             let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
             let spawn_result = sessions.spawn(&spec(prompt, branch));
-            let remote_result =
-                sessions.worktree_remote_url("dark-factory", branch, "origin");
+            let remote_result = sessions.worktree_remote_url("dark-factory", branch, "origin");
             match previous_workspace {
                 Some(value) => std::env::set_var("AO_FAKE_WORKTREE", value),
                 None => std::env::remove_var("AO_FAKE_WORKTREE"),
@@ -2711,8 +2853,11 @@ raise SystemExit(9)
             r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
         )
         .unwrap();
-        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
-            .unwrap();
+        std::fs::write(
+            cli.join("dist/index.js"),
+            "throw new Error('CLI must not run');\n",
+        )
+        .unwrap();
         std::fs::write(
             core.join("package.json"),
             r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
@@ -2804,8 +2949,11 @@ export const isTerminalSession = () => false;
             r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
         )
         .unwrap();
-        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
-            .unwrap();
+        std::fs::write(
+            cli.join("dist/index.js"),
+            "throw new Error('CLI must not run');\n",
+        )
+        .unwrap();
         std::fs::write(
             core.join("package.json"),
             r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
@@ -2871,10 +3019,7 @@ export const ensureLifecycleWorker = async () => appendFileSync(process.env.AO_F
             )
             .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "")
             .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
-            .env(
-                "DARK_FACTORY_AO_SPAWN_BRANCH",
-                "factory/admission-probe-r1",
-            )
+            .env("DARK_FACTORY_AO_SPAWN_BRANCH", "factory/admission-probe-r1")
             .env("AO_FAKE_CALLS", &calls)
             .output()
             .unwrap();
@@ -2888,8 +3033,19 @@ export const ensureLifecycleWorker = async () => appendFileSync(process.env.AO_F
             "cap deferral failed; stdout={stdout}; stderr={stderr}; calls={calls}"
         );
         assert!(stdout.contains("REQUEST=dark-factory-exact-branch-dark-factory"));
-        for expected in ["tmux", "gh", "running", "lifecycle", "lock", "list", "release"] {
-            assert!(calls.lines().any(|line| line == expected), "missing {expected}: {calls}");
+        for expected in [
+            "tmux",
+            "gh",
+            "running",
+            "lifecycle",
+            "lock",
+            "list",
+            "release",
+        ] {
+            assert!(
+                calls.lines().any(|line| line == expected),
+                "missing {expected}: {calls}"
+            );
         }
         assert!(!calls.contains("SPAWN_CALLED"), "{calls}");
     }
@@ -2914,8 +3070,11 @@ export const ensureLifecycleWorker = async () => appendFileSync(process.env.AO_F
             r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
         )
         .unwrap();
-        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
-            .unwrap();
+        std::fs::write(
+            cli.join("dist/index.js"),
+            "throw new Error('CLI must not run');\n",
+        )
+        .unwrap();
         std::fs::write(
             core.join("package.json"),
             r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
@@ -2984,10 +3143,7 @@ export const isTerminalSession = () => false;
             )
             .env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", "--trace-warnings")
             .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
-            .env(
-                "DARK_FACTORY_AO_SPAWN_BRANCH",
-                "factory/spawn-semantics-r1",
-            )
+            .env("DARK_FACTORY_AO_SPAWN_BRANCH", "factory/spawn-semantics-r1")
             .env("AO_FAKE_CALLS", &calls)
             .output()
             .unwrap();
@@ -3000,7 +3156,10 @@ export const isTerminalSession = () => false;
             output.status.success(),
             "below-cap spawn failed; stdout={stdout}; stderr={stderr}; calls={calls}"
         );
-        assert!(stdout.contains("SESSION=spawn-semantic-session"), "{stdout}");
+        assert!(
+            stdout.contains("SESSION=spawn-semantic-session"),
+            "{stdout}"
+        );
         let spawn_line = calls
             .lines()
             .find_map(|line| line.strip_prefix("spawn="))
@@ -3060,8 +3219,11 @@ export const isTerminalSession = () => false;
             r#"{"name":"@jleechanorg/ao-cli","version":"0.1.3","type":"module"}"#,
         )
         .unwrap();
-        std::fs::write(cli.join("dist/index.js"), "throw new Error('CLI must not run');\n")
-            .unwrap();
+        std::fs::write(
+            cli.join("dist/index.js"),
+            "throw new Error('CLI must not run');\n",
+        )
+        .unwrap();
         std::fs::write(
             core.join("package.json"),
             r#"{"name":"@jleechanorg/ao-core","version":"0.1.0","type":"module","exports":{".":{"import":"./dist/index.js"}}}"#,
@@ -3146,7 +3308,10 @@ os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["A
             ("AO_FAKE_CLI_ENTRY", std::env::var("AO_FAKE_CLI_ENTRY").ok()),
             ("AO_FAKE_CALLS", std::env::var("AO_FAKE_CALLS").ok()),
             ("AO_FAKE_LOCK", std::env::var("AO_FAKE_LOCK").ok()),
-            ("AO_FAKE_WORKSPACES", std::env::var("AO_FAKE_WORKSPACES").ok()),
+            (
+                "AO_FAKE_WORKSPACES",
+                std::env::var("AO_FAKE_WORKSPACES").ok(),
+            ),
             (
                 "AO_FAKE_INVALID_WORKSPACE_PROMPT",
                 std::env::var("AO_FAKE_INVALID_WORKSPACE_PROMPT").ok(),
@@ -3170,13 +3335,15 @@ os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["A
             })
             .to_string(),
         );
-        std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax->claude-code");
+        std::env::set_var(
+            "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
+            "minimax->claude-code",
+        );
 
         let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
         let batch_result = sessions.spawn_batch(&[first.clone(), second.clone()]);
         let first_remote = sessions.worktree_remote_url("dark-factory", &first.branch, "origin");
-        let second_remote =
-            sessions.worktree_remote_url("dark-factory", &second.branch, "origin");
+        let second_remote = sessions.worktree_remote_url("dark-factory", &second.branch, "origin");
         std::env::set_var("AO_FAKE_INVALID_WORKSPACE_PROMPT", &invalid.prompt);
         let cleanup_failure = sessions.spawn(&invalid);
         for (key, value) in saved {
@@ -3188,17 +3355,25 @@ os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["A
         let calls = std::fs::read_to_string(&calls).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&root);
 
-        assert!(batch_result.is_ok(), "batch failed: {batch_result:?}; calls={calls}");
+        assert!(
+            batch_result.is_ok(),
+            "batch failed: {batch_result:?}; calls={calls}"
+        );
         let rows: Vec<serde_json::Value> = calls
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        let spawn_rows: Vec<&serde_json::Value> = rows
-            .iter()
-            .filter(|row| row["kind"] == "spawn")
-            .collect();
-        assert_eq!(spawn_rows.len(), 3, "each spec must spawn exactly once: {calls}");
-        assert!(spawn_rows.iter().all(|row| row["agent"] == "minimax"), "{calls}");
+        let spawn_rows: Vec<&serde_json::Value> =
+            rows.iter().filter(|row| row["kind"] == "spawn").collect();
+        assert_eq!(
+            spawn_rows.len(),
+            3,
+            "each spec must spawn exactly once: {calls}"
+        );
+        assert!(
+            spawn_rows.iter().all(|row| row["agent"] == "minimax"),
+            "{calls}"
+        );
         assert_eq!(
             spawn_rows
                 .iter()
@@ -3231,9 +3406,8 @@ impl Sessions for CliSessions {
     fn active_count(&self) -> Result<usize, DaemonError> {
         let out = run_tool("ao", &["status", "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
+        let data: serde_json::Value = serde_json::from_str(&out[json_start..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse ao status: {e}")))?;
         active_session_count(&data)
     }
 
@@ -3274,10 +3448,7 @@ impl Sessions for CliSessions {
                 }
             }
         }
-        Ok(spawned
-            .into_iter()
-            .map(|(session, _)| session)
-            .collect())
+        Ok(spawned.into_iter().map(|(session, _)| session).collect())
     }
 
     /// jleechan-hna3: reverse lookup of the AO session CURRENTLY associated
@@ -3315,9 +3486,8 @@ impl Sessions for CliSessions {
     ) -> Result<SessionId, DaemonError> {
         let out = run_tool("ao", &["status", "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
+        let data: serde_json::Value = serde_json::from_str(&out[json_start..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse ao status: {e}")))?;
         session_for_branch(&data, branch, bead_id)
     }
 
@@ -3329,9 +3499,8 @@ impl Sessions for CliSessions {
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
         let out = run_tool("ao", &["status", "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
+        let data: serde_json::Value = serde_json::from_str(&out[json_start..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse ao status: {e}")))?;
         session_is_quiescent(&data, id)
     }
 
@@ -3357,9 +3526,8 @@ impl Sessions for CliSessions {
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
         let out = run_tool("ao", &["status", "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
-        let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse ao status: {e}"))
-        })?;
+        let data: serde_json::Value = serde_json::from_str(&out[json_start..])
+            .map_err(|e| DaemonError::Parse(format!("failed to parse ao status: {e}")))?;
         session_activity(&data, id)
     }
 
@@ -3529,10 +3697,7 @@ fn is_terminal_ao_session(entry: &serde_json::Value) -> bool {
     ) || entry.get("activity").and_then(|value| value.as_str()) == Some("exited")
 }
 
-fn session_is_quiescent(
-    data: &serde_json::Value,
-    id: &SessionId,
-) -> Result<bool, DaemonError> {
+fn session_is_quiescent(data: &serde_json::Value, id: &SessionId) -> Result<bool, DaemonError> {
     let sessions = data
         .as_array()
         .ok_or_else(|| DaemonError::Parse("ao status JSON must be an array".to_string()))?;
@@ -3643,8 +3808,8 @@ fn active_session_count(data: &serde_json::Value) -> Result<usize, DaemonError> 
     Ok(sessions
         .iter()
         .filter(|entry| {
-            let is_orchestrator = entry.get("role").and_then(|value| value.as_str())
-                == Some("orchestrator");
+            let is_orchestrator =
+                entry.get("role").and_then(|value| value.as_str()) == Some("orchestrator");
             !is_orchestrator && !is_terminal_ao_session(entry)
         })
         .count())
@@ -3739,7 +3904,9 @@ mod active_session_count_tests {
             {"name": "current", "branch": "feat/shared", "status": "working", "activity": "ready"}
         ]);
         assert_eq!(
-            session_for_branch(&status, "feat/shared", "bead").unwrap().0,
+            session_for_branch(&status, "feat/shared", "bead")
+                .unwrap()
+                .0,
             "current"
         );
 
@@ -3932,7 +4099,10 @@ mod worktree_remote_url_tests {
 
         let _ = std::fs::remove_dir_all(&root);
 
-        assert!(result.is_err(), "an unconfigured push remote must fail closed");
+        assert!(
+            result.is_err(),
+            "an unconfigured push remote must fail closed"
+        );
     }
 }
 
@@ -3965,8 +4135,8 @@ mod worktree_transcript_last_activity_epoch_tests {
     #[test]
     fn no_evidence_without_spawned_workspace() {
         let sessions = CliSessions::new("owner/repo", "claude-code");
-        let result = sessions
-            .worktree_transcript_last_activity_epoch("dark-factory", "factory/missing-r1");
+        let result =
+            sessions.worktree_transcript_last_activity_epoch("dark-factory", "factory/missing-r1");
 
         assert_eq!(result.unwrap(), None);
     }
@@ -4004,7 +4174,12 @@ mod worktree_transcript_last_activity_epoch_tests {
         std::env::set_var("HOME", &fake_home);
 
         let sessions = CliSessions::new("owner/repo", "claude-code");
-        record_workspace(&sessions, "dark-factory", "factory/df-100-r1", &worktree_path);
+        record_workspace(
+            &sessions,
+            "dark-factory",
+            "factory/df-100-r1",
+            &worktree_path,
+        );
         let result =
             sessions.worktree_transcript_last_activity_epoch("dark-factory", "factory/df-100-r1");
 
@@ -4044,7 +4219,12 @@ mod worktree_transcript_last_activity_epoch_tests {
         std::env::set_var("HOME", &fake_home);
 
         let sessions = CliSessions::new("owner/repo", "claude-code");
-        record_workspace(&sessions, "dark-factory", "factory/df-101-r1", &worktree_path);
+        record_workspace(
+            &sessions,
+            "dark-factory",
+            "factory/df-101-r1",
+            &worktree_path,
+        );
         let result =
             sessions.worktree_transcript_last_activity_epoch("dark-factory", "factory/df-101-r1");
 
@@ -4160,7 +4340,12 @@ impl Vcs for CliVcs {
     /// the underlying `DaemonError::Tool` with the HTTP body as
     /// stderr surfaces that case to the operator for the same reason
     /// the old CWD-bound `git branch <name> <sha>` did.
-    fn create_branch_at_for_repo(&self, repo: &str, name: &str, sha: &str) -> Result<(), DaemonError> {
+    fn create_branch_at_for_repo(
+        &self,
+        repo: &str,
+        name: &str,
+        sha: &str,
+    ) -> Result<(), DaemonError> {
         let path = format!("repos/{}/git/refs", repo);
         let ref_path = format!("refs/heads/{name}");
         let out = run_tool(
@@ -4178,6 +4363,29 @@ impl Vcs for CliVcs {
             30,
         )?;
         let _ = out; // POST success returns the created ref object; we don't need its body.
+        Ok(())
+    }
+
+    /// jleechan-znmh / issue #341 — routed-repo branch-delete for
+    /// `create_branch_at_for_repo`'s stale-ref recovery. `gh api
+    /// repos/<repo>/git/refs/heads/<name> --method DELETE` removes the
+    /// ref; reroll invokes this from its `extract_ref_already_exists`
+    /// recovery branch and then re-issues the create. Decoupled from the
+    /// daemon's own cwd (its systemd `WorkingDirectory`, the daemon's
+    /// own source-repo checkout) for the same reason
+    /// `create_branch_at_for_repo` is — without the routed-repo DELETE
+    /// the reroll's recovery would silently target the daemon's local
+    /// repo's branch, leaving the routed repo untouched and the next
+    /// create attempt bound to fail the same way.
+    ///
+    /// GitHub returns HTTP 204 on success and HTTP 422 if the ref does
+    /// not exist; the recovery caller treats a 422 as a no-op (the
+    /// create-after-delete will fail with the same shape if the ref
+    /// genuinely does not exist, and that error surfaces to the
+    /// operator instead of swallowing silently here).
+    fn delete_branch_at_for_repo(&self, repo: &str, name: &str) -> Result<(), DaemonError> {
+        let path = format!("repos/{}/git/refs/heads/{}", repo, name);
+        let _out = run_tool("gh", &["api", "--method", "DELETE", &path], 30)?;
         Ok(())
     }
 
@@ -4295,9 +4503,7 @@ impl Vcs for CliVcs {
             other => Err(DaemonError::Tool {
                 tool: "gh".to_string(),
                 rc: 0,
-                stderr: format!(
-                    "gh api {path} returned unrecognized compare status '{other}'"
-                ),
+                stderr: format!("gh api {path} returned unrecognized compare status '{other}'"),
             }),
         }
     }
@@ -4351,20 +4557,24 @@ const FALLBACK_CWD: &str = ".";
 /// does (bead `jleechan-g1k`) — MiniMax is still driving the `claude` CLI, so
 /// it still reads AGENTS.md / `.claude/` from the invocation cwd.
 fn run_minimax_judge(claude_bin: &str, prompt: &str) -> Result<String, DaemonError> {
-    let minimax_key = std::env::var("MINIMAX_API_KEY").map_err(|e| {
-        DaemonError::Tool {
-            tool: "minimax".into(),
-            rc: -1,
-            stderr: format!("MINIMAX_API_KEY not set: {e}"),
-        }
+    let minimax_key = std::env::var("MINIMAX_API_KEY").map_err(|e| DaemonError::Tool {
+        tool: "minimax".into(),
+        rc: -1,
+        stderr: format!("MINIMAX_API_KEY not set: {e}"),
     })?;
 
     let mut cmd = std::process::Command::new(claude_bin);
-    cmd.args(["--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt])
-        .current_dir(FALLBACK_CWD)
-        .stdin(std::process::Stdio::null())
-        .env("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
-        .env("ANTHROPIC_API_KEY", minimax_key);
+    cmd.args([
+        "--print",
+        "--dangerously-skip-permissions",
+        "--setting-sources",
+        "",
+        prompt,
+    ])
+    .current_dir(FALLBACK_CWD)
+    .stdin(std::process::Stdio::null())
+    .env("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
+    .env("ANTHROPIC_API_KEY", minimax_key);
 
     let output = cmd.output().map_err(|e| DaemonError::Tool {
         tool: "minimax".into(),
@@ -4519,7 +4729,10 @@ mod external_ref_tests {
         let corrupted = "jleechanorg/worldarchitect.ai#7888#local-8dyu";
         assert_eq!(
             canonicalize_external_ref_for_comment(corrupted),
-            Some(("jleechanorg/worldarchitect.ai".to_string(), "7888".to_string())),
+            Some((
+                "jleechanorg/worldarchitect.ai".to_string(),
+                "7888".to_string()
+            )),
             "expected the real repo#PR target to be recovered from the double-suffix corruption"
         );
     }
@@ -4563,9 +4776,7 @@ mod external_ref_tests {
     #[test]
     fn parse_external_ref_accepts_github_pull_url() {
         assert_eq!(
-            parse_external_ref(
-                "https://github.com/jleechanorg/worldarchitect.ai/pull/8064"
-            ),
+            parse_external_ref("https://github.com/jleechanorg/worldarchitect.ai/pull/8064"),
             Some((
                 "jleechanorg/worldarchitect.ai".to_string(),
                 "8064".to_string()
@@ -4577,10 +4788,7 @@ mod external_ref_tests {
     fn parse_external_ref_accepts_github_issue_url() {
         assert_eq!(
             parse_external_ref("https://github.com/jleechanorg/dark-factory/issues/238"),
-            Some((
-                "jleechanorg/dark-factory".to_string(),
-                "238".to_string()
-            ))
+            Some(("jleechanorg/dark-factory".to_string(), "238".to_string()))
         );
     }
 
@@ -4770,11 +4978,8 @@ mod chain_llm_fallback_argv_tests {
              done\n",
         )
         .unwrap();
-        std::fs::set_permissions(
-            path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
     }
 
     /// Prepare a temp directory containing a single executable named
@@ -4783,7 +4988,8 @@ mod chain_llm_fallback_argv_tests {
     /// `ChainLlm::judge`. The directory layout matches what `ChainLlm`
     /// expects for the daemon's own cwd (`FALLBACK_CWD = "."`).
     fn make_argv_dump_dir(prefix: &str, bin_name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("afd_chain_llm_{}_{}", prefix, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("afd_chain_llm_{}_{}", prefix, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         write_argv_dump_shim(&dir.join("bin").join(bin_name));
@@ -4859,9 +5065,7 @@ mod chain_llm_fallback_argv_tests {
         // line per remaining argv slot (argv[1..]). Strip the marker and
         // compare against the expected argv (argv[1..]).
         let mut lines = captured.lines();
-        let argv0_line = lines
-            .next()
-            .expect("argv0 marker present in shim output");
+        let argv0_line = lines.next().expect("argv0 marker present in shim output");
         assert!(
             argv0_line.starts_with("argv0="),
             "shim output must start with the argv0 marker; got {argv0_line:?}"
@@ -4869,7 +5073,12 @@ mod chain_llm_fallback_argv_tests {
 
         let actual_args: Vec<&str> = lines.collect();
 
-        let expected = &["exec", "--yolo", "--skip-git-repo-check", "hello-router-prompt"];
+        let expected = &[
+            "exec",
+            "--yolo",
+            "--skip-git-repo-check",
+            "hello-router-prompt",
+        ];
         assert_eq!(
             actual_args, expected,
             "codex fallback argv mismatch — got {actual_args:?}, expected {expected:?}"
@@ -4928,9 +5137,7 @@ mod chain_llm_fallback_argv_tests {
 
         let captured = result.expect("codex shim should succeed");
         let mut lines = captured.lines();
-        let argv0_line = lines
-            .next()
-            .expect("argv0 marker present in shim output");
+        let argv0_line = lines.next().expect("argv0 marker present in shim output");
         assert!(
             argv0_line.starts_with("argv0="),
             "shim output must start with the argv0 marker; got {argv0_line:?}"
@@ -5584,10 +5791,8 @@ exit 1
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let empty_dir = std::env::temp_dir().join(format!(
-            "afd_cli_vcs_no_gh_{}_{nanos}",
-            std::process::id()
-        ));
+        let empty_dir =
+            std::env::temp_dir().join(format!("afd_cli_vcs_no_gh_{}_{nanos}", std::process::id()));
         std::fs::create_dir_all(&empty_dir).unwrap();
 
         let prior_path = std::env::var_os("PATH");

@@ -175,6 +175,14 @@ pub struct FakeScm {
     /// same-repo open PR, or `PrHeadBranch::Fork` for a confirmed open PR
     /// whose head lives on a fork (the fail-closed guard).
     pub open_pr_head_refs: HashMap<(String, u64), PrHeadBranch>,
+    /// jleechan-znmh (issue #341, reroll PR-already-merged tolerance):
+    /// scripted `close_pr_for_repo` / `close_pr` lookup keyed by
+    /// `(repo, pr_number)`. `Some(stderr)` makes the close fail with
+    /// `DaemonError::Tool { tool: "gh", rc: 1, stderr }` (the exact shape
+    /// `gh pr close --repo <x> <n>` produces for an already-merged PR);
+    /// `None` (default) makes the close succeed. jleechan-znmh reroll must
+    /// classify this failure as a tolerant supersede, not a hard error.
+    pub pr_already_merged: HashMap<(String, u64), String>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -245,6 +253,13 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("close_pr({pr},{comment})"));
+        if let Some(stderr) = self.pr_already_merged.get(&("default".into(), pr)) {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: stderr.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -258,6 +273,13 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("close_pr_for_repo({repo},{pr},{comment})"));
+        if let Some(stderr) = self.pr_already_merged.get(&(repo.to_string(), pr)) {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: stderr.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -283,11 +305,7 @@ impl Scm for FakeScm {
             .unwrap_or(PrHeadBranch::NotFound))
     }
 
-    fn pr_number_for_branch(
-        &self,
-        repo: &str,
-        branch: &str,
-    ) -> Result<Option<u64>, DaemonError> {
+    fn pr_number_for_branch(&self, repo: &str, branch: &str) -> Result<Option<u64>, DaemonError> {
         self.calls
             .borrow_mut()
             .push(format!("pr_number_for_branch({repo},{branch})"));
@@ -441,9 +459,7 @@ impl FakeSessions {
     }
 
     pub fn fail_stop_for(&self, session_id: &str) {
-        self.fail_stop_for
-            .borrow_mut()
-            .push(session_id.to_string());
+        self.fail_stop_for.borrow_mut().push(session_id.to_string());
     }
 
     pub fn fail_spawn_deferred_for(&self, bead_id: &str) {
@@ -561,7 +577,10 @@ impl Sessions for FakeSessions {
             .borrow_mut()
             .push(format!("spawn({})", spec.bead_id));
         if self.panic_after_spawn_for.borrow().contains(&spec.bead_id) {
-            panic!("scripted process death after external spawn for {}", spec.bead_id);
+            panic!(
+                "scripted process death after external spawn for {}",
+                spec.bead_id
+            );
         }
         if self.fail_spawn_for.borrow().contains(&spec.bead_id) {
             return Err(DaemonError::Tool {
@@ -570,16 +589,10 @@ impl Sessions for FakeSessions {
                 stderr: format!("scripted spawn failure for {}", spec.bead_id),
             });
         }
-        if self
-            .fail_spawn_cleanup_for
-            .borrow()
-            .contains(&spec.bead_id)
-        {
+        if self.fail_spawn_cleanup_for.borrow().contains(&spec.bead_id) {
             return Err(DaemonError::SpawnCleanupFailed {
                 session: format!("leaked-{}", spec.bead_id),
-                spawn_error: Box::new(DaemonError::Parse(
-                    "scripted invalid spawn metadata".into(),
-                )),
+                spawn_error: Box::new(DaemonError::Parse("scripted invalid spawn metadata".into())),
                 cleanup_error: Box::new(DaemonError::Tool {
                     tool: "ao".into(),
                     rc: 1,
@@ -812,6 +825,16 @@ pub struct FakeVcs {
     /// "no rewrite detected") so tests that don't exercise the force-push
     /// detector don't have to script it.
     pub ancestor_pairs: HashMap<(String, String), bool>,
+    /// jleechan-znmh (issue #341, reroll stale-branch tolerance): scripted
+    /// `create_branch_at_for_repo` lookup keyed by `(repo, name)`. `Some(sha)`
+    /// makes the call fail with `DaemonError::Tool { tool: "gh", rc: 1,
+    /// stderr: "Reference already exists" }` (the exact `gh api
+    /// repos/<r>/git/refs` POST shape when `<refs/heads/<name>>` already
+    /// exists in `<r>` — HTTP 422 serialized by `gh` into this stderr);
+    /// `None` (default) makes the create succeed. jleechan-znmh reroll
+    /// must classify this failure as a recoverable stale-branch and
+    /// retry with a delete-and-recreate, never a hard fatal.
+    pub stale_branch_exists_at: RefCell<HashMap<(String, String), String>>,
 }
 
 impl FakeVcs {
@@ -863,6 +886,18 @@ impl Vcs for FakeVcs {
         self.calls
             .borrow_mut()
             .push(format!("create_branch_at({name},{sha})"));
+        if self
+            .stale_branch_exists_at
+            .borrow()
+            .get(&("default".into(), name.to_string()))
+            .is_some()
+        {
+            return Err(DaemonError::Tool {
+                tool: "git".into(),
+                rc: 1,
+                stderr: format!("fatal: a branch named '{name}' already exists"),
+            });
+        }
         Ok(())
     }
 
@@ -907,6 +942,44 @@ impl Vcs for FakeVcs {
         self.calls
             .borrow_mut()
             .push(format!("create_branch_at_for_repo({repo},{name},{sha})"));
+        // After a recovery delete, the reroll retries the create; we
+        // clear the scripted stale entry once we've observed the
+        // corresponding delete, emulating "repo no longer has the ref".
+        self.stale_branch_exists_at
+            .borrow_mut()
+            .remove(&(repo.to_string(), name.to_string()));
+        if self
+            .stale_branch_exists_at
+            .borrow()
+            .get(&(repo.to_string(), name.to_string()))
+            .is_some()
+        {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: format!(
+                    "gh api POST repos/{repo}/git/refs: Reference already exists (refs/heads/{name})"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// jleechan-znmh / issue #341: the reroll's recovery path issues
+    /// this AFTER the first create_branch_at_for_repo fails with
+    /// "Reference already exists". Recording the delete in `calls`
+    /// lets tests assert the recovery sequence; clearing the stale
+    /// script (in the create impl above, on observe) lets the retry
+    /// succeed.
+    fn delete_branch_at_for_repo(&self, repo: &str, name: &str) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("delete_branch_at_for_repo({repo},{name})"));
+        // Mirror real GH behavior: a real DELETE on a non-existent
+        // ref returns HTTP 422. The reroll's recovery treats a 422
+        // here as a no-op so a delete that found nothing doesn't
+        // itself wedge the bead; mirror that in the fake by
+        // succeeding unconditionally after recording the call.
         Ok(())
     }
 
@@ -1191,8 +1264,7 @@ impl StateStore for FakeStateStore {
         for overlay in self.overlays.borrow_mut().values_mut() {
             // Mirror the production allow-list and its durable no-session
             // proof so integration fakes cannot hide duplicate-spawn bugs.
-            let is_permanent =
-                is_permanent_human_hold_reason(overlay.park_reason.as_deref());
+            let is_permanent = is_permanent_human_hold_reason(overlay.park_reason.as_deref());
             if overlay.state == OverlayState::HumanHeld
                 && overlay.attempt < max_attempt
                 && !is_permanent
@@ -1252,7 +1324,9 @@ impl StateStore for FakeStateStore {
         self.calls
             .borrow_mut()
             .push(format!("reset_reroll_deferral({bead_id})"));
-        self.reroll_deferrals.borrow_mut().insert(bead_id.to_string(), 0);
+        self.reroll_deferrals
+            .borrow_mut()
+            .insert(bead_id.to_string(), 0);
         Ok(())
     }
 
