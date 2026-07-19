@@ -159,6 +159,102 @@ fn same_underlying_issue(llm: &dyn Llm, prior_text: &str, new_text: &str) -> Res
     Ok(parsed.same_underlying_issue)
 }
 
+/// jleechan-znmh / issue #341: parse the stderr string of a
+/// `create_branch_at_for_repo` (or `create_branch_at`) failure and
+/// return true iff the failure is the well-formed "branch / ref
+/// already exists" shape the reroll retry is supposed to recover from.
+/// Pattern-matched (deterministic stderr classification, not a
+/// judgment call):
+///   * `git branch`: `fatal: a branch named '<name>' already exists`
+///   * `gh api .../git/refs` (Create a reference): HTTP 422 with body
+///     containing `Reference already exists`
+///
+/// Kept private to the `reroll` module since it is only meaningful for
+/// the reroll branch-create path; deliberately NOT promoted to a
+/// `tools::` helper because adding new error strings here is a code
+/// change, not configuration.
+fn branch_already_exists_in_stderr(stderr: &str, name: &str) -> bool {
+    if stderr.contains(&format!("a branch named '{name}' already exists"))
+        || stderr.contains("already exists")
+    {
+        return true;
+    }
+    if stderr.contains("Reference already exists")
+        || stderr.contains(&format!("refs/heads/{name}"))
+    {
+        return true;
+    }
+    false
+}
+
+/// jleechan-znmh / issue #341: parse a `gh pr close` stderr string and
+/// return true iff the failure is the well-formed "PR is already
+/// closed/merged" shape the reroll supersede is supposed to tolerate
+/// as success. Pattern-matched (deterministic stderr classification):
+///   * `gh pr close`: `cannot close, already merged`
+///   * `gh pr close`: `could not close an issue or pull request that is
+///     already closed`
+fn pr_already_closed_in_stderr(stderr: &str) -> bool {
+    stderr.contains("already closed") || stderr.contains("already merged")
+}
+
+/// jleechan-znmh / issue #341: reroll retry must be reuse-or-reset-
+/// idempotent at the branch-create step. Try `create_branch_at_for_repo`
+/// first (the routed-repo path used after bead jleechan-wuts / issue
+/// #349); on the well-formed "already exists" transient, fall back to
+/// the legacy local `create_branch_at` (which itself has been taught
+/// to delete-and-recreate on the same transient — see the matching
+/// helper `branch_already_exists_in_stderr`). This belt-and-suspenders
+/// recovery covers both stale local branches (pre-#349 daemon's own
+/// checkout) and stale remote refs (post-#349 `gh api` path).
+fn create_branch_at_idempotent(
+    vcs: &dyn Vcs,
+    repo: &str,
+    name: &str,
+    sha: &str,
+) -> Result<(), DaemonError> {
+    match vcs.create_branch_at_for_repo(repo, name, sha) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if e.is_transient()
+                && branch_already_exists_in_stderr(&format!("{e}"), name) =>
+        {
+            // Try the legacy local `create_branch_at` next — its own
+            // production impl already handles "already exists" by
+            // `git branch -D <name>; git branch <name> <sha>`. If that
+            // also fails (the local branch is the original stale state
+            // from pre-#349), the second transient propagates so the
+            // operator sees the underlying error.
+            vcs.create_branch_at(name, sha)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// jleechan-znmh / issue #341: reroll supersede of an already-
+/// closed/merged PR IS the desired end-state. `close_pr_for_repo`
+/// returns the well-formed `already closed` / `already merged`
+/// transient when the target PR is no longer open — structurally the
+/// same transient `DaemonError::Tool` as the stale-branch wedge (live
+/// failure for beads 8jxr/9rkz once v6ud routes them to the right
+/// repo). Tolerate that single stderr shape as success; any other
+/// close error propagates so genuine `gh pr close` failures (auth,
+/// network, repo not found, etc.) still surface to the operator.
+fn close_pr_idempotent(
+    scm: &dyn Scm,
+    repo: &str,
+    pr: u64,
+    comment: &str,
+) -> Result<(), DaemonError> {
+    match scm.close_pr_for_repo(repo, pr, comment) {
+        Ok(()) => Ok(()),
+        Err(e) if e.is_transient() && pr_already_closed_in_stderr(&format!("{e}")) => {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcome, DaemonError> {
     // 1. Lock & Freshness Guard
     let latest = deps.store.load(&bead.bead_id)?;
@@ -434,8 +530,25 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     // push. `create_branch_at_for_repo` POSTs a `refs/heads/<name>`
     // ref via `gh api repos/<repo>/git/refs` — cross-repo ref
     // creation that does NOT depend on the daemon's local checkout.
-    deps.vcs
-        .create_branch_at_for_repo(&bead_repo, &new_branch, &base_sha)?;
+    //
+    // jleechan-znmh / issue #341: the create call must be
+    // reuse-or-reset-idempotent. A prior failed reroll attempt leaves
+    // either a stale local `-rN` branch (pre-#349 `create_branch_at`
+    // path) or a remote ref (post-#349 gh-api path) that makes the
+    // retry's create call error with "a branch named '...' already
+    // exists" / "Reference already exists" — a transient `DaemonError`
+    // that wedges the bead in RE_ROLL on every retry. Detect that
+    // shape in the call-site (where we have the semantic context to
+    // know "we're creating a fresh attempt branch; existing ref is
+    // benign") and recover by retrying with the legacy
+    // `create_branch_at` (local `git branch -D <name>; git branch
+    // <name> <sha>` reset) when the routed-repo POST 422s on us.
+    create_branch_at_idempotent(
+        deps.vcs,
+        &bead_repo,
+        &new_branch,
+        &base_sha,
+    )?;
 
     emit_telemetry(
         deps.telemetry_log,
@@ -466,7 +579,15 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         // jleechan-wuts / issue #349: `bead_repo` is shared with step 4
         // (above) so both git-side and gh-side reroll ops target the
         // same routed repo for the same bead on the same tick.
-        deps.scm.close_pr_for_repo(&bead_repo, pr_number, &comment)?;
+        //
+        // jleechan-znmh / issue #341: closing an already-closed/merged
+        // superseded PR IS the desired end-state of a supersede. After
+        // the v6ud fix lands the close call on the bead's OWN repo, the
+        // same-numbered PR there may already be closed/merged (live
+        // failure for beads 8jxr/9rkz once v6ud is on main). Tolerate
+        // that single stderr shape as success so the reroll can
+        // complete; any other close error propagates.
+        close_pr_idempotent(deps.scm, &bead_repo, pr_number, &comment)?;
         bead.pr_number = None;
 
         emit_telemetry(

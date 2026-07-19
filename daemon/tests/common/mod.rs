@@ -163,6 +163,18 @@ pub struct FakeScm {
     pub permissions: HashMap<String, Permission>,
     pub pr_snapshots: HashMap<u64, PrSnapshot>,
     pub remote_branches: HashMap<String, Option<u64>>,
+    /// jleechan-znmh / issue #341: scripted transient failures for
+    /// `close_pr_for_repo(repo, pr, comment)`, keyed by `(pr_number,
+    /// stderr_message)`. When the close call's `(pr, stderr)` matches a
+    /// keyed entry, the fake returns that `stderr_message` as a
+    /// `DaemonError::Tool { tool: "gh", rc: 1, stderr }` instead of
+    /// succeeding. Models the live failure where `gh pr close <n> --repo
+    /// <R>` reports "can't be closed because it was already merged" for a
+    /// superseded PR — the fix must tolerate this as a successful
+    /// supersede rather than a hard error that aborts the reroll. The
+    /// entry is consumed (popped from the front of the Vec) so a single
+    /// scripted failure fires exactly once.
+    pub fail_close_pr_for_repo_for: RefCell<Vec<(u64, String)>>,
     /// jleechan-t40t (issue #326): scripted `pr_number_for_branch` lookups,
     /// keyed by `(repo, branch)`. `Some(pr)` is a confirmed open PR bound
     /// to that branch in that repo; absence of a key means "no open PR
@@ -258,6 +270,18 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("close_pr_for_repo({repo},{pr},{comment})"));
+        // jleechan-znmh / issue #341: consume a one-shot scripted failure
+        // when (pr_number, stderr) matches. Models the "already merged"
+        // path the production fix must tolerate.
+        let mut failures = self.fail_close_pr_for_repo_for.borrow_mut();
+        if let Some(idx) = failures.iter().position(|(p, _)| *p == pr) {
+            let (_, stderr) = failures.remove(idx);
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr,
+            });
+        }
         Ok(())
     }
 
@@ -803,6 +827,17 @@ pub struct FakeVcs {
     /// Optional error to return from `head_sha` on every call for a given
     /// branch, modeling a `git rev-parse` failure mid-quiescence-check.
     pub fail_head_sha_for: RefCell<HashMap<String, String>>,
+    /// jleechan-znmh / issue #341: scripted transient failures for
+    /// `create_branch_at_for_repo`, keyed by `(branch_name,
+    /// stderr_message)`. When the create call's `name` matches a keyed
+    /// entry, the fake returns that `stderr_message` as a
+    /// `DaemonError::Tool { tool: "gh", rc: 128, stderr }` instead of
+    /// succeeding. Models the live failure where a stale local `-rN`
+    /// branch from a prior failed attempt makes the reroll's branch
+    /// create call error with "fatal: a branch named 'factory/<bead>-r2'
+    /// already exists". The entry is consumed (popped from the front of
+    /// the Vec) so a single scripted failure fires exactly once.
+    pub fail_create_branch_at_for_repo_for: RefCell<Vec<(String, String)>>,
     /// Scripts `remote_head_sha(branch)`. Reuses the same `heads` map as
     /// `head_sha` (the fake doesn't model the local-vs-remote-tracking-ref
     /// distinction) — set `heads.insert(branch, sha)` to script both.
@@ -898,6 +933,18 @@ impl Vcs for FakeVcs {
     /// shells out to the daemon's local git), masking the cross-repo bug.
     /// The fake simply records the call so tests can assert that reroll
     /// routed through the per-repo entry point with the bead's repo.
+    ///
+    /// jleechan-znmh / issue #341: `fail_create_branch_at_for_repo_for`
+    /// models a transient "Reference already exists" (HTTP 422) / "a
+    /// branch named '<name>' already exists" (local `git branch`) — the
+    /// one-shot scripted failure fires exactly ONCE per `(name, stderr)`
+    /// entry, and any subsequent call with the same `name` succeeds.
+    /// This mirrors the production `CliVcs::create_branch_at_for_repo`
+    /// idempotency contract: first POST fails (existing ref blocks
+    /// create), then a PATCH resets the ref to the new SHA — the
+    /// adapter layer makes the trait call succeed transparently. Tests
+    /// exercise the trait-level contract without depending on the
+    /// internal POST-then-PATCH dance.
     fn create_branch_at_for_repo(
         &self,
         repo: &str,
@@ -907,6 +954,21 @@ impl Vcs for FakeVcs {
         self.calls
             .borrow_mut()
             .push(format!("create_branch_at_for_repo({repo},{name},{sha})"));
+        let mut failures = self.fail_create_branch_at_for_repo_for.borrow_mut();
+        if let Some(idx) = failures.iter().position(|(n, _)| n == name) {
+            let (_, stderr) = failures.remove(idx);
+            // First attempt: fail with the transient. The production
+            // adapter retries internally and succeeds; the fake models
+            // this by allowing subsequent calls with the same name to
+            // succeed transparently. Tests asserting "the reroll
+            // completes despite the stale branch" thus exercise the
+            // production contract end-to-end through the trait.
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 128,
+                stderr,
+            });
+        }
         Ok(())
     }
 

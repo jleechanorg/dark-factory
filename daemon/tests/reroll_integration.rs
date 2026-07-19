@@ -2190,3 +2190,269 @@ fn test_reroll_close_pr_uses_bead_resolved_repo_not_cfg_target_repo() {
     std::fs::remove_dir_all(spec_dir).ok();
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// jleechan-znmh / issue #341: reroll must be reuse-or-reset-idempotent
+/// when a prior failed attempt left state behind (stale local `-rN`
+/// branch, stale remote ref). Pre-fix, the bead wedges in RE_ROLL on
+/// every retry because the branch-create step propagates a transient
+/// "already exists" error as a hard failure. Post-fix,
+/// `reroll::create_branch_at_idempotent` recovers transparently: the
+/// routed-repo create fails → fall back to the local create → local
+/// create deletes the stale branch and recreates at the freshly-computed
+/// baseline SHA. The bead completes its reroll without operator
+/// intervention.
+///
+/// Live failure (jleechan-9rkz, 2026-07-18T21:50:01Z): retry's
+/// `create_branch_at` errors with `fatal: a branch named
+/// 'factory/jleechan-9rkz-r2' already exists`. Verified that the remote
+/// `factory/jleechan-9rkz-r2` returns 404 from `gh api .../branches/...`
+/// — confirming a stale LOCAL-only branch left by the prior attempt,
+/// not a real remote collision.
+///
+/// Test shape: script the FakeVcs to report "Reference already exists"
+/// on the FIRST `create_branch_at_for_repo` call for the new attempt's
+/// branch name (modeling both the local-branch "a branch named ...
+/// already exists" and the gh-api HTTP 422 `Reference already exists`
+/// shapes via the same `branch_already_exists_in_stderr` classifier).
+/// The reroll MUST complete (`RerollOutcome::Rerolled` with
+/// `new_branch == "factory/jleechan-znmh-r2"`). Pre-fix this fails with
+/// a propagated `DaemonError::Tool` transient and the bead stays in
+/// `ReRoll` indefinitely.
+#[test]
+fn test_reroll_recovers_from_stale_branch_left_by_prior_failed_attempt() {
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("main".into(), "base-sha-znmh".into());
+    vcs.heads
+        .insert("factory/jleechan-znmh-r1".into(), "head-sha-znmh".into());
+
+    // Model the live failure: the FIRST routed-repo POST for the new
+    // attempt's branch name reports "Reference already exists" — the
+    // exact stderr shape `gh api .../git/refs` returns on HTTP 422 when
+    // a prior failed attempt left a remote ref behind. The retry
+    // `create_branch_at_for_repo` call returns this transient; the
+    // `create_branch_at_idempotent` helper in `reroll.rs` falls back
+    // to the legacy `create_branch_at` (which is itself idempotent:
+    // deletes the stale local branch, recreates at baseline SHA).
+    // The fake's `create_branch_at` records the call and returns Ok,
+    // mirroring the post-fix success.
+    vcs.fail_create_branch_at_for_repo_for
+        .borrow_mut()
+        .push((
+            "factory/jleechan-znmh-r2".to_string(),
+            "gh api repos/owner/repo/git/refs: HTTP 422 Reference already exists: \
+             a branch named 'factory/jleechan-znmh-r2' already exists"
+                .to_string(),
+        ));
+
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["handle stale branch"],"positiveAssertions":["recover on retry"],"securityRedactionEncountered":false}"#.into()
+    ));
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_znmh_branch_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_reroll_znmh_branch_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "jleechan-znmh".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 30,
+        spend_usd: 0.5,
+        pr_number: Some(341),
+        branch: Some("factory/jleechan-znmh-r1".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+    };
+    store.save(&bead).unwrap();
+    // jleechan-zeij / issue #322: step 3's quiescence probe fast-paths
+    // to "no_live_session" via SessionNotFound. Models the production
+    // state where the prior failed attempt's AO session is already
+    // torn down before this reroll fires.
+    sessions.attach_not_found_for("factory/jleechan-znmh-r1");
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "reroll must tolerate stale -rN branch".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    match outcome {
+        RerollOutcome::Rerolled { new_branch } => {
+            assert_eq!(
+                new_branch, "factory/jleechan-znmh-r2",
+                "reroll must transparently recover from a stale -rN branch \
+                 (jleechan-znmh fix). Pre-fix this would propagate the \
+                 'Reference already exists' transient and wedge the bead in RE_ROLL."
+            );
+        }
+        other => panic!(
+            "expected RerollOutcome::Rerolled despite stale branch; got {other:?}"
+        ),
+    }
+
+    // The bead must be in Recovery with attempt=2 and the new branch
+    // recorded — the full post-reroll state.
+    let updated = store.load("jleechan-znmh").unwrap().unwrap();
+    assert_eq!(updated.state, OverlayState::Recovery);
+    assert_eq!(updated.attempt, 2);
+    assert_eq!(updated.branch, Some("factory/jleechan-znmh-r2".to_string()));
+    assert_eq!(updated.pr_number, None);
+
+    // The recovery must have actually exercised the fallback path:
+    // `create_branch_at_for_repo` was called once (returned the
+    // transient) and `create_branch_at` was called once as the
+    // idempotency fallback (succeeded against the stale local branch).
+    let vcs_calls = vcs.calls.borrow();
+    let routed_calls: Vec<&String> = vcs_calls
+        .iter()
+        .filter(|c| c.starts_with("create_branch_at_for_repo("))
+        .collect();
+    let local_calls: Vec<&String> = vcs_calls
+        .iter()
+        .filter(|c| c.starts_with("create_branch_at("))
+        .collect();
+    assert_eq!(
+        routed_calls.len(),
+        1,
+        "reroll must call create_branch_at_for_repo exactly once; got: {vcs_calls:?}"
+    );
+    assert!(
+        routed_calls[0].contains("factory/jleechan-znmh-r2"),
+        "routed-repo create must target the -r2 branch; got: {routed_calls:?}"
+    );
+    assert_eq!(
+        local_calls.len(),
+        1,
+        "idempotency fallback must call legacy create_branch_at exactly once \
+         to reset the stale local branch; got: {vcs_calls:?}"
+    );
+    assert!(
+        local_calls[0].contains("factory/jleechan-znmh-r2"),
+        "local fallback create must target the -r2 branch; got: {local_calls:?}"
+    );
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-znmh / issue #341 — companion test: the SAME retry must also
+/// tolerate an "already merged" superseded PR (the live failure class for
+/// beads 8jxr/9rkz after the v6ud/#340 cross-repo PR-close fix). The
+/// companion issue closes the cross-repo bug, but the
+/// "already-closed/merged" path is a structurally separate transient
+/// error from `gh pr close` that must also be tolerated — closing an
+/// already-merged PR IS the desired end-state of a supersede.
+#[test]
+fn test_reroll_tolerates_already_closed_superseded_pr() {
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("main".into(), "base-sha-znmh-pr".into());
+    vcs.heads
+        .insert("factory/jleechan-znmh-pr-r1".into(), "head-sha-znmh-pr".into());
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["tolerate already-closed PR"],"positiveAssertions":["supersede is success"],"securityRedactionEncountered":false}"#.into()
+    ));
+
+    // Script close_pr_for_repo to fail with the exact "can't be closed
+    // because it was already merged" transient. The fix must tolerate
+    // this and continue.
+    scm.fail_close_pr_for_repo_for
+        .borrow_mut()
+        .push((341u64, "gh pr close 341 --repo owner/repo: cannot close, already merged".to_string()));
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_znmh_pr_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_reroll_znmh_pr_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "jleechan-znmh-pr".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 30,
+        spend_usd: 0.5,
+        pr_number: Some(341),
+        branch: Some("factory/jleechan-znmh-pr-r1".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+    };
+    store.save(&bead).unwrap();
+    // No live AO session for the prior attempt's branch — fast-path
+    // proceed at step 3, then exercise step 7's PR-close failure path.
+    sessions.attach_not_found_for("factory/jleechan-znmh-pr-r1");
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "reroll must tolerate already-closed PR".into(),
+    };
+
+    // Pre-fix this surfaces as a transient Tool error and wedges the
+    // bead. Post-fix the reroll completes.
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    match outcome {
+        RerollOutcome::Rerolled { new_branch } => {
+            assert_eq!(new_branch, "factory/jleechan-znmh-pr-r2");
+        }
+        other => panic!(
+            "expected RerollOutcome::Rerolled despite already-closed PR; \
+             closing an already-merged superseded PR IS the desired end-state \
+             of a supersede. got: {other:?}"
+        ),
+    }
+
+    let updated = store.load("jleechan-znmh-pr").unwrap().unwrap();
+    assert_eq!(updated.state, OverlayState::Recovery);
+    assert_eq!(updated.attempt, 2);
+    assert_eq!(updated.pr_number, None);
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}

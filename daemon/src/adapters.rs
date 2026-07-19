@@ -4137,8 +4137,27 @@ impl Vcs for CliVcs {
     }
 
     fn create_branch_at(&self, name: &str, sha: &str) -> Result<(), DaemonError> {
-        run_tool("git", &["branch", name, sha], 30)?;
-        Ok(())
+        // jleechan-znmh / issue #341: reuse-or-reset-idempotent. If a
+        // prior failed reroll attempt left a local branch named `name`
+        // in the daemon's git workdir, `git branch <name> <sha>` errors
+        // with `fatal: a branch named '<name>' already exists` —
+        // detect that and reset via `git branch -D <name>; git branch
+        // <name> <sha>`. The post-fix state is identical to a clean
+        // create on a never-seen-before name.
+        match run_tool("git", &["branch", name, sha], 30) {
+            Ok(_) => Ok(()),
+            Err(e)
+                if e.is_transient()
+                    && format!("{e}").contains(&format!(
+                        "a branch named '{name}' already exists"
+                    )) =>
+            {
+                run_tool("git", &["branch", "-D", name], 30)?;
+                run_tool("git", &["branch", name, sha], 30)?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// jleechan-wuts / issue #349: routed-repo variant of
