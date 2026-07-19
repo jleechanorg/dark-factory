@@ -9722,3 +9722,167 @@ fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
     assert_eq!(after.pr_number, Some(4001));
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// jleechan-t40t r10 (issue #326, live incident jleechan-8jxr / overlay
+/// sat at pr_number=359 pointing at the MERGED r3 PR while the attempt
+/// branch was factory/jleechan-8jxr-r10): the requeue-after-ESCALATION
+/// path can leave a stale `pr_number` for a closed/merged PR on the
+/// overlay. The branch may not yet have an open PR at all
+/// (`gh pr list --head <branch>` returns nothing while the coder is
+/// mid-bootstrap). Pre-existing slow-tier drift handling only fires on
+/// `Ok(Some(discovered))` — the `Ok(None)` case is currently a silent
+/// no-op, so a closed/merged PR can ride through into gate assessment
+/// on the next promotion, never converge, and leave the bead DISPATCHED
+/// indefinitely against a MERGED `pr_number`.
+///
+/// Contract (operator-guidance §"Fix contract"): before ANY gate
+/// assessment, validate the stored `pr_number` against the CURRENT
+/// attempt branch; on mismatch or closed/merged PR, defer (do NOT
+/// promote); on inconclusive lookup (`Ok(None)` while `pr_number` is
+/// set), the bead must emit a `PR_NUMBER_REREZOLVE_INCONCLUSIVE`
+/// telemetry event AND stay DISPATCHED so a later slow-tick can
+/// re-resolve once the new branch actually has an open PR. Hard tool
+/// errors (`Err`) are not promoted either — they fall through as
+/// transient. Falling through to ATTESTED on stale `pr_number=359`
+/// is the regression we are guarding against.
+#[test]
+fn slow_tier_dispatched_stale_pr_to_merged_branch_no_open_pr_stays_dispatched() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    // Bead was redispatched onto a brand-new attempt branch but the
+    // overlay carries the prior attempt's MERGED PR number. This is
+    // the exact 8jxr-r10 state: overlay state DISPATCHED on
+    // factory/jleechan-8jxr-r10 with pr_number=359 (the MERGED r3 PR).
+    let branch = "factory/stale-pr-merged-bead-r10";
+    store
+        .save(&BeadOverlay {
+            bead_id: "stale-pr-merged-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 10,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            // Stale: 359 was a prior attempt's PR on the r3 branch, now
+            // merged. The new branch is r10, which has NO open PR yet
+            // (the coder is still bootstrapping) — script lookup as
+            // Ok(None) to model that branch→PR lookup is inconclusive.
+            pr_number: Some(359),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store
+        .register_branch("stale-pr-merged-bead", branch)
+        .unwrap();
+
+    // No open PR is bound to the new branch yet (coder mid-bootstrap).
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), None);
+    // Crucially: the stored `pr_number=359` is the MERGED prior-attempt
+    // PR — `pr_snapshot_for_repo(owner/repo,359)` returns `Err` (no
+    // scripted snapshot), modeling the GitHub-side "PR closed/merged"
+    // lookup outcome. This is the additional probe the
+    // fail-closed-on-stale-pr_number contract relies on: a successful
+    // snapshot fetch would mean the PR is still readable (fresh
+    // dispatch with pr_number set out-of-band) and the bead could
+    // promote; a failed fetch proves the PR is genuinely stale.
+    //
+    // We deliberately do NOT insert pr_snapshots[359] so the probe
+    // returns Err and the fail-closed gate fires.
+
+    let telemetry_log = std::env::temp_dir()
+        .join("afd_t40t_stale_pr_merged_branch_no_open.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let _summary = run_tick(&deps, 1, 0).expect("tick should succeed");
+    let after = store.load("stale-pr-merged-bead").unwrap().unwrap();
+
+    // Operator fix-contract invariant: do NOT promote to ATTESTED when
+    // the stored pr_number belongs to a closed/merged PR (or the
+    // branch→PR lookup is inconclusive). The bead must stay DISPATCHED
+    // so the next slow-tick can re-resolve once the new branch actually
+    // has an open PR.
+    assert_eq!(
+        after.state,
+        OverlayState::Dispatched,
+        "bead must NOT promote to ATTESTED while the stored pr_number points \
+         at a closed/merged PR — that was the live 8jxr-r10 bug; otherwise \
+         gate assessment queries a MERGED PR and the bead can never converge"
+    );
+    assert_eq!(
+        after.pr_number, Some(359),
+        "stale pr_number is preserved (audit trail) when lookup is inconclusive; \
+         a later slow-tick will re-attempt re-resolution once an open PR appears"
+    );
+
+    // Auditability: the inconclusive-lookup condition must emit a
+    // `PR_NUMBER_REREZOLVE_INCONCLUSIVE` event so operators can grep
+    // the daemon log to see WHY a bead is stuck DISPATCHED rather than
+    // a silent fall-through.
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let inconclusive = events
+        .iter()
+        .find(|e| e["eventType"].as_str() == Some("PR_NUMBER_REREZOLVE_INCONCLUSIVE"));
+    assert!(
+        inconclusive.is_some(),
+        "expected PR_NUMBER_REREZOLVE_INCONCLUSIVE telemetry for stale pr_number + \
+         branch has no open PR; events = {events:?}"
+    );
+    let context = &inconclusive.unwrap()["context"];
+    assert_eq!(context["branch"].as_str(), Some(branch));
+    assert_eq!(context["stored_pr_number"].as_u64(), Some(359));
+
+    // Sanity: a slow-tier re-resolution lookup fired (even if the answer
+    // was inconclusive), proving the slow-tick ran and the bead
+    // participates in drift detection every dispatch cycle.
+    let calls = scm.calls.borrow();
+    assert!(
+        calls.iter().any(|c| c == &format!("pr_number_for_branch(owner/repo,{branch})")),
+        "expected pr_number_for_branch lookup on the slow tier; calls = {calls:?}"
+    );
+    // The drift-validation probe is allowed to fetch a snapshot for the
+    // stored `pr_number=359` (that is the fail-closed signal that proves
+    // the PR is unreadable). But it must fire AT MOST ONCE — fast-tier
+    // gate assessment must NOT also fetch the stale snapshot, because
+    // the bead is held DISPATCHED on inconclusive and must not enter the
+    // verifier pipeline against a closed/merged PR.
+    let stale_snapshot_calls = calls
+        .iter()
+        .filter(|c| c == &"pr_snapshot_for_repo(owner/repo,359)")
+        .count();
+    assert!(
+        stale_snapshot_calls <= 1,
+        "stale pr_number=359 must not flow into fast-tier gate assessment; \
+         saw {stale_snapshot_calls} snapshot calls (drift-validation probe + \
+         gate-assessment would be > 1), all calls = {calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}

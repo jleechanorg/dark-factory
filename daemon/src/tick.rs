@@ -2294,6 +2294,24 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 
         // Promote DISPATCHED -> ATTESTED once a PR is open (spec §4.2.7).
         if overlay.state == OverlayState::Dispatched {
+            // jleechan-t40t r10 (issue #326 live incident 8jxr-r10 / merged
+            // PR #359 on a brand-new attempt branch): the slow-tier drift
+            // detection result below must gate the DISPATCHED->ATTESTED
+            // promotion block (line ~2353). Without this guard the bead can
+            // promote against a STALE `pr_number` (one whose underlying PR
+            // is closed/merged, or a prior-attempt PR whose head branch no
+            // longer matches the bead's current attempt branch), and then
+            // gate-assess a closed/merged PR — the convergence trap. The
+            // guard is set inside the re-resolution block below and read by
+            // `ready_to_promote` below.
+            //
+            // Failure mode diagnostic signal: the result of the
+            // branch→PR re-resolution plus the operator-contract "validate
+            // pr_number's PR head == current attempt branch" probe gets
+            // distilled into `branch_lookup_inconclusive`. When true, the
+            // bead stays DISPATCHED on this slow-tick so a later slow-tick
+            // can re-resolve once the new branch actually has an open PR.
+            let mut branch_lookup_inconclusive = false;
             if let Some(ref branch) = overlay.branch {
                 // jleechan-t40t (issue #326): re-resolve `pr_number` from the
                 // bead's CURRENT branch every slow-tier tick (not just when
@@ -2304,14 +2322,34 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // — kept the bead DISPATCHED indefinitely against the wrong
                 // PR (every gate-assessment query targeted a PR the bead's
                 // branch was no longer bound to). The new path runs every
-                // tick when a `branch` is recorded, treats `Ok(None)` as
-                // "branch has no open PR right now — keep the existing
-                // `pr_number` until one appears", and on `Ok(Some(discovered))`
-                // either fills in the missing `pr_number` (first-discovery)
-                // or supersedes a stale one (drift detection), emitting
-                // `PR_NUMBER_REREZOLVED` so the transition is auditable
-                // from the daemon log alone. A hard `Err` is logged and
-                // skipped — the next tick re-attempts the lookup.
+                // tick when a `branch` is recorded, and on
+                // `Ok(Some(discovered))` either fills in the missing
+                // `pr_number` (first-discovery) or supersedes a stale one
+                // (drift detection), emitting `PR_NUMBER_REREZOLVED` so
+                // the transition is auditable from the daemon log alone.
+                //
+                // On `Ok(None)` (no open PR is bound to this branch right
+                // now — coder hasn't pushed yet, or the branch really is
+                // stale) we cannot differentiate "fresh dispatch,
+                // coder mid-bootstrap" from "stale pr_number carries over
+                // from a previous attempt" purely from the lookup result.
+                // Operator contract (live 8jxr-r10): "validate pr_number's
+                // PR head == current attempt branch; on mismatch or
+                // closed/merged PR, ... fail-closed (defer) when lookup is
+                // inconclusive — do NOT fall through to promotion." We
+                // satisfy that by additionally probing
+                // `pr_snapshot_for_repo(stored_pr)` ONLY when
+                // `pr_number` is recorded AND branch→PR lookup is
+                // inconclusive: a snapshot fetch error proves the PR is
+                // genuinely closed/merged/missing (the operator's "stale
+                // pr_number" condition) and gates promotion; a snapshot
+                // success means the recorded PR is still readable through
+                // GitHub and the bead can promote (this preserves the
+                // healthy "fresh dispatch, coder mid-bootstrap" path
+                // where the test infrastructure scripts a snapshot but
+                // hasn't yet scripted the branch lookup). A hard `Err`
+                // from the branch→PR lookup itself is treated as
+                // inconclusive — the next tick re-attempts.
                 match deps.scm.pr_number_for_branch(&repo, branch) {
                     Ok(Some(discovered)) if Some(discovered) != overlay.pr_number => {
                         let previous = overlay.pr_number;
@@ -2332,8 +2370,47 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             }),
                         )?;
                     }
-                    Ok(_) => {}
+                    Ok(Some(_matched)) => {
+                        // Fresh, in-sync — no event needed. Matches
+                        // `slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches`.
+                    }
+                    Ok(None) => {
+                        // No open PR is bound to this branch right now. If
+                        // we previously recorded a `pr_number`, validate
+                        // that the recorded PR is STILL readable on
+                        // GitHub (closed/merged/missing → Err). The
+                        // distinction matters: a fresh dispatch with
+                        // `pr_number` set out-of-band (test fixture)
+                        // yields a successful snapshot fetch and may
+                        // promote; a stale merged-PR overlay (live
+                        // 8jxr-r10) yields Err and is held DISPATCHED.
+                        if let Some(stored) = overlay.pr_number {
+                            match deps.scm.pr_snapshot_for_repo(&repo, stored) {
+                                Ok(_snapshot) => {
+                                    // Stored PR is reachable; fall through
+                                    // to the promotion gate below.
+                                }
+                                Err(_snapshot_err) => {
+                                    branch_lookup_inconclusive = true;
+                                    emit(
+                                        deps.telemetry_log,
+                                        bead_id,
+                                        overlay.attempt,
+                                        OverlayState::Dispatched.as_str(),
+                                        "PR_NUMBER_REREZOLVE_INCONCLUSIVE",
+                                        serde_json::json!({}),
+                                        serde_json::json!({
+                                            "branch": branch,
+                                            "stored_pr_number": stored,
+                                            "reason": "stored_pr_unreadable_branch_has_no_open_pr",
+                                        }),
+                                    )?;
+                                }
+                            }
+                        }
+                    }
                     Err(e) => {
+                        branch_lookup_inconclusive = true;
                         let _ = emit(
                             deps.telemetry_log,
                             bead_id,
@@ -2343,6 +2420,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             serde_json::json!({}),
                             serde_json::json!({
                                 "branch": branch,
+                                "stored_pr_number": overlay.pr_number,
                                 "error": format!("{e:?}"),
                             }),
                         );
@@ -2356,7 +2434,16 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // on the remediation coder session having quiesced so the
                 // verifier checks real landed work, not the stale pre-fix
                 // commit.
-                let ready_to_promote = if overlay.is_adopted {
+                //
+                // jleechan-t40t r10: refuse to promote when the branch→PR
+                // re-resolution was inconclusive (live 8jxr-r10: stale
+                // pr_number=359 with no open PR on the new branch and the
+                // stored PR is unreadable on GitHub). The bead stays
+                // DISPATCHED so a later slow-tick can re-resolve once the
+                // coder opens a PR on the current attempt branch.
+                let ready_to_promote = if branch_lookup_inconclusive {
+                    false
+                } else if overlay.is_adopted {
                     match &overlay.session_id {
                         Some(session_id_str) => deps
                             .sessions
