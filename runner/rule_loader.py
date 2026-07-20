@@ -4,13 +4,15 @@ from pathlib import Path
 from typing import List
 
 class Rule:
-    def __init__(self, rule_id: str, name: str, target_globs: List[str], model_tier: str, description: str, prompt: str):
+    def __init__(self, rule_id: str, name: str, target_globs: List[str], model_tier: str, description: str, prompt: str, reviewer: str | None = None, model: str | None = None):
         self.id = rule_id
         self.name = name
         self.target_globs = target_globs
         self.model_tier = model_tier
         self.description = description
         self.prompt = prompt
+        self.reviewer = reviewer
+        self.model = model
 
 class RuleLoader:
     def __init__(self, global_dir: str | Path, local_dir: str | Path):

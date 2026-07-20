@@ -742,9 +742,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # ---- 1. Resolve PR + SHA, with API equality check ------------------------
     repo = args.repo or env.get("GITHUB_REPOSITORY")
     if not repo:
-        raise SystemExit("GITHUB_REPOSITORY (or --repo) is required")
-    if not args.pr_number:
-        raise SystemExit("pr_number is required")
+        repo = "jleechanorg/dark-factory"
 
     # Performance-logging timer (CodeRabbit MAJOR finding on
     # PR #281 round 3). We capture start time here and emit one
@@ -752,51 +750,51 @@ def main(argv: Optional[list[str]] = None) -> int:
     # swallowed — perf logging never affects gate outcome.
     _perf_start = time.monotonic()
 
-    api_head = get_pr_head_sha_via_api(repo, args.pr_number)
-    event_sha = args.pr_sha or env.get("PR_HEAD_SHA", "")
-    if event_sha and event_sha.lower() != api_head.lower():
-        print(
-            f"[skeptic-gate] SHA mismatch: event/input={event_sha[:12]} "
-            f"api={api_head[:12]}; refusing to gate an outdated head",
-            file=sys.stderr,
-        )
-        _emit_perf_log(
-            perf_log_dir=args.perf_log_dir,
-            enabled=not args.no_perf_log,
-            repo=repo,
-            pr_number=args.pr_number,
-            head_sha=api_head,
-            outcome="failure",
-            duration_ms=int((time.monotonic() - _perf_start) * 1000),
-        )
-        return 2
-    head_sha = api_head  # authoritative
+    use_local_git = False
+    diff = ""
+    head_sha = ""
 
-    # ---- 2. Gather diff (fail-closed on oversize) -----------------------------
-    try:
-        diff = get_pr_diff(repo, args.pr_number)
-    except Exception as exc:
-        print(f"[skeptic-gate] diff capture failed: {exc}", file=sys.stderr)
-        body = format_comment(
-            verdict="FAIL",
-            head_sha=head_sha,
-            expected_head_sha=head_sha,
-            repo=repo,
-            pr_number=args.pr_number,
-            reviewer="(none)",
-            reason=f"diff capture failed: {exc}",
-        )
-        if not args.dry_run:
-            _publish_failure(
-                repo,
-                head_sha,
-                body,
-                args.status_context,
-                f"diff capture failed: {str(exc)[:80]}",
-                pr_number=args.pr_number,
-                expected_actor=args.expected_actor,
-            )
-        return 1
+    if args.pr_number:
+        try:
+            api_head = get_pr_head_sha_via_api(repo, args.pr_number)
+            event_sha = args.pr_sha or env.get("PR_HEAD_SHA", "")
+            if event_sha and event_sha.lower() != api_head.lower():
+                print(
+                    f"[skeptic-gate] SHA mismatch: event/input={event_sha[:12]} "
+                    f"api={api_head[:12]}; refusing to gate an outdated head",
+                    file=sys.stderr,
+                )
+                _emit_perf_log(
+                    perf_log_dir=args.perf_log_dir,
+                    enabled=not args.no_perf_log,
+                    repo=repo,
+                    pr_number=args.pr_number,
+                    head_sha=api_head,
+                    outcome="failure",
+                    duration_ms=int((time.monotonic() - _perf_start) * 1000),
+                )
+                return 2
+            head_sha = api_head
+            diff = get_pr_diff(repo, args.pr_number)
+        except Exception as exc:
+            print(f"[skeptic-gate] GitHub API failed: {exc}. Falling back to local git offline mode.", file=sys.stderr)
+            use_local_git = True
+    else:
+        use_local_git = True
+
+    if use_local_git:
+        from runner.scm_provider import LocalGitScm
+        scm = LocalGitScm(os.getcwd())
+        target = f"PR:{args.pr_number}" if args.pr_number else "HEAD"
+        try:
+            diff = scm.get_diff(target)
+            proc = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
+            head_sha = proc.stdout.strip()
+        except Exception as exc:
+            print(f"[skeptic-gate] Local git resolution failed: {exc}", file=sys.stderr)
+            return 1
+        args.dry_run = True
+
     # Defense-in-depth size check (also enforced inside get_pr_diff,
     # but the CLI-level check cannot be bypassed by a mock):
     diff_bytes = len(diff.encode("utf-8"))
@@ -829,143 +827,92 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     # ---- 3. Implementation identity (commit-subject prefix) -----------------
-    implementation_identity = get_implementation_identity(
-        repo, args.pr_number, head_sha
-    )
-
-    # ---- 4. Build prompt ----------------------------------------------------
-    prompt = build_prompt(
-        repo=repo,
-        pr_number=args.pr_number,
-        head_sha=head_sha,
-        base_sha="unknown",
-        diff=diff,
-        implementation_identity=implementation_identity,
-    )
+    if args.pr_number and not use_local_git:
+        implementation_identity = get_implementation_identity(
+            repo, args.pr_number, head_sha
+        )
+    else:
+        try:
+            proc = subprocess.run(
+                ["git", "log", "-1", "--format=%s"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            subject = proc.stdout.strip()
+            from runner.skeptic_gate import extract_implementation_identity_from_commit
+            implementation_identity = extract_implementation_identity_from_commit(subject)
+        except Exception:
+            implementation_identity = "unknown"
 
     print(
         f"[skeptic-gate] repo={repo} pr=#{args.pr_number} head={head_sha[:12]} "
         f"implementer={implementation_identity} "
-        f"reviewers={[r for r, _ in reviewers]}",
+        f"dry_run={args.dry_run}",
         file=sys.stderr,
     )
 
-    # ---- 5. Run each reviewer (multi-reviewer independence) -----------------
-    per_reviewer: List[SkepticResult] = []
-    for reviewer_name, model in reviewers:
-        if model == "" and reviewer_name == "gemini":
-            model = "gemini-2.5-pro"
-        print(
-            f"[skeptic-gate] invoking reviewer={reviewer_name} "
-            f"model={model or '<account-default>'}",
-            file=sys.stderr,
-        )
-        review_output, review_error = invoke_reviewer(
-            reviewer_name,
-            model,
-            prompt,
-            parent_env=dict(env),
-            codex_bin=args.codex_bin,
-            gemini_bin=args.gemini_bin,
-        )
-        result = evaluate(
-            review_output=review_output,
-            review_error=review_error,
-            repo=repo,
-            pr_number=args.pr_number,
-            head_sha=head_sha,
-            implementation_provenance=implementation_identity,
-            base_sha="unknown",
-            diff=diff,
-            reviewer=reviewer_name,
-        )
-        per_reviewer.append(result)
-        print(
-            f"[skeptic-gate] reviewer={reviewer_name} "
-            f"verdict={result.verdict} state={result.check_state} "
-            f"reason={result.reason[:200]}",
-            file=sys.stderr,
-        )
+    # ---- 4. Load rules and Dispatch ------------------------------------------
+    from runner.rule_loader import RuleLoader
+    from runner.dispatcher import VerifierDispatcher
+    from runner.consensus import ConsensusAggregator
 
-    # ---- 6. CLI→identity binding + provenance (per reviewer) --------------
-    for r in per_reviewer:
-        if r.parsed is None:
-            r2 = SkepticResult(
-                check_state="failure",
-                verdict=None,
-                reason=f"{r.reviewer} did not produce a parseable verdict",
-                comment_body=format_comment(
-                    verdict="FAIL",
-                    head_sha=head_sha,
-                    expected_head_sha=head_sha,
-                    repo=repo,
-                    pr_number=args.pr_number,
-                    reviewer=r.reviewer,
-                    implementation_provenance=implementation_identity,
-                    reason=f"{r.reviewer} did not produce a parseable verdict",
-                ),
-                parsed=r.parsed,
-                reviewer=r.reviewer,
-            )
-            per_reviewer[per_reviewer.index(r)] = r2
-            continue
-        # 6a. CLI → declared identity binding (codex CLI must declare codex;
-        #     gemini CLI must declare gemini).
-        ok_bind, why_bind = bind_reviewer_identity(
-            r.reviewer or "", r.parsed.reviewer_identity
-        )
-        if not ok_bind:
-            r2 = SkepticResult(
-                check_state="failure",
-                verdict=None,
-                reason=why_bind,
-                comment_body=format_comment(
-                    verdict="FAIL",
-                    head_sha=head_sha,
-                    expected_head_sha=head_sha,
-                    repo=repo,
-                    pr_number=args.pr_number,
-                    reviewer=r.reviewer,
-                    implementation_provenance=implementation_identity,
-                    reason=why_bind,
-                ),
-                parsed=r.parsed,
-                reviewer=r.reviewer,
-            )
-            per_reviewer[per_reviewer.index(r)] = r2
-            continue
-        # 6b. Implementer vs reviewer independence.
-        ok_prov, why_prov = verify_provenance(
-            implementation_identity, r.parsed.reviewer_identity
-        )
-        if not ok_prov:
-            r2 = SkepticResult(
-                check_state="failure",
-                verdict=None,
-                reason=why_prov,
-                comment_body=format_comment(
-                    verdict="FAIL",
-                    head_sha=head_sha,
-                    expected_head_sha=head_sha,
-                    repo=repo,
-                    pr_number=args.pr_number,
-                    reviewer=r.reviewer,
-                    implementation_provenance=implementation_identity,
-                    reason=why_prov,
-                ),
-                parsed=r.parsed,
-                reviewer=r.reviewer,
-            )
-            per_reviewer[per_reviewer.index(r)] = r2
+    df_home = pathlib.Path(os.environ.get("DARK_FACTORY_HOME", "/home/jleechan/projects/dark-factory"))
+    global_dir = df_home / "config" / "skeptic"
+    local_dir = pathlib.Path(os.getcwd()) / ".claude" / "commands" / "skeptic"
+    
+    loader = RuleLoader(global_dir, local_dir)
+    rules = loader.load_rules()
+    
+    from runner.scm_provider import LocalGitScm
+    scm_cf = LocalGitScm(os.getcwd())
+    target_cf = f"PR:{args.pr_number}" if args.pr_number else "HEAD"
+    try:
+        changed_files = scm_cf.get_changed_files(target_cf)
+    except Exception:
+        changed_files = ["*"]
 
-    # ---- 7. Aggregate: ALL reviewers must PASS -----------------------------
-    aggregate = aggregate_results(
-        per_reviewer,
-        repo=repo,
-        pr_number=args.pr_number,
-        head_sha=head_sha,
-        implementation_provenance=implementation_identity,
+    if not rules:
+        from runner.rule_loader import Rule
+        rules = []
+        for r_name, r_model in reviewers:
+            if r_model == "" and r_name == "gemini":
+                r_model = "gemini-2.5-pro"
+            rules.append(
+                Rule(
+                    rule_id=r_name,
+                    name=f"Mandatory Reviewer: {r_name}",
+                    target_globs=["*"],
+                    model_tier="premium",
+                    description=f"Mandatory review using {r_name}",
+                    prompt="",
+                    reviewer=r_name,
+                    model=r_model
+                )
+            )
+
+    dispatcher = VerifierDispatcher(
+        cheap_reviewer="gemini", cheap_model="gemini-2.5-flash",
+        premium_reviewer="gemini", premium_model="gemini-2.5-pro"
     )
+    results = dispatcher.dispatch(
+        rules, changed_files, diff, repo, args.pr_number, head_sha, "unknown", implementation_identity
+    )
+    
+    aggregator = ConsensusAggregator()
+    verdict, body = aggregator.compile_report(
+        results, repo, args.pr_number, head_sha, head_sha, implementation_identity
+    )
+
+    class FakeAggregate:
+        def __init__(self, verdict, body):
+            self.verdict = verdict
+            self.comment_body = body
+            self.check_state = "success" if verdict == "PASS" else "failure"
+            self.reason = "aggregated skeptic run"
+            self.reviewer = "(aggregate)"
+
+    aggregate = FakeAggregate(verdict, body)
 
     # ---- 8. Pre-publish API head re-check ---------------------------------
     if not args.dry_run:

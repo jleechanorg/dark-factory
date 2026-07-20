@@ -63,17 +63,77 @@ class VerifierDispatcher:
             prompt = self.build_rule_prompt(
                 rule, repo, pr_number, head_sha, base_sha, diff, implementation_identity
             )
-            if rule.model_tier == "premium":
-                reviewer = self.premium_reviewer
-                model = self.premium_model
-            else:
-                reviewer = self.cheap_reviewer
-                model = self.cheap_model
+            reviewer = rule.reviewer
+            model = rule.model
+            if not reviewer:
+                if rule.model_tier == "premium":
+                    reviewer = self.premium_reviewer
+                    model = self.premium_model
+                else:
+                    reviewer = self.cheap_reviewer
+                    model = self.cheap_model
 
             stdout, err = invoke_reviewer(reviewer, model, prompt)
             res = evaluate(
-                stdout, err, repo, pr_number, head_sha, reviewer, implementation_identity
+                review_output=stdout,
+                review_error=err,
+                repo=repo,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                implementation_provenance=implementation_identity,
+                base_sha="unknown",
+                diff=diff,
+                reviewer=reviewer,
             )
+
+            # Enforce security checks: binding and provenance (self-review rejection)
+            if res.check_state == "success" and res.parsed is not None:
+                from runner.skeptic_gate import bind_reviewer_identity, verify_provenance, format_comment
+                
+                # 1. CLI -> identity binding
+                ok_bind, why_bind = bind_reviewer_identity(reviewer, res.parsed.reviewer_identity)
+                if not ok_bind:
+                    body = format_comment(
+                        verdict="FAIL",
+                        head_sha=head_sha,
+                        expected_head_sha=head_sha,
+                        repo=repo,
+                        pr_number=pr_number,
+                        reviewer=reviewer,
+                        implementation_provenance=implementation_identity,
+                        reason=why_bind,
+                    )
+                    return rule, SkepticResult(
+                        check_state="failure",
+                        verdict=None,
+                        reason=why_bind,
+                        comment_body=body,
+                        parsed=res.parsed,
+                        reviewer=reviewer,
+                    )
+                    
+                # 2. Implementer vs reviewer independence (provenance)
+                ok_prov, why_prov = verify_provenance(implementation_identity, res.parsed.reviewer_identity)
+                if not ok_prov:
+                    body = format_comment(
+                        verdict="FAIL",
+                        head_sha=head_sha,
+                        expected_head_sha=head_sha,
+                        repo=repo,
+                        pr_number=pr_number,
+                        reviewer=reviewer,
+                        implementation_provenance=implementation_identity,
+                        reason=why_prov,
+                    )
+                    return rule, SkepticResult(
+                        check_state="failure",
+                        verdict=None,
+                        reason=why_prov,
+                        comment_body=body,
+                        parsed=res.parsed,
+                        reviewer=reviewer,
+                    )
+
             return rule, res
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(matching_rules)) as executor:
