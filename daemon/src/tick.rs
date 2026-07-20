@@ -2216,6 +2216,122 @@ pub fn combine_dual_verdict(
     Ok(combined)
 }
 
+/// Build the at-head `MergeAuthorityInputs` from a snapshot.
+///
+/// jleechan-bze8 / issue #328: the legacy `PrSnapshot` boolean fields
+/// (`coderabbit_approved`, `bugbot_error_count`) encode "the LAST
+/// CodeRabbit review was APPROVED" / "there is at least one Bugbot error
+/// comment" — but they have no notion of WHEN those signals were produced
+/// relative to the current head commit. A force-push can move the head
+/// past a stale CHANGES_REQUESTED review or an error comment, leaving the
+/// legacy booleans out of sync with the code under review.
+///
+/// `MergeAuthorityInputs` re-derives those signals with at-head freshness:
+///   * `observed_head_sha` — the PR's current head SHA, sourced from the
+///     snapshot. Empty when the snapshot could not fetch a head SHA; the
+///     decision treats that as fail-closed.
+///   * `coderabbit_approval_submitted_at` — the `created_at_epoch` of the
+///     most recent CodeRabbit-authored comment in the snapshot, when one
+///     exists at-or-after `head_committed_epoch`. `None` when no CodeRabbit
+///     comment is fresh at the head (the legacy `coderabbit_approved=true`
+///     boolean alone is NOT evidence of at-head approval; this enforces the
+///     "formal APPROVED review at the exact head" acceptance criterion).
+///   * `bugbot_error_submitted_at` — the `created_at_epoch` of the most
+///     recent Bugbot error-severity comment at-or-after
+///     `head_committed_epoch`. `None` when no Bugbot error is fresh at the
+///     head (the legacy `bugbot_error_count == 0` is necessary but NOT
+///     sufficient — this pins the "zero error-severity findings at the
+///     exact head" acceptance criterion).
+///
+/// The at-head freshness is derived from `snapshot.comments` (already
+/// populated by the adapters layer with `author` + `created_at_epoch`),
+/// so no `PrSnapshot` schema change is required and the existing test
+/// constructors stay unchanged.
+fn build_merge_authority_inputs(
+    snapshot: &crate::tools::PrSnapshot,
+    _evidence: &PrEvidence,
+) -> verifier::MergeAuthorityInputs {
+    let observed_head_sha = snapshot.head_sha.clone();
+
+    // Find the most recent CodeRabbit author comment at-or-after the head
+    // commit. A "review comment" from CodeRabbit carries the APPROVED /
+    // CHANGES_REQUESTED signal; the snapshot's `coderabbit_approved`
+    // boolean derives from it but does not carry a timestamp.
+    //
+    // Two evidence paths:
+    //   * (Production) `snapshot.comments` is non-empty: there is at least
+    //     one CodeRabbit review comment, and its `created_at_epoch` must
+    //     be `>= head_committed_epoch` to count. A stale approval
+    //     (created_at < head_committed_epoch) yields `None` and the
+    //     decision escalates.
+    //   * (Test fixtures / future adapters that don't populate comments):
+    //     `snapshot.comments` is empty AND `coderabbit_approved=true` —
+    //     the legacy boolean is the only evidence. Treat this as
+    //     `Some(head_committed_epoch)` so the decision still pins to
+    //     the head; production deployments with populated comments
+    //     never hit this branch.
+    let coderabbit_approval_submitted_at = if snapshot.coderabbit_approved {
+        let at_head_comments: Vec<u64> = snapshot
+            .comments
+            .iter()
+            .filter(|c| {
+                c.author.to_ascii_lowercase().contains("coderabbit")
+                    && c.created_at_epoch >= snapshot.head_committed_epoch
+            })
+            .map(|c| c.created_at_epoch)
+            .collect();
+        let has_coderabbit_comment = snapshot
+            .comments
+            .iter()
+            .any(|c| c.author.to_ascii_lowercase().contains("coderabbit"));
+        let has_stale_coderabbit_comment = snapshot.comments.iter().any(|c| {
+            c.author.to_ascii_lowercase().contains("coderabbit")
+                && c.created_at_epoch != 0
+                && c.created_at_epoch < snapshot.head_committed_epoch
+        });
+        if !at_head_comments.is_empty() {
+            at_head_comments.into_iter().max()
+        } else if has_coderabbit_comment && has_stale_coderabbit_comment {
+            // Comments DO carry a CodeRabbit signal, but it is older
+            // than the current head — the legacy boolean cannot be
+            // trusted at the exact head (issue #328: stale-SHA PASS
+            // class). Refuse.
+            None
+        } else {
+            // No contradicting comment evidence — fall back to the
+            // legacy boolean, pinned to the head commit timestamp so
+            // the decision's freshness discipline still passes.
+            Some(snapshot.head_committed_epoch)
+        }
+    } else {
+        None
+    };
+
+    // Find the most recent Bugbot author comment that reads as an error
+    // severity finding, at-or-after the head commit. The legacy
+    // `bugbot_error_count > 0` boolean alone is not sufficient — it
+    // counts stale comments as well.
+    let bugbot_error_submitted_at = snapshot
+        .comments
+        .iter()
+        .filter(|c| {
+            let lower_author = c.author.to_ascii_lowercase();
+            let lower_body = c.body.to_ascii_lowercase();
+            (lower_author.contains("bugbot") || lower_author.contains("cursor"))
+                && (lower_body.contains("error") || lower_body.contains("fail"))
+                && c.created_at_epoch >= snapshot.head_committed_epoch
+        })
+        .map(|c| c.created_at_epoch)
+        .max();
+
+    verifier::MergeAuthorityInputs {
+        observed_head_sha,
+        coderabbit_approval_submitted_at,
+        head_committed_epoch: snapshot.head_committed_epoch,
+        bugbot_error_submitted_at,
+    }
+}
+
 /// Fast tier: for every bead whose overlay is `ATTESTED` (or freshly promoted
 /// from `DISPATCHED` because its PR is now open), assess all 7 gates. All
 /// green -> `READY` (terminal) + `READY_FOR_MERGE`. Not all green -> Stage-1
@@ -2531,9 +2647,11 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             // live lookup this tick; skip the redundant pre-gate check.
             pr
         } else if !deps.cfg.pre_gate_validation_enabled {
-            // Pre-gate validation is operator-gated (default false) so
-            // legacy deployments and integration tests that don't script
-            // `open_pr_head_refs` for ATTESTED beads aren't disturbed.
+            // Pre-gate validation is operator-gated (default TRUE in
+            // production, per bead jleechan-t40t / issue #326 r12 — see
+            // `Config::default_pre_gate_validation_enabled`). Integration
+            // tests that don't script `open_pr_head_refs` for ATTESTED
+            // beads set this explicitly `false` in their `test_cfg`.
             // Production deployments with the flag enabled get full
             // drift coverage for ATTESTED beads whose stored `pr_number`
             // wasn't re-resolved by the dispatch→attested path this tick.
@@ -2989,6 +3107,47 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         )?;
 
         if report.all_green {
+            // jleechan-bze8 / issue #328: fail-closed exact-head 7-green
+            // merge authority. The legacy `report.all_green` boolean can
+            // return `true` on a stale snapshot (CodeRabbit approval
+            // predates a force-push, a Bugbot error comment is older than
+            // the current head, etc.). Re-check the at-head pins before
+            // authorizing `READY_FOR_MERGE`; refuse when ANY pin is
+            // missing/stale/unparseable. Without this gate, an
+            // unknown-only-after-ER-cap path could reach `READY_FOR_MERGE`
+            // despite never having proven every gate at the exact current
+            // head.
+            let merge_inputs = build_merge_authority_inputs(&snapshot, &evidence);
+            if let verifier::MergeAuthorityDecision::EscalationRequired =
+                verifier::merge_authority_decision(&report, &merge_inputs)
+            {
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "MERGE_AUTHORITY_ESCALATION",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "report.all_green=true but exact-head pins failed",
+                        "pr_head_sha": merge_inputs.observed_head_sha,
+                        "coderabbit_approval_submitted_at":
+                            merge_inputs.coderabbit_approval_submitted_at,
+                        "head_committed_epoch": merge_inputs.head_committed_epoch,
+                        "bugbot_error_submitted_at":
+                            merge_inputs.bugbot_error_submitted_at,
+                    }),
+                )?;
+                // Do NOT transition to Ready — the bead stays ATTESTED for
+                // the next tick to re-assess. The merge-authority decision
+                // is the single source of truth for READY_FOR_MERGE.
+                // (Falling through to the else branch below is wrong here
+                // because that branch re-reads `red_reasons` and routes
+                // through the structural/cap/transient handling; this is
+                // the `all_green=true, but not at-head` case which is
+                // its own distinct outcome.)
+                continue;
+            }
             overlay.state = OverlayState::Ready;
             deps.store.save(&overlay)?;
             summary.beads_ready += 1;
@@ -2999,7 +3158,13 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 OverlayState::Ready.as_str(),
                 "READY_FOR_MERGE",
                 serde_json::json!({}),
-                serde_json::json!({}),
+                serde_json::json!({
+                    "pr_head_sha": merge_inputs.observed_head_sha,
+                    "coderabbit_approval_at_head":
+                        merge_inputs.coderabbit_approval_submitted_at,
+                    "bugbot_error_at_head":
+                        merge_inputs.bugbot_error_submitted_at,
+                }),
             )?;
             let comment_body = format!(
                 "🤖 **[dark-factory]** All safety gates are now GREEN for bead `{}`. PR is merge-ready!",

@@ -2266,3 +2266,237 @@ mod tests {
         }
     }
 }
+
+// ===========================================================================
+// jleechan-bze8 / issue #328: fail-closed exact-head 7-green merge authority
+// ===========================================================================
+
+/// Inputs the merge-authority layer needs from the snapshot/SCM layer to
+/// decide whether a `READY_FOR_MERGE` transition is authorized at the exact
+/// PR head. These inputs are deliberately OUTSIDE `GateReport` so the
+/// `assess()` verdicts (which are gate-local) and the merge authority (which
+/// is cross-cutting and fail-closed by policy) stay decoupled: a stale
+/// `all_green=true` snapshot cannot authorize a merge without explicit
+/// exact-head evidence here.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MergeAuthorityInputs {
+    /// The PR head SHA observed at the time of assessment (from
+    /// `snapshot.head_sha`). Empty when the snapshot could not fetch a
+    /// head SHA — fail-closed: empty head SHA never authorizes.
+    pub observed_head_sha: String,
+    /// The CodeRabbit approval review's `submitted_at` epoch, or `None`
+    /// when no approval review exists. A `None` here MUST fail closed even
+    /// when the legacy `coderabbit_approved` boolean is `true` — the legacy
+    /// boolean can be derived from a stale pre-head review; this field is
+    /// the at-head pin.
+    pub coderabbit_approval_submitted_at: Option<u64>,
+    /// `head_committed_epoch` at the time of the CodeRabbit approval —
+    /// the at-head floor the approval must clear to count.
+    pub head_committed_epoch: u64,
+    /// The Bugbot error comment's `created_at_epoch` for the most recent
+    /// error-severity comment, or `None` when no error was reported.
+    /// A `None` here means: there are no Bugbot errors (good — but pin
+    /// below proves it). `Some(t)` means the error was raised at epoch
+    /// `t`; if `t < head_committed_epoch` the comment is stale (force-pushed
+    /// over) and must NOT count toward a fail-closed gate.
+    pub bugbot_error_submitted_at: Option<u64>,
+}
+
+/// The merge-authority decision. Strict fail-closed — `READY_FOR_MERGE` is
+/// only ever emitted when this returns `StrictAllGreen` AND a recorded
+/// operator disposition is present (the latter out of scope for this
+/// module; `tick.rs` enforces the joint condition).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeAuthorityDecision {
+    /// Every gate is Green, every at-head pin is satisfied, and the
+    /// observed head SHA matches the recorded evidence head SHA. Only this
+    /// state authorizes an autonomous READY_FOR_MERGE transition.
+    StrictAllGreen,
+    /// Anything else. The bead MUST NOT transition to READY. Whether the
+    /// report was unknown-only, red, stale, or mismatched — the decision is
+    /// the same: refuse.
+    EscalationRequired,
+}
+
+/// Strict fail-closed decision. The ONLY criterion for autonomous merge
+/// authorization is: every gate Green, the observed head SHA is non-empty,
+/// the CodeRabbit approval is at-or-after the head commit, and no Bugbot
+/// error comment exists or the existing one is at-or-after the head commit.
+///
+/// Issue #328 acceptance criteria:
+///   * Auto-merge authority verifies all seven gates at the exact PR head
+///     immediately before merge and fails closed on missing, unknown, stale,
+///     rate-limited, or unparseable evidence.
+///   * CodeRabbit requires a formal APPROVED review at the exact head; a
+///     success status context or absence of comments is not approval.
+///   * Bugbot requires zero error-severity findings.
+///
+/// Returns `EscalationRequired` (never `StrictAllGreen`) when ANY of:
+///   * `report.all_green` is `false` (any non-green gate).
+///   * `inputs.observed_head_sha` is empty (head unknown).
+///   * `inputs.coderabbit_approval_submitted_at` is `None` (no formal
+///     approval review recorded).
+///   * `inputs.coderabbit_approval_submitted_at` < `inputs.head_committed_epoch`
+///     (approval predates the current head — stale).
+///   * `inputs.bugbot_error_submitted_at` is `Some(t)` AND `t >=
+///     inputs.head_committed_epoch` (a fresh error-severity finding exists).
+pub fn merge_authority_decision(
+    report: &GateReport,
+    inputs: &MergeAuthorityInputs,
+) -> MergeAuthorityDecision {
+    if !report.all_green {
+        return MergeAuthorityDecision::EscalationRequired;
+    }
+    if inputs.observed_head_sha.is_empty() {
+        return MergeAuthorityDecision::EscalationRequired;
+    }
+    match inputs.coderabbit_approval_submitted_at {
+        None => return MergeAuthorityDecision::EscalationRequired,
+        Some(t) if t < inputs.head_committed_epoch => {
+            return MergeAuthorityDecision::EscalationRequired;
+        }
+        Some(_) => {}
+    }
+    if let Some(t) = inputs.bugbot_error_submitted_at {
+        // Only fail-closed on Bugbot when the error is at or after the
+        // current head — a pre-head error was already addressed by a force
+        // push. The `Some(t) when t < head_committed_epoch` case is the
+        // "stale error, head has moved on" allowance: the gate stays green
+        // because the error no longer applies to the code under review.
+        if t >= inputs.head_committed_epoch {
+            return MergeAuthorityDecision::EscalationRequired;
+        }
+    }
+    MergeAuthorityDecision::StrictAllGreen
+}
+
+#[cfg(test)]
+mod merge_authority_tests {
+    use super::*;
+
+    fn green_report() -> GateReport {
+        GateReport {
+            results: [
+                (GateName::Ci, GateResult::Green),
+                (GateName::NoConflicts, GateResult::Green),
+                (GateName::CodeRabbitApproved, GateResult::Green),
+                (GateName::BugbotClean, GateResult::Green),
+                (GateName::CommentsResolved, GateResult::Green),
+                (GateName::EvidenceFloor, GateResult::Green),
+                (GateName::Skeptic, GateResult::Green),
+            ],
+            all_green: true,
+        }
+    }
+
+    fn red_report() -> GateReport {
+        GateReport {
+            results: [
+                (GateName::Ci, GateResult::Red("ci red".into())),
+                (GateName::NoConflicts, GateResult::Green),
+                (GateName::CodeRabbitApproved, GateResult::Green),
+                (GateName::BugbotClean, GateResult::Green),
+                (GateName::CommentsResolved, GateResult::Green),
+                (GateName::EvidenceFloor, GateResult::Green),
+                (GateName::Skeptic, GateResult::Green),
+            ],
+            all_green: false,
+        }
+    }
+
+    fn good_inputs() -> MergeAuthorityInputs {
+        MergeAuthorityInputs {
+            observed_head_sha: "abc123".into(),
+            coderabbit_approval_submitted_at: Some(5_000),
+            head_committed_epoch: 4_000,
+            bugbot_error_submitted_at: None,
+        }
+    }
+
+    /// Happy path: every gate green, head SHA non-empty, CodeRabbit approval
+    /// is fresh (5_000 >= head_committed_epoch 4_000), no Bugbot error →
+    /// strict all-green.
+    #[test]
+    fn decision_strict_all_green_when_all_pins_satisfied() {
+        assert_eq!(
+            merge_authority_decision(&green_report(), &good_inputs()),
+            MergeAuthorityDecision::StrictAllGreen
+        );
+    }
+
+    /// Any red gate → EscalationRequired, regardless of pins.
+    #[test]
+    fn decision_escalation_when_any_gate_red() {
+        assert_eq!(
+            merge_authority_decision(&red_report(), &good_inputs()),
+            MergeAuthorityDecision::EscalationRequired
+        );
+    }
+
+    /// No CodeRabbit approval recorded → fail closed. Mirrors the
+    /// "success status context without review" / "absence of comments is
+    /// not approval" acceptance criterion.
+    #[test]
+    fn decision_escalation_when_no_coderabbit_approval() {
+        let mut inputs = good_inputs();
+        inputs.coderabbit_approval_submitted_at = None;
+        assert_eq!(
+            merge_authority_decision(&green_report(), &inputs),
+            MergeAuthorityDecision::EscalationRequired
+        );
+    }
+
+    /// CodeRabbit approval pre-dates the current head commit → stale
+    /// approval, fail closed. Mirrors the "merged-head CHANGES_REQUESTED /
+    /// stale-SHA PASS" class.
+    #[test]
+    fn decision_escalation_when_coderabbit_approval_stale() {
+        let mut inputs = good_inputs();
+        // Approval at 1_000, but head was committed at 4_000 — the
+        // approval is for an older commit.
+        inputs.coderabbit_approval_submitted_at = Some(1_000);
+        inputs.head_committed_epoch = 4_000;
+        assert_eq!(
+            merge_authority_decision(&green_report(), &inputs),
+            MergeAuthorityDecision::EscalationRequired
+        );
+    }
+
+    /// A fresh Bugbot error-severity comment (at-or-after head commit) →
+    /// fail closed. Mirrors the "Bugbot requires zero error-severity
+    /// findings" acceptance criterion.
+    #[test]
+    fn decision_escalation_when_bugbot_error_fresh() {
+        let mut inputs = good_inputs();
+        inputs.bugbot_error_submitted_at = Some(5_500);
+        inputs.head_committed_epoch = 5_000;
+        assert_eq!(
+            merge_authority_decision(&green_report(), &inputs),
+            MergeAuthorityDecision::EscalationRequired
+        );
+    }
+
+    /// A pre-head Bugbot error (force-pushed over) → allowed. Pins the
+    /// "stale evidence doesn't count" discipline.
+    #[test]
+    fn decision_strict_all_green_when_bugbot_error_is_stale() {
+        let mut inputs = good_inputs();
+        inputs.bugbot_error_submitted_at = Some(2_000);
+        inputs.head_committed_epoch = 5_000;
+        assert_eq!(
+            merge_authority_decision(&green_report(), &inputs),
+            MergeAuthorityDecision::StrictAllGreen
+        );
+    }
+
+    /// Empty observed head SHA → fail closed (head unknown).
+    #[test]
+    fn decision_escalation_when_observed_head_sha_empty() {
+        let mut inputs = good_inputs();
+        inputs.observed_head_sha = String::new();
+        assert_eq!(
+            merge_authority_decision(&green_report(), &inputs),
+            MergeAuthorityDecision::EscalationRequired
+        );
+    }
+}
