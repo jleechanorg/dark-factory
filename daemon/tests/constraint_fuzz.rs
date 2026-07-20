@@ -55,6 +55,7 @@ fn test_cfg(spec_dir: &std::path::Path) -> Config {
         held_recheck_cooldown_secs: 900,
         repos: std::collections::HashMap::new(),
         pre_gate_validation_enabled: false,
+        ..Default::default()
     }
 }
 
@@ -294,9 +295,9 @@ fn run_cb_case(case: &CbCase, spec_dir: &std::path::Path, llm: &dyn Llm) -> bool
         session_id: None,
         is_adopted: false,
         spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
     };
     store.save(&bead).unwrap();
 

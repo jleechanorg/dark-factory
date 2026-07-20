@@ -16,9 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use daemon::vacuous_red_green::{
-    check_red_green, FileClass, RedGreenError,
-};
+use daemon::vacuous_red_green::{check_red_green, FileClass, RedGreenError};
 
 /// Build a tiny Rust project that exposes one production function and one
 /// test that exercises it. Returned `Production` path is the .rs file that
@@ -76,7 +74,9 @@ path = "src/lib.rs"
     std::fs::create_dir_all(lib_path.parent().unwrap()).unwrap();
     std::fs::write(&lib_path, "// skeleton lib\n").unwrap();
 
-    run(Command::new("git").current_dir(&root).args(["init", "-q", "-b", "main"]));
+    run(Command::new("git")
+        .current_dir(&root)
+        .args(["init", "-q", "-b", "main"]));
     run(Command::new("git")
         .current_dir(&root)
         .args(["config", "user.email", "test@example.com"]));
@@ -87,10 +87,12 @@ path = "src/lib.rs"
         .current_dir(&root)
         .args(["config", "commit.gpgsign", "false"]));
     run(Command::new("git").current_dir(&root).args(["add", "-A"]));
-    run(Command::new("git").current_dir(&root).args(["commit", "-q", "-m", "base"]));
-    let base_sha = String::from_utf8(
-        run(Command::new("git").current_dir(&root).args(["rev-parse", "HEAD"])),
-    )
+    run(Command::new("git")
+        .current_dir(&root)
+        .args(["commit", "-q", "-m", "base"]));
+    let base_sha = String::from_utf8(run(Command::new("git")
+        .current_dir(&root)
+        .args(["rev-parse", "HEAD"])))
     .unwrap()
     .trim()
     .to_string();
@@ -112,10 +114,7 @@ path = "src/lib.rs"
     let test_path = tests_dir.join("scenario.rs");
     std::fs::write(&test_path, test_src).unwrap();
 
-    MiniProject {
-        root,
-        base_sha,
-    }
+    MiniProject { root, base_sha }
 }
 
 fn run(cmd: &mut Command) -> Vec<u8> {
@@ -140,32 +139,31 @@ fn commit_current_tree(proj: &MiniProject, message: &str) -> String {
     run(Command::new("git")
         .current_dir(&proj.root)
         .args(["commit", "-q", "-m", message]));
-    String::from_utf8(
-        run(Command::new("git").current_dir(&proj.root).args(["rev-parse", "HEAD"])),
-    )
+    String::from_utf8(run(Command::new("git")
+        .current_dir(&proj.root)
+        .args(["rev-parse", "HEAD"])))
     .unwrap()
     .trim()
     .to_string()
 }
 
 fn classify_changed_files(proj: &MiniProject) -> Vec<(PathBuf, FileClass)> {
-    let diff = String::from_utf8(
-        run(Command::new("git").current_dir(&proj.root).args([
-            "diff",
-            "--name-only",
-            &format!("{}...HEAD", proj.base_sha),
-        ])),
-    )
+    let diff = String::from_utf8(run(Command::new("git").current_dir(&proj.root).args([
+        "diff",
+        "--name-only",
+        &format!("{}...HEAD", proj.base_sha),
+    ])))
     .unwrap();
     diff.lines()
         .filter(|l| !l.is_empty())
         .map(|l| {
             let p = proj.root.join(l);
-            let kind = if l.contains("/tests/") || l.ends_with("_test.rs") || l == "tests/scenario.rs" {
-                FileClass::Test
-            } else {
-                FileClass::Production
-            };
+            let kind =
+                if l.contains("/tests/") || l.ends_with("_test.rs") || l == "tests/scenario.rs" {
+                    FileClass::Test
+                } else {
+                    FileClass::Production
+                };
             (p, kind)
         })
         .collect()
@@ -286,7 +284,9 @@ fn target_test_names_are_only_changed_tests() {
     let report = check_red_green(&proj.root, &proj.base_sha, &changed).expect("report");
     let names: Vec<&str> = report.targeted_tests.iter().map(|s| s.as_str()).collect();
     assert!(
-        names.iter().all(|n| ["classify_high", "classify_medium", "classify_low"].contains(n)),
+        names
+            .iter()
+            .all(|n| ["classify_high", "classify_medium", "classify_low"].contains(n)),
         "unexpected targeted_tests: {names:?}"
     );
     // And nothing outside the PR's touched test file.

@@ -1866,11 +1866,9 @@ fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> 
         // `cursor-agent` and the bare `cursor` alias are accepted so
         // `skeptic_reviewers` telemetry is stable regardless of which name
         // the priority list uses.
-        "cursor-agent" | "cursor" => run_tool(
-            "cursor-agent",
-            &["-f", prompt],
-            REVIEWER_TIMEOUT_SECS,
-        ),
+        "cursor-agent" | "cursor" => {
+            run_tool("cursor-agent", &["-f", prompt], REVIEWER_TIMEOUT_SECS)
+        }
         other => Err(DaemonError::Tool {
             tool: other.to_string(),
             rc: -1,
@@ -3002,6 +3000,21 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
             None => verifier::EvidenceGistStatus::NotProvided,
         };
+        // Bead jleechan-ijod / issue #387 (r3): wire the runtime vacuous-test
+        // detector into the gate-assessment path. When the daemon has a local
+        // checkout configured (`cfg.vacuous_worktree_root`), we run the
+        // detector on every assessment tick and surface its verdict via
+        // `PrEvidence::vacuous_red_green`. The detector's verdict gates
+        // `evidence_floor_gate` (gate 6) — a vacuous=true flips gate 6 to
+        // Red with a snippet naming the failing-to-fail tests. InfraError
+        // surfaces as Unknown (wait, do not churn a reroll on a flaky box).
+        //
+        // When `vacuous_worktree_root` is unset (default), we keep the
+        // pre-r3 behavior: `NotProvided` → no override. This is the
+        // default for production deployments until the operator opts in
+        // via `daemon.toml`'s `vacuous_worktree_root = "/path/to/checkout"`.
+        evidence.vacuous_red_green =
+            run_vacuous_detector_for_assessment(deps, &repo, pr, &snapshot);
         let report = verifier::assess(deps.scm, pr, &repo, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
         // jleechan-wzgl: log the full per-gate breakdown (all 7 gates,
@@ -3667,4 +3680,103 @@ fn post_scm_comment_by_bead_id(
     Err(DaemonError::Config(format!(
         "no SCM comment target found for bead {bead_id}"
     )))
+}
+
+/// Bead jleechan-ijod / issue #387 (r3): gate-assessment-time entry point
+/// for the runtime vacuous-test detector. Builds the changed-file list from
+/// `snapshot.files` (the PR's diff as seen by GitHub), spawns the canonical
+/// `daemon/scripts/vacuous-red-green.sh` wrapper against the configured
+/// worktree, and maps the wrapper's JSON output to a `VacuousRedGreenStatus`
+/// for `PrEvidence` consumption.
+///
+/// Returns `NotProvided` (pre-r3 default) when:
+///   * `cfg.vacuous_worktree_root` is unset (operator hasn't opted in),
+///   * the PR has no test files in the diff (so the detector would
+///     return `NoChangedTests`),
+///   * the worktree path is missing/invalid.
+///
+/// Returns `InfraError` when the wrapper subprocess fails (spawn, JSON
+/// parse, etc.) — the gate surfaces this as `Unknown` so a flaky box
+/// doesn't churn a reroll.
+fn run_vacuous_detector_for_assessment(
+    deps: &TickDeps,
+    _repo: &str,
+    _pr: u64,
+    snapshot: &crate::tools::PrSnapshot,
+) -> verifier::VacuousRedGreenStatus {
+    use crate::vacuous_red_green::{self, FileClass};
+
+    let worktree = match &deps.cfg.vacuous_worktree_root {
+        Some(p) => std::path::PathBuf::from(p),
+        None => return verifier::VacuousRedGreenStatus::NotProvided,
+    };
+    if !worktree.exists() {
+        return verifier::VacuousRedGreenStatus::InfraError(format!(
+            "vacuous_worktree_root {} does not exist",
+            worktree.display()
+        ));
+    }
+
+    // Build the changed-files list from snapshot.files. We use only the
+    // repo-relative paths so the detector's `git show base_ref:<path>`
+    // resolution matches what the local checkout sees.
+    let changed: Vec<(std::path::PathBuf, FileClass)> = snapshot
+        .files
+        .iter()
+        .filter(|f| !f.path.is_empty())
+        .map(|f| {
+            let p = std::path::PathBuf::from(&f.path);
+            let class = if vacuous_red_green::is_test_path(&f.path) {
+                FileClass::Test
+            } else {
+                FileClass::Production
+            };
+            (p, class)
+        })
+        .collect();
+
+    // Fast-path: no test files in the diff → detector returns
+    // NoChangedTests → we surface NotProvided so the gate doesn't
+    // confuse "no test diff" with "vacuous".
+    let has_test = changed.iter().any(|(_, k)| *k == FileClass::Test);
+    if !has_test {
+        return verifier::VacuousRedGreenStatus::NotProvided;
+    }
+
+    // Base ref: use the head's first parent (`<head_sha>^`). The snapshot
+    // carries `head_sha` (the PR tip) but not the base SHA directly; the
+    // detector's git ops resolve `<head>^` against the local worktree,
+    // which is the same commit the PR diff is measured against when the
+    // worktree is on the PR branch. If `head_sha` is empty (shouldn't
+    // happen but fail-closed), bail with InfraError.
+    let base_ref = if snapshot.head_sha.is_empty() {
+        return verifier::VacuousRedGreenStatus::InfraError(
+            "snapshot.head_sha is empty; cannot derive base ref".to_string(),
+        );
+    } else {
+        format!("{}^", snapshot.head_sha)
+    };
+
+    let manifest_path = match &deps.cfg.vacuous_manifest_path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => vacuous_red_green::detect_manifest_path(&worktree),
+    };
+
+    // Run the detector IN-PROCESS so we don't pay a cargo build round-trip
+    // per bead per tick (the lib is already linked into the daemon).
+    let report = match vacuous_red_green::check_red_green_with_manifest(
+        &worktree,
+        &base_ref,
+        &changed,
+        &manifest_path,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return verifier::VacuousRedGreenStatus::InfraError(format!(
+                "vacuous_red_green in-process run failed: {e}"
+            ));
+        }
+    };
+
+    verifier::vacuous_red_green_status_from_report(&report)
 }

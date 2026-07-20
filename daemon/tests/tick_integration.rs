@@ -54,6 +54,7 @@ fn test_cfg() -> Config {
         held_recheck_cooldown_secs: 900,
         repos: std::collections::HashMap::new(),
         pre_gate_validation_enabled: false,
+        ..Default::default()
     }
 }
 
@@ -7744,26 +7745,18 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
     let gate_assessment_line = telemetry
         .lines()
         .find(|l| l.contains("\"eventType\":\"GATE_ASSESSMENT\""))
-        .unwrap_or_else(|| {
-            panic!("no GATE_ASSESSMENT line; telemetry:\n{telemetry}")
-        });
+        .unwrap_or_else(|| panic!("no GATE_ASSESSMENT line; telemetry:\n{telemetry}"));
     let gate_assessment: serde_json::Value = serde_json::from_str(gate_assessment_line)
         .unwrap_or_else(|e| {
-            panic!(
-                "GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}"
-            )
+            panic!("GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}")
         });
     let context = gate_assessment
         .get("context")
         .unwrap_or_else(|| panic!("no context: {gate_assessment_line}"));
 
-    let skeptic_reviewers = context["skeptic_reviewers"]
-        .as_array()
-        .unwrap_or_else(|| {
-            panic!(
-                "GATE_ASSESSMENT context.skeptic_reviewers must be an array; context:\n{context}"
-            )
-        });
+    let skeptic_reviewers = context["skeptic_reviewers"].as_array().unwrap_or_else(|| {
+        panic!("GATE_ASSESSMENT context.skeptic_reviewers must be an array; context:\n{context}")
+    });
     let skeptic_reviewers: Vec<&str> = skeptic_reviewers
         .iter()
         .filter_map(|v| v.as_str())
@@ -7865,10 +7858,8 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
 
-    let _env_guard = EnvVarGuard::set(&[
-        ("PATH", &new_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
-    ]);
+    let _env_guard =
+        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -7968,14 +7959,10 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
     let gate_assessment_line = telemetry
         .lines()
         .find(|l| l.contains("\"eventType\":\"GATE_ASSESSMENT\""))
-        .unwrap_or_else(|| {
-            panic!("no GATE_ASSESSMENT line; telemetry:\n{telemetry}")
-        });
+        .unwrap_or_else(|| panic!("no GATE_ASSESSMENT line; telemetry:\n{telemetry}"));
     let gate_assessment: serde_json::Value = serde_json::from_str(gate_assessment_line)
         .unwrap_or_else(|e| {
-            panic!(
-                "GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}"
-            )
+            panic!("GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}")
         });
     let context = gate_assessment
         .get("context")
@@ -10605,8 +10592,10 @@ fn transient_pr_number_reresolve_error_keeps_dispatched_no_promotion() {
         .unwrap();
     store.register_branch("t40t-transient", branch).unwrap();
     // The branch→PR resolution fails transiently this tick.
-    scm.pr_number_for_branch_errors
-        .insert(("owner/repo".into(), branch.into()), "gh api timeout".into());
+    scm.pr_number_for_branch_errors.insert(
+        ("owner/repo".into(), branch.into()),
+        "gh api timeout".into(),
+    );
 
     let telemetry_log = std::env::temp_dir().join("afd_t40t_transient_reresolve.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -10796,7 +10785,14 @@ fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
 // a fail-closed evidence-gate FAIL.
 // ===========================================================================
 
-fn evidence_bead(store: &FakeStateStore, scm: &mut FakeScm, bead_id: &str, pr: u64, branch: &str, body: &str) {
+fn evidence_bead(
+    store: &FakeStateStore,
+    scm: &mut FakeScm,
+    bead_id: &str,
+    pr: u64,
+    branch: &str,
+    body: &str,
+) {
     store
         .save(&BeadOverlay {
             bead_id: bead_id.into(),
@@ -10858,8 +10854,18 @@ fn evidence_gate_verified_gist_reaches_ready() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_ok.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let summary = run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
-        1, 0,
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
     )
     .expect("tick must not error");
     assert_eq!(summary.gates_assessed, 1);
@@ -10868,7 +10874,11 @@ fn evidence_gate_verified_gist_reaches_ready() {
         OverlayState::Ready,
         "a verified evidence gist must let an otherwise-green PR reach READY"
     );
-    assert!(scm.calls.borrow().iter().any(|c| c.contains("gist_nonempty(goodgist)")));
+    assert!(scm
+        .calls
+        .borrow()
+        .iter()
+        .any(|c| c.contains("gist_nonempty(goodgist)")));
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
@@ -10896,8 +10906,18 @@ fn evidence_gate_empty_gist_fails_closed_not_ready() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_empty.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     let summary = run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
-        1, 0,
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
     )
     .expect("tick must not error");
     assert_eq!(summary.gates_assessed, 1);
@@ -10939,8 +10959,18 @@ fn evidence_gate_head_mismatch_fails_closed() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_stale.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
-        1, 0,
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
     )
     .expect("tick must not error");
     assert_ne!(
@@ -10984,9 +11014,20 @@ fn evidence_gate_incomplete_marker_fails_closed() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_incomplete.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
-        1, 0,
-    ).expect("tick must not error");
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick must not error");
     assert_ne!(
         store.load("ev-incomplete").unwrap().unwrap().state,
         OverlayState::Ready,
@@ -11027,9 +11068,20 @@ fn evidence_gate_transient_gist_error_is_pending_not_red() {
     let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_transient.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
     run_tick(
-        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
-        1, 0,
-    ).expect("tick must not error");
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick must not error");
     // Not READY (evidence unknown), but NOT parked/rerolled — stays ATTESTED to retry.
     assert_eq!(
         store.load("ev-transient").unwrap().unwrap().state,

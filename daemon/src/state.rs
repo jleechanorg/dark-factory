@@ -889,7 +889,13 @@ impl SqliteStateStore {
             .map_err(|e| tool_err("ensure_disposition_required_state: rollback probe", e))?;
         let needs_migration = match probe {
             Ok(_) => false, // CHECK already allows it (fresh/already-migrated DB).
-            Err(ref e) if e.to_string().to_ascii_lowercase().contains("check constraint") => true,
+            Err(ref e)
+                if e.to_string()
+                    .to_ascii_lowercase()
+                    .contains("check constraint") =>
+            {
+                true
+            }
             Err(e) => {
                 // A different failure (e.g. a table shape we don't understand)
                 // — do not attempt a rebuild we can't reason about; surface it.
@@ -911,8 +917,9 @@ impl SqliteStateStore {
                 .query_map([], |row| row.get::<_, String>(0))
                 .map_err(|e| tool_err("ensure_disposition_required_state: pragma query", e))?;
             for name in rows {
-                live_cols
-                    .insert(name.map_err(|e| tool_err("ensure_disposition_required_state: pragma row", e))?);
+                live_cols.insert(
+                    name.map_err(|e| tool_err("ensure_disposition_required_state: pragma row", e))?,
+                );
             }
         }
         let copy_cols: Vec<&str> = Self::BEAD_OVERLAY_COLUMNS
@@ -1784,8 +1791,12 @@ mod tests {
         s.save(&o).unwrap();
         // Unset by default.
         assert_eq!(s.held_recheck_after("held-bead").unwrap(), None);
-        s.set_held_recheck_after("held-bead", 1_800_000_000).unwrap();
-        assert_eq!(s.held_recheck_after("held-bead").unwrap(), Some(1_800_000_000));
+        s.set_held_recheck_after("held-bead", 1_800_000_000)
+            .unwrap();
+        assert_eq!(
+            s.held_recheck_after("held-bead").unwrap(),
+            Some(1_800_000_000)
+        );
         // No overlay row -> None, not an error.
         assert_eq!(s.held_recheck_after("no-such-bead").unwrap(), None);
     }
@@ -1927,7 +1938,8 @@ mod tests {
             park_reason: None,
             target_repo: None,
         };
-        s.save(&o).expect("DISPOSITION_REQUIRED must persist after open-time migration");
+        s.save(&o)
+            .expect("DISPOSITION_REQUIRED must persist after open-time migration");
         let got = s.load("held-bead").unwrap().unwrap();
         assert_eq!(got.state, OverlayState::DispositionRequired);
         assert_eq!(got.pr_number, Some(708));

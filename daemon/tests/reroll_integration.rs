@@ -35,6 +35,7 @@ fn test_cfg() -> Config {
         held_recheck_cooldown_secs: 900,
         repos: std::collections::HashMap::new(),
         pre_gate_validation_enabled: false,
+        ..Default::default()
     }
 }
 
@@ -2288,7 +2289,10 @@ fn test_reroll_recovers_from_stale_local_remote_branch_on_retry() {
     // it succeeds — matching how the real `CliVcs` will behave once the
     // production code does the delete-then-retry dance.
     vcs.stale_branch_exists_at.borrow_mut().insert(
-        ("owner/repo".to_string(), "factory/bead-stale-r2".to_string()),
+        (
+            "owner/repo".to_string(),
+            "factory/bead-stale-r2".to_string(),
+        ),
         "gh: Reference already exists (refs/heads/factory/bead-stale-r2) \
          (HTTP 422)"
             .to_string(),
@@ -2520,8 +2524,8 @@ fn test_reroll_close_pr_already_merged_is_tolerated_as_successful_supersede() {
     // branch. Without this a regression that silently swallows the close
     // failure (rather than classifying it) would still pass the green
     // path above.
-    let telemetry = std::fs::read_to_string(&telemetry_log)
-        .expect("reroll must have written telemetry");
+    let telemetry =
+        std::fs::read_to_string(&telemetry_log).expect("reroll must have written telemetry");
     assert!(
         telemetry.contains("REROLL_PR_ALREADY_MERGED"),
         "telemetry must record REROLL_PR_ALREADY_MERGED so operators can audit \

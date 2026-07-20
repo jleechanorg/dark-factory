@@ -7,9 +7,7 @@
 use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::router::RoutingVerdict;
-use crate::state::{
-    set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
-};
+use crate::state::{set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore};
 use crate::tools::{remote_url_for_display, remote_url_matches_repo, Bead, Sessions, SpawnSpec};
 
 #[cfg(test)]
@@ -228,16 +226,16 @@ pub fn dispatch_ready(
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            // jleechan-8jxr r2: pre-fill with cfg.target_repo so this
-            // defensive fallback (no overlay row in the store yet —
-            // should be dead code in production since intake always
-            // persists before dispatch) survives the no-repo park. The
-            // bead's "real" repo would normally be set by
-            // `tick::run_slow_tier`/`intake::normalize`; this value is
-            // only used if the dispatch path runs before any intake.
-            target_repo: Some(cfg.target_repo.clone()),
+                pre_session_head_sha: None,
+                park_reason: None,
+                // jleechan-8jxr r2: pre-fill with cfg.target_repo so this
+                // defensive fallback (no overlay row in the store yet —
+                // should be dead code in production since intake always
+                // persists before dispatch) survives the no-repo park. The
+                // bead's "real" repo would normally be set by
+                // `tick::run_slow_tier`/`intake::normalize`; this value is
+                // only used if the dispatch path runs before any intake.
+                target_repo: Some(cfg.target_repo.clone()),
             },
             Err(err) if err.is_transient() => {
                 report
@@ -663,10 +661,7 @@ pub fn dispatch_ready(
                 }
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
-                set_human_hold_reason(
-                    &mut overlay,
-                    HumanHoldReason::WorktreeRemoteUnverifiable,
-                );
+                set_human_hold_reason(&mut overlay, HumanHoldReason::WorktreeRemoteUnverifiable);
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
@@ -999,14 +994,22 @@ fn shrink_by(text: &mut String, excess: usize, marker: &str) {
     if let Some(pos) = text.rfind(marker) {
         text.truncate(pos);
     }
-    let target = text.len().saturating_sub(excess).saturating_sub(marker.len());
+    let target = text
+        .len()
+        .saturating_sub(excess)
+        .saturating_sub(marker.len());
     truncate_at_char_boundary(text, target);
     if !text.is_empty() {
         text.push_str(marker);
     }
 }
 
-fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str, remote: &str) -> String {
+fn build_coder_prompt(
+    bead: &crate::tools::Bead,
+    branch: &str,
+    target_repo: &str,
+    remote: &str,
+) -> String {
     let mut description = bead.description.trim().to_string();
     if description.len() > CODER_PROMPT_DESCRIPTION_CAP {
         truncate_at_char_boundary(&mut description, CODER_PROMPT_DESCRIPTION_CAP);
@@ -1025,7 +1028,15 @@ fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str
         tree.push_str("\n[tree truncated]");
     }
 
-    let mut prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+    let mut prompt = render_coder_prompt(
+        bead,
+        branch,
+        target_repo,
+        remote,
+        &description,
+        &notes,
+        &tree,
+    );
 
     // jleechan-niqz: the per-section caps above bound `description`, `notes`,
     // and `tree` independently but never reconciled their SUM (plus the fixed
@@ -1044,19 +1055,43 @@ fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str
     if prompt.len() > CODER_PROMPT_TOTAL_CAP && !tree.is_empty() {
         let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
         shrink_by(&mut tree, excess, "\n[tree truncated]");
-        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+        prompt = render_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            &description,
+            &notes,
+            &tree,
+        );
     }
 
     if prompt.len() > CODER_PROMPT_TOTAL_CAP && !description.is_empty() {
         let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
         shrink_by(&mut description, excess, "\n[description truncated]");
-        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+        prompt = render_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            &description,
+            &notes,
+            &tree,
+        );
     }
 
     if prompt.len() > CODER_PROMPT_TOTAL_CAP && !notes.is_empty() {
         let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
         shrink_by(&mut notes, excess, "\n[notes truncated]");
-        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+        prompt = render_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            &description,
+            &notes,
+            &tree,
+        );
     }
 
     prompt
@@ -1263,10 +1298,7 @@ mod tests {
                     ),
                     (
                         "agy".to_string(),
-                        DaemonError::Deferred(format!(
-                            "REQUEST=sq-scripted-{}",
-                            spec.bead_id
-                        )),
+                        DaemonError::Deferred(format!("REQUEST=sq-scripted-{}", spec.bead_id)),
                     ),
                 ]));
             }
@@ -1508,6 +1540,7 @@ mod tests {
             held_recheck_cooldown_secs: 900,
             repos: std::collections::HashMap::new(),
             pre_gate_validation_enabled: false,
+            ..Default::default()
         }
     }
 
@@ -1670,7 +1703,10 @@ mod tests {
             .get("jleechan-fork-pr-bead")
             .cloned()
             .expect("overlay must be persisted");
-        assert_eq!(overlay.branch.as_deref(), Some("factory/jleechan-fork-pr-bead-r1"));
+        assert_eq!(
+            overlay.branch.as_deref(),
+            Some("factory/jleechan-fork-pr-bead-r1")
+        );
         assert!(
             !overlay.is_adopted,
             "fork fallback dispatches a fresh generated branch, not the PR's own              branch, so it must NOT take the append-only adopted-remediation path"
@@ -1763,15 +1799,15 @@ mod tests {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            // jleechan-8jxr r2: a real intake-persisted overlay carries a
-            // resolved `target_repo`. The old test left this `None` and
-            // relied on the pre-fix silent default to `cfg.target_repo` —
-            // which is exactly the bug this bead's regression test
-            // (`dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all`)
-            // pins. Update the test fixture to reflect production reality.
-            target_repo: Some("owner/repo".to_string()),
+                pre_session_head_sha: None,
+                park_reason: None,
+                // jleechan-8jxr r2: a real intake-persisted overlay carries a
+                // resolved `target_repo`. The old test left this `None` and
+                // relied on the pre-fix silent default to `cfg.target_repo` —
+                // which is exactly the bug this bead's regression test
+                // (`dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all`)
+                // pins. Update the test fixture to reflect production reality.
+                target_repo: Some("owner/repo".to_string()),
             })
             .unwrap();
         let cfg = cfg();
@@ -1913,7 +1949,9 @@ mod tests {
             "distinct reason from unmapped_target_repo so operators can tell which remediation to apply"
         );
         assert!(
-            report.failures[0].error.contains("no resolvable repo identity"),
+            report.failures[0]
+                .error
+                .contains("no resolvable repo identity"),
             "error must explain why the bead was parked: {}",
             report.failures[0].error
         );
@@ -2024,10 +2062,7 @@ mod tests {
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
         assert!(
-            report
-                .failures
-                .iter()
-                .all(|f| f.phase != "unmapped_repo"),
+            report.failures.iter().all(|f| f.phase != "unmapped_repo"),
             "a bead with a parseable external_ref MUST NOT park as unmapped_repo; \
              the legacy overlay's None should be back-filled from the bead. failures = {:?}",
             report.failures
@@ -2092,10 +2127,7 @@ mod tests {
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
         assert!(
-            report
-                .failures
-                .iter()
-                .all(|f| f.phase != "unmapped_repo"),
+            report.failures.iter().all(|f| f.phase != "unmapped_repo"),
             "a bead with a body `target_repo:` field MUST NOT park as unmapped_repo; \
              legacy overlay's None must be back-filled from the bead body. failures = {:?}",
             report.failures
@@ -2330,7 +2362,10 @@ mod tests {
         assert_eq!(overlay.state, OverlayState::HumanHeld);
         assert_eq!(overlay.session_id, None);
         assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
-        assert_eq!(overlay.park_reason.as_deref(), Some("spawn_branch_mismatch"));
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("spawn_branch_mismatch")
+        );
     }
 
     #[test]
@@ -2752,7 +2787,10 @@ mod tests {
             matches!(err, DaemonError::SpawnCleanupFailed { .. }),
             "stop failure must remain fatal because a live untracked worker may remain: {err:?}"
         );
-        assert!(!err.is_transient(), "cleanup failure must never back off/retry");
+        assert!(
+            !err.is_transient(),
+            "cleanup failure must never back off/retry"
+        );
 
         let calls = sessions.calls.borrow();
         assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
@@ -2784,7 +2822,12 @@ mod tests {
             file_tree_summary: "src/\n  flux.rs\n  main.rs".into(),
             external_ref: Some("jleechanorg/delorean#42".into()),
         };
-        let prompt = build_coder_prompt(&bead, "factory/bead-x-r1", "jleechanorg/delorean", "worldai");
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/bead-x-r1",
+            "jleechanorg/delorean",
+            "worldai",
+        );
 
         assert!(prompt.contains("Fix the flux capacitor"), "title missing");
         assert!(
@@ -2903,8 +2946,7 @@ mod tests {
 
         let bead = Bead {
             id: "jleechan-j4i8".into(),
-            title: "Regression-shape bead: description + tree summary would sum past 4096"
-                .into(),
+            title: "Regression-shape bead: description + tree summary would sum past 4096".into(),
             // A "moderate-length" description like the live incident's
             // ~1,100 chars, but sized here to sit under its own 6,000-char
             // per-section cap while still contributing meaningfully to the
@@ -2986,7 +3028,12 @@ mod tests {
         };
 
         // Must not panic.
-        let prompt = build_coder_prompt(&bead, "factory/bead-total-unicode-r1", "owner/repo", "origin");
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/bead-total-unicode-r1",
+            "owner/repo",
+            "origin",
+        );
         assert!(prompt.len() <= CODER_PROMPT_TOTAL_CAP);
     }
 
@@ -3022,7 +3069,9 @@ mod tests {
         // issue spec, so the priority relationship is spelled out for the
         // coder (not just implied by ordering).
         assert!(
-            prompt.contains("OPERATOR GUIDANCE (attempt-specific; authoritative over the DESCRIPTION above"),
+            prompt.contains(
+                "OPERATOR GUIDANCE (attempt-specific; authoritative over the DESCRIPTION above"
+            ),
             "prompt must contain the OPERATOR GUIDANCE section header verbatim, got:\n{prompt}"
         );
 
@@ -3214,7 +3263,10 @@ mod tests {
         let prompt = &prompts[0].1;
         assert!(prompt.contains("REPO: owner/repo"), "prompt: {prompt}");
         assert!(prompt.contains("REMOTE: origin"), "prompt: {prompt}");
-        assert!(prompt.contains("BRANCH: factory/bead-0-r1"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("BRANCH: factory/bead-0-r1"),
+            "prompt: {prompt}"
+        );
         assert!(
             prompt.contains("git push origin factory/bead-0-r1"),
             "prompt must state the literal push command verbatim: {prompt}"
@@ -3270,7 +3322,10 @@ mod tests {
 
         let prompts = sessions.spawn_prompts.borrow();
         let prompt = &prompts[0].1;
-        assert!(prompt.contains("REPO: jleechanorg/worldarchitect.ai"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("REPO: jleechanorg/worldarchitect.ai"),
+            "prompt: {prompt}"
+        );
         assert!(prompt.contains("REMOTE: worldai"), "prompt: {prompt}");
         assert!(
             prompt.contains("git push worldai factory/bead-0-r1"),
@@ -3400,10 +3455,7 @@ mod tests {
     #[test]
     fn cleanup_wrapper_hold_save_failure_preserves_dispatching_branch() {
         let sessions = FakeSessions::new(0);
-        sessions.set_worktree_remote(
-            "repo",
-            "https://github.com/wrong-owner/wrong-repo.git",
-        );
+        sessions.set_worktree_remote("repo", "https://github.com/wrong-owner/wrong-repo.git");
         sessions.fail_stop_for("fake-session-1");
         let store = FakeStateStore::new();
         store.fail_save_for("bead-0", OverlayState::HumanHeld);
@@ -3445,13 +3497,11 @@ mod tests {
 
         assert_eq!(report.success_count(), 0);
         assert_eq!(report.failures[0].phase, "worktree_remote_unverifiable");
-        assert!(
-            sessions
-                .calls
-                .borrow()
-                .iter()
-                .any(|call| call == "stop(fake-session-1)")
-        );
+        assert!(sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call == "stop(fake-session-1)"));
         let overlay = store.load("bead-0").unwrap().unwrap();
         assert_eq!(overlay.state, OverlayState::HumanHeld);
         assert_eq!(
@@ -3502,7 +3552,10 @@ mod tests {
             let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
             assert_eq!(report.success_count(), 0, "remote={remote_url}");
-            assert_eq!(report.failures[0].phase, "worktree_remote_mismatch", "remote={remote_url}");
+            assert_eq!(
+                report.failures[0].phase, "worktree_remote_mismatch",
+                "remote={remote_url}"
+            );
             let calls = sessions.calls.borrow();
             assert!(
                 calls.iter().any(|c| c == "stop(fake-session-1)"),
@@ -3510,7 +3563,10 @@ mod tests {
             );
             let overlay = store.load("bead-0").unwrap().unwrap();
             assert_eq!(overlay.state, OverlayState::HumanHeld);
-            assert_eq!(overlay.park_reason.as_deref(), Some("worktree_remote_mismatch"));
+            assert_eq!(
+                overlay.park_reason.as_deref(),
+                Some("worktree_remote_mismatch")
+            );
         }
     }
 }

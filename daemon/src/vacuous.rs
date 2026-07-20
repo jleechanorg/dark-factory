@@ -70,10 +70,7 @@ pub fn scan_test_source(source: &str) -> ScanReport {
     // Strip line comments and string-literal noise out of every line before
     // pattern matching so an `assert!(true)` inside a doc-comment does not
     // false-positive on `TrivialAssert`.
-    let cleaned: Vec<String> = lines
-        .iter()
-        .map(|l| strip_rust_noise(l))
-        .collect();
+    let cleaned: Vec<String> = lines.iter().map(|l| strip_rust_noise(l)).collect();
 
     // TrivialAssert: line that reduces to a literal `true` / `1` / `()`
     // after stripping the `assert!` / `assert_eq!` / `debug_assert!`
@@ -87,7 +84,10 @@ pub fn scan_test_source(source: &str) -> ScanReport {
             // classify as TrivialAssert based solely on the first token.
             let first_expr = take_first_top_level_expression(trimmed);
             let first_trimmed = first_expr.trim();
-            if matches!(first_trimmed, "true" | "1" | "()" | "Some(true)" | "Some(1)") {
+            if matches!(
+                first_trimmed,
+                "true" | "1" | "()" | "Some(true)" | "Some(1)"
+            ) {
                 findings.push(VacuousFinding {
                     file: PathBuf::from("<inline>"),
                     line: i + 1,
@@ -111,7 +111,8 @@ pub fn scan_test_source(source: &str) -> ScanReport {
             .join("\n");
 
         let calls_own_helpers = body.references_self_only;
-        let production_calls = extract_production_identifiers(&cleaned_text, &body.body_local_idents);
+        let production_calls =
+            extract_production_identifiers(&cleaned_text, &body.body_local_idents);
 
         if !production_calls.is_empty() {
             // Production symbols ARE referenced, so this is not the
@@ -261,7 +262,12 @@ fn strip_assert_call(line: &str) -> Option<&str> {
     let name = &line[name_start..open_idx];
     let valid = matches!(
         name,
-        "assert" | "assert_eq" | "assert_ne" | "debug_assert" | "debug_assert_eq" | "debug_assert_ne"
+        "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "debug_assert"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
     );
     if !valid {
         return None;
@@ -452,7 +458,10 @@ fn collect_local_identifiers(body: &[&str]) -> BTreeSet<String> {
             if name_end > 0 {
                 let name = &skip_mut[..name_end];
                 // Drop Rust keywords that the parser would reject anyway.
-                if !matches!(name, "if" | "else" | "match" | "for" | "while" | "loop" | "return") {
+                if !matches!(
+                    name,
+                    "if" | "else" | "match" | "for" | "while" | "loop" | "return"
+                ) {
                     out.insert(name.to_string());
                 }
             }
@@ -666,7 +675,11 @@ fn ident_looks_like_keyword_or_macro(ident: &str, line: &str, end: usize) -> boo
     // immediately followed by `!`. Snake_case production functions
     // (`parse_score`, `validate_path`) are never followed by `!`.
     let next_char = line[end..].chars().next();
-    if next_char == Some('!') && ident.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+    if next_char == Some('!')
+        && ident
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
         return true;
     }
     // Ident is uppercase-or-mixed (e.g. `Foo`, `BarBaz`) AND is a type or
@@ -756,9 +769,7 @@ fn looks_like_symmetric_tautology(text: &str) -> bool {
                     j += 1;
                 }
                 let start = j;
-                while j < bytes.len()
-                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
-                {
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
                     j += 1;
                 }
                 if j > start {
@@ -841,11 +852,10 @@ fn looks_like_construction_round_trip(body_text: &str) -> bool {
                 if name_end > 0 {
                     let name = head[..name_end].to_string();
                     if after_mut[eq_idx + 1..].contains('(') {
-                        let lits: BTreeSet<String> = tokens_in(
-                            after_mut[eq_idx + 1..].trim_end_matches(';'),
-                        )
-                        .into_iter()
-                        .collect();
+                        let lits: BTreeSet<String> =
+                            tokens_in(after_mut[eq_idx + 1..].trim_end_matches(';'))
+                                .into_iter()
+                                .collect();
                         construction_calls.push((name, lits));
                     }
                 }
@@ -892,17 +902,14 @@ fn looks_like_construction_round_trip(body_text: &str) -> bool {
 
             // Side 1: `name.X` is LHS, lookup `rhs_assert` for a literal that
             // appeared in construction lits.
-            let shared_literal_in_assert_rhs = lits
-                .iter()
-                .any(|lit| rhs_assert.contains(lit.as_str()));
+            let shared_literal_in_assert_rhs =
+                lits.iter().any(|lit| rhs_assert.contains(lit.as_str()));
             if rhs_starts_with_name && shared_literal_in_assert_rhs {
                 return true;
             }
             // Side 2: `name.X` is RHS, lookup `lhs` for a literal.
             let rhs_has_name = rhs_assert.starts_with(name.as_str());
-            let shared_literal_in_assert_lhs = lits
-                .iter()
-                .any(|lit| lhs.contains(lit.as_str()));
+            let shared_literal_in_assert_lhs = lits.iter().any(|lit| lhs.contains(lit.as_str()));
             if rhs_has_name && shared_literal_in_assert_lhs {
                 return true;
             }
@@ -929,9 +936,7 @@ fn tokens_in(s: &str) -> Vec<String> {
         let c = bytes[i];
         if c.is_ascii_alphabetic() || c == b'_' || c.is_ascii_digit() {
             let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-            {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
             runs.push((start, i));
@@ -996,6 +1001,9 @@ mod tests {
         assert!(toks.contains(&"2".to_string()), "toks={toks:?}");
         assert!(!toks.contains(&"S".to_string()), "toks={toks:?}");
         assert!(!toks.contains(&"v".to_string()), "toks={toks:?}");
-        assert!(!toks.contains(&"add_production".to_string()), "toks={toks:?}");
+        assert!(
+            !toks.contains(&"add_production".to_string()),
+            "toks={toks:?}"
+        );
     }
 }

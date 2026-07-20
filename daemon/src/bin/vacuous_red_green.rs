@@ -3,7 +3,7 @@
 // the static detector (`daemon::vacuous`).
 //
 // Usage:
-//   vacuous_red_green --base <ref> [--json <out>] [--files <P> ...]
+//   vacuous_red_green --base <ref> [--json <out>] [--files <P> ...] [--manifest-path <P>]
 //
 // Exits:
 //   0 — at least one new/changed test FAILS on the reverted tree
@@ -16,7 +16,7 @@
 // when supplied, only the listed paths are considered. When omitted,
 // `git diff --name-only <base>...HEAD` is used to derive the list.
 
-use daemon::vacuous_red_green::{check_red_green, FileClass};
+use daemon::vacuous_red_green::{check_red_green_with_manifest, FileClass};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -24,6 +24,7 @@ fn main() {
     let mut base: Option<String> = None;
     let mut files: Vec<String> = Vec::new();
     let mut json_out: Option<PathBuf> = None;
+    let mut manifest_path: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
@@ -45,8 +46,17 @@ fn main() {
             "--json" => {
                 json_out = args.next().map(PathBuf::from);
             }
+            "--manifest-path" => {
+                // P1.3: allow callers to pin the cargo manifest so the test
+                // run actually executes against the right crate. Defaults
+                // to `<repo_root>/daemon/Cargo.toml` when omitted.
+                manifest_path = args.next().map(PathBuf::from);
+            }
             "-h" | "--help" => {
-                eprintln!("vacuous_red_green --base <ref> [--files P ...] [--json OUT]");
+                eprintln!(
+                    "vacuous_red_green --base <ref> [--files P ...] [--json OUT] \
+                     [--manifest-path P]"
+                );
                 std::process::exit(2);
             }
             other => {
@@ -74,7 +84,12 @@ fn main() {
             .collect::<Vec<_>>()
     };
 
-    let report = match check_red_green(&cwd, &base, &changed) {
+    let manifest = match manifest_path {
+        Some(m) => m,
+        None => daemon::vacuous_red_green::detect_manifest_path(&cwd),
+    };
+
+    let report = match check_red_green_with_manifest(&cwd, &base, &changed, &manifest) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("vacuous_red_green: error: {e}");

@@ -268,10 +268,7 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("close_pr({pr},{comment})"));
-        if let Some(stderr) = self
-            .pr_already_terminal
-            .get(&("default".to_string(), pr))
-        {
+        if let Some(stderr) = self.pr_already_terminal.get(&("default".to_string(), pr)) {
             return Err(DaemonError::Tool {
                 tool: "gh".into(),
                 rc: 1,
@@ -1013,11 +1010,7 @@ impl Vcs for FakeVcs {
     /// override via a wrapper. Recording the call here lets us verify
     /// the reroll reached the recovery branch on a scripted stale
     /// `create_branch_at_for_repo` 422.
-    fn delete_branch_at_for_repo(
-        &self,
-        repo: &str,
-        name: &str,
-    ) -> Result<(), DaemonError> {
+    fn delete_branch_at_for_repo(&self, repo: &str, name: &str) -> Result<(), DaemonError> {
         self.calls
             .borrow_mut()
             .push(format!("delete_branch_at_for_repo({repo},{name})"));

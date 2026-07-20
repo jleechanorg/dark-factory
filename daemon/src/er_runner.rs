@@ -19,9 +19,9 @@
 // `skeptic_evidence` "is_real() then subprocess" split.
 
 use crate::errors::DaemonError;
-use crate::state::{BeadOverlay, OverlayState};
 #[cfg(test)]
 use crate::state::StateStore;
+use crate::state::{BeadOverlay, OverlayState};
 use crate::tick::TickDeps;
 use crate::tools::{run_tool, PrComment, PrSnapshot};
 use crate::verifier::{self, ErVerdict};
@@ -187,9 +187,7 @@ pub fn maybe_run(
     // 6. Post verbatim reply as a PR comment. If the post fails (network
     //    blip, 403, etc.), do NOT consume an attempt — propagate the error
     //    so the next tick can retry without burning one of the 3 slots.
-    let body = format!(
-        "🤖 **[dark-factory /er]** Evidence review verdict:\n\n```\n{reply}\n```"
-    );
+    let body = format!("🤖 **[dark-factory /er]** Evidence review verdict:\n\n```\n{reply}\n```");
     let ext_ref = format!("{}#{}", repo, pr);
     deps.tracker.comment_external(&ext_ref, &body)?;
 
@@ -247,13 +245,11 @@ pub fn parse_reviewer_reply(raw: &str) -> ErVerdict {
     let mut start = 0;
     while let Some(idx) = lower[start..].find("/er") {
         let abs = start + idx;
-        let valid_start = abs == 0
-            || !lower.as_bytes()[abs - 1].is_ascii_alphanumeric();
-        let valid_end = abs + 3 == lower.len()
-            || {
-                let next = lower.as_bytes()[abs + 3] as char;
-                !next.is_ascii_alphanumeric() && next != '-' && next != '_'
-            };
+        let valid_start = abs == 0 || !lower.as_bytes()[abs - 1].is_ascii_alphanumeric();
+        let valid_end = abs + 3 == lower.len() || {
+            let next = lower.as_bytes()[abs + 3] as char;
+            !next.is_ascii_alphanumeric() && next != '-' && next != '_'
+        };
         if valid_start && valid_end {
             let after = &lower[abs + 3..];
             for token in after
@@ -354,7 +350,9 @@ mod tests {
             Ok(self.issues.clone())
         }
         fn labeled_prs(&self, label: &str) -> Result<Vec<crate::tools::LabeledPr>, DaemonError> {
-            self.calls.borrow_mut().push(format!("labeled_prs({label})"));
+            self.calls
+                .borrow_mut()
+                .push(format!("labeled_prs({label})"));
             Ok(Vec::new())
         }
         fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError> {
@@ -409,15 +407,12 @@ mod tests {
         fn fetch_candidates(&self) -> Result<Vec<crate::tools::Bead>, DaemonError> {
             Ok(Vec::new())
         }
-        fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
+        fn fetch_all_external_refs(
+            &self,
+        ) -> Result<std::collections::HashSet<String>, DaemonError> {
             Ok(std::collections::HashSet::new())
         }
-        fn create_bead(
-            &self,
-            _t: &str,
-            _b: &str,
-            _e: &str,
-        ) -> Result<String, DaemonError> {
+        fn create_bead(&self, _t: &str, _b: &str, _e: &str) -> Result<String, DaemonError> {
             Ok("fake".into())
         }
         fn comment_external(&self, ext_ref: &str, body: &str) -> Result<(), DaemonError> {
@@ -431,27 +426,54 @@ mod tests {
     #[derive(Default)]
     struct Ss;
     impl crate::tools::Sessions for Ss {
-        fn active_count(&self) -> Result<usize, DaemonError> { Ok(0) }
-        fn spawn(&self, _s: &crate::tools::SpawnSpec) -> Result<crate::tools::SessionId, DaemonError> {
+        fn active_count(&self) -> Result<usize, DaemonError> {
+            Ok(0)
+        }
+        fn spawn(
+            &self,
+            _s: &crate::tools::SpawnSpec,
+        ) -> Result<crate::tools::SessionId, DaemonError> {
             Ok(crate::tools::SessionId("fake".into()))
         }
         fn attach(&self, _b: &str, _i: &str) -> Result<crate::tools::SessionId, DaemonError> {
             Ok(crate::tools::SessionId("fake".into()))
         }
-        fn stop(&self, _i: &crate::tools::SessionId) -> Result<(), DaemonError> { Ok(()) }
-        fn is_quiescent(&self, _i: &crate::tools::SessionId) -> Result<bool, DaemonError> { Ok(true) }
+        fn stop(&self, _i: &crate::tools::SessionId) -> Result<(), DaemonError> {
+            Ok(())
+        }
+        fn is_quiescent(&self, _i: &crate::tools::SessionId) -> Result<bool, DaemonError> {
+            Ok(true)
+        }
     }
 
     #[derive(Default)]
     struct V;
     impl crate::tools::Vcs for V {
-        fn base_head(&self, _b: &str) -> Result<String, DaemonError> { Ok("deadbeef".into()) }
-        fn create_branch_at(&self, _n: &str, _s: &str) -> Result<(), DaemonError> { Ok(()) }
-        fn head_sha(&self, _b: &str) -> Result<String, DaemonError> { Ok("deadbeef".into()) }
-        fn is_remote_ahead(&self, _b: &str, _r: &str) -> Result<bool, DaemonError> { Ok(false) }
-        fn push_fix_commit(&self, _branch: &str, _message: &str) -> Result<(), DaemonError> { Ok(()) }
-        fn remote_head_sha(&self, _branch: &str) -> Result<String, DaemonError> { Ok("deadbeef".into()) }
-        fn is_ancestor(&self, _ancestor_sha: &str, _descendant_sha: &str) -> Result<bool, DaemonError> { Ok(true) }
+        fn base_head(&self, _b: &str) -> Result<String, DaemonError> {
+            Ok("deadbeef".into())
+        }
+        fn create_branch_at(&self, _n: &str, _s: &str) -> Result<(), DaemonError> {
+            Ok(())
+        }
+        fn head_sha(&self, _b: &str) -> Result<String, DaemonError> {
+            Ok("deadbeef".into())
+        }
+        fn is_remote_ahead(&self, _b: &str, _r: &str) -> Result<bool, DaemonError> {
+            Ok(false)
+        }
+        fn push_fix_commit(&self, _branch: &str, _message: &str) -> Result<(), DaemonError> {
+            Ok(())
+        }
+        fn remote_head_sha(&self, _branch: &str) -> Result<String, DaemonError> {
+            Ok("deadbeef".into())
+        }
+        fn is_ancestor(
+            &self,
+            _ancestor_sha: &str,
+            _descendant_sha: &str,
+        ) -> Result<bool, DaemonError> {
+            Ok(true)
+        }
     }
 
     // Local in-memory StateStore that records the er_runner_attempt counter.
@@ -476,9 +498,15 @@ mod tests {
                 .insert(overlay.bead_id.clone(), overlay.clone());
             Ok(())
         }
-        fn register_branch(&self, _b: &str, _br: &str) -> Result<(), DaemonError> { Ok(()) }
-        fn owned_branches(&self) -> Result<Vec<String>, DaemonError> { Ok(Vec::new()) }
-        fn bead_id_for_branch(&self, _b: &str) -> Result<Option<String>, DaemonError> { Ok(None) }
+        fn register_branch(&self, _b: &str, _br: &str) -> Result<(), DaemonError> {
+            Ok(())
+        }
+        fn owned_branches(&self) -> Result<Vec<String>, DaemonError> {
+            Ok(Vec::new())
+        }
+        fn bead_id_for_branch(&self, _b: &str) -> Result<Option<String>, DaemonError> {
+            Ok(None)
+        }
         fn increment_active_autonomy(&self, _e: u64) -> Result<Vec<BeadOverlay>, DaemonError> {
             Ok(Vec::new())
         }
@@ -504,7 +532,11 @@ mod tests {
         ) -> Result<(), DaemonError> {
             Ok(())
         }
-        fn load_rejection(&self, _b: &str, _a: u32) -> Result<Option<(String, String)>, DaemonError> {
+        fn load_rejection(
+            &self,
+            _b: &str,
+            _a: u32,
+        ) -> Result<Option<(String, String)>, DaemonError> {
             Ok(None)
         }
         fn incr_er_runner_attempt(
@@ -533,10 +565,7 @@ mod tests {
                 .insert(bead_id.to_string(), hash.to_string());
             Ok(())
         }
-        fn er_runner_attempt(
-            &self,
-            bead_id: &str,
-        ) -> Result<(u32, Option<u64>), DaemonError> {
+        fn er_runner_attempt(&self, bead_id: &str) -> Result<(u32, Option<u64>), DaemonError> {
             Ok(self
                 .er_counts
                 .borrow()
@@ -564,6 +593,7 @@ mod tests {
             held_recheck_cooldown_secs: 900,
             repos: std::collections::HashMap::new(),
             pre_gate_validation_enabled: false,
+            ..Default::default()
         }
     }
 
@@ -691,7 +721,10 @@ mod tests {
         let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
         let outcome = maybe_run(&deps, bead, pr, 5_000_000).unwrap();
         assert_eq!(outcome, Outcome::AlreadyPosted(ErVerdict::Pass));
-        assert!(llm.calls.borrow().is_empty(), "unchanged evidence must not re-spawn the reviewer");
+        assert!(
+            llm.calls.borrow().is_empty(),
+            "unchanged evidence must not re-spawn the reviewer"
+        );
     }
 
     /// r5 finding 4: a CHANGED evidence marker RESETS the /er attempt cap, so a
@@ -710,16 +743,24 @@ mod tests {
 
         let pr = 330;
         let bead = "yoqy3";
-        store.overlays.borrow_mut().insert(bead.into(), attested_overlay(bead, pr));
+        store
+            .overlays
+            .borrow_mut()
+            .insert(bead.into(), attested_overlay(bead, pr));
         // Already at the cap.
-        store.er_counts.borrow_mut().insert(bead.into(), (MAX_ER_RUNNER_ATTEMPTS, Some(1)));
+        store
+            .er_counts
+            .borrow_mut()
+            .insert(bead.into(), (MAX_ER_RUNNER_ATTEMPTS, Some(1)));
         // A fresh verdict exists, but the evidence marker CHANGED since it ran.
         let mut snap = snapshot_with_comments(pr, comments_with_verdict("/er PASS"));
         snap.body = "**Evidence**: https://gist.github.com/u/new (head deadbeef)".into();
         scm.snapshots.borrow_mut().insert(pr, snap);
         store.evidence_hashes.borrow_mut().insert(
             bead.into(),
-            verifier::evidence_marker_hash("**Evidence**: https://gist.github.com/u/old (head deadbeef)"),
+            verifier::evidence_marker_hash(
+                "**Evidence**: https://gist.github.com/u/old (head deadbeef)",
+            ),
         );
 
         let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
@@ -744,8 +785,14 @@ mod tests {
 
         let pr = 331;
         let bead = "yoqy4";
-        store.overlays.borrow_mut().insert(bead.into(), attested_overlay(bead, pr));
-        store.er_counts.borrow_mut().insert(bead.into(), (MAX_ER_RUNNER_ATTEMPTS, Some(1)));
+        store
+            .overlays
+            .borrow_mut()
+            .insert(bead.into(), attested_overlay(bead, pr));
+        store
+            .er_counts
+            .borrow_mut()
+            .insert(bead.into(), (MAX_ER_RUNNER_ATTEMPTS, Some(1)));
         // No fresh verdict (comments empty) so idempotence doesn't short-circuit;
         // the evidence marker is UNCHANGED from the last run.
         let body = "**Evidence**: https://gist.github.com/u/same (head deadbeef)";
@@ -761,7 +808,9 @@ mod tests {
         let outcome = maybe_run(&deps, bead, pr, 9_000_000).unwrap();
         assert_eq!(
             outcome,
-            Outcome::Capped { count: MAX_ER_RUNNER_ATTEMPTS },
+            Outcome::Capped {
+                count: MAX_ER_RUNNER_ATTEMPTS
+            },
             "unchanged evidence at the cap must stay Capped"
         );
         assert!(llm.calls.borrow().is_empty());
@@ -783,15 +832,19 @@ mod tests {
             .overlays
             .borrow_mut()
             .insert(bead.into(), attested_overlay(bead, pr));
-        scm.snapshots
-            .borrow_mut()
-            .insert(pr, snapshot_with_comments(pr, comments_with_verdict("/er PASS")));
+        scm.snapshots.borrow_mut().insert(
+            pr,
+            snapshot_with_comments(pr, comments_with_verdict("/er PASS")),
+        );
 
         let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
         let outcome = maybe_run(&deps, bead, pr, 1_000_000).unwrap();
         assert_eq!(outcome, Outcome::AlreadyPosted(ErVerdict::Pass));
         assert!(llm.calls.borrow().is_empty(), "no reviewer spawn expected");
-        assert!(tracker.comment_calls.borrow().is_empty(), "no PR comment expected");
+        assert!(
+            tracker.comment_calls.borrow().is_empty(),
+            "no PR comment expected"
+        );
     }
 
     #[test]
@@ -856,7 +909,10 @@ mod tests {
         assert_eq!(comment_calls.len(), 1, "exactly one PR comment expected");
         let (ext_ref, body) = &comment_calls[0];
         assert_eq!(ext_ref, "owner/repo#103");
-        assert!(body.contains("/er PASS"), "verbatim verdict in comment: {body:?}");
+        assert!(
+            body.contains("/er PASS"),
+            "verbatim verdict in comment: {body:?}"
+        );
     }
 
     /// jleechan-9xrs Stage D: when the bead has an explicit `target_repo`
@@ -969,10 +1025,17 @@ mod tests {
         let t1 = t0 + 60;
         let second = maybe_run(&deps, bead, pr, t1).unwrap();
         match second {
-            Outcome::Cooldown { elapsed_secs: 60, count: 1 } => {}
+            Outcome::Cooldown {
+                elapsed_secs: 60,
+                count: 1,
+            } => {}
             other => panic!("expected Cooldown(60, 1), got {other:?}"),
         }
-        assert_eq!(llm.calls.borrow().len(), 1, "second call must NOT spawn reviewer");
+        assert_eq!(
+            llm.calls.borrow().len(),
+            1,
+            "second call must NOT spawn reviewer"
+        );
         assert_eq!(
             tracker.comment_calls.borrow().len(),
             1,
@@ -1008,7 +1071,14 @@ mod tests {
         // Second call 400s later — past the 300s cooldown
         let t1 = t0 + ER_RUNNER_COOLDOWN_SECS + 100;
         let second = maybe_run(&deps, bead, pr, t1).unwrap();
-        assert!(matches!(second, Outcome::Posted { count: 2, verdict: ErVerdict::Fail, .. }));
+        assert!(matches!(
+            second,
+            Outcome::Posted {
+                count: 2,
+                verdict: ErVerdict::Fail,
+                ..
+            }
+        ));
         assert_eq!(llm.calls.borrow().len(), 2);
         assert_eq!(tracker.comment_calls.borrow().len(), 2);
     }
@@ -1058,7 +1128,10 @@ mod tests {
             }
         );
         assert_eq!(llm.calls.borrow().len() as u32, MAX_ER_RUNNER_ATTEMPTS);
-        assert_eq!(tracker.comment_calls.borrow().len() as u32, MAX_ER_RUNNER_ATTEMPTS);
+        assert_eq!(
+            tracker.comment_calls.borrow().len() as u32,
+            MAX_ER_RUNNER_ATTEMPTS
+        );
     }
 
     #[test]
@@ -1110,10 +1183,19 @@ mod tests {
     #[test]
     fn parse_reviewer_reply_handles_all_grammar_tokens() {
         assert_eq!(parse_reviewer_reply("/er PASS"), ErVerdict::Pass);
-        assert_eq!(parse_reviewer_reply("/er PASS — saw CI run"), ErVerdict::Pass);
+        assert_eq!(
+            parse_reviewer_reply("/er PASS — saw CI run"),
+            ErVerdict::Pass
+        );
         assert_eq!(parse_reviewer_reply("/er FAIL broken"), ErVerdict::Fail);
-        assert_eq!(parse_reviewer_reply("/er PARTIAL missing coverage"), ErVerdict::Partial);
-        assert_eq!(parse_reviewer_reply("/er INCONCLUSIVE flaky ci"), ErVerdict::Inconclusive);
+        assert_eq!(
+            parse_reviewer_reply("/er PARTIAL missing coverage"),
+            ErVerdict::Partial
+        );
+        assert_eq!(
+            parse_reviewer_reply("/er INCONCLUSIVE flaky ci"),
+            ErVerdict::Inconclusive
+        );
         // Boundary: word-fragment must NOT match (e.g. "superpass")
         assert_eq!(parse_reviewer_reply("supersede"), ErVerdict::Absent);
         // Boundary: no `/er` token at all

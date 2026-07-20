@@ -142,10 +142,7 @@ fn directory_scan_reports_both_classes_correctly() {
             "directory scan missed vacuous example {name}, got: {vacuous_files:?}"
         );
     }
-    let must_not_have = [
-        "real_production_failure.rs",
-        "error_path_enforced.rs",
-    ];
+    let must_not_have = ["real_production_failure.rs", "error_path_enforced.rs"];
     for name in must_not_have {
         assert!(
             !vacuous_files.contains(name),
@@ -220,8 +217,7 @@ fn shell_wrapper_produces_nonzero_exit_when_vacuous_fixtures_present() {
     // to always-return-empty without updating this test.
     let project_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let project_root = project_root.parent().unwrap().to_path_buf();
-    let wrapper = project_root
-        .join("daemon/scripts/vacuous-test-detector.sh");
+    let wrapper = project_root.join("daemon/scripts/vacuous-test-detector.sh");
     assert!(
         wrapper.is_file(),
         "expected wrapper at {}",
@@ -231,7 +227,14 @@ fn shell_wrapper_produces_nonzero_exit_when_vacuous_fixtures_present() {
         .arg(&wrapper)
         .arg("--quiet")
         .current_dir(&project_root)
-        .env("PATH", format!("{}:{}", ".cargo/bin", std::env::var("PATH").unwrap_or_default()))
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                ".cargo/bin",
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
         .output()
         .expect("wrapper invocation must succeed (build only)");
     assert_eq!(

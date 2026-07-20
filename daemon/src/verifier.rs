@@ -314,7 +314,9 @@ pub fn parse_skeptic_verdict(raw: &str) -> Option<SkepticVerdict> {
         }
     }
 
-    if gate7_verdict.is_some() && gha_verdict.is_none() && signoff_verdict.is_none()
+    if gate7_verdict.is_some()
+        && gha_verdict.is_none()
+        && signoff_verdict.is_none()
         && !raw.to_ascii_lowercase().contains("subsystem:")
     {
         return gate7_verdict;
@@ -453,10 +455,7 @@ pub enum VacuousRedGreenStatus {
     },
     /// Every targeted test PASSED on the reverted tree (vacuous coverage —
     /// the test never actually exercises the production code it claims to).
-    Vacuous {
-        targeted: usize,
-        snippet: String,
-    },
+    Vacuous { targeted: usize, snippet: String },
     /// Detector encountered an infra error (cargo build, git apply, etc.).
     /// Surfaced as Unknown — not a vacuous verdict, not a clean pass.
     InfraError(String),
@@ -499,7 +498,9 @@ fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
             }
             ErVerdict::Pass => {}
             ErVerdict::Partial => {
-                return GateResult::Red("/er verdict is PARTIAL (PRODUCTION requires PASS)".to_string());
+                return GateResult::Red(
+                    "/er verdict is PARTIAL (PRODUCTION requires PASS)".to_string(),
+                );
             }
             ErVerdict::Fail => {
                 return GateResult::Red("/er verdict is FAIL".to_string());
@@ -736,10 +737,7 @@ pub fn parse_er_verdict(comments: &[crate::tools::PrComment]) -> ErVerdict {
 ///   the worst case is one redundant `/er` run, bounded by
 ///   `MAX_ER_RUNNER_ATTEMPTS`; the alternative re-opens the self-
 ///   certification hole this function exists to close.
-pub fn parse_er_verdict_since(
-    comments: &[crate::tools::PrComment],
-    min_epoch: u64,
-) -> ErVerdict {
+pub fn parse_er_verdict_since(comments: &[crate::tools::PrComment], min_epoch: u64) -> ErVerdict {
     for comment in comments.iter().rev() {
         if min_epoch > 0 && comment.created_at_epoch < min_epoch {
             continue;
@@ -759,7 +757,10 @@ pub fn parse_er_verdict_since(
             };
             if is_valid_start && is_valid_end {
                 let sub = &body_lower[absolute_idx + 3..];
-                let tokens: Vec<&str> = sub.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()).collect();
+                let tokens: Vec<&str> = sub
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 for token in tokens {
                     match token {
                         "pass" | "passed" => {
@@ -794,13 +795,13 @@ pub fn parse_er_verdict_since(
 pub fn classify_production(files: &[crate::tools::PrFile]) -> bool {
     for file in files {
         let path = &file.path;
-        if path.starts_with("mvp_site/") 
-            && !path.starts_with("mvp_site/tests/") 
-            && !path.starts_with("mvp_site/test_integration/") 
+        if path.starts_with("mvp_site/")
+            && !path.starts_with("mvp_site/tests/")
+            && !path.starts_with("mvp_site/test_integration/")
         {
             return true;
         }
-        
+
         let path_lower = path.to_lowercase();
         if path_lower.contains("prompt") || path_lower.starts_with("prompts/") {
             return true;
@@ -808,10 +809,10 @@ pub fn classify_production(files: &[crate::tools::PrFile]) -> bool {
         if path.starts_with(".github/") {
             return true;
         }
-        if path_lower.contains("ci/") 
+        if path_lower.contains("ci/")
             || path_lower.contains("/ci/")
             || path_lower.starts_with("ci")
-            || path_lower.contains("deploy") 
+            || path_lower.contains("deploy")
             || path_lower.contains("merge-safety")
             || path_lower.contains("merge_safety")
             || path_lower.contains("merge-guard")
@@ -822,8 +823,8 @@ pub fn classify_production(files: &[crate::tools::PrFile]) -> bool {
         {
             return true;
         }
-        if path_lower.starts_with("migrations/") 
-            || path_lower.contains("/migrations/") 
+        if path_lower.starts_with("migrations/")
+            || path_lower.contains("/migrations/")
             || path_lower.starts_with("db/")
             || path_lower.contains("/db/")
             || path_lower.ends_with("schema.sql")
@@ -840,7 +841,7 @@ pub fn calculate_non_test_loc(files: &[crate::tools::PrFile]) -> u32 {
     let mut total = 0;
     for file in files {
         let path_lower = file.path.to_lowercase();
-        let is_test = path_lower.contains("test") 
+        let is_test = path_lower.contains("test")
             || path_lower.contains("/test/")
             || path_lower.contains("/tests/");
         if !is_test {
@@ -1040,15 +1041,44 @@ pub fn assess(
 /// Map the runtime detector's `RedGreenReport` to the verifier-level
 /// `VacuousRedGreenStatus`. Pure (no IO); used by tests and any caller
 /// that has direct access to a checkout.
+///
+/// P1.2 (c): if the detector reports `vacuous=true` BUT the baseline-main
+/// sanity check FAILED, the vacuous verdict is meaningless (the test set
+/// is broken on the base tree, so we can't tell whether the post-revert
+/// all-pass is genuine vacuity or a broken test). Escalate to `InfraError`
+/// rather than falsely green-lighting.
+///
+/// P1.4: skipped tests are folded into the snippet so an operator can
+/// audit the skip list (which `#[ignore]` tests were bypassed, and why).
 pub fn vacuous_red_green_status_from_report(
     report: &crate::vacuous_red_green::RedGreenReport,
 ) -> VacuousRedGreenStatus {
+    // P1.2 (c): a vacuous=true with a broken baseline is NOT vacuous —
+    // it's an infra failure. The detector's vacuous verdict is meaningless
+    // when the test set is broken at baseline.
+    if let crate::vacuous_red_green::BaselineStatus::Fail { reason } = &report.baseline_status {
+        return VacuousRedGreenStatus::InfraError(format!(
+            "baseline-main sanity check failed: {reason}; vacuous verdict cannot be trusted"
+        ));
+    }
+
     if report.vacuous {
-        let snippet = format!(
+        let mut snippet = format!(
             "{} targeted test(s), 0 failed on revert: {:?}",
             report.targeted_tests.len(),
             report.targeted_tests
         );
+        if !report.skipped_tests.is_empty() {
+            snippet.push_str(&format!(
+                "; {} skipped (not counted as pass): {:?}",
+                report.skipped_tests.len(),
+                report
+                    .skipped_tests
+                    .iter()
+                    .map(|s| (&s.name, &s.reason))
+                    .collect::<Vec<_>>()
+            ));
+        }
         VacuousRedGreenStatus::Vacuous {
             targeted: report.targeted_tests.len(),
             snippet,
@@ -1135,16 +1165,15 @@ pub fn run_vacuous_red_green_subprocess(
     };
     let _ = std::fs::remove_file(&tmp_json);
 
-    let report: crate::vacuous_red_green::RedGreenReport =
-        match serde_json::from_str(&json_text) {
-            Ok(r) => r,
-            Err(e) => {
-                return VacuousRedGreenStatus::InfraError(format!(
-                    "vacuous-red-green.sh json parse failed: {e}; exit={:?}",
-                    out.status.code()
-                ));
-            }
-        };
+    let report: crate::vacuous_red_green::RedGreenReport = match serde_json::from_str(&json_text) {
+        Ok(r) => r,
+        Err(e) => {
+            return VacuousRedGreenStatus::InfraError(format!(
+                "vacuous-red-green.sh json parse failed: {e}; exit={:?}",
+                out.status.code()
+            ));
+        }
+    };
 
     vacuous_red_green_status_from_report(&report)
 }
@@ -1268,13 +1297,15 @@ pub fn structural_pending_gates(report: &GateReport) -> Vec<(GateName, &str)> {
     report
         .results
         .iter()
-        .filter_map(|(name, result)| match classify_nongreen_gate(*name, result) {
-            Some(GateBlock::Structural) => match result {
-                GateResult::Unknown(reason) => Some((*name, reason.as_str())),
+        .filter_map(
+            |(name, result)| match classify_nongreen_gate(*name, result) {
+                Some(GateBlock::Structural) => match result {
+                    GateResult::Unknown(reason) => Some((*name, reason.as_str())),
+                    _ => None,
+                },
                 _ => None,
             },
-            _ => None,
-        })
+        )
         .collect()
 }
 
@@ -1744,7 +1775,10 @@ mod tests {
 
         let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
-        assert!(!report.all_green, "issue #385: single-family Pass must NOT be all_green");
+        assert!(
+            !report.all_green,
+            "issue #385: single-family Pass must NOT be all_green"
+        );
         match gate(&report, GateName::Skeptic) {
             GateResult::Red(reason) => assert!(
                 reason.contains("review_degraded") || reason.contains("cross-model"),
@@ -1774,7 +1808,10 @@ mod tests {
         let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
         assert!(!report.all_green);
-        assert!(matches!(gate(&report, GateName::Skeptic), GateResult::Red(_)));
+        assert!(matches!(
+            gate(&report, GateName::Skeptic),
+            GateResult::Red(_)
+        ));
     }
 
     #[test]
@@ -1796,7 +1833,10 @@ mod tests {
 
         let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
-        assert!(report.all_green, "two distinct families with Pass must be all_green");
+        assert!(
+            report.all_green,
+            "two distinct families with Pass must be all_green"
+        );
         assert!(gate(&report, GateName::Skeptic).is_green());
     }
 
@@ -1820,7 +1860,10 @@ mod tests {
 
         let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
 
-        assert!(report.all_green, "mock_llm Pass with review_degraded=false stays green");
+        assert!(
+            report.all_green,
+            "mock_llm Pass with review_degraded=false stays green"
+        );
         assert!(gate(&report, GateName::Skeptic).is_green());
     }
 
@@ -2004,7 +2047,9 @@ mod tests {
 
         assert!(!report.all_green);
         match gate(&report, GateName::EvidenceFloor) {
-            GateResult::Red(reason) => assert!(reason.starts_with("evidence floor"), "got: {reason}"),
+            GateResult::Red(reason) => {
+                assert!(reason.starts_with("evidence floor"), "got: {reason}")
+            }
             other => panic!("expected Red(evidence floor), got {other:?}"),
         }
     }
@@ -2294,40 +2339,99 @@ mod tests {
     fn test_parse_er_verdict() {
         use crate::tools::PrComment;
         // Simple cases
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er PASS".into(), created_at_epoch: 0 }]), ErVerdict::Pass);
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er PARTIAL".into(), created_at_epoch: 0 }]), ErVerdict::Partial);
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er FAIL".into(), created_at_epoch: 0 }]), ErVerdict::Fail);
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er INCONCLUSIVE".into(), created_at_epoch: 0 }]), ErVerdict::Inconclusive);
+        assert_eq!(
+            parse_er_verdict(&[PrComment {
+                author: "alice".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0
+            }]),
+            ErVerdict::Pass
+        );
+        assert_eq!(
+            parse_er_verdict(&[PrComment {
+                author: "alice".into(),
+                body: "/er PARTIAL".into(),
+                created_at_epoch: 0
+            }]),
+            ErVerdict::Partial
+        );
+        assert_eq!(
+            parse_er_verdict(&[PrComment {
+                author: "alice".into(),
+                body: "/er FAIL".into(),
+                created_at_epoch: 0
+            }]),
+            ErVerdict::Fail
+        );
+        assert_eq!(
+            parse_er_verdict(&[PrComment {
+                author: "alice".into(),
+                body: "/er INCONCLUSIVE".into(),
+                created_at_epoch: 0
+            }]),
+            ErVerdict::Inconclusive
+        );
 
         // Latest comment wins (comments are in chronological order)
         let comments = vec![
-            PrComment { author: "alice".into(), body: "/er FAIL".into(), created_at_epoch: 0 },
-            PrComment { author: "bob".into(), body: "/er PASS".into(), created_at_epoch: 0 },
+            PrComment {
+                author: "alice".into(),
+                body: "/er FAIL".into(),
+                created_at_epoch: 0,
+            },
+            PrComment {
+                author: "bob".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            },
         ];
         assert_eq!(parse_er_verdict(&comments), ErVerdict::Pass);
 
         // Multiple verdicts in one comment: last one wins
-        let comments_multiple = vec![
-            PrComment { author: "alice".into(), body: "/er FAIL then /er PASS".into(), created_at_epoch: 0 },
-        ];
+        let comments_multiple = vec![PrComment {
+            author: "alice".into(),
+            body: "/er FAIL then /er PASS".into(),
+            created_at_epoch: 0,
+        }];
         assert_eq!(parse_er_verdict(&comments_multiple), ErVerdict::Pass);
 
         // Word boundary check: "/er-gate" or "/er_gate" should not match as "/er" command
-        assert_eq!(parse_er_verdict(&[PrComment { author: "alice".into(), body: "/er-gate PASS".into(), created_at_epoch: 0 }]), ErVerdict::Absent);
+        assert_eq!(
+            parse_er_verdict(&[PrComment {
+                author: "alice".into(),
+                body: "/er-gate PASS".into(),
+                created_at_epoch: 0
+            }]),
+            ErVerdict::Absent
+        );
     }
 
     // jleechan-nplh: staleness filtering against the head commit epoch.
     #[test]
     fn test_parse_er_verdict_since_staleness() {
         use crate::tools::PrComment;
-        let stale_pass = PrComment { author: "er".into(), body: "/er PASS".into(), created_at_epoch: 1_000 };
-        let fresh_fail = PrComment { author: "er".into(), body: "/er FAIL regressed".into(), created_at_epoch: 3_000 };
+        let stale_pass = PrComment {
+            author: "er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 1_000,
+        };
+        let fresh_fail = PrComment {
+            author: "er".into(),
+            body: "/er FAIL regressed".into(),
+            created_at_epoch: 3_000,
+        };
 
         // A verdict older than the head commit is ignored entirely.
-        assert_eq!(parse_er_verdict_since(std::slice::from_ref(&stale_pass), 2_000), ErVerdict::Absent);
+        assert_eq!(
+            parse_er_verdict_since(std::slice::from_ref(&stale_pass), 2_000),
+            ErVerdict::Absent
+        );
 
         // A verdict at/after the head commit is accepted (>= boundary).
-        assert_eq!(parse_er_verdict_since(std::slice::from_ref(&stale_pass), 1_000), ErVerdict::Pass);
+        assert_eq!(
+            parse_er_verdict_since(std::slice::from_ref(&stale_pass), 1_000),
+            ErVerdict::Pass
+        );
 
         // Stale PASS must not mask a fresh FAIL.
         assert_eq!(
@@ -2341,33 +2445,84 @@ mod tests {
 
         // Comment age unknown (epoch 0) with a known head age: fail closed,
         // treat as stale.
-        let unknown_age = PrComment { author: "er".into(), body: "/er PASS".into(), created_at_epoch: 0 };
-        assert_eq!(parse_er_verdict_since(&[unknown_age], 2_000), ErVerdict::Absent);
+        let unknown_age = PrComment {
+            author: "er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        };
+        assert_eq!(
+            parse_er_verdict_since(&[unknown_age], 2_000),
+            ErVerdict::Absent
+        );
     }
 
     #[test]
     fn test_classify_production() {
         use crate::tools::PrFile;
         // Production cases
-        assert!(classify_production(&[PrFile { path: "mvp_site/src/main.rs".into(), additions: 1, deletions: 0 }]));
-        assert!(classify_production(&[PrFile { path: "prompts/custom.md".into(), additions: 1, deletions: 0 }]));
-        assert!(classify_production(&[PrFile { path: ".github/workflows/ci.yml".into(), additions: 1, deletions: 0 }]));
-        assert!(classify_production(&[PrFile { path: "deploy.sh".into(), additions: 1, deletions: 0 }]));
-        assert!(classify_production(&[PrFile { path: "contracts/schema.sql".into(), additions: 1, deletions: 0 }]));
+        assert!(classify_production(&[PrFile {
+            path: "mvp_site/src/main.rs".into(),
+            additions: 1,
+            deletions: 0
+        }]));
+        assert!(classify_production(&[PrFile {
+            path: "prompts/custom.md".into(),
+            additions: 1,
+            deletions: 0
+        }]));
+        assert!(classify_production(&[PrFile {
+            path: ".github/workflows/ci.yml".into(),
+            additions: 1,
+            deletions: 0
+        }]));
+        assert!(classify_production(&[PrFile {
+            path: "deploy.sh".into(),
+            additions: 1,
+            deletions: 0
+        }]));
+        assert!(classify_production(&[PrFile {
+            path: "contracts/schema.sql".into(),
+            additions: 1,
+            deletions: 0
+        }]));
 
         // Non-production exclusions
-        assert!(!classify_production(&[PrFile { path: "mvp_site/tests/main_test.rs".into(), additions: 1, deletions: 0 }]));
-        assert!(!classify_production(&[PrFile { path: "mvp_site/test_integration/main_test.rs".into(), additions: 1, deletions: 0 }]));
-        assert!(!classify_production(&[PrFile { path: "daemon/src/main.rs".into(), additions: 1, deletions: 0 }]));
+        assert!(!classify_production(&[PrFile {
+            path: "mvp_site/tests/main_test.rs".into(),
+            additions: 1,
+            deletions: 0
+        }]));
+        assert!(!classify_production(&[PrFile {
+            path: "mvp_site/test_integration/main_test.rs".into(),
+            additions: 1,
+            deletions: 0
+        }]));
+        assert!(!classify_production(&[PrFile {
+            path: "daemon/src/main.rs".into(),
+            additions: 1,
+            deletions: 0
+        }]));
     }
 
     #[test]
     fn test_calculate_non_test_loc() {
         use crate::tools::PrFile;
         let files = vec![
-            PrFile { path: "mvp_site/src/main.rs".into(), additions: 100, deletions: 0 },
-            PrFile { path: "mvp_site/tests/test_main.rs".into(), additions: 50, deletions: 0 },
-            PrFile { path: "daemon/src/lib.rs".into(), additions: 30, deletions: 0 },
+            PrFile {
+                path: "mvp_site/src/main.rs".into(),
+                additions: 100,
+                deletions: 0,
+            },
+            PrFile {
+                path: "mvp_site/tests/test_main.rs".into(),
+                additions: 50,
+                deletions: 0,
+            },
+            PrFile {
+                path: "daemon/src/lib.rs".into(),
+                additions: 30,
+                deletions: 0,
+            },
         ];
         assert_eq!(calculate_non_test_loc(&files), 130);
     }
@@ -2395,7 +2550,10 @@ mod tests {
             skeptic_verdict: None,
             ..Default::default()
         };
-        assert!(matches!(evidence_floor_gate(&prod_partial), GateResult::Red(_)));
+        assert!(matches!(
+            evidence_floor_gate(&prod_partial),
+            GateResult::Red(_)
+        ));
 
         // NON_PRODUCTION: Pass and Partial are Green
         let non_prod_partial = PrEvidence {
@@ -2424,7 +2582,10 @@ mod tests {
             skeptic_verdict: None,
             ..Default::default()
         };
-        assert!(matches!(evidence_floor_gate(&prod_fail), GateResult::Red(_)));
+        assert!(matches!(
+            evidence_floor_gate(&prod_fail),
+            GateResult::Red(_)
+        ));
 
         let non_prod_inconclusive = PrEvidence {
             is_production: false,
@@ -2433,7 +2594,10 @@ mod tests {
             skeptic_verdict: None,
             ..Default::default()
         };
-        assert!(matches!(evidence_floor_gate(&non_prod_inconclusive), GateResult::Red(_)));
+        assert!(matches!(
+            evidence_floor_gate(&non_prod_inconclusive),
+            GateResult::Red(_)
+        ));
     }
 
     // --- jleechan-zaga: structured gate-block classification tests (#348) ---
@@ -2527,18 +2691,30 @@ mod tests {
             all_green: false,
             results: [
                 (GateName::Ci, GateResult::Unknown("fetch failed".into())),
-                (GateName::NoConflicts, GateResult::Unknown("fetch failed".into())),
+                (
+                    GateName::NoConflicts,
+                    GateResult::Unknown("fetch failed".into()),
+                ),
                 (
                     GateName::CodeRabbitApproved,
                     GateResult::Unknown("fetch failed".into()),
                 ),
-                (GateName::BugbotClean, GateResult::Unknown("fetch failed".into())),
+                (
+                    GateName::BugbotClean,
+                    GateResult::Unknown("fetch failed".into()),
+                ),
                 (
                     GateName::CommentsResolved,
                     GateResult::Unknown("fetch failed".into()),
                 ),
-                (GateName::EvidenceFloor, GateResult::Unknown("fetch failed".into())),
-                (GateName::Skeptic, GateResult::Unknown("fetch failed".into())),
+                (
+                    GateName::EvidenceFloor,
+                    GateResult::Unknown("fetch failed".into()),
+                ),
+                (
+                    GateName::Skeptic,
+                    GateResult::Unknown("fetch failed".into()),
+                ),
             ],
         };
         assert_eq!(classify_chain(&report), ChainDisposition::TransientOnly);
@@ -2723,10 +2899,9 @@ mod tests {
         // legacy substring floor that used to green this is deleted.
         let ev = evidence_with_status(EvidenceGistStatus::NotProvided);
         match evidence_floor_gate(&ev) {
-            GateResult::Red(reason) => assert!(
-                reason.starts_with("evidence floor"),
-                "got: {reason}"
-            ),
+            GateResult::Red(reason) => {
+                assert!(reason.starts_with("evidence floor"), "got: {reason}")
+            }
             other => panic!("expected Red(evidence floor), got {other:?}"),
         }
     }
@@ -2828,17 +3003,105 @@ mod tests {
         assert!(matches!(evidence_floor_gate(&ev), GateResult::Green));
     }
 
+    /// P1.1 (cursor-agent review): the runtime vacuous-test detector
+    /// verdict, when wired through `PrEvidence::vacuous_red_green`, must
+    /// actually be consumed by the FULL `assess()` path — not just the
+    /// evidence_floor helper in isolation. A vacuous=true with all other
+    /// gates green must still produce `all_green=false` on the
+    /// GateReport, so the bead is NOT marked READY_FOR_MERGE on a
+    /// vacuous-coverage PR. This is the gating test for P1.1 — pre-r3
+    /// the status was hard-coded to `NotProvided` in tick.rs and this
+    /// path was a no-op.
+    #[test]
+    fn assess_flips_all_green_false_on_vacuous_with_everything_else_green() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            skeptic_reviewers: vec!["claude".to_string(), "codex".to_string()],
+            review_degraded: false,
+            evidence_gist_status: EvidenceGistStatus::Verified,
+            vacuous_red_green: VacuousRedGreenStatus::Vacuous {
+                targeted: 2,
+                snippet: "2 targeted test(s), 0 failed on revert: [\"vacuous_constant_truth\"]"
+                    .to_string(),
+            },
+        };
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        assert!(
+            !report.all_green,
+            "vacuous detector verdict must NOT certify the gate as all_green, got {report:?}"
+        );
+        match gate(&report, GateName::EvidenceFloor) {
+            GateResult::Red(reason) => assert!(
+                reason.contains("vacuous-test detector"),
+                "evidence_floor gate must surface the vacuous verdict, got: {reason}"
+            ),
+            other => panic!("expected EvidenceFloor Red(vacuous), got {other:?}"),
+        }
+    }
+
+    /// P1.2 (c) end-to-end: a vacuous=true detector verdict whose
+    /// baseline_status is `Fail` is escalated to `InfraError` (Unknown),
+    /// not Red. A baseline-broken PR must NOT be falsely certified as
+    /// vacuous — the verdict is meaningless when the test set doesn't
+    /// compile at baseline.
+    #[test]
+    fn assess_flips_all_green_false_with_unknown_on_baseline_fail() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            skeptic_reviewers: vec!["claude".to_string(), "codex".to_string()],
+            review_degraded: false,
+            evidence_gist_status: EvidenceGistStatus::Verified,
+            vacuous_red_green: VacuousRedGreenStatus::InfraError(
+                "baseline-main sanity check failed: cargo build failed on reverted tree; \
+                 tests broken at baseline, verdict meaningless"
+                    .to_string(),
+            ),
+        };
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        assert!(
+            !report.all_green,
+            "baseline Fail must NOT certify the gate as all_green"
+        );
+        // Unknown, not Red — a flaky baseline must not churn a reroll.
+        assert!(
+            matches!(
+                gate(&report, GateName::EvidenceFloor),
+                GateResult::Unknown(_)
+            ),
+            "expected Unknown(vacuous baseline fail), got {:?}",
+            gate(&report, GateName::EvidenceFloor)
+        );
+    }
+
     #[test]
     fn vacuous_red_green_status_map_round_trips() {
         // Pure mapping helper: a Genuine lib report must round-trip to
         // Genuine verifier status, a Vacuous lib report to Vacuous. If
         // this drifts, the gate sees stale signal.
-        use crate::vacuous_red_green::{FileClass, RedGreenReport};
+        use crate::vacuous_red_green::{BaselineStatus, FileClass, RedGreenReport, SkippedTest};
         let genuine = RedGreenReport {
             vacuous: false,
             failed_on_revert: 2,
             targeted_tests: vec!["t1".into(), "t2".into()],
             failing_tests: vec!["t2".into()],
+            skipped_tests: vec![],
+            baseline_status: BaselineStatus::Pass { targeted: 2 },
             skipped: false,
         };
         match vacuous_red_green_status_from_report(&genuine) {
@@ -2856,6 +3119,8 @@ mod tests {
             failed_on_revert: 0,
             targeted_tests: vec!["t1".into()],
             failing_tests: vec![],
+            skipped_tests: vec![],
+            baseline_status: BaselineStatus::Pass { targeted: 1 },
             skipped: false,
         };
         match vacuous_red_green_status_from_report(&vacuous) {
@@ -2865,6 +3130,47 @@ mod tests {
             }
             other => panic!("expected Vacuous, got {other:?}"),
         }
+        // BaselineFail + vacuous=true is the P1.2 (c) InfraError path:
+        // the detector's vacuous=true must be escalated to InfraError so
+        // the gate does not falsely certify a vacuous pass.
+        let baseline_broken = RedGreenReport {
+            vacuous: true,
+            failed_on_revert: 0,
+            targeted_tests: vec!["t1".into()],
+            failing_tests: vec![],
+            skipped_tests: vec![],
+            baseline_status: BaselineStatus::Fail {
+                reason: "test".into(),
+            },
+            skipped: false,
+        };
+        match vacuous_red_green_status_from_report(&baseline_broken) {
+            VacuousRedGreenStatus::InfraError(reason) => assert!(reason.contains("baseline")),
+            other => panic!("expected InfraError(baseline), got {other:?}"),
+        }
+        // P1.4: skipped tests must appear in the snippet so an operator
+        // can audit the skip list (vacuous case — the Vacuous snippet
+        // embeds both targeted_tests AND skipped_tests).
+        let skipped = RedGreenReport {
+            vacuous: true,
+            failed_on_revert: 0,
+            targeted_tests: vec!["t1".into(), "t2_ignored".into()],
+            failing_tests: vec![],
+            skipped_tests: vec![SkippedTest {
+                name: "t2_ignored".into(),
+                reason: "needs network".into(),
+            }],
+            baseline_status: BaselineStatus::Pass { targeted: 2 },
+            skipped: false,
+        };
+        let snippet = match vacuous_red_green_status_from_report(&skipped) {
+            VacuousRedGreenStatus::Vacuous { snippet, .. } => snippet,
+            other => panic!("expected Vacuous with snippet, got {other:?}"),
+        };
+        assert!(
+            snippet.contains("t2_ignored") && snippet.contains("needs network"),
+            "snippet must mention the skipped test AND its reason: {snippet}"
+        );
         // FileClass round-trip not needed — the helper doesn't take one.
         let _ = FileClass::Test;
     }

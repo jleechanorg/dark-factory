@@ -87,6 +87,56 @@ pub struct Config {
     /// tests that don't script `open_pr_head_refs` set it explicitly `false`.
     #[serde(default = "default_pre_gate_validation_enabled")]
     pub pre_gate_validation_enabled: bool,
+    /// Bead jleechan-ijod / issue #387 (r3): absolute path to a local
+    /// checkout of the target repo, used as the runtime worktree for the
+    /// vacuous-test detector. When `Some`, the daemon's fast tier runs
+    /// the detector against this checkout on every gate-assessment tick
+    /// and surfaces its verdict via `PrEvidence::vacuous_red_green` so
+    /// gate 6 (`evidence_floor_gate`) can flip Red on vacuous coverage.
+    /// When `None` (default), the detector stays `NotProvided` — same
+    /// pre-r3 behavior. The detector MUST be running against the SAME
+    /// commit the PR is on (HEAD), so the daemon's fast tier refreshes
+    /// this worktree on every tick before invoking the detector (out of
+    /// scope for r3 wiring — the operator is responsible for keeping the
+    /// worktree current, e.g. via `git -C <root> reset --hard origin/<pr-branch>`).
+    #[serde(default)]
+    pub vacuous_worktree_root: Option<String>,
+    /// Bead jleechan-ijod / issue #387 (r3): optional override for the
+    /// cargo manifest path used by the vacuous-test detector. Defaults
+    /// to `<vacuous_worktree_root>/daemon/Cargo.toml` for the dark-factory
+    /// layout. Used by `detect_manifest_path` in `vacuous_red_green`.
+    #[serde(default)]
+    pub vacuous_manifest_path: Option<String>,
+}
+
+/// Default values for tests / fixtures that build a `Config` literal
+/// without going through `Config::load`. Mirrors the production default
+/// config (`config/daemon.toml`) closely enough for unit tests to be
+/// meaningful — they only need stable, deterministic values, not the
+/// operator-tuned production knobs.
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            target_repo: "owner/repo".to_string(),
+            ao_project: None,
+            base_branch: "main".to_string(),
+            stage: 1,
+            max_workers: 30,
+            max_batch: 15,
+            fast_tick_secs: 60,
+            slow_tick_secs: 60,
+            autonomy_timebox_secs: 10_800,
+            budget_warn_usd: 20.0,
+            spec_dir: ".factory/specs/".to_string(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos: std::collections::HashMap::new(),
+            pre_gate_validation_enabled: true,
+            vacuous_worktree_root: None,
+            vacuous_manifest_path: None,
+        }
+    }
 }
 
 /// Default head-stability window (bead jleechan-zeij / issue #322 r3): 30s,

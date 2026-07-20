@@ -1,13 +1,11 @@
 use crate::config::Config;
-use crate::errors::DaemonError;
-use crate::state::{
-    set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
-};
-use crate::tools::{Llm, Scm, SessionActivity, Sessions, SpawnSpec, Vcs};
-use crate::telemetry::{self, TelemetryEvent};
 use crate::constraints;
-use std::path::Path;
+use crate::errors::DaemonError;
+use crate::state::{set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore};
+use crate::telemetry::{self, TelemetryEvent};
+use crate::tools::{Llm, Scm, SessionActivity, Sessions, SpawnSpec, Vcs};
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 
 pub struct RerollDeps<'a> {
     pub scm: &'a dyn Scm,
@@ -23,7 +21,9 @@ pub struct RerollDeps<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RerollOutcome {
-    Rerolled { new_branch: String },
+    Rerolled {
+        new_branch: String,
+    },
     Aborted(String),
     Held(String),
     /// Bead jleechan-zeij / issue #322 r2: the fail-closed proceed predicate
@@ -113,7 +113,11 @@ fn emit_telemetry(
 /// hand-rolled as a scoring function) — mirrors the trailing-JSON-object
 /// parsing contract `constraints::extract` already uses against the same
 /// `Llm` trait.
-fn same_underlying_issue(llm: &dyn Llm, prior_text: &str, new_text: &str) -> Result<bool, DaemonError> {
+fn same_underlying_issue(
+    llm: &dyn Llm,
+    prior_text: &str,
+    new_text: &str,
+) -> Result<bool, DaemonError> {
     let prompt = format!(
         "You are the Circuit-Breaker Semantic Comparator for an autonomous coding factory (spec §4.2.6).\n\
           Two consecutive rejection review comments were left by the SAME reviewer on re-roll attempts of \
@@ -136,11 +140,15 @@ fn same_underlying_issue(llm: &dyn Llm, prior_text: &str, new_text: &str) -> Res
     // through this call site. `ComparatorUnparseable` is transient by
     // design -- see its doc comment in errors.rs.
     let last_close = reply.rfind('}').ok_or_else(|| {
-        DaemonError::ComparatorUnparseable(format!("no JSON object found in circuit-breaker comparator reply: {reply:?}"))
+        DaemonError::ComparatorUnparseable(format!(
+            "no JSON object found in circuit-breaker comparator reply: {reply:?}"
+        ))
     })?;
     let prefix = &reply[..=last_close];
     let last_open = prefix.rfind('{').ok_or_else(|| {
-        DaemonError::ComparatorUnparseable(format!("no JSON object found in circuit-breaker comparator reply: {reply:?}"))
+        DaemonError::ComparatorUnparseable(format!(
+            "no JSON object found in circuit-breaker comparator reply: {reply:?}"
+        ))
     })?;
     let candidate = &prefix[last_open..=last_close];
 
@@ -256,9 +264,13 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     };
 
     if bead.attempt > 1 {
-        if let Some((prev_reviewer, _prev_hash)) = deps.store.load_rejection(&bead.bead_id, bead.attempt - 1)? {
+        if let Some((prev_reviewer, _prev_hash)) =
+            deps.store.load_rejection(&bead.bead_id, bead.attempt - 1)?
+        {
             if prev_reviewer == deps.reviewer {
-                let prev_text = deps.store.load_rejection_text(&bead.bead_id, bead.attempt - 1)?;
+                let prev_text = deps
+                    .store
+                    .load_rejection_text(&bead.bead_id, bead.attempt - 1)?;
                 let same_issue = match prev_text {
                     Some(ref prev) if *prev == deps.review_text => true,
                     Some(ref prev) => same_underlying_issue(deps.llm, prev, &deps.review_text)?,
@@ -311,7 +323,13 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     }
 
     // Save current rejection for future circuit-breaker checks
-    deps.store.save_rejection(&bead.bead_id, bead.attempt, &deps.reviewer, &feedback_hash, &deps.review_text)?;
+    deps.store.save_rejection(
+        &bead.bead_id,
+        bead.attempt,
+        &deps.reviewer,
+        &feedback_hash,
+        &deps.review_text,
+    )?;
 
     // Adopted-PR remediation (bead jleechan-tfs1, Option A + hard safety
     // amendment): `bead.branch` for an adopted bead is the external
@@ -580,10 +598,7 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         // already been achieved out-of-band — clear `pr_number` and
         // continue. Genuine close failures (network errors, permissions,
         // wrong repo) still propagate as `DaemonError::Tool`.
-        match deps
-            .scm
-            .close_pr_for_repo(&bead_repo, pr_number, &comment)
-        {
+        match deps.scm.close_pr_for_repo(&bead_repo, pr_number, &comment) {
             Ok(()) => {
                 bead.pr_number = None;
 
@@ -819,45 +834,48 @@ fn evaluate_proceed(
         // `death_window`), never as a `stable_window_terminal` shortcut — so it
         // is folded into `gone` here, and any successful non-`NotFound`
         // re-attach below resets `not_found_since`, killing the streak.
-        let (gone, activity): (bool, Option<SessionActivity>) =
-            match deps.sessions.attach_within(branch, &bead.bead_id, budget_or_defer!()) {
-                Err(DaemonError::SessionNotFound { .. }) => (true, None),
-                Err(e) if e.is_transient() => {
-                    emit_telemetry(
-                        deps.telemetry_log,
-                        &bead.bead_id,
-                        bead.attempt,
-                        bead.state.as_str(),
-                        "REROLL_QUIESCENCE_CHECK_TRANSIENT",
-                        serde_json::json!({}),
-                        serde_json::json!({"reason": "quiescence_check_transient", "error": format!("{e}")}),
-                    )?;
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
-                Ok(session_id) => {
-                    match deps
-                        .sessions
-                        .session_activity_within(&session_id, budget_or_defer!())
-                    {
-                        Ok(SessionActivity::NotFound) => (true, None),
-                        Ok(a) => (false, Some(a)),
-                        Err(e) if e.is_transient() => {
-                            emit_telemetry(
-                                deps.telemetry_log,
-                                &bead.bead_id,
-                                bead.attempt,
-                                bead.state.as_str(),
-                                "REROLL_QUIESCENCE_CHECK_TRANSIENT",
-                                serde_json::json!({}),
-                                serde_json::json!({"reason": "quiescence_check_transient", "error": format!("{e}")}),
-                            )?;
-                            return Ok(None);
-                        }
-                        Err(e) => return Err(e),
+        let (gone, activity): (bool, Option<SessionActivity>) = match deps.sessions.attach_within(
+            branch,
+            &bead.bead_id,
+            budget_or_defer!(),
+        ) {
+            Err(DaemonError::SessionNotFound { .. }) => (true, None),
+            Err(e) if e.is_transient() => {
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_QUIESCENCE_CHECK_TRANSIENT",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": "quiescence_check_transient", "error": format!("{e}")}),
+                )?;
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+            Ok(session_id) => {
+                match deps
+                    .sessions
+                    .session_activity_within(&session_id, budget_or_defer!())
+                {
+                    Ok(SessionActivity::NotFound) => (true, None),
+                    Ok(a) => (false, Some(a)),
+                    Err(e) if e.is_transient() => {
+                        emit_telemetry(
+                            deps.telemetry_log,
+                            &bead.bead_id,
+                            bead.attempt,
+                            bead.state.as_str(),
+                            "REROLL_QUIESCENCE_CHECK_TRANSIENT",
+                            serde_json::json!({}),
+                            serde_json::json!({"reason": "quiescence_check_transient", "error": format!("{e}")}),
+                        )?;
+                        return Ok(None);
                     }
+                    Err(e) => return Err(e),
                 }
-            };
+            }
+        };
 
         if gone {
             // Positive death: absent continuously for the confirmation window.
@@ -1109,10 +1127,7 @@ fn execute_adopted(
             // quiescent above; persist that no-live-session proof with the
             // recoverable pre-spawn hold.
             bead.session_id = None;
-            set_human_hold_reason(
-                bead,
-                HumanHoldReason::AdoptedPreSessionShaCaptureFailed,
-            );
+            set_human_hold_reason(bead, HumanHoldReason::AdoptedPreSessionShaCaptureFailed);
             deps.store.save(bead)?;
             emit_telemetry(
                 deps.telemetry_log,
@@ -1140,16 +1155,17 @@ fn execute_adopted(
     // keeps this path inert if that restriction is ever lifted before the
     // Stage C/D call-site sweep reaches this function.
     let adopted_repo = bead.repo(deps.cfg).to_string();
-    let adopted_routing = deps.cfg.resolve_repo(&adopted_repo).unwrap_or_else(|| {
-        crate::config::RepoRouting {
-            ao_project: deps
-                .cfg
-                .ao_project
-                .clone()
-                .unwrap_or_else(|| adopted_repo.clone()),
-            push_remote: "origin".to_string(),
-        }
-    });
+    let adopted_routing =
+        deps.cfg
+            .resolve_repo(&adopted_repo)
+            .unwrap_or_else(|| crate::config::RepoRouting {
+                ao_project: deps
+                    .cfg
+                    .ao_project
+                    .clone()
+                    .unwrap_or_else(|| adopted_repo.clone()),
+                push_remote: "origin".to_string(),
+            });
     let spec = SpawnSpec {
         bead_id: bead.bead_id.clone(),
         branch: branch.clone(),

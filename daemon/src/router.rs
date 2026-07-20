@@ -196,7 +196,6 @@ mod tests {
         assert_eq!(verdict, RoutingVerdict::GenericPath);
     }
 
-
     #[test]
     fn prose_reply_is_parse_error_never_defaulted() {
         let llm = FakeLlm::scripted("it looks small to me");
@@ -204,9 +203,9 @@ mod tests {
         match result {
             Err(DaemonError::Parse(_)) => {}
             Err(other) => panic!("expected Parse error, got {other:?}"),
-            Ok(verdict) => panic!(
-                "prose reply must never be silently defaulted to a verdict, got {verdict:?}"
-            ),
+            Ok(verdict) => {
+                panic!("prose reply must never be silently defaulted to a verdict, got {verdict:?}")
+            }
         }
     }
 
@@ -231,8 +230,7 @@ mod tests {
 
     #[test]
     fn unrecognized_verdict_token_is_parse_error_not_default() {
-        let llm =
-            FakeLlm::scripted(r#"{"routingVerdict":"MEDIUM_PATH","justification":"unsure"}"#);
+        let llm = FakeLlm::scripted(r#"{"routingVerdict":"MEDIUM_PATH","justification":"unsure"}"#);
         assert!(matches!(route(&llm, &bead()), Err(DaemonError::Parse(_))));
     }
 
