@@ -77,6 +77,24 @@ Public surface
                                        verbatim text in
                                        `unaddressed_items` and
                                        `constraint`.
+- `evaluate_contract_echo(report, contract, report_prior_findings=...)`
+                                       — r3 opt (issue #386 P2): when a
+                                       `Tuple[PriorFindingEcho, ...]` is
+                                       passed, unaddressed prior
+                                       findings also surface verbatim
+                                       in `constraint`.
+- `AcceptanceItem.required: bool`  — r3 (issue #386 gap 5). Items
+                                       marked `required=True` cannot be
+                                       `N-A`'d away: an `N-A` on a
+                                       required item is treated as
+                                       unaddressed and the constraint
+                                       carries a `[REQUIRED]` marker.
+- `PriorFindingEcho`               — r3 carrier (issue #386 P2).
+                                       Per-item prior-finding verdict
+                                       (`ADDRESSED` / `NOT-ADDRESSED`)
+                                       that the gate enforces even when
+                                       the prior-finding text was
+                                       prompt-only in earlier rounds.
 
 ZFC compliance
 --------------
