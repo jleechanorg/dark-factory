@@ -1853,6 +1853,24 @@ fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, DaemonError> 
             &["-p", prompt, "--yolo", "--skip-trust"],
             REVIEWER_TIMEOUT_SECS,
         ),
+        // jleechan-984e / issue #385: 5th reviewer vendor (Cursor CLI,
+        // `cursor-agent`). Invoked as `cursor-agent -f <prompt>` (headless
+        // non-interactive mode) — the `-f` flag is the documented
+        // equivalent of `claude --print` / `agy --print` / `gemini -p`
+        // and is required so the tool reads the prompt from argv instead
+        // of trying to open an interactive TUI. Cursor's model family is
+        // distinct from claude/codex/agy/gemini/minimax (see
+        // `verifier::vendor_model_family`), so dispatching it as a
+        // fallback (priority[4] in `skeptic_evidence`) is what makes the
+        // gate-7 reviewer set cross-model instead of single-family. Both
+        // `cursor-agent` and the bare `cursor` alias are accepted so
+        // `skeptic_reviewers` telemetry is stable regardless of which name
+        // the priority list uses.
+        "cursor-agent" | "cursor" => run_tool(
+            "cursor-agent",
+            &["-f", prompt],
+            REVIEWER_TIMEOUT_SECS,
+        ),
         other => Err(DaemonError::Tool {
             tool: other.to_string(),
             rc: -1,
@@ -1920,7 +1938,20 @@ fn skeptic_evidence(
     // reordered ahead of them — codex/claude/agy's current outage is a
     // point-in-time incident (quotas reset), not a permanent property of
     // those vendors.
-    let mut priority = vec!["codex", "claude", "agy", "gemini"];
+    //
+    // jleechan-984e / issue #385: 5th reviewer vendor (`cursor-agent`).
+    // Appended after `gemini` so the existing codex/claude/agy/gemini
+    // dispatch order is unchanged for the common case where those vendors
+    // are healthy; cursor-agent is reached only when the four earlier
+    // vendors all fail to parse. cursor-agent is the FIRST cross-model
+    // vendor in the priority list whose model family (`cursor`, see
+    // `verifier::vendor_model_family`) is distinct from claude/codex/agy/
+    // gemini/minimax — adding it is what makes the gate-7 assessment
+    // produce two distinct model families on a normal run, satisfying
+    // `compute_review_degraded(reviewers) == false` so strict merge policy
+    // (#328) treats the assessment as strict-green instead of
+    // `review_degraded=true`.
+    let mut priority = vec!["codex", "claude", "agy", "gemini", "cursor-agent"];
     if !coder_vendor.is_empty() {
         priority.retain(|&v| v != coder_vendor);
     }
@@ -2153,12 +2184,21 @@ fn skeptic_evidence(
         }
     };
 
+    // jleechan-984e / issue #385: compute the cross-model degraded flag
+    // BEFORE moving `used_vendors` into `PrEvidence` so we can still
+    // borrow it. `compute_review_degraded` returns false for the
+    // empty / single-entry / `mock_llm`-only paths so the Stage-1
+    // test-repo lane stays non-degraded even though its single mock
+    // judge has no cross-model sibling.
+    let review_degraded = verifier::compute_review_degraded(&used_vendors);
+
     Ok(PrEvidence {
         is_production: false,
         non_test_changed_loc: 0,
         er_verdict: verifier::ErVerdict::Absent,
         skeptic_verdict,
         skeptic_reviewers: used_vendors,
+        review_degraded,
         // Set in the fast tier from the canonical evidence marker (#323).
         evidence_gist_status: verifier::EvidenceGistStatus::NotProvided,
     })
@@ -2970,6 +3010,18 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             obj.insert(
                 "skeptic_reviewers".to_string(),
                 serde_json::json!(evidence.skeptic_reviewers),
+            );
+            // jleechan-984e / issue #385: surface the cross-model degraded
+            // flag in GATE_ASSESSMENT telemetry so strict merge policy
+            // (#328) — and any downstream operator dashboards / alerts —
+            // can read it without re-deriving the family count from
+            // `skeptic_reviewers`. `true` means the gate-7 verdict came
+            // from a single model family (e.g. only `claude` because
+            // codex is quota-dead and agy/gemini/cursor-agent errored),
+            // which strict merge policy MUST treat as NOT strict-green.
+            obj.insert(
+                "review_degraded".to_string(),
+                serde_json::json!(evidence.review_degraded),
             );
             // jleechan-wzgl (PR #239 review round 1): `auto-merge-guard.sh`'s
             // `latest_assessment_no_red` greps GATE_ASSESSMENT lines by
