@@ -960,7 +960,9 @@ fn render_coder_prompt(
          worktree happens to have configured, even if one exists.\n\
          BRANCH: {branch} — the daemon watches this exact branch on \
          {target_repo} for your commits. Push to it after EVERY green unit of \
-         work; never hold more than ~30 minutes of uncommitted changes.\n\
+         work; never hold more than ~30 minutes of uncommitted changes. Push ONLY\n\
+         to this branch (factory attestation cross-checks the resolved PR's head ref\n\
+         against this value; pushing elsewhere stalls the bead).\n\
          PUSH COMMAND (run this verbatim, never a bare `git push`): git push {remote} {branch}\n\
          \n\
          DELIVERABLE: a pull request from {branch} to the default branch of \
