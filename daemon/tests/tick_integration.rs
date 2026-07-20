@@ -10041,7 +10041,229 @@ fn slow_tier_pre_gate_validation_re_resolves_when_stored_pr_no_longer_open() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
-// ===========================================================================
+/// jleechan-t40t r12 (issue #326), finding 1: a TRANSIENT
+/// `pr_number_for_branch` error while re-resolving a DISPATCHED bead must FAIL
+/// CLOSED — keep the bead DISPATCHED and retry next tick — NEVER promote
+/// DISPATCHED→ATTESTED against the stale, unvalidated `pr_number`.
+#[test]
+fn transient_pr_number_reresolve_error_keeps_dispatched_no_promotion() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    // A DISPATCHED, non-adopted bead with a STALE pr_number that would promote
+    // to ATTESTED (ready_to_promote == true for non-adopted) if the resolution
+    // didn't error.
+    let branch = "factory/t40t-transient-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "t40t-transient".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(999),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("t40t-transient", branch).unwrap();
+    // The branch→PR resolution fails transiently this tick.
+    scm.pr_number_for_branch_errors
+        .insert(("owner/repo".into(), branch.into()), "gh api timeout".into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_t40t_transient_reresolve.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("transient resolution error must not abort the tick");
+
+    let overlay = store.load("t40t-transient").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Dispatched,
+        "a transient re-resolution error must NOT promote to ATTESTED"
+    );
+    assert_eq!(
+        overlay.pr_number,
+        Some(999),
+        "the stale pr_number is left untouched (revalidated next tick), not consumed"
+    );
+    assert_eq!(
+        summary.gates_assessed, 0,
+        "a bead kept DISPATCHED must not be gate-assessed this tick"
+    );
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("\"PR_NUMBER_REREZOLVE_TRANSIENT_ERROR\"")
+            && log.contains("kept_dispatched_no_promotion"),
+        "must emit the fail-closed transient-error telemetry; log:\n{log}"
+    );
+    assert!(
+        !log.contains("\"PR_OPENED\""),
+        "must NOT promote (no PR_OPENED) on an unvalidated stale pr_number; log:\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-t40t r12 (issue #326), finding 3: pre-gate validation on an
+/// ATTESTED bead whose stored PR is closed AND whose branch has no live PR
+/// must DEMOTE the bead to DISPATCHED (so the branch→PR re-resolution path
+/// re-promotes it when a live PR appears) — not clear `pr_number` and strand
+/// it ATTESTED forever. Two ticks: tick 1 demotes; tick 2 (live PR now bound)
+/// re-resolves and re-promotes.
+#[test]
+fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let mut cfg = test_cfg();
+    cfg.pre_gate_validation_enabled = true;
+
+    let branch = "factory/t40t-noopenpr-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "t40t-noopenpr".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(8001),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("t40t-noopenpr", branch).unwrap();
+    // Stored PR 8001 is closed (NotFound), and the branch currently has NO
+    // live PR (no pr_numbers_for_branch entry -> Ok(None)).
+    scm.open_pr_head_refs
+        .insert(("owner/repo".into(), 8001), PrHeadBranch::NotFound);
+
+    let telemetry_log = std::env::temp_dir().join("afd_t40t_no_open_pr_demote.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // --- Tick 1: no live PR -> demote to DISPATCHED (not stranded ATTESTED).
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("pre-gate no-open-pr must not abort the tick");
+
+    let after1 = store.load("t40t-noopenpr").unwrap().unwrap();
+    assert_eq!(
+        after1.state,
+        OverlayState::Dispatched,
+        "an ATTESTED bead whose branch has no live PR must be demoted to \
+         DISPATCHED for re-resolution, not left ATTESTED with a null pr_number"
+    );
+    assert_eq!(after1.pr_number, None);
+    let log1 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log1.contains("demoted_attested_to_dispatched_for_rerezolve"),
+        "must audit the demotion; log:\n{log1}"
+    );
+
+    // --- Tick 2: a live PR (8002) is now bound to the branch. The DISPATCHED
+    // re-resolution path must pick it up and re-promote to ATTESTED.
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(8002));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 8002),
+        PrHeadBranch::SameRepo(branch.into()),
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut snap = qdw_green_snapshot(
+        8002,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: now,
+        }],
+    );
+    snap.head_committed_epoch = now.saturating_sub(60);
+    scm.pr_snapshots.insert(8002, snap);
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        2,
+        0,
+    )
+    .expect("re-resolution tick must not error");
+
+    let after2 = store.load("t40t-noopenpr").unwrap().unwrap();
+    assert_eq!(
+        after2.pr_number,
+        Some(8002),
+        "the demoted bead must re-resolve to the live PR once one is bound"
+    );
+    // It re-promoted through ATTESTED and, since the new PR is all-green,
+    // continued to READY in the same tick — proving the demotion produced a
+    // recoverable hold, not a terminal strand.
+    assert_eq!(
+        after2.state,
+        OverlayState::Ready,
+        "the demoted bead must resume (here all-green -> READY), not stay stranded"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 // jleechan-yoqy / issue #323: end-to-end evidence-contract gate verification
 // through the real fast tier. The coder's `**Evidence**:` marker must point at
 // a fetchable, non-empty gist whose head matches the PR head; anything else is
