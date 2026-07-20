@@ -99,13 +99,19 @@ This PR does NOT add:
 > **7. The reviewer subprocess env is allow-list only — no
 >    GITHUB_TOKEN, no HOME, no SSH agent socket, no cloud creds.**
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 > **8. Every verdict MUST include execution-evidence fields
 >    (TEST_RUN_EVIDENCE, LINT_RUN_EVIDENCE, GREP_CITES,
 >    HEAD_COMMIT_VERIFIED) — pattern-matched PASS verdicts without
 >    proof the reviewer ran tests+lint+grep on the PR HEAD are
 >    evidence-free and the gate rejects them (issue #384).**
+<<<<<<< HEAD
 =======
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 > **8. The published comment is read back with full equality on
 >    all 6 fields; mismatched values fail closed.**
 > **9. A `workflow_dispatch` self-run cannot produce a satisfiable
@@ -180,6 +186,7 @@ python -m runner.skeptic_gate_cli ...
      stdin-delivered prompt) AND gemini (-s, default approval,
      sanitized env, stdin-delivered prompt). 90s default timeout.
 <<<<<<< HEAD
+<<<<<<< HEAD
   h. parse_verdict — strict 10-field contract (6 base + 4 execution
      evidence per issue #384), no prose, no code-block smuggling,
      EXACTLY ONCE per field.
@@ -200,16 +207,30 @@ python -m runner.skeptic_gate_cli ...
 =======
   h. parse_verdict — strict 6-field contract, no prose, no
      code-block smuggling, EXACTLY ONCE per field.
+=======
+  h. parse_verdict — strict 10-field contract (6 base + 4 execution
+     evidence per issue #384), no prose, no code-block smuggling,
+     EXACTLY ONCE per field.
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
   i. bind_reviewer_identity — codex CLI must declare `codex`,
      gemini CLI must declare `gemini`.
   j. verify_provenance — implementation_identity ≠ reviewer_identity.
-  k. aggregate_results — ALL reviewers must PASS; duplicate reviewers
-     rejected.
-  l. Pre-publish API head recheck — abort if changed mid-run.
-  m. Post/upsert comment, set commit status. Status failure fails
+  k. Execution-evidence consistency: TEST_RUN_EVIDENCE must show
+     `failed=0 exit=0`; LINT_RUN_EVIDENCE must show `errors=0`;
+     GREP_CITES must contain ≥1 `path:LINE` cite; HEAD_COMMIT_VERIFIED
+     must equal HEAD_SHA byte-for-byte.
+  l. aggregate_results — ALL reviewers must PASS with non-vacuous
+     execution evidence; duplicate reviewers rejected; vacuous
+     reviewer (no execution evidence) treated as fail.
+  m. Pre-publish API head recheck — abort if changed mid-run.
+  n. Post/upsert comment, set commit status. Status failure fails
      closed (not swallowed).
+<<<<<<< HEAD
   n. Read back: verify ALL six fields equal what we wrote
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+  o. Read back: verify ALL six fields equal what we wrote
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
      byte-for-byte (HEAD_SHA full 40-hex, REPO, PR_NUMBER, VERDICT,
      REVIEWER, IMPLEMENTATION_PROVENANCE). Fail closed if any
      disagree. Verify commit-status state matches.
@@ -268,6 +289,7 @@ closed. **There is no self-PASS path.**
 ## Tests
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 `tests/test_skeptic_gate.py` covers **109** contract + adversarial cases:
 
 | Case | Test(s) |
@@ -284,6 +306,17 @@ closed. **There is no self-PASS path.**
 |---|---|
 | Strict 6-field contract, exactly once | `test_parse_verdict_*` |
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+`tests/test_skeptic_gate.py` covers **109** contract + adversarial cases:
+
+| Case | Test(s) |
+|---|---|
+| Strict 10-field contract (6 base + 4 execution-evidence), exactly once | `test_parse_verdict_*` |
+| Execution-evidence fields required (issue #384) | `test_parse_verdict_rejects_missing_execution_evidence_field`, `test_parse_verdict_rejects_test_run_evidence_when_tests_failed`, `test_parse_verdict_rejects_test_run_evidence_when_exit_nonzero`, `test_parse_verdict_rejects_lint_run_evidence_with_errors`, `test_parse_verdict_rejects_grep_cites_empty`, `test_parse_verdict_rejects_head_commit_verified_mismatch`, `test_parse_verdict_rejects_head_commit_verified_short_sha`, `test_parse_verdict_rejects_duplicate_test_run_evidence` |
+| Vacuous regression fixture caught (issue #384 acceptance) | `test_vacuous_regression_fixture_rejected_by_gate`, `test_vacuous_regression_fixture_with_fake_test_counts_still_rejected` |
+| Aggregator rejects vacuous reviewer verdicts (issue #384) | `test_aggregate_results_rejects_when_only_one_reviewer_has_evidence` |
+| Prompt requires execution-evidence fields | `test_build_prompt_requires_execution_evidence_fields` |
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 | No-prose / no-code-block contract | `test_adversarial_parse_rejects_*` |
 | Stale SHA PASS rejected | `test_bind_to_pr_rejects_stale_sha` |
 | Full equality read-back | `test_verify_published_comment_*`, `test_adversarial_readback_rejects_*` |
@@ -304,6 +337,9 @@ closed. **There is no self-PASS path.**
 | CLI end-to-end paths | `test_cli_forced_pass_*`, `test_cli_forced_fail_*`, `test_cli_provenance_fails_self_review` |
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 ### Execution-evidence contract (issue #384)
 
 Pattern-matched PASS verdicts slipped vacuous regression tests past the
@@ -335,8 +371,11 @@ reviewer whose `ParsedVerdict` has `test_run_evidence is None`,
 `head_commit_verified` is treated as if it had failed — the PR is
 not promoted.
 
+<<<<<<< HEAD
 =======
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 Run:
 
 ```bash

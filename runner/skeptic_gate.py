@@ -177,6 +177,9 @@ class ParsedVerdict:
     `parse_verdict` returns `None` rather than producing a partial
     `ParsedVerdict`.
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 
     The execution-evidence fields (`test_run_evidence`,
     `lint_run_evidence`, `grep_cites`, `head_commit_verified`) are the
@@ -185,8 +188,11 @@ class ParsedVerdict:
     the call sites cited in the diff is rejected at parse time. They
     are stored as parsed structures (or `None` on absence — which the
     contract requires never happens for a valid verdict).
+<<<<<<< HEAD
 =======
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     """
 
     verdict: Literal["PASS", "FAIL"]
@@ -197,6 +203,9 @@ class ParsedVerdict:
     reviewer_identity: str  # the model that emitted the verdict
     raw_excerpt: str
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     # Execution-evidence fields (issue #384):
     test_run_evidence: Optional["ParsedTestRun"] = None
     lint_run_evidence: Optional["ParsedLintRun"] = None
@@ -240,8 +249,11 @@ class ParsedLintRun:
     tool: str
     errors: int
     warnings: int
+<<<<<<< HEAD
 =======
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 
 
 @dataclass(frozen=True)
@@ -448,6 +460,9 @@ _IDENTITY_RE = re.compile(
 )
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 # ---------------------------------------------------------------------------
 # Execution-evidence regexes (issue #384)
 # ---------------------------------------------------------------------------
@@ -485,14 +500,20 @@ _HEAD_COMMIT_VERIFIED_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
+<<<<<<< HEAD
 =======
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 # Field-name regexes used by the no-prose check. A field line MUST
 # consist only of "<FIELD>: <value>" with nothing else on the line.
 # Case-insensitive to match the per-field regexes (Verdict: Pass is OK).
 _FIELD_LINE_RE = re.compile(r"^[A-Z_]+\s*:.*$", re.MULTILINE | re.IGNORECASE)
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 # Required execution-evidence fields (issue #384). The deterministic
 # gate refuses to honor a verdict that does not include all four —
 # pattern-matched PASS verdicts slipped vacuous regression tests and
@@ -504,6 +525,7 @@ EXECUTION_EVIDENCE_FIELDS = (
     "HEAD_COMMIT_VERIFIED",
 )
 
+<<<<<<< HEAD
 
 # ---------------------------------------------------------------------------
 # Contract-echo regex (issue #386)
@@ -984,6 +1006,8 @@ def evaluate_contract_echo(
 
 =======
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -996,6 +1020,9 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     **Strict no-prose contract** (per post-audit comment 4953064910):
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     - 10 required fields, each MUST appear EXACTLY ONCE on its own line:
       `VERDICT`, `HEAD_SHA`, `REPO`, `PR_NUMBER`, `REASON`, `IDENTITY`,
       `TEST_RUN_EVIDENCE`, `LINT_RUN_EVIDENCE`, `GREP_CITES`,
@@ -1003,6 +1030,7 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
       (issue #384) prove the reviewer actually executed the repo's
       tests+lint+grep on the PR HEAD, rather than pattern-matching
       the diff alone.
+<<<<<<< HEAD
     - The output MUST consist ONLY of:
         - up to one comment line (e.g. a leading `# reviewer: codex`)
         - the 10 contract fields, each on its own line
@@ -1013,16 +1041,25 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         - up to one comment line (e.g. a leading `# reviewer: codex`)
         - the 6 contract fields, each on its own line
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+    - The output MUST consist ONLY of:
+        - up to one comment line (e.g. a leading `# reviewer: codex`)
+        - the 10 contract fields, each on its own line
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         - any number of blank lines
       No Markdown code blocks, no extra prose, no second VERDICT line
       smuggled inside a triple-backtick fence.
     - Any field appearing more than once → reject (anti-injection).
     - Any required field missing → reject (fail-closed).
 <<<<<<< HEAD
+<<<<<<< HEAD
     - The 10 lines themselves MUST be the ONLY non-blank lines (no
 =======
     - The 6 lines themselves MUST be the ONLY non-blank lines (no
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+    - The 10 lines themselves MUST be the ONLY non-blank lines (no
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
       trailing prose, no surrounding commentary).
 
     A reviewer that wraps the contract in a Markdown code block
@@ -1055,6 +1092,7 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         if re.match(r"^[A-Z_]+\s*:", stripped, re.IGNORECASE):
             field_lines += 1
 <<<<<<< HEAD
+<<<<<<< HEAD
             # Track the field name so we can enforce EXACTLY 10 distinct
             # contract fields. Per post-audit comment 4953116428, the
             # previous version accepted a 7th field. Now any 11th field
@@ -1065,6 +1103,12 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
             # previous version accepted a 7th field. Now any 7th field
             # (or duplicate of any of the 6) → reject.
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+            # Track the field name so we can enforce EXACTLY 10 distinct
+            # contract fields. Per post-audit comment 4953116428, the
+            # previous version accepted a 7th field. Now any 11th field
+            # (or duplicate of any of the 10) → reject.
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
             field_name_match = re.match(r"^([A-Z_]+)\s*:", stripped, re.IGNORECASE)
             if field_name_match:
                 fname = field_name_match.group(1).upper()
@@ -1090,13 +1134,19 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     reasons = _REASON_RE.findall(output)
     identities = _IDENTITY_RE.findall(output)
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     # Execution-evidence fields (issue #384):
     test_run_evidence = _TEST_RUN_EVIDENCE_RE.findall(output)
     lint_run_evidence = _LINT_RUN_EVIDENCE_RE.findall(output)
     grep_cites = _GREP_CITES_RE.findall(output)
     head_commit_verified = _HEAD_COMMIT_VERIFIED_RE.findall(output)
+<<<<<<< HEAD
 =======
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 
     # Full-length SHA is required (40 hex chars). A reviewer that emits
     # only a short SHA hasn't fully bound its verdict.
@@ -1107,15 +1157,21 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         return None
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     # All ten required fields must be exactly one each. IDENTITY is
     # required for provenance (refuses self-review). The four
     # execution-evidence fields are required by issue #384 — a
     # verdict without them is a vacuous PASS, and the gate must
     # refuse to honor it.
+<<<<<<< HEAD
 =======
     # All six required fields must be exactly one each. IDENTITY is
     # required for provenance (refuses self-review).
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     if (
         len(verdicts) != 1
         or len(repos) != 1
@@ -1123,10 +1179,14 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         or len(reasons) != 1
         or len(identities) != 1
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         or len(test_run_evidence) != 1
         or len(lint_run_evidence) != 1
         or len(grep_cites) != 1
         or len(head_commit_verified) != 1
+<<<<<<< HEAD
     ):
         return None
 
@@ -1143,6 +1203,15 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     # no duplicates; here we also enforce that EXACTLY 6 distinct
     # contract fields are present.
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+    ):
+        return None
+
+    # Exact 10-field contract: no 11th field allowed. The
+    # seen_field_names set already enforced no duplicates; here we
+    # also enforce that EXACTLY 10 distinct contract fields are
+    # present.
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     expected_fields = {
         "VERDICT",
         "HEAD_SHA",
@@ -1151,12 +1220,18 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         "REASON",
         "IDENTITY",
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         "TEST_RUN_EVIDENCE",
         "LINT_RUN_EVIDENCE",
         "GREP_CITES",
         "HEAD_COMMIT_VERIFIED",
+<<<<<<< HEAD
 =======
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     }
     if seen_field_names != expected_fields:
         return None
@@ -1175,6 +1250,9 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         return None
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     # ---- Execution-evidence consistency checks (issue #384) ------------
     # A reviewer that claims PASS but reports failed>0, exit!=0, lint
     # errors>0, or an empty GREP_CITES is internally inconsistent and
@@ -1237,8 +1315,11 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         warnings=lint_warnings,
     )
 
+<<<<<<< HEAD
 =======
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     return ParsedVerdict(
         verdict=verdict_token,  # type: ignore[arg-type]
         head_sha=sha,
@@ -1248,12 +1329,18 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         reviewer_identity=identity_token,
         raw_excerpt=output[:500],
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         test_run_evidence=test_evidence_obj,
         lint_run_evidence=lint_evidence_obj,
         grep_cites=grep_cite_value,
         head_commit_verified=head_verified_sha,
+<<<<<<< HEAD
 =======
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     )
 
 
@@ -1635,6 +1722,7 @@ def evaluate(
 =======
     parsed = parse_verdict(review_output)
     if parsed is None:
+<<<<<<< HEAD
         reason = (
             "reviewer output was unparseable (one or more of "
             "VERDICT/HEAD_SHA/REPO/PR_NUMBER/REASON/IDENTITY missing, "
@@ -1642,6 +1730,32 @@ def evaluate(
             "code-block present — fail-closed)"
         )
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+        # Diagnose the most likely failure mode for the reason. Issue
+        # #384: distinguish "execution evidence missing" from generic
+        # unparseable — evidence-free verdicts are invalid (fail-closed)
+        # and the operator/Healer needs the specific reason to triage.
+        missing_evidence = [
+            f for f in EXECUTION_EVIDENCE_FIELDS
+            if f not in review_output
+        ]
+        if missing_evidence:
+            reason = (
+                "reviewer output missing execution-evidence fields "
+                f"({', '.join(missing_evidence)}) — verdict is invalid "
+                "without proof the reviewer ran the repo's tests/lint/"
+                f"grep on the PR HEAD (issue #384)"
+            )
+        else:
+            reason = (
+                "reviewer output was unparseable (one or more of "
+                "VERDICT/HEAD_SHA/REPO/PR_NUMBER/REASON/IDENTITY/"
+                "TEST_RUN_EVIDENCE/LINT_RUN_EVIDENCE/GREP_CITES/"
+                "HEAD_COMMIT_VERIFIED missing, duplicated, "
+                "inconsistent with VERDICT, or extra prose/code-block "
+                "present — fail-closed)"
+            )
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         body = format_comment(
             verdict="FAIL",
             head_sha=head_sha,
@@ -1869,6 +1983,9 @@ def aggregate_results(
     primary_sha = primary.parsed.head_sha if primary and primary.parsed else head_sha
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     # Execution-evidence guard (issue #384): even if a reviewer's
     # `check_state` is 'success', the verdict is invalid if the parsed
     # result is missing execution-evidence fields. A vacuous
@@ -1912,8 +2029,11 @@ def aggregate_results(
             reviewer="(aggregate)",
         )
 
+<<<<<<< HEAD
 =======
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     extras: List[str] = []
     for r in results:
         marker = "✅ PASS" if r.check_state == "success" else "❌ FAIL"
@@ -1924,6 +2044,7 @@ def aggregate_results(
         agg_state = "success"
         agg_reason = (
 <<<<<<< HEAD
+<<<<<<< HEAD
             f"all {len(results)} reviewers passed with execution "
             f"evidence; primary reviewer: "
             f"{primary.reviewer if primary else '(unknown)'}"
@@ -1931,6 +2052,11 @@ def aggregate_results(
             f"all {len(results)} reviewers passed; "
             f"primary reviewer: {primary.reviewer if primary else '(unknown)'}"
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+            f"all {len(results)} reviewers passed with execution "
+            f"evidence; primary reviewer: "
+            f"{primary.reviewer if primary else '(unknown)'}"
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
         )
     else:
         agg_verdict = "FAIL"
@@ -2089,12 +2215,18 @@ with no extra commentary or code blocks:
     REASON: <one-sentence justification>
     IDENTITY: <codex|gemini|claude|unknown>
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
     TEST_RUN_EVIDENCE: passed=<N> failed=<N> skipped=<N> exit=<N>
     LINT_RUN_EVIDENCE: tool=<name> errors=<N> warnings=<N>
     GREP_CITES: <file:line;file:line;...>
     HEAD_COMMIT_VERIFIED: <full 40-hex SHA of the local HEAD you actually exercised>
+<<<<<<< HEAD
 =======
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 
 Rules:
 - The `HEAD_SHA` MUST be the FULL 40-character hex SHA shown above. Not
@@ -2111,6 +2243,9 @@ Rules:
   blocks containing verdict tokens, no commentary. The deterministic
   gate will reject anything that does not match this contract exactly,
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
   including outputs where any of the ten lines appears more than once.
 
 # Execution-evidence requirement (issue #384) — NOT optional
@@ -2152,6 +2287,7 @@ If the repo's test command is slow or unavailable, report the real
 result (including the failure) — do not fabricate numbers to satisfy
 the contract. A FAIL verdict with honest execution evidence is
 acceptable; a PASS verdict without evidence is not.
+<<<<<<< HEAD
 
 # Contract-echo requirement (issue #386) — REQUIRED when a contract is provided
 
@@ -2266,6 +2402,8 @@ def _build_contract_block(contract: BeadContract) -> str:
 
 =======
   including outputs where any of the six lines appears more than once.
+=======
+>>>>>>> a6c9078 (claude/fable: fix(daemon): skeptic gate execution-evidence contract (issue #384) (#390))
 """
 
 
@@ -2340,8 +2478,11 @@ __all__ = [
     "PriorFindingEcho",
 =======
     "COMMIT_PREFIX_TO_IDENTITY",
+    "EXECUTION_EVIDENCE_FIELDS",
     "MARKER",
     "ModelIdentity",
+    "ParsedLintRun",
+    "ParsedTestRun",
     "ParsedVerdict",
 >>>>>>> 22c6eec ([antig] feat(ci): add SHA-bound skeptic gate workflow for 7-green (#281))
     "REVIEWER_CLI_TO_IDENTITY",
