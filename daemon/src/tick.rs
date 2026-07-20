@@ -2531,12 +2531,14 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             // live lookup this tick; skip the redundant pre-gate check.
             pr
         } else if !deps.cfg.pre_gate_validation_enabled {
-            // Pre-gate validation is operator-gated (default false) so
-            // legacy deployments and integration tests that don't script
-            // `open_pr_head_refs` for ATTESTED beads aren't disturbed.
-            // Production deployments with the flag enabled get full
-            // drift coverage for ATTESTED beads whose stored `pr_number`
-            // wasn't re-resolved by the dispatch→attested path this tick.
+            // Pre-gate validation is operator-gated (default true in
+            // `Config::default_pre_gate_validation_enabled`) so legacy
+            // deployments and integration tests that don't script
+            // `open_pr_head_refs` for ATTESTED beads aren't disturbed
+            // when an operator explicitly disables it via config. The
+            // default ON is the safety posture — drift detection catches
+            // beads whose stored `pr_number` no longer matches the live
+            // PR head ref before gates are assessed against stale state.
             pr
         } else {
             match deps.scm.open_pr_head_ref_for_repo(&repo, pr) {

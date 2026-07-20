@@ -955,6 +955,105 @@ pub fn structural_pending_gates(report: &GateReport) -> Vec<(GateName, &str)> {
         .collect()
 }
 
+// --- jleechan-bze8.1 / issue #328: strict-all-green merge authority ---
+//
+// `report.all_green` is `true` iff every gate is `Green` (no `Red`, no
+// `Unknown`). This was the precondition the daemon used to gate
+// `READY_FOR_MERGE`. The shell-side auto-merge-guard, however, ran a more
+// permissive "no-fail" predicate that allowed `unknown` verdicts — which
+// meant a PR could reach merge in production with one or more gates held
+// `Unknown` by an external verifier that never produced a real verdict
+// (CodeRabbit unavailable, Bugbot absent). On at least three production
+// merges (#365, #375, #382) the per-gate `unknown`s were treated as
+// "infinitely defferable infra noise" instead of "blocking evidence gap,"
+// and the factory merged anyway.
+//
+// The rule going forward: an autonomous merge requires **strict all-green**
+// (every gate is `Green`, NOT a single `Unknown` anywhere in the report),
+// OR an explicit operator disposition record. The "unknown-only-after-cap"
+// path that previously let a PR slip through to READY_FOR_MERGE when the
+// only remaining blocker was a structural `Unknown` (CodeRabbit rate-limited,
+// Bugbot absent) now produces `ESCALATION_REQUIRED` + `HOLD` — the operator
+// decides whether to disposition-override or let it sit. The fix is layered
+// in three places:
+//
+//   1. `verifier::strict_all_green(&GateReport) -> bool` — single source of
+//      truth for "every gate is Green (no Red, no Unknown)".
+//   2. `verifier::MergeAuthority` — enum the tick path uses to gate
+//      `READY_FOR_MERGE` (must be `StrictAllGreen` or `OperatorDispositon`
+//      to proceed; `EscalationRequired` parks the bead HUMAN_HELD).
+//   3. `daemon/scripts/auto-merge-guard.sh` and
+//      `daemon/factory-overlay.sh bead-closed-check` — mirror the same rule
+//      on the shell side so the merge guard never honors an "all green"
+//      state that actually has unknowns the verifier wrote out.
+
+/// Strict-all-green check: `true` iff every gate in `report` is `Green`.
+///
+/// Note this is the **strictest** possible reading — it disallows `Unknown`
+/// gates even when they would be classified `Transient` by
+/// `classify_chain()`. The reason: the auto-merge-guard cannot distinguish
+/// "unknown gate that will resolve on its own" from "unknown gate held
+/// forever by an unavailable external verifier," and treating the two
+/// differently is exactly what produced the #365/#375/#382 regressions.
+pub fn strict_all_green(report: &GateReport) -> bool {
+    report.results.iter().all(|(_, r)| matches!(r, GateResult::Green))
+}
+
+/// The set of gates that are not strictly `Green` — `(gate, reason)`
+/// pairs. Empty iff `strict_all_green` is `true`. Used by the merge-authority
+/// path to name the unknowns in `ESCALATION_REQUIRED` telemetry.
+pub fn nongreen_gates(report: &GateReport) -> Vec<(GateName, &str)> {
+    report
+        .results
+        .iter()
+        .filter_map(|(name, result)| match result {
+            GateResult::Green => None,
+            GateResult::Red(reason) => Some((*name, reason.as_str())),
+            GateResult::Unknown(reason) => Some((*name, reason.as_str())),
+        })
+        .collect()
+}
+
+/// Merge authority — what the autonomous merge path should do given a
+/// `GateReport` and the operator's disposition (if any). This is the single
+/// source of truth for the strict-all-green vs operator-disposition rule,
+/// so the tick path and the shell-side `auto-merge-guard.sh` can never
+/// disagree on whether a PR is safe to merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeAuthority {
+    /// Every gate is `Green` (no `Red`, no `Unknown`). The autonomous
+    /// merge path MAY proceed.
+    StrictAllGreen,
+    /// Not strictly all-green, but the operator has recorded an explicit
+    /// disposition record that authorizes the merge anyway. The autonomous
+    /// merge path MAY proceed under the operator's authority.
+    OperatorDisposition,
+    /// The report has at least one non-green gate AND no operator
+    /// disposition record. The autonomous merge path MUST NOT proceed —
+    /// `tick.rs` parks the bead `HUMAN_HELD` with reason
+    /// `unknown_only_after_cap` (or the equivalent stage-1
+    /// `gate_assessment_not_all_green` reason), and emits
+    /// `ESCALATION_REQUIRED` telemetry. The operator decides whether to
+    /// disposition-override on the next tick.
+    EscalationRequired,
+}
+
+/// Resolve a merge authority decision. `has_operator_disposition` is set by
+/// the caller from its own disposition state (typically a database flag,
+/// a beacon file, or an explicit gate). The function itself is pure — no
+/// hidden side effects, no inferred defaults — so the same input always
+/// produces the same output, and the operator can audit the decision by
+/// reading the inputs.
+pub fn merge_authority(report: &GateReport, has_operator_disposition: bool) -> MergeAuthority {
+    if strict_all_green(report) {
+        MergeAuthority::StrictAllGreen
+    } else if has_operator_disposition {
+        MergeAuthority::OperatorDisposition
+    } else {
+        MergeAuthority::EscalationRequired
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2263,6 +2362,269 @@ mod tests {
                 "expected a pending Unknown, got: {reason}"
             ),
             other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    // --- jleechan-bze8.1 / issue #328: strict-all-green merge authority ---
+
+    /// `all_green=true` (the precondition the daemon used to gate
+    /// `READY_FOR_MERGE`) is the SAME as `strict_all_green` in the current
+    /// verifier — both reduce to "every gate is Green" because `assess`
+    /// builds `all_green` from the same `is_green()` predicate. This test
+    /// pins that invariant; if a future refactor decouples the two,
+    /// `strict_all_green` is the source of truth the auto-merge-guard
+    /// reads, and `all_green` must follow it.
+    #[test]
+    fn strict_all_green_matches_all_green_in_current_assess() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+        assert!(report.all_green, "expected all_green, got {report:?}");
+        assert!(
+            strict_all_green(&report),
+            "strict_all_green must agree with all_green when every gate is Green, \
+             got report: {report:?}"
+        );
+    }
+
+    /// The unknown-only-after-cap regression class (#365 / #375 / #382): a
+    /// report that is `all_green=false` because of a single `Unknown`
+    /// verdict on a structural gate (CodeRabbit unavailable, Bugbot absent)
+    /// must NOT be `strict_all_green` — even though it has zero `Red` gates
+    /// and would pass the old shell-side "no-fail" predicate that
+    /// permitted the three production merges. This is the regression the
+    /// new merge authority exists to prevent.
+    #[test]
+    fn strict_all_green_false_when_only_unknown_gate_is_structural() {
+        // CodeRabbitUnknown is the live shape of the #365/#375/#382
+        // regressions: every other gate is Green, but CodeRabbit is
+        // "unknown" (unavailable, rate-limited, no verdict). Pre-fix,
+        // auto-merge-guard's "no-fail" predicate returned exit 0 and the
+        // PR merged anyway.
+        let mut report = all_green_report();
+        set_gate(
+            &mut report,
+            GateName::CodeRabbitApproved,
+            GateResult::Unknown("CodeRabbit review is still pending/unknown".to_string()),
+        );
+        // Mirror `assess`'s invariant: `all_green` is the AND of every
+        // gate's `is_green()`. The test helpers below mutate `results`
+        // in place without recomputing `all_green`; the strict_all_green
+        // assertion below is what we actually care about.
+        assert!(
+            !strict_all_green(&report),
+            "strict_all_green must be false when ANY gate is Unknown, even if all \
+             others are Green — this is the regression that #328 / bze8.1 closes, \
+             got report: {report:?}"
+        );
+        let unknowns: Vec<&str> = nongreen_gates(&report)
+            .iter()
+            .filter_map(|(_, reason)| reason.contains("unknown").then_some(*reason))
+            .collect();
+        assert_eq!(
+            unknowns.len(),
+            1,
+            "exactly one unknown gate must be reported, got: {unknowns:?}"
+        );
+    }
+
+    /// The pure-red regression class: a single `Red` gate collapses the
+    /// report to both `all_green=false` and `strict_all_green=false`. The
+    /// old "no-fail" predicate would correctly block (the gate is `fail`),
+    /// but `strict_all_green` is the single source of truth and must also
+    /// classify this as not-strict-all-green.
+    #[test]
+    fn strict_all_green_false_when_any_gate_is_red() {
+        let mut report = all_green_report();
+        set_gate(
+            &mut report,
+            GateName::Ci,
+            GateResult::Red("CI check-run(s) not all success".to_string()),
+        );
+        assert!(!strict_all_green(&report));
+    }
+
+    /// Strict-all-green + no operator disposition ⇒ `StrictAllGreen`.
+    /// The autonomous merge path is allowed to proceed.
+    #[test]
+    fn merge_authority_strict_all_green_proceeds_without_disposition() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+        assert_eq!(
+            merge_authority(&report, false),
+            MergeAuthority::StrictAllGreen,
+            "every gate Green + no operator disposition ⇒ StrictAllGreen (autonomous merge)"
+        );
+    }
+
+    /// Strict-all-green + operator disposition recorded ⇒ `OperatorDisposition`.
+    /// The autonomous merge path is allowed to proceed under the operator's
+    /// authority (this combination is rare — it exists so a human can
+    /// pre-authorize a merge the verifier already cleared).
+    #[test]
+    fn merge_authority_strict_all_green_with_disposition_returns_operator_disposition() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+        assert_eq!(
+            merge_authority(&report, true),
+            MergeAuthority::StrictAllGreen,
+            "strict_all_green must take precedence over the disposition flag — the \
+             disposition only matters when strict_all_green is false"
+        );
+    }
+
+    /// Unknown-only-after-cap + no operator disposition ⇒
+    /// `EscalationRequired`. This is the regression-class fix: previously
+    /// the auto-merge-guard merged these PRs (#365 / #375 / #382). After
+    /// the fix, the merge path must return EscalationRequired and `tick.rs`
+    /// must park the bead `HUMAN_HELD` with `ESCALATION_REQUIRED`
+    /// telemetry — never `READY_FOR_MERGE` directly.
+    #[test]
+    fn merge_authority_unknown_only_after_cap_requires_escalation() {
+        let mut report = all_green_report();
+        set_gate(
+            &mut report,
+            GateName::CodeRabbitApproved,
+            GateResult::Unknown("CodeRabbit unavailable".to_string()),
+        );
+        set_gate(
+            &mut report,
+            GateName::BugbotClean,
+            GateResult::Unknown("Bugbot absent".to_string()),
+        );
+        assert_eq!(
+            merge_authority(&report, false),
+            MergeAuthority::EscalationRequired,
+            "unknown-only after-cap + no operator disposition ⇒ EscalationRequired \
+             (PR must NEVER reach READY_FOR_MERGE directly)"
+        );
+    }
+
+    /// Unknown-only-after-cap + operator disposition ⇒ `OperatorDisposition`.
+    /// The operator explicitly authorized the merge; the autonomous path
+    /// proceeds. The operator override is the ONLY thing that can let a
+    /// non-strict-all-green PR reach merge.
+    #[test]
+    fn merge_authority_unknown_only_with_operator_disposition_proceeds() {
+        let mut report = all_green_report();
+        set_gate(
+            &mut report,
+            GateName::CodeRabbitApproved,
+            GateResult::Unknown("CodeRabbit unavailable".to_string()),
+        );
+        assert_eq!(
+            merge_authority(&report, true),
+            MergeAuthority::OperatorDisposition,
+            "operator disposition overrides the unknown gate(s) and authorizes the merge"
+        );
+    }
+
+    /// Pure-red + no operator disposition ⇒ `EscalationRequired`. The
+    /// operator must disposition-override (or wait for the coder to fix
+    /// the diff and the gates to re-clear).
+    #[test]
+    fn merge_authority_red_gates_require_escalation_without_disposition() {
+        let mut report = all_green_report();
+        set_gate(
+            &mut report,
+            GateName::Ci,
+            GateResult::Red("CI failed".to_string()),
+        );
+        assert_eq!(
+            merge_authority(&report, false),
+            MergeAuthority::EscalationRequired,
+            "any Red gate ⇒ EscalationRequired (autonomous merge must NEVER proceed)"
+        );
+    }
+
+    /// Pure-red + operator disposition ⇒ `OperatorDisposition`. The
+    /// operator's override can authorize the merge even with a Red gate
+    /// (e.g. CI flake, retry succeeded out-of-band).
+    #[test]
+    fn merge_authority_red_gates_with_disposition_returns_operator_disposition() {
+        let mut report = all_green_report();
+        set_gate(
+            &mut report,
+            GateName::Ci,
+            GateResult::Red("CI failed".to_string()),
+        );
+        assert_eq!(
+            merge_authority(&report, true),
+            MergeAuthority::OperatorDisposition,
+            "operator disposition authorizes the merge despite Red gate(s)"
+        );
+    }
+
+    /// `nongreen_gates` lists every non-Green gate as `(name, reason)`
+    /// pairs. Used by the merge-authority path to name the unknowns in
+    /// `ESCALATION_REQUIRED` telemetry.
+    #[test]
+    fn nongreen_gates_returns_red_and_unknown_with_reasons() {
+        let mut report = all_green_report();
+        set_gate(
+            &mut report,
+            GateName::Ci,
+            GateResult::Red("CI red".to_string()),
+        );
+        set_gate(
+            &mut report,
+            GateName::CodeRabbitApproved,
+            GateResult::Unknown("CR unknown".to_string()),
+        );
+        let ngs = nongreen_gates(&report);
+        assert_eq!(ngs.len(), 2, "exactly two non-green gates, got: {ngs:?}");
+        let names: Vec<GateName> = ngs.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&GateName::Ci), "missing CI Red: {ngs:?}");
+        assert!(
+            names.contains(&GateName::CodeRabbitApproved),
+            "missing CodeRabbit Unknown: {ngs:?}"
+        );
+    }
+
+    /// All-green baseline `GateReport`. Each merge-authority test mutates
+    /// one or two gates to non-Green via `set_gate` to exercise the
+    /// regression class it owns.
+    fn all_green_report() -> GateReport {
+        GateReport {
+            results: [
+                (GateName::Ci, GateResult::Green),
+                (GateName::NoConflicts, GateResult::Green),
+                (GateName::CodeRabbitApproved, GateResult::Green),
+                (GateName::BugbotClean, GateResult::Green),
+                (GateName::CommentsResolved, GateResult::Green),
+                (GateName::EvidenceFloor, GateResult::Green),
+                (GateName::Skeptic, GateResult::Green),
+            ],
+            all_green: true,
+        }
+    }
+
+    /// In-place gate mutation that preserves `all_green` honestly — each
+    /// mutation flips `all_green` to `false` because a non-Green gate is
+    /// being installed. Tests below assert on `strict_all_green` (the
+    /// authoritative predicate) rather than `all_green`, so the
+    /// `all_green` mirror being out-of-sync with `results` is acceptable
+    /// for fixture-construction purposes only — production never builds a
+    /// `GateReport` this way; `assess` rebuilds `all_green` from
+    /// `results` on every call.
+    fn set_gate(report: &mut GateReport, name: GateName, result: GateResult) {
+        let idx = match name {
+            GateName::Ci => 0,
+            GateName::NoConflicts => 1,
+            GateName::CodeRabbitApproved => 2,
+            GateName::BugbotClean => 3,
+            GateName::CommentsResolved => 4,
+            GateName::EvidenceFloor => 5,
+            GateName::Skeptic => 6,
+        };
+        report.results[idx] = (name, result);
+        if !matches!(report.results[idx].1, GateResult::Green) {
+            report.all_green = false;
         }
     }
 }

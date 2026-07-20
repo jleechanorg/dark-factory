@@ -53,6 +53,29 @@ fn test_cfg() -> Config {
         reroll_death_confirm_secs: 0,
         held_recheck_cooldown_secs: 900,
         repos: std::collections::HashMap::new(),
+        // jleechan-bze8.1 / #382 residual: the production default for
+        // `pre_gate_validation_enabled` is `true` (see
+        // `config.rs::default_pre_gate_validation_enabled`), but the
+        // tick-integration harness keeps `test_cfg` set to `false` to
+        // avoid scripting `open_pr_head_refs` for every ATTESTED bead —
+        // doing so would multiply 30+ tests' fixtures and obscure their
+        // intent. The 33 tests that depend on the pre-gate path being
+        // OFF here either:
+        //   (a) test the pre-gate ON path explicitly (`cfg.pre_gate_validation_enabled = true;`),
+        //   (b) test a different state-machine surface where pre-gate
+        //       is irrelevant (intake / dispatch / DISPATCHED→ATTESTED
+        //       promotions), OR
+        //   (c) rely on a FakeScm that returns an explicit
+        //       `Err(DaemonError::Tool{...})` for `open_pr_head_ref_for_repo`
+        //       and the OFF flag lets the test reach the gating surface
+        //       it actually wants to exercise.
+        // The mismatch is documented but not flipped here because (a) is
+        // already covered by the explicit `cfg.pre_gate_validation_enabled = true;`
+        // tests and (b)/(c) would each require bespoke fixture wiring —
+        // not the goal of #328 / bze8.1, which closes the merge-authority
+        // regression. A future bead (filed as jleechan-pre-gate-test-cfg-default)
+        // can flip this default once the harness grows scripted
+        // `open_pr_head_refs` for the affected 33 tests.
         pre_gate_validation_enabled: false,
     }
 }
@@ -7065,20 +7088,46 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     // confirm the match path is genuinely non-dormant: it parses without
     // crashing and reports a non-blocking verdict for this all-green
     // scenario.
+    //
+    // jleechan-bze8.1 / issue #328: the predicate was changed from a
+    // hard-coded line slice (`sed -n '41,69p'` / `lines().skip(40).take(29)`)
+    // to a marker-driven extraction (`import json, sys` .. `sys.exit(0)'`)
+    // because the bze8.1 strict-all-green rule grew the predicate (operator
+    // disposition override, ESCALATION_REQUIRED branch). Hard-coded line
+    // ranges would silently drift every time the predicate grew; the
+    // marker-driven form is what `tests/scripts/.../test_auto_merge_guard_gate_vocabulary.sh`
+    // uses, so both consumers agree on the same predicate slice.
     let guard_script =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/auto-merge-guard.sh");
     let guard_src = std::fs::read_to_string(&guard_script)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", guard_script.display()));
-    let predicate_block: String = guard_src
-        .lines()
-        .skip(40) // 0-indexed: line 41 (1-indexed) of auto-merge-guard.sh
-        .take(29) // lines 41..=69 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh's `sed -n '41,69p'`
-        .collect::<Vec<_>>()
-        .join("\n");
+    let predicate_block: String = {
+        let mut capture = false;
+        let mut block_lines: Vec<&str> = Vec::new();
+        for line in guard_src.lines() {
+            if line.trim_start() == "import json, sys" {
+                capture = true;
+                block_lines.push(line);
+                continue;
+            }
+            if capture {
+                if line == "sys.exit(0)'" {
+                    break;
+                }
+                block_lines.push(line);
+            }
+        }
+        if !capture {
+            panic!("auto-merge-guard.sh is missing the `import json, sys` marker; \
+                    cannot extract the python predicate block");
+        }
+        block_lines.join("\n")
+    };
     assert!(
         predicate_block.contains("g.items()"),
-        "extracted predicate block drifted from auto-merge-guard.sh's actual \
-         line range 41-69 (line numbers may have shifted); block:\n{predicate_block}"
+        "extracted predicate block does not contain the gate-iteration \
+         expression; the predicate may have regressed to a no-op; \
+         block:\n{predicate_block}"
     );
 
     use std::io::Write as _;
@@ -7109,8 +7158,8 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
          line={gate_assessment_line}"
     );
     assert!(
-        predicate_stdout.contains("no-fail"),
-        "expected a non-blocking 'no-fail' verdict from auto-merge-guard.sh's \
+        predicate_stdout.contains("strict-all-green"),
+        "expected a non-blocking 'strict-all-green' verdict from auto-merge-guard.sh's \
          predicate for this all-green scenario; got: {predicate_stdout}"
     );
 

@@ -419,21 +419,39 @@ print((d[0] if isinstance(d, list) else d).get("status","unknown"))' 2>/dev/null
     merged_ok=""
     if [ -n "$pr_number" ] && [ "$pr_number" != "None" ]; then
       last_ga="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$pr_number[,}]" | tail -1 || true)"
-      if [ -n "$last_ga" ] && printf '%s' "$last_ga" | python3 -c 'import json,sys
-try: g=json.loads(sys.stdin.read())["context"]["gates"]
-except Exception: sys.exit(1)
-# jleechan-240 align guard with the verdict vocabulary accepted by
-# gate-assessment: block on fail (or the legacy "red" alias), including
-# the structured {"verdict":"fail", "evidence":[...]} shape. Warn and
-# unknown stay non-blocking per the documented no-red merge policy.
-ALIAS={"green":"pass","red":"fail","yellow":"warn","warn":"warn","unknown":"unknown","pass":"pass","fail":"fail"}
+      # jleechan-bze8.1 / issue #328: the bead-closed-check must mirror the
+      # auto-merge-guard's STRICT all-green rule. The old "no-fail" predicate
+      # permitted `unknown` verdicts and was the path that let #365/#375/#382
+      # merge with structural-pending unknowns. Now: any `fail` verdict OR any
+      # `unknown` verdict WITHOUT an explicit operator disposition record
+      # blocks the bead from being marked READY. The operator override is
+      # opt-in (same `OPERATOR_DISPOSITION:` token, recorded in the
+      # GATE_ASSESSMENT context's `operator_disposition` field).
+      if [ -n "$last_ga" ] && printf '%s' "$last_ga" | python3 -c '
+import json, sys
+try:
+    ctx = json.loads(sys.stdin.read())["context"]
+    g = ctx["gates"]
+except Exception:
+    sys.exit(1)
+ALIAS = {"pass":"pass","warn":"pass","fail":"fail","unknown":"unknown",
+         "green":"pass","red":"fail","yellow":"pass"}
 def verdict(v):
     if isinstance(v, str):
         return ALIAS.get(v, v)
     if isinstance(v, dict):
         return ALIAS.get(v.get("verdict",""), v.get("verdict",""))
     return v
-sys.exit(0 if not any(verdict(v) == "fail" for v in g.values()) else 1)'; then
+fails = [k for k, v in g.items() if verdict(v) == "fail"]
+if fails:
+    sys.exit(1)
+unknowns = [k for k, v in g.items() if verdict(v) == "unknown"]
+if unknowns:
+    disp = ctx.get("operator_disposition", "")
+    if disp and "OPERATOR_DISPOSITION:" in str(disp):
+        sys.exit(0)
+    sys.exit(1)
+sys.exit(0)'; then
         merged_ok="yes"
       fi
     fi
