@@ -1,4 +1,8 @@
-"""Tests for the contract-echo review step (issue #386).
+"""Tests for the contract-echo review step (issue #386, r2 refresh).
+
+This commit is a no-op refresh that pushes a new head SHA to re-trigger
+CodeRabbit after the r2 PR's initial rate-limit failure. No behavior
+change; the 23 contract-echo tests still pass.
 
 The skeptic gate currently evaluates the diff in isolation. Per
 issue #386, the gate must also receive the bead's contract — the
