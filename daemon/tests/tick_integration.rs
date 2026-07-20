@@ -10263,3 +10263,261 @@ fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+// jleechan-yoqy / issue #323: end-to-end evidence-contract gate verification
+// through the real fast tier. The coder's `**Evidence**:` marker must point at
+// a fetchable, non-empty gist whose head matches the PR head; anything else is
+// a fail-closed evidence-gate FAIL.
+// ===========================================================================
+
+fn evidence_bead(store: &FakeStateStore, scm: &mut FakeScm, bead_id: &str, pr: u64, branch: &str, body: &str) {
+    store
+        .save(&BeadOverlay {
+            bead_id: bead_id.into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch(bead_id, branch).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut snap = qdw_green_snapshot(
+        pr,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: now,
+        }],
+    );
+    snap.head_sha = "deadbeefcafe".into();
+    snap.head_committed_epoch = now.saturating_sub(60);
+    snap.body = body.into();
+    scm.pr_snapshots.insert(pr, snap);
+}
+
+#[test]
+fn evidence_gate_verified_gist_reaches_ready() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-ok",
+        9101,
+        "factory/ev-ok-r1",
+        "**Evidence**: https://gist.github.com/u/goodgist (head deadbeefcafe)",
+    );
+    scm.gists.insert("goodgist".into(), true); // fetchable + non-empty
+
+    let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_ok.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let summary = run_tick(
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
+        1, 0,
+    )
+    .expect("tick must not error");
+    assert_eq!(summary.gates_assessed, 1);
+    assert_eq!(
+        store.load("ev-ok").unwrap().unwrap().state,
+        OverlayState::Ready,
+        "a verified evidence gist must let an otherwise-green PR reach READY"
+    );
+    assert!(scm.calls.borrow().iter().any(|c| c.contains("gist_nonempty(goodgist)")));
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn evidence_gate_empty_gist_fails_closed_not_ready() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-empty",
+        9102,
+        "factory/ev-empty-r1",
+        "**Evidence**: https://gist.github.com/u/emptygist (head deadbeefcafe)",
+    );
+    scm.gists.insert("emptygist".into(), false); // fetchable but EMPTY
+
+    let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_empty.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let summary = run_tick(
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
+        1, 0,
+    )
+    .expect("tick must not error");
+    assert_eq!(summary.gates_assessed, 1);
+    assert_ne!(
+        store.load("ev-empty").unwrap().unwrap().state,
+        OverlayState::Ready,
+        "an empty evidence gist must fail the evidence gate (never READY)"
+    );
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("evidence contract") && log.contains("empty"),
+        "the evidence-gate failure must carry distinct 'evidence contract ... empty' text; log:\n{log}"
+    );
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn evidence_gate_head_mismatch_fails_closed() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // Marker references a STALE head that does not match the PR head.
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-stale",
+        9103,
+        "factory/ev-stale-r1",
+        "**Evidence**: https://gist.github.com/u/goodgist (head 00000000stale)",
+    );
+    scm.gists.insert("goodgist".into(), true);
+
+    let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_stale.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    run_tick(
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
+        1, 0,
+    )
+    .expect("tick must not error");
+    assert_ne!(
+        store.load("ev-stale").unwrap().unwrap().state,
+        OverlayState::Ready,
+        "a stale-head evidence marker must fail the evidence gate"
+    );
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("does not match PR head"),
+        "head-mismatch failure text expected; log:\n{log}"
+    );
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// r5 finding 2: an evidence marker LINE that is present but incomplete
+/// (missing gist URL or `(head <sha>)`) must FAIL the evidence gate
+/// (fail-closed) — not be treated as NotProvided.
+#[test]
+fn evidence_gate_incomplete_marker_fails_closed() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // Marker present but no gist URL / no (head ..) — parse_evidence -> None,
+    // but has_evidence_marker -> true.
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-incomplete",
+        9104,
+        "factory/ev-incomplete-r1",
+        "**Evidence**: I ran the tests, trust me",
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_incomplete.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    run_tick(
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
+        1, 0,
+    ).expect("tick must not error");
+    assert_ne!(
+        store.load("ev-incomplete").unwrap().unwrap().state,
+        OverlayState::Ready,
+        "an incomplete evidence marker must fail the gate (never READY)"
+    );
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("marker present but missing"),
+        "incomplete-marker failure text expected; log:\n{log}"
+    );
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// r5 finding 3: a TRANSIENT gist-fetch error must map to Unknown (wait), NOT
+/// a Red — so infra noise doesn't churn a reroll. The bead stays ATTESTED and
+/// the evidence gate reports pending, not a defect.
+#[test]
+fn evidence_gate_transient_gist_error_is_pending_not_red() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-transient",
+        9105,
+        "factory/ev-transient-r1",
+        "**Evidence**: https://gist.github.com/u/flaky (head deadbeefcafe)",
+    );
+    scm.gists_transient.insert("flaky".into()); // gh outage on fetch
+
+    let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_transient.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    run_tick(
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
+        1, 0,
+    ).expect("tick must not error");
+    // Not READY (evidence unknown), but NOT parked/rerolled — stays ATTESTED to retry.
+    assert_eq!(
+        store.load("ev-transient").unwrap().unwrap().state,
+        OverlayState::Attested,
+        "a transient gist error must leave the bead ATTESTED (wait), not reroll/park"
+    );
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("evidence contract pending"),
+        "transient gist error must surface as a pending Unknown; log:\n{log}"
+    );
+    assert!(
+        !log.contains("REROLL_VERDICT_RECORDED") && !log.contains("PARKED_HUMAN_HELD"),
+        "a transient gist error must not reroll or park; log:\n{log}"
+    );
+    let _ = std::fs::remove_file(&telemetry_log);
+}
