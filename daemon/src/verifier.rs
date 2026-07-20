@@ -788,6 +788,15 @@ fn skeptic_gate(evidence: &PrEvidence) -> GateResult {
         Some(SkepticVerdict::Warn(_)) => GateResult::Green, // warn is non-blocking (spec §4.2.5)
         Some(SkepticVerdict::Fail(reason)) => GateResult::Red(reason.clone()),
     }
+    // NOTE (bead jleechan-984e / issue #385): the cross-model guarantee is
+    // enforced BELOW this point via `assess`. A `Pass`/`Warn` verdict from a
+    // single-family skeptic (`review_degraded == true`) is converted to Red
+    // there, after `assess` has the full `PrEvidence` and can attribute the
+    // reason to the cross-model failure rather than to the gate-7 verdict
+    // itself. Doing it here would force this helper to know about
+    // `review_degraded` AND about the Stage-1 `mock_llm` exemption (which is
+    // already encoded in `compute_review_degraded`'s empty-family filter); the
+    // assess-site wiring keeps `skeptic_gate` verdict-only.
 }
 
 /// Assess all 7 gates for `pr` (spec §4.2.5, design doc §5). `repo` (bead
@@ -810,6 +819,23 @@ pub fn assess(
     cfg: &Config,
     evidence: &PrEvidence,
 ) -> Result<GateReport, crate::errors::DaemonError> {
+    // Bead jleechan-984e / issue #385: cross-model skeptic guarantee. The
+    // base skeptic verdict is the gate-7 parser's output; a Pass/Warn from
+    // a single-family review (`review_degraded == true`) is converted to Red
+    // here so strict merge policy (#328) refuses strict-green in that
+    // case. The `compute_review_degraded` filter already excludes the
+    // test-repo `mock_llm` path and the zero-vendors total-outage path, so
+    // this only fires when real vendors ran and they all belonged to the
+    // same family. Fail verdicts are already Red and are left alone — we
+    // do not mask the verdict's own reason with a cross-model one.
+    let skeptic_with_cross_model = match (skeptic_gate(evidence), evidence.review_degraded) {
+        (GateResult::Green, true) => GateResult::Red(
+            "cross-model skeptic guarantee violated: only one model family contributed to the review (issue #385, strict merge policy #328)"
+                .to_string(),
+        ),
+        (other, _) => other,
+    };
+
     let snapshot = match scm.pr_snapshot_for_repo(repo, pr) {
         Ok(snapshot) => snapshot,
         Err(e) => {
@@ -828,7 +854,7 @@ pub fn assess(
                 (GateName::BugbotClean, GateResult::Unknown(reason.clone())),
                 (GateName::CommentsResolved, GateResult::Unknown(reason)),
                 (GateName::EvidenceFloor, evidence_floor_gate(evidence)),
-                (GateName::Skeptic, skeptic_gate(evidence)),
+                (GateName::Skeptic, skeptic_with_cross_model),
             ];
             let all_green = results.iter().all(|(_, r)| r.is_green());
             return Ok(GateReport { results, all_green });
@@ -883,7 +909,7 @@ pub fn assess(
     };
 
     let evidence_floor = evidence_floor_gate(evidence);
-    let skeptic = skeptic_gate(evidence);
+    let skeptic = skeptic_with_cross_model;
 
     let results = [
         (GateName::Ci, ci),
@@ -1465,6 +1491,164 @@ mod tests {
             gate(&report, GateName::Skeptic),
             GateResult::Unknown(_)
         ));
+    }
+
+    // --- Bead jleechan-984e / issue #385: review_degraded gate ---
+    //
+    // r1 (#391) plumbed the `review_degraded` flag into `PrEvidence` and
+    // GATE_ASSESSMENT telemetry. Strict merge policy (#328) requires that
+    // a single-family skeptic review cannot pass `all_green`. r2 wires the
+    // flag into `skeptic_gate` so a `Pass` verdict whose contributing
+    // reviewers span fewer than two distinct model families is Red (not
+    // Green). The flag is `false` for the test-repo `mock_llm` path and
+    // for the zero-vendors total-outage path (per `compute_review_degraded`),
+    // so neither regresses.
+    #[test]
+    fn skeptic_pass_with_review_degraded_is_red_not_green() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            skeptic_reviewers: vec!["claude".to_string()],
+            review_degraded: true,
+            ..Default::default()
+        };
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        assert!(!report.all_green, "issue #385: single-family Pass must NOT be all_green");
+        match gate(&report, GateName::Skeptic) {
+            GateResult::Red(reason) => assert!(
+                reason.contains("review_degraded") || reason.contains("cross-model"),
+                "Red reason must name the cross-model failure, got {reason:?}"
+            ),
+            other => panic!("expected Red for review_degraded Pass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skeptic_warn_with_review_degraded_is_red_not_green() {
+        // Same rule applies to Warn: warn is non-blocking for the verifier,
+        // but a single-family warn still violates the cross-model guarantee.
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Warn("minor nit".into())),
+            skeptic_reviewers: vec!["claude".to_string()],
+            review_degraded: true,
+            ..Default::default()
+        };
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        assert!(!report.all_green);
+        assert!(matches!(gate(&report, GateName::Skeptic), GateResult::Red(_)));
+    }
+
+    #[test]
+    fn skeptic_pass_with_two_families_is_green() {
+        // Healthy path: two distinct model families (claude=anthropic +
+        // codex=openai) → review_degraded=false → Pass stays Green.
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            skeptic_reviewers: vec!["claude".to_string(), "codex".to_string()],
+            review_degraded: false,
+            ..Default::default()
+        };
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        assert!(report.all_green, "two distinct families with Pass must be all_green");
+        assert!(gate(&report, GateName::Skeptic).is_green());
+    }
+
+    #[test]
+    fn skeptic_pass_with_mock_llm_is_green() {
+        // Stage-1 test-repo path: a single mock_llm Llm::judge call. Per
+        // `compute_review_degraded`, this sets review_degraded=false so
+        // the cross-model gate does not fire on test fixtures.
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            skeptic_reviewers: vec!["mock_llm".to_string()],
+            review_degraded: false,
+            ..Default::default()
+        };
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        assert!(report.all_green, "mock_llm Pass with review_degraded=false stays green");
+        assert!(gate(&report, GateName::Skeptic).is_green());
+    }
+
+    #[test]
+    fn skeptic_pass_with_empty_reviewers_is_green() {
+        // Zero-vendors total-outage path: no verdict was produced (but in
+        // this scenario a Pass was still recorded somehow). The skeptic
+        // gate's verdict is what matters; review_degraded stays false when
+        // no real vendors contributed. The cross-model gate does not fire.
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            skeptic_reviewers: vec![],
+            review_degraded: false,
+            ..Default::default()
+        };
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        assert!(report.all_green);
+        assert!(gate(&report, GateName::Skeptic).is_green());
+    }
+
+    #[test]
+    fn skeptic_fail_with_review_degraded_still_red() {
+        // A Red verdict wins regardless of review_degraded (the Fail reason
+        // is preserved).
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Fail("wrong fix".into())),
+            skeptic_reviewers: vec!["claude".to_string(), "agy".to_string()],
+            review_degraded: false,
+            ..Default::default()
+        };
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        assert!(!report.all_green);
+        match gate(&report, GateName::Skeptic) {
+            GateResult::Red(reason) => assert_eq!(reason, "wrong fix"),
+            other => panic!("expected Red('wrong fix'), got {other:?}"),
+        }
     }
 
     #[test]
