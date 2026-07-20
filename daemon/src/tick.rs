@@ -2386,6 +2386,15 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     }
                     Ok(_) => {}
                     Err(e) => {
+                        // jleechan-t40t r12 (issue #326): FAIL CLOSED. A
+                        // transient branch→PR resolution error leaves the
+                        // stored `pr_number` UNVALIDATED this tick. The pre-fix
+                        // code merely logged and fell through to the promotion
+                        // block below, which would promote DISPATCHED→ATTESTED
+                        // against a possibly-stale number (gate-assessing a PR
+                        // the branch may no longer be bound to). Keep the bead
+                        // DISPATCHED and retry the resolution next tick — never
+                        // promote on an unvalidated number.
                         let _ = emit(
                             deps.telemetry_log,
                             bead_id,
@@ -2396,8 +2405,10 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             serde_json::json!({
                                 "branch": branch,
                                 "error": format!("{e:?}"),
+                                "action": "kept_dispatched_no_promotion",
                             }),
                         );
+                        continue;
                     }
                 }
             }
@@ -2573,13 +2584,23 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 discovered
                             }
                             Ok(None) => {
+                                // jleechan-t40t r12 (issue #326): the stored PR
+                                // drifted off the branch AND the branch has no
+                                // live PR. Clearing `pr_number` alone would
+                                // strand the bead ATTESTED forever — the
+                                // ATTESTED gate path needs a `pr_number` and the
+                                // branch→PR re-resolution only runs for
+                                // DISPATCHED beads. DEMOTE to DISPATCHED so the
+                                // next tick's re-resolution picks it up and
+                                // re-promotes once a live PR appears.
                                 overlay.pr_number = None;
+                                overlay.state = OverlayState::Dispatched;
                                 deps.store.save(&overlay)?;
                                 let _ = emit(
                                     deps.telemetry_log,
                                     bead_id,
                                     overlay.attempt,
-                                    OverlayState::Attested.as_str(),
+                                    OverlayState::Dispatched.as_str(),
                                     "PR_NUMBER_REREZOLVED_NO_OPEN_PR",
                                     serde_json::json!({}),
                                     serde_json::json!({
@@ -2587,6 +2608,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                         "previous_pr_number": pr,
                                         "current_pr_number": serde_json::Value::Null,
                                         "reason": "pre_gate_validation_no_open_pr",
+                                        "action": "demoted_attested_to_dispatched_for_rerezolve",
                                     }),
                                 );
                                 continue;
@@ -2651,13 +2673,20 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             discovered
                         }
                         Ok(None) => {
+                            // jleechan-t40t r12 (issue #326): stored PR is
+                            // closed/missing and the branch has no live PR.
+                            // Demote ATTESTED→DISPATCHED (rather than leaving it
+                            // ATTESTED with a null pr_number, which strands it)
+                            // so the DISPATCHED re-resolution path re-promotes
+                            // it when a live PR appears.
                             overlay.pr_number = None;
+                            overlay.state = OverlayState::Dispatched;
                             deps.store.save(&overlay)?;
                             let _ = emit(
                                 deps.telemetry_log,
                                 bead_id,
                                 overlay.attempt,
-                                OverlayState::Attested.as_str(),
+                                OverlayState::Dispatched.as_str(),
                                 "PR_NUMBER_REREZOLVED_NO_OPEN_PR",
                                 serde_json::json!({}),
                                 serde_json::json!({
@@ -2665,6 +2694,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                     "previous_pr_number": pr,
                                     "current_pr_number": serde_json::Value::Null,
                                     "reason": "pre_gate_validation_no_open_pr",
+                                    "action": "demoted_attested_to_dispatched_for_rerezolve",
                                 }),
                             );
                             continue;
