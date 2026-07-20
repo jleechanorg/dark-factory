@@ -316,8 +316,8 @@ def test_parse_contract_echo_flags_unknown_item_id():
 
 
 def test_evaluate_contract_echo_passes_when_all_addressed():
-    """Happy path: every acceptance item is ADDRESSED with a real
-    file:line cite → gate green for the contract-echo step."""
+    """Happy path: every acceptance item AND every prior finding is
+    ADDRESSED (or N-A) → gate green for the contract-echo step."""
     contract = _sample_contract()
     output = _addressed_output(
         [
@@ -331,6 +331,12 @@ def test_evaluate_contract_echo_passes_when_all_addressed():
                 id="A2",
                 verdict="ADDRESSED",
                 cite="runner/skeptic_gate.py:2",
+                reason="",
+            ),
+            ContractEchoItem(
+                id="P1",
+                verdict="ADDRESSED",
+                cite="runner/skeptic_gate.py:300",
                 reason="",
             ),
         ]
@@ -350,7 +356,12 @@ def test_evaluate_contract_echo_fails_closed_on_omitted_item():
     not a paraphrase.
     """
     contract = _sample_contract()
-    output = _mixed_output()
+    output = (
+        "CONTRACT_ECHO:\n"
+        "ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
+        "ITEM: A2 VERDICT: NOT-ADDRESSED REASON: omitted from diff\n"
+        "ITEM: P1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:300\n"
+    )
     report = parse_contract_echo(output, contract)
     assert report is not None
     verdict = evaluate_contract_echo(report, contract)
@@ -385,13 +396,13 @@ def test_evaluate_contract_echo_constraint_carries_verbatim_text():
 
 def test_evaluate_contract_echo_treats_missing_report_as_not_addressed():
     """A reviewer output without a `CONTRACT_ECHO:` block is
-    equivalent to NOT-ADDRESSED for every item — the gate refuses
-    PASS."""
+    equivalent to NOT-ADDRESSED for every item AND every prior
+    finding — the gate refuses PASS."""
     contract = _sample_contract()
     verdict = evaluate_contract_echo(None, contract)
     assert verdict.ok is False
-    assert len(verdict.unaddressed_items) == 2
-    assert {it.id for it in verdict.unaddressed_items} == {"A1", "A2"}
+    assert len(verdict.unaddressed_items) == 3
+    assert {it.id for it in verdict.unaddressed_items} == {"A1", "A2", "P1"}
 
 
 def test_evaluate_contract_echo_all_na_is_pass():
@@ -402,6 +413,7 @@ def test_evaluate_contract_echo_all_na_is_pass():
         "CONTRACT_ECHO:\n"
         "ITEM: A1 VERDICT: N-A REASON: superseded by issue #400\n"
         "ITEM: A2 VERDICT: N-A REASON: handled in a different PR\n"
+        "ITEM: P1 VERDICT: N-A REASON: prior finding closed in PR #390\n"
     )
     report = parse_contract_echo(output, contract)
     assert report is not None
@@ -502,12 +514,22 @@ from runner.skeptic_gate import evaluate, aggregate_results, ParsedVerdict, Pars
 
 def _verdict_with_contract_echo(contract: BeadContract) -> str:
     """Build a 10-field PASS verdict + a valid `CONTRACT_ECHO:` block
-    addressing every acceptance item."""
+    addressing every acceptance item AND every prior finding."""
     head = HEAD_SHA
     item_lines = "\n".join(
         f"ITEM: {item.id} VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1"
         for item in contract.acceptance_items
     )
+    pf_lines = "\n".join(
+        f"ITEM: P{i} VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1"
+        for i in range(1, len(contract.prior_findings) + 1)
+    )
+    echo_block_lines = []
+    if item_lines:
+        echo_block_lines.append(item_lines)
+    if pf_lines:
+        echo_block_lines.append(pf_lines)
+    echo_block = "\n".join(echo_block_lines)
     return (
         f"VERDICT: PASS\n"
         f"HEAD_SHA: {head}\n"
@@ -520,7 +542,7 @@ def _verdict_with_contract_echo(contract: BeadContract) -> str:
         f"GREP_CITES: runner/skeptic_gate.py:1\n"
         f"HEAD_COMMIT_VERIFIED: {head}\n"
         f"CONTRACT_ECHO:\n"
-        f"{item_lines}\n"
+        f"{echo_block}\n"
     )
 
 
@@ -595,6 +617,7 @@ def test_evaluate_fails_closed_when_one_item_not_addressed():
         f"CONTRACT_ECHO:\n"
         f"ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
         f"ITEM: A2 VERDICT: NOT-ADDRESSED REASON: omitted from diff\n"
+        f"ITEM: P1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:300\n"
     )
     result = evaluate(
         review_output=out,
@@ -613,3 +636,95 @@ def test_evaluate_fails_closed_when_one_item_not_addressed():
         "constraint extraction carries the unaddressed items verbatim"
         in result.reason
     )
+
+
+# ===========================================================================
+# Prior findings enforcement (issue #386 — CodeRabbit finding on PR #397 r2)
+# ===========================================================================
+#
+# The bead's contract includes BOTH acceptance items AND prior findings.
+# The gate must enforce per-item verdicts for both — the prompt enumerates
+# prior findings as `P1`, `P2`, ... so the reviewer can emit matching
+# `ITEM: P<n>` lines.
+
+
+def _contract_with_prior_findings() -> "BeadContract":
+    """A contract with one acceptance item + two prior findings."""
+    return BeadContract(
+        id="jleechan-pq08",
+        description="contract with prior findings",
+        prior_findings=(
+            PriorFinding(
+                source="r5 reviewer",
+                text="missing acceptance closure",
+            ),
+            PriorFinding(
+                source="r3 skeptic",
+                text="diff did not include execution evidence",
+            ),
+        ),
+        acceptance_items=(
+            AcceptanceItem(
+                id="A1",
+                text="acceptance criterion 1",
+            ),
+        ),
+    )
+
+
+def test_evaluate_contract_echo_prior_finding_addressed_passes():
+    """When the reviewer addresses both acceptance items AND prior
+    findings, the gate passes."""
+    contract = _contract_with_prior_findings()
+    out = (
+        "CONTRACT_ECHO:\n"
+        "ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
+        "ITEM: P1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:100\n"
+        "ITEM: P2 VERDICT: N-A REASON: superseded by issue #400\n"
+    )
+    report = parse_contract_echo(out, contract)
+    assert report is not None
+    verdict = evaluate_contract_echo(report, contract)
+    assert verdict.ok is True
+    assert verdict.unaddressed_items == ()
+
+
+def test_evaluate_contract_echo_prior_finding_omitted_is_unaddressed():
+    """A reviewer that omits a prior finding from the contract-echo
+    block fails closed with that finding's text in the constraint."""
+    contract = _contract_with_prior_findings()
+    out = (
+        "CONTRACT_ECHO:\n"
+        "ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
+        # P1 omitted entirely
+        "ITEM: P2 VERDICT: N-A REASON: superseded\n"
+    )
+    report = parse_contract_echo(out, contract)
+    assert report is not None
+    verdict = evaluate_contract_echo(report, contract)
+    assert verdict.ok is False
+    ids = {it.id for it in verdict.unaddressed_items}
+    assert "P1" in ids
+    # Verbatim source + text must be carried into the constraint.
+    p1 = next(it for it in verdict.unaddressed_items if it.id == "P1")
+    assert "r5 reviewer" in p1.text
+    assert "missing acceptance closure" in p1.text
+
+
+def test_evaluate_contract_echo_prior_finding_not_addressed_is_unaddressed():
+    """A reviewer that flags a prior finding as NOT-ADDRESSED fails
+    closed; the finding's text appears verbatim in the constraint."""
+    contract = _contract_with_prior_findings()
+    out = (
+        "CONTRACT_ECHO:\n"
+        "ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
+        "ITEM: P1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:100\n"
+        "ITEM: P2 VERDICT: NOT-ADDRESSED REASON: still open\n"
+    )
+    report = parse_contract_echo(out, contract)
+    assert report is not None
+    verdict = evaluate_contract_echo(report, contract)
+    assert verdict.ok is False
+    p2 = next(it for it in verdict.unaddressed_items if it.id == "P2")
+    assert "r3 skeptic" in p2.text
+    assert "execution evidence" in p2.text

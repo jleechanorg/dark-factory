@@ -44,6 +44,10 @@ DIFF = "+x\n-y\n"
 
 
 def _sample_contract_dict() -> dict:
+    """A contract with 2 acceptance items and 1 prior finding. The
+    CLI test fixtures emit `ITEM: A1`, `ITEM: A2`, and `ITEM: P1`
+    verdicts to satisfy both the prior-findings enforcement and the
+    acceptance-item enforcement added in r2 round 2."""
     return {
         "id": "jleechan-pq08",
         "description": "Contract-echo review step (issue #386, r2 CLI wiring)",
@@ -333,9 +337,10 @@ def _valid_pass_output(identity: str = "codex", *, with_contract_echo: bool = Tr
     )
     if with_contract_echo:
         base += (
-            f"CONTRACT_ECHO:\n"
-            f"ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
-            f"ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
+            "CONTRACT_ECHO:\n"
+            "ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
+            "ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
+            "ITEM: P1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:300\n"
         )
     return base
 

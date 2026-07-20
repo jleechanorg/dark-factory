@@ -856,7 +856,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.contract_file:
         try:
             contract = load_bead_contract(args.contract_file)
-        except (ValueError, TypeError, FileNotFoundError, json.JSONDecodeError) as exc:
+        except (ValueError, TypeError, OSError) as exc:
             print(
                 f"[skeptic-gate] contract load failed: {exc}; "
                 "refusing to gate without the operator-supplied contract",

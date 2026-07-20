@@ -764,6 +764,45 @@ def evaluate_contract_echo(
         # NOT-ADDRESSED or anything else: unaddressed.
         unaddressed.append(item)
 
+    # Prior findings are advisory inputs from prior rounds — but issue
+    # #386 makes them part of the bead's contract. The reviewer MUST
+    # address each prior finding (with `ADDRESSED` cite or `N-A` reason)
+    # in the same `CONTRACT_ECHO:` block. Prior findings are enumerated
+    # as `P1`, `P2`, ... in the prompt (see _format_prior_findings_block)
+    # so the reviewer can emit matching ITEM: P<n> lines.
+    for idx, finding in enumerate(contract.prior_findings, start=1):
+        pf_id = f"P{idx}"
+        verdict_item = emitted.get(pf_id)
+        if verdict_item is None:
+            # Reviewer omitted the prior finding entirely; treat as
+            # NOT-ADDRESSED with a synthetic AcceptanceItem carrying the
+            # finding's verbatim text + source.
+            unaddressed.append(
+                AcceptanceItem(
+                    id=pf_id,
+                    text=f"({finding.source}) {finding.text}",
+                )
+            )
+            continue
+        if verdict_item.verdict == "ADDRESSED":
+            continue
+        if verdict_item.verdict == "N-A":
+            if not verdict_item.reason:
+                unaddressed.append(
+                    AcceptanceItem(
+                        id=pf_id,
+                        text=f"({finding.source}) {finding.text}",
+                    )
+                )
+            continue
+        # NOT-ADDRESSED or anything else: unaddressed.
+        unaddressed.append(
+            AcceptanceItem(
+                id=pf_id,
+                text=f"({finding.source}) {finding.text}",
+            )
+        )
+
     if not unaddressed:
         return ContractEchoVerdictResult(
             ok=True,
@@ -1947,7 +1986,9 @@ def _format_prior_findings_block(prior_findings: Tuple[PriorFinding, ...]) -> st
         return "(no prior findings)"
     lines = []
     for i, pf in enumerate(prior_findings, 1):
-        lines.append(f"{i}. ({pf.source}) {pf.text}")
+        # Use the synthetic id `P<i>` so the reviewer can echo each
+        # prior finding in the `CONTRACT_ECHO:` block as `ITEM: P<i>`.
+        lines.append(f"- P{i} ({pf.source}) {pf.text}")
     return "\n".join(lines)
 
 
