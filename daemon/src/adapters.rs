@@ -1209,13 +1209,14 @@ impl Scm for CliScm {
         }
     }
 
-    /// Bead jleechan-yoqy / issue #323: `gh api gists/<id>` and report whether
-    /// the gist exists AND has at least one non-empty file. A 404 / private /
-    /// missing gist is an `Err` (unfetchable → the evidence gate fails closed);
-    /// a fetchable gist with only empty files is `Ok(false)`.
-    fn gist_nonempty(&self, gist_id: &str) -> Result<bool, DaemonError> {
-        // Sum the `size` of every file in the gist via jq; empty/absent -> 0.
-        let out = run_tool(
+    /// Bead jleechan-yoqy / issue #323 (r5): `gh api gists/<id>` and report the
+    /// gist's verification state. A 404 (deleted / private / never existed) is
+    /// `Ok(None)` — a DEFINITIVE miss the evidence gate fails on. Any other gh
+    /// error is TRANSIENT (`Err`) — the gate waits rather than churning a
+    /// reroll on gh noise. A fetchable gist reports `Ok(Some(total_size > 0))`.
+    fn gist_nonempty(&self, gist_id: &str) -> Result<Option<bool>, DaemonError> {
+        // Sum the `size` of every file in the gist via jq; empty -> 0.
+        let out = match run_tool(
             "gh",
             &[
                 "api",
@@ -1224,10 +1225,19 @@ impl Scm for CliScm {
                 "[.files[].size] | add // 0",
             ],
             30,
-        )?;
-        let trimmed = out.trim();
-        let total: u64 = trimmed.parse().unwrap_or(0);
-        Ok(total > 0)
+        ) {
+            Ok(out) => out,
+            Err(DaemonError::Tool { stderr, .. })
+                if stderr.contains("404")
+                    || stderr.contains("Not Found")
+                    || stderr.contains("not found") =>
+            {
+                return Ok(None); // definitively missing
+            }
+            Err(e) => return Err(e), // transient — the gate waits
+        };
+        let total: u64 = out.trim().parse().unwrap_or(0);
+        Ok(Some(total > 0))
     }
 
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {

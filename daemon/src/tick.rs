@@ -2156,7 +2156,6 @@ fn skeptic_evidence(
     Ok(PrEvidence {
         is_production: false,
         non_test_changed_loc: 0,
-        has_integration_evidence_marker: false,
         er_verdict: verifier::ErVerdict::Absent,
         skeptic_verdict,
         skeptic_reviewers: used_vendors,
@@ -2910,16 +2909,16 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         };
         evidence.is_production = verifier::classify_production(&snapshot.files);
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
-        evidence.has_integration_evidence_marker =
-            verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
-        // Bead jleechan-yoqy / issue #323: verify the canonical evidence
-        // contract fail-closed. When the coder published a `**Evidence**:`
-        // marker, it MUST reference the PR's current head AND point at a
-        // fetchable, non-empty gist — otherwise it is a distinct evidence
-        // FAIL, never silently ignored. No marker -> NotProvided (the LOC
-        // floor decides). Only PRs carrying a marker incur the gist API call.
+        // Bead jleechan-yoqy / issue #323 (r5): verify the canonical evidence
+        // contract fail-closed. A fully-parsed marker MUST reference the PR's
+        // current head AND point at a gist that is fetchable + non-empty. r5
+        // finding 2: a marker LINE present but incomplete (missing gist URL or
+        // `(head <sha>)`) is a definitive FAIL, not NotProvided — only a
+        // genuinely absent marker is NotProvided. r5 finding 3: a TRANSIENT
+        // gist-fetch error is Pending (Unknown/wait), never a Red that churns a
+        // reroll; only a definitive miss (empty / 404) is Failed. Only PRs
+        // carrying a marker incur the gist API call.
         evidence.evidence_gist_status = match verifier::parse_evidence(&snapshot.body) {
-            None => verifier::EvidenceGistStatus::NotProvided,
             Some(parsed) => {
                 let head_matches = {
                     let want = snapshot.head_sha.to_ascii_lowercase();
@@ -2935,18 +2934,28 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     ))
                 } else {
                     match deps.scm.gist_nonempty(&parsed.gist_id) {
-                        Ok(true) => verifier::EvidenceGistStatus::Verified,
-                        Ok(false) => verifier::EvidenceGistStatus::Failed(format!(
+                        Ok(Some(true)) => verifier::EvidenceGistStatus::Verified,
+                        Ok(Some(false)) => verifier::EvidenceGistStatus::Failed(format!(
                             "evidence gist {} is empty",
                             parsed.gist_id
                         )),
-                        Err(e) => verifier::EvidenceGistStatus::Failed(format!(
-                            "evidence gist {} not fetchable: {e}",
+                        Ok(None) => verifier::EvidenceGistStatus::Failed(format!(
+                            "evidence gist {} not found",
+                            parsed.gist_id
+                        )),
+                        Err(e) => verifier::EvidenceGistStatus::Pending(format!(
+                            "evidence gist {} fetch failed transiently: {e}",
                             parsed.gist_id
                         )),
                     }
                 }
             }
+            None if verifier::has_evidence_marker(&snapshot.body) => {
+                verifier::EvidenceGistStatus::Failed(
+                    "evidence marker present but missing a gist URL or `(head <sha>)`".to_string(),
+                )
+            }
+            None => verifier::EvidenceGistStatus::NotProvided,
         };
         let report = verifier::assess(deps.scm, pr, &repo, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;

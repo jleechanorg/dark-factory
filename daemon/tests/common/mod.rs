@@ -191,9 +191,13 @@ pub struct FakeScm {
     /// on a transient tool error.
     pub pr_already_terminal: HashMap<(String, u64), String>,
     /// jleechan-yoqy / issue #323: scripted gist state keyed by gist id.
-    /// `Some(true)` = fetchable + non-empty, `Some(false)` = fetchable + empty,
-    /// absent key = unfetchable (`gist_nonempty` returns `Err`, fail-closed).
+    /// present + `true` = fetchable + non-empty (`Ok(Some(true))`), present +
+    /// `false` = fetchable + empty (`Ok(Some(false))`), absent = definitively
+    /// not found (`Ok(None)`). See `gists_transient` for the transient case.
     pub gists: HashMap<String, bool>,
+    /// r5 finding 3: gist ids whose fetch returns a TRANSIENT `Err` (gh
+    /// outage) — the evidence gate must wait (Unknown), not fail.
+    pub gists_transient: std::collections::HashSet<String>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -348,18 +352,21 @@ impl Scm for FakeScm {
             .flatten())
     }
 
-    fn gist_nonempty(&self, gist_id: &str) -> Result<bool, DaemonError> {
+    fn gist_nonempty(&self, gist_id: &str) -> Result<Option<bool>, DaemonError> {
         self.calls
             .borrow_mut()
             .push(format!("gist_nonempty({gist_id})"));
-        match self.gists.get(gist_id) {
-            Some(nonempty) => Ok(*nonempty),
-            // Absent = unfetchable (missing/private) — fail-closed.
-            None => Err(DaemonError::Tool {
+        if self.gists_transient.contains(gist_id) {
+            return Err(DaemonError::Tool {
                 tool: "gh".into(),
                 rc: 1,
-                stderr: format!("gist {gist_id} not found (404)"),
-            }),
+                stderr: format!("gist {gist_id} fetch failed (transient gh outage)"),
+            });
+        }
+        match self.gists.get(gist_id) {
+            Some(nonempty) => Ok(Some(*nonempty)),
+            // Absent = definitively not found (404).
+            None => Ok(None),
         }
     }
 }

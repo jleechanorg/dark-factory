@@ -278,6 +278,13 @@ pub trait StateStore {
     fn incr_er_runner_attempt(&self, _bead_id: &str, _now_epoch: u64) -> Result<u32, DaemonError> {
         Ok(1)
     }
+    /// Reset `bead_id`'s `/er` attempt counter to 0 (bead jleechan-yoqy /
+    /// issue #323 r5 finding 4). Called when the PR body's evidence marker
+    /// changed, so genuinely-new evidence is re-reviewed instead of being
+    /// suppressed by a prior run's attempt cap. Default no-op for fakes.
+    fn reset_er_runner_attempt(&self, _bead_id: &str) -> Result<(), DaemonError> {
+        Ok(())
+    }
     /// Read the evidence-marker hash recorded at `bead_id`'s last `/er` run
     /// (bead jleechan-yoqy / issue #323). `None` = no run recorded. Used by
     /// `er_runner::maybe_run` to re-trigger `/er` after an evidence-only PR
@@ -1529,6 +1536,19 @@ impl StateStore for SqliteStateStore {
             }
             Err(e) if no_such_column(&e) => Ok(1),
             Err(e) => Err(tool_err("incr_er_runner_attempt", e)),
+        }
+    }
+
+    fn reset_er_runner_attempt(&self, bead_id: &str) -> Result<(), DaemonError> {
+        let res = self.conn.execute(
+            "UPDATE bead_overlay SET attempt_er_runner_count = 0, updated_at = ?2 \
+             WHERE bead_id = ?1",
+            params![bead_id, now_iso8601()],
+        );
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) if no_such_column(&e) => Ok(()),
+            Err(e) => Err(tool_err("reset_er_runner_attempt", e)),
         }
     }
 

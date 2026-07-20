@@ -509,14 +509,18 @@ pub trait Scm {
         let _ = (repo, branch);
         Ok(None)
     }
-    /// Bead jleechan-yoqy / issue #323: does the gist `gist_id` exist and
-    /// carry at least one non-empty file? `Ok(true)` = fetchable AND non-empty,
-    /// `Ok(false)` = fetchable but empty, `Err` = unfetchable (missing /
-    /// private / network). The evidence gate treats anything but `Ok(true)` as
-    /// a FAIL (fail-closed). Default impl is `Err` ("unverifiable") so fakes
-    /// and impls that predate this method never accidentally pass the gate;
-    /// `CliScm` overrides it to run `gh api gists/<id>`.
-    fn gist_nonempty(&self, gist_id: &str) -> Result<bool, DaemonError> {
+    /// Bead jleechan-yoqy / issue #323: verify a gist for the evidence gate.
+    ///
+    /// - `Ok(Some(true))` — fetchable AND non-empty (evidence Verified).
+    /// - `Ok(Some(false))` — fetchable but EMPTY (definitive Failed).
+    /// - `Ok(None)` — DEFINITIVELY not found: 404 / deleted / private (Failed).
+    /// - `Err(..)` — TRANSIENT (gh outage / network): the gate waits (Unknown),
+    ///   it does NOT churn a reroll (r5 finding 3).
+    ///
+    /// Default impl is `Err` ("unverifiable") so fakes and impls that predate
+    /// this method never accidentally pass the gate; `CliScm` overrides it to
+    /// run `gh api gists/<id>`.
+    fn gist_nonempty(&self, gist_id: &str) -> Result<Option<bool>, DaemonError> {
         Err(DaemonError::Tool {
             tool: "gh".into(),
             rc: -1,

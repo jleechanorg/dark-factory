@@ -143,17 +143,23 @@ pub fn maybe_run(
     // evidence marker has changed since the last run; when it is unchanged (or
     // was never recorded), respect the existing verdict.
     let current_evidence_hash = verifier::evidence_marker_hash(&snapshot.body);
-    if existing != ErVerdict::Absent {
-        match deps.store.last_er_evidence_hash(bead_id)? {
-            Some(prev) if prev != current_evidence_hash => {
-                // Evidence changed under a fresh verdict — fall through and
-                // re-run /er against the updated evidence.
-            }
-            _ => return Ok(Outcome::AlreadyPosted(existing)),
-        }
+    let evidence_changed = deps
+        .store
+        .last_er_evidence_hash(bead_id)?
+        .is_some_and(|prev| prev != current_evidence_hash);
+    if existing != ErVerdict::Absent && !evidence_changed {
+        // A fresh verdict AND the evidence marker is unchanged since it ran —
+        // respect it. (A changed marker falls through to re-review below.)
+        return Ok(Outcome::AlreadyPosted(existing));
     }
 
-    // 3. Capped?
+    // 3. Capped? r5 finding 4: a CHANGED evidence marker RESETS the attempt
+    //    cap — otherwise a bead that exhausted its /er attempts could never
+    //    have genuinely-new evidence reviewed, defeating the retrigger design.
+    //    An unchanged marker keeps the cap (no wasteful re-review churn).
+    if evidence_changed {
+        deps.store.reset_er_runner_attempt(bead_id)?;
+    }
     let (count, last_at) = deps.store.er_runner_attempt(bead_id)?;
     if count >= MAX_ER_RUNNER_ATTEMPTS {
         return Ok(Outcome::Capped { count });
@@ -512,6 +518,12 @@ mod tests {
             entry.1 = Some(now_epoch);
             Ok(entry.0)
         }
+        fn reset_er_runner_attempt(&self, bead_id: &str) -> Result<(), DaemonError> {
+            if let Some(entry) = self.er_counts.borrow_mut().get_mut(bead_id) {
+                entry.0 = 0;
+            }
+            Ok(())
+        }
         fn last_er_evidence_hash(&self, bead_id: &str) -> Result<Option<String>, DaemonError> {
             Ok(self.evidence_hashes.borrow().get(bead_id).cloned())
         }
@@ -680,6 +692,79 @@ mod tests {
         let outcome = maybe_run(&deps, bead, pr, 5_000_000).unwrap();
         assert_eq!(outcome, Outcome::AlreadyPosted(ErVerdict::Pass));
         assert!(llm.calls.borrow().is_empty(), "unchanged evidence must not re-spawn the reviewer");
+    }
+
+    /// r5 finding 4: a CHANGED evidence marker RESETS the /er attempt cap, so a
+    /// bead that already exhausted MAX attempts still gets genuinely-new
+    /// evidence reviewed (not stuck Capped).
+    #[test]
+    fn er_new_evidence_hash_resets_cap() {
+        telemetry_cleanup();
+        let scm = S::default();
+        let tracker = T::default();
+        let sessions = Ss;
+        let llm = L::default();
+        *llm.response.borrow_mut() = Some(Ok("/er PASS".into()));
+        let store = St::default();
+        let cfg = test_cfg();
+
+        let pr = 330;
+        let bead = "yoqy3";
+        store.overlays.borrow_mut().insert(bead.into(), attested_overlay(bead, pr));
+        // Already at the cap.
+        store.er_counts.borrow_mut().insert(bead.into(), (MAX_ER_RUNNER_ATTEMPTS, Some(1)));
+        // A fresh verdict exists, but the evidence marker CHANGED since it ran.
+        let mut snap = snapshot_with_comments(pr, comments_with_verdict("/er PASS"));
+        snap.body = "**Evidence**: https://gist.github.com/u/new (head deadbeef)".into();
+        scm.snapshots.borrow_mut().insert(pr, snap);
+        store.evidence_hashes.borrow_mut().insert(
+            bead.into(),
+            verifier::evidence_marker_hash("**Evidence**: https://gist.github.com/u/old (head deadbeef)"),
+        );
+
+        let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
+        let outcome = maybe_run(&deps, bead, pr, 9_000_000).unwrap();
+        assert!(
+            matches!(outcome, Outcome::Posted { count: 1, .. }),
+            "changed evidence must reset the cap and re-run (count restarts at 1), got {outcome:?}"
+        );
+    }
+
+    /// The dual: an UNCHANGED evidence marker at the cap stays Capped — the
+    /// reset only fires on genuinely-new evidence.
+    #[test]
+    fn er_same_evidence_hash_stays_capped() {
+        telemetry_cleanup();
+        let scm = S::default();
+        let tracker = T::default();
+        let sessions = Ss;
+        let llm = L::default();
+        let store = St::default();
+        let cfg = test_cfg();
+
+        let pr = 331;
+        let bead = "yoqy4";
+        store.overlays.borrow_mut().insert(bead.into(), attested_overlay(bead, pr));
+        store.er_counts.borrow_mut().insert(bead.into(), (MAX_ER_RUNNER_ATTEMPTS, Some(1)));
+        // No fresh verdict (comments empty) so idempotence doesn't short-circuit;
+        // the evidence marker is UNCHANGED from the last run.
+        let body = "**Evidence**: https://gist.github.com/u/same (head deadbeef)";
+        let mut snap = snapshot_with_comments(pr, vec![]);
+        snap.body = body.into();
+        scm.snapshots.borrow_mut().insert(pr, snap);
+        store
+            .evidence_hashes
+            .borrow_mut()
+            .insert(bead.into(), verifier::evidence_marker_hash(body));
+
+        let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
+        let outcome = maybe_run(&deps, bead, pr, 9_000_000).unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::Capped { count: MAX_ER_RUNNER_ATTEMPTS },
+            "unchanged evidence at the cap must stay Capped"
+        );
+        assert!(llm.calls.borrow().is_empty());
     }
 
     #[test]

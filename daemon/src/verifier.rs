@@ -321,9 +321,6 @@ pub struct PrEvidence {
     pub is_production: bool,
     /// Non-test changed LOC in the diff (spec §4.2.5 evidence floor).
     pub non_test_changed_loc: u32,
-    /// Whether the PR body/comments carry an integration-evidence marker
-    /// (Layer-2+ proof, not unit-only) for diffs over the LOC floor.
-    pub has_integration_evidence_marker: bool,
     /// The `/er` (evidence review) verdict (spec §4.2.5 gate 6). This is the
     /// PRIMARY gate-6 signal — the LOC floor below is an ADDITIONAL floor on
     /// top of it, not a substitute for it (hardening sweep P1, bead
@@ -366,10 +363,15 @@ pub enum EvidenceGistStatus {
     /// Marker present, gist fetchable and non-empty, and it references the
     /// PR's current head SHA — the evidence contract is satisfied.
     Verified,
-    /// Marker present but verification failed; the string is the distinct,
-    /// operator-facing reason (unparseable, gist unfetchable, gist empty, or
-    /// head-SHA mismatch).
+    /// Marker present but DEFINITIVELY invalid; the string is the distinct,
+    /// operator-facing reason (incomplete marker, gist not found, gist empty,
+    /// or head-SHA mismatch). Fail-closed → Red.
     Failed(String),
+    /// Marker present and head-matched, but the gist could not be fetched due
+    /// to a TRANSIENT error (gh outage / network). r5 finding 3: this is
+    /// Unknown (wait and re-check), NOT a Red — a transient gh blip must not
+    /// churn a reroll. The string is the transient reason.
+    Pending(String),
 }
 
 /// Gate 6 (spec §4.2.5): green only when `/er` returned `Pass` AND the
@@ -411,26 +413,35 @@ fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
         }
     }
 
-    // Bead jleechan-yoqy / issue #323: the canonical evidence contract. When
-    // the coder published an evidence marker, its verification is AUTHORITATIVE
-    // and fail-closed — a present-but-invalid marker is a distinct Red, never
-    // silently ignored; a verified marker satisfies the floor regardless of
-    // LOC. Only when NO marker was provided do we fall back to the LOC floor.
+    // Bead jleechan-yoqy / issue #323 (r5): the canonical evidence contract is
+    // the ONLY way a large diff's evidence goes green. A verified marker (gist
+    // fetchable + non-empty + head-matched) passes REGARDLESS of LOC; a
+    // present-but-invalid marker is a distinct Red (fail-closed); a transient
+    // gist-fetch failure is Unknown (wait, do not churn a reroll on gh noise).
     match &evidence.evidence_gist_status {
         EvidenceGistStatus::Verified => return GateResult::Green,
         EvidenceGistStatus::Failed(reason) => {
             return GateResult::Red(format!("evidence contract: {reason}"));
         }
+        EvidenceGistStatus::Pending(reason) => {
+            return GateResult::Unknown(format!("evidence contract pending: {reason}"));
+        }
         EvidenceGistStatus::NotProvided => {}
     }
 
+    // r5 finding 1: the legacy `has_integration_evidence_marker` substring
+    // floor is DELETED — it let a large diff go green with an unverified
+    // keyword and was the exact prior #323 bypass. Below the LOC floor a small
+    // diff needs no evidence gist; at/above it, only a VERIFIED canonical
+    // marker (handled above) greens the gate — otherwise it is Red.
     if evidence.non_test_changed_loc <= EVIDENCE_FLOOR_LOC {
-        return GateResult::Green;
-    }
-    if evidence.has_integration_evidence_marker {
         GateResult::Green
     } else {
-        GateResult::Red("evidence floor".to_string())
+        GateResult::Red(
+            "evidence floor: a verified canonical **Evidence** gist is required for diffs \
+             above the non-test LOC floor"
+                .to_string(),
+        )
     }
 }
 
@@ -678,21 +689,20 @@ pub fn calculate_non_test_loc(files: &[crate::tools::PrFile]) -> u32 {
     total
 }
 
-pub fn check_integration_marker(body: &str, comments: &[crate::tools::PrComment]) -> bool {
-    let lower_body = body.to_lowercase();
-    if lower_body.contains("has_integration_evidence_marker") 
-       || lower_body.contains("integration-evidence") 
-       || lower_body.contains("integration evidence") 
-    {
-        return true;
-    }
-    for comment in comments {
-        let lower_comment = comment.body.to_lowercase();
-        if lower_comment.contains("has_integration_evidence_marker") 
-           || lower_comment.contains("integration-evidence") 
-           || lower_comment.contains("integration evidence") 
-        {
-            return true;
+/// Bead jleechan-yoqy / issue #323 r5 (finding 2): is a canonical evidence
+/// marker line PRESENT in `body` at all, regardless of whether it fully parses
+/// into a gist + head SHA? Distinguishes "marker present but incomplete"
+/// (fail-closed) from "no marker at all" (LOC floor applies). Matches
+/// [`crate::tools::EVIDENCE_MARKER`] leading a line, `**` optional,
+/// case-insensitive — the same leading-marker rule as `parse_evidence`.
+pub fn has_evidence_marker(body: &str) -> bool {
+    for line in body.lines() {
+        let cleaned = line.replace('*', "");
+        if let Some(idx) = cleaned.to_ascii_lowercase().find("evidence:") {
+            let prefix = cleaned[..idx].trim();
+            if prefix.trim_start_matches('-').trim().is_empty() {
+                return true;
+            }
         }
     }
     false
@@ -1067,7 +1077,6 @@ mod tests {
         PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1264,7 +1273,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 150,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1274,22 +1282,27 @@ mod tests {
 
         assert!(!report.all_green);
         match gate(&report, GateName::EvidenceFloor) {
-            GateResult::Red(reason) => assert_eq!(reason, "evidence floor"),
-            other => panic!("expected Red(\"evidence floor\"), got {other:?}"),
+            GateResult::Red(reason) => assert!(
+                reason.starts_with("evidence floor"),
+                "expected an evidence-floor Red, got: {reason}"
+            ),
+            other => panic!("expected Red(evidence floor), got {other:?}"),
         }
     }
 
+    /// r5 finding 1: a large diff greens the evidence gate ONLY via a VERIFIED
+    /// canonical evidence gist — the legacy substring marker no longer counts.
     #[test]
-    fn large_diff_with_evidence_marker_is_green() {
+    fn large_diff_with_verified_canonical_evidence_is_green() {
         let mut scm = FakeScm::default();
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 150,
-            has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            evidence_gist_status: EvidenceGistStatus::Verified,
             ..Default::default()
         };
 
@@ -1307,7 +1320,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 100, // exactly at the floor, not over it
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1327,7 +1339,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Fail("wrong fix".into())),
             ..Default::default()
@@ -1350,7 +1361,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Warn("minor nit".into())),
             ..Default::default()
@@ -1370,7 +1380,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: None,
             ..Default::default()
@@ -1415,7 +1424,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10, // well under the floor
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Absent,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1464,7 +1472,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10, // well under the floor
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Fail,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1487,7 +1494,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1508,7 +1514,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 150,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1518,22 +1523,22 @@ mod tests {
 
         assert!(!report.all_green);
         match gate(&report, GateName::EvidenceFloor) {
-            GateResult::Red(reason) => assert_eq!(reason, "evidence floor"),
-            other => panic!("expected Red(\"evidence floor\"), got {other:?}"),
+            GateResult::Red(reason) => assert!(reason.starts_with("evidence floor"), "got: {reason}"),
+            other => panic!("expected Red(evidence floor), got {other:?}"),
         }
     }
 
     #[test]
-    fn er_pass_with_large_diff_and_evidence_marker_is_green() {
+    fn er_pass_with_large_diff_and_verified_evidence_is_green() {
         let mut scm = FakeScm::default();
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 150,
-            has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            evidence_gist_status: EvidenceGistStatus::Verified,
             ..Default::default()
         };
 
@@ -1553,7 +1558,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 150,
-            has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Absent,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1576,7 +1580,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 150,
-            has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Fail,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1888,21 +1891,9 @@ mod tests {
         assert_eq!(calculate_non_test_loc(&files), 130);
     }
 
-    #[test]
-    fn test_check_integration_marker() {
-        use crate::tools::PrComment;
-        // PR body contains marker
-        assert!(check_integration_marker("Here is the has_integration_evidence_marker", &[]));
-        assert!(check_integration_marker("Here is the integration-evidence proof", &[]));
-        assert!(check_integration_marker("Here is the integration evidence proof", &[]));
-
-        // Comment contains marker
-        let comments = vec![PrComment { author: "alice".into(), body: "Found integration evidence".into(), created_at_epoch: 0 }];
-        assert!(check_integration_marker("No marker here", &comments));
-
-        // Neither contains marker
-        assert!(!check_integration_marker("No marker here", &[]));
-    }
+    // r5 finding 1: `check_integration_marker` (the legacy substring floor) is
+    // DELETED — the canonical verified evidence path is the only way a large
+    // diff's evidence goes green (see the evidence_gate_* tests below).
 
     #[test]
     fn test_evidence_floor_gate_production_vs_non_production() {
@@ -1910,7 +1901,6 @@ mod tests {
         let prod_pass = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: None,
             ..Default::default()
@@ -1920,7 +1910,6 @@ mod tests {
         let prod_partial = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Partial,
             skeptic_verdict: None,
             ..Default::default()
@@ -1931,7 +1920,6 @@ mod tests {
         let non_prod_partial = PrEvidence {
             is_production: false,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Partial,
             skeptic_verdict: None,
             ..Default::default()
@@ -1941,7 +1929,6 @@ mod tests {
         let non_prod_pass = PrEvidence {
             is_production: false,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: None,
             ..Default::default()
@@ -1952,7 +1939,6 @@ mod tests {
         let prod_fail = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Fail,
             skeptic_verdict: None,
             ..Default::default()
@@ -1962,7 +1948,6 @@ mod tests {
         let non_prod_inconclusive = PrEvidence {
             is_production: false,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Inconclusive,
             skeptic_verdict: None,
             ..Default::default()
@@ -2252,13 +2237,32 @@ mod tests {
     }
 
     #[test]
-    fn evidence_gate_not_provided_falls_back_to_loc_floor() {
-        // No marker + above floor + no integration marker => the existing
-        // "evidence floor" Red (unchanged behavior).
+    fn evidence_gate_not_provided_above_floor_is_red_no_legacy_bypass() {
+        // r5 finding 1: no canonical marker + above the LOC floor => Red. The
+        // legacy substring floor that used to green this is deleted.
         let ev = evidence_with_status(EvidenceGistStatus::NotProvided);
         match evidence_floor_gate(&ev) {
-            GateResult::Red(reason) => assert_eq!(reason, "evidence floor"),
+            GateResult::Red(reason) => assert!(
+                reason.starts_with("evidence floor"),
+                "got: {reason}"
+            ),
             other => panic!("expected Red(evidence floor), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evidence_gate_pending_is_unknown_not_red() {
+        // r5 finding 3: a transient gist-fetch failure must be Unknown (wait),
+        // never Red (which would churn a reroll on gh noise).
+        let ev = evidence_with_status(EvidenceGistStatus::Pending(
+            "gist g fetch failed transiently".to_string(),
+        ));
+        match evidence_floor_gate(&ev) {
+            GateResult::Unknown(reason) => assert!(
+                reason.contains("pending"),
+                "expected a pending Unknown, got: {reason}"
+            ),
+            other => panic!("expected Unknown, got {other:?}"),
         }
     }
 }
