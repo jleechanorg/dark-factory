@@ -2160,6 +2160,8 @@ fn skeptic_evidence(
         er_verdict: verifier::ErVerdict::Absent,
         skeptic_verdict,
         skeptic_reviewers: used_vendors,
+        // Set in the fast tier from the canonical evidence marker (#323).
+        evidence_gist_status: verifier::EvidenceGistStatus::NotProvided,
     })
 }
 
@@ -2880,6 +2882,42 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
         evidence.has_integration_evidence_marker =
             verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
+        // Bead jleechan-yoqy / issue #323: verify the canonical evidence
+        // contract fail-closed. When the coder published a `**Evidence**:`
+        // marker, it MUST reference the PR's current head AND point at a
+        // fetchable, non-empty gist — otherwise it is a distinct evidence
+        // FAIL, never silently ignored. No marker -> NotProvided (the LOC
+        // floor decides). Only PRs carrying a marker incur the gist API call.
+        evidence.evidence_gist_status = match verifier::parse_evidence(&snapshot.body) {
+            None => verifier::EvidenceGistStatus::NotProvided,
+            Some(parsed) => {
+                let head_matches = {
+                    let want = snapshot.head_sha.to_ascii_lowercase();
+                    let got = parsed.head_sha.to_ascii_lowercase();
+                    !got.is_empty()
+                        && !want.is_empty()
+                        && (want.starts_with(&got) || got.starts_with(&want))
+                };
+                if !head_matches {
+                    verifier::EvidenceGistStatus::Failed(format!(
+                        "evidence head {} does not match PR head {}",
+                        parsed.head_sha, snapshot.head_sha
+                    ))
+                } else {
+                    match deps.scm.gist_nonempty(&parsed.gist_id) {
+                        Ok(true) => verifier::EvidenceGistStatus::Verified,
+                        Ok(false) => verifier::EvidenceGistStatus::Failed(format!(
+                            "evidence gist {} is empty",
+                            parsed.gist_id
+                        )),
+                        Err(e) => verifier::EvidenceGistStatus::Failed(format!(
+                            "evidence gist {} not fetchable: {e}",
+                            parsed.gist_id
+                        )),
+                    }
+                }
+            }
+        };
         let report = verifier::assess(deps.scm, pr, &repo, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
         // jleechan-wzgl: log the full per-gate breakdown (all 7 gates,

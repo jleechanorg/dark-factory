@@ -83,7 +83,11 @@ pub fn build_er_prompt(bead_id: &str, pr: u64, target_repo: &str) -> String {
            gh pr checks {pr} --repo {target_repo}\n\
          \n\
          Decide whether the PR has REAL evidence (tests run, integration checks,\n\
-         screenshots, videos, evidence bundles) supporting its claims.\n\
+         screenshots, videos, evidence bundles) supporting its claims. The PR\n\
+         body is REQUIRED to carry the canonical evidence line \
+         `{evidence_marker} <gist-url> (head <sha>)` pointing at a public,\n\
+         non-empty gist whose <sha> matches the PR head; a missing, empty, or\n\
+         stale-head gist is a FAIL.\n\
          \n\
          Reply with EXACTLY ONE LINE, no preamble, no markdown:\n\
            /er PASS\n\
@@ -95,6 +99,7 @@ pub fn build_er_prompt(bead_id: &str, pr: u64, target_repo: &str) -> String {
            /er INCONCLUSIVE <one short reason>\n\
          \n\
          Bead id: {bead_id}. PR: {pr}.",
+        evidence_marker = crate::tools::EVIDENCE_MARKER,
     )
 }
 
@@ -130,8 +135,22 @@ pub fn maybe_run(
     let snapshot = deps.scm.pr_snapshot_for_repo(&repo, pr)?;
     let existing =
         verifier::parse_er_verdict_since(&snapshot.comments, snapshot.head_committed_epoch);
+    // Bead jleechan-yoqy / issue #323: idempotence is keyed on BOTH the head
+    // commit (via `parse_er_verdict_since`) AND the PR body's evidence marker.
+    // An evidence-ONLY body update (same head commit, new/changed gist) leaves
+    // `head_committed_epoch` unchanged, so a fresh verdict would otherwise
+    // suppress re-review of the new evidence forever. Re-trigger `/er` when the
+    // evidence marker has changed since the last run; when it is unchanged (or
+    // was never recorded), respect the existing verdict.
+    let current_evidence_hash = verifier::evidence_marker_hash(&snapshot.body);
     if existing != ErVerdict::Absent {
-        return Ok(Outcome::AlreadyPosted(existing));
+        match deps.store.last_er_evidence_hash(bead_id)? {
+            Some(prev) if prev != current_evidence_hash => {
+                // Evidence changed under a fresh verdict — fall through and
+                // re-run /er against the updated evidence.
+            }
+            _ => return Ok(Outcome::AlreadyPosted(existing)),
+        }
     }
 
     // 3. Capped?
@@ -171,6 +190,11 @@ pub fn maybe_run(
     // 7. Increment attempt counter — only AFTER the comment landed, so a
     //    transient `comment_external` failure doesn't burn a retry slot.
     let new_count = deps.store.incr_er_runner_attempt(bead_id, now_epoch)?;
+    // Record the evidence marker this run reviewed, so a later evidence-only
+    // body update (jleechan-yoqy / #323) re-triggers /er instead of being
+    // suppressed by this run's verdict.
+    deps.store
+        .set_er_evidence_hash(bead_id, &current_evidence_hash)?;
 
     // 8. Parse verdict from the reply (NOT just from the now-posted comment —
     //    parse_er_verdict would find /er PASS etc. inside the formatted body,
@@ -429,6 +453,7 @@ mod tests {
     struct St {
         overlays: std::cell::RefCell<std::collections::HashMap<String, BeadOverlay>>,
         er_counts: std::cell::RefCell<std::collections::HashMap<String, (u32, Option<u64>)>>,
+        evidence_hashes: std::cell::RefCell<std::collections::HashMap<String, String>>,
         calls: std::cell::RefCell<Vec<String>>,
     }
     impl StateStore for St {
@@ -486,6 +511,15 @@ mod tests {
             entry.0 += 1;
             entry.1 = Some(now_epoch);
             Ok(entry.0)
+        }
+        fn last_er_evidence_hash(&self, bead_id: &str) -> Result<Option<String>, DaemonError> {
+            Ok(self.evidence_hashes.borrow().get(bead_id).cloned())
+        }
+        fn set_er_evidence_hash(&self, bead_id: &str, hash: &str) -> Result<(), DaemonError> {
+            self.evidence_hashes
+                .borrow_mut()
+                .insert(bead_id.to_string(), hash.to_string());
+            Ok(())
         }
         fn er_runner_attempt(
             &self,
@@ -568,6 +602,85 @@ mod tests {
     // TDD red phase: tests must FAIL until implementation lands.
     // Each test names the gap it pins down.
     // =========================================================
+
+    /// jleechan-yoqy / issue #323: an evidence-ONLY PR body update (same head
+    /// commit, changed gist) must RE-TRIGGER /er even though a fresh verdict
+    /// exists — otherwise stale evidence review is suppressed forever.
+    #[test]
+    fn er_retriggers_when_evidence_marker_changed() {
+        telemetry_cleanup();
+        let scm = S::default();
+        let tracker = T::default();
+        let sessions = Ss;
+        let llm = L::default();
+        *llm.response.borrow_mut() = Some(Ok("/er PASS".into()));
+        let store = St::default();
+        let cfg = test_cfg();
+
+        let pr = 320;
+        let bead = "yoqy1";
+        store
+            .overlays
+            .borrow_mut()
+            .insert(bead.into(), attested_overlay(bead, pr));
+        let mut snap = snapshot_with_comments(pr, comments_with_verdict("/er PASS"));
+        snap.body = "**Evidence**: https://gist.github.com/u/newgist (head deadbeef)".into();
+        scm.snapshots.borrow_mut().insert(pr, snap);
+        // The last /er run recorded a DIFFERENT evidence marker (old gist).
+        store.evidence_hashes.borrow_mut().insert(
+            bead.into(),
+            verifier::evidence_marker_hash(
+                "**Evidence**: https://gist.github.com/u/oldgist (head deadbeef)",
+            ),
+        );
+
+        let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
+        let outcome = maybe_run(&deps, bead, pr, 5_000_000).unwrap();
+        assert!(
+            matches!(outcome, Outcome::Posted { .. }),
+            "an evidence-only body change must re-trigger /er, got {outcome:?}"
+        );
+        // The new evidence hash is now recorded for the next idempotence check.
+        assert_eq!(
+            store.last_er_evidence_hash(bead).unwrap(),
+            Some(verifier::evidence_marker_hash(
+                "**Evidence**: https://gist.github.com/u/newgist (head deadbeef)"
+            ))
+        );
+    }
+
+    /// The dual: an unchanged evidence marker (stored hash == current) under a
+    /// fresh verdict must remain AlreadyPosted — no wasteful re-review.
+    #[test]
+    fn er_no_retrigger_when_evidence_unchanged() {
+        telemetry_cleanup();
+        let scm = S::default();
+        let tracker = T::default();
+        let sessions = Ss;
+        let llm = L::default();
+        let store = St::default();
+        let cfg = test_cfg();
+
+        let pr = 321;
+        let bead = "yoqy2";
+        store
+            .overlays
+            .borrow_mut()
+            .insert(bead.into(), attested_overlay(bead, pr));
+        let body = "**Evidence**: https://gist.github.com/u/g (head deadbeef)";
+        let mut snap = snapshot_with_comments(pr, comments_with_verdict("/er PASS"));
+        snap.body = body.into();
+        scm.snapshots.borrow_mut().insert(pr, snap);
+        store
+            .evidence_hashes
+            .borrow_mut()
+            .insert(bead.into(), verifier::evidence_marker_hash(body));
+
+        let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
+        let outcome = maybe_run(&deps, bead, pr, 5_000_000).unwrap();
+        assert_eq!(outcome, Outcome::AlreadyPosted(ErVerdict::Pass));
+        assert!(llm.calls.borrow().is_empty(), "unchanged evidence must not re-spawn the reviewer");
+    }
 
     #[test]
     fn noop_when_pass_comment_already_present() {
@@ -929,6 +1042,13 @@ mod tests {
         assert!(p.contains("owner/repo"));
         assert!(p.contains("b9"));
         assert!(p.contains("/er PASS"));
+        // jleechan-yoqy / #323: the reviewer contract references the ONE
+        // canonical evidence marker so it looks for the same line the coder
+        // is prompted to write and the verifier parses.
+        assert!(
+            p.contains(crate::tools::EVIDENCE_MARKER),
+            "reviewer prompt must reference the canonical evidence marker"
+        );
     }
 
     #[test]

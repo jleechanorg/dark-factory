@@ -185,6 +185,10 @@ pub struct FakeScm {
     /// `REROLL_PR_ALREADY_MERGED` telemetry, continue), not wedge the bead
     /// on a transient tool error.
     pub pr_already_terminal: HashMap<(String, u64), String>,
+    /// jleechan-yoqy / issue #323: scripted gist state keyed by gist id.
+    /// `Some(true)` = fetchable + non-empty, `Some(false)` = fetchable + empty,
+    /// absent key = unfetchable (`gist_nonempty` returns `Err`, fail-closed).
+    pub gists: HashMap<String, bool>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -327,6 +331,21 @@ impl Scm for FakeScm {
             .get(&(repo.to_string(), branch.to_string()))
             .copied()
             .flatten())
+    }
+
+    fn gist_nonempty(&self, gist_id: &str) -> Result<bool, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("gist_nonempty({gist_id})"));
+        match self.gists.get(gist_id) {
+            Some(nonempty) => Ok(*nonempty),
+            // Absent = unfetchable (missing/private) — fail-closed.
+            None => Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: format!("gist {gist_id} not found (404)"),
+            }),
+        }
     }
 }
 
@@ -1131,6 +1150,9 @@ pub struct FakeStateStore {
     /// epoch (mirrors the `held_recheck_after` SQLite column), stored
     /// independently of `BeadOverlay`.
     pub held_recheck_after: RefCell<HashMap<String, u64>>,
+    /// Bead jleechan-yoqy / issue #323: per-bead last-/er evidence-marker hash
+    /// (mirrors the `last_er_evidence_hash` column), for the retrigger tests.
+    pub last_er_evidence_hash: RefCell<HashMap<String, String>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -1353,6 +1375,20 @@ impl StateStore for FakeStateStore {
         self.held_recheck_after
             .borrow_mut()
             .insert(bead_id.to_string(), epoch);
+        Ok(())
+    }
+
+    fn last_er_evidence_hash(&self, bead_id: &str) -> Result<Option<String>, DaemonError> {
+        Ok(self.last_er_evidence_hash.borrow().get(bead_id).cloned())
+    }
+
+    fn set_er_evidence_hash(&self, bead_id: &str, hash: &str) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("set_er_evidence_hash({bead_id})"));
+        self.last_er_evidence_hash
+            .borrow_mut()
+            .insert(bead_id.to_string(), hash.to_string());
         Ok(())
     }
 

@@ -278,6 +278,19 @@ pub trait StateStore {
     fn incr_er_runner_attempt(&self, _bead_id: &str, _now_epoch: u64) -> Result<u32, DaemonError> {
         Ok(1)
     }
+    /// Read the evidence-marker hash recorded at `bead_id`'s last `/er` run
+    /// (bead jleechan-yoqy / issue #323). `None` = no run recorded. Used by
+    /// `er_runner::maybe_run` to re-trigger `/er` after an evidence-only PR
+    /// body update. Default `Ok(None)` so fakes that don't exercise the
+    /// retrigger path behave as "never recorded" (respect the existing verdict).
+    fn last_er_evidence_hash(&self, _bead_id: &str) -> Result<Option<String>, DaemonError> {
+        Ok(None)
+    }
+    /// Record the evidence-marker hash reviewed by `bead_id`'s latest `/er`
+    /// run. Default no-op for fakes.
+    fn set_er_evidence_hash(&self, _bead_id: &str, _hash: &str) -> Result<(), DaemonError> {
+        Ok(())
+    }
     /// Read the consecutive re-roll deferral count for `bead_id` (bead
     /// jleechan-zeij / issue #322 r2). Persisted in its own column rather
     /// than on [`BeadOverlay`] — like `attempt_er_runner_count`, it is a
@@ -521,6 +534,7 @@ impl SqliteStateStore {
         Self::ensure_target_repo_column(&conn)?;
         Self::ensure_reroll_deferral_count_column(&conn)?;
         Self::ensure_held_recheck_after_column(&conn)?;
+        Self::ensure_last_er_evidence_hash_column(&conn)?;
         Self::ensure_disposition_required_state(&conn)?;
         Ok(Self { conn })
     }
@@ -540,6 +554,7 @@ impl SqliteStateStore {
         Self::ensure_target_repo_column(&conn)?;
         Self::ensure_reroll_deferral_count_column(&conn)?;
         Self::ensure_held_recheck_after_column(&conn)?;
+        Self::ensure_last_er_evidence_hash_column(&conn)?;
         Self::ensure_disposition_required_state(&conn)?;
         Ok(Self { conn })
     }
@@ -751,6 +766,30 @@ impl SqliteStateStore {
         Ok(())
     }
 
+    /// Idempotent migration for the `last_er_evidence_hash` column (bead
+    /// jleechan-yoqy / issue #323). Same probe-then-`ALTER` pattern. Nullable
+    /// (NULL = "no /er run recorded"). MUST run before
+    /// `ensure_disposition_required_state` so the column is present for the
+    /// CHECK rebuild's column-intersection copy.
+    fn ensure_last_er_evidence_hash_column(conn: &Connection) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'last_er_evidence_hash'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_last_er_evidence_hash_column: pragma", e))?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN last_er_evidence_hash TEXT",
+                [],
+            )
+            .map_err(|e| tool_err("ensure_last_er_evidence_hash_column: add column", e))?;
+        }
+        Ok(())
+    }
+
     /// Canonical `bead_overlay` column list (in `schema.sql` order). The
     /// DISPOSITION_REQUIRED CHECK rebuild uses this to build the new table and
     /// to copy data by EXPLICIT column name. Keep in sync with `schema.sql`'s
@@ -775,6 +814,7 @@ impl SqliteStateStore {
         "target_repo",
         "reroll_deferral_count",
         "held_recheck_after",
+        "last_er_evidence_hash",
     ];
 
     /// The canonical `CREATE TABLE bead_overlay` statement (with the current
@@ -804,7 +844,8 @@ impl SqliteStateStore {
         park_reason TEXT, \
         target_repo TEXT, \
         reroll_deferral_count INTEGER NOT NULL DEFAULT 0, \
-        held_recheck_after INTEGER)";
+        held_recheck_after INTEGER, \
+        last_er_evidence_hash TEXT)";
 
     /// Bead jleechan-zaga / issue #348: migrate the `bead_overlay.state` CHECK
     /// constraint to allow `'DISPOSITION_REQUIRED'`. Unlike every other
@@ -1561,6 +1602,32 @@ impl StateStore for SqliteStateStore {
             Ok(_) => Ok(()),
             Err(e) if no_such_column(&e) => Ok(()),
             Err(e) => Err(tool_err("set_held_recheck_after", e)),
+        }
+    }
+
+    fn last_er_evidence_hash(&self, bead_id: &str) -> Result<Option<String>, DaemonError> {
+        let row: Result<Option<String>, rusqlite::Error> = self.conn.query_row(
+            "SELECT last_er_evidence_hash FROM bead_overlay WHERE bead_id = ?1",
+            params![bead_id],
+            |row| row.get(0),
+        );
+        match row {
+            Ok(v) => Ok(v),
+            Err(e) if no_such_column(&e) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(tool_err("last_er_evidence_hash", e)),
+        }
+    }
+
+    fn set_er_evidence_hash(&self, bead_id: &str, hash: &str) -> Result<(), DaemonError> {
+        let res = self.conn.execute(
+            "UPDATE bead_overlay SET last_er_evidence_hash = ?2, updated_at = ?3 WHERE bead_id = ?1",
+            params![bead_id, hash, now_iso8601()],
+        );
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) if no_such_column(&e) => Ok(()),
+            Err(e) => Err(tool_err("set_er_evidence_hash", e)),
         }
     }
 }

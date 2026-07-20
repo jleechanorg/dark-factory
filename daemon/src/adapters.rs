@@ -1209,6 +1209,27 @@ impl Scm for CliScm {
         }
     }
 
+    /// Bead jleechan-yoqy / issue #323: `gh api gists/<id>` and report whether
+    /// the gist exists AND has at least one non-empty file. A 404 / private /
+    /// missing gist is an `Err` (unfetchable → the evidence gate fails closed);
+    /// a fetchable gist with only empty files is `Ok(false)`.
+    fn gist_nonempty(&self, gist_id: &str) -> Result<bool, DaemonError> {
+        // Sum the `size` of every file in the gist via jq; empty/absent -> 0.
+        let out = run_tool(
+            "gh",
+            &[
+                "api",
+                &format!("gists/{gist_id}"),
+                "--jq",
+                "[.files[].size] | add // 0",
+            ],
+            30,
+        )?;
+        let trimmed = out.trim();
+        let total: u64 = trimmed.parse().unwrap_or(0);
+        Ok(total > 0)
+    }
+
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
         let offline_path = std::path::Path::new(".beads/offline").join(format!("pr_{}.json", pr));
         if offline_path.exists() {

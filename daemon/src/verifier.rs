@@ -346,6 +346,30 @@ pub struct PrEvidence {
     /// GATE_ASSESSMENT's provenance signal for confirming the gate-7
     /// reviewer was non-self and genuinely ran, not self-certified.
     pub skeptic_reviewers: Vec<String>,
+    /// Bead jleechan-yoqy / issue #323: result of verifying the canonical
+    /// evidence marker (`**Evidence**:` + gist URL + `(head <sha>)`) against
+    /// the live gist and the PR's current head. Computed in `tick.rs` (which
+    /// has the SCM adapter); `evidence_floor_gate` consults it. `NotProvided`
+    /// (the default) means no evidence marker was in the body, so the existing
+    /// LOC-floor logic applies unchanged.
+    pub evidence_gist_status: EvidenceGistStatus,
+}
+
+/// Bead jleechan-yoqy / issue #323: fail-closed verification result for the
+/// canonical evidence marker.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EvidenceGistStatus {
+    /// No canonical evidence marker in the PR body — the LOC-floor logic
+    /// decides the gate as before.
+    #[default]
+    NotProvided,
+    /// Marker present, gist fetchable and non-empty, and it references the
+    /// PR's current head SHA — the evidence contract is satisfied.
+    Verified,
+    /// Marker present but verification failed; the string is the distinct,
+    /// operator-facing reason (unparseable, gist unfetchable, gist empty, or
+    /// head-SHA mismatch).
+    Failed(String),
 }
 
 /// Gate 6 (spec §4.2.5): green only when `/er` returned `Pass` AND the
@@ -387,6 +411,19 @@ fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
         }
     }
 
+    // Bead jleechan-yoqy / issue #323: the canonical evidence contract. When
+    // the coder published an evidence marker, its verification is AUTHORITATIVE
+    // and fail-closed — a present-but-invalid marker is a distinct Red, never
+    // silently ignored; a verified marker satisfies the floor regardless of
+    // LOC. Only when NO marker was provided do we fall back to the LOC floor.
+    match &evidence.evidence_gist_status {
+        EvidenceGistStatus::Verified => return GateResult::Green,
+        EvidenceGistStatus::Failed(reason) => {
+            return GateResult::Red(format!("evidence contract: {reason}"));
+        }
+        EvidenceGistStatus::NotProvided => {}
+    }
+
     if evidence.non_test_changed_loc <= EVIDENCE_FLOOR_LOC {
         return GateResult::Green;
     }
@@ -395,6 +432,114 @@ fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
     } else {
         GateResult::Red("evidence floor".to_string())
     }
+}
+
+/// Bead jleechan-yoqy / issue #323: a parsed canonical evidence reference from
+/// a PR body — the gist id and the head SHA the coder attested it covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedEvidence {
+    pub gist_id: String,
+    pub head_sha: String,
+}
+
+/// Parse the ONE canonical evidence marker from `body`. Matches
+/// [`crate::tools::EVIDENCE_MARKER`] (`**Evidence**:`) case-insensitively with
+/// the `**` bold markers optional, on a line that starts with the marker
+/// (leading whitespace and an optional `-` bullet tolerated). Extracts the
+/// gist id (last path segment of a `gist.github.com/...` URL) and the head SHA
+/// from a trailing `(head <sha>)`. Returns `None` if the marker, a gist URL,
+/// or the head SHA is absent — the exact prompt-mandated string
+/// `**Evidence**: <gist-url> (head <sha>)` round-trips through this parser.
+pub fn parse_evidence(body: &str) -> Option<ParsedEvidence> {
+    for line in body.lines() {
+        // Tolerate bold `**` markers by stripping asterisks for marker
+        // detection; URLs and SHAs never contain `*`.
+        let cleaned = line.replace('*', "");
+        let marker_idx = match cleaned.to_ascii_lowercase().find("evidence:") {
+            Some(i) => i,
+            None => continue,
+        };
+        // The marker must LEAD the line (only whitespace / a `-` bullet before
+        // it) so prose mentioning "evidence:" elsewhere isn't misread.
+        let prefix = cleaned[..marker_idx].trim();
+        if !prefix.trim_start_matches('-').trim().is_empty() {
+            continue;
+        }
+        let rest = &cleaned[marker_idx + "evidence:".len()..];
+        let gist_id = match extract_gist_id(rest) {
+            Some(id) => id,
+            None => continue,
+        };
+        let head_sha = match extract_head_sha(rest) {
+            Some(sha) => sha,
+            None => continue,
+        };
+        return Some(ParsedEvidence { gist_id, head_sha });
+    }
+    None
+}
+
+/// Extract the gist id (last non-empty path segment of a
+/// `gist.github.com/...` URL) from `text`.
+fn extract_gist_id(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let host = "gist.github.com/";
+    let host_idx = lower.find(host)?;
+    let after = &text[host_idx + host.len()..];
+    // The URL token ends at whitespace or a closing paren/angle bracket.
+    let url_token: &str = after
+        .split(|c: char| c.is_whitespace() || c == ')' || c == '>' || c == '(')
+        .next()
+        .unwrap_or("");
+    let id = url_token
+        .trim_end_matches('/')
+        .rsplit('/')
+        .find(|seg| !seg.is_empty())?
+        // Strip any URL fragment/query or trailing punctuation.
+        .split(['#', '?'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(['.', ',']);
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+/// Extract the head SHA from a trailing `(head <sha>)` clause in `text`
+/// (case-insensitive on `head`).
+fn extract_head_sha(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let key = "(head ";
+    let key_idx = lower.find(key)?;
+    let after = &text[key_idx + key.len()..];
+    let sha: &str = after
+        .split(|c: char| c.is_whitespace() || c == ')')
+        .find(|s| !s.is_empty())?;
+    let sha = sha.trim();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha.to_string())
+    }
+}
+
+/// Bead jleechan-yoqy / issue #323: a stable hash of the PR body's evidence
+/// marker, used by `er_runner` to detect an evidence-only body update (same
+/// head commit, changed gist) and re-trigger `/er`. `None` marker hashes to a
+/// fixed sentinel so "no marker" is distinguishable from any real marker.
+pub fn evidence_marker_hash(body: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match parse_evidence(body) {
+        Some(ev) => {
+            ev.gist_id.hash(&mut hasher);
+            ev.head_sha.hash(&mut hasher);
+        }
+        None => "<no-evidence-marker>".hash(&mut hasher),
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 pub fn parse_er_verdict(comments: &[crate::tools::PrComment]) -> ErVerdict {
@@ -2006,5 +2151,114 @@ mod tests {
         let cfg = test_cfg();
         let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
         assert_eq!(classify_chain(&report), ChainDisposition::TransientOnly);
+    }
+
+    // --- jleechan-yoqy / issue #323: canonical evidence contract tests ---
+
+    /// ROUND-TRIP: the EXACT string the coder-dispatch prompt mandates
+    /// (`{EVIDENCE_MARKER} <gist-url> (head <sha>)`) must parse back to the
+    /// gist id and head SHA. This is the contract that ties the prompt, the
+    /// reviewer, and the parser to one literal.
+    #[test]
+    fn evidence_marker_round_trips_from_prompt_mandated_string() {
+        let gist_id = "abc123def456";
+        let head = "deadbeefcafe";
+        // Build exactly as the prompt instructs, using the shared constant.
+        let line = format!(
+            "{} https://gist.github.com/octocat/{gist_id} (head {head})",
+            crate::tools::EVIDENCE_MARKER
+        );
+        let body = format!("Some PR description.\n\n{line}\n\nMore text.");
+        let parsed = parse_evidence(&body).expect("prompt-mandated evidence line must parse");
+        assert_eq!(parsed.gist_id, gist_id);
+        assert_eq!(parsed.head_sha, head);
+    }
+
+    #[test]
+    fn evidence_marker_parse_tolerates_case_and_missing_bold_and_bullet() {
+        // Bold markers optional, case-insensitive, leading `-` bullet tolerated.
+        let body = "- evidence: https://gist.github.com/u/deadid (head abc123)";
+        let parsed = parse_evidence(body).unwrap();
+        assert_eq!(parsed.gist_id, "deadid");
+        assert_eq!(parsed.head_sha, "abc123");
+
+        // Bare gist URL with no user path segment.
+        let body2 = "**EVIDENCE**: https://gist.github.com/onlyid (head ffff)";
+        let parsed2 = parse_evidence(body2).unwrap();
+        assert_eq!(parsed2.gist_id, "onlyid");
+    }
+
+    #[test]
+    fn evidence_marker_absent_or_incomplete_parses_none() {
+        assert_eq!(parse_evidence("no marker here"), None);
+        // Prose mentioning evidence mid-line is not the marker.
+        assert_eq!(
+            parse_evidence("we added evidence: see the tests"),
+            None,
+            "a non-gist evidence line must not falsely parse"
+        );
+        // Marker + gist but no (head ..) clause.
+        assert_eq!(
+            parse_evidence("**Evidence**: https://gist.github.com/u/x"),
+            None
+        );
+    }
+
+    #[test]
+    fn evidence_marker_hash_changes_with_gist_and_is_stable() {
+        let a = "**Evidence**: https://gist.github.com/u/g1 (head h1)";
+        let b = "**Evidence**: https://gist.github.com/u/g2 (head h1)"; // gist changed
+        let none = "no evidence marker";
+        assert_eq!(evidence_marker_hash(a), evidence_marker_hash(a), "stable");
+        assert_ne!(
+            evidence_marker_hash(a),
+            evidence_marker_hash(b),
+            "an evidence-only gist change must change the hash"
+        );
+        assert_ne!(evidence_marker_hash(a), evidence_marker_hash(none));
+    }
+
+    fn evidence_with_status(status: EvidenceGistStatus) -> PrEvidence {
+        PrEvidence {
+            is_production: false,
+            non_test_changed_loc: 500, // above the LOC floor
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            evidence_gist_status: status,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn evidence_gate_verified_is_green_even_above_loc_floor() {
+        let ev = evidence_with_status(EvidenceGistStatus::Verified);
+        assert!(matches!(evidence_floor_gate(&ev), GateResult::Green));
+    }
+
+    #[test]
+    fn evidence_gate_failed_is_red_with_distinct_text() {
+        let ev = evidence_with_status(EvidenceGistStatus::Failed(
+            "evidence gist abc is empty".to_string(),
+        ));
+        match evidence_floor_gate(&ev) {
+            GateResult::Red(reason) => {
+                assert!(
+                    reason.contains("evidence contract") && reason.contains("empty"),
+                    "distinct evidence-failure text expected, got: {reason}"
+                );
+            }
+            other => panic!("expected Red, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evidence_gate_not_provided_falls_back_to_loc_floor() {
+        // No marker + above floor + no integration marker => the existing
+        // "evidence floor" Red (unchanged behavior).
+        let ev = evidence_with_status(EvidenceGistStatus::NotProvided);
+        match evidence_floor_gate(&ev) {
+            GateResult::Red(reason) => assert_eq!(reason, "evidence floor"),
+            other => panic!("expected Red(evidence floor), got {other:?}"),
+        }
     }
 }
