@@ -19,6 +19,214 @@ use crate::tools::Scm;
 /// marker in the PR body (spec §4.2.5 "Evidence floor").
 const EVIDENCE_FLOOR_LOC: u32 = 100;
 
+/// Canonical PR-body marker for a public-gist evidence bundle. jleechan-yoqy
+/// r3: shared by `dispatch::render_coder_prompt` (coder emits it),
+/// `er_runner::build_er_prompt` (reviewer is told to look for it), and
+/// `parse_evidence_marker` (parser recognizes it). ONE token, three call
+/// sites — round-trip test `canonical_marker_round_trips_through_dispatch`
+/// pins the contract end-to-end. Do NOT introduce a second marker.
+pub const CANONICAL_EVIDENCE_MARKER: &str = "**Evidence**:";
+
+/// Hash of the canonical evidence marker + gist URL from a PR body. Used by
+/// `er_runner::maybe_run` as the second component of the AlreadyPosted key —
+/// `head_committed_epoch` alone is not enough: an evidence-only body update
+/// (same head SHA, different gist URL) MUST re-trigger `/er` instead of being
+/// short-circuited by a stale "verdict posted after this head" guard.
+pub fn evidence_marker_hash(body: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    parse_evidence_marker(body).hash(&mut h);
+    h.finish()
+}
+
+/// Parse the canonical `**Evidence**: <gist_url>` marker out of a PR body.
+/// Returns the gist URL (the substring after `**Evidence**: `, trimmed) or
+/// `None` if the marker is absent or malformed. The match is case-sensitive
+/// on `**Evidence**:` (the operator-mandated literal) — fail-closed on a
+/// typo rather than silently green-lighting an alternate spelling that the
+/// coder prompt never told the coder to write.
+pub fn parse_evidence_marker(body: &str) -> Option<String> {
+    let idx = body.find(CANONICAL_EVIDENCE_MARKER)?;
+    let after = &body[idx + CANONICAL_EVIDENCE_MARKER.len()..];
+    // Skip the colon + at least one space/separator, then capture the URL.
+    let after = after.trim_start_matches(':').trim_start();
+    let url_end = after
+        .find(|c: char| c.is_whitespace() || c == '\n' || c == '\r')
+        .unwrap_or(after.len());
+    let url = after[..url_end].trim();
+    if url.is_empty() {
+        return None;
+    }
+    Some(url.to_string())
+}
+
+/// Outcome of a fail-closed evidence-gist existence check (bead
+/// jleechan-yoqy r3, operator guidance item 2). The gate must NOT trust
+/// a `**Evidence**: <gist_url>` marker alone — the substring match in
+/// `check_integration_marker` is necessary but not sufficient. `assess`
+/// combines `Verified` with the marker to flip gate 6 green; every other
+/// variant is Red.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GistEvidenceCheck {
+    /// The PR body has no `**Evidence**:` marker at all — separate code
+    /// path; `has_integration_evidence_marker` would already be false.
+    /// Modeled here so the gate has a single switch over the result.
+    NoMarker,
+    /// The marker is present but the URL is not a recognizable gist
+    /// host (`gist.github.com`/`api.github.com/gists`). Treat as
+    /// malformed — fail closed.
+    MalformedUrl,
+    /// The gist could not be reached (network error, 404, 5xx). Fail
+    /// closed — we cannot prove the bundle exists, so we cannot let the
+    /// gate green-light on a possibly-missing artifact.
+    FetchFailed(String),
+    /// The gist exists but is private, empty, or does not reference the
+    /// current head SHA. Fail closed.
+    Invalid {
+        gist_id: String,
+        reason: &'static str,
+    },
+    /// The gist exists, is public, has at least one non-empty file, and
+    /// at least one file's content references the current head SHA.
+    /// THIS is the only state that lets gate 6 green-light.
+    Verified {
+        gist_id: String,
+        referencing_files: Vec<String>,
+    },
+}
+
+impl Default for GistEvidenceCheck {
+    fn default() -> Self {
+        // Back-compat: tests/fixtures that don't exercise the gist gate
+        // get `NoMarker` (equivalent to "the check never ran"), which
+        // the gate treats as Red for production PRs over the LOC floor
+        // but a no-op for everything else.
+        GistEvidenceCheck::NoMarker
+    }
+}
+
+/// Extract the 32-char hex gist ID from a canonical
+/// `https://gist.github.com/<user>/<id>` URL (the shape
+/// `dispatch::render_coder_prompt` tells the coder to emit). Returns
+/// `None` for non-gist URLs, malformed inputs, or IDs that aren't 32
+/// hex chars (GitHub gists all use 32-hex IDs).
+pub fn parse_gist_id(url: &str) -> Option<String> {
+    let url = url.trim();
+    // Accept `https://gist.github.com/<user>/<id>` and the bare
+    // `<id>` (some test fixtures inline the ID directly). Anything
+    // else is malformed.
+    let id = if let Some(rest) = url.strip_prefix("https://gist.github.com/") {
+        // rest is "<user>/<id>" or "<id>" — take the LAST segment.
+        rest.rsplit('/').next()?
+    } else if url.starts_with("https://") || url.starts_with("http://") {
+        return None;
+    } else {
+        url
+    };
+    let id = id.trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+    if id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(id.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Fetch a gist's raw JSON body via `gh api gists/<id>` and check it
+/// for the four fail-closed properties: (a) `public == true`,
+/// (b) `files` is non-empty, (c) every file has non-empty `content`,
+/// (d) at least one file's content references `head_sha` (substring
+/// match — sufficient for the contract, strict equality would
+/// over-constrain coders who wrap the SHA in fence blocks).
+///
+/// `fetch` is a closure (not a `Scm` method) so this function is
+/// testable without spinning up the full Scm trait, AND so `tick.rs`
+/// can pass `|id| scm.fetch_gist(id)` against the real `gh api` in
+/// production without coupling the verifier module to the SCM
+/// boundary. The closure signature mirrors the production call:
+/// `fn(&str) -> Result<String, _>` where the String is the raw `gh api
+/// gists/<id>` stdout body.
+pub fn verify_gist_evidence<F>(
+    body: &str,
+    head_sha: &str,
+    fetch: F,
+) -> GistEvidenceCheck
+where
+    F: FnOnce(&str) -> Result<String, String>,
+{
+    let Some(url) = parse_evidence_marker(body) else {
+        return GistEvidenceCheck::NoMarker;
+    };
+    let Some(gist_id) = parse_gist_id(&url) else {
+        return GistEvidenceCheck::MalformedUrl;
+    };
+    let raw = match fetch(&gist_id) {
+        Ok(s) => s,
+        Err(e) => return GistEvidenceCheck::FetchFailed(e),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return GistEvidenceCheck::FetchFailed("not JSON".into()),
+    };
+    // (a) public
+    let public = parsed.get("public").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !public {
+        return GistEvidenceCheck::Invalid {
+            gist_id: gist_id.clone(),
+            reason: "gist is private",
+        };
+    }
+    // (b) + (c) files non-empty and every file has non-empty content
+    let files = parsed
+        .get("files")
+        .and_then(|v| v.as_object())
+        .map(|o| o.len())
+        .unwrap_or(0);
+    if files == 0 {
+        return GistEvidenceCheck::Invalid {
+            gist_id: gist_id.clone(),
+            reason: "gist has no files",
+        };
+    }
+    let file_contents: Vec<(String, String)> = parsed
+        .get("files")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(name, val)| {
+                    let content = val.get("content")?.as_str()?.to_string();
+                    if content.is_empty() {
+                        None
+                    } else {
+                        Some((name.clone(), content))
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if file_contents.is_empty() {
+        return GistEvidenceCheck::Invalid {
+            gist_id: gist_id.clone(),
+            reason: "all gist files are empty",
+        };
+    }
+    // (d) at least one file references the current head SHA.
+    let referencing_files: Vec<String> = file_contents
+        .iter()
+        .filter(|(_, content)| content.contains(head_sha))
+        .map(|(name, _)| name.clone())
+        .collect();
+    if referencing_files.is_empty() {
+        return GistEvidenceCheck::Invalid {
+            gist_id: gist_id.clone(),
+            reason: "no gist file references the current head SHA",
+        };
+    }
+    GistEvidenceCheck::Verified {
+        gist_id,
+        referencing_files,
+    }
+}
+
 /// The 7 named gates, in the fixed order `GateReport::results` is reported in
 /// (spec §4.2.5, numbered 1-7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,7 +531,19 @@ pub struct PrEvidence {
     pub non_test_changed_loc: u32,
     /// Whether the PR body/comments carry an integration-evidence marker
     /// (Layer-2+ proof, not unit-only) for diffs over the LOC floor.
+    /// Kept as a fast-path boolean for tests/legacy callers; the
+    /// canonical signal for gate 6 is `gist_verification == Verified`,
+    /// which is strictly stronger than this substring match.
     pub has_integration_evidence_marker: bool,
+    /// jleechan-yoqy r3: outcome of the fail-closed gist existence check
+    /// (operator guidance item 2). Gate 6 only flips green when this is
+    /// `Verified { .. }` — every other variant is Red, including
+    /// `NoMarker`, `FetchFailed`, and `Invalid`. `tick.rs` populates this
+    /// from `verify_gist_evidence(snapshot.body, snapshot.head_sha,
+    /// |id| scm.fetch_gist(id))`. `Default::default()` is `NoMarker` —
+    /// tests/fixtures that don't exercise the gist gate get the
+    /// pre-r3 behavior (substring match sufficient).
+    pub gist_verification: GistEvidenceCheck,
     /// The `/er` (evidence review) verdict (spec §4.2.5 gate 6). This is the
     /// PRIMARY gate-6 signal — the LOC floor below is an ADDITIONAL floor on
     /// top of it, not a substitute for it (hardening sweep P1, bead
@@ -390,7 +610,35 @@ fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
     if evidence.non_test_changed_loc <= EVIDENCE_FLOOR_LOC {
         return GateResult::Green;
     }
-    if evidence.has_integration_evidence_marker {
+    // jleechan-yoqy r3: production PRs over the LOC floor require BOTH the
+    // substring marker AND a fail-closed gist existence check
+    // (`gist_verification == Verified`). A bare marker is no longer
+    // sufficient — the marker alone is exactly the "substring-only
+    // self-certification" the operator flagged in the r2 review. The
+    // legacy `has_integration_evidence_marker` is still honored so test
+    // fixtures and non-production beads (small diffs under the LOC
+    // floor) keep their existing behavior.
+    if evidence.is_production {
+        match &evidence.gist_verification {
+            GistEvidenceCheck::Verified { .. } => GateResult::Green,
+            GistEvidenceCheck::NoMarker => GateResult::Red(
+                "evidence floor: production PR over LOC floor has no **Evidence**: <gist_url> marker"
+                    .to_string(),
+            ),
+            GistEvidenceCheck::MalformedUrl => GateResult::Red(
+                "evidence floor: **Evidence** marker URL is not a recognizable gist"
+                    .to_string(),
+            ),
+            GistEvidenceCheck::FetchFailed(e) => GateResult::Red(format!(
+                "evidence floor: gist existence check failed: {e}"
+            )),
+            GistEvidenceCheck::Invalid { reason, .. } => GateResult::Red(format!(
+                "evidence floor: {reason}"
+            )),
+        }
+    } else if evidence.has_integration_evidence_marker
+        || matches!(evidence.gist_verification, GistEvidenceCheck::Verified { .. })
+    {
         GateResult::Green
     } else {
         GateResult::Red("evidence floor".to_string())
@@ -533,19 +781,31 @@ pub fn calculate_non_test_loc(files: &[crate::tools::PrFile]) -> u32 {
     total
 }
 
+/// jleechan-yoqy r3: this gate still accepts the legacy
+/// `has_integration_evidence_marker` / `integration-evidence` tokens (older
+/// beads, test fixtures, and r1/r2 of the coder-prompt fix rely on them),
+/// BUT a fresh gate-6 green now also requires `parse_evidence_marker` to
+/// return Some on the PR body — the legacy tokens alone are insufficient
+/// for production PRs. `comments` are scanned only for the legacy tokens
+/// (a reviewer posting `**Evidence**: <url>` in a comment does not
+/// satisfy the canonical marker, by design: the marker is the CODER's
+/// contract, not the reviewer's).
 pub fn check_integration_marker(body: &str, comments: &[crate::tools::PrComment]) -> bool {
+    if parse_evidence_marker(body).is_some() {
+        return true;
+    }
     let lower_body = body.to_lowercase();
-    if lower_body.contains("has_integration_evidence_marker") 
-       || lower_body.contains("integration-evidence") 
-       || lower_body.contains("integration evidence") 
+    if lower_body.contains("has_integration_evidence_marker")
+       || lower_body.contains("integration-evidence")
+       || lower_body.contains("integration evidence")
     {
         return true;
     }
     for comment in comments {
         let lower_comment = comment.body.to_lowercase();
-        if lower_comment.contains("has_integration_evidence_marker") 
-           || lower_comment.contains("integration-evidence") 
-           || lower_comment.contains("integration evidence") 
+        if lower_comment.contains("has_integration_evidence_marker")
+           || lower_comment.contains("integration-evidence")
+           || lower_comment.contains("integration evidence")
         {
             return true;
         }
@@ -1120,6 +1380,9 @@ mod tests {
             is_production: true,
             non_test_changed_loc: 150,
             has_integration_evidence_marker: false,
+            // No marker → Default (NoMarker). The new gate produces a
+            // more specific reason string than the legacy "evidence
+            // floor" sentinel.
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1129,8 +1392,11 @@ mod tests {
 
         assert!(!report.all_green);
         match gate(&report, GateName::EvidenceFloor) {
-            GateResult::Red(reason) => assert_eq!(reason, "evidence floor"),
-            other => panic!("expected Red(\"evidence floor\"), got {other:?}"),
+            GateResult::Red(reason) => assert!(
+                reason.contains("no **Evidence**: <gist_url> marker"),
+                "expected Red with marker-missing reason, got {reason:?}"
+            ),
+            other => panic!("expected Red(marker-missing), got {other:?}"),
         }
     }
 
@@ -1139,10 +1405,17 @@ mod tests {
         let mut scm = FakeScm::default();
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
+        // jleechan-yoqy r3: production PRs over the LOC floor require
+        // BOTH the substring marker AND a Verified gist (the bare
+        // marker is the r2 regression). This test now sets both.
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 150,
             has_integration_evidence_marker: true,
+            gist_verification: GistEvidenceCheck::Verified {
+                gist_id: "abc123456789abcdef0123456789abcd".to_string(),
+                referencing_files: vec!["out.txt".to_string()],
+            },
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1373,8 +1646,11 @@ mod tests {
 
         assert!(!report.all_green);
         match gate(&report, GateName::EvidenceFloor) {
-            GateResult::Red(reason) => assert_eq!(reason, "evidence floor"),
-            other => panic!("expected Red(\"evidence floor\"), got {other:?}"),
+            GateResult::Red(reason) => assert!(
+                reason.contains("no **Evidence**: <gist_url> marker"),
+                "expected Red with marker-missing reason, got {reason:?}"
+            ),
+            other => panic!("expected Red(marker-missing), got {other:?}"),
         }
     }
 
@@ -1387,6 +1663,12 @@ mod tests {
             is_production: true,
             non_test_changed_loc: 150,
             has_integration_evidence_marker: true,
+            // jleechan-yoqy r3: marker alone insufficient for production
+            // PRs — Verified gist required.
+            gist_verification: GistEvidenceCheck::Verified {
+                gist_id: "abc123456789abcdef0123456789abcd".to_string(),
+                referencing_files: vec!["out.txt".to_string()],
+            },
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1757,6 +2039,282 @@ mod tests {
 
         // Neither contains marker
         assert!(!check_integration_marker("No marker here", &[]));
+
+        // jleechan-yoqy r3: canonical **Evidence**: <gist_url> marker in body
+        // satisfies the gate even when no legacy token is present.
+        assert!(check_integration_marker(
+            "**Evidence**: https://gist.github.com/jleechan/abc123",
+            &[],
+        ));
+        // Canonical marker with no legacy fallback still flips green.
+        assert!(check_integration_marker(
+            "Some prose.\n\n**Evidence**: https://gist.github.com/jleechan/deadbeef\n\nMore prose.",
+            &[],
+        ));
+    }
+
+    /// jleechan-yoqy r3: the parser recognizes the exact marker the coder
+    /// prompt emits (`**Evidence**:` followed by a gist URL on the same line).
+    #[test]
+    fn parse_evidence_marker_recognizes_canonical_form() {
+        assert_eq!(
+            parse_evidence_marker("**Evidence**: https://gist.github.com/jleechan/abc123"),
+            Some("https://gist.github.com/jleechan/abc123".to_string()),
+        );
+        assert_eq!(
+            parse_evidence_marker(
+                "Some prose.\n\n**Evidence**: https://gist.github.com/jleechan/deadbeef\n\nMore prose.",
+            ),
+            Some("https://gist.github.com/jleechan/deadbeef".to_string()),
+        );
+        // Surrounding markdown is fine.
+        assert_eq!(
+            parse_evidence_marker("**Evidence**:https://gist.github.com/x/y"),
+            Some("https://gist.github.com/x/y".to_string()),
+        );
+    }
+
+    /// jleechan-yoqy r3: the parser is case-sensitive and fail-closed on
+    /// misspellings — a typo in the operator-mandated marker must NOT
+    /// green-light gate 6.
+    #[test]
+    fn parse_evidence_marker_rejects_misspellings() {
+        assert_eq!(parse_evidence_marker("**evidence**: https://gist.github.com/x/y"), None);
+        assert_eq!(parse_evidence_marker("**Evidence** : https://gist.github.com/x/y"), None);
+        assert_eq!(parse_evidence_marker("Evidence: https://gist.github.com/x/y"), None);
+        assert_eq!(parse_evidence_marker("**Evidence**:"), None);
+        assert_eq!(parse_evidence_marker(""), None);
+        // Legacy markers are NOT parsed by parse_evidence_marker — only
+        // check_integration_marker retains them as a back-compat layer.
+        assert_eq!(parse_evidence_marker("integration-evidence"), None);
+    }
+
+    /// jleechan-yoqy r3: changing the body evidence URL changes the marker
+    /// hash, even when the head SHA / epoch stays the same. This is the
+    /// second component of the AlreadyPosted key.
+    #[test]
+    fn evidence_marker_hash_changes_with_url() {
+        let a = evidence_marker_hash("**Evidence**: https://gist.github.com/jleechan/abc");
+        let b = evidence_marker_hash("**Evidence**: https://gist.github.com/jleechan/abc");
+        let c = evidence_marker_hash("**Evidence**: https://gist.github.com/jleechan/def");
+        let d = evidence_marker_hash("no marker at all");
+        assert_eq!(a, b, "same body → same hash");
+        assert_ne!(a, c, "different gist URL → different hash");
+        assert_ne!(a, d, "no marker → different hash (sentinel)");
+    }
+
+    /// jleechan-yoqy r3 (operator guidance item 3): the literal marker
+    /// emitted by `dispatch::render_coder_prompt`
+    /// ("**Evidence**: <gist_url>") MUST round-trip through
+    /// `parse_evidence_marker`. The marker constant lives in BOTH files
+    /// only by convention — this test pins the contract: if the dispatch
+    /// template drifts from the parser, this test fails.
+    #[test]
+    fn canonical_marker_round_trips_through_dispatch() {
+        // The exact substring that render_coder_prompt tells the coder to
+        // write, copied verbatim from daemon/src/dispatch.rs.
+        const PROMPT_MANDATED_LITERAL: &str = "**Evidence**: <gist_url>";
+        // Embedded in a realistic PR body the way a coder would paste it.
+        let body = format!(
+            "## Summary\n\nFix the bug.\n\n## Testing\n\ncargo test ran.\n\n{PROMPT_MANDATED_LITERAL}\n"
+        );
+        let parsed = parse_evidence_marker(&body);
+        assert_eq!(
+            parsed.as_deref(),
+            Some("<gist_url>"),
+            "parser must pick up the literal marker emitted by the coder prompt, got {parsed:?}"
+        );
+        // And the gate recognizes the body.
+        assert!(
+            check_integration_marker(&body, &[]),
+            "check_integration_marker must green-light a body containing the literal prompt-mandated marker"
+        );
+        // And the marker constant agrees with the dispatch template.
+        assert_eq!(CANONICAL_EVIDENCE_MARKER, "**Evidence**:");
+    }
+
+    /// jleechan-yoqy r3 (operator guidance item 2): the parser must accept
+    /// the canonical `https://gist.github.com/<user>/<id>` shape AND
+    /// extract the 32-hex gist ID. Bare IDs are accepted as a test
+    /// convenience; non-gist URLs are rejected.
+    #[test]
+    fn parse_gist_id_handles_canonical_and_malformed() {
+        // Canonical: https://gist.github.com/<user>/<32-hex>
+        assert_eq!(
+            parse_gist_id("https://gist.github.com/jleechan/abc123456789abcdef0123456789abcd"),
+            Some("abc123456789abcdef0123456789abcd".to_string()),
+        );
+        assert_eq!(
+            parse_gist_id(
+                &parse_evidence_marker(
+                    "**Evidence**: https://gist.github.com/octocat/deadbeefdeadbeefdeadbeefdeadbeef"
+                )
+                .expect("marker must be recognized"),
+            ),
+            Some("deadbeefdeadbeefdeadbeefdeadbeef".to_string()),
+        );
+        // Bare 32-hex ID (test fixture convenience)
+        assert_eq!(
+            parse_gist_id("0123456789abcdef0123456789abcdef"),
+            Some("0123456789abcdef0123456789abcdef".to_string()),
+        );
+        // Non-gist URLs → None
+        assert_eq!(parse_gist_id("https://github.com/jleechan/df"), None);
+        assert_eq!(parse_gist_id("https://gist.github.com/"), None);
+        // Too short
+        assert_eq!(parse_gist_id("abc"), None);
+        // Wrong chars
+        assert_eq!(
+            parse_gist_id("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
+            None,
+            "non-hex gist ID must be rejected"
+        );
+    }
+
+    /// jleechan-yoqy r3 (operator guidance item 2): a public gist with a
+    /// file referencing the current head SHA is `Verified`. The substring
+    /// match is intentional — coders wrap the SHA in fence blocks, commit
+    /// messages, etc., so strict equality would over-constrain.
+    #[test]
+    fn verify_gist_evidence_returns_verified_for_public_gist_with_head_ref() {
+        let body = "**Evidence**: https://gist.github.com/jleechan/abc123456789abcdef0123456789abcd";
+        let head_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let fetch = |_id: &str| -> Result<String, String> {
+            Ok(format!(
+                r#"{{"public": true, "files": {{"test-output.txt": {{"content": "running tests for head {head_sha}\nok\n"}}}}}}"#
+            ))
+        };
+        match verify_gist_evidence(body, head_sha, fetch) {
+            GistEvidenceCheck::Verified { gist_id, referencing_files } => {
+                assert_eq!(gist_id, "abc123456789abcdef0123456789abcd");
+                assert_eq!(referencing_files, vec!["test-output.txt".to_string()]);
+            }
+            other => panic!("expected Verified, got {other:?}"),
+        }
+    }
+
+    /// jleechan-yoqy r3: a private gist is `Invalid` — fail-closed.
+    #[test]
+    fn verify_gist_evidence_rejects_private_gist() {
+        let body = "**Evidence**: https://gist.github.com/jleechan/abc123456789abcdef0123456789abcd";
+        let fetch = |_id: &str| -> Result<String, String> {
+            Ok(r#"{"public": false, "files": {"x.txt": {"content": "x"}}}"#.to_string())
+        };
+        match verify_gist_evidence(body, "deadbeef", fetch) {
+            GistEvidenceCheck::Invalid { reason, .. } => {
+                assert_eq!(reason, "gist is private");
+            }
+            other => panic!("expected Invalid(private), got {other:?}"),
+        }
+    }
+
+    /// jleechan-yoqy r3: a public gist with no files is `Invalid`.
+    #[test]
+    fn verify_gist_evidence_rejects_empty_gist() {
+        let body = "**Evidence**: https://gist.github.com/jleechan/abc123456789abcdef0123456789abcd";
+        let fetch = |_id: &str| -> Result<String, String> {
+            Ok(r#"{"public": true, "files": {}}"#.to_string())
+        };
+        match verify_gist_evidence(body, "deadbeef", fetch) {
+            GistEvidenceCheck::Invalid { reason, .. } => {
+                assert_eq!(reason, "gist has no files");
+            }
+            other => panic!("expected Invalid(no-files), got {other:?}"),
+        }
+    }
+
+    /// jleechan-yoqy r3: a public gist whose files do NOT reference the
+    /// current head SHA is `Invalid` — the bundle is stale or fabricated.
+    #[test]
+    fn verify_gist_evidence_rejects_gist_without_head_sha_reference() {
+        let body = "**Evidence**: https://gist.github.com/jleechan/abc123456789abcdef0123456789abcd";
+        let head_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let fetch = |_id: &str| -> Result<String, String> {
+            Ok(r#"{"public": true, "files": {"out.txt": {"content": "some other head"}}}"#.to_string())
+        };
+        match verify_gist_evidence(body, head_sha, fetch) {
+            GistEvidenceCheck::Invalid { reason, .. } => {
+                assert_eq!(reason, "no gist file references the current head SHA");
+            }
+            other => panic!("expected Invalid(no-head-ref), got {other:?}"),
+        }
+    }
+
+    /// jleechan-yoqy r3: a network/404 fetch error is `FetchFailed` —
+    /// fail-closed, the gate must not green-light on a possibly-missing
+    /// artifact.
+    #[test]
+    fn verify_gist_evidence_fails_closed_on_fetch_error() {
+        let body = "**Evidence**: https://gist.github.com/jleechan/abc123456789abcdef0123456789abcd";
+        let fetch = |_id: &str| -> Result<String, String> { Err("404 Not Found".into()) };
+        match verify_gist_evidence(body, "deadbeef", fetch) {
+            GistEvidenceCheck::FetchFailed(e) => assert_eq!(e, "404 Not Found"),
+            other => panic!("expected FetchFailed, got {other:?}"),
+        }
+    }
+
+    /// jleechan-yoqy r3: a body with no `**Evidence**` marker at all is
+    /// `NoMarker` — the substring `check_integration_marker` would still
+    /// flag this via its legacy fallbacks, but `verify_gist_evidence` is
+    /// a separate, stricter check.
+    #[test]
+    fn verify_gist_evidence_returns_no_marker_when_absent() {
+        let fetch = |_id: &str| -> Result<String, String> { panic!("fetch must not be called when no marker"); };
+        assert_eq!(
+            verify_gist_evidence("no marker here", "deadbeef", fetch),
+            GistEvidenceCheck::NoMarker,
+        );
+    }
+
+    /// jleechan-yoqy r3: a marker whose URL is malformed (not a gist
+    /// host, not a 32-hex ID) is `MalformedUrl`.
+    #[test]
+    fn verify_gist_evidence_returns_malformed_for_non_gist_url() {
+        let body = "**Evidence**: https://github.com/jleechan/dark-factory";
+        let fetch = |_id: &str| -> Result<String, String> { panic!("fetch must not be called for malformed URL"); };
+        assert_eq!(
+            verify_gist_evidence(body, "deadbeef", fetch),
+            GistEvidenceCheck::MalformedUrl,
+        );
+    }
+
+    /// jleechan-yoqy r3: a Verified gist flips gate 6 green for a
+    /// production PR over the LOC floor.
+    #[test]
+    fn production_pr_with_verified_gist_flips_evidence_floor_green() {
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 200, // over the floor
+            has_integration_evidence_marker: true,
+            gist_verification: GistEvidenceCheck::Verified {
+                gist_id: "abc123456789abcdef0123456789abcd".to_string(),
+                referencing_files: vec!["out.txt".to_string()],
+            },
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
+        };
+        assert!(evidence_floor_gate(&evidence).is_green());
+    }
+
+    /// jleechan-yoqy r3 (negative): a production PR over the LOC floor
+    /// with only the substring marker (no gist verification) MUST stay
+    /// Red — the operator-flagged regression.
+    #[test]
+    fn production_pr_with_marker_but_no_gist_verification_stays_red() {
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 200,
+            has_integration_evidence_marker: true,
+            gist_verification: GistEvidenceCheck::FetchFailed("404".into()),
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            ..Default::default()
+        };
+        match evidence_floor_gate(&evidence) {
+            GateResult::Red(reason) => assert!(reason.contains("gist existence check failed")),
+            other => panic!("expected Red, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2008,3 +2566,4 @@ mod tests {
         assert_eq!(classify_chain(&report), ChainDisposition::TransientOnly);
     }
 }
+

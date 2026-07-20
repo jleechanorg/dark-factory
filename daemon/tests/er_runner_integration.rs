@@ -217,7 +217,7 @@ impl Vcs for VcsMock {
 #[derive(Default)]
 struct StoreMock {
     overlays: RefCell<HashMap<String, BeadOverlay>>,
-    er_counts: RefCell<HashMap<String, (u32, Option<u64>)>>,
+    er_counts: RefCell<HashMap<String, (u32, Option<u64>, u64)>>,
     branch_beads: RefCell<HashMap<String, String>>,
 }
 
@@ -280,23 +280,25 @@ impl StateStore for StoreMock {
     fn er_runner_attempt(
         &self,
         bead_id: &str,
-    ) -> Result<(u32, Option<u64>), daemon::errors::DaemonError> {
+    ) -> Result<(u32, Option<u64>, u64), daemon::errors::DaemonError> {
         Ok(self
             .er_counts
             .borrow()
             .get(bead_id)
             .copied()
-            .unwrap_or((0, None)))
+            .unwrap_or((0, None, 0)))
     }
     fn incr_er_runner_attempt(
         &self,
         bead_id: &str,
         now_epoch: u64,
+        marker_hash: u64,
     ) -> Result<u32, daemon::errors::DaemonError> {
         let mut counts = self.er_counts.borrow_mut();
-        let entry = counts.entry(bead_id.to_string()).or_insert((0, None));
+        let entry = counts.entry(bead_id.to_string()).or_insert((0, None, 0));
         entry.0 += 1;
         entry.1 = Some(now_epoch);
+        entry.2 = marker_hash;
         Ok(entry.0)
     }
     fn reconcile_dispatching(&self) -> Result<(), daemon::errors::DaemonError> {
@@ -506,7 +508,7 @@ fn er_runner_spawns_reviewer_and_posted_comment_flips_gate_to_pass() {
     );
 
     // The attempt counter was incremented to 1.
-    let (count, _last) = store.er_runner_attempt("b1").unwrap();
+    let (count, _last, _marker_hash) = store.er_runner_attempt("b1").unwrap();
     assert_eq!(count, 1);
 
     // The /er verdict comment now lives in the ScmMock snapshot, so

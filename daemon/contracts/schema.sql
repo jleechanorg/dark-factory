@@ -114,7 +114,19 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- BeadOverlay field — same decoupling as `reroll_deferral_count`). Older
   -- DBs pre-date this column and get it via the idempotent
   -- `ensure_held_recheck_after_column` migration in `SqliteStateStore::open`.
-  held_recheck_after INTEGER
+  held_recheck_after INTEGER,
+  -- Bead jleechan-yoqy r3 (refs #323): 64-bit hash of the canonical
+  -- `**Evidence**: <gist_url>` marker taken from the PR body AT THE TIME
+  -- the runner posted its verdict comment. Together with
+  -- `last_er_runner_attempt_at` (== head epoch at post time) this forms
+  -- the second component of the AlreadyPosted idempotence key — a fresh
+  -- evidence-only body update (same head SHA, new gist URL) MUST
+  -- re-trigger `/er` instead of being short-circuited by a stale "verdict
+  -- posted after this head" guard. Default 0 ("never posted"); older DBs
+  -- get this via the idempotent
+  -- `ensure_last_er_runner_marker_hash_column` migration in
+  -- `SqliteStateStore::open`.
+  last_er_runner_marker_hash INTEGER NOT NULL DEFAULT 0
 );
 
 -- Deletion guard: the daemon/skills may delete ONLY refs recorded here (spec §4.2.8).

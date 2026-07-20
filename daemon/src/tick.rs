@@ -2157,6 +2157,7 @@ fn skeptic_evidence(
         is_production: false,
         non_test_changed_loc: 0,
         has_integration_evidence_marker: false,
+        gist_verification: verifier::GistEvidenceCheck::NoMarker,
         er_verdict: verifier::ErVerdict::Absent,
         skeptic_verdict,
         skeptic_reviewers: used_vendors,
@@ -2880,6 +2881,32 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
         evidence.has_integration_evidence_marker =
             verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
+        // jleechan-yoqy r3 (operator guidance item 2): run the
+        // fail-closed gist existence check before assess() so gate 6
+        // sees a `Verified`/non-Verified verdict instead of trusting a
+        // bare substring marker. `run_tool` shells out to `gh api
+        // gists/<id>`; the closure converts the `gh` rc/stderr into the
+        // `String` error type `verify_gist_evidence` expects. 30s
+        // timeout matches the existing `gh api` budget in
+        // `factory-overlay.sh`/`intake::fetch_issue` callers.
+        let head_sha_for_gist = snapshot.head_sha.clone();
+        let gist_check = verifier::verify_gist_evidence(
+            &snapshot.body,
+            &head_sha_for_gist,
+            |gist_id| -> Result<String, String> {
+                let res = crate::tools::run_tool(
+                    "gh",
+                    &["api", &format!("gists/{gist_id}")],
+                    30,
+                );
+                match res {
+                    Ok(stdout) if !stdout.is_empty() => Ok(stdout),
+                    Ok(_) => Err("empty response".into()),
+                    Err(e) => Err(format!("gh api gists/{gist_id} failed: {e:?}")),
+                }
+            },
+        );
+        evidence.gist_verification = gist_check;
         let report = verifier::assess(deps.scm, pr, &repo, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
         // jleechan-wzgl: log the full per-gate breakdown (all 7 gates,

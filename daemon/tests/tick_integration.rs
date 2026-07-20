@@ -4595,7 +4595,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
     );
     store.er_attempts.borrow_mut().insert(
         "er-capped-unknown".into(),
-        (er_runner::MAX_ER_RUNNER_ATTEMPTS, Some(1)),
+        (er_runner::MAX_ER_RUNNER_ATTEMPTS, Some(1), 0),
     );
 
     scm.pr_snapshots.insert(
@@ -4754,7 +4754,7 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
     );
     store.er_attempts.borrow_mut().insert(
         "er-capped-retry".into(),
-        (er_runner::MAX_ER_RUNNER_ATTEMPTS, Some(1)),
+        (er_runner::MAX_ER_RUNNER_ATTEMPTS, Some(1), 0),
     );
     *tracker.fail_next_comment.borrow_mut() = Some("transient comment failure".into());
 
@@ -5722,7 +5722,7 @@ impl Scm for QdwAssessRefetchScm {
 
 struct QdwAttemptStore {
     inner: FakeStateStore,
-    er_attempts: std::cell::RefCell<std::collections::HashMap<String, (u32, Option<u64>)>>,
+    er_attempts: std::cell::RefCell<std::collections::HashMap<String, (u32, Option<u64>, u64)>>,
 }
 
 impl QdwAttemptStore {
@@ -5801,22 +5801,22 @@ impl StateStore for QdwAttemptStore {
         self.inner.load_rejection(bead_id, attempt)
     }
 
-    fn er_runner_attempt(&self, bead_id: &str) -> Result<(u32, Option<u64>), DaemonError> {
+    fn er_runner_attempt(&self, bead_id: &str) -> Result<(u32, Option<u64>, u64), DaemonError> {
         Ok(self
             .er_attempts
             .borrow()
             .get(bead_id)
             .copied()
-            .unwrap_or((0, None)))
+            .unwrap_or((0, None, 0)))
     }
 
-    fn incr_er_runner_attempt(&self, bead_id: &str, now_epoch: u64) -> Result<u32, DaemonError> {
+    fn incr_er_runner_attempt(&self, bead_id: &str, now_epoch: u64, marker_hash: u64) -> Result<u32, DaemonError> {
         let mut attempts = self.er_attempts.borrow_mut();
         let next = attempts
             .get(bead_id)
-            .map(|(count, _)| count + 1)
+            .map(|(count, _, _)| count + 1)
             .unwrap_or(1);
-        attempts.insert(bead_id.to_string(), (next, Some(now_epoch)));
+        attempts.insert(bead_id.to_string(), (next, Some(now_epoch), marker_hash));
         Ok(next)
     }
 
@@ -5982,7 +5982,7 @@ fn qdw_post_er_refetch_failure_skips_bead_without_false_park() {
         5,
         "affected PR should stop immediately after the failed post_er_refetch call; an assess() fall-through would add another pr_snapshot call"
     );
-    let (er_attempt_count, _) = store
+    let (er_attempt_count, _, _) = store
         .er_runner_attempt("qdw-post-refetch-fails")
         .expect("test store must expose /er runner attempts");
     assert_eq!(

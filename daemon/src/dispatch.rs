@@ -967,6 +967,15 @@ fn render_coder_prompt(
          {target_repo} containing the completed task, with tests proving the \
          change (red→green where feasible).\n\
          \n\
+         EVIDENCE BUNDLE (bead jleechan-yoqy, refs #323) — gate 6 is structurally\n\
+         unable to pass on a production PR without a published public-gist\n\
+         evidence bundle. After tests are green: (1) `gh gist create --public\n\
+         --desc \"Evidence for PR #<n>\" <evidence-file>`; (2) add EXACTLY this\n\
+         line to the PR body — the parser matches this token LITERALLY\n\
+         (parse_evidence_marker in daemon/src/verifier.rs):\n\
+           **Evidence**: <gist_url>\n\
+         Without this line, gate 6 stays Red.\n\
+         \n\
          RULES:\n\
          - Do NOT merge anything and do NOT close the PR or the bead — the \
          factory's verifier gates (/green, /er, skeptic) decide promotion.\n\

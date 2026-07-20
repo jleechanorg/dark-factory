@@ -265,17 +265,30 @@ pub trait StateStore {
     ) -> Result<Option<String>, DaemonError> {
         Ok(None)
     }
-    /// Read the `(attempt_count, last_attempt_epoch_secs)` pair for the
-    /// `/er` runner (bead jleechan-qqq). Default impl returns `(0, None)`
-    /// so test fakes that don't override it get the "never spawned" state.
-    fn er_runner_attempt(&self, _bead_id: &str) -> Result<(u32, Option<u64>), DaemonError> {
-        Ok((0, None))
+    /// Read the `(attempt_count, last_attempt_epoch_secs, last_marker_hash)`
+    /// triple for the `/er` runner (bead jleechan-qqq). The marker hash is
+    /// the second component of the AlreadyPosted idempotence key (bead
+    /// jleechan-yoqy r3, refs #323): a fresh evidence-only body update MUST
+    /// re-trigger `/er` instead of being silently swallowed by the
+    /// stale-epoch guard. Default impl returns `(0, None, 0)` so test fakes
+    /// that don't override it get the "never spawned" state.
+    fn er_runner_attempt(
+        &self,
+        _bead_id: &str,
+    ) -> Result<(u32, Option<u64>, u64), DaemonError> {
+        Ok((0, None, 0))
     }
-    /// Atomically increment the `/er` runner attempt counter for `bead_id`
-    /// and stamp `last_attempt_epoch_secs` to `now_epoch`. Returns the
-    /// new count. Default impl just returns `1` so fakes that don't
-    /// override it still satisfy the call (they aren't used in production).
-    fn incr_er_runner_attempt(&self, _bead_id: &str, _now_epoch: u64) -> Result<u32, DaemonError> {
+    /// Atomically increment the `/er` runner attempt counter for `bead_id`,
+    /// stamp `last_attempt_epoch_secs` to `now_epoch`, and store
+    /// `last_marker_hash` for the AlreadyPosted key. Returns the new count.
+    /// Default impl just returns `1` so fakes that don't override it still
+    /// satisfy the call (they aren't used in production).
+    fn incr_er_runner_attempt(
+        &self,
+        _bead_id: &str,
+        _now_epoch: u64,
+        _marker_hash: u64,
+    ) -> Result<u32, DaemonError> {
         Ok(1)
     }
     /// Read the consecutive re-roll deferral count for `bead_id` (bead
@@ -521,6 +534,7 @@ impl SqliteStateStore {
         Self::ensure_target_repo_column(&conn)?;
         Self::ensure_reroll_deferral_count_column(&conn)?;
         Self::ensure_held_recheck_after_column(&conn)?;
+        Self::ensure_last_er_runner_marker_hash_column(&conn)?;
         Self::ensure_disposition_required_state(&conn)?;
         Ok(Self { conn })
     }
@@ -540,6 +554,7 @@ impl SqliteStateStore {
         Self::ensure_target_repo_column(&conn)?;
         Self::ensure_reroll_deferral_count_column(&conn)?;
         Self::ensure_held_recheck_after_column(&conn)?;
+        Self::ensure_last_er_runner_marker_hash_column(&conn)?;
         Self::ensure_disposition_required_state(&conn)?;
         Ok(Self { conn })
     }
@@ -751,6 +766,39 @@ impl SqliteStateStore {
         Ok(())
     }
 
+    /// Idempotent migration for the `last_er_runner_marker_hash` column
+    /// (bead jleechan-yoqy r3, refs #323). Default 0 ("never posted");
+    /// 64-bit DefaultHasher fingerprint of the canonical `**Evidence**:
+    /// <gist_url>` marker taken from the PR body at the time the runner
+    /// last posted its verdict. Combined with the existing
+    /// `last_er_runner_attempt_at` (= head epoch at post time) it forms
+    /// the second component of the AlreadyPosted idempotence key, so a
+    /// fresh evidence-only body update retriggers `/er` instead of
+    /// being silently swallowed by a stale-epoch guard.
+    fn ensure_last_er_runner_marker_hash_column(
+        conn: &Connection,
+    ) -> Result<(), DaemonError> {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'last_er_runner_marker_hash'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| tool_err("ensure_last_er_runner_marker_hash_column: pragma", e))?;
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE bead_overlay ADD COLUMN \
+                 last_er_runner_marker_hash INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| {
+                tool_err("ensure_last_er_runner_marker_hash_column: add column", e)
+            })?;
+        }
+        Ok(())
+    }
+
     /// Canonical `bead_overlay` column list (in `schema.sql` order). The
     /// DISPOSITION_REQUIRED CHECK rebuild uses this to build the new table and
     /// to copy data by EXPLICIT column name. Keep in sync with `schema.sql`'s
@@ -775,6 +823,7 @@ impl SqliteStateStore {
         "target_repo",
         "reroll_deferral_count",
         "held_recheck_after",
+        "last_er_runner_marker_hash",
     ];
 
     /// The canonical `CREATE TABLE bead_overlay` statement (with the current
@@ -804,7 +853,8 @@ impl SqliteStateStore {
         park_reason TEXT, \
         target_repo TEXT, \
         reroll_deferral_count INTEGER NOT NULL DEFAULT 0, \
-        held_recheck_after INTEGER)";
+        held_recheck_after INTEGER, \
+        last_er_runner_marker_hash INTEGER NOT NULL DEFAULT 0)";
 
     /// Bead jleechan-zaga / issue #348: migrate the `bead_overlay.state` CHECK
     /// constraint to allow `'DISPOSITION_REQUIRED'`. Unlike every other
@@ -1450,26 +1500,36 @@ impl StateStore for SqliteStateStore {
             .map_err(|e| tool_err("load_rejection_text", e))
     }
 
-    fn er_runner_attempt(&self, bead_id: &str) -> Result<(u32, Option<u64>), DaemonError> {
+    fn er_runner_attempt(&self, bead_id: &str) -> Result<(u32, Option<u64>, u64), DaemonError> {
         // Schema migration: the columns were added after the initial release;
         // older DB files won't have them. Detect that by attempting the
-        // SELECT and falling back to (0, None) if the column is missing
+        // SELECT and falling back to (0, None, 0) if the column is missing
         // (sqlite returns "no such column" rather than an empty result).
-        let row: Result<(i64, Option<i64>), rusqlite::Error> = self.conn.query_row(
-            "SELECT attempt_er_runner_count, last_er_runner_attempt_at \
+        let row: Result<(i64, Option<i64>, i64), rusqlite::Error> = self.conn.query_row(
+            "SELECT attempt_er_runner_count, last_er_runner_attempt_at, \
+                    COALESCE(last_er_runner_marker_hash, 0) \
              FROM bead_overlay WHERE bead_id = ?1",
             params![bead_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         );
         match row {
-            Ok((count, last_at)) => Ok((count.max(0) as u32, last_at.map(|v| v.max(0) as u64))),
-            Err(e) if no_such_column(&e) => Ok((0, None)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok((0, None)),
+            Ok((count, last_at, marker_hash)) => Ok((
+                count.max(0) as u32,
+                last_at.map(|v| v.max(0) as u64),
+                marker_hash.max(0) as u64,
+            )),
+            Err(e) if no_such_column(&e) => Ok((0, None, 0)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok((0, None, 0)),
             Err(e) => Err(tool_err("er_runner_attempt", e)),
         }
     }
 
-    fn incr_er_runner_attempt(&self, bead_id: &str, now_epoch: u64) -> Result<u32, DaemonError> {
+    fn incr_er_runner_attempt(
+        &self,
+        bead_id: &str,
+        now_epoch: u64,
+        marker_hash: u64,
+    ) -> Result<u32, DaemonError> {
         // Try the UPDATE first (modern schema). If the column is missing
         // (legacy DB), fall back to no-op + return 1 so the runner's
         // attempt cap still fires on the in-memory counter.
@@ -1477,13 +1537,19 @@ impl StateStore for SqliteStateStore {
             "UPDATE bead_overlay SET \
                 attempt_er_runner_count = COALESCE(attempt_er_runner_count, 0) + 1, \
                 last_er_runner_attempt_at = ?2, \
+                last_er_runner_marker_hash = ?4, \
                 updated_at = ?3 \
              WHERE bead_id = ?1",
-            params![bead_id, now_epoch as i64, now_iso8601()],
+            params![
+                bead_id,
+                now_epoch as i64,
+                now_iso8601(),
+                marker_hash as i64,
+            ],
         );
         match res {
             Ok(_) => {
-                let (count, _) = self.er_runner_attempt(bead_id)?;
+                let (count, _, _) = self.er_runner_attempt(bead_id)?;
                 Ok(count)
             }
             Err(e) if no_such_column(&e) => Ok(1),

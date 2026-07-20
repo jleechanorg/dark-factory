@@ -72,6 +72,13 @@ pub enum Outcome {
 
 /// Build the prompt sent to the spawned reviewer. Public for unit-test
 /// pinning (so a regression that mutates the prompt is caught immediately).
+///
+/// jleechan-yoqy r3: tells the reviewer about the canonical PR-body marker
+/// `**Evidence**: <gist_url>` emitted by `dispatch::render_coder_prompt` —
+/// the same marker `verifier::parse_evidence_marker` recognizes. Reviewers
+/// are instructed to FAIL if the marker is present but the gist does not
+/// exist (gh api gists/<id>), is empty, is private, or does not reference
+/// the current head SHA.
 pub fn build_er_prompt(bead_id: &str, pr: u64, target_repo: &str) -> String {
     format!(
         "You are the /er (evidence review) gate for an autonomous coding factory.\n\
@@ -84,6 +91,12 @@ pub fn build_er_prompt(bead_id: &str, pr: u64, target_repo: &str) -> String {
          \n\
          Decide whether the PR has REAL evidence (tests run, integration checks,\n\
          screenshots, videos, evidence bundles) supporting its claims.\n\
+         \n\
+         The PR body MUST contain a canonical evidence marker on its own line:\n\
+           **Evidence**: https://gist.github.com/<user>/<gist-id>\n\
+         If the marker is present, VERIFY the gist actually exists, is public,\n\
+         non-empty, and references the current head SHA. Run:\n\
+           gh api gists/<gist-id> --jq '{{public, files: (.files | keys), truncated}}'\n\
          \n\
          Reply with EXACTLY ONE LINE, no preamble, no markdown:\n\
            /er PASS\n\
@@ -121,21 +134,72 @@ pub fn maybe_run(
     };
     let repo = overlay.repo(deps.cfg).to_string();
 
-    // 2. Already posted? (idempotence) — jleechan-nplh: only a verdict
-    //    posted at/after the CURRENT head commit counts. A verdict that
-    //    predates the head verified code that no longer exists; treating it
-    //    as valid would short-circuit re-verification forever (live
-    //    incident: worldarchitect.ai#7888, a 2026-07-08 PASS suppressed
-    //    re-review of a 2026-07-10 head ~100 commits later).
+    // 2. Already posted? (idempotence) — jleechan-nplh + jleechan-yoqy r3:
+    //    only a verdict posted at/after the CURRENT head commit counts, AND
+    //    only for the CURRENT canonical `**Evidence**: <gist_url>` marker
+    //    in the PR body. Two failure modes this guard closes:
+    //
+    //    (a) A verdict older than the head SHA verified code that no
+    //        longer exists; treating it as valid would short-circuit
+    //        re-verification forever (live incident: worldarchitect.ai
+    //        #7888, a 2026-07-08 PASS suppressed re-review of a
+    //        2026-07-10 head ~100 commits later).
+    //    (b) The same head SHA, but the coder updated the body to add a
+    //        fresh `**Evidence**: <new_gist>` marker — a NEW evidence
+    //        bundle that deserves a fresh `/er` verdict. The marker hash
+    //        changes; a stale PASS must not silently green-light it.
+    //
+    //    AlreadyPosted short-circuits only when BOTH the epoch AND the
+    //    marker hash match the stored post state. A mismatch on either
+    //    falls through to a fresh spawn (consuming one of the 3 retry
+    //    slots).
     let snapshot = deps.scm.pr_snapshot_for_repo(&repo, pr)?;
-    let existing =
-        verifier::parse_er_verdict_since(&snapshot.comments, snapshot.head_committed_epoch);
-    if existing != ErVerdict::Absent {
-        return Ok(Outcome::AlreadyPosted(existing));
+    let marker_hash = verifier::evidence_marker_hash(&snapshot.body);
+    let (count, last_at, last_marker_hash) = deps.store.er_runner_attempt(bead_id)?;
+
+    // AlreadyPosted short-circuit ONLY when WE previously stamped a post
+    // for THIS bead (`last_at` is Some). Pre-migration DBs and first-ever
+    // ticks for a bead that already has a verdict (operator-posted or
+    // pre-r3) fall through to the documented `parse_er_verdict_since`
+    // path: the verdict is treated as fresh, no spawn. This preserves
+    // backward compat — a tighter key would deadlock the gate for any
+    // bead whose post state predates r3 (live migration in production
+    // right now: every existing bead has `last_at = None` after the new
+    // column's default-0 migration runs).
+    if last_at.is_some() {
+        // Match `parse_er_verdict_since` fail-open: head epoch == 0 means
+        // "head age unknown" (offline snapshots, test doubles); treat the
+        // epoch filter as satisfied. Otherwise the verdict is fresh when
+        // `last_at >= snapshot.head_committed_epoch` (spawn happened AFTER
+        // the head commit — the verdict comments are at-or-after the
+        // spawn epoch by construction, so this matches the
+        // `created_at_epoch < min_epoch → STALE` rule in
+        // `parse_er_verdict_since`).
+        let epoch_matches = snapshot.head_committed_epoch == 0
+            || last_at.unwrap() >= snapshot.head_committed_epoch;
+        let marker_matches = last_marker_hash == marker_hash;
+        if epoch_matches && marker_matches {
+            let existing = verifier::parse_er_verdict_since(
+                &snapshot.comments,
+                snapshot.head_committed_epoch,
+            );
+            if existing != ErVerdict::Absent {
+                return Ok(Outcome::AlreadyPosted(existing));
+            }
+        }
+    } else {
+        // Never stamped: a pre-existing verdict comment is trusted as-is
+        // (back-compat with pre-r3 verdicts and operator-posted verdicts).
+        let existing = verifier::parse_er_verdict_since(
+            &snapshot.comments,
+            snapshot.head_committed_epoch,
+        );
+        if existing != ErVerdict::Absent {
+            return Ok(Outcome::AlreadyPosted(existing));
+        }
     }
 
     // 3. Capped?
-    let (count, last_at) = deps.store.er_runner_attempt(bead_id)?;
     if count >= MAX_ER_RUNNER_ATTEMPTS {
         return Ok(Outcome::Capped { count });
     }
@@ -170,7 +234,12 @@ pub fn maybe_run(
 
     // 7. Increment attempt counter — only AFTER the comment landed, so a
     //    transient `comment_external` failure doesn't burn a retry slot.
-    let new_count = deps.store.incr_er_runner_attempt(bead_id, now_epoch)?;
+    //    Stamp the marker hash from the SAME body we fetched in step 2
+    //    so the next tick's AlreadyPosted check (which re-reads the body)
+    //    sees the matching hash and short-circuits.
+    let new_count = deps
+        .store
+        .incr_er_runner_attempt(bead_id, now_epoch, marker_hash)?;
 
     // 8. Parse verdict from the reply (NOT just from the now-posted comment —
     //    parse_er_verdict would find /er PASS etc. inside the formatted body,
@@ -276,6 +345,25 @@ pub fn snapshot_with_comments(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
     }
 }
 
+/// jleechan-yoqy r3: like `snapshot_with_comments`, but allows the test
+/// to set the PR body and head-committed epoch so the
+/// AlreadyPosted-(head_epoch, body_marker_hash) key can be exercised
+/// end-to-end. The default helper sets body="" and epoch=0, which would
+/// never produce a non-zero marker hash and would always short-circuit
+/// on the OLD key (epoch alone) — a regression magnet for the very fix
+/// this helper supports.
+pub fn snapshot_with_body_and_epoch(
+    pr: u64,
+    body: &str,
+    head_committed_epoch: u64,
+    comments: Vec<PrComment>,
+) -> PrSnapshot {
+    let mut s = snapshot_with_comments(pr, comments);
+    s.body = body.to_string();
+    s.head_committed_epoch = head_committed_epoch;
+    s
+}
+
 /// Suppress unused-import warnings for items only referenced in tests.
 #[allow(dead_code)]
 fn _force_use(_: &BeadOverlay) {}
@@ -283,7 +371,7 @@ fn _force_use(_: &BeadOverlay) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{Issue, Permission, PrSnapshot};
+    use crate::tools::{Issue, Permission, PrComment, PrSnapshot};
 
     // ----- Local test scaffolding (mirrors tests/common/mod.rs but lives
     // inside the unit-test module so it doesn't widen the public surface
@@ -428,7 +516,7 @@ mod tests {
     #[derive(Default)]
     struct St {
         overlays: std::cell::RefCell<std::collections::HashMap<String, BeadOverlay>>,
-        er_counts: std::cell::RefCell<std::collections::HashMap<String, (u32, Option<u64>)>>,
+        er_counts: std::cell::RefCell<std::collections::HashMap<String, (u32, Option<u64>, u64)>>,
         calls: std::cell::RefCell<Vec<String>>,
     }
     impl StateStore for St {
@@ -480,23 +568,25 @@ mod tests {
             &self,
             bead_id: &str,
             now_epoch: u64,
+            marker_hash: u64,
         ) -> Result<u32, DaemonError> {
             let mut counts = self.er_counts.borrow_mut();
-            let entry = counts.entry(bead_id.to_string()).or_insert((0, None));
+            let entry = counts.entry(bead_id.to_string()).or_insert((0, None, 0));
             entry.0 += 1;
             entry.1 = Some(now_epoch);
+            entry.2 = marker_hash;
             Ok(entry.0)
         }
         fn er_runner_attempt(
             &self,
             bead_id: &str,
-        ) -> Result<(u32, Option<u64>), DaemonError> {
+        ) -> Result<(u32, Option<u64>, u64), DaemonError> {
             Ok(self
                 .er_counts
                 .borrow()
                 .get(bead_id)
                 .copied()
-                .unwrap_or((0, None)))
+                .unwrap_or((0, None, 0)))
         }
     }
 
@@ -621,6 +711,142 @@ mod tests {
         let outcome = maybe_run(&deps, bead, pr, 1_000_000).unwrap();
         assert_eq!(outcome, Outcome::AlreadyPosted(ErVerdict::Fail));
         assert!(llm.calls.borrow().is_empty());
+    }
+
+    /// jleechan-yoqy r3 (operator guidance item 1): the AlreadyPosted
+    /// idempotence key MUST include the body-evidence-marker hash, not
+    /// only the head commit epoch. If the marker hash changes (the coder
+    /// updated the body to add a fresh `**Evidence**: <new_gist>` line
+    /// against the SAME head SHA), a previously-posted `/er PASS` MUST
+    /// NOT short-circuit the new spawn.
+    #[test]
+    fn evidence_only_body_update_retriggers_er() {
+        telemetry_cleanup();
+        let scm = S::default();
+        let tracker = T::default();
+        let sessions = Ss;
+        let llm = L::default();
+        *llm.response.borrow_mut() = Some(Ok("/er PASS".into()));
+        let store = St::default();
+        let cfg = test_cfg();
+
+        let pr = 250;
+        let bead = "b-evidence-update";
+        store
+            .overlays
+            .borrow_mut()
+            .insert(bead.into(), attested_overlay(bead, pr));
+
+        // Body v1 — has canonical marker with gist A
+        let body_v1 = "**Evidence**: https://gist.github.com/jleechan/aaaa";
+        // Body v2 — same head SHA, NEW gist URL
+        let body_v2 = "**Evidence**: https://gist.github.com/jleechan/bbbb";
+
+        let head_epoch = 9_000_000u64;
+        // First spawn: body v1, no verdict comment yet → spawns reviewer.
+        scm.snapshots.borrow_mut().insert(
+            pr,
+            snapshot_with_body_and_epoch(
+                pr,
+                body_v1,
+                head_epoch,
+                comments_with_verdict("/er PASS"),
+            ),
+        );
+        let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
+        let first = maybe_run(&deps, bead, pr, head_epoch + 10).unwrap();
+        assert!(
+            matches!(first, Outcome::Posted { count: 1, .. }),
+            "first spawn must fire, got {first:?}"
+        );
+
+        // Wait past the cooldown.
+        let t1 = head_epoch + 10 + ER_RUNNER_COOLDOWN_SECS + 1;
+
+        // Second tick: SAME head SHA, NEW body (different gist URL). The
+        // stored marker hash was stamped from body_v1; the snapshot's
+        // marker hash comes from body_v2 → mismatch → must RE-spawn, not
+        // short-circuit. (OLD code returned AlreadyPosted here — the
+        // regression that the operator flagged.)
+        scm.snapshots.borrow_mut().insert(
+            pr,
+            snapshot_with_body_and_epoch(
+                pr,
+                body_v2,
+                head_epoch,
+                comments_with_verdict("/er PASS"),
+            ),
+        );
+        let second = maybe_run(&deps, bead, pr, t1).unwrap();
+        assert!(
+            matches!(second, Outcome::Posted { count: 2, .. }),
+            "evidence-only body update MUST re-trigger /er, got {second:?}"
+        );
+    }
+
+    /// jleechan-yoqy r3 (companion test): when both head epoch AND marker
+    /// hash match the stored state, AlreadyPosted DOES short-circuit —
+    /// the key still serves its purpose for the common case (no body
+    /// change since last review). The store is pre-seeded with a prior
+    /// `last_at` so the new key path (not the "never stamped" back-compat
+    /// branch) actually runs.
+    #[test]
+    fn already_posted_when_epoch_and_marker_hash_match() {
+        telemetry_cleanup();
+        let scm = S::default();
+        let tracker = T::default();
+        let sessions = Ss;
+        let llm = L::default();
+        *llm.response.borrow_mut() = Some(Ok("/er PASS".into()));
+        let store = St::default();
+        let cfg = test_cfg();
+
+        let pr = 251;
+        let bead = "b-no-change";
+        store
+            .overlays
+            .borrow_mut()
+            .insert(bead.into(), attested_overlay(bead, pr));
+        let body = "**Evidence**: https://gist.github.com/jleechan/stable";
+        let head_epoch = 9_500_000u64;
+        let pre_stamp_at = head_epoch + 100u64;
+        let pre_stamp_hash = verifier::evidence_marker_hash(body);
+        // Pre-seed the store with a prior spawn so the new key path is
+        // exercised (the back-compat "never stamped" branch would
+        // otherwise short-circuit on the first call).
+        store
+            .er_counts
+            .borrow_mut()
+            .insert(bead.to_string(), (1, Some(pre_stamp_at), pre_stamp_hash));
+
+        // Verdict comment timestamp must be >= head epoch so the
+        // `parse_er_verdict_since` staleness filter accepts it.
+        let verdict_comment = PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: pre_stamp_at + 5,
+        };
+        let snapshot = snapshot_with_body_and_epoch(
+            pr,
+            body,
+            head_epoch,
+            vec![verdict_comment],
+        );
+        scm.snapshots.borrow_mut().insert(pr, snapshot);
+
+        let deps = make_deps(&scm, &tracker, &sessions, &llm, &store, &cfg);
+        // Wait past cooldown. Body, head, marker_hash all match the
+        // stored state — must short-circuit.
+        let t1 = pre_stamp_at + ER_RUNNER_COOLDOWN_SECS + 1;
+        let outcome = maybe_run(&deps, bead, pr, t1).unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::AlreadyPosted(ErVerdict::Pass),
+            "stable (head, marker_hash) MUST short-circuit, got {outcome:?}"
+        );
+        // No new spawn, no new comment posted.
+        assert!(llm.calls.borrow().is_empty());
+        assert!(tracker.comment_calls.borrow().is_empty());
     }
 
     #[test]
@@ -961,8 +1187,15 @@ mod tests {
                 count: 1,
             }
         );
-        let (count, last_at) = store.er_runner_attempt(bead).unwrap();
+        let (count, last_at, last_marker_hash) = store.er_runner_attempt(bead).unwrap();
         assert_eq!(count, 1);
         assert_eq!(last_at, Some(7_000_000));
+        // No body → marker hash is the sentinel "absent marker" value
+        // (whatever DefaultHasher returns for parse_evidence_marker("")).
+        assert_eq!(
+            last_marker_hash,
+            crate::verifier::evidence_marker_hash(""),
+            "marker hash must reflect the snapshot body fetched in step 2"
+        );
     }
 }
