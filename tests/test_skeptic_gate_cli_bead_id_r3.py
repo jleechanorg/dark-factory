@@ -236,6 +236,14 @@ def test_br_failure_closes_gate(monkeypatch):
         )
 
     monkeypatch.setattr(cli_mod, "load_bead_contract_from_bead", fake_load_failing)
+    # Stub the gh API surface too — CI runners don't have GH_TOKEN,
+    # so the real `gh api` call would 4 before the br failure ever
+    # raises. Mirrors the dry-run stubs used by the other tests in
+    # this file so the test exercises the br-failure branch in
+    # isolation.
+    monkeypatch.setattr(cli_mod, "get_pr_head_sha_via_api", lambda *a, **k: HEAD_SHA)
+    monkeypatch.setattr(cli_mod, "get_pr_diff", lambda *a, **k: "diff --git a/x b/x")
+    monkeypatch.setattr(cli_mod, "get_implementation_identity", lambda *a, **k: "claude")
 
     rc = cli_mod.main([
         "--repo", REPO,
