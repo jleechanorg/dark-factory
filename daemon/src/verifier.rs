@@ -216,6 +216,64 @@ fn find_marker_verdict(raw: &str) -> Option<SkepticVerdict> {
 /// pass/warn/fail in the Python pipeline runner. Anything else is a parse
 /// failure, not a heuristic guess.
 ///
+/// Bead jleechan-984e / issue #385: vendor → model family. The taxonomy is
+/// the smallest grouping that gives a meaningful cross-model guarantee
+/// (different training, different failure modes) — `claude` and `minimax`
+/// share an Anthropic-compatible API surface but are operated by different
+/// organizations and counts as separate families; `codex` is OpenAI;
+/// `agy`/`gemini` are both Google-distributed (Antigravity CLI vs Gemini
+/// CLI); `cursor-agent` is Cursor's own model. The skeptic gate's
+/// `review_degraded` flag fires when the set of families that actually
+/// contributed is < 2; this helper is the single source of truth so the
+/// `dispatch_reviewer` list and the degraded calculation cannot drift.
+pub fn vendor_model_family(vendor: &str) -> &'static str {
+    match vendor {
+        "claude" => "anthropic",
+        "minimax" => "minimax",
+        "codex" => "openai",
+        "agy" => "google-antigravity",
+        "gemini" => "google-gemini",
+        "cursor-agent" | "cursor" => "cursor",
+        // Test-repo path: not a real family; the `review_degraded` rule
+        // explicitly excludes `mock_llm` from the family count (see
+        // `compute_review_degraded`), so returning `""` keeps it inert.
+        "mock_llm" => "",
+        // Unknown vendor labels must not silently collapse into a real
+        // family — they are excluded from the family count too, which
+        // makes a typo in `skeptic_reviewers` degrade-safe instead of
+        // accidentally passing the cross-model gate.
+        _ => "",
+    }
+}
+
+/// Bead jleechan-984e / issue #385: `true` iff the contributor list
+/// (`PrEvidence::skeptic_reviewers`) covers >= 2 DISTINCT non-empty model
+/// families per `vendor_model_family`. Special cases:
+///   - empty list → NOT degraded (no verdict means there is no
+///     cross-model guarantee TO violate; this is also the
+///     `skeptic_verdict=None` / total-outage `Err` path)
+///   - single non-empty family → DEGRADED (the production bug: only
+///     `claude` ran because codex is quota-dead)
+///   - two or more distinct families → NOT degraded (cross-model
+///     guarantee met)
+///   - `mock_llm` / unknown vendor labels are IGNORED (they have empty
+///     family strings per `vendor_model_family`), so the Stage-1
+///     test-repo path stays non-degraded even though its single mock
+///     judge has no cross-model sibling.
+pub fn compute_review_degraded(reviewers: &[String]) -> bool {
+    let families: std::collections::BTreeSet<&str> = reviewers
+        .iter()
+        .map(|v| vendor_model_family(v))
+        .filter(|f| !f.is_empty())
+        .collect();
+    // Empty: no verdict, no guarantee to violate. 1: single-family
+    // (degraded). 2+: cross-model guarantee met.
+    match families.len() {
+        0 | 1 => !families.is_empty(), // 1 family = degraded; 0 families = no verdict, not degraded
+        _ => false,
+    }
+}
+
 /// Strategy (spec Appendix C.3, mirrors `_parse_verdict`'s priority order):
 ///   1. Scan all lines for a marker (`verdict:`/`overall:`/`normalized:`,
 ///      case-insensitive) followed by a `pass|warn|fail` token; the LAST
@@ -343,6 +401,21 @@ pub struct PrEvidence {
     /// GATE_ASSESSMENT's provenance signal for confirming the gate-7
     /// reviewer was non-self and genuinely ran, not self-certified.
     pub skeptic_reviewers: Vec<String>,
+    /// Bead jleechan-984e / issue #385: `true` when the gate-7 reviewers that
+    /// actually contributed (`skeptic_reviewers` above) span fewer than TWO
+    /// distinct model families. A single-family review (e.g. only `claude`
+    /// because `codex` is quota-dead and `agy`/`cursor-agent` errored) shares
+    /// the coder's blind spots — every defect that reached main tonight
+    /// passed a claude-only skeptic and was caught by a different model
+    /// family executing the code. Strict merge policy (#328) treats this
+    /// flag as NOT strict-green, so a "green" assessment with
+    /// `review_degraded=true` cannot pass the unattended merge gate until a
+    /// cross-model vendor is restored. `false` when (a) zero or one vendors
+    /// ran (the test-repo `mock_llm` path and the total-outage path both
+    /// stay non-degraded: there is no cross-model guarantee to violate) or
+    /// (b) two or more distinct model families contributed. See
+    /// `vendor_model_family` for the family taxonomy.
+    pub review_degraded: bool,
     /// Bead jleechan-yoqy / issue #323: result of verifying the canonical
     /// evidence marker (`**Evidence**:` + gist URL + `(head <sha>)`) against
     /// the live gist and the PR's current head. Computed in `tick.rs` (which
@@ -2264,5 +2337,118 @@ mod tests {
             ),
             other => panic!("expected Unknown, got {other:?}"),
         }
+    }
+
+    // jleechan-984e / issue #385: vendor → model family taxonomy.
+    // Tests assert the EXACT family strings, not just distinctness, so
+    // any future rename or family merge fails loudly instead of silently
+    // collapsing two "different" vendors into one family.
+    #[test]
+    fn vendor_model_family_known_vendors() {
+        assert_eq!(vendor_model_family("claude"), "anthropic");
+        assert_eq!(vendor_model_family("minimax"), "minimax");
+        assert_eq!(vendor_model_family("codex"), "openai");
+        assert_eq!(vendor_model_family("agy"), "google-antigravity");
+        assert_eq!(vendor_model_family("gemini"), "google-gemini");
+        assert_eq!(vendor_model_family("cursor-agent"), "cursor");
+        // Bare `cursor` alias must map to the same family so dispatch
+        // routing and telemetry stay consistent regardless of which
+        // spelling the priority list uses.
+        assert_eq!(vendor_model_family("cursor"), "cursor");
+    }
+
+    #[test]
+    fn vendor_model_family_unknown_and_mock_return_empty() {
+        // Unknown / mock labels must NOT silently collapse into a real
+        // family — `compute_review_degraded` filters empty families, so
+        // returning `""` here keeps them inert rather than accidentally
+        // satisfying the cross-model guarantee.
+        assert_eq!(vendor_model_family("mock_llm"), "");
+        assert_eq!(vendor_model_family("nonsense_vendor"), "");
+        assert_eq!(vendor_model_family(""), "");
+    }
+
+    // jleechan-984e / issue #385: `compute_review_degraded` is true iff
+    // the contributor set covers fewer than TWO distinct non-empty
+    // model families.
+    #[test]
+    fn compute_review_degraded_empty_is_false() {
+        // Zero contributors cannot violate the cross-model guarantee.
+        assert!(!compute_review_degraded(&[]));
+    }
+
+    #[test]
+    fn compute_review_degraded_single_family_is_true() {
+        // The exact production scenario from the issue: codex quota-dead,
+        // agy/cursor-agent errored, so only claude contributed.
+        let v = vec!["claude".to_string()];
+        assert!(
+            compute_review_degraded(&v),
+            "single claude contributor must be review_degraded (issue #385 acceptance)"
+        );
+    }
+
+    #[test]
+    fn compute_review_degraded_two_distinct_families_is_false() {
+        // Codex (openai) + claude (anthropic) → two distinct families →
+        // strict merge policy can treat this as strict-green.
+        let v = vec!["codex".to_string(), "claude".to_string()];
+        assert!(
+            !compute_review_degraded(&v),
+            "codex+claude (two distinct families) must NOT be degraded"
+        );
+    }
+
+    #[test]
+    fn compute_review_degraded_same_family_deduped_is_true() {
+        // Two contributors from the SAME family — a same-model review —
+        // shares the coder's blind spots and must be flagged degraded.
+        // `agy` and `gemini` both come from Google but they are distinct
+        // families in the taxonomy, so this test specifically uses two
+        // claude contributors (impossible in practice but defensive).
+        let v = vec!["claude".to_string(), "claude".to_string()];
+        assert!(
+            compute_review_degraded(&v),
+            "duplicate claude contributors (single family) must be degraded"
+        );
+    }
+
+    #[test]
+    fn compute_review_degraded_agy_and_cursor_are_two_families() {
+        // The exact healthy-path acceptance case from the issue:
+        // `agy` falls through and a different-family vendor (cursor)
+        // also contributed — degraded MUST be false.
+        let v = vec!["agy".to_string(), "cursor-agent".to_string()];
+        assert!(
+            !compute_review_degraded(&v),
+            "agy + cursor-agent are distinct families and must NOT be degraded"
+        );
+    }
+
+    #[test]
+    fn compute_review_degraded_mock_llm_does_not_count() {
+        // The Stage-1 test-repo path produces a `["mock_llm"]` list —
+        // `vendor_model_family("mock_llm") == ""` so the family set is
+        // empty and the degraded flag is false (no real cross-model
+        // guarantee to violate in the test path).
+        let v = vec!["mock_llm".to_string()];
+        assert!(
+            !compute_review_degraded(&v),
+            "test-repo mock_llm-only contributor must NOT be flagged \
+             degraded (no real family to cross-check against)"
+        );
+    }
+
+    #[test]
+    fn compute_review_degraded_google_split_is_two_families() {
+        // agy (Google Antigravity) and gemini (Google Gemini CLI) are
+        // operated as separate CLIs/quota pools per the dispatch_reviewer
+        // comment, so they count as two distinct families even though
+        // both are Google-distributed.
+        let v = vec!["agy".to_string(), "gemini".to_string()];
+        assert!(
+            !compute_review_degraded(&v),
+            "agy + gemini are distinct Google families and must NOT be degraded"
+        );
     }
 }
