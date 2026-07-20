@@ -57,6 +57,26 @@ Public surface
 - `build_prompt(...)`                — pure string assembly. No judgment
                                        calls — the reviewer is the one
                                        that judges the diff.
+- `BeadContract` / `AcceptanceItem` / `PriorFinding` — the durable
+                                       input to the contract-echo step
+                                       (issue #386).
+- `load_bead_contract(source)`      — load a contract from a dict,
+                                       JSON file path, or pass-through.
+                                       Rejects empty acceptance items
+                                       and duplicate IDs.
+- `parse_contract_echo(output, contract)` — extract per-item verdicts
+                                       (`ADDRESSED file:line` /
+                                       `NOT-ADDRESSED` / `N-A` with
+                                       reason) from the reviewer's
+                                       `CONTRACT_ECHO:` block.
+- `evaluate_contract_echo(report, contract)` — fail-closed check:
+                                       every acceptance item must be
+                                       `ADDRESSED` or `N-A`. Any
+                                       `NOT-ADDRESSED` for an
+                                       acceptance item surfaces the
+                                       verbatim text in
+                                       `unaddressed_items` and
+                                       `constraint`.
 
 ZFC compliance
 --------------
