@@ -4,14 +4,20 @@ from runner.rule_loader import Rule
 from runner.skeptic_gate import SkepticResult, format_comment
 
 class ConsensusAggregator:
-    def aggregate(self, results: List[Tuple[Rule, SkepticResult]]) -> str:
+    def aggregate(self, results: List[Tuple[Rule, SkepticResult]]) -> str | None:
         if not results:
             return "PASS"
+        has_invalid = False
+        has_fail = False
         for rule, res in results:
-            if res.check_state == "failure":
-                return "FAIL"
-            if res.verdict == "FAIL":
-                return "FAIL"
+            if res.check_state == "failure" or res.verdict is None:
+                has_invalid = True
+            elif res.verdict == "FAIL":
+                has_fail = True
+        if has_invalid:
+            return None
+        if has_fail:
+            return "FAIL"
         return "PASS"
 
     def compile_report(self, results: List[Tuple[Rule, SkepticResult]], repo: str, pr_number: int, head_sha: str, expected_head_sha: str, implementation_provenance: str) -> Tuple[str, str]:
