@@ -4194,6 +4194,28 @@ impl Vcs for CliVcs {
         Ok(())
     }
 
+    /// Bead jleechan-znmh / issue #341: delete a ref via the routed-repo
+    /// Data API. Companion to [`create_branch_at_for_repo`](Self::create_branch_at_for_repo):
+    /// when a prior failed reroll left a stale `factory/<bead>-r<n>` ref
+    /// behind (HTTP 422 on the next POST), the reroll calls this to clear
+    /// it before retrying the create. Cross-repo, cwd-independent —
+    /// identical plumbing shape to the create, mirroring how
+    /// `create_branch_at_for_repo` was added for issue #349.
+    fn delete_branch_at_for_repo(
+        &self,
+        repo: &str,
+        name: &str,
+    ) -> Result<(), DaemonError> {
+        let path = format!("repos/{}/git/refs/heads/{}", repo, name);
+        let out = run_tool(
+            "gh",
+            &["api", "--method", "DELETE", &path],
+            30,
+        )?;
+        let _ = out; // DELETE success returns 204; we don't need the body.
+        Ok(())
+    }
+
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError> {
         self.head_sha_within(branch, 30)
     }

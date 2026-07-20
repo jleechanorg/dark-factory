@@ -2261,3 +2261,273 @@ fn test_reroll_close_pr_uses_bead_resolved_repo_not_cfg_target_repo() {
     std::fs::remove_dir_all(spec_dir).ok();
     let _ = std::fs::remove_file(&telemetry_log);
 }
+
+/// Regression test for issue #341 / bead jleechan-znmh — reroll branch
+/// creation must be reuse-or-reset-idempotent. When a prior failed
+/// reroll attempt left a stale `factory/<bead>-r<n>` ref behind in the
+/// routed repo (the live failure for jleechan-9rkz, 2026-07-18), the
+/// next retry's `create_branch_at_for_repo` POST hits
+/// `Reference already exists (refs/heads/<name>)` from the GH Data API
+/// (HTTP 422). The reroll must classify that stderr signature, delete
+/// the stale ref via `delete_branch_at_for_repo`, and retry the create —
+/// NOT wedge the bead on a transient tool error.
+#[test]
+fn test_reroll_recovers_from_stale_local_remote_branch_on_retry() {
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("main".into(), "base-sha-stale".into());
+    vcs.heads
+        .insert("factory/bead-stale-r1".into(), "head-sha-stale".into());
+    // Script: the routed repo already has a `factory/bead-stale-r2` ref
+    // (left behind by a prior failed reroll). The fake's
+    // `create_branch_at_for_repo` returns the canonical GH 422 stderr
+    // shape on the first call; on the second call (after reroll deletes
+    // the stale ref via the new `delete_branch_at_for_repo` entry point)
+    // it succeeds — matching how the real `CliVcs` will behave once the
+    // production code does the delete-then-retry dance.
+    vcs.stale_branch_exists_at.borrow_mut().insert(
+        ("owner/repo".to_string(), "factory/bead-stale-r2".to_string()),
+        "gh: Reference already exists (refs/heads/factory/bead-stale-r2) \
+         (HTTP 422)"
+            .to_string(),
+    );
+
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into()
+    ));
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_stale_branch_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_reroll_stale_branch_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-stale".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 20,
+        spend_usd: 0.5,
+        pr_number: Some(303),
+        branch: Some("factory/bead-stale-r1".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+    };
+    store.save(&bead).unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "Don't print to stdout, log errors.".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    match outcome {
+        RerollOutcome::Rerolled { new_branch } => {
+            assert_eq!(new_branch, "factory/bead-stale-r2");
+        }
+        other => panic!(
+            "expected RerollOutcome::Rerolled (reroll must recover from stale local -rN branch \
+             left behind by a prior failed attempt, NOT wedge on the 422); got {:?}",
+            other
+        ),
+    }
+
+    // Verify the reroll actually called delete on the stale ref before
+    // retrying the create — without this assertion a regression that
+    // retries the create without deleting would still pass the green
+    // path above (since the fake's second create succeeds), so we must
+    // pin the delete-then-retry order explicitly.
+    let vcs_calls = vcs.calls.borrow();
+    let create_indices: Vec<usize> = vcs_calls
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            if c.contains("create_branch_at_for_repo(owner/repo,factory/bead-stale-r2,") {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let delete_indices: Vec<usize> = vcs_calls
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            if c.contains("delete_branch_at_for_repo(owner/repo,factory/bead-stale-r2)") {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        !create_indices.is_empty(),
+        "reroll never called create_branch_at_for_repo for the new -r2 branch: {vcs_calls:?}"
+    );
+    assert!(
+        !delete_indices.is_empty(),
+        "reroll reached Recovery but did NOT call delete_branch_at_for_repo for the stale -r2 ref — \
+         the very next real attempt would still wedge on the same 422: {vcs_calls:?}"
+    );
+    // Ordering: the delete MUST fall between the first create (which
+    // failed with the 422) and the second create (which succeeded). A
+    // regression that retries the create without deleting — or that
+    // deletes AFTER the successful retry — would still produce a green
+    // path above, so we pin the exact delete-then-retry sandwich here.
+    let first_create = *create_indices.iter().min().unwrap();
+    let last_create = *create_indices.iter().max().unwrap();
+    let delete_in_between = delete_indices
+        .iter()
+        .any(|&d| d > first_create && d < last_create);
+    assert!(
+        delete_in_between,
+        "delete-then-retry sandwich violated: first_create={first_create}, \
+         last_create={last_create}, deletes at {delete_indices:?}; \
+         a delete must land BETWEEN the failing create and the successful retry create"
+    );
+
+    let updated = store.load("bead-stale").unwrap().unwrap();
+    assert_eq!(updated.state, OverlayState::Recovery);
+    assert_eq!(updated.attempt, 2);
+    assert_eq!(updated.branch, Some("factory/bead-stale-r2".into()));
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Regression test for issue #341 / bead jleechan-znmh (acceptance
+/// criterion #2): when step 7's `close_pr_for_repo` fails because the
+/// PR is already merged or already closed (the live failure for
+/// jleechan-8jxr, 2026-07-18 — a separate process merged the PR between
+/// the reroll's snapshot and its close attempt), the reroll must
+/// tolerate that as a successful supersede rather than wedge the bead
+/// on a transient tool error. `gh` exits 1 with stderr matching
+/// "already merged" / "already closed" / "is already in a closed state";
+/// the reroll must classify that signature and continue to constraint
+/// extraction with `pr_number` cleared.
+#[test]
+fn test_reroll_close_pr_already_merged_is_tolerated_as_successful_supersede() {
+    let mut scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("main".into(), "base-sha-merged".into());
+    vcs.heads
+        .insert("factory/bead-merged-r1".into(), "head-sha-merged".into());
+    // Script the bead's resolved repo's PR as already-merged. Exact
+    // stderr shape matches `gh pr close --repo owner/repo <n>` for a
+    // merged PR.
+    scm.pr_already_terminal.insert(
+        ("owner/repo".to_string(), 404u64),
+        "cannot close: pull request #404 is already merged".to_string(),
+    );
+
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into()
+    ));
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_pr_merged_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_reroll_pr_merged_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-merged".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 20,
+        spend_usd: 0.5,
+        pr_number: Some(404),
+        branch: Some("factory/bead-merged-r1".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+    };
+    store.save(&bead).unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: "Don't print to stdout, log errors.".into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    match outcome {
+        RerollOutcome::Rerolled { new_branch } => {
+            assert_eq!(new_branch, "factory/bead-merged-r2");
+        }
+        other => panic!(
+            "expected RerollOutcome::Rerolled (reroll must tolerate PR-already-merged as a \
+             supersede, NOT wedge on the close failure); got {:?}",
+            other
+        ),
+    }
+
+    // pr_number must be cleared (the PR is gone — closing it again is
+    // moot, the bead has successfully moved on to a new -rN branch).
+    let updated = store.load("bead-merged").unwrap().unwrap();
+    assert_eq!(updated.state, OverlayState::Recovery);
+    assert_eq!(updated.attempt, 2);
+    assert_eq!(
+        updated.pr_number, None,
+        "pr_number must be cleared after a tolerant already-merged supersede; \
+         the bead should not carry a stale pr_number into Recovery"
+    );
+
+    // Telemetry: confirm the reroll emitted the REROLL_PR_ALREADY_MERGED
+    // signal so operators can audit which rerolls took the tolerant
+    // branch. Without this a regression that silently swallows the close
+    // failure (rather than classifying it) would still pass the green
+    // path above.
+    let telemetry = std::fs::read_to_string(&telemetry_log)
+        .expect("reroll must have written telemetry");
+    assert!(
+        telemetry.contains("REROLL_PR_ALREADY_MERGED"),
+        "telemetry must record REROLL_PR_ALREADY_MERGED so operators can audit \
+         tolerant supersedes; got: {telemetry}"
+    );
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+}

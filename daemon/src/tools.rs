@@ -756,6 +756,26 @@ pub trait Vcs {
         let _ = repo;
         self.create_branch_at(name, sha)
     }
+    /// Repo-scoped variant of ref deletion (bead jleechan-znmh / issue #341,
+    /// reroll idempotency on stale local `-rN` branches). When the daemon's
+    /// routed-repo `create_branch_at_for_repo` POST fails with HTTP 422
+    /// "Reference already exists" — meaning a PRIOR failed reroll attempt
+    /// left a `factory/<bead>-r<n>` ref behind in the routed repo, even
+    /// though the daemon's local checkout never created it — the reroll
+    /// must delete that stale ref via this entry point and retry the
+    /// create. Like `create_branch_at_for_repo`, this is a cross-repo
+    /// `gh api` operation decoupled from the daemon's own cwd (the same
+    /// shape as #349). Default impl is a no-op so existing single-repo
+    /// test fakes keep their original behaviour transparently; `CliVcs`
+    /// overrides it to `DELETE repos/<repo>/git/refs/heads/<name>`.
+    fn delete_branch_at_for_repo(
+        &self,
+        repo: &str,
+        name: &str,
+    ) -> Result<(), DaemonError> {
+        let _ = (repo, name);
+        Ok(())
+    }
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError>;
     /// Budget-bounded [`head_sha`](Vcs::head_sha) (bead jleechan-zeij / issue
     /// #322 r4 P2). Default delegates to the unbounded method; the real
