@@ -431,6 +431,17 @@ pub enum HumanHoldReason {
     AdoptedSpawnFailed,
     UnknownOnlyGateCapped,
     CircuitBreaker,
+    /// Bead jleechan-328 / jleechanorg/dark-factory#328: the strict merge
+    /// policy refused to emit READY_FOR_MERGE because the gate assessment
+    /// was strict-green at the exact head, but the cross-model skeptic
+    /// review ran on a SINGLE model family (`review_degraded == true`). A
+    /// single-model-family review cannot satisfy the cross-model guarantee
+    /// that strict merge policy requires; the bead is parked at
+    /// `HUMAN_HELD` for operator disposition rather than promoted to
+    /// `READY` autonomously. Permanent (NOT in `recoverable_exact_values()`)
+    /// — the operator must either re-trigger an assessment with multi-model
+    /// reviewers available, or explicitly disposition the bead.
+    StrictMergeReviewDegraded,
     EscalationLocalFallback(String),
 }
 
@@ -472,6 +483,7 @@ impl HumanHoldReason {
             Self::AdoptedSpawnFailed => "adopted_spawn_failed",
             Self::UnknownOnlyGateCapped => "unknown_only_gate_report_with_er_runner_capped",
             Self::CircuitBreaker => CIRCUIT_BREAKER_PARK_REASON,
+            Self::StrictMergeReviewDegraded => "strict_merge_policy_review_degraded",
             Self::EscalationLocalFallback(reason) => {
                 return format!("escalation_local_fallback:{reason}");
             }

@@ -6821,19 +6821,33 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    // jleechan-baaf regression (vendor fallback) + jleechan-328 strict
+    // merge policy: the third vendor (agy) does produce a usable verdict,
+    // so GATE_ASSESSMENT carries all_green:true — but the only reachable
+    // vendor family here is google-antigravity (agy), so the cross-model
+    // guarantee has degraded. Strict merge policy (#328) escalates to
+    // HUMAN_HELD instead of emitting READY_FOR_MERGE.
     assert_eq!(
-        summary.beads_ready, 1,
-        "jleechan-baaf regression: when the first two dispatched reviewer \
-         vendors (codex, claude) both fail to produce a parseable verdict \
-         but a third vendor (agy) is available in `priority` and would \
-         succeed, `skeptic_evidence` must fall back to it instead of \
-         propagating a total-outage Err. summary={summary:?}\n\
-         telemetry:\n{telemetry}"
+        summary.beads_ready, 0,
+        "jleechan-baaf regression + jleechan-328 strict merge policy: only \
+         the agy vendor family is reachable, so review_degraded=true and \
+         strict merge policy (#328) refuses to promote to READY. \
+         summary={summary:?}\ntelemetry:\n{telemetry}"
+    );
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "strict merge policy must escalate a single-family review to \
+         HUMAN_HELD"
     );
     assert!(
         telemetry.contains("\"all_green\":true"),
         "GATE_ASSESSMENT must report all_green:true once the third vendor's \
          verdict is used; telemetry:\n{telemetry}"
+    );
+    assert!(
+        telemetry.contains("\"reason\":\"strict_merge_policy_review_degraded\""),
+        "ESCALATION_REQUIRED telemetry must carry the strict-merge-policy \
+         reason (issue #328); telemetry:\n{telemetry}"
     );
 
     let overlay = store
@@ -6842,9 +6856,14 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
         .expect("overlay must still exist");
     assert_eq!(
         overlay.state,
-        OverlayState::Ready,
-        "bead must reach READY via the third vendor's verdict, not stay \
-         ATTESTED on a false total-outage"
+        OverlayState::HumanHeld,
+        "bead must NOT reach READY when review is single-family (jleechan-328 \
+         strict merge policy); it must be parked at HUMAN_HELD"
+    );
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("strict_merge_policy_review_degraded"),
+        "park_reason must name the strict-merge-policy reason"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -6982,8 +7001,18 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
     assert_eq!(
-        summary.beads_ready, 1,
-        "bead should reach READY via the agy fallback verdict"
+        summary.beads_ready, 0,
+        "jleechan-328 strict merge policy: agy is the only reachable vendor \
+         here, so review_degraded=true and the strict merge policy escalates \
+         to HUMAN_HELD instead of READY. The original bead-level gate \
+         assessment still completes (GATE_ASSESSMENT line carries \
+         all_green:true), but the bead must NOT promote to READY — see \
+         park_reason=strict_merge_policy_review_degraded below."
+    );
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "strict merge policy must escalate a single-family review to \
+         HUMAN_HELD"
     );
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
@@ -7069,16 +7098,26 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/auto-merge-guard.sh");
     let guard_src = std::fs::read_to_string(&guard_script)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", guard_script.display()));
+    // jleechan-328 / jleechanorg/dark-factory#328: the predicate grew
+    // (fail-closed on unknown, unparseable, review_degraded) so the line
+    // range is now 41..=103 instead of 41..=69. Keep this in sync with
+    // tests/scripts/test_auto_merge_guard_gate_vocabulary.sh's
+    // `sed -n '41,103p' | sed "s/'$//"`.
     let predicate_block: String = guard_src
         .lines()
         .skip(40) // 0-indexed: line 41 (1-indexed) of auto-merge-guard.sh
-        .take(29) // lines 41..=69 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh's `sed -n '41,69p'`
+        .take(63) // lines 41..=103 inclusive
         .collect::<Vec<_>>()
         .join("\n");
+    // Strip the trailing `'` so Python doesn't see a syntax error (the
+    // bash `printf ... | python3 -c '...'` heredoc close-quote is on
+    // line 104; the test feeds the predicate via `-c` instead and the
+    // trailing single-quote would land inside the Python source).
+    let predicate_block = predicate_block.trim_end_matches('\'').to_string();
     assert!(
         predicate_block.contains("g.items()"),
         "extracted predicate block drifted from auto-merge-guard.sh's actual \
-         line range 41-69 (line numbers may have shifted); block:\n{predicate_block}"
+         line range 41-103 (line numbers may have shifted); block:\n{predicate_block}"
     );
 
     use std::io::Write as _;
@@ -7101,17 +7140,26 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         .expect("python3 predicate failed to run to completion");
     let predicate_stdout = String::from_utf8_lossy(&output.stdout);
     let predicate_stderr = String::from_utf8_lossy(&output.stderr);
+    // jleechan-328 / jleechanorg/dark-factory#328: this fixture has only
+    // the agy reviewer (single-family → review_degraded=true), so the
+    // strict merge policy (#328) correctly rejects the assessment even
+    // though every gate reads green. The predicate must return a FAIL
+    // verdict for review_degraded; that is the new contract being
+    // pinned here (previously the test expected a non-blocking
+    // `no-fail`, but that was the exact bypass the bead names).
     assert!(
-        output.status.success(),
-        "auto-merge-guard.sh's real predicate must accept the emitted \
-         GATE_ASSESSMENT line (dict-shaped gates, canonical vocab) for this \
-         all-green scenario; stdout={predicate_stdout}\nstderr={predicate_stderr}\n\
-         line={gate_assessment_line}"
+        !output.status.success(),
+        "auto-merge-guard.sh's real predicate must REJECT the emitted \
+         GATE_ASSESSMENT line for a single-family review (issue #328 \
+         strict merge policy: review_degraded=true blocks even when every \
+         gate reads green); stdout={predicate_stdout}\n\
+         stderr={predicate_stderr}\nline={gate_assessment_line}"
     );
     assert!(
-        predicate_stdout.contains("no-fail"),
-        "expected a non-blocking 'no-fail' verdict from auto-merge-guard.sh's \
-         predicate for this all-green scenario; got: {predicate_stdout}"
+        predicate_stdout.contains("review_degraded"),
+        "expected a blocking 'review_degraded' verdict from \
+         auto-merge-guard.sh's predicate for the strict merge policy \
+         (issue #328); got: {predicate_stdout}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -7451,19 +7499,36 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    // jleechan-328 / jleechanorg/dark-factory#328: the strict merge policy
+    // escalates a single-model-family review (this test's setup — only
+    // `gemini` is reachable) to HUMAN_HELD instead of emitting
+    // READY_FOR_MERGE. The original bkru regression — falling back to the
+    // fourth vendor instead of propagating a total-outage — is preserved
+    // (the GATE_ASSESSMENT line still reports `all_green:true`), but the
+    // promotion to READY is now gated on `review_degraded == false`.
     assert_eq!(
-        summary.beads_ready, 1,
-        "jleechan-bkru regression: when the first THREE dispatched/fallback \
-         reviewer vendors (codex, claude, agy) all fail to produce a \
-         parseable verdict but a fourth vendor (gemini) is available in \
-         `priority` and would succeed, `skeptic_evidence` must fall back \
-         to it instead of propagating a total-outage Err. \
+        summary.beads_ready, 0,
+        "jleechan-bkru regression + jleechan-328 strict merge policy: when \
+         the only available reviewer is a single-model family (gemini), the \
+         cross-model guarantee has degraded, so the strict merge policy \
+         (#328) refuses to promote to READY. summary={summary:?}\n\
+         telemetry:\n{telemetry}"
+    );
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "strict merge policy must escalate a single-family review to \
+         HUMAN_HELD with reason=strict_merge_policy_review_degraded: \
          summary={summary:?}\ntelemetry:\n{telemetry}"
     );
     assert!(
         telemetry.contains("\"all_green\":true"),
         "GATE_ASSESSMENT must report all_green:true once the fourth \
          vendor's verdict is used; telemetry:\n{telemetry}"
+    );
+    assert!(
+        telemetry.contains("\"reason\":\"strict_merge_policy_review_degraded\""),
+        "ESCALATION_REQUIRED telemetry must carry the strict-merge-policy \
+         reason (issue #328); telemetry:\n{telemetry}"
     );
 
     let overlay = store
@@ -7472,9 +7537,15 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
         .expect("overlay must still exist");
     assert_eq!(
         overlay.state,
-        OverlayState::Ready,
-        "bead must reach READY via the fourth vendor's verdict, not stay \
-         ATTESTED on a false total-outage"
+        OverlayState::HumanHeld,
+        "bead must NOT reach READY when review is single-family (jleechan-328 \
+         strict merge policy); it must be parked at HUMAN_HELD with \
+         reason=strict_merge_policy_review_degraded"
+    );
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("strict_merge_policy_review_degraded"),
+        "park_reason must name the strict-merge-policy reason, not a legacy one"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -7627,14 +7698,22 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    // jleechan-385 regression (vendor fallback) + jleechan-328 strict
+    // merge policy: cursor-agent is the only reachable vendor here, so
+    // the cross-model guarantee has degraded (single cursor family).
+    // Strict merge policy (#328) refuses to promote to READY on a
+    // single-family review even when the gate report is all-green.
     assert_eq!(
-        summary.beads_ready, 1,
-        "issue #385 regression: when the first FOUR dispatched/fallback \
-         reviewer vendors (codex, claude, agy, gemini) all fail to produce \
-         a parseable verdict but a fifth vendor (cursor-agent) is available \
-         in `priority` and would succeed, `skeptic_evidence` must fall back \
-         to it instead of propagating a total-outage Err. \
+        summary.beads_ready, 0,
+        "issue #385 regression + jleechan-328 strict merge policy: only \
+         cursor-agent is reachable, so review_degraded=true and strict \
+         merge policy (#328) refuses to promote to READY. \
          summary={summary:?}\ntelemetry:\n{telemetry}"
+    );
+    assert_eq!(
+        summary.beads_parked_human_held, 1,
+        "strict merge policy must escalate a single-family review to \
+         HUMAN_HELD"
     );
     assert!(
         telemetry.contains("\"all_green\":true"),
@@ -7700,9 +7779,14 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
         .expect("overlay must still exist");
     assert_eq!(
         overlay.state,
-        OverlayState::Ready,
-        "bead must reach READY via cursor-agent's verdict, not stay ATTESTED \
-         on a false total-outage"
+        OverlayState::HumanHeld,
+        "bead must NOT reach READY when review is single-family (jleechan-328 \
+         strict merge policy); it must be parked at HUMAN_HELD"
+    );
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("strict_merge_policy_review_degraded"),
+        "park_reason must name the strict-merge-policy reason"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

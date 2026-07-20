@@ -33,7 +33,7 @@ if [ "$recent" -ge "$MAX_PER_HOUR" ]; then
   exit 0
 fi
 
-latest_assessment_no_red() { # <pr_number> -> exit 0 if latest GATE_ASSESSMENT exists and has NO red/fail gate
+latest_assessment_no_red() { # <pr_number> -> exit 0 iff the latest GATE_ASSESSMENT proves every gate green at the exact head (fail-closed otherwise)
   local pr="$1" last
   last="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$pr[,}]" | tail -1)"
   [ -n "$last" ] || return 1                       # never assessed → block
@@ -44,29 +44,63 @@ try:
     g = ctx["gates"]
 except Exception:
     sys.exit(1)                                    # unparseable → block
-# jleechan-240 expand: gate values can be a string ("pass"|"warn"|"fail"|"unknown")
-# or a structured object {"verdict": "...", "evidence":[...]}; the merge-authority
-# guard must block on any fail verdict, not the literal "red" string the original
-# 7-gate schema emitted. Legacy "red" is treated as fail (it was the original
-# blocking token); "warn" and "unknown" stay non-blocking per the documented
-# no-red merge policy (infra walls like CodeRabbit/Bugbot quota should not
-# deadlock the factory).
+# jleechan-328 / jleechanorg/dark-factory#328: fail-closed exact-head 7-green
+# merge authority. The legacy policy treated "unknown" as a deferral (next
+# tick) and let a disposition note substitute for strict 7-green. That was
+# the exact bypass the bead names: recent factory/operator merges were
+# called green despite missing CodeRabbit/Bugbot/Skeptic verdicts, which
+# contradicts the repository rule that every merge gate must be proven
+# green at the exact head.
+#
+# The new contract:
+#   * any FAIL verdict → block
+#   * any UNKNOWN verdict → block (fail-closed on infra walls: "unknown"
+#     means we have not proven this gate; that is not the same as green)
+#   * missing/empty gates object → block (cannot prove what is absent)
+#   * unparseable verdict token (anything outside pass|warn|fail|unknown)
+#     → block
+#   * `review_degraded: true` (single-model-family review) → block, even
+#     when every gate reads green; a single-model family cannot satisfy
+#     strict merge policy (jleechan-984e)
+#   * only a complete {"<gate>": "pass"|"warn"} for every required gate
+#     AND review_degraded in {false, absent} → allow
 ALIAS = {"pass":"pass","warn":"warn","fail":"fail","unknown":"unknown",
          "green":"pass","red":"fail","yellow":"warn"}
+ALLOWED_VERDICTS = {"pass", "warn"}
 def verdict(v):
     if isinstance(v, str):
-        return ALIAS.get(v, v)
+        return ALIAS.get(v, None)                  # unparseable → None
     if isinstance(v, dict):
-        return ALIAS.get(v.get("verdict",""), v.get("verdict",""))
-    return v
-fails = [k for k,v in g.items() if verdict(v) == "fail"]
+        return ALIAS.get(v.get("verdict",""), None)
+    return None
+if not isinstance(g, dict) or not g:
+    print("FAIL: gates object is missing or empty (fail-closed)"); sys.exit(1)
+unknowns = []
+fails = []
+unparseable = []
+for k, v in g.items():
+    tok = verdict(v)
+    if tok is None:
+        unparseable.append(k)
+    elif tok == "fail":
+        fails.append(k)
+    elif tok == "unknown":
+        unknowns.append(k)
+if unparseable:
+    print("FAIL:unparseable:" + ",".join(unparseable)); sys.exit(1)
 if fails:
-    print("FAIL:" + ",".join(fails)); sys.exit(1)   # any fail → block
-unknowns = [k for k,v in g.items() if verdict(v) == "unknown"]
+    print("FAIL:" + ",".join(fails)); sys.exit(1)
 if unknowns:
-    print("no-fail (unknowns defer: " + ",".join(unknowns) + ")")
-else:
-    print("no-fail (all gates cleared)")
+    print("FAIL:unknown:" + ",".join(unknowns)); sys.exit(1)
+# Strict merge policy (issue #328): a single-model-family review does not
+# satisfy the contract. `review_degraded` is emitted by the daemon on every
+# GATE_ASSESSMENT (jleechan-984e); absent == false (legacy telemetry) is
+# treated as multi-model.
+review_degraded = ctx.get("review_degraded", False)
+if review_degraded is True or str(review_degraded).lower() == "true":
+    print("FAIL:review_degraded (single-model family review, strict merge policy)")
+    sys.exit(1)
+print("no-fail (all 7 gates cleared at exact head)")
 sys.exit(0)'
 }
 

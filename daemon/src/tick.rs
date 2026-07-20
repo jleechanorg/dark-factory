@@ -2571,12 +2571,16 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             // live lookup this tick; skip the redundant pre-gate check.
             pr
         } else if !deps.cfg.pre_gate_validation_enabled {
-            // Pre-gate validation is operator-gated (default false) so
-            // legacy deployments and integration tests that don't script
-            // `open_pr_head_refs` for ATTESTED beads aren't disturbed.
-            // Production deployments with the flag enabled get full
-            // drift coverage for ATTESTED beads whose stored `pr_number`
-            // wasn't re-resolved by the dispatch→attested path this tick.
+            // Pre-gate validation is operator-gated (default TRUE per
+            // `default_pre_gate_validation_enabled` in `daemon/src/config.rs`)
+            // so production deployments always get full drift coverage for
+            // ATTESTED beads whose stored `pr_number` wasn't re-resolved
+            // by the dispatch→attested path this tick. Operators / legacy
+            // deployments can opt out by setting
+            // `pre_gate_validation_enabled = false` explicitly; integration
+            // tests in `daemon/tests/tick_integration.rs::test_cfg` set it
+            // false so tests that don't script `open_pr_head_refs` for
+            // ATTESTED beads aren't disturbed.
             pr
         } else {
             match deps.scm.open_pr_head_ref_for_repo(&repo, pr) {
@@ -3041,6 +3045,51 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         )?;
 
         if report.all_green {
+            // jleechan-328 / jleechanorg/dark-factory#328: strict merge
+            // policy — a single-model-family review (review_degraded == true)
+            // cannot satisfy the cross-model guarantee even when every gate
+            // reads green. Promote to ESCALATION_REQUIRED + HUMAN_HELD so the
+            // operator decides, NOT READY_FOR_MERGE. This is the fail-closed
+            // contract that replaces the legacy "all_green implies
+            // READY_FOR_MERGE" path, which the bead names as the exact
+            // bypass that allowed the autonomous merge authority to call
+            // PRs green on degraded reviews. The fast-tier caller uses
+            // `verifier::is_strict_merge_ready` (one source of truth for
+            // this rule) instead of `report.all_green` alone, so a future
+            // refactor cannot silently re-open the bypass.
+            if !verifier::is_strict_merge_ready(&report, evidence.review_degraded) {
+                overlay.state = OverlayState::HumanHeld;
+                overlay.attempt = MAX_HUMAN_HELD_RECOVERY_ATTEMPT;
+                set_human_hold_reason(
+                    &mut overlay,
+                    HumanHoldReason::StrictMergeReviewDegraded,
+                );
+                deps.store.save(&overlay)?;
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "ESCALATION_REQUIRED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "strict_merge_policy_review_degraded",
+                        "detail": "all 7 gates green but skeptic_reviewers cover only one model family; \
+                                   strict merge policy (#328) refuses to call this PR green without \
+                                   operator disposition",
+                        "pr_number": pr,
+                        "skeptic_reviewers": evidence.skeptic_reviewers,
+                        "review_degraded": evidence.review_degraded,
+                    }),
+                )?;
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required for bead `{bead_id}`: all 7 gates are GREEN at the exact head, but the cross-model skeptic ran on a single model family (review_degraded=true). Strict merge policy (#328) refuses to emit READY_FOR_MERGE on a degraded review — the bead is held at HUMAN_HELD for operator disposition rather than autonomous merge. Skeptic reviewers on this assessment: {}.",
+                    evidence.skeptic_reviewers.join(", ")
+                );
+                let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+                continue;
+            }
             overlay.state = OverlayState::Ready;
             deps.store.save(&overlay)?;
             summary.beads_ready += 1;

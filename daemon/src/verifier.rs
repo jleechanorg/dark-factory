@@ -1028,6 +1028,27 @@ pub fn structural_pending_gates(report: &GateReport) -> Vec<(GateName, &str)> {
         .collect()
 }
 
+/// Bead jleechan-328 / jleechanorg/dark-factory#328: the strict merge
+/// predicate. `all_green` alone is the legacy contract; strict merge
+/// policy (the rule the bead codifies) requires BOTH that every gate
+/// reads `Green` AND that the cross-model skeptic review was not
+/// degraded (single-model-family). The fast-tier caller MUST use this
+/// predicate instead of `report.all_green` so the fail-closed rule has
+/// one source of truth — a future refactor that reintroduces an
+/// `all_green`-only check would re-open the bypass the bead names.
+///
+/// Parameters:
+/// - `report`: the per-gate assessment from `verifier::assess`. A
+///   non-green report always returns `false` here, so an unknown gate
+///   cannot accidentally pass.
+/// - `review_degraded`: the cross-model family count from
+///   `PrEvidence::review_degraded`. `true` means the skeptic ran on a
+///   single model family and the strict merge policy refuses to call
+///   the PR green.
+pub fn is_strict_merge_ready(report: &GateReport, review_degraded: bool) -> bool {
+    report.all_green && !review_degraded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2449,6 +2470,68 @@ mod tests {
         assert!(
             !compute_review_degraded(&v),
             "agy + gemini are distinct Google families and must NOT be degraded"
+        );
+    }
+
+    // jleechan-328 / jleechanorg/dark-factory#328: the strict merge policy.
+    // Even when every gate reads green, a single-model-family review
+    // (`review_degraded == true`) MUST refuse to call the PR ready for
+    // merge. This is the bead's "fail-closed exact-head 7-green merge
+    // authority" contract: `all_green` is necessary but not sufficient
+    // when the cross-model guarantee has degraded. The fast-tier caller
+    // checks `is_strict_merge_ready(report, review_degraded)` instead of
+    // `report.all_green` alone; the predicate below is the canonical
+    // helper that future code MUST use so the rule has one source of
+    // truth.
+    #[test]
+    fn strict_merge_ready_all_green_and_not_degraded_is_true() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+        assert!(report.all_green, "test setup must produce all-green");
+        assert!(
+            is_strict_merge_ready(&report, false),
+            "all-green + non-degraded review must be strict-merge-ready"
+        );
+    }
+
+    #[test]
+    fn strict_merge_ready_all_green_but_degraded_is_false() {
+        // This is the exact regression #328 documents: every gate reads
+        // green at the exact head, but the cross-model skeptic ran on a
+        // single model family. The strict merge policy MUST refuse.
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+        assert!(report.all_green);
+        assert!(
+            !is_strict_merge_ready(&report, true),
+            "all-green + degraded review must NOT be strict-merge-ready \
+             (issue #328 acceptance: single-family review cannot satisfy \
+             strict merge policy)"
+        );
+    }
+
+    #[test]
+    fn strict_merge_ready_with_any_unknown_gate_is_false() {
+        // Belt-and-suspenders for the daemon's all_green contract: a
+        // single Unknown gate forces all_green=false, so this is a
+        // regression pin on the existing verifier::assess semantics
+        // (not a new rule). Issue #328 names "unknown defers" as a
+        // bypass; the strict predicate makes it impossible for the
+        // fast tier to mistake an unknown for a green.
+        let mut scm = FakeScm::default();
+        let mut snapshot = all_green_snapshot(7);
+        snapshot.bugbot_error_count = 1;
+        scm.snapshots.insert(7, snapshot);
+        let cfg = test_cfg();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
+        assert!(!report.all_green);
+        assert!(
+            !is_strict_merge_ready(&report, false),
+            "non-green report must never be strict-merge-ready"
         );
     }
 }
