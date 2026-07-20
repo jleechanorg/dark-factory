@@ -1145,6 +1145,101 @@ impl Scm for CliScm {
         Ok(parse_open_pr_head_ref(&out, repo))
     }
 
+    /// Bead jleechan-t40t (issue #326): resolve the CURRENT open PR whose
+    /// head ref is `branch` in `repo`. Implementation issues
+    /// `gh pr list --head <branch> --repo <repo> --json number --jq '.[0].number'`
+    /// and parses the trimmed stdout as a `u64`. Mirrors the
+    /// slow-tier DISPATCHED re-resolution path in `tick.rs::run_slow_tier`
+    /// — both have to agree on the same branch→PR contract. `Err(_)` is
+    /// returned only on a hard `gh` failure; "no such PR" is `Ok(None)` so
+    /// callers can distinguish "transient tool error" (retry next tick)
+    /// from "the branch really has no open PR right now" (legitimate —
+    /// keep using the existing `pr_number` until one appears).
+    fn pr_number_for_branch(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        // jleechan-t40t (issue #326) r6: filter the lookup to SAME-REPO
+        // PRs only. `--repo owner/repo` scopes the LIST to that repo, but
+        // `--head <branch>` matches against `headRefName` which can
+        // collide with a fork PR's head branch name (r6 lesson from
+        // PR #305 — `gh pr list --head X --repo owner/repo` may surface
+        // a fork PR whose `headRefName == X` because the JSON payload
+        // includes `headRepository.nameWithOwner`). The jq filter
+        // selects only entries whose headRepository matches the queried
+        // repo, mirroring the same-repo guard `intake::same_repo_pr`
+        // already applies to PR adoption.
+        let jq_filter = format!(
+            ".[] | select(.headRepository.nameWithOwner == \"{repo}\") | .number"
+        );
+        let out = match run_tool(
+            "gh",
+            &[
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--repo",
+                repo,
+                "--json",
+                "number,headRepository",
+                "--jq",
+                &jq_filter,
+            ],
+            30,
+        ) {
+            Ok(o) => o,
+            Err(DaemonError::Tool { stderr, .. })
+                if stderr.contains("404")
+                    || stderr.contains("Not Found")
+                    || stderr.contains("not found") =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let trimmed = out.trim();
+        if trimmed.is_empty() || trimmed == "null" {
+            return Ok(None);
+        }
+        match trimmed.parse::<u64>() {
+            Ok(pr) => Ok(Some(pr)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Bead jleechan-yoqy / issue #323 (r5): `gh api gists/<id>` and report the
+    /// gist's verification state. A 404 (deleted / private / never existed) is
+    /// `Ok(None)` — a DEFINITIVE miss the evidence gate fails on. Any other gh
+    /// error is TRANSIENT (`Err`) — the gate waits rather than churning a
+    /// reroll on gh noise. A fetchable gist reports `Ok(Some(total_size > 0))`.
+    fn gist_nonempty(&self, gist_id: &str) -> Result<Option<bool>, DaemonError> {
+        // Sum the `size` of every file in the gist via jq; empty -> 0.
+        let out = match run_tool(
+            "gh",
+            &[
+                "api",
+                &format!("gists/{gist_id}"),
+                "--jq",
+                "[.files[].size] | add // 0",
+            ],
+            30,
+        ) {
+            Ok(out) => out,
+            Err(DaemonError::Tool { stderr, .. })
+                if stderr.contains("404")
+                    || stderr.contains("Not Found")
+                    || stderr.contains("not found") =>
+            {
+                return Ok(None); // definitively missing
+            }
+            Err(e) => return Err(e), // transient — the gate waits
+        };
+        let total: u64 = out.trim().parse().unwrap_or(0);
+        Ok(Some(total > 0))
+    }
+
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
         let offline_path = std::path::Path::new(".beads/offline").join(format!("pr_{}.json", pr));
         if offline_path.exists() {
@@ -4323,6 +4418,28 @@ impl Vcs for CliVcs {
             30,
         )?;
         let _ = out; // POST success returns the created ref object; we don't need its body.
+        Ok(())
+    }
+
+    /// Bead jleechan-znmh / issue #341: delete a ref via the routed-repo
+    /// Data API. Companion to [`create_branch_at_for_repo`](Self::create_branch_at_for_repo):
+    /// when a prior failed reroll left a stale `factory/<bead>-r<n>` ref
+    /// behind (HTTP 422 on the next POST), the reroll calls this to clear
+    /// it before retrying the create. Cross-repo, cwd-independent —
+    /// identical plumbing shape to the create, mirroring how
+    /// `create_branch_at_for_repo` was added for issue #349.
+    fn delete_branch_at_for_repo(
+        &self,
+        repo: &str,
+        name: &str,
+    ) -> Result<(), DaemonError> {
+        let path = format!("repos/{}/git/refs/heads/{}", repo, name);
+        let out = run_tool(
+            "gh",
+            &["api", "--method", "DELETE", &path],
+            30,
+        )?;
+        let _ = out; // DELETE success returns 204; we don't need the body.
         Ok(())
     }
 

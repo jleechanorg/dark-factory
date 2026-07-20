@@ -23,9 +23,7 @@ use crate::dispatch::{self, MAX_TRANSIENT_SPAWN_RETRY};
 use crate::errors::DaemonError;
 use crate::intake::{self, IntakeOutcome, IntakeVerdict};
 use crate::router::{self, RoutingVerdict};
-use crate::state::{
-    set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
-};
+use crate::state::{set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore};
 use crate::telemetry::{self, TelemetryEvent};
 use crate::tools::{Bead, Llm, PrHeadBranch, Scm, SessionId, Sessions, Tracker, Vcs};
 use crate::verifier::{self, PrEvidence};
@@ -642,9 +640,10 @@ pub fn run_tick(
                             // could never observe real progress and would
                             // eventually park a perfectly healthy, actively
                             // pushing coder as `coder_silent`.
-                            let last_commit_epoch = deps
-                                .scm
-                                .remote_branch_last_commit_for_repo(overlay.repo(deps.cfg), branch)?;
+                            let last_commit_epoch = deps.scm.remote_branch_last_commit_for_repo(
+                                overlay.repo(deps.cfg),
+                                branch,
+                            )?;
                             let now_epoch = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -1070,8 +1069,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             // owner/repo today. Still resolved from `external_ref` (not
             // left `None`) so it stays correct once Stage C/D lift the
             // same-repo-only restriction for adopted PRs.
-            let target_repo =
-                intake::resolve_target_repo("", Some(adopted.external_ref.as_str()));
+            let target_repo = intake::resolve_target_repo("", Some(adopted.external_ref.as_str()));
             let mut overlay = existing.unwrap_or(BeadOverlay {
                 bead_id: adopted.bead_id.clone(),
                 state: OverlayState::Attested,
@@ -1084,9 +1082,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 session_id: None,
                 is_adopted: true,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo,
             });
             overlay.state = OverlayState::Attested;
             overlay.pr_number = Some(adopted.pr_number);
@@ -1141,8 +1139,13 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // the bead's OWN resolved repo instead of unconditionally
         // `cfg.target_repo`.
         let target_repo = intake::resolve_target_repo(
-            tracker_bead.as_ref().map(|b| b.description.as_str()).unwrap_or(""),
-            tracker_bead.as_ref().and_then(|b| b.external_ref.as_deref()),
+            tracker_bead
+                .as_ref()
+                .map(|b| b.description.as_str())
+                .unwrap_or(""),
+            tracker_bead
+                .as_ref()
+                .and_then(|b| b.external_ref.as_deref()),
         );
 
         if deps.llm.is_real() {
@@ -1280,9 +1283,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     session_id: None,
                     is_adopted: false,
                     spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo,
+                    pre_session_head_sha: None,
+                    park_reason: None,
+                    target_repo,
                 };
                 deps.store.save(&o)?;
                 summary.beads_created += 1;
@@ -1339,10 +1342,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // silent default" discipline router.rs already enforces.
                 let mut held = overlay;
                 held.state = OverlayState::HumanHeld;
-                set_human_hold_reason(
-                    &mut held,
-                    HumanHoldReason::RouterParse(reason.clone()),
-                );
+                set_human_hold_reason(&mut held, HumanHoldReason::RouterParse(reason.clone()));
                 deps.store.save(&held)?;
                 summary.beads_parked_human_held += 1;
                 emit(
@@ -1500,11 +1500,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
                 {
                     if is_missing_scm_target_error(&err) {
-                        record_local_escalation_fallback(
-                            deps,
-                            &failure.bead_id,
-                            "unmapped_repo",
-                        )?;
+                        record_local_escalation_fallback(deps, &failure.bead_id, "unmapped_repo")?;
                         summary.beads_escalated_locally += 1;
                         emit(
                             deps.telemetry_log,
@@ -1933,8 +1929,7 @@ fn skeptic_evidence(
     // bead's OWN resolved repo so a test-repo bead dispatched under a
     // non-test global `cfg.target_repo` (or vice versa) is classified
     // correctly instead of by the daemon-global repo.
-    let is_test_repo =
-        repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
+    let is_test_repo = repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo";
 
     let mut gha_verdict = "verdict: absent";
     let mut signoff_verdict = "verdict: absent";
@@ -2161,10 +2156,11 @@ fn skeptic_evidence(
     Ok(PrEvidence {
         is_production: false,
         non_test_changed_loc: 0,
-        has_integration_evidence_marker: false,
         er_verdict: verifier::ErVerdict::Absent,
         skeptic_verdict,
         skeptic_reviewers: used_vendors,
+        // Set in the fast tier from the canonical evidence marker (#323).
+        evidence_gist_status: verifier::EvidenceGistStatus::NotProvided,
     })
 }
 
@@ -2293,28 +2289,127 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         }
 
         // Promote DISPATCHED -> ATTESTED once a PR is open (spec §4.2.7).
+        // jleechan-t40t r6: `pr_number_reresolved_this_tick` is set whenever
+        // the dispatch→attested re-resolution path above mutates
+        // `overlay.pr_number` (drift detection, stale-clear, or transient
+        // error). Pre-gate validation below uses it to skip the redundant
+        // `open_pr_head_ref_for_repo` re-check on freshly-resolved PRs,
+        // which would otherwise emit a false-positive
+        // `PR_PRE_GATE_VALIDATION_MISMATCH` on every healthy bead.
+        let mut pr_number_reresolved_this_tick = false;
         if overlay.state == OverlayState::Dispatched {
-            if overlay.pr_number.is_none() {
-                if let Some(ref branch) = overlay.branch {
-                    if let Ok(out) = crate::tools::run_tool(
-                        "gh",
-                        &[
-                            "pr",
-                            "list",
-                            "--head",
-                            branch,
-                            "--repo",
-                            &repo,
-                            "--json",
-                            "number",
-                            "--jq",
-                            ".[0].number",
-                        ],
-                        30,
-                    ) {
-                        if let Ok(pr) = out.trim().parse::<u64>() {
-                            overlay.pr_number = Some(pr);
-                        }
+            if let Some(ref branch) = overlay.branch {
+                // jleechan-t40t (issue #326): re-resolve `pr_number` from the
+                // bead's CURRENT branch every slow-tier tick (not just when
+                // it's `None`). The pre-fix code only ran this lookup when
+                // `pr_number.is_none()`, which meant a stale `pr_number` —
+                // e.g. set from an AO session that was later superseded by
+                // a different PR on the same branch, or written out-of-band
+                // — kept the bead DISPATCHED indefinitely against the wrong
+                // PR (every gate-assessment query targeted a PR the bead's
+                // branch was no longer bound to).
+                //
+                // r6 contract: `Ok(Some(discovered))` either fills in the
+                // missing `pr_number` (first-discovery) or supersedes a
+                // stale one (drift detection), emitting `PR_NUMBER_REREZOLVED`
+                // so the transition is auditable from the daemon log alone.
+                // `Ok(None)` is FAIL-CLOSED: when a stale `pr_number` was
+                // recorded against a now-merged/closed PR and the branch has
+                // no live PR, the stale number MUST be cleared so the bead
+                // does NOT promote to ATTESTED against a dead PR
+                // (jleechan-t8fd / PR #316 wedge); the bead stays DISPATCHED
+                // and waits for the next live PR. The clear is audited via
+                // `PR_NUMBER_REREZOLVED_NO_OPEN_PR` with
+                // reason=`branch_mismatch_no_open_pr`. A hard `Err` is logged
+                // via `PR_NUMBER_REREZOLVE_TRANSIENT_ERROR` and skipped —
+                // the next tick re-attempts the lookup.
+                match deps.scm.pr_number_for_branch(&repo, branch) {
+                    Ok(Some(discovered)) if Some(discovered) != overlay.pr_number => {
+                        let previous = overlay.pr_number;
+                        overlay.pr_number = Some(discovered);
+                        deps.store.save(&overlay)?;
+                        pr_number_reresolved_this_tick = true;
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Dispatched.as_str(),
+                            "PR_NUMBER_REREZOLVED",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "branch": branch,
+                                "previous_pr_number": previous,
+                                "current_pr_number": discovered,
+                                "reason": "branch_mismatch_stale_state",
+                            }),
+                        )?;
+                    }
+                    Ok(None) if overlay.pr_number.is_some() && !overlay.is_adopted => {
+                        // Fail-closed: a stale `pr_number` points at a PR
+                        // that is no longer open for this branch (e.g. it
+                        // merged and the bead was re-cut with a fresh -rN
+                        // branch, or the prior PR was closed out-of-band).
+                        // Clearing it keeps the bead DISPATCHED and prevents
+                        // promotion to ATTESTED against a dead PR. The
+                        // next tick (or the same tick's later blocks) will
+                        // see `pr_number.is_none()` and short-circuit out
+                        // of any gate-assessment path until a new PR
+                        // appears.
+                        //
+                        // NOT applied to adopted beads: an adopted PR's
+                        // `pr_number` was set from a positively-confirmed
+                        // external contributor's `external_ref` lookup
+                        // at adoption time (see `intake::normalize_labeled_prs`),
+                        // not from a branch→PR re-resolution. Clearing
+                        // it here would erase the adoption guarantee —
+                        // adopted beads rely on the stored `pr_number`
+                        // surviving until the contributor's PR is
+                        // closed/merged by them, NOT until our branch
+                        // lookup happens to agree.
+                        let previous = overlay.pr_number;
+                        overlay.pr_number = None;
+                        deps.store.save(&overlay)?;
+                        pr_number_reresolved_this_tick = true;
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Dispatched.as_str(),
+                            "PR_NUMBER_REREZOLVED_NO_OPEN_PR",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "branch": branch,
+                                "previous_pr_number": previous,
+                                "current_pr_number": serde_json::Value::Null,
+                                "reason": "branch_mismatch_no_open_pr",
+                            }),
+                        )?;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        // jleechan-t40t r12 (issue #326): FAIL CLOSED. A
+                        // transient branch→PR resolution error leaves the
+                        // stored `pr_number` UNVALIDATED this tick. The pre-fix
+                        // code merely logged and fell through to the promotion
+                        // block below, which would promote DISPATCHED→ATTESTED
+                        // against a possibly-stale number (gate-assessing a PR
+                        // the branch may no longer be bound to). Keep the bead
+                        // DISPATCHED and retry the resolution next tick — never
+                        // promote on an unvalidated number.
+                        let _ = emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Dispatched.as_str(),
+                            "PR_NUMBER_REREZOLVE_TRANSIENT_ERROR",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "branch": branch,
+                                "error": format!("{e:?}"),
+                                "action": "kept_dispatched_no_promotion",
+                            }),
+                        );
+                        continue;
                     }
                 }
             }
@@ -2415,6 +2510,233 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             Some(pr) => pr,
             None => continue,
         };
+
+        // jleechan-t40t r6: pre-gate validation. Before any gate assessment,
+        // the stored `pr_number` MUST (a) be a real OPEN PR and (b) have its
+        // head ref equal to `overlay.branch` — otherwise every gate query
+        // targets a PR the bead's branch is no longer bound to (jleechan-t8fd
+        // / PR #316 wedge). Closed/missing/not-same-branch PRs are
+        // re-resolved by head branch; an inconclusive re-resolution DEFERs
+        // (no fast-tier assessment this tick) instead of gate-assessing a
+        // stale PR.
+        //
+        // Skipped when the slow-tier re-resolution path above JUST set the
+        // `pr_number` from the branch this same tick (the dispatch→ATTESTED
+        // promotion block already verified the branch→PR live lookup, so
+        // re-validating the freshly-resolved value is redundant and would
+        // emit a false-positive `PR_PRE_GATE_VALIDATION_MISMATCH` on every
+        // healthy bead).
+        let pre_gate_pr = if pr_number_reresolved_this_tick {
+            // Slow-tier re-resolution path already verified the branch→PR
+            // live lookup this tick; skip the redundant pre-gate check.
+            pr
+        } else if !deps.cfg.pre_gate_validation_enabled {
+            // Pre-gate validation is operator-gated (default false) so
+            // legacy deployments and integration tests that don't script
+            // `open_pr_head_refs` for ATTESTED beads aren't disturbed.
+            // Production deployments with the flag enabled get full
+            // drift coverage for ATTESTED beads whose stored `pr_number`
+            // wasn't re-resolved by the dispatch→attested path this tick.
+            pr
+        } else {
+            match deps.scm.open_pr_head_ref_for_repo(&repo, pr) {
+                Ok(PrHeadBranch::SameRepo(head)) => {
+                    if Some(head.as_str()) == overlay.branch.as_deref() {
+                        pr
+                    } else {
+                        // Stored pr is OPEN but its head ref has drifted
+                        // off the bead's recorded branch — re-resolve by
+                        // head branch; defer if the branch has no live PR.
+                        let _ = emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Attested.as_str(),
+                            "PR_PRE_GATE_VALIDATION_MISMATCH",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "branch": overlay.branch,
+                                "stored_pr_number": pr,
+                                "open_pr_head_ref_resolution": format!("SameRepo({head})"),
+                                "reason": "stored_pr_head_ref_drifted",
+                            }),
+                        );
+                        match deps
+                            .scm
+                            .pr_number_for_branch(&repo, overlay.branch.as_deref().unwrap_or(""))
+                        {
+                            Ok(Some(discovered)) => {
+                                overlay.pr_number = Some(discovered);
+                                deps.store.save(&overlay)?;
+                                emit(
+                                    deps.telemetry_log,
+                                    bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Attested.as_str(),
+                                    "PR_NUMBER_REREZOLVED",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "branch": overlay.branch,
+                                        "previous_pr_number": pr,
+                                        "current_pr_number": discovered,
+                                        "reason": "pre_gate_validation_drift",
+                                    }),
+                                )?;
+                                discovered
+                            }
+                            Ok(None) => {
+                                // jleechan-t40t r12 (issue #326): the stored PR
+                                // drifted off the branch AND the branch has no
+                                // live PR. Clearing `pr_number` alone would
+                                // strand the bead ATTESTED forever — the
+                                // ATTESTED gate path needs a `pr_number` and the
+                                // branch→PR re-resolution only runs for
+                                // DISPATCHED beads. DEMOTE to DISPATCHED so the
+                                // next tick's re-resolution picks it up and
+                                // re-promotes once a live PR appears.
+                                overlay.pr_number = None;
+                                overlay.state = OverlayState::Dispatched;
+                                deps.store.save(&overlay)?;
+                                let _ = emit(
+                                    deps.telemetry_log,
+                                    bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Dispatched.as_str(),
+                                    "PR_NUMBER_REREZOLVED_NO_OPEN_PR",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "branch": overlay.branch,
+                                        "previous_pr_number": pr,
+                                        "current_pr_number": serde_json::Value::Null,
+                                        "reason": "pre_gate_validation_no_open_pr",
+                                        "action": "demoted_attested_to_dispatched_for_rerezolve",
+                                    }),
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                let _ = emit(
+                                    deps.telemetry_log,
+                                    bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Attested.as_str(),
+                                    "PR_NUMBER_REREZOLVE_TRANSIENT_ERROR",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "branch": overlay.branch,
+                                        "phase": "pre_gate_validation",
+                                        "error": format!("{e:?}"),
+                                    }),
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
+                Ok(other) => {
+                    // Closed/missing/fork — emit mismatch, re-resolve by
+                    // head branch; defer if no live PR.
+                    let _ = emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Attested.as_str(),
+                        "PR_PRE_GATE_VALIDATION_MISMATCH",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "branch": overlay.branch,
+                            "stored_pr_number": pr,
+                            "open_pr_head_ref_resolution": format!("{other:?}"),
+                            "reason": "stored_pr_no_longer_open_or_branch_mismatch",
+                        }),
+                    );
+                    match deps
+                        .scm
+                        .pr_number_for_branch(&repo, overlay.branch.as_deref().unwrap_or(""))
+                    {
+                        Ok(Some(discovered)) => {
+                            overlay.pr_number = Some(discovered);
+                            deps.store.save(&overlay)?;
+                            emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::Attested.as_str(),
+                                "PR_NUMBER_REREZOLVED",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "branch": overlay.branch,
+                                    "previous_pr_number": pr,
+                                    "current_pr_number": discovered,
+                                    "reason": "pre_gate_validation_drift",
+                                }),
+                            )?;
+                            discovered
+                        }
+                        Ok(None) => {
+                            // jleechan-t40t r12 (issue #326): stored PR is
+                            // closed/missing and the branch has no live PR.
+                            // Demote ATTESTED→DISPATCHED (rather than leaving it
+                            // ATTESTED with a null pr_number, which strands it)
+                            // so the DISPATCHED re-resolution path re-promotes
+                            // it when a live PR appears.
+                            overlay.pr_number = None;
+                            overlay.state = OverlayState::Dispatched;
+                            deps.store.save(&overlay)?;
+                            let _ = emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::Dispatched.as_str(),
+                                "PR_NUMBER_REREZOLVED_NO_OPEN_PR",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "branch": overlay.branch,
+                                    "previous_pr_number": pr,
+                                    "current_pr_number": serde_json::Value::Null,
+                                    "reason": "pre_gate_validation_no_open_pr",
+                                    "action": "demoted_attested_to_dispatched_for_rerezolve",
+                                }),
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::Attested.as_str(),
+                                "PR_NUMBER_REREZOLVE_TRANSIENT_ERROR",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "branch": overlay.branch,
+                                    "phase": "pre_gate_validation",
+                                    "error": format!("{e:?}"),
+                                }),
+                            );
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Attested.as_str(),
+                        "PR_PRE_GATE_VALIDATION_TRANSIENT_ERROR",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "branch": overlay.branch,
+                            "stored_pr_number": pr,
+                            "error": format!("{e:?}"),
+                        }),
+                    );
+                    continue;
+                }
+            }
+        };
+        let pr = pre_gate_pr;
 
         // jleechan-qdw: per-bead isolation. A transient `gh`/GraphQL/network
         // hiccup fetching THIS bead's PR snapshot must not abort the fast
@@ -2581,15 +2903,60 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             // jleechan-nplh: a verdict comment older than the current head
             // commit is stale evidence — gate 6 must not self-certify from
             // it (same staleness rule as `er_runner::maybe_run` step 2).
-            None => verifier::parse_er_verdict_since(
-                &snapshot.comments,
-                snapshot.head_committed_epoch,
-            ),
+            None => {
+                verifier::parse_er_verdict_since(&snapshot.comments, snapshot.head_committed_epoch)
+            }
         };
         evidence.is_production = verifier::classify_production(&snapshot.files);
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
-        evidence.has_integration_evidence_marker =
-            verifier::check_integration_marker(&snapshot.body, &snapshot.comments);
+        // Bead jleechan-yoqy / issue #323 (r5): verify the canonical evidence
+        // contract fail-closed. A fully-parsed marker MUST reference the PR's
+        // current head AND point at a gist that is fetchable + non-empty. r5
+        // finding 2: a marker LINE present but incomplete (missing gist URL or
+        // `(head <sha>)`) is a definitive FAIL, not NotProvided — only a
+        // genuinely absent marker is NotProvided. r5 finding 3: a TRANSIENT
+        // gist-fetch error is Pending (Unknown/wait), never a Red that churns a
+        // reroll; only a definitive miss (empty / 404) is Failed. Only PRs
+        // carrying a marker incur the gist API call.
+        evidence.evidence_gist_status = match verifier::parse_evidence(&snapshot.body) {
+            Some(parsed) => {
+                let head_matches = {
+                    let want = snapshot.head_sha.to_ascii_lowercase();
+                    let got = parsed.head_sha.to_ascii_lowercase();
+                    !got.is_empty()
+                        && !want.is_empty()
+                        && (want.starts_with(&got) || got.starts_with(&want))
+                };
+                if !head_matches {
+                    verifier::EvidenceGistStatus::Failed(format!(
+                        "evidence head {} does not match PR head {}",
+                        parsed.head_sha, snapshot.head_sha
+                    ))
+                } else {
+                    match deps.scm.gist_nonempty(&parsed.gist_id) {
+                        Ok(Some(true)) => verifier::EvidenceGistStatus::Verified,
+                        Ok(Some(false)) => verifier::EvidenceGistStatus::Failed(format!(
+                            "evidence gist {} is empty",
+                            parsed.gist_id
+                        )),
+                        Ok(None) => verifier::EvidenceGistStatus::Failed(format!(
+                            "evidence gist {} not found",
+                            parsed.gist_id
+                        )),
+                        Err(e) => verifier::EvidenceGistStatus::Pending(format!(
+                            "evidence gist {} fetch failed transiently: {e}",
+                            parsed.gist_id
+                        )),
+                    }
+                }
+            }
+            None if verifier::has_evidence_marker(&snapshot.body) => {
+                verifier::EvidenceGistStatus::Failed(
+                    "evidence marker present but missing a gist URL or `(head <sha>)`".to_string(),
+                )
+            }
+            None => verifier::EvidenceGistStatus::NotProvided,
+        };
         let report = verifier::assess(deps.scm, pr, &repo, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
         // jleechan-wzgl: log the full per-gate breakdown (all 7 gates,
@@ -2785,10 +3152,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     }
                     overlay.state = OverlayState::HumanHeld;
                     overlay.attempt = MAX_HUMAN_HELD_RECOVERY_ATTEMPT;
-                    set_human_hold_reason(
-                        &mut overlay,
-                        HumanHoldReason::UnknownOnlyGateCapped,
-                    );
+                    set_human_hold_reason(&mut overlay, HumanHoldReason::UnknownOnlyGateCapped);
                     deps.store.save(&overlay)?;
                     record_escalation(
                         deps,
@@ -3056,10 +3420,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         // invisible to recovery. Park it HUMAN_HELD with a
                         // distinct, operator-visible reason instead.
                         overlay.state = OverlayState::HumanHeld;
-                        set_human_hold_reason(
-                            &mut overlay,
-                            HumanHoldReason::RerollPermanentError,
-                        );
+                        set_human_hold_reason(&mut overlay, HumanHoldReason::RerollPermanentError);
                         deps.store.save(&overlay)?;
                         summary.beads_parked_human_held += 1;
                         emit(
