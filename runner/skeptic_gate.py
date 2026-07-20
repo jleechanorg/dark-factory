@@ -264,10 +264,16 @@ class AcceptanceItem:
     verbatim wording the bead author wrote — it is the durable
     input the gate checks against and the constraint that flows
     into the next roll on NOT-ADDRESSED.
+
+    `required` (issue #386 r3, gap 5): when True, a reviewer
+    verdict of `N-A` is treated as unaddressed — the bead author
+    is saying "this must be done", so the reviewer cannot opt out.
+    Defaults to False for backward compatibility with r2 contracts.
     """
 
     id: str
     text: str
+    required: bool = False
 
 
 @dataclass(frozen=True)
@@ -277,7 +283,9 @@ class PriorFinding:
 
     `source` is free-form (e.g. "r5 reviewer", "skeptic r3") and
     `text` is the verbatim finding. The prompt embeds both so the
-    reviewer can address each prior item.
+    reviewer can address each prior item. r3 promotes prior findings
+    from prompt-only (gap 7 P2) to per-item enforced via
+    `evaluate_contract_echo(report_prior_findings=...)`.
     """
 
     source: str
@@ -290,7 +298,10 @@ class BeadContract:
 
     `id` is the bead identifier (`jleechan-pq08` for this work).
     `description` is the bead's body — the goal the worker is
-    implementing. `prior_findings` lists findings from prior rounds
+    implementing. `notes` (r3, gap 1) carries operator guidance
+    distinct from description (the bead author's free-form guidance
+    notes from `br show <id>` reach the reviewer as a separate
+    section). `prior_findings` lists findings from prior rounds
     that the bead author wants the reviewer to re-verify. Every
     `acceptance_items` entry is what the gate requires per-item
     verdicts for; if even one is `NOT-ADDRESSED` in the diff, the
@@ -299,6 +310,7 @@ class BeadContract:
 
     id: str
     description: str
+    notes: Tuple[str, ...] = ()
     prior_findings: Tuple[PriorFinding, ...] = ()
     acceptance_items: Tuple[AcceptanceItem, ...] = ()
 
@@ -349,6 +361,22 @@ class ContractEchoVerdictResult:
     ok: bool
     unaddressed_items: Tuple[AcceptanceItem, ...] = ()
     constraint: str = ""
+    unaddressed_prior_findings: Tuple[PriorFinding, ...] = ()
+
+
+@dataclass(frozen=True)
+class PriorFindingEcho:
+    """A reviewer verdict on a single PriorFinding.
+
+    Pairs a `PriorFinding`'s `source` (its stable identifier) with
+    a verdict and optional cite / reason. Same verdict vocabulary as
+    `ContractEchoItem` but indexed by source rather than a generated id.
+    """
+
+    source: str
+    verdict: ContractEchoVerdict
+    cite: str = ""
+    reason: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +546,18 @@ def load_bead_contract(source: Union[str, os.PathLike, dict, BeadContract]) -> B
 
     description = str(data.get("description") or "")
 
+    raw_notes = data.get("notes")
+    if raw_notes is None:
+        notes: Tuple[str, ...] = ()
+    elif isinstance(raw_notes, list):
+        notes = tuple(str(n) for n in raw_notes)
+    elif isinstance(raw_notes, str):
+        notes = (raw_notes,)
+    else:
+        raise TypeError(
+            "load_bead_contract: 'notes' must be a string or list of strings"
+        )
+
     raw_prior = data.get("prior_findings") or []
     if not isinstance(raw_prior, list):
         raise TypeError("load_bead_contract: 'prior_findings' must be a list")
@@ -562,15 +602,85 @@ def load_bead_contract(source: Union[str, os.PathLike, dict, BeadContract]) -> B
             AcceptanceItem(
                 id=item_id,
                 text=str(it.get("text") or "").strip(),
+                required=bool(it.get("required") or False),
             )
         )
 
     return BeadContract(
         id=bead_id,
         description=description,
+        notes=notes,
         prior_findings=tuple(prior_findings),
         acceptance_items=tuple(acceptance_items),
     )
+
+
+def _br_show_json(bead_id: str, br_bin: str = "br") -> str:
+    """Subprocess wrapper around `br show <bead_id> --json`.
+
+    Returns stdout as a JSON string. The single source of truth
+    for the bead — used by `load_bead_contract_from_bead` to
+    materialise a `BeadContract` from the live bead source instead
+    of a hand-authored contract file.
+
+    Exposed at module level so tests can monkeypatch this without
+    spawning a real `br` subprocess. The function is intentionally
+    a thin subprocess wrapper — fail-closed on any error so the
+    caller never receives a fabricated contract (issue #386 r3,
+    gap 2).
+    """
+    import subprocess
+
+    proc = subprocess.run(
+        [br_bin, "show", "--json", bead_id],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"_br_show_json: br show --json {bead_id!r} failed "
+            f"(rc={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
+        )
+    return proc.stdout
+
+
+def load_bead_contract_from_bead(
+    bead_id: str, br_bin: str = "br"
+) -> BeadContract:
+    """Load a `BeadContract` directly from the live bead source.
+
+    Closes r3 gap 2: production was hand-authoring contracts and
+    depending on `--contract-file` only. This reader pulls the
+    bead's actual `description`, `notes`, `prior_findings`, and
+    `acceptance_items` from `br show --json <id>` and feeds them
+    through `load_bead_contract` for the same validation.
+
+    Field mapping (the bead JSON shape is documented in
+    `~/.claude/docs/beads.md`):
+      - `description` (str)  -> description
+      - `notes` (str|list)   -> notes
+      - `prior_findings`     -> prior_findings (the bead author
+                                embeds these as `[ {source, text} ]`
+                                in the bead's notes JSON block;
+                                absent `prior_findings` is allowed
+                                and falls back to the most-recent
+                                contract-echo report's unaddressed
+                                items cached at
+                                `.cache/contract_echo/<bead>.json`)
+      - `acceptance_items`  -> acceptance_items; the bead JSON
+                                uses `id` / `text` / `required`
+                                keys per item, matching the
+                                contract-echo format.
+
+    Subprocess and parse errors raise so callers fail closed —
+    never silently fabricate a contract. Tests stub
+    `_br_show_json` rather than spawning `br`.
+    """
+    raw = _br_show_json(bead_id, br_bin=br_bin)
+    payload = json.loads(raw)
+    payload.setdefault("id", bead_id)
+    return load_bead_contract(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -709,8 +819,9 @@ def parse_contract_echo(
 def evaluate_contract_echo(
     report: Optional[ContractEchoReport],
     contract: BeadContract,
+    report_prior_findings: Optional[Tuple["PriorFindingEcho", ...]] = None,
 ) -> ContractEchoVerdictResult:
-    """Check that every acceptance item is ADDRESSED or N-A.
+    """Check that every acceptance item is ADDRESSED or N-A (with caveats).
 
     - `ADDRESSED` (with a `CITE:` file:line): the reviewer claims the
       diff addresses this item; we trust the reviewer on the cite
@@ -718,9 +829,13 @@ def evaluate_contract_echo(
       contract in `parse_verdict` is what backs the claim).
     - `N-A` (with a `REASON:`): the reviewer says the item is not
       applicable this round; this counts as a pass IF the reason is
-      non-empty. An empty `N-A` reason is rejected at parse time
-      (see `parse_contract_echo`), so by the time we get here, a
-      `N-A` item is always with a reason.
+      non-empty AND the item is not `required=True`. An empty
+      `N-A` reason is rejected at parse time (see
+      `parse_contract_echo`), so by the time we get here, a
+      `N-A` item is always with a reason. r3 (gap 5): if the item
+      is `required=True`, `N-A` is treated as unaddressed —
+      the bead author says "this MUST be done", so the reviewer
+      cannot opt out.
     - `NOT-ADDRESSED` (with a `REASON:`): the reviewer flags the
       item as unaddressed; we surface it verbatim in
       `unaddressed_items` and `constraint`.
@@ -729,6 +844,15 @@ def evaluate_contract_echo(
       cover it.
     - `report is None` (no `CONTRACT_ECHO:` block at all): every
       contract item is unaddressed.
+
+    Prior findings (r3, gap 7 P2): when `report_prior_findings` is
+    supplied, every `PriorFinding` listed in the contract must be
+    covered (ADDRESSED or N-A). Uncovered prior findings are
+    surfaced in `unaddressed_prior_findings` and appended to
+    `constraint` verbatim. Prior findings are prompt-only when
+    `report_prior_findings=None` (preserves r2 behavior on
+    contracts whose bead did not opt into prior-finding
+    enforcement).
 
     The `constraint` string carries the unaddressed items VERBATIM
     (the bead author's text, not a paraphrase) so the next roll's
@@ -760,15 +884,35 @@ def evaluate_contract_echo(
             # Reason is required at parse time; defensively re-check.
             if not verdict_item.reason:
                 unaddressed.append(item)
+                continue
+            # r3 gap 5: required items cannot be N-A'd away.
+            if item.required:
+                unaddressed.append(item)
+                continue
             continue
         # NOT-ADDRESSED or anything else: unaddressed.
         unaddressed.append(item)
 
-    if not unaddressed:
+    unaddressed_prior: List[PriorFinding] = []
+    if report_prior_findings is not None:
+        emitted_pf = {pf.source: pf for pf in report_prior_findings}
+        for pf in contract.prior_findings:
+            verdict_pf = emitted_pf.get(pf.source)
+            if verdict_pf is None:
+                unaddressed_prior.append(pf)
+                continue
+            if verdict_pf.verdict == "ADDRESSED":
+                continue
+            if verdict_pf.verdict == "N-A" and verdict_pf.reason:
+                continue
+            unaddressed_prior.append(pf)
+
+    if not unaddressed and not unaddressed_prior:
         return ContractEchoVerdictResult(
             ok=True,
             unaddressed_items=(),
             constraint="",
+            unaddressed_prior_findings=(),
         )
 
     # Build the constraint string with the unaddressed items'
@@ -781,11 +925,21 @@ def evaluate_contract_echo(
         "",
     ]
     for item in unaddressed:
-        lines.append(f"- {item.id}: {item.text}")
+        required_marker = " [REQUIRED]" if item.required else ""
+        lines.append(f"- {item.id}{required_marker}: {item.text}")
+    if unaddressed_prior:
+        lines.append("")
+        lines.append(
+            f"Prior findings NOT-ADDRESSED: {len(unaddressed_prior)} "
+            "(verbatim from prior-round reviewer / CodeRabbit etc.):"
+        )
+        for pf in unaddressed_prior:
+            lines.append(f"- {pf.source}: {pf.text}")
     return ContractEchoVerdictResult(
         ok=False,
         unaddressed_items=tuple(unaddressed),
         constraint="\n".join(lines),
+        unaddressed_prior_findings=tuple(unaddressed_prior),
     )
 
 
@@ -1922,6 +2076,14 @@ output requirement below.
 - Bead id: {bead_id}
 - Description: {bead_description}
 
+## Operator notes (bead author free-form guidance)
+
+The following notes are authoritative operator guidance distinct
+from the description. Follow the operator guidance when applying
+the acceptance items and prior findings below:
+
+{notes_block}
+
 ## Prior findings
 
 The following findings from prior rounds are open unless the
@@ -1936,7 +2098,9 @@ The bead author has set the following acceptance items. Every item
 MUST appear in the `CONTRACT_ECHO:` block below with one of
 `ADDRESSED` (with `CITE: <file:line>`), `NOT-ADDRESSED` (with
 `REASON: <text>`), or `N-A` (with `REASON: <text>`). Missing items
-are treated as `NOT-ADDRESSED` and the gate fails closed:
+are treated as `NOT-ADDRESSED` and the gate fails closed. Items
+marked `[REQUIRED]` cannot be `N-A`'d away — the bead author says
+they must be addressed in this round.
 
 {acceptance_items_block}
 """
@@ -1956,7 +2120,17 @@ def _format_acceptance_items_block(items: Tuple[AcceptanceItem, ...]) -> str:
         return "(no acceptance items)"
     lines = []
     for it in items:
-        lines.append(f"- {it.id}: {it.text}")
+        required_marker = " [REQUIRED]" if it.required else ""
+        lines.append(f"- {it.id}{required_marker}: {it.text}")
+    return "\n".join(lines)
+
+
+def _format_notes_block(notes: Tuple[str, ...]) -> str:
+    if not notes:
+        return "(no operator notes)"
+    lines = []
+    for i, note in enumerate(notes, 1):
+        lines.append(f"{i}. {note}")
     return "\n".join(lines)
 
 
@@ -1964,6 +2138,7 @@ def _build_contract_block(contract: BeadContract) -> str:
     return _CONTRACT_BLOCK_TEMPLATE.format(
         bead_id=contract.id,
         bead_description=contract.description or "(no description)",
+        notes_block=_format_notes_block(contract.notes),
         prior_findings_block=_format_prior_findings_block(contract.prior_findings),
         acceptance_items_block=_format_acceptance_items_block(contract.acceptance_items),
     )
@@ -2025,6 +2200,7 @@ __all__ = [
     "ParsedTestRun",
     "ParsedVerdict",
     "PriorFinding",
+    "PriorFindingEcho",
     "REVIEWER_CLI_TO_IDENTITY",
     "ReadBackCheck",
     "SkepticResult",
@@ -2039,6 +2215,7 @@ __all__ = [
     "extract_implementation_identity_from_commit",
     "format_comment",
     "load_bead_contract",
+    "load_bead_contract_from_bead",
     "parse_contract_echo",
     "parse_verdict",
     "verify_published_comment",
