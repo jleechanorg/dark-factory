@@ -136,6 +136,7 @@ from .handler_universal_prompts import (
     UNIVERSAL_DEAD_CODE_PROMPT,
     _gate_dead_code,
     _gate_skeptic,
+    _gate_cross_model,
 )
 
 # Net-LOC + slash + pytest gates.
@@ -216,6 +217,7 @@ TYPE_REGISTRY: "dict[str, Handler]" = {
     "gate_green": _gate_green,
     "gate_audit": _gate_audit,
     "gate_evidence_audit": _gate_audit,
+    "gate_cross_model": _gate_cross_model,
     "parallel": _parallel_fanout,       # fan-out type (type=parallel)
     "join": _join_handler,              # fan-in type (type=join)
     "parallel_reviewer": _parallel_reviewer,

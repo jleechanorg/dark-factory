@@ -493,3 +493,172 @@ def _gate_skeptic(node: "Node", ctx: "Context") -> "Result":
     if local_cmd.exists():
         return _slash_gate("skeptic")(node, ctx)
     return _run_universal_prompt_gate(UNIVERSAL_SKEPTIC_PROMPT, "gate_skeptic", node, ctx)
+
+
+# ---------------------------------------------------------------------------
+# Cross-model reviewer gate (issue #385 / bead jleechan-984e)
+# ---------------------------------------------------------------------------
+#
+# vendor-fallback chain (cursor-agent → codex → agy) owned by
+# ``runner.cross_model_reviewer``. The differ-from-coder-family rule
+# is enforced there; here we only wire it into the gate machinery +
+# emit ``cross_model_degraded`` metadata (read by strict-merge #328
+# to refuse strict-green when only one model family participated).
+
+UNIVERSAL_CROSS_MODEL_PROMPT = """\
+You are an executing cross-model reviewer for a Dark Factory PR.
+
+You are NOT the implementing agent. You MUST NOT be a sibling of the
+coder's model family when a different vendor is available — that is
+the cross-model guarantee this gate exists to enforce. Read the diff
+listed below, run the project's tests and lint, and emit a structured
+verdict at the end.
+
+If the diff is wrong, broken, or under-tested, your VERDICT MUST be
+``fail``. If the diff is sound and the evidence it cites is real,
+your VERDICT MUST be ``pass``. There is no third option.
+
+Your response MUST be valid Markdown and MUST contain exactly the
+following two lines at the very end (machine contract — missing or
+malformed lines fail the gate):
+
+  verdict: <pass|fail>
+  head_sha: {expected_sha}
+
+Optional: include a brief human-readable section above the
+machine-contract lines describing the one or two highest-leverage
+findings (or `no findings`).
+"""
+
+
+def _gate_cross_model(node: "Node", ctx: "Context") -> "Result":
+    """Cross-model reviewer gate.
+
+    Resolves the next available vendor in the chain, invokes it
+    against the current diff, parses its verdict via the canonical
+    ``runner.cross_model_reviewer.aggregate_cross_model_verdict``
+    (which routes through ``runner.handler_verdict._parse_verdict`` so
+    verdict-token semantics stay in one module), and emits the
+    resolution + verdict into ``Result.metadata`` for CXDB / perf_log
+    consumption.
+
+    Strict-merge policy #328 reads ``metadata["cross_model_degraded"]``
+    and refuses ``strict-green`` when the value is ``"true"``.
+    """
+    # Late import keeps the module-level dependency graph acyclic
+    # (cross_model_reviewer imports handler_verdict which is already
+    # imported by handlers).
+    from .cross_model_reviewer import (
+        aggregate_cross_model_verdict,
+        build_metadata,
+        resolve_cross_model_reviewer,
+    )
+
+    # Custom-prompt precedence identical to other gate_* handlers.
+    if _node_prompt_ref(node):
+        return _run_custom_prompt_gate(node, ctx, "gate_cross_model")
+
+    # Echo / mock_llm backend: tests pre-seed the verdict via state
+    # hint so they can drive the gate deterministically without an
+    # LLM subprocess.
+    if ctx.backend in ("echo", "mock_llm"):
+        hint = ctx.state.get(f"{node.name}.outcome", "success")
+        verdict_raw = "pass" if hint == "success" else "fail"
+        # Build a synthetic resolution so the metadata shape stays
+        # consistent (operator/CXDB readers always see the keys).
+        from .cross_model_reviewer import (
+            CROSS_MODEL_VENDOR_CHAIN,
+            CrossModelResolution,
+            CrossModelVerdict,
+        )
+
+        fake_resolution = CrossModelResolution(
+            vendor=CROSS_MODEL_VENDOR_CHAIN[0],
+            family="echo",
+            skipped=(),
+            degraded=False,
+        )
+        fake_verdict = CrossModelVerdict(
+            raw_verdict=verdict_raw,
+            normalized_outcome=hint,
+            parsed_text=f"verdict: {verdict_raw}",
+        )
+        meta = build_metadata(resolution=fake_resolution, verdict=fake_verdict)
+        meta["slash_command"] = "gate_cross_model"
+        return Result(
+            outcome=hint,
+            output=f"echo gate_cross_model: pre-seeded {hint}",
+            metadata=meta,
+        )
+
+    # Resolve the next vendor in the chain (cursor-agent → codex →
+    # agy). Defaults are the canonical chain; tests can override via
+    # node attrs.
+    coder_family = node.attrs.get("coder_family")  # escape hatch for tests
+    resolution = resolve_cross_model_reviewer(
+        coder_backend=ctx.backend,
+        coder_family=coder_family,
+    )
+
+    # No vendor available — fail closed with degraded metadata so
+    # strict-merge #328 refuses strict-green.
+    if resolution.vendor is None:
+        verdict = aggregate_cross_model_verdict("")
+        meta = build_metadata(resolution=resolution, verdict=verdict)
+        meta["slash_command"] = "gate_cross_model"
+        return Result(
+            outcome="failure",
+            output=(
+                f"gate_cross_model: no vendor in chain "
+                f"{list(resolution.skipped)} is installed"
+            ),
+            metadata=meta,
+        )
+
+    # Bind the verdict to the current HEAD SHA so a stale or
+    # late-arriving verdict cannot be applied to a different commit.
+    expected_sha = _handlers_shim._worktree_head_sha(ctx.workdir)
+    if expected_sha is None:
+        verdict = aggregate_cross_model_verdict("")
+        meta = build_metadata(resolution=resolution, verdict=verdict)
+        meta["slash_command"] = "gate_cross_model"
+        meta["head_sha_status"] = "missing"
+        return Result(
+            outcome="error",
+            output=f"gate_cross_model cannot resolve HEAD SHA for {ctx.workdir}",
+            metadata=meta,
+        )
+
+    sha_directive = (
+        f"\n\n<!-- RUNNER BINDING REQUIREMENT (non-negotiable) -->\n"
+        f"expected_head_sha: {expected_sha}\n\n"
+        f"CRITICAL: Your response MUST include the following line verbatim:\n"
+        f"head_sha: {expected_sha}\n"
+    )
+    prompt = UNIVERSAL_CROSS_MODEL_PROMPT.format(expected_sha=expected_sha) + sha_directive
+    timeout = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1200"), 1200)
+
+    # Honor the resolver's vendor end-to-end. We bypass _resolve_gate_backend's
+    # priority-queue so the cross-model chain's chosen vendor is the actual
+    # subprocess (not silently collapsed back to claude). For runners that
+    # don't expose the underlying gate runner, fall back to the priority-
+    # queue path; the resolved backend STILL drives the verdict via the
+    # _run_gate_once helper which inspects backend routing.
+    backend = resolution.vendor
+    result = _handlers_shim._run_gate_once(
+        backend=backend,
+        prompt=prompt,
+        expected_sha=expected_sha,
+        timeout=timeout,
+        ctx=ctx,
+        name="gate_cross_model",
+        gate_strict=_gate_strict_flag(node),
+    )
+
+    # Parse the model output through the canonical verdict parser so
+    # verdict-token semantics stay in one module (handler_verdict).
+    verdict = aggregate_cross_model_verdict(result.output or "")
+    meta = build_metadata(resolution=resolution, verdict=verdict)
+
+    result.metadata = {**result.metadata, **meta}
+    return result
