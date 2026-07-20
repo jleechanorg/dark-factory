@@ -6722,6 +6722,16 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
     // vendor3 (agy) is healthy and would have produced a usable verdict —
     // the bug is that it is never dispatched.
     write_fake_reviewer(&fake_bin_dir, "agy", "pass");
+    // vendor4 (gemini) is also healthy. Bead jleechan-984e r2 / strict
+    // merge policy (#328): because the dual-dispatch primaries (codex,
+    // claude) both failed to parse and only agy (the 3rd vendor in the
+    // fallback loop) produced a verdict, `used_vendors == ["agy"]` — a
+    // single-family review. This test now asserts the bead MUST park
+    // HUMAN_HELD instead of reaching READY: the fallback chain still works,
+    // but the cross-model guarantee refuses strict-green on a single-family
+    // Pass.
+    write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
@@ -6821,19 +6831,24 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    // Bead jleechan-984e r2 / strict merge policy (#328): the fallback
+    // chain still works (agy's verdict was parsed and recorded), but the
+    // cross-model guarantee refuses strict-green because only `agy` ran
+    // (single family). The bead must park HUMAN_HELD, NOT reach READY.
     assert_eq!(
-        summary.beads_ready, 1,
-        "jleechan-baaf regression: when the first two dispatched reviewer \
+        summary.beads_ready, 0,
+        "jleechan-baaf regression (r2): when the first two dispatched reviewer \
          vendors (codex, claude) both fail to produce a parseable verdict \
-         but a third vendor (agy) is available in `priority` and would \
-         succeed, `skeptic_evidence` must fall back to it instead of \
-         propagating a total-outage Err. summary={summary:?}\n\
-         telemetry:\n{telemetry}"
+         but a third vendor (agy) is available in `priority` and succeeds, \
+         `skeptic_evidence` MUST fall back to it (NOT propagate a total- \
+         outage Err) — but with single-family agy the bead MUST park on \
+         the cross-model gate (issue #385 / strict merge policy #328) \
+         instead of reaching READY. summary={summary:?}\ntelemetry:\n{telemetry}"
     );
     assert!(
-        telemetry.contains("\"all_green\":true"),
-        "GATE_ASSESSMENT must report all_green:true once the third vendor's \
-         verdict is used; telemetry:\n{telemetry}"
+        telemetry.contains("\"all_green\":false"),
+        "GATE_ASSESSMENT must report all_green:false because the cross-model \
+         gate blocks single-family Pass; telemetry:\n{telemetry}"
     );
 
     let overlay = store
@@ -6842,9 +6857,26 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
         .expect("overlay must still exist");
     assert_eq!(
         overlay.state,
-        OverlayState::Ready,
-        "bead must reach READY via the third vendor's verdict, not stay \
-         ATTESTED on a false total-outage"
+        OverlayState::HumanHeld,
+        "bead must park HUMAN_HELD via the third vendor's verdict on the \
+         cross-model gate failure, not stay ATTESTED on a false total-outage \
+         and not reach READY (single-family review cannot pass strict merge \
+         policy #328)"
+    );
+    // The fallback chain itself MUST have worked — `agy` must appear in
+    // skeptic_reviewers (proving the 3rd-vendor slot was reached and its
+    // verdict parsed). This is the regression guard for the baaf bug:
+    // before the fix, an outage of the first two vendors caused a total-
+    // outage Err, never reaching agy.
+    assert!(
+        telemetry.contains("\"skeptic_reviewers\":[\"agy\"]"),
+        "fallback chain regression (baaf): agy must appear in skeptic_reviewers \
+         after codex+claude both fail to parse; telemetry:\n{telemetry}"
+    );
+    assert!(
+        telemetry.contains("\"review_degraded\":true"),
+        "single-family agy review MUST emit review_degraded:true so strict \
+         merge policy #328 refuses strict-green; telemetry:\n{telemetry}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -6886,6 +6918,14 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     write_fake_reviewer(&fake_bin_dir, "codex", "not a verdict at all");
     write_fake_reviewer(&fake_bin_dir, "claude", "still not a verdict");
     write_fake_reviewer(&fake_bin_dir, "agy", "pass");
+    // Bead jleechan-984e r2 / strict merge policy (#328): agy alone is a
+    // single-family review, so we add gemini (google-gemini family) as a
+    // second healthy vendor so the cross-model guarantee is satisfied.
+    // This keeps the test focused on its wzgl-acceptance (per-gate
+    // breakdown + vendor identity in telemetry) without coupling it to the
+    // cross-model gate failure mode covered by the cursor-agent test below.
+    write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
@@ -6981,9 +7021,15 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     )
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
+    // Bead jleechan-984e r2 / strict merge policy (#328): agy alone is a
+    // single-family review, so the bead must park HUMAN_HELD on the
+    // cross-model gate failure instead of reaching READY. The telemetry
+    // shape (per-gate object, vendor identity) is the focus of this test;
+    // the ready-vs-held outcome is a side effect of the r2 wiring.
     assert_eq!(
-        summary.beads_ready, 1,
-        "bead should reach READY via the agy fallback verdict"
+        summary.beads_ready, 0,
+        "bead must park HUMAN_HELD (single-family agy review is blocked by \
+         cross-model gate under r2 / strict merge policy #328)"
     );
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
@@ -7101,17 +7147,35 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         .expect("python3 predicate failed to run to completion");
     let predicate_stdout = String::from_utf8_lossy(&output.stdout);
     let predicate_stderr = String::from_utf8_lossy(&output.stderr);
+    // Bead jleechan-984e r2: agy alone is single-family, so the
+    // GATE_ASSESSMENT line is now NOT all-green (the skeptic gate emits
+    // verdict=fail with the cross-model reason). The auto-merge-guard.sh
+    // predicate parses the line (proving the dict-shaped gates + canonical
+    // vocab contract holds) and reports `FAIL:skeptic` with exit 1 because
+    // the cross-model gate tripped. The telemetry-shape contract is what
+    // this test exists to lock in; the ready-vs-fail outcome is the r2
+    // wiring's side effect.
     assert!(
-        output.status.success(),
-        "auto-merge-guard.sh's real predicate must accept the emitted \
-         GATE_ASSESSMENT line (dict-shaped gates, canonical vocab) for this \
-         all-green scenario; stdout={predicate_stdout}\nstderr={predicate_stderr}\n\
+        predicate_stderr.is_empty(),
+        "predicate must parse the GATE_ASSESSMENT line without stderr; \
+         stdout={predicate_stdout}\nstderr={predicate_stderr}\n\
          line={gate_assessment_line}"
     );
     assert!(
-        predicate_stdout.contains("no-fail"),
-        "expected a non-blocking 'no-fail' verdict from auto-merge-guard.sh's \
-         predicate for this all-green scenario; got: {predicate_stdout}"
+        predicate_stdout.starts_with("FAIL:"),
+        "r2 acceptance: single-family agy review must produce a \
+         FAIL:<gate> prefix from auto-merge-guard.sh (the cross-model gate \
+         blocks strict-green); got: {predicate_stdout}"
+    );
+    assert!(
+        predicate_stdout.contains("skeptic"),
+        "r2 acceptance: the FAIL must name the skeptic gate (the gate the \
+         cross-model wire flipped to fail); got: {predicate_stdout}"
+    );
+    assert!(
+        !output.status.success(),
+        "r2 acceptance: predicate must exit non-zero (block the merge) when \
+         cross-model gate fails; got exit success for stdout={predicate_stdout}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -7351,6 +7415,12 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
     // vendor4 (gemini) is healthy and would have produced a usable verdict
     // — the bug (pre-fix) is that `priority[3]` is never reached.
     write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
+    // vendor5 (cursor-agent) is also healthy. Bead jleechan-984e r2 /
+    // strict merge policy (#328): gemini + cursor-agent are two distinct
+    // model families (google-gemini, cursor), so the cross-model guarantee
+    // is satisfied and the bead reaches READY. `gemini` alone would now
+    // park HUMAN_HELD (single family).
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
@@ -7451,19 +7521,25 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    // Bead jleechan-984e r2 / strict merge policy (#328): the 4th-vendor
+    // fallback chain still works (gemini was reached and parsed), but the
+    // cross-model guarantee refuses strict-green because only gemini ran
+    // (single family). The bead must park HUMAN_HELD, NOT reach READY.
     assert_eq!(
-        summary.beads_ready, 1,
-        "jleechan-bkru regression: when the first THREE dispatched/fallback \
-         reviewer vendors (codex, claude, agy) all fail to produce a \
-         parseable verdict but a fourth vendor (gemini) is available in \
-         `priority` and would succeed, `skeptic_evidence` must fall back \
-         to it instead of propagating a total-outage Err. \
-         summary={summary:?}\ntelemetry:\n{telemetry}"
+        summary.beads_ready, 0,
+        "jleechan-bkru regression (r2): when the first THREE dispatched/ \
+         fallback reviewer vendors (codex, claude, agy) all fail to \
+         produce a parseable verdict but a fourth vendor (gemini) is \
+         available in `priority` and succeeds, `skeptic_evidence` MUST \
+         fall back to it (NOT propagate a total-outage Err) — but with \
+         single-family gemini the bead MUST park on the cross-model gate \
+         (issue #385 / strict merge policy #328) instead of reaching \
+         READY. summary={summary:?}\ntelemetry:\n{telemetry}"
     );
     assert!(
-        telemetry.contains("\"all_green\":true"),
-        "GATE_ASSESSMENT must report all_green:true once the fourth \
-         vendor's verdict is used; telemetry:\n{telemetry}"
+        telemetry.contains("\"all_green\":false"),
+        "GATE_ASSESSMENT must report all_green:false because the cross-model \
+         gate blocks single-family Pass; telemetry:\n{telemetry}"
     );
 
     let overlay = store
@@ -7472,9 +7548,25 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
         .expect("overlay must still exist");
     assert_eq!(
         overlay.state,
-        OverlayState::Ready,
-        "bead must reach READY via the fourth vendor's verdict, not stay \
-         ATTESTED on a false total-outage"
+        OverlayState::HumanHeld,
+        "bead must park HUMAN_HELD via the fourth vendor's verdict on the \
+         cross-model gate failure, not stay ATTESTED on a false total-outage \
+         and not reach READY (single-family review cannot pass strict merge \
+         policy #328)"
+    );
+    // The fallback chain itself MUST have worked — gemini must appear in
+    // skeptic_reviewers (proving the 4th-vendor slot was reached and its
+    // verdict parsed).
+    assert!(
+        telemetry.contains("\"skeptic_reviewers\":[\"gemini\"]"),
+        "fallback chain regression (bkru): gemini must appear in \
+         skeptic_reviewers after codex+claude+agy all fail to parse; \
+         telemetry:\n{telemetry}"
+    );
+    assert!(
+        telemetry.contains("\"review_degraded\":true"),
+        "single-family gemini review MUST emit review_degraded:true so \
+         strict merge policy #328 refuses strict-green; telemetry:\n{telemetry}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -7627,19 +7719,23 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    // Bead jleechan-984e r2 (issue #385 / strict merge policy #328):
+    // cursor-agent ALONE is a single-family review; strict merge policy now
+    // fail-closed refuses strict-green on that path. The bead must therefore
+    // NOT reach READY (it parks HUMAN_HELD on the cross-model gate failure).
+    // The fallback chain itself still works — `skeptic_reviewers` proves
+    // cursor-agent was reached and its verdict parsed.
     assert_eq!(
-        summary.beads_ready, 1,
-        "issue #385 regression: when the first FOUR dispatched/fallback \
-         reviewer vendors (codex, claude, agy, gemini) all fail to produce \
-         a parseable verdict but a fifth vendor (cursor-agent) is available \
-         in `priority` and would succeed, `skeptic_evidence` must fall back \
-         to it instead of propagating a total-outage Err. \
-         summary={summary:?}\ntelemetry:\n{telemetry}"
+        summary.beads_ready, 0,
+        "issue #385 r2 / strict merge policy #328: cursor-agent alone is a \
+         single-family review, so the bead must NOT reach READY (it must \
+         park on the cross-model gate failure, not propagate a total-outage \
+         Err). summary={summary:?}\ntelemetry:\n{telemetry}"
     );
     assert!(
-        telemetry.contains("\"all_green\":true"),
-        "GATE_ASSESSMENT must report all_green:true once cursor-agent's \
-         verdict is used; telemetry:\n{telemetry}"
+        telemetry.contains("\"all_green\":false"),
+        "GATE_ASSESSMENT must report all_green:false because the cross-model \
+         gate blocks single-family Pass; telemetry:\n{telemetry}"
     );
 
     // Acceptance check #1 from issue #385: the cursor-agent reviewer must
@@ -7681,28 +7777,55 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
     // Acceptance check #2 from issue #385: with only one vendor having
     // contributed (cursor-agent) and that vendor belonging to a single
     // model family, `review_degraded` MUST be true — strict merge policy
-    // (#328) MUST treat this assessment as NOT strict-green. The GATE
-    // ASSESSMENT can still be `all_green:true` (the verdict was Pass),
-    // but the degraded flag is the additional signal operators/auto-merge
-    // need to know the cross-model guarantee is NOT satisfied on this
-    // specific run (cursor-agent alone = single-family = same-model blind
-    // spots if the coder was also cursor).
+    // (#328) MUST treat this assessment as NOT strict-green. r2 wires that
+    // signal into the skeptic gate so all_green is now correctly false
+    // (instead of true-with-degraded-flag like in r1).
     assert_eq!(
         context["review_degraded"].as_bool(),
         Some(true),
         "issue #385 acceptance: review_degraded MUST be true when only one \
          model family (cursor) contributed; context:\n{context}"
     );
+    // r2 acceptance: the skeptic gate must emit the cross-model Red reason,
+    // not Pass.
+    let skeptic_gate = context["gates"]["skeptic"].clone();
+    let skeptic_verdict = skeptic_gate
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        skeptic_verdict, "fail",
+        "issue #385 r2 acceptance: cross-model gate must flip single-family \
+         Pass to fail; skeptic gate: {skeptic_gate}"
+    );
+    let skeptic_evidence = skeptic_gate
+        .get("evidence")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|e| e.as_str()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    assert!(
+        skeptic_evidence
+            .iter()
+            .any(|s| s.contains("cross-model") || s.contains("review_degraded")),
+        "issue #385 r2 acceptance: skeptic gate Red reason must name the \
+         cross-model failure; got: {skeptic_evidence:?}"
+    );
 
     let overlay = store
         .load("real-repo-bead-cursoragent")
         .unwrap()
         .expect("overlay must still exist");
+    // r2 / strict merge policy (#328): cursor-agent alone is a single-family
+    // review. The bead must park (HUMAN_HELD) on the cross-model gate
+    // failure, NOT reach READY. The dispatch worked — the verdict parsed —
+    // but the cross-model guarantee refuses strict-green until a second
+    // family contributes.
     assert_eq!(
         overlay.state,
-        OverlayState::Ready,
-        "bead must reach READY via cursor-agent's verdict, not stay ATTESTED \
-         on a false total-outage"
+        OverlayState::HumanHeld,
+        "issue #385 r2 / strict merge policy #328: cursor-agent alone is a \
+         single-family review; the bead must park HUMAN_HELD on the \
+         cross-model gate failure, not stay ATTESTED and not reach READY"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
