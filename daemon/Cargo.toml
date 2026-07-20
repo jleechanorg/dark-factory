@@ -7,6 +7,10 @@ edition = "2021"
 name = "vacuous_test_detector"
 path = "src/bin/vacuous_test_detector.rs"
 
+[[bin]]
+name = "vacuous_red_green"
+path = "src/bin/vacuous_red_green.rs"
+
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
