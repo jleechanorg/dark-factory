@@ -20,6 +20,7 @@ pub mod verifier;
 pub mod adapters;
 pub mod er_runner;
 pub mod vacuous;
+pub mod vacuous_red_green;
 
 
 pub mod gates_compute;

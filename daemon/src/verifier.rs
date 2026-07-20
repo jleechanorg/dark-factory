@@ -423,6 +423,43 @@ pub struct PrEvidence {
     /// (the default) means no evidence marker was in the body, so the existing
     /// LOC-floor logic applies unchanged.
     pub evidence_gist_status: EvidenceGistStatus,
+    /// Bead jleechan-ijod / issue #387 (r3): runtime red-green vacuous-test
+    /// detector verdict for the PR's new/changed tests. The detector
+    /// (`daemon::vacuous_red_green::check_red_green`) reverts the production
+    /// diff, runs the PR's targeted tests, and reports whether at least one
+    /// failed. `NotProvided` (the default) means the PR has no test files
+    /// in the diff and the detector skipped; `Genuine` means ≥1 test
+    /// failed on the reverted tree; `Vacuous` means every targeted test
+    /// passed on the reverted tree — the always-green-pin failure mode
+    /// from PR #382 / bead t8fd. `InfraError` is a transient infra failure
+    /// inside the detector (cargo build, git apply, etc.) and surfaces as
+    /// Unknown so a reroll doesn't churn on a flaky box.
+    pub vacuous_red_green: VacuousRedGreenStatus,
+}
+
+/// Bead jleechan-ijod / issue #387 (r3): outcome of the runtime red-green
+/// vacuous-test detector run against a PR's diff.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum VacuousRedGreenStatus {
+    /// No test files in the PR diff — the detector didn't run. Default;
+    /// preserves the pre-r3 gate behavior for non-test PRs.
+    #[default]
+    NotProvided,
+    /// At least one targeted test FAILED on the reverted tree (genuine
+    /// red-green; the test actually exercises the production logic).
+    Genuine {
+        failed_on_revert: usize,
+        targeted: usize,
+    },
+    /// Every targeted test PASSED on the reverted tree (vacuous coverage —
+    /// the test never actually exercises the production code it claims to).
+    Vacuous {
+        targeted: usize,
+        snippet: String,
+    },
+    /// Detector encountered an infra error (cargo build, git apply, etc.).
+    /// Surfaced as Unknown — not a vacuous verdict, not a clean pass.
+    InfraError(String),
 }
 
 /// Bead jleechan-yoqy / issue #323: fail-closed verification result for the
@@ -491,8 +528,37 @@ fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
     // fetchable + non-empty + head-matched) passes REGARDLESS of LOC; a
     // present-but-invalid marker is a distinct Red (fail-closed); a transient
     // gist-fetch failure is Unknown (wait, do not churn a reroll on gh noise).
+    //
+    // Bead jleechan-ijod / issue #387 (r3): a Vacuous runtime verdict
+    // OVERRIDES the verified-evidence green — vacuous tests pin a fake green
+    // bar; a verified gist can't certify a test that doesn't exercise prod.
+    // An InfraError also overrides the verified path (Unknown), so a flaky
+    // detector doesn't paper over a real defect with a verified gist.
     match &evidence.evidence_gist_status {
-        EvidenceGistStatus::Verified => return GateResult::Green,
+        EvidenceGistStatus::Verified => {
+            // Vacuous-test detector verdict takes precedence: if the
+            // detector ran and saw a vacuous signal, the verified-evidence
+            // path is NOT enough to green the gate. InfraError is
+            // Unknown (wait), Genuine/NotProvided fall through to green.
+            match &evidence.vacuous_red_green {
+                VacuousRedGreenStatus::Vacuous { targeted, snippet } => {
+                    return GateResult::Red(format!(
+                        "vacuous-test detector (issue #387, bead jleechan-ijod r3): \
+                         {targeted} targeted test(s) all pass on the reverted production \
+                         tree; the diff pins a green bar without exercising prod. \
+                         snippet: {snippet}"
+                    ));
+                }
+                VacuousRedGreenStatus::InfraError(reason) => {
+                    return GateResult::Unknown(format!(
+                        "vacuous-test detector infra error (issue #387): {reason}"
+                    ));
+                }
+                VacuousRedGreenStatus::Genuine { .. } | VacuousRedGreenStatus::NotProvided => {
+                    return GateResult::Green;
+                }
+            }
+        }
         EvidenceGistStatus::Failed(reason) => {
             return GateResult::Red(format!("evidence contract: {reason}"));
         }
@@ -507,7 +573,7 @@ fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
     // keyword and was the exact prior #323 bypass. Below the LOC floor a small
     // diff needs no evidence gist; at/above it, only a VERIFIED canonical
     // marker (handled above) greens the gate — otherwise it is Red.
-    if evidence.non_test_changed_loc <= EVIDENCE_FLOOR_LOC {
+    let loc_gate = if evidence.non_test_changed_loc <= EVIDENCE_FLOOR_LOC {
         GateResult::Green
     } else {
         GateResult::Red(
@@ -515,7 +581,29 @@ fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
              above the non-test LOC floor"
                 .to_string(),
         )
+    };
+
+    // Below the LOC floor the vacuous-test detector still applies (these
+    // signals are independent: small diffs are also vulnerable to
+    // always-green-pin tests, see issue #387 / PR #382). Vacuous → Red,
+    // InfraError → Unknown, Genuine/NotProvided → no override.
+    match &evidence.vacuous_red_green {
+        VacuousRedGreenStatus::Vacuous { targeted, snippet } => {
+            return GateResult::Red(format!(
+                "vacuous-test detector (issue #387, bead jleechan-ijod r3): {targeted} \
+                 targeted test(s) all pass on the reverted production tree; the diff pins \
+                 a green bar without exercising prod. snippet: {snippet}"
+            ));
+        }
+        VacuousRedGreenStatus::InfraError(reason) => {
+            return GateResult::Unknown(format!(
+                "vacuous-test detector infra error (issue #387): {reason}"
+            ));
+        }
+        VacuousRedGreenStatus::Genuine { .. } | VacuousRedGreenStatus::NotProvided => {}
     }
+
+    loc_gate
 }
 
 /// Bead jleechan-yoqy / issue #323: a parsed canonical evidence reference from
@@ -923,6 +1011,142 @@ pub fn assess(
     let all_green = results.iter().all(|(_, r)| r.is_green());
 
     Ok(GateReport { results, all_green })
+}
+
+// --- bead jleechan-ijod / issue #387 (r3) ---
+//
+// Helper that bridges `daemon::vacuous_red_green` to `VacuousRedGreenStatus`.
+// The runtime detector requires a local checkout (it spawns `cargo test` and
+// runs `git show <base>:<path>`); the daemon's main process talks to GitHub
+// via `gh` and does NOT have such a checkout, so this helper exposes the
+// two integration points the daemon needs:
+//
+//   * `vacuous_red_green_status_from_report` — pure map from the lib's
+//     `RedGreenReport` to the verifier-level `VacuousRedGreenStatus`. Used
+//     when the daemon can call the detector directly (e.g. tests, future
+//     worktree-aware paths).
+//
+//   * `run_vacuous_red_green_subprocess` — spawns the canonical
+//     `daemon/scripts/vacuous-red-green.sh` wrapper, parses the JSON
+//     RedGreenReport from `--json`, and maps it to VacuousRedGreenStatus.
+//     This is the integration point the fast tier uses when the operator
+//     has configured a worktree path (see `Config::vacuous_worktree_root`).
+//
+// Both keep the gate contract the single source of truth — the gate-6
+// verdict logic in `evidence_floor_gate` keys off VacuousRedGreenStatus,
+// NOT off exit codes or JSON shapes, so the lib and subprocess paths
+// can't drift.
+
+/// Map the runtime detector's `RedGreenReport` to the verifier-level
+/// `VacuousRedGreenStatus`. Pure (no IO); used by tests and any caller
+/// that has direct access to a checkout.
+pub fn vacuous_red_green_status_from_report(
+    report: &crate::vacuous_red_green::RedGreenReport,
+) -> VacuousRedGreenStatus {
+    if report.vacuous {
+        let snippet = format!(
+            "{} targeted test(s), 0 failed on revert: {:?}",
+            report.targeted_tests.len(),
+            report.targeted_tests
+        );
+        VacuousRedGreenStatus::Vacuous {
+            targeted: report.targeted_tests.len(),
+            snippet,
+        }
+    } else {
+        VacuousRedGreenStatus::Genuine {
+            failed_on_revert: report.failed_on_revert,
+            targeted: report.targeted_tests.len(),
+        }
+    }
+}
+
+/// Spawn the canonical `vacuous-red-green.sh` wrapper against a checked-out
+/// repo. Returns the parsed VacuousRedGreenStatus, or `InfraError` if the
+/// subprocess could not be invoked or its output was unparseable. The
+/// detector's own errors (e.g. `NoChangedTests`) are surfaced as
+/// `NotProvided` so the gate contract stays honest: "no test files in the
+/// diff" is not the same as "vacuous."
+///
+/// `wrapper_path` is the absolute path to
+/// `daemon/scripts/vacuous-red-green.sh`. `repo_root` is the worktree the
+/// detector should run against. `base_ref` is the PR's base SHA / branch.
+/// `changed_files` is the list of (repo-relative path, FileClass) pairs
+/// from `git diff --name-only base_ref...HEAD`.
+pub fn run_vacuous_red_green_subprocess(
+    wrapper_path: &std::path::Path,
+    repo_root: &std::path::Path,
+    base_ref: &str,
+    changed_files: &[(std::path::PathBuf, crate::vacuous_red_green::FileClass)],
+) -> VacuousRedGreenStatus {
+    use std::process::Command;
+
+    // No test files → no point spawning the detector; mirror the lib's
+    // NoChangedTests contract so the gate doesn't think it's missing
+    // signal.
+    if changed_files
+        .iter()
+        .all(|(_, k)| *k == crate::vacuous_red_green::FileClass::Production)
+    {
+        return VacuousRedGreenStatus::NotProvided;
+    }
+
+    // Write the JSON report to a tmp file so the wrapper has a place to
+    // drop it; on success we read + parse + unlink.
+    let tmp_json = std::env::temp_dir().join(format!(
+        "vacuous_red_green_{}_{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+
+    let mut cmd = Command::new(wrapper_path);
+    cmd.current_dir(repo_root)
+        .arg("--base")
+        .arg(base_ref)
+        .arg("--json")
+        .arg(&tmp_json);
+    for (path, _class) in changed_files {
+        cmd.arg("--files").arg(path);
+    }
+
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            return VacuousRedGreenStatus::InfraError(format!(
+                "vacuous-red-green.sh spawn failed: {e}"
+            ));
+        }
+    };
+
+    // Exit 0 = Genuine, 1 = Vacuous, 2 = error. Read the JSON regardless —
+    // the exit code is the binary verdict, but the JSON carries the count
+    // detail the gate message needs.
+    let json_text = match std::fs::read_to_string(&tmp_json) {
+        Ok(s) => s,
+        Err(e) => {
+            return VacuousRedGreenStatus::InfraError(format!(
+                "vacuous-red-green.sh json read failed: {e}; exit={:?}",
+                out.status.code()
+            ));
+        }
+    };
+    let _ = std::fs::remove_file(&tmp_json);
+
+    let report: crate::vacuous_red_green::RedGreenReport =
+        match serde_json::from_str(&json_text) {
+            Ok(r) => r,
+            Err(e) => {
+                return VacuousRedGreenStatus::InfraError(format!(
+                    "vacuous-red-green.sh json parse failed: {e}; exit={:?}",
+                    out.status.code()
+                ));
+            }
+        };
+
+    vacuous_red_green_status_from_report(&report)
 }
 
 // --- jleechan-zaga: structured gate-block classification (issue #348) ---
@@ -2521,6 +2745,128 @@ mod tests {
             ),
             other => panic!("expected Unknown, got {other:?}"),
         }
+    }
+
+    // --- bead jleechan-ijod / issue #387 (r3) ---
+    //
+    // The runtime red-green vacuous-test detector gates on
+    // `evidence_floor_gate` via the new `VacuousRedGreenStatus` field. The
+    // PR's overall gate-6 verdict is unchanged for `NotProvided` and
+    // `Genuine` (pre-r3 behavior). `Vacuous` flips the gate to Red (the
+    // always-green-pin failure mode from PR #382); `InfraError` flips to
+    // Unknown (transient, do not churn a reroll).
+
+    fn evidence_with_vacuous(status: VacuousRedGreenStatus) -> PrEvidence {
+        let mut ev = evidence_with_status(EvidenceGistStatus::Verified);
+        ev.vacuous_red_green = status;
+        ev
+    }
+
+    #[test]
+    fn evidence_gate_vacuous_test_is_red_with_snippet() {
+        // Vacuous coverage: every targeted test passed on the reverted
+        // production tree. The gate must be Red with a message that names
+        // the test count and bead provenance so an operator can audit.
+        let ev = evidence_with_vacuous(VacuousRedGreenStatus::Vacuous {
+            targeted: 3,
+            snippet: "3 targeted test(s), 0 failed on revert: [\"vacuous_constant_truth\"]"
+                .to_string(),
+        });
+        match evidence_floor_gate(&ev) {
+            GateResult::Red(reason) => {
+                assert!(
+                    reason.contains("vacuous-test detector") && reason.contains("issue #387"),
+                    "expected r3 vacuous-test text, got: {reason}"
+                );
+                assert!(
+                    reason.contains("3 targeted") || reason.contains("vacuous_constant_truth"),
+                    "expected the detector's count/snippet in the reason: {reason}"
+                );
+            }
+            other => panic!("expected Red(vacuous), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evidence_gate_vacuous_infra_error_is_unknown_not_red() {
+        // Transient infra failure inside the detector (cargo build, git
+        // apply, etc.) is Unknown — do NOT churn a reroll on a flaky box.
+        let ev = evidence_with_vacuous(VacuousRedGreenStatus::InfraError(
+            "vacuous-red-green.sh spawn failed: No such file or directory".to_string(),
+        ));
+        match evidence_floor_gate(&ev) {
+            GateResult::Unknown(reason) => {
+                assert!(
+                    reason.contains("vacuous-test detector infra error"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected Unknown(infra), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evidence_gate_vacuous_genuine_does_not_override_verified_evidence() {
+        // A genuine red-green verdict is information, not a gate override.
+        // A verified canonical evidence gist still greens the gate; the
+        // Genuine verdict just confirms the tests actually exercise prod.
+        let ev = evidence_with_vacuous(VacuousRedGreenStatus::Genuine {
+            failed_on_revert: 1,
+            targeted: 3,
+        });
+        assert!(
+            matches!(evidence_floor_gate(&ev), GateResult::Green),
+            "Genuine + verified evidence must be Green"
+        );
+    }
+
+    #[test]
+    fn evidence_gate_vacuous_not_provided_is_unchanged() {
+        // No test files in the diff → detector skipped → pre-r3 behavior.
+        // Verified evidence marker → Green (no regression for non-test PRs).
+        let ev = evidence_with_vacuous(VacuousRedGreenStatus::NotProvided);
+        assert!(matches!(evidence_floor_gate(&ev), GateResult::Green));
+    }
+
+    #[test]
+    fn vacuous_red_green_status_map_round_trips() {
+        // Pure mapping helper: a Genuine lib report must round-trip to
+        // Genuine verifier status, a Vacuous lib report to Vacuous. If
+        // this drifts, the gate sees stale signal.
+        use crate::vacuous_red_green::{FileClass, RedGreenReport};
+        let genuine = RedGreenReport {
+            vacuous: false,
+            failed_on_revert: 2,
+            targeted_tests: vec!["t1".into(), "t2".into()],
+            failing_tests: vec!["t2".into()],
+            skipped: false,
+        };
+        match vacuous_red_green_status_from_report(&genuine) {
+            VacuousRedGreenStatus::Genuine {
+                failed_on_revert,
+                targeted,
+            } => {
+                assert_eq!(failed_on_revert, 2);
+                assert_eq!(targeted, 2);
+            }
+            other => panic!("expected Genuine, got {other:?}"),
+        }
+        let vacuous = RedGreenReport {
+            vacuous: true,
+            failed_on_revert: 0,
+            targeted_tests: vec!["t1".into()],
+            failing_tests: vec![],
+            skipped: false,
+        };
+        match vacuous_red_green_status_from_report(&vacuous) {
+            VacuousRedGreenStatus::Vacuous { targeted, snippet } => {
+                assert_eq!(targeted, 1);
+                assert!(snippet.contains("t1"));
+            }
+            other => panic!("expected Vacuous, got {other:?}"),
+        }
+        // FileClass round-trip not needed — the helper doesn't take one.
+        let _ = FileClass::Test;
     }
 
     // jleechan-984e / issue #385: vendor → model family taxonomy.

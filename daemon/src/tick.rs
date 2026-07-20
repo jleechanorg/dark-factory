@@ -2201,6 +2201,11 @@ fn skeptic_evidence(
         review_degraded,
         // Set in the fast tier from the canonical evidence marker (#323).
         evidence_gist_status: verifier::EvidenceGistStatus::NotProvided,
+        // Bead jleechan-ijod / issue #387 (r3): the runtime vacuous-test
+        // detector only runs in the production-adjacent fast tier (which
+        // has the SCM/git context to derive the diff); Stage 1's mock-llm
+        // test-repo lane has no PR diff to revert, so it stays NotProvided.
+        vacuous_red_green: verifier::VacuousRedGreenStatus::NotProvided,
     })
 }
 
