@@ -509,7 +509,34 @@ pub trait Scm {
         let _ = (repo, branch);
         Ok(None)
     }
+    /// Bead jleechan-yoqy / issue #323: verify a gist for the evidence gate.
+    ///
+    /// - `Ok(Some(true))` — fetchable AND non-empty (evidence Verified).
+    /// - `Ok(Some(false))` — fetchable but EMPTY (definitive Failed).
+    /// - `Ok(None)` — DEFINITIVELY not found: 404 / deleted / private (Failed).
+    /// - `Err(..)` — TRANSIENT (gh outage / network): the gate waits (Unknown),
+    ///   it does NOT churn a reroll (r5 finding 3).
+    ///
+    /// Default impl is `Err` ("unverifiable") so fakes and impls that predate
+    /// this method never accidentally pass the gate; `CliScm` overrides it to
+    /// run `gh api gists/<id>`.
+    fn gist_nonempty(&self, gist_id: &str) -> Result<Option<bool>, DaemonError> {
+        Err(DaemonError::Tool {
+            tool: "gh".into(),
+            rc: -1,
+            stderr: format!("gist_nonempty not implemented for this adapter (gist {gist_id})"),
+        })
+    }
 }
+
+/// Bead jleechan-yoqy / issue #323: the ONE canonical evidence marker literal.
+/// The coder-dispatch prompt requires the coder to put
+/// `**Evidence**: <gist-url> (head <sha>)` in the PR body; the `/er` reviewer
+/// contract references this same constant; and the verifier parser matches it
+/// (case-insensitive, with the `**` bold markers optional). Defining it once
+/// here — the shared low-level module every layer imports — guarantees the
+/// prompt, the reviewer contract, and the parser can never drift apart.
+pub const EVIDENCE_MARKER: &str = "**Evidence**:";
 
 /// Resolution of an [`Scm::open_pr_head_ref_for_repo`] lookup (bead
 /// jleechan-drive-pr-branch-binding-pcpr). A three-way result rather than
