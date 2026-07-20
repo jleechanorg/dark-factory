@@ -73,9 +73,11 @@ diff.
 
 from __future__ import annotations
 
+import json
+import os
 import re
-from dataclasses import dataclass
-from typing import List, Literal, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Literal, Optional, Tuple, Union
 
 
 # Unique HTML marker used by the GitHub comment upsert logic. Any prior
@@ -218,6 +220,118 @@ class SkepticResult:
 
 
 # ---------------------------------------------------------------------------
+# Contract-echo types (issue #386)
+# ---------------------------------------------------------------------------
+#
+# The skeptic gate currently evaluates the diff in isolation. The
+# contract-echo step is the fix: the bead author writes a contract
+# (description, prior findings, acceptance items) once, and the
+# reviewer must emit per-item verdicts against it. Any acceptance
+# item that is NOT-ADDRESSED in the diff fails the gate closed and
+# surfaces the item's text verbatim — so the next roll's worker
+# reads the exact problem, not a paraphrase.
+
+
+ContractEchoVerdict = Literal["ADDRESSED", "NOT-ADDRESSED", "N-A"]
+
+
+@dataclass(frozen=True)
+class AcceptanceItem:
+    """A single acceptance criterion from the bead's contract.
+
+    `id` is the canonical identifier the reviewer echoes in the
+    `CONTRACT_ECHO:` block (e.g. `A1`, `A2`). `text` is the
+    verbatim wording the bead author wrote — it is the durable
+    input the gate checks against and the constraint that flows
+    into the next roll on NOT-ADDRESSED.
+    """
+
+    id: str
+    text: str
+
+
+@dataclass(frozen=True)
+class PriorFinding:
+    """A finding from a prior round that the bead author wants the
+    reviewer to address.
+
+    `source` is free-form (e.g. "r5 reviewer", "skeptic r3") and
+    `text` is the verbatim finding. The prompt embeds both so the
+    reviewer can address each prior item.
+    """
+
+    source: str
+    text: str
+
+
+@dataclass(frozen=True)
+class BeadContract:
+    """The bead's contract: the durable input to the contract-echo step.
+
+    `id` is the bead identifier (`jleechan-pq08` for this work).
+    `description` is the bead's body — the goal the worker is
+    implementing. `prior_findings` lists findings from prior rounds
+    that the bead author wants the reviewer to re-verify. Every
+    `acceptance_items` entry is what the gate requires per-item
+    verdicts for; if even one is `NOT-ADDRESSED` in the diff, the
+    gate fails closed.
+    """
+
+    id: str
+    description: str
+    prior_findings: Tuple[PriorFinding, ...] = ()
+    acceptance_items: Tuple[AcceptanceItem, ...] = ()
+
+
+@dataclass(frozen=True)
+class ContractEchoItem:
+    """A single per-item verdict extracted from the reviewer's output.
+
+    `cite` is the file:line where the reviewer says the item is
+    addressed (required for `ADDRESSED`, may be empty for
+    `NOT-ADDRESSED` or `N-A`). `reason` is the reviewer's
+    justification — required for `N-A` and `NOT-ADDRESSED`.
+    """
+
+    id: str
+    verdict: ContractEchoVerdict
+    cite: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ContractEchoReport:
+    """The full set of per-item verdicts the reviewer emitted.
+
+    `items` may be a strict subset of the contract's items when
+    the reviewer cited unknown IDs or omitted items. `evaluate_contract_echo`
+    cross-references this against the contract to determine which
+    items are unaddressed.
+    """
+
+    items: Tuple[ContractEchoItem, ...]
+
+
+@dataclass(frozen=True)
+class ContractEchoVerdictResult:
+    """Outcome of `evaluate_contract_echo`.
+
+    `ok=True` means every acceptance item is `ADDRESSED` or
+    `N-A` (with a reason). `ok=False` means at least one item
+    is `NOT-ADDRESSED` or missing; `unaddressed_items` carries
+    the full `AcceptanceItem` records (verbatim text) so the
+    next roll's worker reads the exact problem, not a paraphrase.
+    `constraint` is a human-readable constraint string suitable
+    for embedding in the gate's failure comment or handing to
+    the next roll.
+    """
+
+    ok: bool
+    unaddressed_items: Tuple[AcceptanceItem, ...] = ()
+    constraint: str = ""
+
+
+# ---------------------------------------------------------------------------
 # Anchored, case-insensitive, multi-match-detecting regexes
 # ---------------------------------------------------------------------------
 #
@@ -301,6 +415,358 @@ EXECUTION_EVIDENCE_FIELDS = (
     "GREP_CITES",
     "HEAD_COMMIT_VERIFIED",
 )
+
+
+# ---------------------------------------------------------------------------
+# Contract-echo regex (issue #386)
+# ---------------------------------------------------------------------------
+#
+# A per-item verdict line looks like:
+#   ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:42
+#   ITEM: A2 VERDICT: NOT-ADDRESSED REASON: omitted from diff
+#   ITEM: A3 VERDICT: N-A REASON: not applicable this round
+#
+# The line is anchored at start-of-line (re.MULTILINE) and the
+# verdict token is restricted to the three known values. The cite
+# is a file:line; the reason is free text. Each line is one
+# item — no chained semicolon-separated items (parity with
+# `GREP_CITES`).
+
+CONTRACT_ECHO_HEADER_RE = re.compile(
+    r"^\s*CONTRACT_ECHO\s*:\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+CONTRACT_ECHO_LINE_RE = re.compile(
+    r"^\s*ITEM\s*:\s*(?P<id>[A-Za-z0-9._\-]+)\s+"
+    r"VERDICT\s*:\s*(?P<verdict>ADDRESSED|NOT-ADDRESSED|N-A)\s+"
+    r"(?:CITE\s*:\s*(?P<cite>[^\s\n][^\n]*?)|REASON\s*:\s*(?P<reason>[^\n]+?))"
+    r"\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Contract-echo loader (issue #386)
+# ---------------------------------------------------------------------------
+
+
+def load_bead_contract(source: Union[str, os.PathLike, dict, BeadContract]) -> BeadContract:
+    """Load a `BeadContract` from a dict, a JSON file path, or pass-through.
+
+    Acceptable inputs:
+      - `BeadContract`   — returned unchanged.
+      - `dict`           — the in-memory shape callers wire into the gate.
+      - `str` / Path     — path to a JSON file on disk; the file is read
+                          and parsed. A non-existent file is a hard
+                          error (we never silently fabricate a contract).
+
+    Validation:
+      - `id` is required and non-empty.
+      - `description` defaults to empty string.
+      - `prior_findings` is optional (defaults to empty).
+      - `acceptance_items` MUST be non-empty — without items the
+        contract-echo step has nothing to verify per-item against.
+      - Duplicate `acceptance_items` IDs are rejected (per-item
+        verdicts would not be uniquely addressable).
+
+    Reject anything that isn't a dict / path / BeadContract — a
+    stringified JSON literal in argv is a known injection surface.
+    """
+    if isinstance(source, BeadContract):
+        return source
+    if isinstance(source, dict):
+        data = source
+    elif isinstance(source, (str, os.PathLike)):
+        path = os.fspath(source)
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.loads(fh.read())
+    else:
+        raise TypeError(
+            f"load_bead_contract: source must be dict, path, or BeadContract; "
+            f"got {type(source).__name__}"
+        )
+
+    if not isinstance(data, dict):
+        raise TypeError(
+            f"load_bead_contract: parsed contract must be a JSON object; "
+            f"got {type(data).__name__}"
+        )
+
+    bead_id = str(data.get("id") or "").strip()
+    if not bead_id:
+        raise ValueError("load_bead_contract: 'id' is required and must be non-empty")
+
+    description = str(data.get("description") or "")
+
+    raw_prior = data.get("prior_findings") or []
+    if not isinstance(raw_prior, list):
+        raise TypeError("load_bead_contract: 'prior_findings' must be a list")
+    prior_findings: List[PriorFinding] = []
+    for pf in raw_prior:
+        if not isinstance(pf, dict):
+            raise TypeError(
+                f"load_bead_contract: prior_finding must be a dict; got {type(pf).__name__}"
+            )
+        prior_findings.append(
+            PriorFinding(
+                source=str(pf.get("source") or "").strip(),
+                text=str(pf.get("text") or "").strip(),
+            )
+        )
+
+    raw_items = data.get("acceptance_items") or []
+    if not isinstance(raw_items, list):
+        raise TypeError("load_bead_contract: 'acceptance_items' must be a list")
+    if not raw_items:
+        raise ValueError(
+            "load_bead_contract: 'acceptance_items' must be non-empty — the "
+            "contract-echo step requires per-item verdicts and an empty list "
+            "has nothing to verify against"
+        )
+    seen_ids = set()
+    acceptance_items: List[AcceptanceItem] = []
+    for it in raw_items:
+        if not isinstance(it, dict):
+            raise TypeError(
+                f"load_bead_contract: acceptance_item must be a dict; got {type(it).__name__}"
+            )
+        item_id = str(it.get("id") or "").strip()
+        if not item_id:
+            raise ValueError("load_bead_contract: acceptance_item.id is required")
+        if item_id in seen_ids:
+            raise ValueError(
+                f"load_bead_contract: duplicate acceptance_item.id={item_id!r}"
+            )
+        seen_ids.add(item_id)
+        acceptance_items.append(
+            AcceptanceItem(
+                id=item_id,
+                text=str(it.get("text") or "").strip(),
+            )
+        )
+
+    return BeadContract(
+        id=bead_id,
+        description=description,
+        prior_findings=tuple(prior_findings),
+        acceptance_items=tuple(acceptance_items),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Contract-echo parser (issue #386)
+# ---------------------------------------------------------------------------
+
+
+def _strip_contract_echo_block(output: str) -> str:
+    """Remove the `CONTRACT_ECHO:` block from a reviewer output so the
+    10-field `parse_verdict` can run on the remainder.
+
+    The block is at the END of the output (after the 10 structured
+    fields). The header line (`CONTRACT_ECHO:`) is dropped, every
+    `ITEM:` line is dropped, and any blank lines immediately around
+    the block are normalized. If the block is not present, the
+    output is returned unchanged (so the function is safe to call
+    regardless of whether a contract was supplied).
+    """
+    if not isinstance(output, str):
+        return output
+    header_match = CONTRACT_ECHO_HEADER_RE.search(output)
+    if not header_match:
+        return output
+    head_part = output[: header_match.start()]
+    after = output[header_match.end():]
+    kept_after: List[str] = []
+    for raw_line in after.splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("ITEM:"):
+            continue
+        kept_after.append(raw_line)
+    out = head_part.rstrip("\n") + "\n" + "\n".join(kept_after).rstrip() + "\n"
+    return out
+
+
+def parse_contract_echo(
+    output: object, contract: BeadContract
+) -> Optional[ContractEchoReport]:
+    """Extract a `ContractEchoReport` from a reviewer's free-form stdout.
+
+    The expected block format is:
+
+        CONTRACT_ECHO:
+        ITEM: <id> VERDICT: <ADDRESSED|NOT-ADDRESSED|N-A> CITE: <file:line>
+        ITEM: <id> VERDICT: <N-A> REASON: <free text>
+        ...
+
+    The block MUST be present (one or more `ITEM:` lines) for the
+    output to be considered. A reviewer that omits the block has
+    not addressed the contract — the caller should treat the
+    resulting `None` as every item NOT-ADDRESSED.
+
+    Per-item rules:
+      - `ADDRESSED` requires a `CITE:` value matching the
+        `file:line` pattern (a path followed by `:NUMBER`).
+      - `N-A` and `NOT-ADDRESSED` require a `REASON:` value (no
+        empty justification).
+      - Items whose ID is not on the contract are kept in the
+        report (caller decides what to do) but the unknown ID
+        still counts as the contract item being unaddressed.
+    """
+    if not isinstance(output, str):
+        return None
+    if not isinstance(contract, BeadContract):
+        return None
+
+    # Locate the CONTRACT_ECHO: header line, then walk forward and
+    # collect the immediately-following `ITEM:` lines. We stop at the
+    # first non-blank, non-ITEM line (the strict no-prose contract
+    # the gate enforces elsewhere — anything after the block is
+    # considered out-of-block and ignored).
+    header_match = CONTRACT_ECHO_HEADER_RE.search(output)
+    if not header_match:
+        return None
+    after = output[header_match.end():]
+    item_lines: List[str] = []
+    for raw_line in after.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            # Blank lines are allowed within the block.
+            continue
+        if not stripped.startswith("ITEM:"):
+            # Out-of-block content; stop walking.
+            break
+        item_lines.append(raw_line)
+    if not item_lines:
+        return None
+
+    items: List[ContractEchoItem] = []
+    for raw_line in item_lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        m = CONTRACT_ECHO_LINE_RE.match(line)
+        if m is None:
+            # An unparseable line in the contract-echo block: the
+            # reviewer emitted something we cannot interpret. Per
+            # the strict no-prose contract the gate enforces for
+            # the headline verdict, we reject the whole block
+            # rather than guess.
+            return None
+        item_id = m.group("id")
+        verdict_token = m.group("verdict").upper()
+        cite = (m.group("cite") or "").strip()
+        reason = (m.group("reason") or "").strip()
+
+        if verdict_token == "ADDRESSED":
+            if not cite:
+                return None
+            if not re.match(r"^[\w./\-]+:\d+$", cite):
+                return None
+        else:
+            # N-A or NOT-ADDRESSED — reason is required.
+            if not reason:
+                return None
+
+        items.append(
+            ContractEchoItem(
+                id=item_id,
+                verdict=verdict_token,  # type: ignore[arg-type]
+                cite=cite,
+                reason=reason,
+            )
+        )
+
+    if not items:
+        return None
+    return ContractEchoReport(items=tuple(items))
+
+
+# ---------------------------------------------------------------------------
+# Contract-echo evaluator (issue #386 — the headline invariant)
+# ---------------------------------------------------------------------------
+
+
+def evaluate_contract_echo(
+    report: Optional[ContractEchoReport],
+    contract: BeadContract,
+) -> ContractEchoVerdictResult:
+    """Check that every acceptance item is ADDRESSED or N-A.
+
+    - `ADDRESSED` (with a `CITE:` file:line): the reviewer claims the
+      diff addresses this item; we trust the reviewer on the cite
+      (we don't second-guess the file:line — the executor evidence
+      contract in `parse_verdict` is what backs the claim).
+    - `N-A` (with a `REASON:`): the reviewer says the item is not
+      applicable this round; this counts as a pass IF the reason is
+      non-empty. An empty `N-A` reason is rejected at parse time
+      (see `parse_contract_echo`), so by the time we get here, a
+      `N-A` item is always with a reason.
+    - `NOT-ADDRESSED` (with a `REASON:`): the reviewer flags the
+      item as unaddressed; we surface it verbatim in
+      `unaddressed_items` and `constraint`.
+    - Missing item (the reviewer's report does not contain the
+      item's ID): the item is unaddressed — the reviewer did not
+      cover it.
+    - `report is None` (no `CONTRACT_ECHO:` block at all): every
+      contract item is unaddressed.
+
+    The `constraint` string carries the unaddressed items VERBATIM
+    (the bead author's text, not a paraphrase) so the next roll's
+    worker reads the exact problem. This is the headline invariant
+    of issue #386: constraint extraction MUST carry the
+    unaddressed items verbatim.
+    """
+    if not isinstance(contract, BeadContract):
+        return ContractEchoVerdictResult(ok=False, constraint="contract is not a BeadContract")
+
+    # Build a lookup: item_id -> per-item verdict emitted by the reviewer.
+    emitted: dict = {}
+    if report is not None:
+        for it in report.items:
+            # First-write-wins on duplicate IDs; subsequent writes
+            # for the same ID are ignored. The strict no-duplicate
+            # invariant is on the contract side (load_bead_contract).
+            emitted.setdefault(it.id, it)
+
+    unaddressed: List[AcceptanceItem] = []
+    for item in contract.acceptance_items:
+        verdict_item = emitted.get(item.id)
+        if verdict_item is None:
+            unaddressed.append(item)
+            continue
+        if verdict_item.verdict == "ADDRESSED":
+            continue
+        if verdict_item.verdict == "N-A":
+            # Reason is required at parse time; defensively re-check.
+            if not verdict_item.reason:
+                unaddressed.append(item)
+            continue
+        # NOT-ADDRESSED or anything else: unaddressed.
+        unaddressed.append(item)
+
+    if not unaddressed:
+        return ContractEchoVerdictResult(
+            ok=True,
+            unaddressed_items=(),
+            constraint="",
+        )
+
+    # Build the constraint string with the unaddressed items'
+    # VERBATIM text. The worker's next-roll input MUST read the
+    # exact problem the bead author wrote.
+    lines = [
+        f"Contract-echo gate: {len(unaddressed)} acceptance item(s) NOT-ADDRESSED.",
+        "These items must be addressed in the next roll. The text below is "
+        "verbatim from the bead author's contract — do not paraphrase:",
+        "",
+    ]
+    for item in unaddressed:
+        lines.append(f"- {item.id}: {item.text}")
+    return ContractEchoVerdictResult(
+        ok=False,
+        unaddressed_items=tuple(unaddressed),
+        constraint="\n".join(lines),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -818,6 +1284,7 @@ def evaluate(
     base_sha: str = "",  # kept for future use
     diff: str = "",  # kept for future use
     reviewer: str = "reviewer",
+    contract: Optional[BeadContract] = None,
 ) -> SkepticResult:
     """Decide a single reviewer's outcome from its output (or absence).
 
@@ -857,7 +1324,23 @@ def evaluate(
             reviewer=reviewer,
         )
 
-    parsed = parse_verdict(review_output)
+    # ---- Pre-parse: extract contract-echo block (issue #386) -----------
+    # The `parse_verdict` function enforces a strict 10-field
+    # no-extra-fields contract (issue #384). When a bead contract is
+    # supplied, the reviewer's output additionally carries a
+    # `CONTRACT_ECHO:` block. We extract that block FIRST (storing
+    # the result for the post-parse contract-echo enforcement
+    # below) and strip it from the output before handing the rest to
+    # `parse_verdict`, so the 10-field contract is preserved
+    # unchanged. The contract-echo block is preserved verbatim in
+    # `raw_excerpt` if a parser-level pass is needed.
+    echo_report: Optional[ContractEchoReport] = None
+    output_for_parse = review_output
+    if contract is not None:
+        echo_report = parse_contract_echo(review_output, contract)
+        output_for_parse = _strip_contract_echo_block(review_output)
+
+    parsed = parse_verdict(output_for_parse)
     if parsed is None:
         # Diagnose the most likely failure mode for the reason. Issue
         # #384: distinguish "execution evidence missing" from generic
@@ -927,6 +1410,43 @@ def evaluate(
             parsed=parsed,
             reviewer=reviewer,
         )
+
+    # ---- Contract-echo enforcement (issue #386) ------------------------
+    # When the gate is invoked with a `contract`, the reviewer's
+    # output MUST include a valid `CONTRACT_ECHO:` block that
+    # addresses every acceptance item (or marks them `N-A` with a
+    # reason). A reviewer that omits the block, marks items as
+    # `NOT-ADDRESSED`, or fails to cite one of the contract's
+    # acceptance items fails the gate closed. The failure reason
+    # carries the unaddressed item's VERBATIM text — the next
+    # roll's worker reads the exact problem, not a paraphrase.
+    if contract is not None:
+        echo_verdict = evaluate_contract_echo(echo_report, contract)
+        if not echo_verdict.ok:
+            reason = (
+                f"contract-echo gate failed: {len(echo_verdict.unaddressed_items)} "
+                f"acceptance item(s) not addressed in the diff. The constraint "
+                f"below is verbatim from the bead author's contract and must "
+                f"be addressed in the next roll.\n\n{echo_verdict.constraint}"
+            )
+            body = format_comment(
+                verdict=parsed.verdict,
+                head_sha=parsed.head_sha,
+                expected_head_sha=head_sha,
+                repo=repo,
+                pr_number=pr_number,
+                reviewer=reviewer,
+                implementation_provenance=implementation_provenance,
+                reason=reason,
+            )
+            return SkepticResult(
+                check_state="failure",
+                verdict=None,
+                reason=reason,
+                comment_body=body,
+                parsed=parsed,
+                reviewer=reviewer,
+            )
 
     body = format_comment(
         verdict=parsed.verdict,
@@ -1264,6 +1784,8 @@ exact commit SHA you were shown.
 {diff}
 ```
 
+{contract_block}
+
 # Output contract — REQUIRED, no extra prose
 
 Emit EXACTLY this format, on its own lines, with the values substituted.
@@ -1336,7 +1858,95 @@ If the repo's test command is slow or unavailable, report the real
 result (including the failure) — do not fabricate numbers to satisfy
 the contract. A FAIL verdict with honest execution evidence is
 acceptable; a PASS verdict without evidence is not.
+
+# Contract-echo requirement (issue #386) — REQUIRED when a contract is provided
+
+When the prompt includes a `# Bead contract` section, the gate also
+requires per-item verdicts against the bead's acceptance items.
+Emit a `CONTRACT_ECHO:` block AFTER the ten structured fields,
+with one line per acceptance item, in the form:
+
+    CONTRACT_ECHO:
+    ITEM: <id> VERDICT: <ADDRESSED|NOT-ADDRESSED|N-A> CITE: <file:line>
+    ITEM: <id> VERDICT: <N-A> REASON: <free text>
+    ...
+
+Rules:
+- `ADDRESSED` requires `CITE: <file:line>` — the file path and line
+  number where the diff addresses the item. The file must exist
+  in the diff; the line must be a real enforcement site.
+- `NOT-ADDRESSED` requires `REASON: <text>` — the reviewer's
+  explanation of why the diff does not address the item. The gate
+  fails closed with this reason as the verbatim constraint for the
+  next roll.
+- `N-A` requires `REASON: <text>` — when the item does not apply
+  to this round. A bare `N-A` is rejected (we never accept an
+  unjustified classification).
+- Every acceptance item MUST appear exactly once in the block —
+  the gate cross-references the report against the contract and
+  treats missing items as `NOT-ADDRESSED`.
+- Items in prior rounds' findings (`# Prior findings` below) MUST
+  also be addressed — either as `ADDRESSED` (with the file:line
+  where the prior finding was closed) or as `N-A` (with the
+  reason it is no longer applicable). A prior finding that is
+  still open is `NOT-ADDRESSED` in the same block.
 """
+
+
+_CONTRACT_BLOCK_TEMPLATE = """# Bead contract (issue #386)
+
+The bead author wrote this contract. The gate verifies that every
+acceptance item is addressed in the diff — see the `CONTRACT_ECHO:`
+output requirement below.
+
+- Bead id: {bead_id}
+- Description: {bead_description}
+
+## Prior findings
+
+The following findings from prior rounds are open unless the
+reviewer marks them `ADDRESSED` (with a file:line cite) or `N-A`
+(with a reason). Per the bead author, these MUST be addressed:
+
+{prior_findings_block}
+
+## Acceptance items
+
+The bead author has set the following acceptance items. Every item
+MUST appear in the `CONTRACT_ECHO:` block below with one of
+`ADDRESSED` (with `CITE: <file:line>`), `NOT-ADDRESSED` (with
+`REASON: <text>`), or `N-A` (with `REASON: <text>`). Missing items
+are treated as `NOT-ADDRESSED` and the gate fails closed:
+
+{acceptance_items_block}
+"""
+
+
+def _format_prior_findings_block(prior_findings: Tuple[PriorFinding, ...]) -> str:
+    if not prior_findings:
+        return "(no prior findings)"
+    lines = []
+    for i, pf in enumerate(prior_findings, 1):
+        lines.append(f"{i}. ({pf.source}) {pf.text}")
+    return "\n".join(lines)
+
+
+def _format_acceptance_items_block(items: Tuple[AcceptanceItem, ...]) -> str:
+    if not items:
+        return "(no acceptance items)"
+    lines = []
+    for it in items:
+        lines.append(f"- {it.id}: {it.text}")
+    return "\n".join(lines)
+
+
+def _build_contract_block(contract: BeadContract) -> str:
+    return _CONTRACT_BLOCK_TEMPLATE.format(
+        bead_id=contract.id,
+        bead_description=contract.description or "(no description)",
+        prior_findings_block=_format_prior_findings_block(contract.prior_findings),
+        acceptance_items_block=_format_acceptance_items_block(contract.acceptance_items),
+    )
 
 
 def build_prompt(
@@ -1347,12 +1957,27 @@ def build_prompt(
     base_sha: str,
     diff: str,
     implementation_identity: str = "unknown",
+    contract: Optional[BeadContract] = None,
 ) -> str:
     """Assemble the prompt sent to the independent reviewer CLI.
 
     Pure string assembly — no model call, no judgment. The reviewer
     model is the one that emits the structured verdict.
+
+    When `contract` is supplied (issue #386), a `# Bead contract`
+    section is interpolated into the prompt, documenting the bead's
+    description, prior findings, and acceptance items. The reviewer
+    is then required to emit a `CONTRACT_ECHO:` block in its
+    verdict (see `_PROMPT_TEMPLATE`). The deterministic gate parses
+    the block via `parse_contract_echo` and checks every acceptance
+    item is `ADDRESSED` (or `N-A` with a reason) via
+    `evaluate_contract_echo`. Without a contract, the prompt is the
+    legacy 10-field form (issue #384).
     """
+    if contract is not None:
+        contract_block = _build_contract_block(contract)
+    else:
+        contract_block = ""
     return _PROMPT_TEMPLATE.format(
         repo=repo,
         pr_number=pr_number,
@@ -1360,17 +1985,26 @@ def build_prompt(
         base_sha=base_sha,
         diff=diff,
         implementation_identity=implementation_identity,
+        contract_block=contract_block,
     )
 
 
 __all__ = [
+    "AcceptanceItem",
+    "BeadContract",
     "COMMIT_PREFIX_TO_IDENTITY",
+    "CONTRACT_ECHO_LINE_RE",
+    "ContractEchoItem",
+    "ContractEchoReport",
+    "ContractEchoVerdict",
+    "ContractEchoVerdictResult",
     "EXECUTION_EVIDENCE_FIELDS",
     "MARKER",
     "ModelIdentity",
     "ParsedLintRun",
     "ParsedTestRun",
     "ParsedVerdict",
+    "PriorFinding",
     "REVIEWER_CLI_TO_IDENTITY",
     "ReadBackCheck",
     "SkepticResult",
@@ -1381,8 +2015,11 @@ __all__ = [
     "build_prompt",
     "comment_marker",
     "evaluate",
+    "evaluate_contract_echo",
     "extract_implementation_identity_from_commit",
     "format_comment",
+    "load_bead_contract",
+    "parse_contract_echo",
     "parse_verdict",
     "verify_published_comment",
     "verify_provenance",
