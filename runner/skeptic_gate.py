@@ -127,6 +127,14 @@ class ParsedVerdict:
     other than the headline four is missing in the reviewer's output,
     `parse_verdict` returns `None` rather than producing a partial
     `ParsedVerdict`.
+
+    The execution-evidence fields (`test_run_evidence`,
+    `lint_run_evidence`, `grep_cites`, `head_commit_verified`) are the
+    headline enforcement of issue #384: a verdict that does not prove
+    the reviewer actually executed the repo's tests/lint and grepped
+    the call sites cited in the diff is rejected at parse time. They
+    are stored as parsed structures (or `None` on absence — which the
+    contract requires never happens for a valid verdict).
     """
 
     verdict: Literal["PASS", "FAIL"]
@@ -136,6 +144,49 @@ class ParsedVerdict:
     reason: str
     reviewer_identity: str  # the model that emitted the verdict
     raw_excerpt: str
+    # Execution-evidence fields (issue #384):
+    test_run_evidence: Optional["ParsedTestRun"] = None
+    lint_run_evidence: Optional["ParsedLintRun"] = None
+    grep_cites: str = ""
+    head_commit_verified: str = ""
+
+
+@dataclass(frozen=True)
+class ParsedTestRun:
+    """Parsed `TEST_RUN_EVIDENCE` field from a reviewer verdict.
+
+    The reviewer must report the result of actually running the
+    repo's test suite on the PR HEAD. The form is:
+
+        TEST_RUN_EVIDENCE: passed=<int> failed=<int> skipped=<int> exit=<int>
+
+    `exit=0` AND `failed=0` is required for a PASS verdict —
+    `parse_verdict` rejects internally inconsistent claims.
+    """
+
+    passed: int
+    failed: int
+    skipped: int
+    exit: int
+
+
+@dataclass(frozen=True)
+class ParsedLintRun:
+    """Parsed `LINT_RUN_EVIDENCE` field from a reviewer verdict.
+
+    The reviewer must report the result of actually running the
+    repo's primary linter on the PR HEAD. The form is:
+
+        LINT_RUN_EVIDENCE: tool=<name> errors=<int> warnings=<int>
+
+    `errors=0` is required for a PASS verdict — `parse_verdict`
+    rejects the verdict if the reviewer claims green while the
+    linter reports errors.
+    """
+
+    tool: str
+    errors: int
+    warnings: int
 
 
 @dataclass(frozen=True)
@@ -198,10 +249,58 @@ _IDENTITY_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# Execution-evidence regexes (issue #384)
+# ---------------------------------------------------------------------------
+#
+# These four fields are MANDATORY for a valid verdict. They prove that
+# the reviewer actually ran the repo's test suite + lint + grep on the
+# PR HEAD, rather than pattern-matching the diff alone. Pattern-matched
+# PASS verdicts are how prior PRs (#382: regression test never invokes
+# code under test; #365 r5: fail-open paths) slipped past the gate.
+#
+# Each field MUST appear EXACTLY ONCE on its own line. Anchored to
+# start-of-line + case-insensitive, same rule as the 6-field contract.
+
+_TEST_RUN_EVIDENCE_RE = re.compile(
+    r"^\s*TEST_RUN_EVIDENCE\s*:\s*"
+    r"passed\s*=\s*(\d+)\s+"
+    r"failed\s*=\s*(\d+)\s+"
+    r"skipped\s*=\s*(\d+)\s+"
+    r"exit\s*=\s*(-?\d+)\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+_LINT_RUN_EVIDENCE_RE = re.compile(
+    r"^\s*LINT_RUN_EVIDENCE\s*:\s*"
+    r"tool\s*=\s*([a-zA-Z0-9_.\-]+)\s+"
+    r"errors\s*=\s*(\d+)\s+"
+    r"warnings\s*=\s*(\d+)\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+_GREP_CITES_RE = re.compile(
+    r"^\s*GREP_CITES\s*:\s*(\S[^\n]*?)[ \t]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+_HEAD_COMMIT_VERIFIED_RE = re.compile(
+    r"^\s*HEAD_COMMIT_VERIFIED\s*:\s*([0-9a-f]{40})\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
 # Field-name regexes used by the no-prose check. A field line MUST
 # consist only of "<FIELD>: <value>" with nothing else on the line.
 # Case-insensitive to match the per-field regexes (Verdict: Pass is OK).
 _FIELD_LINE_RE = re.compile(r"^[A-Z_]+\s*:.*$", re.MULTILINE | re.IGNORECASE)
+
+# Required execution-evidence fields (issue #384). The deterministic
+# gate refuses to honor a verdict that does not include all four —
+# pattern-matched PASS verdicts slipped vacuous regression tests and
+# fail-open paths past the gate in PRs #382 and #365 r5.
+EXECUTION_EVIDENCE_FIELDS = (
+    "TEST_RUN_EVIDENCE",
+    "LINT_RUN_EVIDENCE",
+    "GREP_CITES",
+    "HEAD_COMMIT_VERIFIED",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -214,17 +313,22 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
 
     **Strict no-prose contract** (per post-audit comment 4953064910):
 
-    - 6 required fields, each MUST appear EXACTLY ONCE on its own line:
-      `VERDICT`, `HEAD_SHA`, `REPO`, `PR_NUMBER`, `REASON`, `IDENTITY`.
+    - 10 required fields, each MUST appear EXACTLY ONCE on its own line:
+      `VERDICT`, `HEAD_SHA`, `REPO`, `PR_NUMBER`, `REASON`, `IDENTITY`,
+      `TEST_RUN_EVIDENCE`, `LINT_RUN_EVIDENCE`, `GREP_CITES`,
+      `HEAD_COMMIT_VERIFIED`. The four execution-evidence fields
+      (issue #384) prove the reviewer actually executed the repo's
+      tests+lint+grep on the PR HEAD, rather than pattern-matching
+      the diff alone.
     - The output MUST consist ONLY of:
         - up to one comment line (e.g. a leading `# reviewer: codex`)
-        - the 6 contract fields, each on its own line
+        - the 10 contract fields, each on its own line
         - any number of blank lines
       No Markdown code blocks, no extra prose, no second VERDICT line
       smuggled inside a triple-backtick fence.
     - Any field appearing more than once → reject (anti-injection).
     - Any required field missing → reject (fail-closed).
-    - The 6 lines themselves MUST be the ONLY non-blank lines (no
+    - The 10 lines themselves MUST be the ONLY non-blank lines (no
       trailing prose, no surrounding commentary).
 
     A reviewer that wraps the contract in a Markdown code block
@@ -256,10 +360,10 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
             continue
         if re.match(r"^[A-Z_]+\s*:", stripped, re.IGNORECASE):
             field_lines += 1
-            # Track the field name so we can enforce EXACTLY 6 distinct
+            # Track the field name so we can enforce EXACTLY 10 distinct
             # contract fields. Per post-audit comment 4953116428, the
-            # previous version accepted a 7th field. Now any 7th field
-            # (or duplicate of any of the 6) → reject.
+            # previous version accepted a 7th field. Now any 11th field
+            # (or duplicate of any of the 10) → reject.
             field_name_match = re.match(r"^([A-Z_]+)\s*:", stripped, re.IGNORECASE)
             if field_name_match:
                 fname = field_name_match.group(1).upper()
@@ -284,6 +388,11 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     prs = _PR_RE.findall(output)
     reasons = _REASON_RE.findall(output)
     identities = _IDENTITY_RE.findall(output)
+    # Execution-evidence fields (issue #384):
+    test_run_evidence = _TEST_RUN_EVIDENCE_RE.findall(output)
+    lint_run_evidence = _LINT_RUN_EVIDENCE_RE.findall(output)
+    grep_cites = _GREP_CITES_RE.findall(output)
+    head_commit_verified = _HEAD_COMMIT_VERIFIED_RE.findall(output)
 
     # Full-length SHA is required (40 hex chars). A reviewer that emits
     # only a short SHA hasn't fully bound its verdict.
@@ -293,21 +402,28 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         return None
 
-    # All six required fields must be exactly one each. IDENTITY is
-    # required for provenance (refuses self-review).
+    # All ten required fields must be exactly one each. IDENTITY is
+    # required for provenance (refuses self-review). The four
+    # execution-evidence fields are required by issue #384 — a
+    # verdict without them is a vacuous PASS, and the gate must
+    # refuse to honor it.
     if (
         len(verdicts) != 1
         or len(repos) != 1
         or len(prs) != 1
         or len(reasons) != 1
         or len(identities) != 1
+        or len(test_run_evidence) != 1
+        or len(lint_run_evidence) != 1
+        or len(grep_cites) != 1
+        or len(head_commit_verified) != 1
     ):
         return None
 
-    # Exact 6-field contract (per post-audit comment 4953116428):
-    # no 7th field allowed. The seen_field_names set already enforced
-    # no duplicates; here we also enforce that EXACTLY 6 distinct
-    # contract fields are present.
+    # Exact 10-field contract: no 11th field allowed. The
+    # seen_field_names set already enforced no duplicates; here we
+    # also enforce that EXACTLY 10 distinct contract fields are
+    # present.
     expected_fields = {
         "VERDICT",
         "HEAD_SHA",
@@ -315,6 +431,10 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         "PR_NUMBER",
         "REASON",
         "IDENTITY",
+        "TEST_RUN_EVIDENCE",
+        "LINT_RUN_EVIDENCE",
+        "GREP_CITES",
+        "HEAD_COMMIT_VERIFIED",
     }
     if seen_field_names != expected_fields:
         return None
@@ -332,6 +452,68 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
     if len(set(short_shas)) != 1:
         return None
 
+    # ---- Execution-evidence consistency checks (issue #384) ------------
+    # A reviewer that claims PASS but reports failed>0, exit!=0, lint
+    # errors>0, or an empty GREP_CITES is internally inconsistent and
+    # must be rejected — the gate cannot accept a verdict where the
+    # execution evidence contradicts the verdict.
+    test_passed, test_failed, test_skipped, test_exit = (
+        int(test_run_evidence[0][0]),
+        int(test_run_evidence[0][1]),
+        int(test_run_evidence[0][2]),
+        int(test_run_evidence[0][3]),
+    )
+    if test_exit != 0 or test_failed != 0:
+        # A non-zero exit OR any failed test is a hard fail signal.
+        # The reviewer cannot claim a clean PASS.
+        return None
+
+    lint_tool, lint_errors, lint_warnings = (
+        lint_run_evidence[0][0],
+        int(lint_run_evidence[0][1]),
+        int(lint_run_evidence[0][2]),
+    )
+    if lint_errors != 0:
+        return None
+
+    grep_cite_value = grep_cites[0].strip()
+    if not grep_cite_value:
+        # Empty GREP_CITES means the reviewer cited no enforcement call
+        # sites — the gate cannot verify the reviewer's claims about
+        # what code does or does not enforce. Reject.
+        return None
+    # Require at least one file:line cite (a "path:number" token).
+    # The format is `path/to/file.py:LINE;path/to/file.py:LINE` —
+    # semicolon-separated `path:number` pairs. A value like `;` or
+    # `;;` contains separators but no real citation → reject.
+    cite_tokens = [t.strip() for t in grep_cite_value.split(";") if t.strip()]
+    if not any(re.match(r"^[\w./\-]+:\d+$", tok) for tok in cite_tokens):
+        # No `file:line` cite pair — the reviewer did not cite any
+        # enforcement call sites. Reject.
+        return None
+
+    head_verified_sha = head_commit_verified[0].lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", head_verified_sha):
+        return None
+    # HEAD_COMMIT_VERIFIED must equal HEAD_SHA byte-for-byte. If the
+    # reviewer's "verified HEAD" differs from the gate SHA, the reviewer
+    # was operating on a different tree (most likely the diff they read
+    # is not what the gate sees). Reject.
+    if head_verified_sha != sha:
+        return None
+
+    test_evidence_obj = ParsedTestRun(
+        passed=test_passed,
+        failed=test_failed,
+        skipped=test_skipped,
+        exit=test_exit,
+    )
+    lint_evidence_obj = ParsedLintRun(
+        tool=lint_tool,
+        errors=lint_errors,
+        warnings=lint_warnings,
+    )
+
     return ParsedVerdict(
         verdict=verdict_token,  # type: ignore[arg-type]
         head_sha=sha,
@@ -340,6 +522,10 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         reason=reasons[0].strip(),
         reviewer_identity=identity_token,
         raw_excerpt=output[:500],
+        test_run_evidence=test_evidence_obj,
+        lint_run_evidence=lint_evidence_obj,
+        grep_cites=grep_cite_value,
+        head_commit_verified=head_verified_sha,
     )
 
 
@@ -673,12 +859,30 @@ def evaluate(
 
     parsed = parse_verdict(review_output)
     if parsed is None:
-        reason = (
-            "reviewer output was unparseable (one or more of "
-            "VERDICT/HEAD_SHA/REPO/PR_NUMBER/REASON/IDENTITY missing, "
-            "duplicated, or HEAD_SHA not 40 hex chars, or extra prose/"
-            "code-block present — fail-closed)"
-        )
+        # Diagnose the most likely failure mode for the reason. Issue
+        # #384: distinguish "execution evidence missing" from generic
+        # unparseable — evidence-free verdicts are invalid (fail-closed)
+        # and the operator/Healer needs the specific reason to triage.
+        missing_evidence = [
+            f for f in EXECUTION_EVIDENCE_FIELDS
+            if f not in review_output
+        ]
+        if missing_evidence:
+            reason = (
+                "reviewer output missing execution-evidence fields "
+                f"({', '.join(missing_evidence)}) — verdict is invalid "
+                "without proof the reviewer ran the repo's tests/lint/"
+                f"grep on the PR HEAD (issue #384)"
+            )
+        else:
+            reason = (
+                "reviewer output was unparseable (one or more of "
+                "VERDICT/HEAD_SHA/REPO/PR_NUMBER/REASON/IDENTITY/"
+                "TEST_RUN_EVIDENCE/LINT_RUN_EVIDENCE/GREP_CITES/"
+                "HEAD_COMMIT_VERIFIED missing, duplicated, "
+                "inconsistent with VERDICT, or extra prose/code-block "
+                "present — fail-closed)"
+            )
         body = format_comment(
             verdict="FAIL",
             head_sha=head_sha,
@@ -865,6 +1069,49 @@ def aggregate_results(
     primary = bound[0] if bound else None
     primary_sha = primary.parsed.head_sha if primary and primary.parsed else head_sha
 
+    # Execution-evidence guard (issue #384): even if a reviewer's
+    # `check_state` is 'success', the verdict is invalid if the parsed
+    # result is missing execution-evidence fields. A vacuous
+    # `ParsedVerdict` (`test_run_evidence is None` or empty
+    # `grep_cites`) means the reviewer submitted a pattern-matched PASS
+    # rather than running the repo's tests/lint/grep — refuse the
+    # aggregation as if the reviewer had failed. This prevents the
+    # PR-#382 failure mode (regression test never invokes code under
+    # test) from passing the gate.
+    vacuous = [
+        r.reviewer for r in results
+        if r.parsed is None
+        or r.parsed.test_run_evidence is None
+        or r.parsed.lint_run_evidence is None
+        or not r.parsed.grep_cites
+        or not r.parsed.head_commit_verified
+    ]
+    if vacuous:
+        reason = (
+            f"mandatory reviewer(s) submitted a vacuous verdict without "
+            f"execution evidence: {vacuous}; the gate requires every "
+            f"reviewer to have actually run the repo's tests/lint/grep "
+            f"on the PR HEAD (issue #384)"
+        )
+        body = format_comment(
+            verdict="FAIL",
+            head_sha=head_sha,
+            expected_head_sha=head_sha,
+            repo=repo,
+            pr_number=pr_number,
+            reviewer="(aggregate)",
+            implementation_provenance=implementation_provenance,
+            reason=reason,
+        )
+        return SkepticResult(
+            check_state="failure",
+            verdict=None,
+            reason=reason,
+            comment_body=body,
+            parsed=None,
+            reviewer="(aggregate)",
+        )
+
     extras: List[str] = []
     for r in results:
         marker = "✅ PASS" if r.check_state == "success" else "❌ FAIL"
@@ -874,8 +1121,9 @@ def aggregate_results(
         agg_verdict = "PASS"
         agg_state = "success"
         agg_reason = (
-            f"all {len(results)} reviewers passed; "
-            f"primary reviewer: {primary.reviewer if primary else '(unknown)'}"
+            f"all {len(results)} reviewers passed with execution "
+            f"evidence; primary reviewer: "
+            f"{primary.reviewer if primary else '(unknown)'}"
         )
     else:
         agg_verdict = "FAIL"
@@ -1028,6 +1276,10 @@ with no extra commentary or code blocks:
     PR_NUMBER: {pr_number}
     REASON: <one-sentence justification>
     IDENTITY: <codex|gemini|claude|unknown>
+    TEST_RUN_EVIDENCE: passed=<N> failed=<N> skipped=<N> exit=<N>
+    LINT_RUN_EVIDENCE: tool=<name> errors=<N> warnings=<N>
+    GREP_CITES: <file:line;file:line;...>
+    HEAD_COMMIT_VERIFIED: <full 40-hex SHA of the local HEAD you actually exercised>
 
 Rules:
 - The `HEAD_SHA` MUST be the FULL 40-character hex SHA shown above. Not
@@ -1043,7 +1295,47 @@ Rules:
 - Do not include any other text — no extra VERDICT lines, no code
   blocks containing verdict tokens, no commentary. The deterministic
   gate will reject anything that does not match this contract exactly,
-  including outputs where any of the six lines appears more than once.
+  including outputs where any of the ten lines appears more than once.
+
+# Execution-evidence requirement (issue #384) — NOT optional
+
+The four execution-evidence lines (`TEST_RUN_EVIDENCE`,
+`LINT_RUN_EVIDENCE`, `GREP_CITES`, `HEAD_COMMIT_VERIFIED`) are
+MANDATORY. Verdicts without them are evidence-free and the gate
+will reject the verdict with `verdict=null` even if the rest of the
+contract is well-formed.
+
+Before emitting your verdict you MUST actually execute the repo's
+test suite and primary linter on the PR HEAD and cite the call
+sites for any enforcement claim you make:
+
+- `TEST_RUN_EVIDENCE` — run the repo's primary test command (e.g.
+  `pytest`, `cargo test`, `go test ./...`, `npm test`) on the PR HEAD
+  and report real counts: `passed=N failed=N skipped=N exit=N`. A
+  PASS verdict with `failed>0` or `exit!=0` is internally inconsistent
+  and will be rejected. **Do not pattern-match** the diff to guess test
+  results — a vacuous regression test (`def test_placeholder(): pass`)
+  has passed the gate in the past (PR #382). Run the suite.
+- `LINT_RUN_EVIDENCE` — run the repo's primary linter (ruff, clippy,
+  eslint, etc.) on the PR HEAD and report real counts:
+  `tool=<name> errors=N warnings=N`. A PASS verdict with `errors>0`
+  is internally inconsistent and will be rejected.
+- `GREP_CITES` — for each enforcement claim in the diff (e.g. "the
+  gate now rejects evidence-free verdicts"), cite the production
+  call site AND the test that exercises it as
+  `path/to/file.py:LINE;path/to/test_X.py:LINE`. Empty `GREP_CITES`
+  are rejected — citing zero call sites means the reviewer has not
+  verified that the enforcement actually exists where claimed.
+- `HEAD_COMMIT_VERIFIED` — the full 40-hex SHA of the local HEAD you
+  actually exercised. It MUST equal `HEAD_SHA` byte-for-byte. If you
+  ran your tests on a different tree than the gate, the gate will
+  reject the verdict (you read a different diff than the one being
+  gated).
+
+If the repo's test command is slow or unavailable, report the real
+result (including the failure) — do not fabricate numbers to satisfy
+the contract. A FAIL verdict with honest execution evidence is
+acceptable; a PASS verdict without evidence is not.
 """
 
 
@@ -1073,8 +1365,11 @@ def build_prompt(
 
 __all__ = [
     "COMMIT_PREFIX_TO_IDENTITY",
+    "EXECUTION_EVIDENCE_FIELDS",
     "MARKER",
     "ModelIdentity",
+    "ParsedLintRun",
+    "ParsedTestRun",
     "ParsedVerdict",
     "REVIEWER_CLI_TO_IDENTITY",
     "ReadBackCheck",
