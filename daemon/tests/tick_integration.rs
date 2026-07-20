@@ -7481,6 +7481,409 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
 }
 
+// --- jleechan-984e / issue #385: cross-model reviewer + review_degraded ---
+//
+// Issue #385 acceptance: "assessment telemetry shows two model families on
+// a normal run; vendor-down fallback test; degraded flag when only one
+// family available." This test exercises BOTH halves of that contract
+// through the real `run_tick` call stack:
+//
+//   1. The 5th priority member (`cursor-agent`, a different model family
+//      from claude/codex/agy/gemini/minimax) is reachable as a vendor
+//      fallback when the first four are unavailable — proving the
+//      `cursor-agent -f <prompt>` dispatch arm in `dispatch_reviewer` and
+//      the appended `cursor-agent` entry in the priority list.
+//
+//   2. When the gate-7 reviewer set ends up as `["agy", "cursor-agent"]`
+//      (two distinct families per `verifier::vendor_model_family`), the
+//      GATE_ASSESSMENT telemetry carries `review_degraded: false`, so
+//      strict merge policy (#328) treats the assessment as strict-green
+//      rather than NOT strict-green.
+//
+//   3. The single-family failure mode — `["agy"]` only because cursor-agent
+//      and every earlier vendor failed to parse — produces
+//      `review_degraded: true` in GATE_ASSESSMENT, which is the exact
+//      fail-closed signal the issue asks for.
+#[test]
+#[cfg(unix)]
+fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_fake_reviewers_cursor_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    // vendors 1-4 all fail to parse (mimics the live 2026-07-09
+    // codex/claude/agy triple-outage that motivated issue #385). vendor5
+    // (`cursor-agent`) is healthy and produces a parseable verdict.
+    write_fake_reviewer(&fake_bin_dir, "codex", "not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "claude", "still not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "agy", "also not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "gemini", "also still not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+
+    // coder=minimax → priority = [codex, claude, agy, gemini, cursor-agent].
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
+    ]);
+
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+
+    let mut cfg = test_cfg();
+    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" → is_test_repo == false
+
+    store.overlays.borrow_mut().insert(
+        "real-repo-bead-cursoragent".into(),
+        BeadOverlay {
+            bead_id: "real-repo-bead-cursoragent".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(559),
+            branch: Some("factory/real-repo-bead-cursoragent-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+    store
+        .branches
+        .borrow_mut()
+        .push("factory/real-repo-bead-cursoragent-r1".into());
+    store.branch_beads.borrow_mut().insert(
+        "factory/real-repo-bead-cursoragent-r1".into(),
+        "real-repo-bead-cursoragent".into(),
+    );
+
+    scm.pr_snapshots.insert(
+        559,
+        PrSnapshot {
+            pr_number: 559,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadbeef559".into(),
+            body: String::new(),
+            comments: vec![PrComment {
+                author: "some-reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
+            files: vec![],
+            updated_at_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            ci_status: "green".into(),
+            coderabbit_status: "green".into(),
+            ci_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_real_target_repo_skeptic_cursoragent_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert_eq!(
+        summary.beads_ready, 1,
+        "issue #385 regression: when the first FOUR dispatched/fallback \
+         reviewer vendors (codex, claude, agy, gemini) all fail to produce \
+         a parseable verdict but a fifth vendor (cursor-agent) is available \
+         in `priority` and would succeed, `skeptic_evidence` must fall back \
+         to it instead of propagating a total-outage Err. \
+         summary={summary:?}\ntelemetry:\n{telemetry}"
+    );
+    assert!(
+        telemetry.contains("\"all_green\":true"),
+        "GATE_ASSESSMENT must report all_green:true once cursor-agent's \
+         verdict is used; telemetry:\n{telemetry}"
+    );
+
+    // Acceptance check #1 from issue #385: the cursor-agent reviewer must
+    // appear in `skeptic_reviewers` (it's the only vendor that produced
+    // a parseable verdict on this run).
+    let gate_assessment_line = telemetry
+        .lines()
+        .find(|l| l.contains("\"eventType\":\"GATE_ASSESSMENT\""))
+        .unwrap_or_else(|| {
+            panic!("no GATE_ASSESSMENT line; telemetry:\n{telemetry}")
+        });
+    let gate_assessment: serde_json::Value = serde_json::from_str(gate_assessment_line)
+        .unwrap_or_else(|e| {
+            panic!(
+                "GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}"
+            )
+        });
+    let context = gate_assessment
+        .get("context")
+        .unwrap_or_else(|| panic!("no context: {gate_assessment_line}"));
+
+    let skeptic_reviewers = context["skeptic_reviewers"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "GATE_ASSESSMENT context.skeptic_reviewers must be an array; context:\n{context}"
+            )
+        });
+    let skeptic_reviewers: Vec<&str> = skeptic_reviewers
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        skeptic_reviewers.contains(&"cursor-agent"),
+        "issue #385 acceptance: cursor-agent must appear in skeptic_reviewers \
+         after the first four vendors fail to parse; got: {skeptic_reviewers:?}"
+    );
+
+    // Acceptance check #2 from issue #385: with only one vendor having
+    // contributed (cursor-agent) and that vendor belonging to a single
+    // model family, `review_degraded` MUST be true — strict merge policy
+    // (#328) MUST treat this assessment as NOT strict-green. The GATE
+    // ASSESSMENT can still be `all_green:true` (the verdict was Pass),
+    // but the degraded flag is the additional signal operators/auto-merge
+    // need to know the cross-model guarantee is NOT satisfied on this
+    // specific run (cursor-agent alone = single-family = same-model blind
+    // spots if the coder was also cursor).
+    assert_eq!(
+        context["review_degraded"].as_bool(),
+        Some(true),
+        "issue #385 acceptance: review_degraded MUST be true when only one \
+         model family (cursor) contributed; context:\n{context}"
+    );
+
+    let overlay = store
+        .load("real-repo-bead-cursoragent")
+        .unwrap()
+        .expect("overlay must still exist");
+    assert_eq!(
+        overlay.state,
+        OverlayState::Ready,
+        "bead must reach READY via cursor-agent's verdict, not stay ATTESTED \
+         on a false total-outage"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
+    // The opposite half of the cross-model guarantee: when two vendors
+    // from DISTINCT model families both contribute, review_degraded MUST
+    // be false. We arrange for `codex` and `claude` to be the two
+    // healthy reviewers — `codex` is `openai` family, `claude` is
+    // `anthropic`. coder=agy (excluded from priority → priority becomes
+    // [codex, claude, gemini, cursor-agent] with both codex and claude
+    // reaching vendor1/vendor2 dual-dispatch and BOTH producing parseable
+    // verdicts).
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_fake_reviewers_twofam_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    write_fake_reviewer(&fake_bin_dir, "codex", "pass");
+    write_fake_reviewer(&fake_bin_dir, "claude", "pass");
+    write_fake_reviewer(&fake_bin_dir, "agy", "unreachable");
+    write_fake_reviewer(&fake_bin_dir, "gemini", "unreachable");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
+    ]);
+
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+
+    let mut cfg = test_cfg();
+    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" → is_test_repo == false
+
+    store.overlays.borrow_mut().insert(
+        "real-repo-bead-twofam".into(),
+        BeadOverlay {
+            bead_id: "real-repo-bead-twofam".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(560),
+            branch: Some("factory/real-repo-bead-twofam-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+    store
+        .branches
+        .borrow_mut()
+        .push("factory/real-repo-bead-twofam-r1".into());
+    store.branch_beads.borrow_mut().insert(
+        "factory/real-repo-bead-twofam-r1".into(),
+        "real-repo-bead-twofam".into(),
+    );
+
+    scm.pr_snapshots.insert(
+        560,
+        PrSnapshot {
+            pr_number: 560,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadbeef560".into(),
+            body: String::new(),
+            comments: vec![PrComment {
+                author: "some-reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
+            files: vec![],
+            updated_at_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            ci_status: "green".into(),
+            coderabbit_status: "green".into(),
+            ci_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_real_target_repo_skeptic_twofam_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert_eq!(
+        summary.beads_ready, 1,
+        "two-family dual-dispatch: codex + claude both pass → bead must reach READY. \
+         summary={summary:?}\ntelemetry:\n{telemetry}"
+    );
+
+    let gate_assessment_line = telemetry
+        .lines()
+        .find(|l| l.contains("\"eventType\":\"GATE_ASSESSMENT\""))
+        .unwrap_or_else(|| {
+            panic!("no GATE_ASSESSMENT line; telemetry:\n{telemetry}")
+        });
+    let gate_assessment: serde_json::Value = serde_json::from_str(gate_assessment_line)
+        .unwrap_or_else(|e| {
+            panic!(
+                "GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}"
+            )
+        });
+    let context = gate_assessment
+        .get("context")
+        .unwrap_or_else(|| panic!("no context: {gate_assessment_line}"));
+
+    let skeptic_reviewers: Vec<&str> = context["skeptic_reviewers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    // Both codex (openai) and claude (anthropic) are in the dual-dispatch
+    // vendor1/vendor2 primary positions and both produced parseable
+    // verdicts, so both MUST appear in skeptic_reviewers.
+    assert!(
+        skeptic_reviewers.contains(&"codex") && skeptic_reviewers.contains(&"claude"),
+        "both codex and claude must be in skeptic_reviewers (both dual-dispatch \
+         primaries produced parseable verdicts); got: {skeptic_reviewers:?}"
+    );
+    // Two distinct model families → review_degraded MUST be false.
+    assert_eq!(
+        context["review_degraded"].as_bool(),
+        Some(false),
+        "issue #385 acceptance: two distinct model families (codex=openai, \
+         claude=anthropic) → review_degraded MUST be false; context:\n{context}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
 // jleechan follow-up to #198 (fix/dispatch-batch-isolation): #198 fixed the
 // batch-abort bug in `dispatch_ready`'s transient-spawn-failure path (a
 // requeue no longer aborts the rest of the batch), but left the requeue path
