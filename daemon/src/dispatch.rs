@@ -973,9 +973,15 @@ fn render_coder_prompt(
          - Do NOT force-push over commits you did not author.\n\
          - Work only within the task's scope; file follow-up notes rather \
          than expanding scope.\n\
+         - EVIDENCE (required to pass the evidence gate): publish a PUBLIC gist \
+         of your verification output (`gh gist create --public <file>`), then put \
+         this exact line in the PR body: `{evidence_marker} <gist-url> (head <sha>)` \
+         where <sha> is the PR head commit. The gist must be non-empty and its \
+         head <sha> must match the PR head.\n\
          {tree_block}",
         id = bead.id,
         title = bead.title,
+        evidence_marker = crate::tools::EVIDENCE_MARKER,
     )
 }
 
@@ -2812,6 +2818,16 @@ mod tests {
             "external ref missing"
         );
         assert!(prompt.contains("flux.rs"), "file-tree orientation missing");
+        // jleechan-yoqy / issue #323: the coder must be told to publish a
+        // public gist and write the ONE canonical evidence marker.
+        assert!(
+            prompt.contains(crate::tools::EVIDENCE_MARKER),
+            "coder prompt must mandate the canonical evidence marker: {prompt}"
+        );
+        assert!(
+            prompt.contains("gh gist create --public"),
+            "coder prompt must instruct publishing a public gist"
+        );
     }
 
     #[test]

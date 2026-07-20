@@ -114,7 +114,16 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- BeadOverlay field — same decoupling as `reroll_deferral_count`). Older
   -- DBs pre-date this column and get it via the idempotent
   -- `ensure_held_recheck_after_column` migration in `SqliteStateStore::open`.
-  held_recheck_after INTEGER
+  held_recheck_after INTEGER,
+  -- Bead jleechan-yoqy / issue #323: hash of the PR body's canonical evidence
+  -- marker (`**Evidence**:` + gist + head) at the bead's last /er run. NULL =
+  -- no run recorded. `er_runner::maybe_run` re-triggers /er when this differs
+  -- from the current body's marker hash (an evidence-only body update, same
+  -- head commit). Owned by the er_runner via the `last_er_evidence_hash`/
+  -- `set_er_evidence_hash` StateStore methods (NOT a BeadOverlay field). Older
+  -- DBs get it via the idempotent `ensure_last_er_evidence_hash_column`
+  -- migration in `SqliteStateStore::open`.
+  last_er_evidence_hash TEXT
 );
 
 -- Deletion guard: the daemon/skills may delete ONLY refs recorded here (spec §4.2.8).
