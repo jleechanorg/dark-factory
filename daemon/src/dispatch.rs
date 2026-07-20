@@ -960,7 +960,9 @@ fn render_coder_prompt(
          worktree happens to have configured, even if one exists.\n\
          BRANCH: {branch} — the daemon watches this exact branch on \
          {target_repo} for your commits. Push to it after EVERY green unit of \
-         work; never hold more than ~30 minutes of uncommitted changes.\n\
+         work; never hold more than ~30 minutes of uncommitted changes. Push ONLY\
+         to this branch (factory attestation cross-checks the resolved PR's head ref\
+         against this value; pushing elsewhere stalls the bead).\n\
          PUSH COMMAND (run this verbatim, never a bare `git push`): git push {remote} {branch}\n\
          \n\
          DELIVERABLE: a pull request from {branch} to the default branch of \
@@ -2805,6 +2807,15 @@ mod tests {
             prompt.contains("git push worldai factory/bead-x-r1"),
             "literal push command missing: {prompt}"
         );
+        // jleechan-t8fd / jleechanorg/dark-factory#310 — the prompt must
+        // explicitly tell the coder that pushing anywhere but the stamped
+        // `BRANCH:` value is rejected by attestation, so the coder cannot
+        // mistake it for a PR head branch.
+        assert!(
+            prompt.contains("Push ONLY"),
+            "explicit \"Push ONLY\" authorization line missing (bead \
+             jleechan-t8fd / jleechanorg/dark-factory#310): {prompt}"
+        );
         assert!(
             prompt.contains("Do NOT merge"),
             "no-merge rule missing — merge authority stays with the gates"
@@ -3207,6 +3218,15 @@ mod tests {
         assert!(
             prompt.contains("git push origin factory/bead-0-r1"),
             "prompt must state the literal push command verbatim: {prompt}"
+        );
+        // jleechan-t8fd / jleechanorg/dark-factory#310 — explicit authorized-
+        // branch line. The factory's attestation cross-checks the resolved
+        // PR's head ref against the stamped BRANCH value; the prompt must
+        // tell the coder this so they don't push to a PR head branch.
+        assert!(
+            prompt.contains("Push ONLY"),
+            "explicit \"Push ONLY\" authorization line missing (bead \
+             jleechan-t8fd / jleechanorg/dark-factory#310): {prompt}"
         );
     }
 
