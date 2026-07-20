@@ -51,6 +51,7 @@ from typing import List, Optional, Tuple
 
 from runner.skeptic_gate import (
     MARKER,
+    BeadContract,
     ReadBackCheck,
     SkepticResult,
     aggregate_results,
@@ -59,6 +60,7 @@ from runner.skeptic_gate import (
     evaluate,
     extract_implementation_identity_from_commit,
     format_comment,
+    load_bead_contract,
     verify_published_comment,
     verify_provenance,
 )
@@ -734,6 +736,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="Disable performance logging under --perf-log-dir.",
     )
+    parser.add_argument(
+        "--contract-file",
+        default=os.environ.get("SKEPTIC_CONTRACT_FILE", ""),
+        help=(
+            "Path to a JSON file describing the bead's contract (issue #386). "
+            "When supplied, the reviewer prompt embeds the bead's prior "
+            "findings + acceptance items and the gate requires per-item "
+            "verdicts (ADDRESSED / NOT-ADDRESSED / N-A). Without this flag "
+            "the gate runs the legacy 10-field contract (issue #384)."
+        ),
+    )
     args = parser.parse_args(argv)
     env = os.environ
 
@@ -833,6 +846,33 @@ def main(argv: Optional[list[str]] = None) -> int:
         repo, args.pr_number, head_sha
     )
 
+    # ---- 3a. Load bead contract (issue #386) --------------------------------
+    # When the workflow operator wires `--contract-file`, the gate must
+    # enforce per-item verdicts against the bead's acceptance items.
+    # A missing or unreadable contract file is a hard error — we never
+    # silently fall back to the legacy 10-field contract when the
+    # operator asked for the contract-echo step.
+    contract: Optional[BeadContract] = None
+    if args.contract_file:
+        try:
+            contract = load_bead_contract(args.contract_file)
+        except (ValueError, TypeError, FileNotFoundError, json.JSONDecodeError) as exc:
+            print(
+                f"[skeptic-gate] contract load failed: {exc}; "
+                "refusing to gate without the operator-supplied contract",
+                file=sys.stderr,
+            )
+            _emit_perf_log(
+                perf_log_dir=args.perf_log_dir,
+                enabled=not args.no_perf_log,
+                repo=repo,
+                pr_number=args.pr_number,
+                head_sha=head_sha,
+                outcome="failure",
+                duration_ms=int((time.monotonic() - _perf_start) * 1000),
+            )
+            return 2
+
     # ---- 4. Build prompt ----------------------------------------------------
     prompt = build_prompt(
         repo=repo,
@@ -841,6 +881,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         base_sha="unknown",
         diff=diff,
         implementation_identity=implementation_identity,
+        contract=contract,
     )
 
     print(
@@ -878,6 +919,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             base_sha="unknown",
             diff=diff,
             reviewer=reviewer_name,
+            contract=contract,
         )
         per_reviewer.append(result)
         print(
