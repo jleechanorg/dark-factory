@@ -9,6 +9,13 @@ pub struct Extracted {
     pub inhibition_specs: Vec<String>,
     pub positive_assertions: Vec<String>,
     pub security_redaction_encountered: bool,
+    /// Issue #408 / bead jleechan-1a5e r3 (P1-7): reviewer items that the
+    /// coder's previous attempt did NOT address. Empty when the review is
+    /// either fully satisfied or the LLM does not surface any. Surfaced
+    /// as a separate constraint so the reroll prompt and the appended
+    /// spec block can carry them as hard requirements for the next
+    /// attempt.
+    pub not_addressed: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -17,6 +24,11 @@ struct LlmExtractorResponse {
     inhibition_specs: Vec<String>,
     positive_assertions: Vec<String>,
     security_redaction_encountered: bool,
+    /// Optional on the wire so a reviewer LLM that does not surface
+    /// `notAddressed` (older prompts, smaller models) still parses
+    /// cleanly. Defaults to `[]` when absent.
+    #[serde(default)]
+    not_addressed: Vec<String>,
 }
 
 /// Screens the reviewer feedback text for holdout test internals or subpaths and redacts them.
@@ -75,7 +87,7 @@ pub fn extract(llm: &dyn Llm, review_text: &str) -> Result<Extracted, DaemonErro
     let (redacted_text, programmatic_encountered) = redact_holdouts(review_text);
 
     let prompt = format!(
-        "You are the Constraint Extractor for an autonomous coding factory.\n         Analyze the following rejection review feedback:\n\n         \"\"\"\n         {}\n         \"\"\"\n\n         Extract any positive assertions (what the code MUST do) and inhibition specs (what the code MUST NOT do, which get priority).\n         Also, verify if there are any holdout test internals or leaked holdout details in the feedback. If so, set securityRedactionEncountered to true.\n         Respond with exactly one JSON object as the last thing in your reply, in this format:\n         {{\n           \"inhibitionSpecs\": [\"...\"],\n           \"positiveAssertions\": [\"...\"],\n           \"securityRedactionEncountered\": true|false\n         }}",
+        "You are the Constraint Extractor for an autonomous coding factory.\n         Analyze the following rejection review feedback:\n\n         \"\"\"\n         {}\n         \"\"\"\n\n         Extract any positive assertions (what the code MUST do) and inhibition specs (what the code MUST NOT do, which get priority).\n         Also, identify any reviewer items the coder's previous attempt did NOT address (the reviewer asked for these but the coder's PR did not implement them) — these flow into the next attempt's hard constraints.\n         Also, verify if there are any holdout test internals or leaked holdout details in the feedback. If so, set securityRedactionEncountered to true.\n         Respond with exactly one JSON object as the last thing in your reply, in this format:\n         {{\n           \"inhibitionSpecs\": [\"...\"],\n           \"positiveAssertions\": [\"...\"],\n           \"notAddressed\": [\"...\"],\n           \"securityRedactionEncountered\": true|false\n         }}",
         redacted_text
     );
 
@@ -105,6 +117,11 @@ pub fn extract(llm: &dyn Llm, review_text: &str) -> Result<Extracted, DaemonErro
         positive_assertions: parsed.positive_assertions,
         security_redaction_encountered: parsed.security_redaction_encountered
             || programmatic_encountered,
+        // P1-7: reviewer items the coder's previous attempt did not
+        // address. Empty when the LLM does not surface any — backward
+        // compatible with older reviewer LLMs that do not parse
+        // `notAddressed` (serde defaults the field to `[]` when absent).
+        not_addressed: parsed.not_addressed,
     })
 }
 

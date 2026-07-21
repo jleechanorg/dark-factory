@@ -1,20 +1,20 @@
 // CLI front-end for `daemon::vacuous_red_green` — runtime red-green
 // vacuous-test detector. Issue #387 / bead jleechan-ijod. Companion to
-// the static detector (`daemon::vacuous`).
+// the static detector (`daemon::vacuous`). Issue #408 r3: takes an
+// explicit `--manifest-path` (P1-3) so cargo can locate the daemon
+// Cargo.toml on dark-factory layout.
 //
 // Usage:
-//   vacuous_red_green --base <ref> [--json <out>] [--files <P> ...]
+//   vacuous_red_green --base <ref> [--manifest-path <Cargo.toml>]
+//                      [--files P ...] [--json OUT]
 //
 // Exits:
-//   0 — at least one new/changed test FAILS on the reverted tree
-//       (genuine red-green; gate passes)
-//   1 — every new/changed test PASSES on the reverted tree (vacuous;
-//       gate fails)
+//   0 — at least one new/changed test FAILS on the reverted tree AND all
+//       three checks (green_on_head, failed_on_revert, baseline_passed)
+//       pass (genuine red-green; gate passes)
+//   1 — every new/changed test PASSES on the reverted tree, OR one of the
+//       three checks fails (vacuous; gate fails)
 //   2 — internal error (diff capture, git apply, etc.)
-//
-// `--base <ref>` is required (the diff baseline). `--files` is optional;
-// when supplied, only the listed paths are considered. When omitted,
-// `git diff --name-only <base>...HEAD` is used to derive the list.
 
 use daemon::vacuous_red_green::{check_red_green, FileClass};
 use std::path::PathBuf;
@@ -22,6 +22,7 @@ use std::process::Command;
 
 fn main() {
     let mut base: Option<String> = None;
+    let mut manifest: Option<PathBuf> = None;
     let mut files: Vec<String> = Vec::new();
     let mut json_out: Option<PathBuf> = None;
 
@@ -31,10 +32,10 @@ fn main() {
             "--base" => {
                 base = args.next();
             }
+            "--manifest-path" => {
+                manifest = args.next().map(PathBuf::from);
+            }
             "--files" => {
-                // `--files` consumes path args until the next flag token
-                // (any token starting with `--`). Peek first so a follow-up
-                // `--files` stays in the outer queue.
                 while let Some(next) = args.peek() {
                     if next.starts_with("--") {
                         break;
@@ -46,7 +47,10 @@ fn main() {
                 json_out = args.next().map(PathBuf::from);
             }
             "-h" | "--help" => {
-                eprintln!("vacuous_red_green --base <ref> [--files P ...] [--json OUT]");
+                eprintln!(
+                    "vacuous_red_green --base <ref> [--manifest-path <Cargo.toml>] \
+                     [--files P ...] [--json OUT]"
+                );
                 std::process::exit(2);
             }
             other => {
@@ -64,7 +68,13 @@ fn main() {
         }
     };
 
+    // P1-3: default to `<cwd>/daemon/Cargo.toml` if `--manifest-path` is
+    // absent. On dark-factory layout that is the only Cargo.toml in the
+    // repo. The check on existence is delegated to `check_red_green` so
+    // the test surface (which supplies an explicit path) still works.
     let cwd = std::env::current_dir().expect("cwd");
+    let manifest_path = manifest.unwrap_or_else(|| cwd.join("daemon").join("Cargo.toml"));
+
     let changed = if files.is_empty() {
         derive_changed(&cwd, &base)
     } else {
@@ -74,7 +84,7 @@ fn main() {
             .collect::<Vec<_>>()
     };
 
-    let report = match check_red_green(&cwd, &base, &changed) {
+    let report = match check_red_green(&cwd, &manifest_path, &base, &changed) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("vacuous_red_green: error: {e}");
@@ -93,15 +103,35 @@ fn main() {
         }
     }
 
-    if report.vacuous {
+    // Issue #408 r3: all three checks must pass for the gate to clear.
+    let any_check_failed = !report.green_on_head
+        || !report.baseline_passed
+        || report.ignored_without_skip_reason
+            .iter()
+            .any(|t| report.targeted_tests.iter().any(|tt| tt == t))
+        || report.ignored_without_skip_reason.len()
+            > report.targeted_tests.is_empty() as usize;
+    // Note: ignored-without-reason is flagged but NOT a fatal error — the
+    // CLI surfaces them in stderr so operators can audit, but it does not
+    // fail the gate (they don't count as coverage, they don't subtract
+    // from it). The real "vacuous" failure mode is the revert-side all-green.
+
+    if report.vacuous || any_check_failed {
         eprintln!(
-            "vacuous_red_green: VACUOUS ({} tests targeted, 0 failed on revert)",
-            report.targeted_tests.len()
+            "vacuous_red_green: VACUOUS (vacuous={}, green_on_head={}, baseline_passed={}, \
+             targeted={}, failed_on_revert={}, ignored_no_reason={:?})",
+            report.vacuous,
+            report.green_on_head,
+            report.baseline_passed,
+            report.targeted_tests.len(),
+            report.failing_tests.len(),
+            report.ignored_without_skip_reason
         );
         std::process::exit(1);
     } else {
         eprintln!(
-            "vacuous_red_green: GENUINE ({} tests targeted, {} failed on revert: {:?})",
+            "vacuous_red_green: GENUINE ({} tests targeted, {} failed on revert: {:?}, \
+             green_on_head=true, baseline_passed=true)",
             report.targeted_tests.len(),
             report.failing_tests.len(),
             report.failing_tests

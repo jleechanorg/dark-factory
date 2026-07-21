@@ -39,6 +39,20 @@ held_recheck_cooldown_secs = 900        # 15 minutes between re-assessments of a
 # deployments that cannot supply open_pr_head_ref data.
 pre_gate_validation_enabled = true
 
+# Runtime vacuous-test detector (issue #408 / bead jleechan-1a5e r3).
+# OPTIONAL — omitting BOTH defaults to TRUE / `daemon/Cargo.toml`. The
+# detector (`daemon::vacuous_red_green::check_red_green`) is wired into
+# gate 6 (EvidenceFloor) via `PrEvidence::vacuous_red_green_status` and
+# runs three checks per bead: (a) targeted tests pass on head, (b) at
+# least one targeted test FAILS after the production diff is reverted,
+# (c) the pristine base tree's `cargo test` compiles + passes. A vacuous
+# result (any check fails) turns EvidenceFloor Red. Set false for
+# non-Rust repos where cargo test is not applicable, or override
+# `vacuous_test_manifest_path` for repos whose Cargo.toml lives
+# elsewhere.
+vacuous_test_detection_enabled = true
+vacuous_test_manifest_path = "daemon/Cargo.toml"
+
 # Multi-repo dispatch routing table (bead jleechan-35y4 Stage B; see
 # docs/multirepo-dispatch-investigation-2026-07-11.md). OPTIONAL — omitting
 # [repos] entirely is fully backward compatible: every bead resolves to the
