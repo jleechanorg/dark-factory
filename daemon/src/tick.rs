@@ -1959,10 +1959,42 @@ fn run_vacuous_red_green_check(
         })
         .collect();
     let cwd = std::path::Path::new(".");
+    // jleechan-1a5e r5 (codex P1 of PR #420): the detector MUST receive
+    // the PR base ref (resolved upstream in adapters.rs from
+    // `gh pr view --json baseRefName` + a git-ref SHA lookup), NOT
+    // `snapshot.head_sha`. Passing head_sha collapses
+    // `base_ref...HEAD` onto the head commit and turns every PR into
+    // Pending/Unknown. When the base ref cannot be resolved (offline
+    // fixture, transient gh hiccup) we fall back to the FAIL-CLOSED
+    // Pending state — never to head_sha — so a coder cannot smuggle
+    // an unverified vacuous-detector run past the gate via a missing
+    // base ref.
+    let base_ref: String = match &snapshot.base_ref {
+        Some(sha) if !sha.is_empty() => sha.clone(),
+        _ => {
+            let _ = emit(
+                deps.telemetry_log,
+                bead_id,
+                0,
+                "Attested",
+                "VACUOUS_RED_GREEN_BASE_REF_MISSING",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "repo": repo,
+                    "pr": snapshot.pr_number,
+                    "head_sha": snapshot.head_sha,
+                }),
+            );
+            return verifier::VacuousRedGreenStatus::Pending(format!(
+                "PR base ref unknown for PR #{}; cannot anchor vacuous-red-green diff",
+                snapshot.pr_number
+            ));
+        }
+    };
     match crate::vacuous_red_green::check_red_green(
         cwd,
         manifest_path,
-        &snapshot.head_sha,
+        &base_ref,
         &changed,
     ) {
         Ok(report) => {

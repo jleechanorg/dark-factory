@@ -182,6 +182,15 @@ pub struct PrSnapshot {
     /// timestamp, so this floor narrows the stale-verdict hole rather than
     /// closing it exactly.
     pub head_committed_epoch: u64,
+    /// jleechan-1a5e r5 (codex P1 of PR #420): the PR base ref (the branch
+    /// the PR targets, e.g. `main`). Resolved from `gh pr view --json
+    /// baseRefName` so the runtime vacuous-red-green detector can diff
+    /// `base_ref...HEAD` instead of `head_sha...HEAD` (which always
+    /// reports no changes). When `base_ref` cannot be resolved (offline
+    /// fixture, gh fetch failure) callers MUST treat it as unknown —
+    /// falling back to head_sha collapses the detector onto the head
+    /// tree and silently turns every PR into Pending/Unknown.
+    pub base_ref: Option<String>,
 }
 
 /// Parameters for spawning a new AO/`aow` session (design doc §4).

@@ -559,32 +559,81 @@ pub fn parse_test_fn_name(line: &str) -> Option<String> {
 /// Run `cargo test` against the pristine base tree (no revert). Used by
 /// P1-1 (c) baseline-main sanity. Returns `Ok(())` when every test passes
 /// on base, `Err(reason)` otherwise.
+///
+/// jleechan-1a5e r5 (CodeRabbit review of PR #420): the previous
+/// implementation only exported `GIT_BASE_REF` into the cargo env and
+/// invoked cargo against the daemon's current worktree (which is the
+/// PR head after the dispatch cycle). That meant the baseline sanity
+/// check was actually testing the PR head tree, not the base tree, and
+/// the `--quiet` flag masked the per-test output. The fix creates a
+/// throw-away git worktree at `base_ref`, runs cargo there, and removes
+/// the worktree on the way out (success or failure).
 fn run_cargo_baseline(
     repo_root: &Path,
     manifest_path: &Path,
     base_ref: &str,
 ) -> Result<(), String> {
-    // We don't have a copy of the test fn names at base (that's the
-    // pre-PR baseline), so we let cargo discover them naturally by
-    // running `cargo test --manifest-path <path>`. The exact invocation
-    // does not matter for sanity — the goal is "the base tree compiles
-    // + tests pass". `GIT_BASE_REF` is exported so any integration test
-    // helper that needs the base ref (e.g. for `git show`) can resolve
-    // it; the cargo invocation itself does not need it.
-    //
-    // r5 (CodeRabbit review of PR #420): the previous `--skip ignored`
-    // arg was a bug. cargo's `--skip` matches test NAMES (substring),
-    // not the `#[ignore]` attribute — there is no flag to "skip
-    // `#[ignore]`-attributed tests" because libtest already skips them
-    // by default. Passing `--skip ignored` matched no tests and only
-    // existed because of an incorrect comment in r3.
-    let out = Command::new("cargo")
+    // Materialize the pristine base_ref tree in a throw-away worktree
+    // so cargo test runs against the actual baseline, not the daemon's
+    // current worktree (which is the PR head).
+    let worktree_path = std::env::temp_dir().join(format!(
+        "vacuous_baseline_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let add_status = Command::new("git")
         .current_dir(repo_root)
-        .args(["test", "--quiet", "--manifest-path"])
-        .arg(manifest_path)
-        .env("GIT_BASE_REF", base_ref)
+        .args([
+            "worktree",
+            "add",
+            "--detach",
+            worktree_path.to_string_lossy().as_ref(),
+            base_ref,
+        ])
         .output()
-        .map_err(|e| format!("spawn cargo test (baseline): {e}"))?;
+        .map_err(|e| format!("spawn git worktree add: {e}"))?;
+    if !add_status.status.success() {
+        return Err(format!(
+            "git worktree add (base={base_ref}) failed: {}",
+            String::from_utf8_lossy(&add_status.stderr)
+        ));
+    }
+
+    // Resolve the manifest path inside the worktree. The CLI is invoked
+    // with a repo-root-relative manifest (e.g. `daemon/Cargo.toml`); in
+    // the worktree the same relative path resolves to the file's pristine
+    // base version.
+    let worktree_manifest = if manifest_path.is_absolute() {
+        if let Ok(rel) = manifest_path.strip_prefix(repo_root) {
+            worktree_path.join(rel)
+        } else {
+            manifest_path.to_path_buf()
+        }
+    } else {
+        worktree_path.join(manifest_path)
+    };
+
+    let result = Command::new("cargo")
+        .current_dir(&worktree_path)
+        .args(["test", "--quiet", "--manifest-path"])
+        .arg(&worktree_manifest)
+        .output();
+
+    // Always remove the worktree on the way out, even on cargo failure.
+    let _ = Command::new("git")
+        .current_dir(repo_root)
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            worktree_path.to_string_lossy().as_ref(),
+        ])
+        .output();
+
+    let out = result.map_err(|e| format!("spawn cargo test (baseline): {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "rc={:?} stderr={}",

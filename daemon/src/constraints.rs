@@ -16,6 +16,15 @@ pub struct Extracted {
     /// spec block can carry them as hard requirements for the next
     /// attempt.
     pub not_addressed: Vec<String>,
+    /// jleechan-1a5e r5 (CodeRabbit review of PR #420, line 70-95):
+    /// structured per-item `{key, ReviewerStatus}` records parsed from
+    /// `REVIEWER_STATUS: <key> = NOT-ADDRESSED|N-A|ADDRESSED` lines in the
+    /// reviewer output. The flat `not_addressed` list above is the
+    /// backward-compatible projection; this carries the NOT-ADDRESSED /
+    /// N-A / Addressed distinction so the next-round coder prompt
+    /// renders NOT-ADDRESSED as "must address" and N-A as "do not
+    /// chase". Empty when the reviewer CLI doesn't emit the schema.
+    pub not_addressed_structured: Vec<(String, ReviewerStatus)>,
 }
 
 /// Issue #408 / bead jleechan-1a5e r2 (R2-4) + r3: per-item status
@@ -163,6 +172,50 @@ pub fn parse_not_addressed_schema_line(text: &str) -> Option<Vec<String>> {
     }
 }
 
+/// jleechan-1a5e r5 (CodeRabbit review of PR #420, line 70-95): parse
+/// `REVIEWER_STATUS: <key> = NOT-ADDRESSED|N-A|ADDRESSED` schema lines
+/// from the reviewer / skeptic reply. Each line contributes one
+/// `(key, ReviewerStatus)` pair. Returns an empty Vec when no schema
+/// line is present so callers can fall back to the legacy flat path
+/// without distinguishing "absent" from "no items".
+///
+/// Format (one per line):
+///   `REVIEWER_STATUS: <key> = NOT-ADDRESSED`
+///   `REVIEWER_STATUS: <key> = N-A`
+///   `REVIEWER_STATUS: <key> = ADDRESSED`
+///
+/// The `<key>` is everything between `REVIEWER_STATUS:` and `= <token>`,
+/// trimmed. Whitespace around the `=` is optional. Unknown tokens are
+/// silently skipped (no panic) so a reviewer that emits an extra status
+/// name in a future version doesn't fail the daemon.
+pub fn parse_reviewer_status_schema_line(
+    text: &str,
+) -> Vec<(String, ReviewerStatus)> {
+    let mut out: Vec<(String, ReviewerStatus)> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let after = match trimmed.strip_prefix("REVIEWER_STATUS:") {
+            Some(s) => s.trim_start(),
+            None => continue,
+        };
+        // Split on the LAST `=` so keys with `=` in them still parse.
+        // The status token is the trailing all-caps identifier.
+        let (raw_key, raw_status) = match after.rsplit_once('=') {
+            Some((k, s)) => (k.trim(), s.trim()),
+            None => continue,
+        };
+        if raw_key.is_empty() {
+            continue;
+        }
+        let status = match ReviewerStatus::parse_wire_token(raw_status) {
+            Some(s) => s,
+            None => continue,
+        };
+        out.push((raw_key.to_string(), status));
+    }
+    out
+}
+
 /// Screens the reviewer feedback text for holdout test internals or subpaths and redacts them.
 pub fn redact_holdouts(text: &str) -> (String, bool) {
     let mut result = String::new();
@@ -277,6 +330,12 @@ pub fn extract(llm: &dyn Llm, review_text: &str) -> Result<Extracted, DaemonErro
         // LLMs that predate the contract — serde defaults the field to
         // `[]` when absent).
         not_addressed: schema_line_items.unwrap_or(parsed.not_addressed),
+        // jleechan-1a5e r5 (CodeRabbit review of PR #420, line 70-95):
+        // populate the structured per-item list from
+        // `REVIEWER_STATUS:` lines in the redacted text so the reroll
+        // writer can persist the NOT-ADDRESSED / N-A distinction.
+        // Empty when the reviewer CLI doesn't emit the schema.
+        not_addressed_structured: parse_reviewer_status_schema_line(&redacted_text),
     })
 }
 
@@ -791,5 +850,81 @@ mod tests {
             prior.not_addressed_structured
         );
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    /// jleechan-1a5e r5 (CodeRabbit review of PR #420): round-trip a
+    /// `REVIEWER_STATUS:` schema line through the parser so the
+    /// live review path's per-item {key, status} projection has a
+    /// fast unit-level companion. The full end-to-end flow (reviewer
+    /// -> extract -> reroll block -> parse_latest_reroll_block) lives
+    /// in the integration suite.
+    #[test]
+    fn r5_parse_reviewer_status_schema_line_classifies_all_statuses() {
+        let text = "\
+REVIEWER_STATUS: 3-check coverage = NOT-ADDRESSED
+REVIEWER_STATUS: out of scope = N-A
+REVIEWER_STATUS: prior_block_budget = ADDRESSED
+";
+        let parsed = parse_reviewer_status_schema_line(text);
+        assert_eq!(parsed.len(), 3);
+        let find = |k: &str| -> ReviewerStatus {
+            parsed
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, s)| *s)
+                .expect("missing key")
+        };
+        assert_eq!(find("3-check coverage"), ReviewerStatus::NotAddressed);
+        assert_eq!(find("out of scope"), ReviewerStatus::NotApplicable);
+        assert_eq!(find("prior_block_budget"), ReviewerStatus::Addressed);
+    }
+
+    #[test]
+    fn r5_parse_reviewer_status_schema_line_tolerates_absent_or_malformed() {
+        // No schema line at all → empty.
+        assert!(parse_reviewer_status_schema_line("no schema here").is_empty());
+
+        // Unknown status token → silently skipped (no panic).
+        let parsed = parse_reviewer_status_schema_line(
+            "REVIEWER_STATUS: a key = FUTURE-STATUS\n\
+             REVIEWER_STATUS: b key = NOT-ADDRESSED\n",
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "b key");
+        assert_eq!(parsed[0].1, ReviewerStatus::NotAddressed);
+    }
+
+    /// jleechan-1a5e r5: the extract() helper must populate
+    /// `Extracted.not_addressed_structured` when the reviewer emits a
+    /// `REVIEWER_STATUS:` schema line. Without this the structured
+    /// array is dead text — only populated in hand-written fixtures.
+    #[test]
+    fn r5_extract_populates_not_addressed_structured_from_schema_line() {
+        let reply = r#"
+some prose
+NOT-ADDRESSED: ["a", "b"]
+REVIEWER_STATUS: a = NOT-ADDRESSED
+REVIEWER_STATUS: b = N-A
+REVIEWER_STATUS: c = ADDRESSED
+"#;
+        let llm = FakeLlm(
+            r#"{"inhibitionSpecs":[],"positiveAssertions":[],"securityRedactionEncountered":false}"#
+                .to_string(),
+        );
+        let ext = extract(&llm, reply).expect("extract");
+        assert_eq!(ext.not_addressed, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(ext.not_addressed_structured.len(), 3);
+        assert!(ext
+            .not_addressed_structured
+            .iter()
+            .any(|(k, s)| k == "a" && *s == ReviewerStatus::NotAddressed));
+        assert!(ext
+            .not_addressed_structured
+            .iter()
+            .any(|(k, s)| k == "b" && *s == ReviewerStatus::NotApplicable));
+        assert!(ext
+            .not_addressed_structured
+            .iter()
+            .any(|(k, s)| k == "c" && *s == ReviewerStatus::Addressed));
     }
 }

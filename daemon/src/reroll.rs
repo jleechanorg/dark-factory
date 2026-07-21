@@ -649,13 +649,28 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         not_addressed_lines.push_str(&format!("    \"{}\",\n", spec.replace('"', "\\\"")));
     }
 
+    // jleechan-1a5e r5 (CodeRabbit review of PR #420, line 70-95):
+    // persist the structured per-item NOT-ADDRESSED / N-A records into
+    // the [[reroll]] block as `not_addressed_structured`. Without this,
+    // `not_addressed_structured` only ever originates from hand-written
+    // test fixtures, defeating the r3 wiring in `constraints.rs`.
+    let mut not_addressed_structured_lines = String::new();
+    for (key, status) in &extracted.not_addressed_structured {
+        not_addressed_structured_lines.push_str(&format!(
+            "         {{ key = \"{}\", status = \"{}\" }},\n",
+            key.replace('"', "\\\""),
+            status.as_wire_token()
+        ));
+    }
+
     let block = format!(
-        "\n[[reroll]]\n         reviewer = \"{}\"\n         attempt = {}\n         inhibition_specs = [\n         {}         ]\n         positive_assertions = [\n         {}         ]\n         not_addressed = [\n         {}         ]\n         raw_feedback = \"\"\"\n         {}\n         \"\"\"\n",
+        "\n[[reroll]]\n         reviewer = \"{}\"\n         attempt = {}\n         inhibition_specs = [\n         {}         ]\n         positive_assertions = [\n         {}         ]\n         not_addressed = [\n         {}         ]\n         not_addressed_structured = [\n{}         ]\n         raw_feedback = \"\"\"\n         {}\n         \"\"\"\n",
         deps.reviewer,
         superseded_attempt,
         inhibition_lines,
         positive_lines,
         not_addressed_lines,
+        not_addressed_structured_lines,
         deps.review_text
     );
 

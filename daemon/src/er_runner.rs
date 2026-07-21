@@ -303,6 +303,7 @@ pub fn snapshot_with_comments(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         coderabbit_status: "green".into(),
         ci_pending: false,
         head_committed_epoch: 0,
+        base_ref: None,
     }
 }
 

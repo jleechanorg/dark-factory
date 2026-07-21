@@ -344,6 +344,7 @@ fn all_green_snapshot(pr: u64) -> PrSnapshot {
         coderabbit_status: "green".into(),
         ci_pending: false,
         head_committed_epoch: 0,
+        base_ref: None,
     }
 }
 

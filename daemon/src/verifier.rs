@@ -1232,6 +1232,7 @@ mod tests {
             coderabbit_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
+            base_ref: None,
         }
     }
 
@@ -1255,6 +1256,7 @@ mod tests {
             coderabbit_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
+            base_ref: None,
         }
     }
 

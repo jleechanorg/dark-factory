@@ -646,6 +646,8 @@ impl Scm for CliScm {
                     files: Vec<crate::tools::PrFile>,
                     updated_at_epoch: Option<u64>,
                     head_committed_epoch: Option<u64>,
+                    #[serde(default)]
+                    base_ref: Option<String>,
                 }
                 if let Ok(snap) = serde_json::from_str::<OfflinePrSnapshot>(&raw) {
                     let ci_status = if snap.ci_success { "green".to_string() } else { "red".to_string() };
@@ -666,6 +668,7 @@ impl Scm for CliScm {
                         coderabbit_status,
                         ci_pending: false,
                         head_committed_epoch: snap.head_committed_epoch.unwrap_or(0),
+                        base_ref: snap.base_ref,
                     });
                 }
             }
@@ -685,6 +688,13 @@ impl Scm for CliScm {
             reviews: Vec<GhReview>,
             #[serde(rename = "headRefOid")]
             head_ref_oid: String,
+            // jleechan-1a5e r5 (codex P1 of PR #420): the PR base branch name
+            // (e.g. "main") is the canonical diff anchor for the vacuous-red
+            // detector. Missing here is treated as None by serde::default so
+            // a transient gh schema drift degrades to "unknown" rather than
+            // fabricating a base ref.
+            #[serde(default, rename = "baseRefName")]
+            base_ref_name: String,
             body: String,
             comments: Vec<GhComment>,
             files: Vec<GhFile>,
@@ -726,7 +736,7 @@ impl Scm for CliScm {
                 "--repo",
                 &self.repo,
                 "--json",
-                "mergeable,reviews,headRefOid,body,comments,files,updatedAt",
+                "mergeable,reviews,headRefOid,baseRefName,body,comments,files,updatedAt",
             ],
             30,
         ) {
@@ -745,8 +755,15 @@ impl Scm for CliScm {
                 struct RestPr {
                     mergeable: Option<bool>,
                     head: RestHead,
+                    #[serde(rename = "base")]
+                    base: Option<RestBase>,
                     body: Option<String>,
                     updated_at: String,
+                }
+                #[derive(serde::Deserialize)]
+                struct RestBase {
+                    #[serde(rename = "ref")]
+                    ref_name: String,
                 }
                 #[derive(serde::Deserialize)]
                 struct RestHead {
@@ -794,6 +811,7 @@ impl Scm for CliScm {
                     mergeable: if rest_pr.mergeable.unwrap_or(false) { "MERGEABLE".to_string() } else { "CONFLICTING".to_string() },
                     reviews: rest_reviews.into_iter().map(|r| GhReview { author: GhAuthor { login: r.user.map(|u| u.login).unwrap_or_default() }, state: r.state }).collect(),
                     head_ref_oid: rest_pr.head.sha,
+                    base_ref_name: rest_pr.base.map(|b| b.ref_name).unwrap_or_default(),
                     body: rest_pr.body.unwrap_or_default(),
                     comments: rest_comments.into_iter().map(|c| GhComment { author: GhAuthor { login: c.user.map(|u| u.login).unwrap_or_default() }, body: c.body, created_at: c.created_at }).collect(),
                     files: rest_files.into_iter().map(|f| GhFile { path: f.filename, additions: f.additions, deletions: f.deletions }).collect(),
@@ -1093,6 +1111,25 @@ impl Scm for CliScm {
         });
 
         let ci_pending = ci_status == "unknown";
+        // jleechan-1a5e r5 (codex P1 of PR #420): resolve the PR base ref
+        // name (e.g. "main") to its SHA so the runtime vacuous-red-green
+        // detector can diff `base_ref...HEAD` instead of `head_sha...HEAD`.
+        // Falling back to None when the name is missing or the resolve
+        // call fails (gh fetch hiccup, branch deleted upstream) lets the
+        // caller treat this as Unknown rather than fabricating a base
+        // ref that collides the detector onto the head tree.
+        let base_ref = if view.base_ref_name.is_empty() {
+            None
+        } else {
+            let url = format!(
+                "repos/{}/git/ref/heads/{}",
+                self.repo, view.base_ref_name
+            );
+            run_tool("gh", &["api", &url, "--jq", ".object.sha"], 30)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s != "null")
+        };
         let snapshot = PrSnapshot {
             pr_number: pr,
             ci_success,
@@ -1109,6 +1146,7 @@ impl Scm for CliScm {
             coderabbit_status,
             ci_pending,
             head_committed_epoch,
+            base_ref,
         };
         {
             let mut cache = self.pr_snapshot_cache.lock().unwrap();
