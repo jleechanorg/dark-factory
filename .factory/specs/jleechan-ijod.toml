@@ -1,0 +1,21 @@
+
+[[reroll]]
+         reviewer = "skeptic"
+         attempt = 4
+         inhibition_specs = [
+             "PR MUST NOT be in CONFLICTING state (must have no merge conflicts)",
+    "PR MUST NOT be DIRTY (must have no uncommitted changes that block merge)",
+    "PR MUST NOT have any failing CI check-run(s) (all CI must be success)",
+    "CodeRabbit required check MUST NOT be in FAILURE state",
+         ]
+         positive_assertions = [
+             "PR mergeable_state MUST be mergeable/clean",
+    "All CI check-runs MUST be success",
+    "CodeRabbit required check MUST succeed",
+    "CodeRabbit review MUST NOT be blocked by review rate limit (retry or wait until limit resets)",
+         ]
+         raw_feedback = """
+         Ci: CI check-run(s) not all success
+NoConflicts: PR is not mergeable (conflicts)
+Skeptic: mergeable_state=CONFLICTING (DIRTY); CodeRabbit required check is FAILURE due review rate limit”】【
+         """
