@@ -487,9 +487,102 @@ CRITICAL FORMATTING INSTRUCTIONS:
 
 
 def _gate_skeptic(node: "Node", ctx: "Context") -> "Result":
-    if _node_prompt_ref(node):
-        return _run_custom_prompt_gate(node, ctx, "gate_skeptic")
-    local_cmd = ctx.workdir / ".claude" / "commands" / "skeptic.md"
-    if local_cmd.exists():
-        return _slash_gate("skeptic")(node, ctx)
-    return _run_universal_prompt_gate(UNIVERSAL_SKEPTIC_PROMPT, "gate_skeptic", node, ctx)
+    # 1. Handle echo/mock_llm backend
+    if ctx.backend in ("echo", "mock_llm"):
+        hint = ctx.state.get(f"{node.name}.outcome", "success")
+        return Result(
+            outcome=hint,
+            output=f"echo gate skeptic: pre-seeded {hint}",
+            metadata={"slash_command": "skeptic", "verdict": "echo:" + hint},
+        )
+
+    # 2. Get expected SHA
+    expected_sha = _handlers_shim._worktree_head_sha(ctx.workdir)
+    if expected_sha is None:
+        return Result(
+            outcome="error",
+            output=f"gate skeptic cannot resolve HEAD SHA for {ctx.workdir}",
+            metadata={"slash_command": "skeptic", "verdict": "unknown", "head_sha_status": "missing"},
+        )
+
+    # 3. Load rules using RuleLoader
+    import os
+    from pathlib import Path
+    
+    df_home = Path(os.environ.get("DARK_FACTORY_HOME", "/home/jleechan/projects/dark-factory"))
+    global_dir = df_home / "config" / "skeptic"
+    local_dir = ctx.workdir / ".claude" / "commands" / "skeptic"
+    
+    from runner.rule_loader import RuleLoader
+    from runner.scm_provider import LocalGitScm
+    from runner.dispatcher import VerifierDispatcher
+    from runner.consensus import ConsensusAggregator
+    from runner.skeptic_gate_cli import get_implementation_identity
+    
+    loader = RuleLoader(global_dir, local_dir)
+    rules = loader.load_rules()
+
+    if not rules:
+        from runner.rule_loader import Rule
+        rules = [
+            Rule(
+                rule_id="universal-skeptic",
+                name="Universal Skeptic Reviewer",
+                target_globs=["*"],
+                model_tier="premium",
+                description="Universal skeptic checks",
+                prompt=UNIVERSAL_SKEPTIC_PROMPT
+            )
+        ]
+    
+    # 4. Resolve diff and changed files using ScmProvider
+    scm = LocalGitScm(ctx.workdir)
+    pr_num = 0
+    if ctx.git_ctx and ctx.git_ctx.branch_slug.startswith("pr-"):
+        try:
+            pr_num = int(ctx.git_ctx.branch_slug.split("-")[1])
+        except Exception:
+            pass
+    if not pr_num:
+        pr_env = os.environ.get("GITHUB_PR_NUMBER") or os.environ.get("PR_NUMBER")
+        if pr_env:
+            try:
+                pr_num = int(pr_env)
+            except Exception:
+                pass
+                
+    target = f"PR:{pr_num}" if pr_num else "HEAD"
+    
+    try:
+        diff = scm.get_diff(target)
+        changed_files = scm.get_changed_files(target)
+    except Exception as exc:
+        return Result(
+            outcome="error",
+            output=f"gate skeptic failed to resolve SCM context: {exc}",
+            metadata={"slash_command": "skeptic", "verdict": "unknown", "scm_status": "failed"},
+        )
+
+    # Determine implementation identity
+    repo = os.environ.get("GITHUB_REPOSITORY", "jleechanorg/dark-factory")
+    implementation_identity = get_implementation_identity(repo, pr_num, expected_sha) if pr_num else "unknown"
+
+    # Dispatch rules
+    dispatcher = VerifierDispatcher()
+    results = dispatcher.dispatch(
+        rules, changed_files, diff, repo, pr_num, expected_sha, "unknown", implementation_identity
+    )
+    
+    # Aggregate consensus
+    aggregator = ConsensusAggregator()
+    verdict, body = aggregator.compile_report(
+        results, repo, pr_num, expected_sha, expected_sha, implementation_identity
+    )
+    
+    outcome = "success" if verdict == "PASS" else "failure"
+    return Result(
+        outcome=outcome,
+        output=body,
+        metadata={"slash_command": "skeptic", "verdict": verdict},
+    )
+
