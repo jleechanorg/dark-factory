@@ -40,6 +40,7 @@ use std::process::Command;
 
 struct MiniProject {
     root: PathBuf,
+    #[allow(dead_code)]
     base_sha: String,
 }
 
