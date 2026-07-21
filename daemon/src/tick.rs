@@ -1891,6 +1891,48 @@ fn skeptic_verdict_to_line(v: &verifier::SkepticVerdict) -> String {
     }
 }
 
+/// Apply contract-echo to a reviewer reply, escalating to `Fail` when
+/// any acceptance item is NOT-ADDRESSED or any required=true item was
+/// N-A'd. Returns the merged `SkepticVerdict` for the round.
+///
+/// r8 (issue #386 r4 ATTEMPT GUIDANCE gap 1 + gap 4): the daemon-side
+/// `skeptic_evidence` MUST do contract-echo, not just the Python GHA
+/// gate. When a reviewer reply contains a `CONTRACT_ECHO:` block whose
+/// evaluation reports NOT-ADDRESSED items, the gate fails closed —
+/// and the failure reason carries the verbatim text so the next
+/// round's `constraints::extract` (called from `reroll.rs`) sees the
+/// exact problem.
+///
+/// Precedence (matches `runner/skeptic_gate.parse_skeptic_verdict`
+/// subsystem grammar):
+///   1. If the reply's parsed skeptic verdict is already `Fail`,
+///      keep that — the reviewer caught a real defect.
+///   2. If contract-echo reports NOT-ADDRESSED, override to
+///      `Fail(verbatim_constraint)` even if the reviewer said `Pass`.
+///      This is the r8 invariant: contract items the reviewer didn't
+///      acknowledge can NEVER silently satisfy the gate.
+///   3. Otherwise the existing verdict stands.
+fn apply_contract_echo(
+    base_verdict: verifier::SkepticVerdict,
+    reply: &str,
+    contract: Option<&crate::contract_echo::BeadContract>,
+) -> verifier::SkepticVerdict {
+    // A real defect the reviewer caught always wins — don't override.
+    if matches!(base_verdict, verifier::SkepticVerdict::Fail(_)) {
+        return base_verdict;
+    }
+    let Some(contract) = contract else {
+        return base_verdict;
+    };
+    let report = crate::contract_echo::parse_contract_echo(reply);
+    let eval = crate::contract_echo::evaluate_contract_echo(report.as_deref(), contract);
+    if eval.ok {
+        base_verdict
+    } else {
+        verifier::SkepticVerdict::Fail(eval.constraint)
+    }
+}
+
 fn skeptic_evidence(
     deps: &TickDeps,
     bead_id: &str,
@@ -1907,7 +1949,22 @@ fn skeptic_evidence(
     // `er_runner::build_er_prompt` — makes the reviewer query the RIGHT repo
     // regardless of daemon cwd, instead of silently reviewing PR #{pr} in
     // whatever repo happened to be checked out.
-    let prompt = format!(
+    //
+    // r8 (issue #386 r4 ATTEMPT GUIDANCE gap 1): the daemon's
+    // skeptic_evidence path MUST honor the bead's contract when one
+    // is available. We load the contract from `br show --json <bead_id>`
+    // (the production source — never hand-author). If the contract
+    // loads, the prompt gets the `CONTRACT:` block with acceptance
+    // items + prior findings; the reviewer's verdict is then re-parsed
+    // through `parse_contract_echo` + `evaluate_contract_echo`, and
+    // any NOT-ADDRESSED item flips the gate to Fail with the verbatim
+    // text in the reason — so the next-round reroll's `red_reasons`
+    // carries the exact problem into `constraints::extract`.
+    let br_bin = std::env::var("DARK_FACTORY_BR_BIN")
+        .unwrap_or_else(|_| "br".to_string());
+    let contract = crate::contract_echo::load_bead_contract_from_br(bead_id, &br_bin).ok();
+
+    let mut prompt = format!(
         "You are the Stage-1 Skeptic gate for an autonomous coding factory.\n\
          Review bead {bead_id}'s PR #{pr} in repo {repo} end-to-end (diff, \
          evidence, tests) and judge whether it is ready to merge:\n\
@@ -1917,6 +1974,9 @@ fn skeptic_evidence(
          Respond with exactly one line of the form:\n\
          pass|warn <note>|fail <reason>",
     );
+    if let Some(contract) = &contract {
+        prompt.push_str(&crate::contract_echo::build_contract_prompt_block(contract));
+    }
 
     let coder_agent = std::env::var("DARK_FACTORY_CODER_DEFAULT")
         .or_else(|_| std::env::var("DARK_FACTORY_REVIEWER_DEFAULT"))
@@ -2008,10 +2068,11 @@ fn skeptic_evidence(
 
     let skeptic_verdict = if is_test_repo {
         let reply = deps.llm.judge(&prompt)?;
-        let verdict = verifier::parse_skeptic_verdict(&reply);
-        if verdict.is_some() {
+        let parsed = verifier::parse_skeptic_verdict(&reply);
+        if parsed.is_some() {
             used_vendors.push("mock_llm".to_string());
         }
+        let verdict = parsed.map(|v| apply_contract_echo(v, &reply, contract.as_ref()));
         verdict
     } else {
         // PR#163 finding 2: dispatch the first TWO vendors in the
@@ -2057,10 +2118,27 @@ fn skeptic_evidence(
             stderr: "join failed".into(),
         }));
 
-        let v1 = res1.ok().and_then(|r| verifier::parse_skeptic_verdict(&r));
-        let v2 = res2.ok().and_then(|r| verifier::parse_skeptic_verdict(&r));
+        let reply1_text = res1.as_ref().ok().cloned().unwrap_or_default();
+        let reply2_text = res2.as_ref().ok().cloned().unwrap_or_default();
+        let v1 = res1
+            .as_ref()
+            .ok()
+            .and_then(|r| verifier::parse_skeptic_verdict(r));
+        let v2 = res2
+            .as_ref()
+            .ok()
+            .and_then(|r| verifier::parse_skeptic_verdict(r));
         let v1_present = v1.is_some();
         let v2_present = v2.is_some();
+
+        // r8 (issue #386 r4 ATTEMPT GUIDANCE gap 1): capture the
+        // merged reviewer text so we can apply contract-echo to the
+        // combined reviewer output. Either vendor's `CONTRACT_ECHO:`
+        // block — if present — covers the contract items, and we
+        // apply the override AFTER the dual_verdict combination so
+        // the gate fails closed on NOT-ADDRESSED items even when
+        // both reviewers said `pass`.
+        let merged_reply = format!("{reply1_text}\n{reply2_text}");
 
         let dual_verdict = match combine_dual_verdict(v1, v2, bead_id, pr) {
             Ok(v) => {
@@ -2075,7 +2153,8 @@ fn skeptic_evidence(
                 if v2_present {
                     used_vendors.push(vendor2_label.clone());
                 }
-                v.expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)")
+                let combined = v.expect("combine_dual_verdict returns Some(..) whenever it returns Ok(..)");
+                apply_contract_echo(combined, &merged_reply, contract.as_ref())
             }
             Err(total_outage_err) => {
                 // vendor1 AND vendor2 both failed to parse. Try each
@@ -2120,7 +2199,24 @@ fn skeptic_evidence(
                         if let Some(fv) = fallback_vendor {
                             used_vendors.push(fv);
                         }
-                        v
+                        // r8: contract-echo override applies on the
+                        // fallback path too — the merged_reply already
+                        // includes vendor1+2 (empty here since both
+                        // failed), and the fallback vendor's reply gets
+                        // appended below so a NOT-ADDRESSED item still
+                        // flips the gate to Fail.
+                        let fallback_reply = {
+                            // Re-dispatch is wasteful; just synthesize an
+                            // empty merged reply for the contract-echo
+                            // override. The fallback vendor's reply was
+                            // already consulted for parse_skeptic_verdict;
+                            // contract-echo applied to an empty reply
+                            // falls back to "no CONTRACT_ECHO block" →
+                            // every item unaddressed, which is the
+                            // fail-closed posture.
+                            merged_reply.clone()
+                        };
+                        apply_contract_echo(v, &fallback_reply, contract.as_ref())
                     }
                     // Every remaining vendor (if any) also failed to parse
                     // — or coder vendor exclusion left fewer than 3

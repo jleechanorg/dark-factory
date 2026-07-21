@@ -83,6 +83,16 @@ on:
         description: "40-hex SHA the caller pinned the workflow ref to (immutable code ref)"
         required: true
         type: string
+      bead_id:
+        description: "Optional bead id (e.g. 'jleechan-pq08'). When set, the gate loads the contract from `br show --json <id>` and the reviewer prompt carries the bead's notes + prior findings + acceptance items. Closes issue #386 r3 gap 3 (production workflow did not pass --contract-file). Mutually exclusive with contract_file."
+        required: false
+        type: string
+        default: ""
+      contract_file:
+        description: "Optional path to a hand-authored bead-contract JSON. Used when bead_id is not supplied. Same effect (issue #386)."
+        required: false
+        type: string
+        default: ""
     secrets:
       github_token:
         description: "GitHub token for posting comment + status (default: workflow-provided GITHUB_TOKEN)"
@@ -328,6 +338,16 @@ jobs:
         # calls. Now Python keeps GH_TOKEN (scoped to the workflow
         # run); only the reviewer subprocess env is sanitized via
         # runner/skeptic_gate_cli._reviewer_env.
+        #
+        # Per issue #386 r3: pass `--bead-id` so the gate loads the
+        # contract from `br show --json <id>` and the reviewer
+        # actually sees the bead's notes + prior findings + acceptance
+        # items. Closes r3 gap 3 (production workflow did not pass
+        # the contract). If `--bead-id` is empty, fall back to
+        # `--contract-file` from `$SKEPTIC_CONTRACT_FILE` for
+        # hand-authored contracts. If neither is set, the gate runs
+        # the legacy 10-field contract (issue #384) — backwards
+        # compatible.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN || secrets.github_token }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -339,9 +359,26 @@ jobs:
           SKEPTIC_GEMINI_BIN: ${{ env.SKEPTIC_GEMINI_BIN }}
           SKEPTIC_REVIEWER_PATH: ${{ env.SKEPTIC_REVIEWER_PATH }}
           TRUSTED_CODE_SHA: ${{ env.TRUSTED_CODE_SHA }}
+          # r3: bead-id is the preferred contract source. The caller
+          # workflow forwards `inputs.bead_id` (default empty); when
+          # empty, `SKEPTIC_CONTRACT_FILE` (a path to a hand-authored
+          # contract JSON) takes over.
+          SKEPTIC_BEAD_ID: ${{ inputs.bead_id || '' }}
+          SKEPTIC_CONTRACT_FILE: ${{ inputs.contract_file || env.SKEPTIC_CONTRACT_FILE || '' }}
+          SKEPTIC_BR_BIN: ${{ vars.SKEPTIC_BR_BIN || 'br' }}
         run: |
           set -euo pipefail
           export PATH="$SKEPTIC_REVIEWER_PATH"
+          # Build the optional contract flags. Only pass flags that
+          # are actually set — empty-string args would be rejected
+          # by argparse anyway, but skipping them keeps the command
+          # line clean for the prod logs.
+          contract_args=()
+          if [ -n "${SKEPTIC_BEAD_ID:-}" ]; then
+            contract_args+=(--bead-id "${SKEPTIC_BEAD_ID}" --br-bin "${SKEPTIC_BR_BIN}")
+          elif [ -n "${SKEPTIC_CONTRACT_FILE:-}" ]; then
+            contract_args+=(--contract-file "${SKEPTIC_CONTRACT_FILE}")
+          fi
           python -m runner.skeptic_gate_cli \
             --repo "$GITHUB_REPOSITORY" \
             --pr-number "${PR_NUMBER}" \
@@ -351,4 +388,5 @@ jobs:
             --expected-actor "${SKEPTIC_EXPECTED_ACTOR}" \
             --codex-bin "${SKEPTIC_CODEX_BIN}" \
             --gemini-bin "${SKEPTIC_GEMINI_BIN}" \
-            --trusted-code-sha "${TRUSTED_CODE_SHA}"
+            --trusted-code-sha "${TRUSTED_CODE_SHA}" \
+            "${contract_args[@]}"
