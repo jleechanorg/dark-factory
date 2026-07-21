@@ -36,6 +36,15 @@ def _substitute_placeholders(text: str, ctx: "Context") -> str:
     """
     text = text.replace("${goal}", ctx.goal)
     for k, v in ctx.state.items():
+        # Skip non-string values entirely: the prompt template only expects
+        # strings, and silently coercing opaque types (e.g. a ``Graph`` object
+        # stashed by the ``type="dynamic"`` handler for graph-driven fallback
+        # resolution) would inject a multi-KB debug dump via ``__str__`` into
+        # the rendered prompt. Earlier ``str(v)`` coercion also caused crashes
+        # with non-string types in some render paths; skipping is the
+        # minimum-viable safe fix.
+        if not isinstance(v, str):
+            continue
         text = text.replace("${state." + k + "}", v)
     diff = ctx.state.get("_last_diff", "")
     if not diff:
