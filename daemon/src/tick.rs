@@ -88,6 +88,27 @@ const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
 const ESCALATION_REVIEWER: &str = "dark-factory-escalation";
 const ESCALATION_SENTINEL_ATTEMPT: u32 = u32::MAX;
 
+/// Bead jleechan-msmq: an ATTESTED bead with `reroll_count > 0` is in the
+/// reroll pipeline. The OLD PR's gate verdict cannot advance the bead
+/// (the reroll branch IS the advancement); re-assessing it on every
+/// subsequent tick is pure churn that races with two breakers:
+///
+///   * the autonomy timebox — `autonomy_secs` keeps bumping, and once it
+///     crosses `autonomy_timebox_secs`, the timebox-park branch calls
+///     `kill_session_and_clear_handle`, killing the fresh coder lane
+///     that was just fabricated by the reroll before it has a chance to
+///     push a fix. Symptom: bead goes HumanHeld → recover-held → QUEUED,
+///     dispatched session dead, bead ping-pongs forever.
+///   * the circuit-breaker — same reviewer citing the same red gate on
+///     identical evidence trips on attempt 2 and parks HUMAN_HELD, even
+///     though the fresh lane was about to land a fix.
+///
+/// The fix: skip the per-tick gate assessment for ATTESTED beads whose
+/// `reroll_count > 0`. The reroll branch (which runs below this guard in
+/// `run_fast_tier`) is the ONLY consumer of the fresh lane's progress;
+/// the OLD PR's gates are not relevant once reroll has been initiated.
+/// Emitting `VERIFIER_SKIPPED_REROLL_IN_PROGRESS` lets an operator tell
+/// the skip from a transient snapshot error or a circuit-breaker trip.
 /// Result of looking up CI-pending state for an active overlay (used by the
 /// autonomy/timebox bookkeeping in `run_tick`'s active-overlay loop).
 ///
@@ -2828,6 +2849,51 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 continue;
             }
         };
+
+        // Bead jleechan-msmq: skip gate re-assessment when this bead's prior
+        // reroll attempt DEFERRED (`reroll_deferral_count > 0`,
+        // `reroll::execute`'s `defer_or_cap` left the bead ATTESTED with
+        // the OLD PR still set, head SHA unchanged). The OLD PR's gate
+        // verdict cannot advance the bead (the reroll branch IS the
+        // advancement) and re-assessing it on every subsequent tick
+        // races with two breakers (see module-level comment above for
+        // the failure mode): the autonomy timebox parks + kills the live
+        // coder lane before its first push, and the circuit-breaker trips
+        // on identical red evidence at attempt 2.
+        //
+        // Scoped specifically to DEFERRED rerolls. An IN-FLIGHT reroll
+        // (`reroll_count > 0` with `reroll_deferral_count == 0`) is a
+        // different state: the reroll succeeded once and a fresh attempt
+        // branch is open. The reroll branch below still fires normally
+        // for that bead on every tick (it advances to either another
+        // reroll, or holds at ReRoll awaiting the fresh coder's first
+        // push). Skipping those would silently strand the in-flight
+        // reroll's per-tick progress check.
+        //
+        // The fast tier's reroll branch below this guard still fires
+        // normally on every tick for in-flight beads, so deferrals
+        // continue to be observed and the bead remains re-eligible; the
+        // SUPPRESSED surface is the duplicate GATE_ASSESSMENT emit for
+        // the DEFERRED branch only.
+        let reroll_deferral_count = deps.store.reroll_deferral_count(bead_id).unwrap_or(0);
+        if reroll_deferral_count > 0 {
+            let _ = emit(
+                deps.telemetry_log,
+                bead_id,
+                overlay.attempt,
+                OverlayState::Attested.as_str(),
+                "VERIFIER_SKIPPED_REROLL_IN_PROGRESS",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "prNumber": pr,
+                    "headSha": snapshot.head_sha,
+                    "rerollCount": overlay.reroll_count,
+                    "rerollDeferralCount": reroll_deferral_count,
+                    "reason": "prior reroll attempt deferred; old PR gates cannot advance the bead",
+                }),
+            );
+            continue;
+        }
 
         // jleechan-qqq: if no `/er` verdict is recorded yet, dispatch an
         // independent reviewer (claude/codex subprocess) and post the
