@@ -338,10 +338,10 @@ def _valid_pass_output(identity: str = "codex", *, with_contract_echo: bool = Tr
         # the contract's prior finding (r5 reviewer in the CLI
         # fixture).
         base += (
-            f"CONTRACT_ECHO:\n"
-            f"ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
-            f"ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
-            f"PRIOR_FINDING: r5 reviewer VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
+            "CONTRACT_ECHO:\n"
+            "ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
+            "ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
+            "PRIOR_FINDING: r5 reviewer VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
         )
     return base
 
@@ -450,8 +450,8 @@ def _output_for_reviewer_omitting_prior_findings(reviewer_name: str) -> str:
         f"LINT_RUN_EVIDENCE: tool=ruff errors=0 warnings=0\n"
         f"GREP_CITES: runner/skeptic_gate.py:1\n"
         f"HEAD_COMMIT_VERIFIED: {head}\n"
-        f"CONTRACT_ECHO:\n"
-        f"ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
-        f"ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
+        "CONTRACT_ECHO:\n"
+        "ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
+        "ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
         # NOTE: no PRIOR_FINDING: line — must fail closed.
     )

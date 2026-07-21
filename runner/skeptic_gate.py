@@ -1701,11 +1701,20 @@ def evaluate(
             ),
         )
         if not echo_verdict.ok:
+            # r10 (issue #386): the gate can now also fail closed on
+            # unaddressed prior findings. The summary count must
+            # reflect BOTH unaddressed acceptance items AND
+            # omitted/NOT-ADDRESSED prior findings so the next-round
+            # worker can size the reroll correctly. The per-item
+            # verbatim detail still lives in `echo_verdict.constraint`.
+            unaddressed_items_count = len(echo_verdict.unaddressed_items)
+            unaddressed_pf_count = len(echo_verdict.unaddressed_prior_findings)
             reason = (
-                f"contract-echo gate failed: {len(echo_verdict.unaddressed_items)} "
-                f"acceptance item(s) not addressed in the diff. The constraint "
-                f"below is verbatim from the bead author's contract and must "
-                f"be addressed in the next roll.\n\n{echo_verdict.constraint}"
+                f"contract-echo gate failed: {unaddressed_items_count} "
+                f"acceptance item(s) and {unaddressed_pf_count} prior "
+                f"finding(s) not addressed in the diff. The constraint "
+                f"below is verbatim from the bead author's contract and "
+                f"must be addressed in the next roll.\n\n{echo_verdict.constraint}"
             )
             body = format_comment(
                 verdict=parsed.verdict,
