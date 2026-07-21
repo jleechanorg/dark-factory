@@ -1,0 +1,35 @@
+// Level-5 fixture that satisfies the hard tier but opts out of soft-tier
+// nodes via skip_<x>="true" graph attributes. Conformance should pass
+// cleanly because soft-tier items are warnings, not errors, and the
+// skip flags silence them.
+digraph level5_with_skip {
+    graph [
+        goal="Level-5 fixture with soft-tier skip flags set."
+        backend="claude"
+        level5="true"
+        skip_holdout="true"
+        skip_spec_validation="true"
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    implement [type="codergen", prompt="@prompts/hello/implement.md"]
+    fix       [type="codergen", prompt="@prompts/hello/fix.md", max_visits="3"]
+    gate_er         [type="gate_er",      label="/er Evidence Review",  timeout=600]
+    gate_skeptic    [type="gate_skeptic", label="Skeptic",              timeout=600]
+    adversarial     [type="tool", command="agy --print review --pr ${state.pr_url}", timeout=600]
+    healer          [type="tool", command="df-healer --cxdb /tmp/x.sqlite", timeout=600]
+
+    start -> implement -> gate_er
+    gate_er -> gate_skeptic [condition="outcome=success"]
+    gate_er -> fix          [condition="outcome!=success"]
+    gate_skeptic -> adversarial [condition="outcome=success"]
+    gate_skeptic -> fix          [condition="outcome!=success"]
+    adversarial -> exit [condition="outcome=success"]
+    adversarial -> fix  [condition="outcome!=success"]
+    fix -> gate_er [condition="outcome!=exhausted"]
+    fix -> healer [condition="outcome=exhausted"]
+    healer -> exit
+}

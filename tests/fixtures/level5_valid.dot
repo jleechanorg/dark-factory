@@ -1,0 +1,43 @@
+// Minimal Level-5 compliant fixture — satisfies all hard-tier gates and
+// declares soft-tier nodes (holdout, healer, spec_validation) explicitly so
+// the conformance validator should produce zero diagnostics.
+digraph level5_valid {
+    graph [
+        goal="Level-5 reference fixture for conformance validate tests."
+        backend="claude"
+        level5="true"
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    implement [type="codergen", prompt="@prompts/hello/implement.md"]
+    fix       [type="codergen", prompt="@prompts/hello/fix.md", max_visits="3"]
+
+    holdout         [type="holdout_eval", label="Holdout Eval", feature="hello", timeout=600]
+    gate_er         [type="gate_er",      label="/er Evidence Review",            timeout=600]
+    gate_skeptic    [type="gate_skeptic", label="Skeptic (inverted incentive)",   timeout=600]
+    adversarial     [type="tool",         label="Cross-vendor adversarial reviewer",
+                     command="codex exec --yolo review --pr ${state.pr_url}",
+                     timeout=600]
+    healer          [type="tool",         label="CXDB failure cluster",
+                     command="df-healer --cxdb ${state.cxdb_path}",
+                     timeout=600]
+    spec_validation [type="codergen",     prompt="@prompts/hello/spec_validation.md"]
+
+    start -> implement -> holdout
+    holdout -> gate_er [condition="outcome=success"]
+    holdout -> fix     [condition="outcome!=success"]
+    gate_er -> gate_skeptic [condition="outcome=success"]
+    gate_er -> fix         [condition="outcome!=success"]
+    gate_skeptic -> adversarial [condition="outcome=success"]
+    gate_skeptic -> fix         [condition="outcome!=success"]
+    adversarial -> spec_validation [condition="outcome=success"]
+    adversarial -> fix            [condition="outcome!=success"]
+    spec_validation -> exit [condition="outcome=success"]
+    spec_validation -> fix  [condition="outcome!=success"]
+    fix -> healer [condition="outcome=exhausted"]
+    fix -> holdout [condition="outcome!=exhausted"]
+    healer -> exit
+}
