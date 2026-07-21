@@ -1,0 +1,47 @@
+
+[[reroll]]
+         reviewer = "skeptic"
+         attempt = 5
+         inhibition_specs = [
+             "load_bead_contract_from_bead MUST NOT crash when `br show --json` returns a JSON array instead of a JSON object",
+    "load_bead_contract_from_bead MUST NOT crash when a live bead has no acceptance_items field",
+    "`--bead-id` MUST NOT remain opt-in; PR auto-wire MUST be the default path so bead identity is derived from the PR",
+    "evaluate() MUST NOT run without prior-finding enforcement wired in",
+    "The daemon MUST NOT run without redispatch wiring for skeptic failures",
+    "CI check-runs MUST NOT be left failing on the PR",
+    "CodeRabbit review MUST NOT be left in a non-APPROVED state",
+    "Review threads MUST NOT remain unresolved (target: 0 unresolved)",
+    "Code MUST NOT assume br show output is a JSON object — it is empirically a JSON array",
+         ]
+         positive_assertions = [
+             "All CI check-runs MUST be success",
+    "CodeRabbit review MUST reach APPROVED state",
+    "All review threads MUST be resolved (no unresolved threads)",
+    "load_bead_contract_from_bead MUST parse `br show --json` as a JSON array and tolerate beads that have no acceptance_items",
+    "`--bead-id` MUST be auto-wired from the PR; the operator MUST NOT have to pass it manually",
+    "evaluate() MUST enforce prior findings (carry-over/closure of prior-review findings)",
+    "The daemon MUST redispatch when the skeptic gate rejects, per bead r3 requirements",
+    "The contract loader MUST handle real-world br show output shape (array, not object)",
+         ]
+         raw_feedback = """
+         Ci: CI check-run(s) not all success
+CodeRabbitApproved: CodeRabbit review is not APPROVED
+CommentsResolved: 4 unresolved review thread(s)
+Skeptic: load_bead_contract_from_bead crashes on real `br show --json` (returns a JSON array, not an object; live jleechan-pq08 has no acceptance_items); `--bead-id` is still opt-in with no PR auto-wire, and prior-finding enforcement plus daemon redispatch remain unwired in `evaluate()`/daemon despite bead r3 requirements
+         """
+
+[[reroll]]
+         reviewer = "skeptic"
+         attempt = 6
+         inhibition_specs = [
+             "MUST NOT accept or merge when any required CI check-run is not successful.",
+    "MUST NOT satisfy or claim the cross-model skeptic guarantee when only one model family contributed to the review.",
+         ]
+         positive_assertions = [
+             "All required CI check-runs MUST complete successfully.",
+    "The skeptic review MUST include contributions from at least two distinct model families to satisfy the cross-model guarantee.",
+         ]
+         raw_feedback = """
+         Ci: CI check-run(s) not all success
+Skeptic: cross-model skeptic guarantee violated: only one model family contributed to the review (issue #385, strict merge policy #328)
+         """
