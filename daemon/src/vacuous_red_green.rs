@@ -228,25 +228,33 @@ pub fn check_red_green_with_manifest(
         None => find_cargo_manifest(repo_root),
     };
 
-    // Step 1: discover the test fn names + per-fn skip reasons in each
-    // changed test file. `#[ignore]` and `#[ignore = "..."]` populate
-    // `skip_reason` so the report can record them instead of silently
-    // counting them as "all green on revert" (issue #387 r5 finding 4).
+    // Step 1: discover the diff-aware added/modified test fns + their
+    // per-fn skip reasons across the changed test files. r6 contract
+    // (issue #387 r6 P1 #5): scope at the fn level AND only emit fns that
+    // were actually added or modified by this PR — not every `#[test]`
+    // living in a changed test file. The base blob for each path is
+    // fetched via `git show <base_ref>:<rel>` so we can compare fn bodies
+    // (added fns = name missing from base; modified fns = same name in
+    // both, different body). `#[ignore]` / `#[ignore = "..."]` populate
+    // `skip_reason` (issue #387 r5 finding 4).
     let mut targeted: BTreeSet<String> = BTreeSet::new();
     let mut skipped: Vec<TestFnInfo> = Vec::new();
     for path in &test_files {
-        let src = std::fs::read_to_string(path).map_err(|e| {
+        let head_src = std::fs::read_to_string(path).map_err(|e| {
             RedGreenError::Git(format!("read test file {}: {e}", path.display()))
         })?;
-        for info in discover_test_fns_with_skip(&src) {
-            if targeted.insert(info.name.clone()) {
-                if let Some(reason) = info.skip_reason {
-                    skipped.push(TestFnInfo {
-                        name: info.name,
-                        skip_reason: Some(reason),
-                    });
-                }
-            }
+        let rel = relative_repo_path(repo_root, path);
+        let base_src = match rel {
+            Some(r) => read_base_blob(repo_root, base_ref, &r),
+            None => None,
+        };
+        let (added_or_modified, skipped_local) =
+            compute_targeted_test_fns(base_src.as_deref(), &head_src);
+        for info in skipped_local {
+            skipped.push(info);
+        }
+        for name in added_or_modified {
+            targeted.insert(name);
         }
     }
     let targeted_tests: Vec<String> = targeted.iter().cloned().collect();
@@ -443,6 +451,209 @@ fn parse_test_fn_name(line: &str) -> Option<String> {
         return None;
     }
     Some(after_fn[..name_end].to_string())
+}
+
+/// Strip the daemon cwd prefix from an absolute path used in `git show
+/// <base_ref>:<path>`. Returns `None` when `path` is not under
+/// `repo_root` (the caller will then skip the base-blob fetch and fall
+/// back to "treat every head fn as added").
+fn relative_repo_path(repo_root: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(repo_root)
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+}
+
+/// Fetch the test-file blob at `base_ref:<rel_path>` from git. Returns
+/// `None` when the file does not exist on the base (a brand-new test
+/// file is purely "added", which the diff-aware scoping handles by
+/// emitting every head-side fn). A failed `git show` for any other
+/// reason (corrupt repo, revoked ref) is propagated as `Some("")` so
+/// the downstream parse simply sees an empty base file — every head fn
+/// still classifies as "added".
+fn read_base_blob(repo_root: &Path, base_ref: &str, rel_path: &str) -> Option<String> {
+    let spec = format!("{base_ref}:{rel_path}");
+    let out = Command::new("git")
+        .current_dir(repo_root)
+        .args(["show", &spec])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        // File did not exist on base, or ref is unresolvable. Treat as
+        // "no base content" — every head fn will look new.
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+/// Diff-aware scoping (issue #387 r6 P1 #5): given the parsed HEAD-side
+/// `#[test]` fns (with skip_reasons) and the optional base-side source
+/// for the same file, return `(targeted_names, skipped_records)` where
+/// `targeted_names` contains exactly those head-side fns that were
+/// added OR modified by this PR. Pre-existing fns whose body bytes are
+/// identical to base are excluded. A `None` base_src (file did not
+/// exist before the PR) classifies every head fn as added.
+///
+/// The "added" detection is by-name: a fn is added iff its name is not
+/// present in the base parser. The "modified" detection is by body: a
+/// fn with the same name in both is modified iff the byte slice
+/// between `fn <name>(` and its matching `}` differs between base and
+/// head. The matching brace is found by counting nested `{`/`}` inside
+/// the fn body — sufficient for the test-fn shapes cargo recognises.
+pub fn compute_targeted_test_fns(
+    base_src: Option<&str>,
+    head_src: &str,
+) -> (Vec<String>, Vec<TestFnInfo>) {
+    let head_fns = discover_test_fns_with_skip(head_src);
+    if head_fns.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let base_fns = match base_src {
+        None => Vec::new(),
+        Some(src) => discover_test_fns_with_skip(src),
+    };
+    let base_names: BTreeSet<&str> = base_fns.iter().map(|i| i.name.as_str()).collect();
+    // For fns present in both, we need the body bytes to detect "modified".
+    // Index base-side bodies once by name so the loop below is O(head).
+    let mut base_body_by_name: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::new();
+    if let Some(src) = base_src {
+        for (start, end, name) in fn_bodies_iter(src) {
+            base_body_by_name.insert(name, &src[start..end]);
+        }
+    }
+    let mut head_body_by_name: std::collections::HashMap<&str, (usize, usize)> =
+        std::collections::HashMap::new();
+    for (start, end, name) in fn_bodies_iter(head_src) {
+        head_body_by_name.insert(name, (start, end));
+    }
+
+    let mut targeted: Vec<String> = Vec::new();
+    let mut skipped: Vec<TestFnInfo> = Vec::new();
+
+    for info in head_fns {
+        if base_src.is_none() {
+            // Brand-new file: every head fn is added.
+            targeted.push(info.name.clone());
+            if let Some(reason) = info.skip_reason {
+                skipped.push(TestFnInfo {
+                    name: info.name,
+                    skip_reason: Some(reason),
+                });
+            }
+            continue;
+        }
+        if !base_names.contains(info.name.as_str()) {
+            // Added: name not in base.
+            targeted.push(info.name.clone());
+            if let Some(reason) = info.skip_reason {
+                skipped.push(TestFnInfo {
+                    name: info.name,
+                    skip_reason: Some(reason),
+                });
+            }
+            continue;
+        }
+        // Existing fn in both — compare bodies.
+        let head_body = head_body_by_name
+            .get(info.name.as_str())
+            .copied()
+            .map(|(s, e)| &head_src[s..e]);
+        let base_body = base_body_by_name.get(info.name.as_str()).copied();
+        if head_body != base_body {
+            targeted.push(info.name.clone());
+            if let Some(reason) = info.skip_reason {
+                skipped.push(TestFnInfo {
+                    name: info.name,
+                    skip_reason: Some(reason),
+                });
+            }
+        }
+        // Unchanged fns are intentionally dropped — issue #387 r6 P1 #5.
+    }
+
+    (targeted, skipped)
+}
+
+/// Iterate `(body_start, body_end, name)` for every `fn <name>(...)`
+/// in `source`, where body bytes run from immediately AFTER the opening
+/// `{` of the fn body to the matching closing `}` (exclusive). Used by
+/// `compute_targeted_test_fns` to compare per-fn bodies between base
+/// and head. Stops at EOF if the matching `}` is missing.
+fn fn_bodies_iter(source: &str) -> Vec<(usize, usize, &str)> {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < len {
+        // Look for the literal sequence `fn <name>(`. The simplest
+        // search is over byte offsets — Rust source is ASCII for our
+        // purposes (test files don't embed multi-byte identifiers).
+        if let Some(rel) = find_subslice(&source[i..], b"fn ") {
+            let fn_kw = i + rel;
+            let after = fn_kw + 3;
+            // Parse the name.
+            let mut name_end = after;
+            while name_end < len {
+                let c = bytes[name_end];
+                if c.is_ascii_alphanumeric() || c == b'_' {
+                    name_end += 1;
+                } else {
+                    break;
+                }
+            }
+            if name_end == after {
+                i = after;
+                continue;
+            }
+            let name = &source[after..name_end];
+            // Skip past the parameter list `(...)`.
+            let mut p = name_end;
+            if p < len && bytes[p] == b'(' {
+                let mut depth = 1;
+                p += 1;
+                while p < len && depth > 0 {
+                    match bytes[p] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    p += 1;
+                }
+            }
+            // Skip return type + where clauses until we hit `{`.
+            let mut brace = p;
+            while brace < len && bytes[brace] != b'{' {
+                brace += 1;
+            }
+            if brace >= len {
+                break;
+            }
+            // Walk to matching `}`.
+            let body_start = brace + 1;
+            let mut depth = 1;
+            let mut j = body_start;
+            while j < len && depth > 0 {
+                match bytes[j] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if j > body_start {
+                out.push((body_start, j.saturating_sub(1), name));
+            }
+            i = j;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn find_subslice(haystack: &str, needle: &[u8]) -> Option<usize> {
+    haystack.as_bytes().windows(needle.len()).position(|w| w == needle)
 }
 
 fn capture_production_diff(
@@ -928,6 +1139,121 @@ fn ordinary() { assert!(true); }
             failing_on_revert: vec!["classify_high".to_string()],
         };
         assert_eq!(outcome.verdict(), Verdict::BaselineFailed);
+    }
+
+    // ---- r6: diff-aware fn-level scoping (issue #387 r6 P1 #5) ----
+
+    #[test]
+    fn diff_aware_targeting_only_emits_added_fn_when_file_is_new() {
+        // base_src == None simulates a brand-new test file added by the
+        // PR. Every head fn must classify as added.
+        let head = r#"
+#[test]
+fn new_test() { assert!(true); }
+"#;
+        let (targeted, skipped) = compute_targeted_test_fns(None, head);
+        assert_eq!(targeted, vec!["new_test".to_string()]);
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn diff_aware_targeting_excludes_fn_with_unchanged_body() {
+        // Base has both fns. Head re-declares them with the same body —
+        // issue #387 r6 P1 #5: unchanged fns must NOT be re-run.
+        let base = r#"
+#[test]
+fn a() { assert!(true); }
+
+#[test]
+fn b() { assert!(false); }
+"#;
+        let head = r#"
+#[test]
+fn a() { assert!(true); }
+
+#[test]
+fn b() { assert!(false); }
+"#;
+        let (targeted, _skipped) = compute_targeted_test_fns(Some(base), head);
+        assert!(
+            targeted.is_empty(),
+            "no fn changed, expected empty targeted list; got {targeted:?}"
+        );
+    }
+
+    #[test]
+    fn diff_aware_targeting_emits_modified_fn_when_body_changed() {
+        let base = r#"
+#[test]
+fn a() { assert!(true); }
+"#;
+        let head = r#"
+#[test]
+fn a() { assert!(false); }
+"#;
+        let (targeted, _) = compute_targeted_test_fns(Some(base), head);
+        assert_eq!(targeted, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn diff_aware_targeting_mixes_added_and_unchanged() {
+        // Base has fn `a` only. Head adds `b` and leaves `a` alone.
+        let base = r#"
+#[test]
+fn a() { assert!(true); }
+"#;
+        let head = r#"
+#[test]
+fn a() { assert!(true); }
+
+#[test]
+fn b() { assert!(true); }
+"#;
+        let (targeted, _) = compute_targeted_test_fns(Some(base), head);
+        assert_eq!(targeted, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn diff_aware_targeting_preserves_skip_reason_for_targeted_fns() {
+        let base = r#"
+#[test]
+fn a() { assert!(true); }
+"#;
+        let head = r#"
+#[test]
+#[ignore = "needs fixture"]
+fn b() { assert!(true); }
+"#;
+        let (targeted, skipped) = compute_targeted_test_fns(Some(base), head);
+        assert_eq!(targeted, vec!["b".to_string()]);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].name, "b");
+        assert_eq!(skipped[0].skip_reason.as_deref(), Some("needs fixture"));
+    }
+
+    #[test]
+    fn fn_bodies_iter_extracts_per_fn_body() {
+        let src = r#"
+#[test]
+fn a() { assert!(true); }
+
+#[test]
+fn b() {
+    let x = 1;
+    assert_eq!(x, 1);
+}
+"#;
+        let bodies: Vec<&str> = fn_bodies_iter(src)
+            .into_iter()
+            .map(|(_, _, _name)| _name)
+            .collect();
+        assert_eq!(bodies, vec!["a", "b"]);
+
+        // Body for `b` should include "let x = 1".
+        let bodies_full = fn_bodies_iter(src);
+        let body_b = bodies_full.iter().find(|(_, _, n)| *n == "b").unwrap();
+        let body_text = &src[body_b.0..body_b.1];
+        assert!(body_text.contains("let x = 1"));
     }
 }
 
