@@ -241,3 +241,63 @@ def _enforce_outcome_verdict_consistency(result: "Result", *, gate_strict: bool 
         suggested_next_ids=result.suggested_next_ids,
         context_updates=result.context_updates,
     )
+
+
+# Reproduction receipt: a reviewer PASS is only trustworthy when the review
+# transcript shows the reviewer actually RE-RAN a build/test runner and that
+# run SUCCEEDED (exit 0). Without that, a PASS is read-only theater; with a
+# nonzero-only exit trail, the reviewer reproduced a FAILURE and passed it
+# anyway. No outer \b anchors on runners: leading "./" and trailing chars
+# (e.g. "run_tests.sh") make \b-wrapping reject legitimate reproductions.
+_RECEIPT_RUNNER_RE = re.compile(
+    r"(uv run pytest|pytest|python[0-9.]* -m (?:pytest|unittest)|py -m (?:pytest|unittest)|"
+    r"npm (?:test|run|ci)|yarn (?:test|run)|pnpm (?:test|run)|vitest|jest|npx playwright|"
+    r"playwright test|go (?:test|build)|cargo (?:test|build)|\bmake |\bmvn |gradle|gradlew|"
+    r"bazel (?:test|build)|ctest|rspec|mix test|\btox\b|cmake --build|run_tests|"
+    r"bash \S*test|bash \S+\.sh|\./run)",
+    re.IGNORECASE,
+)
+
+# One capture group over the exit-code digits so the gate can require a
+# SUCCESSFUL reproduction, not merely a captured exit code. KNOWN CEILING:
+# a regex cannot bind an exit code to the command that produced it, so any
+# captured zero satisfies the gate; likewise fabricated prose naming a runner
+# plus "exit code: 0" passes. This stops read-only PASSes and honest-but-
+# failed reproductions, not a lying reviewer — the full fix is engine-captured
+# execution. Both ceilings are pinned in tests/test_reviewer_reproduction_receipt.py.
+_RECEIPT_EXIT_RE = re.compile(
+    r"(?:exit[_ ]?code\s*[:=]?\s*|exit\s*[:=]\s*|exited with\s+|returned\s+|"
+    r"\$\?\s*[:=]?\s*|\bexit\s+)(\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def _reproduction_receipt_gap(text: str) -> str:
+    """Return why `text` fails as a reproduction receipt, or "" if it holds.
+
+    Callers apply this ONLY to a success outcome — a failure verdict needs no
+    reproduction. Pure text analysis; network-free.
+    """
+    body = text or ""
+    if not body.strip():
+        return (
+            "reproduction receipt: review passed but produced no transcript — "
+            "a PASS must re-run the build/test and capture its exit code, not "
+            "review from narrative alone"
+        )
+    has_runner = bool(_RECEIPT_RUNNER_RE.search(body))
+    exit_codes = [int(m.group(1)) for m in _RECEIPT_EXIT_RE.finditer(body)]
+    if not (has_runner and exit_codes):
+        return (
+            "reproduction receipt: review passed without a reproduced build/test "
+            f"and captured exit code (runner_found={has_runner}, "
+            f"exit_code_found={bool(exit_codes)}) — re-run the suite/build and "
+            "record its exit code in the review output, or the PASS is read-only"
+        )
+    if 0 not in exit_codes:
+        return (
+            "reproduction receipt: review passed but its reproduced build/test "
+            f"FAILED (captured exit codes: {sorted(set(exit_codes))}) — a PASS "
+            "requires a successful reproduction (exit code 0)"
+        )
+    return ""

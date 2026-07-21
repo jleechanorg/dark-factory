@@ -171,6 +171,55 @@ def _coalesce_parallel_outcome(primary: str, shadows: list[str]) -> str:
     return "failure"
 
 
+def _receipt_required_flag(node: "Node") -> bool:
+    """Read the ``receipt_required`` node attribute as a bool.
+
+    Same acceptance rules as ``_gate_strict_flag``: ``True`` / ``"true"`` /
+    ``"1"`` / ``"yes"`` (case-insensitive); anything else is False so
+    existing graphs do not regress. When True, a reviewer success is only
+    kept if the review transcript carries a reproduction receipt — a real
+    build/test runner AND a captured exit code 0 (see
+    ``handler_verdict._reproduction_receipt_gap``).
+    """
+    raw = node.attrs.get("receipt_required")
+    if raw is True:
+        return True
+    return isinstance(raw, str) and raw.strip().lower() in ("true", "1", "yes")
+
+
+def _enforce_reproduction_receipt(result: "Result") -> "Result":
+    """Downgrade a reviewer success whose transcript lacks a reproduction receipt.
+
+    A reviewer that verdicts PASS without re-running the build/test (or whose
+    re-run FAILED, nonzero-only exit trail) is read-only theater — the exact
+    self-reported-verdict hole the receipt gate closes. Only success outcomes
+    are touched; failure/error pass through so route-back reasons are never
+    masked. Mirrors the ``verdict_adjusted_for_consistency`` audit pattern:
+    the original verdict is preserved in metadata.
+    """
+    # Lazy import to avoid circular import at module load time
+    from .handler_verdict import _reproduction_receipt_gap
+
+    if result.outcome != "success":
+        return result
+    gap = _reproduction_receipt_gap(result.output or "")
+    if not gap:
+        return result
+    new_md = dict(result.metadata or {})
+    new_md["original_verdict"] = str(new_md.get("verdict", ""))
+    new_md["verdict"] = "fail"
+    new_md["receipt_downgraded"] = "true"
+    new_md["receipt_gap"] = gap
+    return Result(
+        outcome="failure",
+        output=(result.output or "") + "\n\n" + gap,
+        metadata=new_md,
+        preferred_label=result.preferred_label,
+        suggested_next_ids=result.suggested_next_ids,
+        context_updates=result.context_updates,
+    )
+
+
 def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
@@ -230,10 +279,15 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         # verdict (e.g., outcome=failure with verdict=pass) can occur when stale
         # spec artifacts cause the reviewer to misjudge. Force verdict to match outcome.
         # Dispatch via the canonical re-export shim so the unqualified name here
-        # reaches the single definition in ``runner.handler_verdict``.
+        # reaches the single definition in ``runner.handler_verdict``. Then,
+        # when the graph declares ``receipt_required="true"`` on this
+        # parallel-reviewer node, downgrade a success whose transcript lacks
+        # a reproduction receipt (real build/test runner + exit code 0).
         primary = _handlers_shim._enforce_outcome_verdict_consistency(
             primary, gate_strict=gate_strict,
         )
+        if _receipt_required_flag(node):
+            primary = _enforce_reproduction_receipt(primary)
         return primary
 
     result = primary
@@ -263,6 +317,9 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         suggested_next_ids=result.suggested_next_ids,
         context_updates=result.context_updates,
     )
-    return _handlers_shim._enforce_outcome_verdict_consistency(
+    final_result = _handlers_shim._enforce_outcome_verdict_consistency(
         final_result, gate_strict=gate_strict,
     )
+    if _receipt_required_flag(node):
+        final_result = _enforce_reproduction_receipt(final_result)
+    return final_result
