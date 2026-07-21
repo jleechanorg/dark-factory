@@ -68,7 +68,13 @@ Public surface
                                        (`ADDRESSED file:line` /
                                        `NOT-ADDRESSED` / `N-A` with
                                        reason) from the reviewer's
-                                       `CONTRACT_ECHO:` block.
+                                       `CONTRACT_ECHO:` block. Also
+                                       extracts `PRIOR_FINDING:` lines
+                                       (issue #386 r10) when the
+                                       contract has prior findings —
+                                       a reviewer cannot return PASS
+                                       while silently skipping the
+                                       bead author's prior findings.
 - `evaluate_contract_echo(report, contract)` — fail-closed check:
                                        every acceptance item must be
                                        `ADDRESSED` or `N-A`. Any
