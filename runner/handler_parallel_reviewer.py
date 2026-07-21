@@ -175,16 +175,20 @@ def _receipt_required_flag(node: "Node") -> bool:
     """Read the ``receipt_required`` node attribute as a bool.
 
     Same acceptance rules as ``_gate_strict_flag``: ``True`` / ``"true"`` /
-    ``"1"`` / ``"yes"`` (case-insensitive); anything else is False so
-    existing graphs do not regress. When True, a reviewer success is only
-    kept if the review transcript carries a reproduction receipt — a real
-    build/test runner AND a captured exit code 0 (see
+    ``"1"`` / ``"yes"`` (case-insensitive) / ``1`` (as int). Anything else is
+    False so existing graphs do not regress. When True, a reviewer success
+    is only kept if the review transcript carries a reproduction receipt —
+    a real build/test runner AND a captured exit code 0 (see
     ``handler_verdict._reproduction_receipt_gap``).
     """
     raw = node.attrs.get("receipt_required")
     if raw is True:
         return True
-    return isinstance(raw, str) and raw.strip().lower() in ("true", "1", "yes")
+    if isinstance(raw, str) and raw.strip().lower() in ("true", "1", "yes"):
+        return True
+    if isinstance(raw, int) and raw == 1:
+        return True
+    return False
 
 
 def _enforce_reproduction_receipt(result: "Result") -> "Result":
@@ -196,6 +200,15 @@ def _enforce_reproduction_receipt(result: "Result") -> "Result":
     are touched; failure/error pass through so route-back reasons are never
     masked. Mirrors the ``verdict_adjusted_for_consistency`` audit pattern:
     the original verdict is preserved in metadata.
+
+    Audit chain note: when called AFTER ``_enforce_outcome_verdict_consistency``
+    (the call sites in ``_parallel_reviewer`` wire it that way on purpose —
+    consistency normalization operates on outcome↔verdict tokens, not
+    transcript content, and a successful-after-consistency pass is exactly
+    what we want to receipt-check), consistency may have already set
+    ``original_verdict`` to the RAW reviewer output (it does so on a genuine
+    contradiction). Honor that pre-existing value: do not overwrite it with
+    the post-consistency canonical token.
     """
     # Lazy import to avoid circular import at module load time
     from .handler_verdict import _reproduction_receipt_gap
@@ -206,7 +219,11 @@ def _enforce_reproduction_receipt(result: "Result") -> "Result":
     if not gap:
         return result
     new_md = dict(result.metadata or {})
-    new_md["original_verdict"] = str(new_md.get("verdict", ""))
+    # Only set original_verdict if consistency didn't already record the raw
+    # reviewer output — otherwise we'd clobber the more truthful pre-consistency
+    # value with the post-consistency canonical token.
+    if "original_verdict" not in new_md:
+        new_md["original_verdict"] = str(new_md.get("verdict", ""))
     new_md["verdict"] = "fail"
     new_md["receipt_downgraded"] = "true"
     new_md["receipt_gap"] = gap

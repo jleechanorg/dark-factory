@@ -153,6 +153,30 @@ class TestEnforceReproductionReceipt:
         assert adjusted.metadata["reviewer_backend"] == "claude"
         assert adjusted.context_updates == {"k": "v"}
 
+    def test_does_not_clobber_pre_existing_original_verdict(self):
+        """When ``_enforce_outcome_verdict_consistency`` already wrote the
+        raw reviewer verdict into ``original_verdict``, the receipt gate
+        must honor that pre-existing value — overwriting it with the
+        post-consistency canonical token would mask the actual reviewer
+        output from audit readers.
+        """
+        result = Result(
+            outcome="success",
+            output="narrative only",
+            metadata={
+                # Consistency ran first, recorded the raw reviewer output
+                "verdict": "pass",
+                "verdict_adjusted_for_consistency": "true",
+                "original_verdict": "approve",  # raw reviewer token
+            },
+        )
+        adjusted = _enforce_reproduction_receipt(result)
+        # The pre-existing raw verdict survives the receipt downgrade.
+        assert adjusted.metadata["original_verdict"] == "approve"
+        assert adjusted.metadata["verdict"] == "fail"
+        assert adjusted.metadata["receipt_downgraded"] == "true"
+        assert "receipt_gap" in adjusted.metadata
+
 
 class TestReceiptRequiredFlag:
     """Opt-in flag parsing — same no-regression rules as gate_strict."""
@@ -161,7 +185,7 @@ class TestReceiptRequiredFlag:
         def __init__(self, attrs):
             self.attrs = attrs
 
-    @pytest.mark.parametrize("raw", [True, "true", "TRUE", "1", "yes"])
+    @pytest.mark.parametrize("raw", [True, "true", "TRUE", "1", "yes", 1])
     def test_enabled_values(self, raw):
         assert _receipt_required_flag(self._Node({"receipt_required": raw})) is True
 
