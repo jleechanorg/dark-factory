@@ -2201,6 +2201,15 @@ fn skeptic_evidence(
         review_degraded,
         // Set in the fast tier from the canonical evidence marker (#323).
         evidence_gist_status: verifier::EvidenceGistStatus::NotProvided,
+        // Bead jleechan-ijod / issue #387 (r5): the runtime vacuous-test
+        // detector only runs in the production-adjacent fast tier (which
+        // has the SCM/git context to derive the diff); Stage 1's mock-llm
+        // test-repo lane has no PR diff to revert, so it stays NotProvided.
+        // The fast-tier caller is responsible for invoking
+        // `daemon::vacuous_red_green::check_red_green_with_manifest` and
+        // translating the verdict into a `VacuousRedGreenStatus` before
+        // constructing `PrEvidence` here.
+        vacuous_red_green: verifier::VacuousRedGreenStatus::NotProvided,
     })
 }
 
@@ -2208,6 +2217,184 @@ fn skeptic_evidence(
 /// `SkepticVerdict` for gate 7.
 ///
 /// Single-pass success is preserved: if EITHER reviewer returns a usable
+/// Bead jleechan-ijod / issue #387 (r5): invoke the runtime red-green
+/// vacuous-test detector for `pr` in `repo` and translate its
+/// `RedGreenReport` into a `VacuousRedGreenStatus` for the gate-8
+/// consumer.
+///
+/// This is the PRODUCTION-side wiring of the gate-8 path that the
+/// verifier side (`vacuous_red_green_gate`) consumes. It is intentionally
+/// minimal: the detector runs only when the daemon's own CWD is a checkout
+/// of a cargo project (the typical Stage-2 production-adjacent lane). For
+/// the Stage-1 test-repo lane (`is_test_repo`) the detector is not invoked
+/// and the status stays `NotProvided`, so the gate stays Green.
+///
+/// The detector's verdict is translated verbatim — the r5 contract says
+/// the gate consumer is the source of truth on what each verdict means for
+/// merge eligibility (`Vacuous -> Red`, others -> Green/Unknown).
+fn vacuous_red_green_for_pr(
+    deps: &TickDeps,
+    pr: u64,
+    repo: &str,
+    snapshot: &crate::tools::PrSnapshot,
+) -> verifier::VacuousRedGreenStatus {
+    // Test-repo PRs (Stage-1 mock-llm lane) have no PR diff to revert, so
+    // the detector has nothing to measure. Stay NotProvided so gate 8
+    // stays Green — issue #387 r5 contract: the gate must not block the
+    // test-repo fast lane.
+    if repo.contains("fake-") || repo.contains("test-") || repo == "owner/repo" {
+        return verifier::VacuousRedGreenStatus::NotProvided;
+    }
+
+    // The detector needs a local working tree to revert + cargo-run.
+    // The daemon's own CWD is a checkout of `cfg.target_repo` (the
+    // canonical dark-factory source tree) for the Stage-2 production
+    // lane; if the current CWD does not contain a Cargo.toml, the
+    // detector has no manifest to run against, and we surface that as
+    // ManifestMissing rather than silently treating NEVER_RAN as a
+    // vacuous pass (issue #387 r5 finding 3).
+    let repo_root = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(_) => {
+            return verifier::VacuousRedGreenStatus::ManifestMissing(
+                "could not read daemon cwd".to_string(),
+            );
+        }
+    };
+    let manifest = match crate::vacuous_red_green::find_cargo_manifest(&repo_root) {
+        Some(m) => m,
+        None => {
+            return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
+                "no Cargo.toml reachable from {}",
+                repo_root.display()
+            ));
+        }
+    };
+
+    // Resolve the base ref from the PR's merge-base. Use `gh pr view`
+    // to fetch the baseRefName, then resolve it locally via VCS. We
+    // use the PR's head SHA from the snapshot so the diff is captured
+    // relative to the same commit the gate will compare against.
+    let base_ref = match resolve_pr_base_ref(deps, pr, repo) {
+        Ok(b) => b,
+        Err(e) => {
+            return verifier::VacuousRedGreenStatus::BaselineFailed(format!(
+                "could not resolve base ref: {e}"
+            ));
+        }
+    };
+
+    // Collect the PR's changed files and classify them.
+    let changed = snapshot
+        .files
+        .iter()
+        .map(|f| {
+            let kind = if f.path.contains("/tests/")
+                || f.path.starts_with("tests/")
+                || f.path.ends_with("_test.rs")
+            {
+                crate::vacuous_red_green::FileClass::Test
+            } else {
+                crate::vacuous_red_green::FileClass::Production
+            };
+            Ok((repo_root.join(&f.path), kind))
+        })
+        .collect::<Result<Vec<_>, std::convert::Infallible>>()
+        .unwrap_or_default();
+
+    if changed.is_empty() {
+        return verifier::VacuousRedGreenStatus::NoChangedTests;
+    }
+
+    // Invoke the detector.
+    match crate::vacuous_red_green::check_red_green_with_manifest(
+        &repo_root,
+        &base_ref,
+        &changed,
+        Some(&manifest),
+    ) {
+        Ok(report) => translate_verdict(report.verdict, report.failed_on_revert),
+        Err(e) => translate_error(e),
+    }
+}
+
+/// Translate the detector's `RedGreenError` into a structured
+/// `VacuousRedGreenStatus` so the gate can surface the failure mode
+/// rather than swallowing it as a generic Unknown.
+fn translate_error(e: crate::vacuous_red_green::RedGreenError) -> verifier::VacuousRedGreenStatus {
+    use crate::vacuous_red_green::RedGreenError;
+    match e {
+        RedGreenError::NoChangedTests => verifier::VacuousRedGreenStatus::NoChangedTests,
+        RedGreenError::ManifestMissing(s) => verifier::VacuousRedGreenStatus::ManifestMissing(s),
+        RedGreenError::BaselineFailed(s) => verifier::VacuousRedGreenStatus::BaselineFailed(s),
+        RedGreenError::RevertFailed(s) | RedGreenError::RestoreFailed(s) => {
+            verifier::VacuousRedGreenStatus::GreenFailed(format!("working-tree revert failed: {s}"))
+        }
+        RedGreenError::Git(s) => verifier::VacuousRedGreenStatus::GreenFailed(format!("git error: {s}")),
+    }
+}
+
+/// Translate the detector's `Verdict` into a structured
+/// `VacuousRedGreenStatus`. The `failed_on_revert` count is included in
+/// the `GreenFailed` reason so operators can see which tests tripped
+/// the head-green check.
+fn translate_verdict(
+    v: crate::vacuous_red_green::Verdict,
+    failed_on_revert: usize,
+) -> verifier::VacuousRedGreenStatus {
+    use crate::vacuous_red_green::Verdict;
+    match v {
+        Verdict::Genuine => verifier::VacuousRedGreenStatus::Genuine,
+        Verdict::Vacuous => verifier::VacuousRedGreenStatus::Vacuous,
+        Verdict::GreenFailed => verifier::VacuousRedGreenStatus::GreenFailed(format!(
+            "{failed_on_revert} test(s) failed on PR head (before any revert)"
+        )),
+        Verdict::BaselineFailed => verifier::VacuousRedGreenStatus::BaselineFailed(
+            "tests failed on pristine base_ref (before any revert)".to_string(),
+        ),
+        Verdict::NoChangedTests => verifier::VacuousRedGreenStatus::NoChangedTests,
+        Verdict::ManifestMissing => {
+            verifier::VacuousRedGreenStatus::ManifestMissing("detector could not find manifest".to_string())
+        }
+    }
+}
+
+/// Resolve the merge-base SHA for `pr` in `repo`. Uses `gh pr view` to
+/// fetch the baseRefName, then `git rev-parse` (via Vcs) to convert it
+/// into a SHA. Returns the SHA, or an error string suitable for
+/// surfacing in the gate.
+fn resolve_pr_base_ref(deps: &TickDeps, pr: u64, repo: &str) -> Result<String, String> {
+    // Use gh pr view to get the base ref name. Fail closed on any error
+    // — the gate cannot meaningfully run the detector without a base ref.
+    let out = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr.to_string(),
+            "--repo",
+            repo,
+            "--json",
+            "baseRefName",
+            "-q",
+            ".baseRefName",
+        ])
+        .output()
+        .map_err(|e| format!("spawn gh pr view: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "gh pr view failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if branch.is_empty() {
+        return Err("gh pr view returned empty baseRefName".to_string());
+    }
+    deps.vcs
+        .base_head_for_repo(repo, &branch)
+        .map_err(|e| format!("resolve base ref {branch}: {e}"))
+}
+
 /// verdict (`Fail`/`Warn`/`Pass`), that verdict wins (Fail beats Warn
 /// beats Pass in priority, and either side overrides `None`).
 ///
@@ -2949,6 +3136,15 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         };
         evidence.is_production = verifier::classify_production(&snapshot.files);
         evidence.non_test_changed_loc = verifier::calculate_non_test_loc(&snapshot.files);
+        // Bead jleechan-ijod / issue #387 (r5): invoke the runtime vacuous-test
+        // detector on production PRs and translate its verdict into
+        // `VacuousRedGreenStatus` for gate-8 consumption. Test-repo PRs and
+        // PRs with no test files in the diff stay `NotProvided` so the gate
+        // stays Green. Any error during the detector invocation (missing
+        // manifest, gh CLI error, baseline resolution failure) is surfaced
+        // as a structured `VacuousRedGreenStatus` variant — gate 8 turns
+        // these into `Unknown` rather than misreporting Vacuous.
+        evidence.vacuous_red_green = vacuous_red_green_for_pr(deps, pr, &repo, &snapshot);
         // Bead jleechan-yoqy / issue #323 (r5): verify the canonical evidence
         // contract fail-closed. A fully-parsed marker MUST reference the PR's
         // current head AND point at a gist that is fetchable + non-empty. r5

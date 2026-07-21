@@ -13,11 +13,11 @@
 // detector's verdict on each. Each scenario runs `cargo test` in a
 // throwaway directory so the host's daemon crate is untouched.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use daemon::vacuous_red_green::{
-    check_red_green, FileClass, RedGreenError,
+    check_red_green, check_red_green_with_manifest, FileClass, RedGreenError, Verdict,
 };
 
 /// Build a tiny Rust project that exposes one production function and one
@@ -233,16 +233,25 @@ fn genuine_red_green_passes_check() {
     let proj = build_mini_project(ProjectKind::GenuineRedGreen);
     let _ = commit_current_tree(&proj, "feat: real test");
     let changed = classify_changed_files(&proj);
+    let manifest = proj.root.join("Cargo.toml");
 
-    let report = check_red_green(&proj.root, &proj.base_sha, &changed).expect("report");
+    let report = check_red_green_with_manifest(
+        &proj.root,
+        &proj.base_sha,
+        &changed,
+        Some(&manifest),
+    )
+    .expect("report");
     assert!(
         !report.vacuous,
         "expected genuine red-green test to NOT be flagged vacuous; report={report:?}"
     );
+    assert_eq!(report.verdict, Verdict::Genuine);
     assert!(
         report.failed_on_revert >= 1,
         "expected at least one test to fail after revert; report={report:?}"
     );
+    assert_eq!(report.manifest_path.as_deref(), Some(manifest.as_path()));
 }
 
 #[test]
@@ -250,8 +259,16 @@ fn vacuous_test_is_flagged() {
     let proj = build_mini_project(ProjectKind::VacuousAlwaysGreen);
     let _ = commit_current_tree(&proj, "feat: vacuous test");
     let changed = classify_changed_files(&proj);
+    let manifest = proj.root.join("Cargo.toml");
 
-    let report = check_red_green(&proj.root, &proj.base_sha, &changed).expect("report");
+    let report = check_red_green_with_manifest(
+        &proj.root,
+        &proj.base_sha,
+        &changed,
+        Some(&manifest),
+    )
+    .expect("report");
+    assert_eq!(report.verdict, Verdict::Vacuous);
     assert!(
         report.vacuous,
         "expected vacuous test to be flagged; report={report:?}"
@@ -282,8 +299,15 @@ fn target_test_names_are_only_changed_tests() {
     let proj = build_mini_project(ProjectKind::GenuineRedGreen);
     let _ = commit_current_tree(&proj, "feat: real test");
     let changed = classify_changed_files(&proj);
+    let manifest = proj.root.join("Cargo.toml");
 
-    let report = check_red_green(&proj.root, &proj.base_sha, &changed).expect("report");
+    let report = check_red_green_with_manifest(
+        &proj.root,
+        &proj.base_sha,
+        &changed,
+        Some(&manifest),
+    )
+    .expect("report");
     let names: Vec<&str> = report.targeted_tests.iter().map(|s| s.as_str()).collect();
     assert!(
         names.iter().all(|n| ["classify_high", "classify_medium", "classify_low"].contains(n)),
@@ -296,5 +320,68 @@ fn target_test_names_are_only_changed_tests() {
     );
 }
 
-#[allow(dead_code)]
-fn _silence_path_unused(_: &Path) {}
+// ---- r5: ignore-skipped tests are recorded, not counted as vacuous-pass ----
+
+/// Pure unit-style test exercising the fn-level `discover_test_fns_with_skip`
+/// path (no cargo invocation) so the gate can rely on the fn-level scoping
+/// contract without paying for a `cargo test` round-trip in CI.
+#[test]
+fn ignored_tests_are_recorded_with_skip_reason_not_silently_passed() {
+    let src = r#"
+#[test]
+fn ordinary() { assert!(true); }
+
+#[test]
+#[ignore = "needs fixture repo"]
+fn needs_network() { assert!(true); }
+
+#[test]
+#[ignore]
+fn slow_path() { assert!(true); }
+"#;
+    let infos = daemon::vacuous_red_green::discover_test_fns_with_skip(src);
+    let names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+    assert!(names.contains(&"ordinary"), "ordinary must be discovered: {names:?}");
+    assert!(names.contains(&"needs_network"), "needs_network must be discovered: {names:?}");
+    assert!(names.contains(&"slow_path"), "slow_path must be discovered: {names:?}");
+
+    let ordinary = infos.iter().find(|i| i.name == "ordinary").unwrap();
+    assert!(ordinary.skip_reason.is_none(), "ordinary has no #[ignore]");
+
+    let needs_network = infos.iter().find(|i| i.name == "needs_network").unwrap();
+    assert_eq!(
+        needs_network.skip_reason.as_deref(),
+        Some("needs fixture repo"),
+        "#[ignore = \"...\"] must populate skip_reason verbatim",
+    );
+
+    let slow_path = infos.iter().find(|i| i.name == "slow_path").unwrap();
+    assert!(
+        slow_path.skip_reason.is_some(),
+        "bare #[ignore] must still record a skip_reason",
+    );
+}
+
+/// Verdict precedence contract: when green-on-head fails, the verdict is
+/// `GreenFailed` even if the revert run would have been red — the
+/// green-on-head phase is the precondition that makes the revert signal
+/// meaningful.
+#[test]
+fn verdict_precedence_green_failed_beats_genuine() {
+    let outcome = daemon::vacuous_red_green::RunOutcome {
+        green_on_head_ok: false,
+        baseline_ok: true,
+        failing_on_revert: vec!["a".to_string()],
+    };
+    assert_eq!(outcome.verdict(), Verdict::GreenFailed);
+}
+
+#[test]
+fn verdict_precedence_baseline_failed_beats_vacuous() {
+    let outcome = daemon::vacuous_red_green::RunOutcome {
+        green_on_head_ok: true,
+        baseline_ok: false,
+        failing_on_revert: vec![],
+    };
+    assert_eq!(outcome.verdict(), Verdict::BaselineFailed);
+}
