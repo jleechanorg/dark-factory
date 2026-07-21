@@ -122,6 +122,20 @@ def _addressed_output(items: list[ContractEchoItem]) -> str:
     return "CONTRACT_ECHO:\n" + "\n".join(lines)
 
 
+def _addressed_output_with_prior_findings(
+    items: list[ContractEchoItem],
+    prior_sources: list[str],
+) -> str:
+    """Like `_addressed_output` but also emits PRIOR_FINDING: lines for
+    every prior finding in the contract. Required when the contract
+    has `prior_findings` (r3, gap 7 P2): the reviewer MUST address each
+    one or the gate fails closed (issue #386 r10 CodeRabbit feedback)."""
+    lines = [f"ITEM: {it.id} VERDICT: ADDRESSED CITE: {it.cite}" for it in items]
+    for src in prior_sources:
+        lines.append(f"PRIOR_FINDING: {src} VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1")
+    return "CONTRACT_ECHO:\n" + "\n".join(lines)
+
+
 def _mixed_output() -> str:
     """A reviewer output where one item is NOT-ADDRESSED (the fixture case).
 
@@ -137,6 +151,7 @@ def _mixed_output() -> str:
         "ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
         "ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
         "ITEM: A3 VERDICT: NOT-ADDRESSED REASON: omitted from diff\n"
+        "PRIOR_FINDING: r5 reviewer VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:42\n"
     )
 
 
@@ -634,12 +649,19 @@ from runner.skeptic_gate import evaluate, aggregate_results, ParsedVerdict, Pars
 
 def _verdict_with_contract_echo(contract: BeadContract) -> str:
     """Build a 10-field PASS verdict + a valid `CONTRACT_ECHO:` block
-    addressing every acceptance item."""
+    addressing every acceptance item AND every prior finding
+    (issue #386 r10 — prior findings are now enforced; the reviewer
+    MUST emit PRIOR_FINDING: lines or the gate fails closed)."""
     head = HEAD_SHA
     item_lines = "\n".join(
         f"ITEM: {item.id} VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1"
         for item in contract.acceptance_items
     )
+    prior_lines = "\n".join(
+        f"PRIOR_FINDING: {pf.source} VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:42"
+        for pf in contract.prior_findings
+    )
+    block = item_lines + ("\n" + prior_lines if prior_lines else "")
     return (
         f"VERDICT: PASS\n"
         f"HEAD_SHA: {head}\n"
@@ -652,7 +674,7 @@ def _verdict_with_contract_echo(contract: BeadContract) -> str:
         f"GREP_CITES: runner/skeptic_gate.py:1\n"
         f"HEAD_COMMIT_VERIFIED: {head}\n"
         f"CONTRACT_ECHO:\n"
-        f"{item_lines}\n"
+        f"{block}\n"
     )
 
 

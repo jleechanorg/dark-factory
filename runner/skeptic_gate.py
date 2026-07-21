@@ -357,9 +357,15 @@ class ContractEchoReport:
     the reviewer cited unknown IDs or omitted items. `evaluate_contract_echo`
     cross-references this against the contract to determine which
     items are unaddressed.
+
+    `prior_findings` carries the reviewer's verdict on each
+    `PriorFinding` (r3, issue #386 gap 7 P2). When the contract
+    has prior_findings and the reviewer omits them, the
+    `evaluate_contract_echo` caller may treat them as unaddressed.
     """
 
     items: Tuple[ContractEchoItem, ...]
+    prior_findings: Tuple["PriorFindingEcho", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -504,6 +510,19 @@ CONTRACT_ECHO_HEADER_RE = re.compile(
 )
 CONTRACT_ECHO_LINE_RE = re.compile(
     r"^\s*ITEM\s*:\s*(?P<id>[A-Za-z0-9._\-]+)\s+"
+    r"VERDICT\s*:\s*(?P<verdict>ADDRESSED|NOT-ADDRESSED|N-A)\s+"
+    r"(?:CITE\s*:\s*(?P<cite>[^\s\n][^\n]*?)|REASON\s*:\s*(?P<reason>[^\n]+?))"
+    r"\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+# PRIOR_FINDING lines mirror ITEM lines but use `source` (a stable
+# identifier from the bead's prior_findings) instead of a generated id.
+# Same verdict vocabulary, same CITE:/REASON: shape. The source token
+# allows spaces and colons (e.g. "r2 cursor-agent" or "r2:CodeRabbit")
+# so the reviewer can echo the bead author's source verbatim without
+# rewriting it.
+CONTRACT_ECHO_PRIOR_LINE_RE = re.compile(
+    r"^\s*PRIOR_FINDING\s*:\s*(?P<source>[^\s][^\n]*?)\s+"
     r"VERDICT\s*:\s*(?P<verdict>ADDRESSED|NOT-ADDRESSED|N-A)\s+"
     r"(?:CITE\s*:\s*(?P<cite>[^\s\n][^\n]*?)|REASON\s*:\s*(?P<reason>[^\n]+?))"
     r"\s*$",
@@ -712,10 +731,14 @@ def _strip_contract_echo_block(output: str) -> str:
 
     The block is at the END of the output (after the 10 structured
     fields). The header line (`CONTRACT_ECHO:`) is dropped, every
-    `ITEM:` line is dropped, and any blank lines immediately around
-    the block are normalized. If the block is not present, the
-    output is returned unchanged (so the function is safe to call
-    regardless of whether a contract was supplied).
+    `ITEM:` and `PRIOR_FINDING:` line is dropped, and any blank
+    lines immediately around the block are normalized. If the block
+    is not present, the output is returned unchanged (so the function
+    is safe to call regardless of whether a contract was supplied).
+
+    r10 (issue #386): PRIOR_FINDING: lines were added to the
+    contract-echo block. They MUST be stripped too, otherwise
+    `parse_verdict` sees them as extra prose and rejects the output.
     """
     if not isinstance(output, str):
         return output
@@ -727,7 +750,7 @@ def _strip_contract_echo_block(output: str) -> str:
     kept_after: List[str] = []
     for raw_line in after.splitlines():
         stripped = raw_line.strip()
-        if stripped.startswith("ITEM:"):
+        if stripped.startswith("ITEM:") or stripped.startswith("PRIOR_FINDING:"):
             continue
         kept_after.append(raw_line)
     out = head_part.rstrip("\n") + "\n" + "\n".join(kept_after).rstrip() + "\n"
@@ -766,24 +789,29 @@ def parse_contract_echo(
         return None
 
     # Locate the CONTRACT_ECHO: header line, then walk forward and
-    # collect the immediately-following `ITEM:` lines. We stop at the
-    # first non-blank, non-ITEM line (the strict no-prose contract
-    # the gate enforces elsewhere — anything after the block is
-    # considered out-of-block and ignored).
+    # collect the immediately-following `ITEM:` / `PRIOR_FINDING:` lines.
+    # We stop at the first non-blank, non-{ITEM,PRIOR_FINDING} line (the
+    # strict no-prose contract the gate enforces elsewhere — anything
+    # after the block is considered out-of-block and ignored).
     header_match = CONTRACT_ECHO_HEADER_RE.search(output)
     if not header_match:
         return None
     after = output[header_match.end():]
     item_lines: List[str] = []
+    prior_lines: List[str] = []
     for raw_line in after.splitlines():
         stripped = raw_line.strip()
         if not stripped:
             # Blank lines are allowed within the block.
             continue
-        if not stripped.startswith("ITEM:"):
-            # Out-of-block content; stop walking.
-            break
-        item_lines.append(raw_line)
+        if stripped.startswith("ITEM:"):
+            item_lines.append(raw_line)
+            continue
+        if stripped.startswith("PRIOR_FINDING:"):
+            prior_lines.append(raw_line)
+            continue
+        # Out-of-block content; stop walking.
+        break
     if not item_lines:
         return None
 
@@ -826,7 +854,45 @@ def parse_contract_echo(
 
     if not items:
         return None
-    return ContractEchoReport(items=tuple(items))
+
+    prior_findings_echo: List[PriorFindingEcho] = []
+    for raw_line in prior_lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        m = CONTRACT_ECHO_PRIOR_LINE_RE.match(line)
+        if m is None:
+            # Same no-prose policy as ITEM: lines — reject the whole
+            # block when a PRIOR_FINDING: line is unparseable so the
+            # reviewer cannot smuggle prose through a malformed line.
+            return None
+        source = m.group("source")
+        verdict_token = m.group("verdict").upper()
+        cite = (m.group("cite") or "").strip()
+        reason = (m.group("reason") or "").strip()
+
+        if verdict_token == "ADDRESSED":
+            if not cite:
+                return None
+            if not re.match(r"^[\w./\-]+:\d+$", cite):
+                return None
+        else:
+            if not reason:
+                return None
+
+        prior_findings_echo.append(
+            PriorFindingEcho(
+                source=source,
+                verdict=verdict_token,  # type: ignore[arg-type]
+                cite=cite,
+                reason=reason,
+            )
+        )
+
+    return ContractEchoReport(
+        items=tuple(items),
+        prior_findings=tuple(prior_findings_echo),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1613,7 +1679,21 @@ def evaluate(
     # carries the unaddressed item's VERBATIM text — the next
     # roll's worker reads the exact problem, not a paraphrase.
     if contract is not None:
-        echo_verdict = evaluate_contract_echo(echo_report, contract)
+        # Pass through the reviewer's prior-finding verdicts so the
+        # evaluator can fail-closed when the contract has prior
+        # findings that the reviewer omitted (r3, gap 7 P2). When
+        # the contract has no prior findings, the tuple is empty
+        # and the evaluator short-circuits to a pass on prior findings.
+        # echo_report may be None when the reviewer omitted the
+        # CONTRACT_ECHO: block entirely — substitute an empty report
+        # so the prior-findings list defaults to () instead of crashing.
+        echo_verdict = evaluate_contract_echo(
+            echo_report,
+            contract,
+            report_prior_findings=(
+                echo_report.prior_findings if echo_report is not None else ()
+            ),
+        )
         if not echo_verdict.ok:
             reason = (
                 f"contract-echo gate failed: {len(echo_verdict.unaddressed_items)} "

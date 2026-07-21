@@ -108,6 +108,8 @@ def _all_na_output(contract: BeadContract) -> str:
     ]
     for it in contract.acceptance_items:
         lines.append(f"ITEM: {it.id} VERDICT: N-A REASON: out of scope")
+    for pf in contract.prior_findings:
+        lines.append(f"PRIOR_FINDING: {pf.source} VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:243")
     return "\n".join(lines) + "\n"
 
 
@@ -119,6 +121,7 @@ def _mixed_required_na_output() -> str:
         "ITEM: A1 VERDICT: N-A REASON: covered by general pattern\n"
         "ITEM: A2 VERDICT: N-A REASON: not needed\n"
         "ITEM: A3 VERDICT: N-A REASON: skip\n"
+        "PRIOR_FINDING: r2 cursor-agent VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:243\n"
     )
 
 

@@ -1010,7 +1010,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     elif args.contract_file:
         try:
             contract = load_bead_contract(args.contract_file)
-        except (ValueError, TypeError, FileNotFoundError, json.JSONDecodeError) as exc:
+        except (ValueError, TypeError, FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+            # OSError covers PermissionError (chmod 0 / 000), IsADirectoryError,
+            # and other read failures that FileNotFoundError alone misses.
+            # All such failures must take the fail-closed return 2 path — never
+            # silently fall through to the legacy 10-field contract.
             print(
                 f"[skeptic-gate] contract load failed: {exc}; "
                 "refusing to gate without the operator-supplied contract",

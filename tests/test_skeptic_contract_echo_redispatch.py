@@ -54,6 +54,10 @@ def _addressed_output_passing_10_field(head: str, items: tuple[AcceptanceItem, .
         f"HEAD_COMMIT_VERIFIED: {head}\n"
         "CONTRACT_ECHO:\n"
         f"{item_lines}\n"
+        # The contract has prior_findings; the reviewer MUST also emit
+        # PRIOR_FINDING: lines (issue #386 r10 — prior findings are now
+        # enforced end-to-end).
+        "PRIOR_FINDING: r5 reviewer VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
     )
 
 
