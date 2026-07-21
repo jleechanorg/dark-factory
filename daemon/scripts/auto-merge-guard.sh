@@ -81,7 +81,7 @@ def verdict(v):
 # `{"ci_green":"pass"}` subset MUST NOT pass — the predicate must prove
 # every canonical gate was actually assessed before strict-all-green can
 # hold. Canonical set is `daemon/src/verifier.rs::GateName::as_str()`,
-# kept in lockstep with `daemon/factory-overlay.sh`'s REQUIRED_KEYS and
+# kept in lockstep with `daemon/factory-overlay.sh` REQUIRED_KEYS and
 # `tests/scripts/test_auto_merge_guard_gate_vocabulary.sh`. Extra keys
 # (code_standards / zfc) are still permitted as optional overlays; only
 # the *absence* of a required key blocks the merge.
