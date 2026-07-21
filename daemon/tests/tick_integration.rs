@@ -7053,7 +7053,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     let gates = context["gates"]
         .as_object()
         .unwrap_or_else(|| panic!("GATE_ASSESSMENT context.gates must be a {{gate_name: verdict}} object, not an array; context:\n{context}"));
-    const CANONICAL_GATE_KEYS: [&str; 7] = [
+    const CANONICAL_GATE_KEYS: [&str; 8] = [
         "ci_green",
         "no_conflicts",
         "coderabbit",
@@ -7061,11 +7061,17 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         "comments_resolved",
         "evidence_review",
         "skeptic",
+        // Bead jleechan-ijod / issue #387 (r6): gate 8 is the runtime
+        // vacuous-test detector's verdict (NotProvided = Green for test
+        // fixtures with no PR diff to revert; Genuine = Green; Vacuous
+        // = Red; BaselineFailed / ManifestMissing = Unknown). The
+        // canonical vocabulary widens from 7 to 8 in r6.
+        "vacuous_red_green",
     ];
     assert_eq!(
         gates.len(),
-        7,
-        "GATE_ASSESSMENT must report all 7 per-gate results, not just all_green; context:\n{context}"
+        8,
+        "GATE_ASSESSMENT must report all 8 per-gate results, not just all_green; context:\n{context}"
     );
     for key in CANONICAL_GATE_KEYS {
         assert!(
