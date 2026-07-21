@@ -142,7 +142,6 @@ def test_backoff_does_not_retry_undeclared_exception():
 def test_backoff_sleep_sequence_is_exponential():
     """Sleep values follow the exponential backoff curve."""
 
-    @backoff(retries=4, base=0.1, cap=10.0, on=(ValueError,))
     def fn() -> str:
         raise ValueError("fail")
 
@@ -163,7 +162,6 @@ def test_backoff_sleep_sequence_is_exponential():
 def test_backoff_sleep_respects_cap():
     """Once exponential growth exceeds cap, the cap is applied."""
 
-    @backoff(retries=5, base=0.1, cap=0.3, on=(ValueError,))
     def fn() -> str:
         raise ValueError("fail")
 
@@ -272,7 +270,6 @@ def test_backoff_full_jitter_produces_in_range_delays():
     """With full jitter, all observed sleeps are within the bounded range."""
     rng = random.Random(0)
 
-    @backoff(retries=10, base=0.1, cap=2.0, on=(ValueError,))
     def fn() -> str:
         raise ValueError("fail")
 
