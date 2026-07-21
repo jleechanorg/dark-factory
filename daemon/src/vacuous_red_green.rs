@@ -73,7 +73,25 @@ pub struct RedGreenReport {
     /// added/modified test fns per P1-5).
     pub targeted_tests: Vec<String>,
     /// Names of tests that ran and FAILED on the reverted tree.
+    /// Guaranteed disjoint from `never_ran_tests` (a test cannot be both
+    /// "ran and failed" AND "never ran") — the detector keeps the two
+    /// lists disjoint so the gate path can distinguish a genuine red
+    /// from a NEVER_RAN / skip outcome. See R2-1 in the r2 integration
+    /// test suite.
     pub failing_tests: Vec<String>,
+    /// R2-1: names of test fns that NEVER RAN on the reverted tree
+    /// (cargo did not execute them — compile error in a sibling test,
+    /// filter excluded them, etc). Marker is `<name>:NEVER_RAN` so the
+    /// gate can grep for the suffix. Crucially, these entries do NOT
+    /// count as a "genuine failing test on revert" — they are a
+    /// separate signal that maps to `Pending` (wait and re-check),
+    /// not `Verified`.
+    pub never_ran_tests: Vec<String>,
+    /// R2-2: names of test fns whose BODY DIFFERS between `base_ref`
+    /// and the PR head. These are MODIFIED (not added) tests and count
+    /// as coverage proof even though they existed at base. P1-5 r1 only
+    /// detected ADDED fns; r2 closes the modified-fns gap.
+    pub modified_tests: Vec<String>,
     /// P1-4: names of `#[ignore]`-attributed test fns that were excluded
     /// from the coverage proof (cargo will not run them).
     pub ignored_tests: Vec<String>,
@@ -148,8 +166,12 @@ pub fn check_red_green(
     // Step 1: discover the test fn names in each changed test file at HEAD.
     // Track which ones carry `#[ignore]` (P1-4) — these are EXCLUDED from
     // the coverage proof entirely. The set of HEAD fns minus the set of
-    // pre-existing fns at `base_ref` = the added-or-modified set (P1-5).
+    // pre-existing UNCHANGED fns at `base_ref` = the added-or-modified
+    // set (P1-5 + R2-2). R2-2: a same-named fn that existed at base but
+    // whose body DIFFERS is MODIFIED and counts as coverage proof; only
+    // byte-identical same-named fns are dropped.
     let mut targeted: BTreeSet<String> = BTreeSet::new();
+    let mut modified: BTreeSet<String> = BTreeSet::new();
     let mut ignored: BTreeSet<String> = BTreeSet::new();
     let mut ignored_no_reason: BTreeSet<String> = BTreeSet::new();
     for path in &test_files {
@@ -158,14 +180,26 @@ pub fn check_red_green(
         })?;
         let head_fns = discover_test_fns(&src);
         let base_src = read_base_version(repo_root, base_ref, path)?;
-        let base_fns: BTreeSet<String> = discover_test_fns(&base_src).into_iter().collect();
+        let base_bodies = extract_fn_bodies(&base_src);
+        let head_bodies = extract_fn_bodies(&src);
         let (attr_index, skip_reasons) = build_ignore_index(&src);
         for name in head_fns {
-            if base_fns.contains(&name) {
-                // Pre-existing fn at HEAD: NOT a coverage proof for this PR.
+            // R2-2: detect modified fns by body diff. A same-named fn
+            // whose body at head differs from its body at base is a
+            // MODIFIED test and counts as coverage proof. Body-equal
+            // fns are unchanged pre-existing fns (not coverage proof).
+            let is_modified = base_bodies
+                .get(&name)
+                .map(|base_body| head_bodies.get(&name) != Some(base_body))
+                .unwrap_or(false);
+            let is_preexisting = base_bodies.contains_key(&name) && !is_modified;
+            if is_preexisting {
+                // Pre-existing AND unchanged fn: NOT a coverage proof
+                // for this PR (P1-5 r1 behavior, preserved).
                 continue;
             }
-            // Added or modified: count as coverage proof unless `#[ignore]`.
+            // Added (no base body) OR modified (body diff): count as
+            // coverage proof unless `#[ignore]`.
             if attr_index.contains(&name) {
                 ignored.insert(name.clone());
                 if !skip_reasons.contains(&name) {
@@ -173,10 +207,14 @@ pub fn check_red_green(
                 }
                 continue;
             }
+            if is_modified {
+                modified.insert(name.clone());
+            }
             targeted.insert(name);
         }
     }
     let targeted_tests: Vec<String> = targeted.iter().cloned().collect();
+    let modified_tests: Vec<String> = modified.iter().cloned().collect();
     let ignored_tests: Vec<String> = ignored.iter().cloned().collect();
     let ignored_without_skip_reason: Vec<String> = ignored_no_reason.iter().cloned().collect();
 
@@ -234,8 +272,14 @@ pub fn check_red_green(
         )));
     }
 
-    let (failed_on_revert, failing_tests) = outcome?;
-    let vacuous = failing_tests.is_empty();
+    let (failed_on_revert, failing_tests, never_ran_tests) = outcome?;
+    // R2-1: `vacuous` is now computed ONLY from genuinely-failing tests.
+    // NEVER_RAN entries (compile errors / skipped tests) live in
+    // `never_ran_tests` and are NOT counted as `failing` — a PR whose
+    // tests never ran on revert must NOT vacuously report `vacuous=false`
+    // and Verified. The gate consumes `never_ran_tests` separately via
+    // `verdict_from_vacuous_report`.
+    let vacuous = failing_tests.is_empty() && never_ran_tests.is_empty();
 
     Ok(RedGreenReport {
         vacuous,
@@ -244,6 +288,8 @@ pub fn check_red_green(
         baseline_passed,
         targeted_tests,
         failing_tests,
+        never_ran_tests,
+        modified_tests,
         ignored_tests,
         ignored_without_skip_reason,
         manifest_path_used: manifest_path.to_path_buf(),
@@ -364,6 +410,129 @@ fn parse_test_fn_name(line: &str) -> Option<String> {
         return None;
     }
     Some(after_fn[..name_end].to_string())
+}
+
+/// Extract a map of `<test_fn_name> -> fn_body_text` from a Rust source
+/// file. The body is the slice from the `fn <name>` signature line
+/// through the matching closing brace, so a body-level diff between
+/// base and head survives trivial whitespace / reordering changes
+/// that would otherwise show as "modified" when they aren't.
+/// Used by R2-2 (modified-fns detection) — when a same-named fn exists
+/// at base and head but its body differs, the fn is a modified test
+/// and counts as coverage proof.
+fn extract_fn_bodies(source: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for `fn <name>` at a word boundary (skip identifiers
+        // like `fn_name` and string literals).
+        if let Some(rel_idx) = find_fn_keyword(&source[i..]) {
+            let abs_idx = i + rel_idx;
+            // Skip past the `fn ` keyword itself, then read the fn
+            // signature line. `parse_test_fn_name` looks for the
+            // FIRST `fn ` in the input — by passing the rest-of-line
+            // starting at `abs_idx + 3`, the signature IS the input
+            // and the fn name parses correctly. (Previous bug: passed
+            // `abs_idx + 3` to parse_test_fn_name which itself looks
+            // for `fn ` again, jumping over the real signature to the
+            // next `fn` later in the source.)
+            let signature_line = &source[abs_idx..];
+            let name = match parse_test_fn_name(signature_line) {
+                Some(n) => n,
+                None => {
+                    i = abs_idx + 3;
+                    continue;
+                }
+            };
+            // Locate the opening brace of the fn body. The signature
+            // ends with `{` (possibly after some params); find it.
+            let brace_rel = match signature_line.find('{') {
+                Some(idx) => idx,
+                None => {
+                    i = abs_idx + 3;
+                    continue;
+                }
+            };
+            let body_start = abs_idx + brace_rel;
+            // Walk forward tracking brace depth to find the matching
+            // close.
+            let mut depth: i32 = 0;
+            let mut j = body_start;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            // Slice from `fn` start to just past `}`
+                            let body = &source[abs_idx..=j];
+                            out.insert(name.clone(), body.to_string());
+                            i = j + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if j >= bytes.len() {
+                // Unbalanced braces — bail.
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Locate the next `fn ` keyword boundary in `s`, returning the
+/// absolute offset of the `f` in `fn `. Skips occurrences inside
+/// identifiers (e.g. `my_fn`), string literals, line comments, and
+/// block comments so the body extractor stays correct on real-world
+/// Rust sources.
+fn find_fn_keyword(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let c = bytes[i];
+        // Word boundary on the left
+        let left_ok = i == 0
+            || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if left_ok && &bytes[i..i + 3] == b"fn " {
+            return Some(i);
+        }
+        // Skip string literals / line / block comments to avoid matching
+        // `fn` inside `"fn"` or `// fn`.
+        match c {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                i += 1;
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// Run `cargo test` against the pristine base tree (no revert). Used by
@@ -573,12 +742,19 @@ fn run_cargo_tests_against_reverted(
     manifest_path: &Path,
     test_files: &[PathBuf],
     targeted_tests: &[String],
-) -> Result<(usize, Vec<String>), RedGreenError> {
+) -> Result<(usize, Vec<String>, Vec<String>), RedGreenError> {
+    // Returns `(failed_count, failing_tests, never_ran_tests)`. R2-1:
+    // NEVER_RAN entries are split into their own list so the gate path
+    // can distinguish a test that genuinely failed on revert (real red)
+    // from one that never ran (compile error / skip / filter — Pending,
+    // not Verified). The two lists are GUARANTEED disjoint at the call
+    // site in `check_red_green`.
     if targeted_tests.is_empty() {
-        return Ok((0, vec![]));
+        return Ok((0, vec![], vec![]));
     }
 
     let mut failing: Vec<String> = Vec::new();
+    let mut never_ran: Vec<String> = Vec::new();
     let mut compile_errored = false;
     for tf in test_files {
         let basename = tf
@@ -620,16 +796,19 @@ fn run_cargo_tests_against_reverted(
             } else if !(stdout.contains(&passed_marker)
                 || stdout.contains(&format!("test {name} ... ignored")))
             {
-                failing.push(format!("{name}:NEVER_RAN"));
+                // R2-1: classify as NEVER_RAN (separate signal) — the
+                // r1 attempt left these in `failing` which made
+                // `vacuous = false` for a PR whose tests never ran.
+                never_ran.push(format!("{name}:NEVER_RAN"));
             }
         }
     }
 
-    if compile_errored && failing.is_empty() {
-        failing.push("__COMPILE_FAILED_ON_REVERT__".to_string());
+    if compile_errored && failing.is_empty() && never_ran.is_empty() {
+        never_ran.push("__COMPILE_FAILED_ON_REVERT__:NEVER_RAN".to_string());
     }
 
-    Ok((failing.len(), failing))
+    Ok((failing.len(), failing, never_ran))
 }
 
 // Tiny smoke test — the integration suite under `tests/` is the real proof.

@@ -1,8 +1,129 @@
 use crate::errors::DaemonError;
 use crate::tools::Llm;
+use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
+
+/// Issue #408 / bead jleechan-1a5e r2 (R2-4): per-item status emitted by
+/// the reviewer CLI / skeptic on a known schema line. The structured
+/// path is INDEPENDENT of the LLM JSON extractor — a reviewer that emits
+/// `REVIEWER_STATUS: <key> = NOT-ADDRESSED` is parsed directly so the
+/// `not_addressed` constraints reach the next-round coder prompt even if
+/// the LLM extractor truncates or omits `notAddressed`. R2-4 closes the
+/// r1 "fires on gaps is still LLM-JSON dependent, not structured" gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ReviewerStatus {
+    /// Reviewer confirmed the item was addressed by the coder's PR.
+    Addressed,
+    /// Reviewer explicitly marked the item as NOT addressed; the next
+    /// attempt MUST treat this as a hard constraint.
+    NotAddressed,
+    /// Item is not in scope for this PR (reviewer confirmed it is out
+    /// of scope). Distinct from NOT-ADDRESSED so the next-round coder
+    /// prompt does not waste cycles on out-of-scope items.
+    NotApplicable,
+}
+
+impl ReviewerStatus {
+    /// Wire token used by the reviewer / skeptic when emitting a
+    /// structured status line. Stable contract — DO NOT rename without
+    /// coordinating with the reviewer CLI prompts.
+    pub const fn as_wire_token(self) -> &'static str {
+        match self {
+            ReviewerStatus::Addressed => "ADDRESSED",
+            ReviewerStatus::NotAddressed => "NOT-ADDRESSED",
+            ReviewerStatus::NotApplicable => "N-A",
+        }
+    }
+
+    /// Parse a wire token back into the enum. Tolerant of the case the
+    /// reviewer happens to emit; the canonical form is uppercase.
+    pub fn parse_wire_token(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "ADDRESSED" => Some(ReviewerStatus::Addressed),
+            "NOT-ADDRESSED" | "NOT_ADDRESSED" | "NOTADDRESSED" => {
+                Some(ReviewerStatus::NotAddressed)
+            }
+            "N-A" | "NA" | "NOT-APPLICABLE" | "NOT_APPLICABLE" => {
+                Some(ReviewerStatus::NotApplicable)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// One structured entry from the reviewer's per-item status block.
+/// Carries the `key` (the item identifier the reviewer used) and the
+/// status the reviewer assigned it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReviewerStatusEntry {
+    pub key: String,
+    pub status: ReviewerStatus,
+}
+
+/// Issue #408 / bead jleechan-1a5e r2 (R2-4): parse the structured
+/// `REVIEWER_STATUS: <key> = <status>` lines emitted by the reviewer CLI
+/// / skeptic into typed entries. Pure text — NO LLM call. This is the
+/// deterministic path operator required: even if the LLM extractor
+/// truncates, the structured lines surface in `not_addressed`.
+///
+/// Accepted line shapes (whitespace tolerant):
+///   REVIEWER_STATUS: 3-check coverage = NOT-ADDRESSED
+///   REVIEWER_STATUS: manifest-path = ADDRESSED
+///   `REVIEWER_STATUS: foo = N-A`
+///
+/// Malformed lines are silently skipped — the LLM extractor remains a
+/// fallback for unstructured prose.
+pub fn parse_reviewer_status_lines(review_text: &str) -> Vec<ReviewerStatusEntry> {
+    let mut out: Vec<ReviewerStatusEntry> = Vec::new();
+    let mut seen: BTreeSet<(String, ReviewerStatus)> = BTreeSet::new();
+    for line in review_text.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("REVIEWER_STATUS:") else {
+            continue;
+        };
+        let Some((key_raw, status_raw)) = rest.split_once('=') else {
+            continue;
+        };
+        let key = key_raw.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let Some(status) = ReviewerStatus::parse_wire_token(status_raw) else {
+            continue;
+        };
+        let entry = ReviewerStatusEntry {
+            key: key.clone(),
+            status,
+        };
+        // Dedupe: if the reviewer repeats the same (key, status), keep
+        // only one. A later contradiction (same key, different status)
+        // is resolved by LATER-WINS — the reviewer's most recent
+        // judgment supersedes an earlier one.
+        seen.insert((key, status));
+        // Re-build the deduped vector in input order: remove any
+        // earlier occurrence of the same key with a different status,
+        // then append the current entry.
+        out.retain(|e| e.key != entry.key);
+        out.push(entry);
+    }
+    out
+}
+
+/// Extract just the NOT-ADDRESSED items from structured status lines.
+/// Convenience helper for callers that only need the structured
+/// NOT-ADDRESSED subset (matches the r2 `Extracted::not_addressed`
+/// field shape).
+pub fn not_addressed_keys_from_status_lines(
+    review_text: &str,
+) -> Vec<String> {
+    parse_reviewer_status_lines(review_text)
+        .into_iter()
+        .filter(|e| e.status == ReviewerStatus::NotAddressed)
+        .map(|e| e.key)
+        .collect()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extracted {
@@ -14,7 +135,10 @@ pub struct Extracted {
     /// either fully satisfied or the LLM does not surface any. Surfaced
     /// as a separate constraint so the reroll prompt and the appended
     /// spec block can carry them as hard requirements for the next
-    /// attempt.
+    /// attempt. R2-4 also folds structured `REVIEWER_STATUS:` lines
+    /// (with status NOT-ADDRESSED) into this list — the deterministic
+    /// path runs FIRST so a truncated LLM reply does NOT silently drop
+    /// gaps.
     pub not_addressed: Vec<String>,
 }
 
@@ -86,6 +210,14 @@ pub fn redact_holdouts(text: &str) -> (String, bool) {
 pub fn extract(llm: &dyn Llm, review_text: &str) -> Result<Extracted, DaemonError> {
     let (redacted_text, programmatic_encountered) = redact_holdouts(review_text);
 
+    // R2-4: parse structured `REVIEWER_STATUS: <key> = <status>` lines
+    // FIRST (no LLM). Items the reviewer marked NOT-ADDRESSED are
+    // already present in the merged result before the LLM extractor
+    // runs, so a truncated or schema-divergent LLM reply cannot
+    // silently drop them. The LLM extractor then ADDs any additional
+    // NOT-ADDRESSED items it surfaces from free-form prose.
+    let structured_not_addressed = not_addressed_keys_from_status_lines(review_text);
+
     let prompt = format!(
         "You are the Constraint Extractor for an autonomous coding factory.\n         Analyze the following rejection review feedback:\n\n         \"\"\"\n         {}\n         \"\"\"\n\n         Extract any positive assertions (what the code MUST do) and inhibition specs (what the code MUST NOT do, which get priority).\n         Also, identify any reviewer items the coder's previous attempt did NOT address (the reviewer asked for these but the coder's PR did not implement them) — these flow into the next attempt's hard constraints.\n         Also, verify if there are any holdout test internals or leaked holdout details in the feedback. If so, set securityRedactionEncountered to true.\n         Respond with exactly one JSON object as the last thing in your reply, in this format:\n         {{\n           \"inhibitionSpecs\": [\"...\"],\n           \"positiveAssertions\": [\"...\"],\n           \"notAddressed\": [\"...\"],\n           \"securityRedactionEncountered\": true|false\n         }}",
         redacted_text
@@ -112,16 +244,36 @@ pub fn extract(llm: &dyn Llm, review_text: &str) -> Result<Extracted, DaemonErro
         ))
     })?;
 
+    // R2-4 merge: structured NOT-ADDRESSED keys come first (they are
+    // authoritative when present), then any LLM-surfaced NOT-ADDRESSED
+    // items are appended, with dedup. A truncated LLM reply cannot
+    // drop the structured set because it was already captured before
+    // the LLM was even called.
+    let mut merged_not_addressed: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for key in structured_not_addressed
+        .into_iter()
+        .chain(parsed.not_addressed.into_iter())
+    {
+        let trimmed = key.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.clone()) {
+            merged_not_addressed.push(trimmed);
+        }
+    }
+
     Ok(Extracted {
         inhibition_specs: parsed.inhibition_specs,
         positive_assertions: parsed.positive_assertions,
         security_redaction_encountered: parsed.security_redaction_encountered
             || programmatic_encountered,
-        // P1-7: reviewer items the coder's previous attempt did not
-        // address. Empty when the LLM does not surface any — backward
-        // compatible with older reviewer LLMs that do not parse
-        // `notAddressed` (serde defaults the field to `[]` when absent).
-        not_addressed: parsed.not_addressed,
+        // P1-7 + R2-4: NOT-ADDRESSED items — structured status lines
+        // (deterministic) merged with LLM-surfaced items (fallback),
+        // deduplicated. The structured set runs first so the LLM
+        // extractor cannot drop it on a truncated reply.
+        not_addressed: merged_not_addressed,
     })
 }
 

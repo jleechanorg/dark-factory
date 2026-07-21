@@ -57,6 +57,80 @@ const MAX_REROLL_DEFERRALS: u32 = 5;
 /// `RerollOutcome::Held` message can never drift apart.
 pub const CIRCUIT_BREAKER_PARK_REASON: &str = crate::state::CIRCUIT_BREAKER_PARK_REASON;
 
+/// Issue #408 / bead jleechan-1a5e r2 (R2-4): emit the
+/// `CONSTRAINT_MUTATION_SUCCESS` payload as a JSON string so the
+/// `not_addressed` count is queryable in dashboards (r1's payload
+/// silently omitted `notAddressedCount`, which made
+/// `not_addressed` invisible in rollups). The caller passes the
+/// pre-formed payload to `emit_telemetry`. Splitting the payload
+/// formatter out as a pure function makes the r2 regression test
+/// (R2-4 telemetry) trivial: assert the JSON contains
+/// `notAddressedCount`.
+pub fn format_constraint_mutation_payload(extracted: &constraints::Extracted) -> String {
+    serde_json::json!({
+        "extractedConstraints": {
+            "positiveAssertionsCount": extracted.positive_assertions.len(),
+            "inhibitionSpecsCount": extracted.inhibition_specs.len(),
+            // R2-4: structured NOT-ADDRESSED count — emitted every time
+            // the constraint block is mutated so dashboards / rollups
+            // can prove `not_addressed` actually propagated.
+            "notAddressedCount": extracted.not_addressed.len(),
+        }
+    })
+    .to_string()
+}
+
+/// Issue #408 / bead jleechan-1a5e r2 (R2-4): build the TOML
+/// `[[reroll]]` block that flows into the next-round spec. r1 wrote
+/// `not_addressed` as a plain `[Vec<String>]` block — that lossy
+/// shape collapsed NOT-ADDRESSED and N-A into the same constraint
+/// list, so the next-round coder prompt had no way to tell which
+/// items were "in scope but missed" vs "out of scope". r2 emits a
+/// structured `[[reroll.not_addressed_structured]]` array of
+/// `{key, status}` records alongside the flat list for backward
+/// compat with parsers that only know the flat shape.
+pub fn format_reroll_block(
+    reviewer: &str,
+    superseded_attempt: u32,
+    extracted: &constraints::Extracted,
+    structured: &[(String, constraints::ReviewerStatus)],
+    raw_feedback: &str,
+) -> String {
+    let mut inhibition_lines = String::new();
+    for spec in &extracted.inhibition_specs {
+        inhibition_lines.push_str(&format!("    \"{}\",\n", spec.replace('"', "\\\"")));
+    }
+    let mut positive_lines = String::new();
+    for spec in &extracted.positive_assertions {
+        positive_lines.push_str(&format!("    \"{}\",\n", spec.replace('"', "\\\"")));
+    }
+    let mut not_addressed_lines = String::new();
+    for spec in &extracted.not_addressed {
+        not_addressed_lines.push_str(&format!("    \"{}\",\n", spec.replace('"', "\\\"")));
+    }
+    let mut structured_block = String::new();
+    for (key, status) in structured {
+        // TOML inline-table syntax — backslash-escape any embedded
+        // quotes in the key so the spec parser never trips on a
+        // pathological reviewer-supplied identifier.
+        let key_escaped = key.replace('"', "\\\"");
+        structured_block.push_str(&format!(
+            "{{ key = \"{key_escaped}\", status = \"{status}\" }},\n",
+            status = status.as_wire_token()
+        ));
+    }
+    format!(
+        "\n[[reroll]]\n         reviewer = \"{}\"\n         attempt = {}\n         inhibition_specs = [\n         {}         ]\n         positive_assertions = [\n         {}         ]\n         not_addressed = [\n         {}         ]\n         not_addressed_structured = [\n         {}         ]\n         raw_feedback = \"\"\"\n         {}\n         \"\"\"\n",
+        reviewer.replace('"', "\\\""),
+        superseded_attempt,
+        inhibition_lines,
+        positive_lines,
+        not_addressed_lines,
+        structured_block,
+        raw_feedback.replace('"', "\\\"")
+    )
+}
+
 fn now_iso8601() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -631,32 +705,27 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
 
     let extracted = constraints::extract(deps.llm, &deps.review_text)?;
 
-    // Format spec block append-only
-    let mut inhibition_lines = String::new();
-    for spec in &extracted.inhibition_specs {
-        inhibition_lines.push_str(&format!("    \"{}\",\n", spec.replace('"', "\\\"")));
-    }
-    let mut positive_lines = String::new();
-    for spec in &extracted.positive_assertions {
-        positive_lines.push_str(&format!("    \"{}\",\n", spec.replace('"', "\\\"")));
-    }
-    // Issue #408 / bead jleechan-1a5e r3 (P1-7): NOT-ADDRESSED items flow
-    // into the spec block as a distinct constraint list so the next-round
-    // coder prompt is briefed on the unresolved gaps. Empty list is fine
-    // (the block always carries the field for parser stability).
-    let mut not_addressed_lines = String::new();
-    for spec in &extracted.not_addressed {
-        not_addressed_lines.push_str(&format!("    \"{}\",\n", spec.replace('"', "\\\"")));
-    }
+    // Issue #408 / bead jleechan-1a5e r2 (R2-4): capture the structured
+    // per-item status entries from the reviewer text so the spec block
+    // can carry `not_addressed_structured = [{key, status}]` — the
+    // next-round coder prompt distinguishes NOT-ADDRESSED (in scope,
+    // missed) from N-A (out of scope, do not retry).
+    let structured_entries = constraints::parse_reviewer_status_lines(&deps.review_text);
+    let structured_pairs: Vec<(String, constraints::ReviewerStatus)> = structured_entries
+        .into_iter()
+        .map(|e| (e.key, e.status))
+        .collect();
 
-    let block = format!(
-        "\n[[reroll]]\n         reviewer = \"{}\"\n         attempt = {}\n         inhibition_specs = [\n         {}         ]\n         positive_assertions = [\n         {}         ]\n         not_addressed = [\n         {}         ]\n         raw_feedback = \"\"\"\n         {}\n         \"\"\"\n",
-        deps.reviewer,
+    // Issue #408 / bead jleechan-1a5e r3 (P1-7) + r2 (R2-4): the spec
+    // block now carries the structured per-item status alongside the
+    // flat NOT-ADDRESSED list. Delegating to `format_reroll_block`
+    // keeps the wire format in one place.
+    let block = format_reroll_block(
+        &deps.reviewer,
         superseded_attempt,
-        inhibition_lines,
-        positive_lines,
-        not_addressed_lines,
-        deps.review_text
+        &extracted,
+        &structured_pairs,
+        &deps.review_text,
     );
 
     let spec_path = Path::new(&deps.cfg.spec_dir).join(format!("{}.toml", bead.bead_id));
@@ -666,20 +735,39 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     bead.state = OverlayState::Recovery;
     deps.store.save(bead)?;
 
+    // R2-4: `CONSTRAINT_MUTATION_SUCCESS` payload now includes the
+    // `notAddressedCount` (via `format_constraint_mutation_payload`).
+    // The r1 attempt emitted only `positiveAssertionsCount` +
+    // `inhibitionSpecsCount`, which made `not_addressed` invisible in
+    // dashboards and rollups.
+    let payload_str = format_constraint_mutation_payload(&extracted);
+    let payload: serde_json::Value = serde_json::from_str(&payload_str).map_err(|e| {
+        DaemonError::Parse(format!(
+            "format_constraint_mutation_payload produced invalid JSON: {e}"
+        ))
+    })?;
+
+    // Merge the extracted-constraint payload into the base telemetry
+    // envelope without overwriting `consumedUSD` / `elapsedAutonomySeconds`.
+    let mut envelope = serde_json::json!({
+        "consumedUSD": 0.0,
+        "elapsedAutonomySeconds": bead.autonomy_secs,
+    });
+    if let (Some(env_obj), Some(pay_obj)) =
+        (envelope.as_object_mut(), payload.as_object())
+    {
+        for (k, v) in pay_obj {
+            env_obj.insert(k.clone(), v.clone());
+        }
+    }
+
     emit_telemetry(
         deps.telemetry_log,
         &bead.bead_id,
         bead.attempt,
         bead.state.as_str(),
         "CONSTRAINT_MUTATION_SUCCESS",
-        serde_json::json!({
-            "consumedUSD": 0.0,
-            "elapsedAutonomySeconds": bead.autonomy_secs,
-            "extractedConstraints": {
-                "positiveAssertionsCount": extracted.positive_assertions.len(),
-                "inhibitionSpecsCount": extracted.inhibition_specs.len(),
-            }
-        }),
+        envelope,
         serde_json::json!({
             "targetBranch": new_branch,
             "baseCommit": base_sha,

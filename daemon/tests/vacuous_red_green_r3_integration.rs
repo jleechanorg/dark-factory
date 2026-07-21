@@ -223,9 +223,16 @@ fn report_includes_three_check_fields() {
         !report.vacuous,
         "genuine red-green must NOT be flagged vacuous; got {report:?}"
     );
+    // R2-1: the red signal can come in as EITHER a genuine failing
+    // test OR a NEVER_RAN (compile error in the reverted production
+    // fn). The detector splits the two so the gate helper can
+    // distinguish them; the report assertion just checks "some red
+    // signal was observed", which is `failed_on_revert +
+    // never_ran_tests.len()`.
+    let red_signal = report.failed_on_revert + report.never_ran_tests.len();
     assert!(
-        report.failed_on_revert >= 1,
-        "expected at least one failing test on revert; got {report:?}"
+        red_signal >= 1,
+        "expected at least one genuine red OR never_ran entry on revert; report={report:?}"
     );
 }
 

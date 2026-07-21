@@ -237,13 +237,26 @@ fn genuine_red_green_passes_check() {
     let manifest_path = proj.root.join("Cargo.toml");
     let report = check_red_green(&proj.root, &manifest_path, &proj.base_sha, &changed)
         .expect("report");
+    // R2-1: a genuine red-green test must NOT be flagged vacuous,
+    // regardless of whether the "red signal" came in as a genuine
+    // failed test OR a NEVER_RAN (compile error in the reverted
+    // production fn). The r1 attempt conflated both into
+    // `failed_on_revert` and required `>= 1`; r2 splits them so a
+    // genuine red-green test that compile-errored on revert is
+    // correctly NOT vacuous (the assertion is vacuous must be false).
     assert!(
         !report.vacuous,
         "expected genuine red-green test to NOT be flagged vacuous; report={report:?}"
     );
+    // R2-1: the red signal is in EITHER `failing_tests` (genuine) OR
+    // `never_ran_tests` (compile error). The detector surfaces both so
+    // the gate helper can distinguish them. The OLD `failed_on_revert
+    // >= 1` assertion is no longer correct because a compile error on
+    // revert produces NEVER_RAN, not a failed test run.
+    let red_signal = report.failed_on_revert + report.never_ran_tests.len();
     assert!(
-        report.failed_on_revert >= 1,
-        "expected at least one test to fail after revert; report={report:?}"
+        red_signal >= 1,
+        "expected at least one genuine red OR never_ran entry on revert; report={report:?}"
     );
 }
 

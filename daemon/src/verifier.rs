@@ -481,6 +481,78 @@ pub enum EvidenceGistStatus {
     Pending(String),
 }
 
+/// Issue #408 / bead jleechan-1a5e r2 (R2-1 + R2-3): convert a
+/// `RedGreenReport` from the runtime vacuous-test detector into the
+/// `VacuousRedGreenStatus` consumed by `evidence_floor_gate`. The r1
+/// attempt inlined this logic in `tick.rs` and missed two of the
+/// three r2 contracts:
+///
+/// * **R2-1**  A `RedGreenReport` whose every targeted test came back
+///   `NEVER_RAN` (compile error in a sibling / filter dropped them)
+///   MUST surface as `Pending` rather than `Verified`. The r1 attempt
+///   treated any non-empty `failing_tests` as a red signal —
+///   including the `:NEVER_RAN` entries — which let a PR whose tests
+///   never ran on the reverted tree vacuously pass.
+/// * **R2-3**  `ignored_without_skip_reason` non-empty MUST surface as
+///   `Failed`. The CLI already consults this list; the gate path
+///   (this function) was the gap. A coder who `#[ignore]`s a test
+///   without a `skip_reason` cannot satisfy the gate any more.
+/// * **R2-2**  `modified_tests` is informational only here — the
+///   detector already includes modified fns in `targeted_tests`, so
+///   the modified-fns fix lands in `vacuous_red_green.rs`, not in
+///   this gate wrapper.
+///
+/// All three rules apply BEFORE the legacy vacuous/green_on_head/
+/// baseline_passed check, so a vacuous detector whose targeted tests
+/// all `NEVER_RAN` is Pending regardless of `vacuous=false`.
+pub fn verdict_from_vacuous_report(
+    report: &crate::vacuous_red_green::RedGreenReport,
+) -> VacuousRedGreenStatus {
+    // R2-3: a test `#[ignore]`-attributed without a skip_reason is a
+    // distinct contract violation — the coder silently opted the test
+    // out of coverage. The CLI path has long flagged this list; the
+    // gate path now does too.
+    if !report.ignored_without_skip_reason.is_empty() {
+        return VacuousRedGreenStatus::Failed(format!(
+            "{} test(s) #[ignore]-attributed without skip_reason: {:?}; gate requires every ignored test to carry a documented skip_reason",
+            report.ignored_without_skip_reason.len(),
+            report.ignored_without_skip_reason
+        ));
+    }
+    // R2-1: if the report covers at least one targeted test AND every
+    // one of them came back NEVER_RAN, the gate is Pending (transient
+    // or genuine infra issue) — NOT Verified. A NEVER_RAN entry is
+    // not a "red signal"; it means the test did not run at all.
+    if !report.targeted_tests.is_empty()
+        && !report.never_ran_tests.is_empty()
+        && report.failing_tests.is_empty()
+    {
+        return VacuousRedGreenStatus::Pending(format!(
+            "all {} targeted test(s) never ran on the reverted tree ({}); transient or compile error — re-check next tick",
+            report.targeted_tests.len(),
+            report.never_ran_tests.len()
+        ));
+    }
+    // Legacy r1 contract (P1-1 / P1-2 / P1-6) preserved. We require
+    // (a) green_on_head, (b) at least one genuine failing test on
+    // revert, AND (c) a clean baseline tree. ANY missing -> Failed
+    // with the operator-facing reason.
+    if report.vacuous || !report.green_on_head || !report.baseline_passed {
+        let reason = if !report.baseline_passed {
+            "baseline tree failed cargo test".to_string()
+        } else if !report.green_on_head {
+            format!(
+                "targeted tests fail on head ({:?})",
+                report.failing_tests
+            )
+        } else {
+            "every targeted test passes on the reverted tree (vacuous)".to_string()
+        };
+        return VacuousRedGreenStatus::Failed(reason);
+    }
+    VacuousRedGreenStatus::Verified
+}
+
 /// Gate 6 (spec §4.2.5): green only when `/er` returned `Pass` AND the
 /// non-test-LOC floor also passes (integration-evidence marker present above
 /// the floor). An absent `/er` verdict is `Unknown` — we cannot say the

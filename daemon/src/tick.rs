@@ -1966,21 +1966,14 @@ fn run_vacuous_red_green_check(
         &changed,
     ) {
         Ok(report) => {
-            if report.vacuous || !report.green_on_head || !report.baseline_passed {
-                let reason = if !report.baseline_passed {
-                    "baseline tree failed cargo test".to_string()
-                } else if !report.green_on_head {
-                    format!(
-                        "targeted tests fail on head ({:?})",
-                        report.failing_tests
-                    )
-                } else {
-                    "every targeted test passes on the reverted tree (vacuous)".to_string()
-                };
-                verifier::VacuousRedGreenStatus::Failed(reason)
-            } else {
-                verifier::VacuousRedGreenStatus::Verified
-            }
+            // Issue #408 r2 / R2-1 + R2-3: delegate to the verdict
+            // helper in verifier.rs so the gate-side contract is
+            // testable in isolation. The helper enforces:
+            //   * ignored_without_skip_reason non-empty -> Failed (R2-3)
+            //   * all targeted tests NEVER_RAN -> Pending (R2-1)
+            //   * vacuous || !green_on_head || !baseline_passed -> Failed
+            //   * otherwise -> Verified
+            verifier::verdict_from_vacuous_report(&report)
         }
         Err(crate::vacuous_red_green::RedGreenError::NoChangedTests) => {
             // PR has no test files — vacuous detection is N/A for this
