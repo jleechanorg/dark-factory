@@ -108,3 +108,76 @@ def test_conformance_validate_walker_skips_underscore_dot_libraries():
         diag.get("severity") == "error" and "start" in diag.get("message", "").lower()
         for diag in payload_explicit["diagnostics"]
     ), payload_explicit
+
+
+# ---------------------------------------------------------------------------
+# Level-5 rule set — see project_2026-06-22_g3_closure_dynamic_node_design.md
+# ---------------------------------------------------------------------------
+
+
+def test_level5_valid_passes():
+    proc = run_conformance("validate", "tests/fixtures/level5_valid.dot")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["diagnostics"] == [], payload
+
+
+def test_level5_missing_gate_fails():
+    proc = run_conformance("validate", "tests/fixtures/level5_missing_gate.dot")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    payload = json.loads(proc.stdout)
+    rules = {d.get("rule") for d in payload["diagnostics"]}
+    assert "missing_hard_tier_gate" in rules, payload
+    assert any(
+        d.get("severity") == "error" and "gate_er" in d.get("message", "")
+        for d in payload["diagnostics"]
+    ), payload
+
+
+def test_level5_with_skip_passes():
+    proc = run_conformance("validate", "tests/fixtures/level5_with_skip.dot")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["diagnostics"] == [], payload
+
+
+def test_slim_pipelines_exempt_from_level5():
+    """Slim pipelines must remain free of Level-5 hard-tier enforcement."""
+    proc = run_conformance("validate", "pipelines/slim/minimal_feature.dot")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    payload = json.loads(proc.stdout)
+    assert all(
+        d.get("rule") != "missing_hard_tier_gate"
+        for d in payload["diagnostics"]
+    ), payload
+
+
+def test_hello_dot_exempt_from_level5():
+    """`hello.dot` is the smoke lane and must stay exempt from Level-5."""
+    proc = run_conformance("validate", "pipelines/factory/hello.dot")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    payload = json.loads(proc.stdout)
+    assert all(
+        d.get("rule") != "missing_hard_tier_gate"
+        for d in payload["diagnostics"]
+    ), payload
+
+
+def test_graph_level5_true_attribute_enables_rule(tmp_path):
+    """A `.dot` with `graph [level5="true"]` triggers the rule check
+    regardless of location — used by tests + ad-hoc author validation."""
+    level5_dot = tmp_path / "adhoc_level5.dot"
+    level5_dot.write_text(
+        'digraph adhoc {\n'
+        '    graph [level5="true", backend="claude"]\n'
+        '    rankdir=LR\n'
+        '    start [shape=Mdiamond, label="Start"]\n'
+        '    exit  [shape=Msquare,  label="Exit"]\n'
+        '    start -> exit\n'
+        '}\n'
+    )
+    proc = run_conformance("validate", str(level5_dot))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    payload = json.loads(proc.stdout)
+    rules = [d.get("rule") for d in payload["diagnostics"]]
+    assert "missing_hard_tier_gate" in rules, payload

@@ -1,0 +1,36 @@
+// Level-5 fixture that omits the `gate_er` node on purpose so the
+// conformance validator should flag it as a missing hard-tier gate.
+// It still includes gate_skeptic + a cross-vendor reviewer so only the
+// gate_er check fires.
+digraph level5_missing_gate {
+    graph [
+        goal="Level-5 fixture intentionally missing gate_er."
+        backend="claude"
+        level5="true"
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    implement  [type="codergen", prompt="@prompts/hello/implement.md"]
+    fix        [type="codergen", prompt="@prompts/hello/fix.md", max_visits="3"]
+    holdout    [type="holdout_eval", label="Holdout Eval", feature="hello", timeout=600]
+    gate_skeptic [type="gate_skeptic", label="Skeptic", timeout=600]
+    adversarial [type="tool", command="codex exec --yolo review", timeout=600]
+    healer     [type="tool", command="df-healer --cxdb /tmp/x.sqlite", timeout=600]
+    spec_validation [type="codergen", prompt="@prompts/hello/spec_validation.md"]
+
+    start -> implement -> holdout
+    holdout -> gate_skeptic [condition="outcome=success"]
+    holdout -> fix          [condition="outcome!=success"]
+    gate_skeptic -> adversarial [condition="outcome=success"]
+    gate_skeptic -> fix          [condition="outcome!=success"]
+    adversarial -> spec_validation [condition="outcome=success"]
+    adversarial -> fix            [condition="outcome!=success"]
+    spec_validation -> exit [condition="outcome=success"]
+    spec_validation -> fix  [condition="outcome!=success"]
+    fix -> healer [condition="outcome=exhausted"]
+    fix -> holdout [condition="outcome!=exhausted"]
+    healer -> exit
+}
