@@ -133,7 +133,9 @@ pub fn parse_not_addressed_schema_line(text: &str) -> Option<Vec<String>> {
         }
         match ch {
             '\\' if in_str => {
-                buf.push(ch);
+                // Defer handling to the next char so we don't push the
+                // backslash itself; the next loop iteration appends the
+                // escaped character verbatim.
                 escape = true;
             }
             '"' => {
@@ -225,7 +227,12 @@ pub fn extract(llm: &dyn Llm, review_text: &str) -> Result<Extracted, DaemonErro
     // CONSTRAINT_NOT_ADDRESSED_EXTRACTED event so operators can audit
     // the per-bead propagation chain (reviewer → extractor → reroll
     // spec block → next-round red dispatch).
-    let schema_line_items = parse_not_addressed_schema_line(review_text);
+    //
+    // r5 (CodeRabbit review of PR #420, security): parse from the
+    // already-redacted text so a NOT-ADDRESSED item that references a
+    // holdout path/substring cannot bypass programmatic redaction on
+    // its way into the reroll spec block + next-round coder prompt.
+    let schema_line_items = parse_not_addressed_schema_line(&redacted_text);
     if let Some(ref items) = schema_line_items {
         if !items.is_empty() {
             let _ = log_not_addressed_telemetry(items);
@@ -512,7 +519,11 @@ pub fn format_prior_constraints_block(prior: &PriorRerollBlock) -> String {
     if !prior.not_addressed_structured.is_empty() {
         s.push_str("\nNOT-ADDRESSED items from previous reviewer (must address):\n");
         for (key, status) in &prior.not_addressed_structured {
-            if *status == ReviewerStatus::NotApplicable {
+            // r5 (CodeRabbit review of PR #420): omit BOTH Addressed (the
+            // reviewer confirmed) AND NotApplicable (out-of-scope) from
+            // the "must address" list. Only NotAddressed (in-scope,
+            // missed) belongs here.
+            if *status != ReviewerStatus::NotAddressed {
                 continue;
             }
             s.push_str(&format!("- {key}\n"));

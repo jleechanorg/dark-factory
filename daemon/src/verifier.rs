@@ -535,6 +535,22 @@ fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
     // fetchable + non-empty + head-matched) passes REGARDLESS of LOC; a
     // present-but-invalid marker is a distinct Red (fail-closed); a transient
     // gist-fetch failure is Unknown (wait, do not churn a reroll on gh noise).
+    //
+    // r5 (codex review of PR #420, P1): the vacuous-red-green check must run
+    // BEFORE the verified-evidence early return so a vacuous PR with a
+    // valid evidence gist still fails the gate. A verified gist proves
+    // "evidence contract is satisfied" — it does NOT prove "tests are not
+    // vacuous". The vacuous detector is an independent signal; both must
+    // clear for the gate to green.
+    match &evidence.vacuous_red_green_status {
+        VacuousRedGreenStatus::Failed(reason) => {
+            return GateResult::Red(format!("vacuous red-green: {reason}"));
+        }
+        VacuousRedGreenStatus::Pending(reason) => {
+            return GateResult::Unknown(format!("vacuous red-green pending: {reason}"));
+        }
+        VacuousRedGreenStatus::Verified | VacuousRedGreenStatus::NotRun => {}
+    }
     match &evidence.evidence_gist_status {
         EvidenceGistStatus::Verified => return GateResult::Green,
         EvidenceGistStatus::Failed(reason) => {

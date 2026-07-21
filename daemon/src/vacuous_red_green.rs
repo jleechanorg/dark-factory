@@ -331,11 +331,21 @@ pub fn to_gate_status(report: &RedGreenReport) -> crate::verifier::VacuousRedGre
         ));
     }
     if report.vacuous {
-        // vacuous=true AND all checks ran cleanly means: every targeted
-        // test passed on revert too. If genuine_red_on_revert=false,
-        // every "failure" was a synthetic NEVER_RAN — the gate cannot
-        // verify; surface as Pending.
+        // vacuous=true with EMPTY failing_tests is true vacuity — every
+        // targeted test passed on revert, so the test suite proves
+        // nothing. r5 (cursor-agent + codex review of PR #420): this is
+        // a real defect, the gate must Fail. The Pending branch below
+        // is reserved for the synthetic-NEVER_RAN-only case (non-empty
+        // failing_tests, but every entry is `:NEVER_RAN` /
+        // `__COMPILE_FAILED_ON_REVERT__`).
         if !report.genuine_red_on_revert {
+            if report.failing_tests.is_empty() {
+                return VacuousRedGreenStatus::Failed(format!(
+                    "vacuous red-green: targeted tests all pass on revert \
+                     (no genuine red); targeted={:?}",
+                    report.targeted_tests
+                ));
+            }
             return VacuousRedGreenStatus::Pending(format!(
                 "no genuine red on revert: every observation is NEVER_RAN \
                  or COMPILE_FAILED; failing_tests={:?}",
@@ -347,6 +357,15 @@ pub fn to_gate_status(report: &RedGreenReport) -> crate::verifier::VacuousRedGre
         return VacuousRedGreenStatus::Failed(
             "vacuous=true but a real failure was observed on revert".to_string(),
         );
+    }
+    // vacuous=false with synthetic-only failing_tests — Pending (transient,
+    // never-ran noise, not Verified).
+    if !report.failing_tests.is_empty() && !report.genuine_red_on_revert {
+        return VacuousRedGreenStatus::Pending(format!(
+            "failing_tests contains only synthetic entries \
+             (NEVER_RAN / COMPILE_FAILED); failing_tests={:?}",
+            report.failing_tests
+        ));
     }
     VacuousRedGreenStatus::Verified
 }
@@ -547,14 +566,22 @@ fn run_cargo_baseline(
 ) -> Result<(), String> {
     // We don't have a copy of the test fn names at base (that's the
     // pre-PR baseline), so we let cargo discover them naturally by
-    // running `cargo test --workspace` (or the equivalent for the
-    // given manifest). The exact invocation does not matter for
-    // sanity — the goal is "the base tree compiles + tests pass".
+    // running `cargo test --manifest-path <path>`. The exact invocation
+    // does not matter for sanity — the goal is "the base tree compiles
+    // + tests pass". `GIT_BASE_REF` is exported so any integration test
+    // helper that needs the base ref (e.g. for `git show`) can resolve
+    // it; the cargo invocation itself does not need it.
+    //
+    // r5 (CodeRabbit review of PR #420): the previous `--skip ignored`
+    // arg was a bug. cargo's `--skip` matches test NAMES (substring),
+    // not the `#[ignore]` attribute — there is no flag to "skip
+    // `#[ignore]`-attributed tests" because libtest already skips them
+    // by default. Passing `--skip ignored` matched no tests and only
+    // existed because of an incorrect comment in r3.
     let out = Command::new("cargo")
         .current_dir(repo_root)
         .args(["test", "--quiet", "--manifest-path"])
         .arg(manifest_path)
-        .args(["--", "--skip", "ignored"])
         .env("GIT_BASE_REF", base_ref)
         .output()
         .map_err(|e| format!("spawn cargo test (baseline): {e}"))?;

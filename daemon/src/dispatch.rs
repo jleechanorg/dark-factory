@@ -1160,6 +1160,31 @@ fn build_coder_prompt_with_prior(
         );
     }
 
+    // r5 (CodeRabbit review of PR #420): `prior_block` is unbounded —
+    // a verbose prior review can leave the assembled prompt over
+    // CODER_PROMPT_TOTAL_CAP, causing AO spawn failures. The per-section
+    // caps above bound description/notes/tree but never the prior block.
+    // Shrink it as the last-resort pass (lowest priority because losing
+    // prior constraints is acceptable, losing the operator-authored
+    // notes/description is not).
+    if prompt.len() > CODER_PROMPT_TOTAL_CAP && !prior_block.is_empty() {
+        let mut prior_block_owned = prior_block.to_string();
+        let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
+        shrink_by(&mut prior_block_owned, excess, "\n[prior truncated]");
+        prompt = render_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            CoderPromptSections {
+                description: &description,
+                notes: &notes,
+                tree: &tree,
+                prior_block: &prior_block_owned,
+            },
+        );
+    }
+
     prompt
 }
 

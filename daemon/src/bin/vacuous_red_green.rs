@@ -16,7 +16,8 @@
 //       three checks fails (vacuous; gate fails)
 //   2 — internal error (diff capture, git apply, etc.)
 
-use daemon::vacuous_red_green::{check_red_green, FileClass};
+use daemon::vacuous_red_green::{check_red_green, to_gate_status, FileClass};
+use daemon::verifier::VacuousRedGreenStatus;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -103,40 +104,59 @@ fn main() {
         }
     }
 
-    // Issue #408 r3: all three checks must pass for the gate to clear.
-    let any_check_failed = !report.green_on_head
-        || !report.baseline_passed
-        || report.ignored_without_skip_reason
-            .iter()
-            .any(|t| report.targeted_tests.iter().any(|tt| tt == t))
-        || report.ignored_without_skip_reason.len()
-            > report.targeted_tests.is_empty() as usize;
-    // Note: ignored-without-reason is flagged but NOT a fatal error — the
-    // CLI surfaces them in stderr so operators can audit, but it does not
-    // fail the gate (they don't count as coverage, they don't subtract
-    // from it). The real "vacuous" failure mode is the revert-side all-green.
-
-    if report.vacuous || any_check_failed {
-        eprintln!(
-            "vacuous_red_green: VACUOUS (vacuous={}, green_on_head={}, baseline_passed={}, \
-             targeted={}, failed_on_revert={}, ignored_no_reason={:?})",
-            report.vacuous,
-            report.green_on_head,
-            report.baseline_passed,
-            report.targeted_tests.len(),
-            report.failing_tests.len(),
-            report.ignored_without_skip_reason
-        );
-        std::process::exit(1);
-    } else {
-        eprintln!(
-            "vacuous_red_green: GENUINE ({} tests targeted, {} failed on revert: {:?}, \
-             green_on_head=true, baseline_passed=true)",
-            report.targeted_tests.len(),
-            report.failing_tests.len(),
-            report.failing_tests
-        );
-        std::process::exit(0);
+    // r5 (CodeRabbit review of PR #420): reuse `to_gate_status` as the
+    // single source of truth for the CLI's exit status so the CLI and
+    // the daemon gate path cannot drift. r3 had an inline
+    // `any_check_failed` expression that contradicted its own comment
+    // ("flagged but NOT a fatal error") and used a bool-cast
+    // (`len() > is_empty() as usize`) comparison that almost never
+    // fired. Pending and Failed both exit 1; only Verified exits 0.
+    let status = to_gate_status(&report);
+    match status {
+        VacuousRedGreenStatus::Verified => {
+            eprintln!(
+                "vacuous_red_green: GENUINE ({} tests targeted, {} failed on revert: {:?}, \
+                 green_on_head=true, baseline_passed=true)",
+                report.targeted_tests.len(),
+                report.failing_tests.len(),
+                report.failing_tests
+            );
+            std::process::exit(0);
+        }
+        VacuousRedGreenStatus::Failed(reason) => {
+            eprintln!(
+                "vacuous_red_green: FAILED ({reason}; vacuous={}, green_on_head={}, \
+                 baseline_passed={}, targeted={}, failed_on_revert={}, ignored_no_reason={:?})",
+                report.vacuous,
+                report.green_on_head,
+                report.baseline_passed,
+                report.targeted_tests.len(),
+                report.failing_tests.len(),
+                report.ignored_without_skip_reason
+            );
+            std::process::exit(1);
+        }
+        VacuousRedGreenStatus::Pending(reason) => {
+            eprintln!(
+                "vacuous_red_green: PENDING ({reason}; vacuous={}, green_on_head={}, \
+                 baseline_passed={}, targeted={}, failed_on_revert={}, ignored_no_reason={:?})",
+                report.vacuous,
+                report.green_on_head,
+                report.baseline_passed,
+                report.targeted_tests.len(),
+                report.failing_tests.len(),
+                report.ignored_without_skip_reason
+            );
+            std::process::exit(1);
+        }
+        VacuousRedGreenStatus::NotRun => {
+            // Detector did not run (operator disabled, missing manifest,
+            // etc.) — surface as 2 (internal/inconclusive) so the calling
+            // shell script can distinguish "no answer" from "definitely
+            // vacuous".
+            eprintln!("vacuous_red_green: NOT_RUN (detector was not executed)");
+            std::process::exit(2);
+        }
     }
 }
 
