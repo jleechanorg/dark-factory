@@ -61,6 +61,16 @@ pub struct RedGreenReport {
     /// `0` plus `vacuous=true` is the signal; `>=1` plus `vacuous=false`
     /// is a genuine red-green test.
     pub failed_on_revert: usize,
+    /// r3 (cursor-agent review of PR #410, fix (a)): True iff at least
+    /// one `failing_tests` entry is a REAL test failure (NOT a synthetic
+    /// `:NEVER_RAN` / `:COMPILE_FAILED_ON_REVERT` marker). When this is
+    /// false but `failed_on_revert > 0`, every failure is a "never
+    /// actually ran" outcome — the gate path maps this to Pending, not
+    /// Verified, so a coder cannot smuggle a never-ran test past the
+    /// gate by relying on the r1 vacuous-only signal.
+    pub genuine_red_on_revert: bool,
+    /// r3 (fix (a)): count of real failures (excludes NEVER_RAN).
+    pub failed_without_never_ran: usize,
     /// P1-1 (a): True when the targeted tests PASS on the head tree (no
     /// revert). Required so a deliberately-broken-on-head test cannot
     /// satisfy the gate via revert-makes-it-pass.
@@ -149,6 +159,11 @@ pub fn check_red_green(
     // Track which ones carry `#[ignore]` (P1-4) — these are EXCLUDED from
     // the coverage proof entirely. The set of HEAD fns minus the set of
     // pre-existing fns at `base_ref` = the added-or-modified set (P1-5).
+    //
+    // r3 fix (b) — modified-fn detection: a fn present in BOTH base and
+    // head is only counted as a coverage proof when its BODY has actually
+    // changed. r1 skipped such fns entirely, letting a coder leave a
+    // pre-existing test fn untouched and still call it coverage.
     let mut targeted: BTreeSet<String> = BTreeSet::new();
     let mut ignored: BTreeSet<String> = BTreeSet::new();
     let mut ignored_no_reason: BTreeSet<String> = BTreeSet::new();
@@ -157,12 +172,20 @@ pub fn check_red_green(
             RedGreenError::Git(format!("read test file {}: {e}", path.display()))
         })?;
         let head_fns = discover_test_fns(&src);
+        let head_bodies = extract_fn_bodies(&src);
         let base_src = read_base_version(repo_root, base_ref, path)?;
-        let base_fns: BTreeSet<String> = discover_test_fns(&base_src).into_iter().collect();
+        let base_bodies = extract_fn_bodies(&base_src);
         let (attr_index, skip_reasons) = build_ignore_index(&src);
         for name in head_fns {
-            if base_fns.contains(&name) {
-                // Pre-existing fn at HEAD: NOT a coverage proof for this PR.
+            let is_in_base = base_bodies.contains_key(&name);
+            let body_changed = match (head_bodies.get(&name), base_bodies.get(&name)) {
+                (Some(h), Some(b)) => h != b,
+                _ => true, // present in head but missing in base → "added"
+            };
+            if is_in_base && !body_changed {
+                // Pre-existing fn at HEAD with IDENTICAL body: NOT a
+                // coverage proof for this PR. The coder didn't change
+                // it; the test isn't measuring anything new.
                 continue;
             }
             // Added or modified: count as coverage proof unless `#[ignore]`.
@@ -237,9 +260,26 @@ pub fn check_red_green(
     let (failed_on_revert, failing_tests) = outcome?;
     let vacuous = failing_tests.is_empty();
 
+    // r3 fix (a): distinguish real test failures from synthetic
+    // `:NEVER_RAN` / `:COMPILE_FAILED_ON_REVERT` markers so the gate
+    // path can return Pending (not Verified) when every observation is
+    // "never actually ran".
+    let real_failures: Vec<String> = failing_tests
+        .iter()
+        .filter(|t| {
+            !t.ends_with(":NEVER_RAN")
+                && t.as_str() != "__COMPILE_FAILED_ON_REVERT__"
+        })
+        .cloned()
+        .collect();
+    let failed_without_never_ran = real_failures.len();
+    let genuine_red_on_revert = failed_without_never_ran > 0;
+
     Ok(RedGreenReport {
         vacuous,
         failed_on_revert,
+        genuine_red_on_revert,
+        failed_without_never_ran,
         green_on_head,
         baseline_passed,
         targeted_tests,
@@ -248,6 +288,67 @@ pub fn check_red_green(
         ignored_without_skip_reason,
         manifest_path_used: manifest_path.to_path_buf(),
     })
+}
+
+/// r3 (cursor-agent fix (a) + (c)): collapse a `RedGreenReport` into the
+/// gate's `VacuousRedGreenStatus`. Mapping:
+///
+/// - `ignored_without_skip_reason` non-empty → `Failed` (caller cannot
+///   silently smuggle a known-broken test into the green bar).
+/// - `vacuous=false && genuine_red_on_revert=true` → `Verified` (real
+///   red-green; gate passes).
+/// - `vacuous=true && genuine_red_on_revert=false` → `Pending` (every
+///   observation is NEVER_RAN / COMPILE-FAILED; transient signal —
+///   wait and re-check, do NOT churn a reroll).
+/// - `vacuous=true && genuine_red_on_revert=true` → `Failed` (at least
+///   one real test failed on revert but something else in the report is
+///   also vacuous — surface as Failed so the operator can investigate).
+/// - `vacuous=true && !green_on_head` → `Failed` (head regression).
+/// - `vacuous=true && !baseline_passed` → `Failed` (base broken).
+/// - everything else (no failing_tests, no ignored-no-reason,
+///   all three checks green) → `Verified`.
+pub fn to_gate_status(report: &RedGreenReport) -> crate::verifier::VacuousRedGreenStatus {
+    use crate::verifier::VacuousRedGreenStatus;
+    // (c) ignored_without_skip_reason is fatal regardless of the other
+    // signals — it means the PR has a known-broken test marked as
+    // `#[ignore]` without an explanatory reason.
+    if !report.ignored_without_skip_reason.is_empty() {
+        return VacuousRedGreenStatus::Failed(format!(
+            "{} test(s) marked #[ignore] without a skip_reason: {:?}",
+            report.ignored_without_skip_reason.len(),
+            report.ignored_without_skip_reason
+        ));
+    }
+    if !report.baseline_passed {
+        return VacuousRedGreenStatus::Failed(
+            "baseline tree failed cargo test (P1-1c)".to_string(),
+        );
+    }
+    if !report.green_on_head {
+        return VacuousRedGreenStatus::Failed(format!(
+            "targeted tests fail on head (P1-1a): {:?}",
+            report.failing_tests
+        ));
+    }
+    if report.vacuous {
+        // vacuous=true AND all checks ran cleanly means: every targeted
+        // test passed on revert too. If genuine_red_on_revert=false,
+        // every "failure" was a synthetic NEVER_RAN — the gate cannot
+        // verify; surface as Pending.
+        if !report.genuine_red_on_revert {
+            return VacuousRedGreenStatus::Pending(format!(
+                "no genuine red on revert: every observation is NEVER_RAN \
+                 or COMPILE_FAILED; failing_tests={:?}",
+                report.failing_tests
+            ));
+        }
+        // vacuous=true with a real failure is unusual (the real failure
+        // is also in failing_tests) — surface as Failed.
+        return VacuousRedGreenStatus::Failed(
+            "vacuous=true but a real failure was observed on revert".to_string(),
+        );
+    }
+    VacuousRedGreenStatus::Verified
 }
 
 /// Read the version of `path` at `base_ref` from the git index. Used to
@@ -271,6 +372,76 @@ fn read_base_version(
     // File didn't exist at base. Return empty source — every HEAD fn is
     // "added" relative to the empty baseline.
     Ok(String::new())
+}
+
+/// Extract `(fn_name → body_text)` pairs from a Rust source. The body is
+/// the contiguous block of braces following the fn signature, dedented to
+/// ignore surrounding whitespace. Used for body-level diff between base
+/// and head (cursor-agent r2 fix (b) — modified-fn detection).
+fn extract_fn_bodies(source: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let lines: Vec<&str> = source.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        let is_test_attr = trimmed.starts_with("#[test]")
+            || trimmed.starts_with("#[tokio::test]")
+            || trimmed.starts_with("#[rstest]");
+        if !is_test_attr {
+            i += 1;
+            continue;
+        }
+        // Walk through attributes and capture the fn signature.
+        let mut j = i;
+        while j < lines.len() && lines[j].trim_start().starts_with("#[") {
+            j += 1;
+        }
+        let sig_line = match lines.get(j) {
+            Some(l) => l,
+            None => break,
+        };
+        let name = match parse_test_fn_name(sig_line.trim_start()) {
+            Some(n) => n,
+            None => {
+                i = j + 1;
+                continue;
+            }
+        };
+        // Find the opening `{` on the sig line OR on subsequent lines.
+        let mut k = j;
+        while k < lines.len() && !lines[k].contains('{') {
+            k += 1;
+        }
+        if k >= lines.len() {
+            i = j + 1;
+            continue;
+        }
+        // Walk brace-balanced to capture the body.
+        let mut depth: i32 = 0;
+        let mut body_lines: Vec<&str> = Vec::new();
+        let mut started = false;
+        let mut idx = k;
+        for line in &lines[k..] {
+            body_lines.push(line);
+            for ch in line.chars() {
+                if ch == '{' {
+                    depth += 1;
+                    started = true;
+                } else if ch == '}' {
+                    depth -= 1;
+                }
+            }
+            if started && depth == 0 {
+                break;
+            }
+            idx += 1;
+        }
+        let _ = idx;
+        let body = body_lines.join("\n");
+        out.insert(name, body);
+        i = j + 1;
+    }
+    out
 }
 
 /// Scan a Rust source file for `#[test] fn <name>(` declarations AND
@@ -327,7 +498,7 @@ fn build_ignore_index(source: &str) -> (BTreeSet<String>, BTreeSet<String>) {
 /// Scan a Rust source file for `#[test] fn <name>(` declarations.
 /// Multi-attribute test fns (e.g. `#[tokio::test]`) are supported by
 /// looking one line above the `fn` for a `#[` line containing `test`.
-fn discover_test_fns(source: &str) -> Vec<String> {
+pub fn discover_test_fns(source: &str) -> Vec<String> {
     let lines: Vec<&str> = source.lines().collect();
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
@@ -350,7 +521,7 @@ fn discover_test_fns(source: &str) -> Vec<String> {
     out
 }
 
-fn parse_test_fn_name(line: &str) -> Option<String> {
+pub fn parse_test_fn_name(line: &str) -> Option<String> {
     let idx = line.find("fn ")?;
     let rest = &line[idx + 3..];
     let after_fn = rest.trim_start();
@@ -585,9 +756,15 @@ fn run_cargo_tests_against_reverted(
             .file_stem()
             .and_then(|s| s.to_str())
             .ok_or_else(|| RedGreenError::Git(format!("bad test file path: {}", tf.display())))?;
+        // r3 (cursor-agent fix (a) regression): drop `--quiet` so the
+        // per-test PASS/FAIL summary line is emitted. With `--quiet`
+        // cargo prints a one-character-per-test progress line (`.`/`F`)
+        // and only the final tally — neither contains `test <name>
+        // ... ok` / `test <name> ... FAILED`, so the r1 parser
+        // mis-classified every green run as NEVER_RAN. Without
+        // `--quiet` the standard summary format is restored.
         let mut args: Vec<String> = vec![
             "test".to_string(),
-            "--quiet".to_string(),
             "--manifest-path".to_string(),
             manifest_path.to_string_lossy().to_string(),
             "--test".to_string(),

@@ -31,6 +31,85 @@ struct LlmExtractorResponse {
     not_addressed: Vec<String>,
 }
 
+/// r3 (cursor-agent review of PR #410 / issue #408 — fix (d)):
+/// deterministic schema-line parser for the structured NOT-ADDRESSED
+/// output the reviewer CLI / skeptic is now contractually required to
+/// emit. The exact line shape is:
+///
+/// ```text
+/// NOT-ADDRESSED: ["item 1", "item 2", "item 3"]
+/// ```
+///
+/// (single space after the colon, JSON-style array of strings, one per
+/// unresolved reviewer item). The parser is regex-free; it locates the
+/// marker on its own line, balances brackets, splits on `","` while
+/// respecting `\"` escapes inside each string, and strips the surrounding
+/// `"` quotes. Returns `None` when the marker is absent so callers fall
+/// back to the legacy LLM-JSON path (kept for backward compat with
+/// older reviewer LLMs that predate this contract).
+///
+/// Why a schema line instead of LLM JSON: the operator's r2 review
+/// noted that r1's `LlmExtractorResponse.not_addressed` field put the
+/// hot path through a model whose JSON output drifts across vendors.
+/// A reviewer is already emitting a verdict line (`verdict: pass|warn|
+/// fail`) and a structured schema line at the bottom of its reply; the
+/// NOT-ADDRESSED list belongs next to those, not nested inside another
+/// JSON object that the extractor has to guess at.
+pub fn parse_not_addressed_schema_line(text: &str) -> Option<Vec<String>> {
+    let line = text.lines().find(|l| {
+        let t = l.trim_start();
+        t.starts_with("NOT-ADDRESSED:")
+    })?;
+    let after = line
+        .trim_start()
+        .trim_start_matches("NOT-ADDRESSED:")
+        .trim_start();
+    // Strip a leading `[` and trailing `]`.
+    let inner = after.trim();
+    let inner = inner.strip_prefix('[').unwrap_or(inner);
+    let inner = inner.strip_suffix(']').unwrap_or(inner);
+    // Walk char-by-char; split on commas that appear OUTSIDE `"..."` and
+    // outside `\"` escapes.
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut in_str = false;
+    let mut escape = false;
+    for ch in inner.chars() {
+        if escape {
+            buf.push(ch);
+            escape = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_str => {
+                buf.push(ch);
+                escape = true;
+            }
+            '"' => {
+                in_str = !in_str;
+                // do not include the quote in the parsed string
+            }
+            ',' if !in_str => {
+                let trimmed = buf.trim().trim_matches('"').to_string();
+                if !trimmed.is_empty() {
+                    out.push(trimmed);
+                }
+                buf.clear();
+            }
+            _ => buf.push(ch),
+        }
+    }
+    let trimmed = buf.trim().trim_matches('"').to_string();
+    if !trimmed.is_empty() {
+        out.push(trimmed);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// Screens the reviewer feedback text for holdout test internals or subpaths and redacts them.
 pub fn redact_holdouts(text: &str) -> (String, bool) {
     let mut result = String::new();
@@ -86,6 +165,22 @@ pub fn redact_holdouts(text: &str) -> (String, bool) {
 pub fn extract(llm: &dyn Llm, review_text: &str) -> Result<Extracted, DaemonError> {
     let (redacted_text, programmatic_encountered) = redact_holdouts(review_text);
 
+    // r3 (cursor-agent review of PR #410 / issue #408 — fix (d)):
+    // structured NOT-ADDRESSED takes precedence over the LLM JSON
+    // `notAddressed` field. The deterministic schema line is the
+    // primary source; the legacy LLM JSON is a fallback for older
+    // reviewer LLMs that predate this contract (serde defaults the
+    // field to `[]` when absent). Telemetry emits a structured
+    // CONSTRAINT_NOT_ADDRESSED_EXTRACTED event so operators can audit
+    // the per-bead propagation chain (reviewer → extractor → reroll
+    // spec block → next-round red dispatch).
+    let schema_line_items = parse_not_addressed_schema_line(review_text);
+    if let Some(ref items) = schema_line_items {
+        if !items.is_empty() {
+            let _ = log_not_addressed_telemetry(items);
+        }
+    }
+
     let prompt = format!(
         "You are the Constraint Extractor for an autonomous coding factory.\n         Analyze the following rejection review feedback:\n\n         \"\"\"\n         {}\n         \"\"\"\n\n         Extract any positive assertions (what the code MUST do) and inhibition specs (what the code MUST NOT do, which get priority).\n         Also, identify any reviewer items the coder's previous attempt did NOT address (the reviewer asked for these but the coder's PR did not implement them) — these flow into the next attempt's hard constraints.\n         Also, verify if there are any holdout test internals or leaked holdout details in the feedback. If so, set securityRedactionEncountered to true.\n         Respond with exactly one JSON object as the last thing in your reply, in this format:\n         {{\n           \"inhibitionSpecs\": [\"...\"],\n           \"positiveAssertions\": [\"...\"],\n           \"notAddressed\": [\"...\"],\n           \"securityRedactionEncountered\": true|false\n         }}",
         redacted_text
@@ -117,12 +212,37 @@ pub fn extract(llm: &dyn Llm, review_text: &str) -> Result<Extracted, DaemonErro
         positive_assertions: parsed.positive_assertions,
         security_redaction_encountered: parsed.security_redaction_encountered
             || programmatic_encountered,
-        // P1-7: reviewer items the coder's previous attempt did not
-        // address. Empty when the LLM does not surface any — backward
-        // compatible with older reviewer LLMs that do not parse
-        // `notAddressed` (serde defaults the field to `[]` when absent).
-        not_addressed: parsed.not_addressed,
+        // r3 (fix d): the deterministic schema line takes precedence
+        // over the LLM JSON `notAddressed` field. Schema line is parsed
+        // at function entry from `review_text`; if absent we fall back
+        // to whatever the LLM surfaced (back-compat for older reviewer
+        // LLMs that predate the contract — serde defaults the field to
+        // `[]` when absent).
+        not_addressed: schema_line_items.unwrap_or(parsed.not_addressed),
     })
+}
+
+/// r3 (fix d): append a CONSTRAINT_NOT_ADDRESSED_EXTRACTED telemetry
+/// line so operators can audit the propagation chain. The helper is a
+/// best-effort append (the telemetry directory may not exist; missing
+/// permissions are not a daemon-stopper). The exact line shape mirrors
+/// the rest of the daemon's emit() calls but is local to constraints.rs
+/// because the daemon-wide emit() takes a `TickDeps` we do not have
+/// here.
+fn log_not_addressed_telemetry(items: &[String]) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    let path = std::env::var("CONSTRAINTS_TELEMETRY_LOG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/constraints_not_addressed.jsonl"));
+    let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+    let line = serde_json::json!({
+        "event": "CONSTRAINT_NOT_ADDRESSED_EXTRACTED",
+        "count": items.len(),
+        "items": items,
+    });
+    writeln!(f, "{line}")?;
+    Ok(())
 }
 
 /// Appends the extracted constraints block append-only to the bead's spec file.

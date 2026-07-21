@@ -1966,21 +1966,44 @@ fn run_vacuous_red_green_check(
         &changed,
     ) {
         Ok(report) => {
-            if report.vacuous || !report.green_on_head || !report.baseline_passed {
-                let reason = if !report.baseline_passed {
-                    "baseline tree failed cargo test".to_string()
-                } else if !report.green_on_head {
-                    format!(
-                        "targeted tests fail on head ({:?})",
-                        report.failing_tests
-                    )
-                } else {
-                    "every targeted test passes on the reverted tree (vacuous)".to_string()
-                };
+            // r3 (cursor-agent fix (a) + (c)): fold the report through
+            // the deterministic `to_gate_status` helper instead of the
+            // r1 inline boolean check. The helper distinguishes Pending
+            // (every observation is NEVER_RAN / COMPILE_FAILED, so the
+            // gate cannot verify) from Failed (real defect) from
+            // Verified (genuine red-green). It also flags
+            // `ignored_without_skip_reason` as a hard Red.
+            let status = crate::vacuous_red_green::to_gate_status(&report);
+            match &status {
                 verifier::VacuousRedGreenStatus::Failed(reason)
-            } else {
+                | verifier::VacuousRedGreenStatus::Pending(reason) => {
+                    let kind = if matches!(
+                        status,
+                        verifier::VacuousRedGreenStatus::Failed(_)
+                    ) {
+                        "VACUOUS_RED_GREEN_FAILED"
+                    } else {
+                        "VACUOUS_RED_GREEN_PENDING"
+                    };
+                    let _ = emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        0,
+                        "Attested",
+                        kind,
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": reason,
+                            "repo": repo,
+                            "report": serde_json::to_value(&report)
+                                .unwrap_or(serde_json::json!({})),
+                        }),
+                    );
+                }
                 verifier::VacuousRedGreenStatus::Verified
+                | verifier::VacuousRedGreenStatus::NotRun => {}
             }
+            status
         }
         Err(crate::vacuous_red_green::RedGreenError::NoChangedTests) => {
             // PR has no test files — vacuous detection is N/A for this
