@@ -17,8 +17,8 @@ class TestDispatcher(unittest.TestCase):
         self.assertTrue(dispatcher.rule_matches(rule, ["src/main.py", "README.md"]))
         self.assertFalse(dispatcher.rule_matches(rule, ["src/main.rs", "README.md"]))
 
-    @patch("runner.dispatcher.invoke_reviewer")
-    @patch("runner.dispatcher.evaluate")
+    @patch("runner.skeptic_gate_cli.invoke_reviewer")
+    @patch("runner.skeptic_gate_cli.evaluate")
     def test_dispatch(self, mock_evaluate, mock_invoke):
         mock_invoke.return_value = ("stdout_content", None)
         mock_evaluate.return_value = MagicMock(check_state="success")

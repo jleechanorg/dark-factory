@@ -23,6 +23,10 @@ These tests prove:
 from __future__ import annotations
 
 import json
+<<<<<<< HEAD
+=======
+import os
+>>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
 import sys
 from typing import List, Optional, Tuple
 
@@ -332,10 +336,22 @@ def _valid_pass_output(identity: str = "codex", *, with_contract_echo: bool = Tr
         f"HEAD_COMMIT_VERIFIED: {head}\n"
     )
     if with_contract_echo:
+<<<<<<< HEAD
         base += (
             f"CONTRACT_ECHO:\n"
             f"ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
             f"ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
+=======
+        # r10 (issue #386): prior_findings are now enforced end-to-end,
+        # so the fixture output must also emit PRIOR_FINDING: lines for
+        # the contract's prior finding (r5 reviewer in the CLI
+        # fixture).
+        base += (
+            "CONTRACT_ECHO:\n"
+            "ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
+            "ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
+            "PRIOR_FINDING: r5 reviewer VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
+>>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
         )
     return base
 
@@ -351,4 +367,105 @@ def _output_for_reviewer_no_contract(reviewer_name: str) -> str:
     """For the legacy no-contract path: the reviewer MUST NOT emit a
     CONTRACT_ECHO block (the strict 10-field parser rejects it as
     an 11th field)."""
+<<<<<<< HEAD
     return _output_for_reviewer(reviewer_name, with_contract_echo=False)
+=======
+    return _output_for_reviewer(reviewer_name, with_contract_echo=False)
+
+
+# ---------------------------------------------------------------------------
+# r10 regression tests (CodeRabbit feedback on PR #418)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_fails_closed_on_unreadable_contract_file(monkeypatch, tmp_path):
+    """An existing but unreadable contract file (chmod 000) must take
+    the fail-closed exit-2 path. Previously the `except` only caught
+    FileNotFoundError + JSON/validation errors, so a PermissionError
+    leaked through and the gate silently fell back to the legacy
+    10-field contract (issue #386 r10 CodeRabbit gap 1)."""
+    unreadable = tmp_path / "unreadable-contract.json"
+    unreadable.write_text(json.dumps(_sample_contract_dict()))
+    unreadable.chmod(0o000)
+    # Root always has read access on POSIX (CAP_DAC_OVERRIDE), so
+    # skip this assertion when running as root.
+    if os.access(str(unreadable), os.R_OK):
+        unreadable.chmod(0o000)
+        # Some root environments ignore 0o000 on tmpfs; fall back to
+        # chmod 0o000 on a directory path so the test still documents
+        # the contract — but skip the assertion rather than fabricate
+        # an OK signal.
+        if os.access(str(unreadable), os.R_OK):
+            pytest.skip("root can read 0o000 files; cannot simulate PermissionError")
+    captured = _patch_cli_dependencies(
+        monkeypatch,
+        contract_path=str(unreadable),
+        review_output_for=_output_for_reviewer,
+    )
+    rc = cli_mod.main([
+        "--repo", REPO,
+        "--pr-number", str(PR_NUMBER),
+        "--contract-file", str(unreadable),
+        "--dry-run",
+        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-2.5-pro"]]',
+    ])
+    assert rc == 2
+    # No reviewer invocation must have happened.
+    assert captured["build_prompt_calls"] == []
+    assert captured["evaluate_calls"] == []
+
+
+def test_cli_fails_closed_when_reviewer_omits_prior_finding(monkeypatch, tmp_path):
+    """When the contract has prior_findings but the reviewer's
+    CONTRACT_ECHO block omits the PRIOR_FINDING: lines, the gate must
+    fail closed (issue #386 r10 CodeRabbit gap 2). The reviewer cannot
+    return PASS while silently skipping the bead author's prior findings
+    — they MUST address every one (or N-A with a reason)."""
+    contract_json = tmp_path / "contract.json"
+    contract_json.write_text(json.dumps(_sample_contract_dict()))
+    captured = _patch_cli_dependencies(
+        monkeypatch,
+        contract_path=str(contract_json),
+        # Reviewer output: addresses acceptance items but OMITS the
+        # PRIOR_FINDING: line for the contract's prior finding
+        # ("r5 reviewer"). The gate must fail closed on this.
+        review_output=_output_for_reviewer_omitting_prior_findings,
+    )
+    rc = cli_mod.main([
+        "--repo", REPO,
+        "--pr-number", str(PR_NUMBER),
+        "--contract-file", str(contract_json),
+        "--dry-run",
+        "--reviewers-json", '[["codex", ""], ["gemini", "gemini-2.5-pro"]]',
+    ])
+    # rc != 0 (gate red) — the prior finding was omitted and the
+    # evaluator marked it unaddressed.
+    assert rc != 0
+    # The evaluator was invoked at least once (so the contract-echo
+    # path ran).
+    assert captured["evaluate_calls"], "evaluate() was never called"
+
+
+def _output_for_reviewer_omitting_prior_findings(reviewer_name: str) -> str:
+    """A reviewer output that addresses acceptance items but OMITS the
+    PRIOR_FINDING: lines. The contract-echo gate must fail closed on
+    this (issue #386 r10 CodeRabbit gap 2)."""
+    identity = "gemini" if reviewer_name == "gemini" else "codex"
+    head = HEAD_SHA
+    return (
+        f"VERDICT: PASS\n"
+        f"HEAD_SHA: {head}\n"
+        f"REPO: {REPO}\n"
+        f"PR_NUMBER: {PR_NUMBER}\n"
+        f"REASON: ok\n"
+        f"IDENTITY: {identity}\n"
+        f"TEST_RUN_EVIDENCE: passed=10 failed=0 skipped=0 exit=0\n"
+        f"LINT_RUN_EVIDENCE: tool=ruff errors=0 warnings=0\n"
+        f"GREP_CITES: runner/skeptic_gate.py:1\n"
+        f"HEAD_COMMIT_VERIFIED: {head}\n"
+        "CONTRACT_ECHO:\n"
+        "ITEM: A1 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:1\n"
+        "ITEM: A2 VERDICT: ADDRESSED CITE: runner/skeptic_gate.py:2\n"
+        # NOTE: no PRIOR_FINDING: line — must fail closed.
+    )
+>>>>>>> f3009e2 (claude/antig: feat(skeptic): contract-echo in daemon skeptic_evidence + bead-id CLI plumbing (#386))
