@@ -40,7 +40,6 @@ jobs:
             4. Bugbot clean (zero error-severity)
             5. Inline comments resolved
             6. /er Evidence review PASS (this gate's parent trigger)
-            7. Skeptic PASS
           The /er command on the PR fetches the evidence-review-bot verdict.
           EOF
 
