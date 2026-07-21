@@ -3029,6 +3029,22 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             // this key the guard's match path is permanently dormant no
             // matter how correct the `gates` shape is.
             obj.insert("pr_number".to_string(), serde_json::json!(pr));
+            // jleechan-328 P1 #1 (exact-head binding): record the PR's
+            // current head SHA in the assessment context so the shell
+            // merge-guard can refuse to honour a stale assessment from an
+            // OLDER head. Without this field the timer-driven merge path
+            // would reuse an all-green assessment made before a push.
+            obj.insert("head_sha".to_string(), serde_json::json!(snapshot.head_sha));
+            // jleechan-328 P1 #3 (operator disposition round-trip): single
+            // canonical field emitted from `overlay.park_reason` so the
+            // shell override reads the SAME key the daemon emits. Missing
+            // → guard falls through to the standard no-red path. The
+            // disposition vocabulary is owned here (`overlay.park_reason`)
+            // — never duplicate the field elsewhere.
+            obj.insert(
+                "operator_disposition".to_string(),
+                serde_json::json!(overlay.park_reason.clone().unwrap_or_default()),
+            );
         }
         emit(
             deps.telemetry_log,
