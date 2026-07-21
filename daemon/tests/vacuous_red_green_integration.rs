@@ -234,7 +234,9 @@ fn genuine_red_green_passes_check() {
     let _ = commit_current_tree(&proj, "feat: real test");
     let changed = classify_changed_files(&proj);
 
-    let report = check_red_green(&proj.root, &proj.base_sha, &changed).expect("report");
+    let manifest_path = proj.root.join("Cargo.toml");
+    let report = check_red_green(&proj.root, &manifest_path, &proj.base_sha, &changed)
+        .expect("report");
     assert!(
         !report.vacuous,
         "expected genuine red-green test to NOT be flagged vacuous; report={report:?}"
@@ -251,7 +253,9 @@ fn vacuous_test_is_flagged() {
     let _ = commit_current_tree(&proj, "feat: vacuous test");
     let changed = classify_changed_files(&proj);
 
-    let report = check_red_green(&proj.root, &proj.base_sha, &changed).expect("report");
+    let manifest_path = proj.root.join("Cargo.toml");
+    let report = check_red_green(&proj.root, &manifest_path, &proj.base_sha, &changed)
+        .expect("report");
     assert!(
         report.vacuous,
         "expected vacuous test to be flagged; report={report:?}"
@@ -268,7 +272,8 @@ fn errors_propagate_for_unrunnable_cargo() {
     // — the detector cannot prove anything about a PR with no tests.
     let proj = build_mini_project(ProjectKind::GenuineRedGreen);
     let empty: Vec<(PathBuf, FileClass)> = vec![];
-    let err = check_red_green(&proj.root, &proj.base_sha, &empty).unwrap_err();
+    let manifest_path = proj.root.join("Cargo.toml");
+    let err = check_red_green(&proj.root, &manifest_path, &proj.base_sha, &empty).unwrap_err();
     assert!(matches!(err, RedGreenError::NoChangedTests), "got {err:?}");
 }
 
@@ -283,7 +288,9 @@ fn target_test_names_are_only_changed_tests() {
     let _ = commit_current_tree(&proj, "feat: real test");
     let changed = classify_changed_files(&proj);
 
-    let report = check_red_green(&proj.root, &proj.base_sha, &changed).expect("report");
+    let manifest_path = proj.root.join("Cargo.toml");
+    let report = check_red_green(&proj.root, &manifest_path, &proj.base_sha, &changed)
+        .expect("report");
     let names: Vec<&str> = report.targeted_tests.iter().map(|s| s.as_str()).collect();
     assert!(
         names.iter().all(|n| ["classify_high", "classify_medium", "classify_low"].contains(n)),

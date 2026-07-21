@@ -640,13 +640,22 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     for spec in &extracted.positive_assertions {
         positive_lines.push_str(&format!("    \"{}\",\n", spec.replace('"', "\\\"")));
     }
+    // Issue #408 / bead jleechan-1a5e r3 (P1-7): NOT-ADDRESSED items flow
+    // into the spec block as a distinct constraint list so the next-round
+    // coder prompt is briefed on the unresolved gaps. Empty list is fine
+    // (the block always carries the field for parser stability).
+    let mut not_addressed_lines = String::new();
+    for spec in &extracted.not_addressed {
+        not_addressed_lines.push_str(&format!("    \"{}\",\n", spec.replace('"', "\\\"")));
+    }
 
     let block = format!(
-        "\n[[reroll]]\n         reviewer = \"{}\"\n         attempt = {}\n         inhibition_specs = [\n         {}         ]\n         positive_assertions = [\n         {}         ]\n         raw_feedback = \"\"\"\n         {}\n         \"\"\"\n",
+        "\n[[reroll]]\n         reviewer = \"{}\"\n         attempt = {}\n         inhibition_specs = [\n         {}         ]\n         positive_assertions = [\n         {}         ]\n         not_addressed = [\n         {}         ]\n         raw_feedback = \"\"\"\n         {}\n         \"\"\"\n",
         deps.reviewer,
         superseded_attempt,
         inhibition_lines,
         positive_lines,
+        not_addressed_lines,
         deps.review_text
     );
 

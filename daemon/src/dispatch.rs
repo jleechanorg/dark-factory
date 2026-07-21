@@ -465,7 +465,28 @@ pub fn dispatch_ready(
             // interim mitigation before this bead's `[repos]` plumbing
             // existed) plus the exact `routing.push_remote`, closing the
             // gap #247's doc comment explicitly deferred to this bead.
-            _ => build_coder_prompt(bead, &branch, &repo, &routing.push_remote),
+            //
+            // jleechan-1a5e r3: when the bead's spec.toml carries a prior
+            // `[[reroll]]` block (i.e. this is NOT the first attempt),
+            // the previous reviewer's structured NOT-ADDRESSED items
+            // MUST flow into the next-round coder prompt as
+            // authoritative constraints. Without this, structured
+            // NOT-ADDRESSED is dead text. The lookup is best-effort:
+            // malformed or absent spec files produce an empty block and
+            // the prompt is byte-identical to the pre-r3 renderer.
+            _ => {
+                let prior_block = render_prior_constraints_for_dispatch(
+                    &cfg.spec_dir,
+                    &bead.id,
+                );
+                build_coder_prompt_with_prior(
+                    bead,
+                    &branch,
+                    &repo,
+                    &routing.push_remote,
+                    &prior_block,
+                )
+            }
         };
 
         let spec = SpawnSpec {
@@ -894,15 +915,30 @@ fn truncate_at_char_boundary(s: &mut String, cap: usize) {
 /// dominates the description (it's the operator's per-attempt override of
 /// the bead body), and the repo-map tree drops first when the AO 4,096-char
 /// ceiling forces a cut.
+/// jleechan-1a5e r3: per-section content passed to `render_coder_prompt`.
+/// Bundled into a struct so clippy's too-many-arguments lint does not
+/// regress when adding future sections.
+struct CoderPromptSections<'a> {
+    description: &'a str,
+    notes: &'a str,
+    tree: &'a str,
+    prior_block: &'a str,
+}
+
 fn render_coder_prompt(
     bead: &crate::tools::Bead,
     branch: &str,
     target_repo: &str,
     remote: &str,
-    description: &str,
-    notes: &str,
-    tree: &str,
+    sections: CoderPromptSections<'_>,
 ) -> String {
+    let CoderPromptSections {
+        description,
+        notes,
+        tree,
+        prior_block,
+    } = sections;
+    let prior_block_owned = prior_block.to_string();
     let description_block = if description.is_empty() {
         String::new()
     } else {
@@ -951,7 +987,7 @@ fn render_coder_prompt(
         "You are an autonomous factory coder working bead {id}.\n\
          \n\
          TASK: {title}\n\
-         {description_block}{notes_block}{external_block}\
+         {description_block}{notes_block}{external_block}{prior_block_owned}\
          \n\
          REPO: {target_repo} — all commits, pushes, and the PR belong to this \
          repo and no other.\n\
@@ -1006,7 +1042,28 @@ fn shrink_by(text: &mut String, excess: usize, marker: &str) {
     }
 }
 
-fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str, remote: &str) -> String {
+/// jleechan-1a5e r3: public entry point so the regression test in
+/// `tests/r3_next_round_dispatch_integration.rs` can assert the
+/// first-attempt prompt is byte-identical to the prior-block variant.
+/// Equivalent to `build_coder_prompt_with_prior_pub` with an empty
+/// `prior_block`.
+pub fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str, remote: &str) -> String {
+    build_coder_prompt_with_prior(bead, branch, target_repo, remote, "")
+}
+
+/// jleechan-1a5e r3: when a bead has a prior failed attempt, its
+/// spec.toml carries the previous reviewer's NOT-ADDRESSED items in a
+/// `[[reroll]]` block. The next-round coder MUST see those items as
+/// authoritative constraints (otherwise structured NOT-ADDRESSED is dead
+/// text — the operator flagged this as the r2 P1-4 regression gap). The
+/// caller passes the rendered block (or `""` for first-attempt beads).
+fn build_coder_prompt_with_prior(
+    bead: &crate::tools::Bead,
+    branch: &str,
+    target_repo: &str,
+    remote: &str,
+    prior_block: &str,
+) -> String {
     let mut description = bead.description.trim().to_string();
     if description.len() > CODER_PROMPT_DESCRIPTION_CAP {
         truncate_at_char_boundary(&mut description, CODER_PROMPT_DESCRIPTION_CAP);
@@ -1025,7 +1082,18 @@ fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str
         tree.push_str("\n[tree truncated]");
     }
 
-    let mut prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+    let mut prompt = render_coder_prompt(
+        bead,
+        branch,
+        target_repo,
+        remote,
+        CoderPromptSections {
+            description: &description,
+            notes: &notes,
+            tree: &tree,
+            prior_block,
+        },
+    );
 
     // jleechan-niqz: the per-section caps above bound `description`, `notes`,
     // and `tree` independently but never reconciled their SUM (plus the fixed
@@ -1044,22 +1112,90 @@ fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str
     if prompt.len() > CODER_PROMPT_TOTAL_CAP && !tree.is_empty() {
         let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
         shrink_by(&mut tree, excess, "\n[tree truncated]");
-        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+        prompt = render_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            CoderPromptSections {
+                description: &description,
+                notes: &notes,
+                tree: &tree,
+                prior_block,
+            },
+        );
     }
 
     if prompt.len() > CODER_PROMPT_TOTAL_CAP && !description.is_empty() {
         let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
         shrink_by(&mut description, excess, "\n[description truncated]");
-        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+        prompt = render_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            CoderPromptSections {
+                description: &description,
+                notes: &notes,
+                tree: &tree,
+                prior_block,
+            },
+        );
     }
 
     if prompt.len() > CODER_PROMPT_TOTAL_CAP && !notes.is_empty() {
         let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
         shrink_by(&mut notes, excess, "\n[notes truncated]");
-        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+        prompt = render_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            CoderPromptSections {
+                description: &description,
+                notes: &notes,
+                tree: &tree,
+                prior_block,
+            },
+        );
     }
 
     prompt
+}
+
+/// jleechan-1a5e r3: public re-export of `build_coder_prompt_with_prior`
+/// so the regression test in `tests/vacuous_red_green_r2_integration.rs`
+/// can exercise the exact same code path the dispatch pipeline uses.
+/// Used by `render_prior_constraints_for_dispatch` callers in production
+/// (passed an empty string for first-attempt beads).
+pub fn build_coder_prompt_with_prior_pub(
+    bead: &crate::tools::Bead,
+    branch: &str,
+    target_repo: &str,
+    remote: &str,
+    prior_block: &str,
+) -> String {
+    build_coder_prompt_with_prior(bead, branch, target_repo, remote, prior_block)
+}
+
+/// jleechan-1a5e r3: read the bead's spec.toml and render the prior
+/// `[[reroll]]` block (if any) as the next-round coder prompt's
+/// PREVIOUS ATTEMPT CONSTRAINTS section. Returns the empty string when:
+///   * the spec file does not exist (first-attempt bead)
+///   * the spec file is malformed (we silently treat as no prior attempt
+///     so dispatch keeps working)
+///   * no `[[reroll]]` block is present
+///
+/// Pure TOML read — NO LLM call. The structured `not_addressed_structured`
+/// array drives the rendered block; the flat `not_addressed` list is
+/// shown as a fallback when structured entries are absent.
+fn render_prior_constraints_for_dispatch(spec_dir: &str, bead_id: &str) -> String {
+    use crate::constraints;
+    let spec_path = std::path::Path::new(spec_dir).join(format!("{bead_id}.toml"));
+    match constraints::parse_latest_reroll_block(&spec_path) {
+        Some(prior) if prior.attempt > 0 => constraints::format_prior_constraints_block(&prior),
+        _ => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -1508,6 +1644,8 @@ mod tests {
             held_recheck_cooldown_secs: 900,
             repos: std::collections::HashMap::new(),
             pre_gate_validation_enabled: false,
+            vacuous_test_detection_enabled: false,
+            vacuous_test_manifest_path: "".to_string(),
         }
     }
 

@@ -423,6 +423,40 @@ pub struct PrEvidence {
     /// (the default) means no evidence marker was in the body, so the existing
     /// LOC-floor logic applies unchanged.
     pub evidence_gist_status: EvidenceGistStatus,
+    /// Issue #408 / bead jleechan-1a5e r3: result of running the runtime
+    /// vacuous-test detector (`daemon::vacuous_red_green::check_red_green`)
+    /// against the PR's head tree. Computed in `tick.rs` (which has the
+    /// SCM/VCS adapters); `vacuous_red_green_gate` consults it. Default
+    /// `NotRun` keeps the existing pre-#408 behavior (no vacuous-test
+    /// detector on the gate path) until the operator opts in by setting
+    /// `Config::vacuous_test_detection_enabled = true`.
+    pub vacuous_red_green_status: VacuousRedGreenStatus,
+}
+
+/// Issue #408 / bead jleechan-1a5e r3: fail-closed result for the runtime
+/// vacuous-test detector. Wired into `evidence_floor_gate` so a vacuous
+/// result turns the EvidenceFloor gate Red without expanding the 7-gate
+/// vocabulary. The shape mirrors `EvidenceGistStatus` for uniformity.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum VacuousRedGreenStatus {
+    /// Detector not run yet — the gate is wired but `tick.rs` has not
+    /// executed the check this tick (e.g. operator disabled it, or the
+    /// PR has no test files). Pre-#408 default.
+    #[default]
+    NotRun,
+    /// Detector ran and all three checks (green_on_head, failed_on_revert,
+    /// baseline_passed) returned a non-vacuous result with at least one
+    /// failing test on revert. The gate is green.
+    Verified,
+    /// Detector ran and reported vacuity (no failing tests on revert,
+    /// OR green_on_head/baseline_passed failed). Fail-closed -> Red,
+    /// the string is the operator-facing reason.
+    Failed(String),
+    /// Detector could not run due to a TRANSIENT error (git/Cargo outage,
+    /// missing manifest path on disk, etc.). r3: this is Unknown (wait
+    /// and re-check), NOT a Red — a transient blip must not churn a
+    /// reroll. The string is the transient reason.
+    Pending(String),
 }
 
 /// Bead jleechan-yoqy / issue #323: fail-closed verification result for the
@@ -454,6 +488,16 @@ pub enum EvidenceGistStatus {
 /// an explicit `/er` `Fail` is `Red`, naming the failed gate. Both must clear
 /// before the LOC floor is even consulted, since a passing LOC floor never
 /// substitutes for a missing/failing `/er` run.
+///
+/// Issue #408 / bead jleechan-1a5e r3: the runtime vacuous-test detector's
+/// verdict is wired INTO this gate (rather than minted as a separate
+/// `vacuous_red_green` gate that would change the 7-gate vocabulary
+/// `auto-merge-guard.sh` / `factory-overlay.sh` / the gate-contract test
+/// depend on). A vacuous-red-green failure makes EvidenceFloor Red with
+/// the reason from `VacuousRedGreenStatus::Failed`. Transient
+/// (`Pending`) and `NotRun` (pre-#408 default or operator-disabled)
+/// states are tolerated as Unknown so a transient detector blip does
+/// not churn a reroll.
 fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
     if evidence.is_production {
         match evidence.er_verdict {
@@ -508,14 +552,44 @@ fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
     // diff needs no evidence gist; at/above it, only a VERIFIED canonical
     // marker (handled above) greens the gate — otherwise it is Red.
     if evidence.non_test_changed_loc <= EVIDENCE_FLOOR_LOC {
-        GateResult::Green
-    } else {
-        GateResult::Red(
-            "evidence floor: a verified canonical **Evidence** gist is required for diffs \
-             above the non-test LOC floor"
-                .to_string(),
-        )
+        // P1-6 / P1-1 wiring: even on a small diff that passes the LOC
+        // floor, the runtime vacuous-test detector's verdict still
+        // applies. A vacuous result fails the gate so a coder cannot
+        // smuggle a vacuous test in on a tiny change either.
+        return match &evidence.vacuous_red_green_status {
+            VacuousRedGreenStatus::Verified => GateResult::Green,
+            VacuousRedGreenStatus::Failed(reason) => {
+                GateResult::Red(format!("vacuous red-green: {reason}"))
+            }
+            VacuousRedGreenStatus::Pending(reason) => {
+                GateResult::Unknown(format!("vacuous red-green pending: {reason}"))
+            }
+            VacuousRedGreenStatus::NotRun => GateResult::Green,
+        };
     }
+
+    // Large diff: the LOC floor already demands a verified canonical
+    // marker above. Apply the vacuous-red-green verdict as an additional
+    // check on top — a vacuous test never satisfies the gate regardless
+    // of LOC floor status. The original "evidence floor: a verified
+    // canonical **Evidence** gist is required" Red is preserved for
+    // large diffs without a verified marker.
+    match &evidence.vacuous_red_green_status {
+        VacuousRedGreenStatus::Verified => {}
+        VacuousRedGreenStatus::Failed(reason) => {
+            return GateResult::Red(format!("vacuous red-green: {reason}"));
+        }
+        VacuousRedGreenStatus::Pending(reason) => {
+            return GateResult::Unknown(format!("vacuous red-green pending: {reason}"));
+        }
+        VacuousRedGreenStatus::NotRun => {}
+    }
+
+    GateResult::Red(
+        "evidence floor: a verified canonical **Evidence** gist is required for diffs \
+         above the non-test LOC floor"
+            .to_string(),
+    )
 }
 
 /// Bead jleechan-yoqy / issue #323: a parsed canonical evidence reference from
@@ -2633,6 +2707,82 @@ mod tests {
         assert!(
             !compute_review_degraded(&v),
             "agy + gemini are distinct Google families and must NOT be degraded"
+        );
+    }
+
+    // ---- Issue #408 / bead jleechan-1a5e r3 (P1-2 / P1-6) gate wiring ----
+
+    #[test]
+    fn vacuous_red_green_failed_turns_evidence_floor_red() {
+        // P1-2 / P1-6 wiring: a vacuous-test verdict MUST turn the gate
+        // Red even on a small diff so a coder cannot smuggle a vacuous
+        // test in on a tiny change.
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            vacuous_red_green_status: VacuousRedGreenStatus::Failed(
+                "every targeted test passes on the reverted tree (vacuous)".to_string(),
+            ),
+            ..Default::default()
+        };
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+        match gate(&report, GateName::EvidenceFloor) {
+            GateResult::Red(reason) => assert!(
+                reason.contains("vacuous red-green"),
+                "Red reason must name the vacuous check; got {reason}"
+            ),
+            other => panic!("expected Red(vacuous red-green); got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vacuous_red_green_verified_keeps_evidence_floor_green_for_small_diff() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            vacuous_red_green_status: VacuousRedGreenStatus::Verified,
+            ..Default::default()
+        };
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+        assert!(gate(&report, GateName::EvidenceFloor).is_green());
+    }
+
+    #[test]
+    fn vacuous_red_green_pending_is_unknown_not_red() {
+        // A transient detector outage (Pending) MUST NOT churn a reroll —
+        // it surfaces as Unknown so the next tick retries.
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            vacuous_red_green_status: VacuousRedGreenStatus::Pending(
+                "manifest path daemon/Cargo.toml not present on the daemon filesystem"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+        assert!(
+            matches!(
+                gate(&report, GateName::EvidenceFloor),
+                GateResult::Unknown(_)
+            ),
+            "Pending status MUST be Unknown (do not churn a reroll); got {:?}",
+            gate(&report, GateName::EvidenceFloor)
         );
     }
 }

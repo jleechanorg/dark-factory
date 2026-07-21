@@ -35,6 +35,8 @@ fn test_cfg() -> Config {
         held_recheck_cooldown_secs: 900,
         repos: std::collections::HashMap::new(),
         pre_gate_validation_enabled: false,
+            vacuous_test_detection_enabled: false,
+            vacuous_test_manifest_path: "".to_string(),
     }
 }
 
@@ -2530,4 +2532,133 @@ fn test_reroll_close_pr_already_merged_is_tolerated_as_successful_supersede() {
 
     std::fs::remove_dir_all(spec_dir).ok();
     let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// ---------------------------------------------------------------------------
+// r3 (cursor-agent review of PR #410 / issue #408 — fix (d)):
+// regression that asserts next-round red dispatch CONSUMES the
+// structured NOT-ADDRESSED schema line items as hard constraints in
+// the appended spec block. The deterministic schema line is now the
+// primary NOT-ADDRESSED source; the LLM-JSON fallback is NOT what we
+// are exercising here. The spec block must carry the items so the
+// next-round coder prompt is briefed on the unresolved gaps.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_reroll_consumes_structured_not_addressed_schema_line() {
+    let scm = FakeScm::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = true;
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("main".into(), "base-sha-123".into());
+    vcs.heads
+        .insert("factory/bead-na-r1".into(), "head-sha-123".into());
+    let store = FakeStateStore::new();
+    let llm = FakeLlm::new();
+    // The LLM JSON reply does NOT carry notAddressed (older prompt
+    // shape). The structured schema line in `review_text` is what
+    // must populate `extracted.not_addressed`.
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"inhibitionSpecs":["no print"],"positiveAssertions":["log errors"],"securityRedactionEncountered":false}"#.into()
+    ));
+
+    let mut cfg = test_cfg();
+    cfg.spec_dir = std::env::temp_dir()
+        .join("afd_spec_dir_not_addressed_test")
+        .to_string_lossy()
+        .to_string();
+    let spec_dir = std::path::Path::new(&cfg.spec_dir);
+    let _ = std::fs::remove_dir_all(spec_dir);
+    std::fs::create_dir_all(spec_dir).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join("afd_not_addressed_telemetry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // Point the constraints telemetry at the same file so we can assert
+    // CONSTRAINT_NOT_ADDRESSED_EXTRACTED was emitted.
+    std::env::set_var(
+        "CONSTRAINTS_TELEMETRY_LOG",
+        telemetry_log.to_string_lossy().to_string(),
+    );
+
+    let mut bead = BeadOverlay {
+        bead_id: "bead-na".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0,
+        autonomy_secs: 20,
+        spend_usd: 0.5,
+        pr_number: Some(301),
+        branch: Some("factory/bead-na-r1".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: None,
+    };
+    store.save(&bead).unwrap();
+
+    let deps = RerollDeps {
+        scm: &scm,
+        sessions: &sessions,
+        vcs: &vcs,
+        store: &store,
+        llm: &llm,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        reviewer: "skeptic".into(),
+        review_text: r#"verdict: fail reviewer missed the 3-check coverage.
+
+Reviewer notes go here.
+
+NOT-ADDRESSED: ["the 3-check coverage", "the manifest-path", "the #[ignore] handling"]
+"#
+        .into(),
+    };
+
+    let outcome = reroll::execute(&deps, &mut bead).unwrap();
+    match outcome {
+        RerollOutcome::Rerolled { new_branch } => {
+            assert_eq!(new_branch, "factory/bead-na-r2");
+        }
+        other => panic!("expected RerollOutcome::Rerolled, got {:?}", other),
+    }
+
+    // (d) The spec block must carry the structured NOT-ADDRESSED items
+    // verbatim — that is the whole point of the schema line: the
+    // next-round coder prompt is briefed on the unresolved gaps
+    // without the LLM-JSON path having to guess at them.
+    let spec_path = spec_dir.join("bead-na.toml");
+    assert!(spec_path.exists());
+    let spec_content = std::fs::read_to_string(&spec_path).unwrap();
+    assert!(
+        spec_content.contains("not_addressed"),
+        "spec block must carry a `not_addressed` field; got: {spec_content}"
+    );
+    assert!(
+        spec_content.contains("the 3-check coverage"),
+        "structured NOT-ADDRESSED item #1 must propagate; got: {spec_content}"
+    );
+    assert!(
+        spec_content.contains("the manifest-path"),
+        "structured NOT-ADDRESSED item #2 must propagate; got: {spec_content}"
+    );
+    assert!(
+        spec_content.contains("the #[ignore] handling"),
+        "structured NOT-ADDRESSED item #3 must propagate; got: {spec_content}"
+    );
+
+    // (d) Telemetry: the CONSTRAINT_NOT_ADDRESSED_EXTRACTED event must
+    // have been emitted so operators can audit the propagation chain.
+    let telemetry = std::fs::read_to_string(&telemetry_log)
+        .expect("constraints telemetry must be written");
+    assert!(
+        telemetry.contains("CONSTRAINT_NOT_ADDRESSED_EXTRACTED"),
+        "telemetry must record CONSTRAINT_NOT_ADDRESSED_EXTRACTED; got: {telemetry}"
+    );
+
+    std::fs::remove_dir_all(spec_dir).ok();
+    let _ = std::fs::remove_file(&telemetry_log);
+    std::env::remove_var("CONSTRAINTS_TELEMETRY_LOG");
 }

@@ -87,6 +87,26 @@ pub struct Config {
     /// tests that don't script `open_pr_head_refs` set it explicitly `false`.
     #[serde(default = "default_pre_gate_validation_enabled")]
     pub pre_gate_validation_enabled: bool,
+    /// Issue #408 / bead jleechan-1a5e r3: when true, the runtime
+    /// vacuous-test detector (`daemon::vacuous_red_green::check_red_green`)
+    /// is wired into gate 6 (EvidenceFloor) via
+    /// `PrEvidence::vacuous_red_green_status` and enforced on every
+    /// bead assessment. DEFAULT TRUE — the factory ships the rule on by
+    /// default, matching the r2 comment in `vacuous.rs:21` that has long
+    /// claimed this gate existed. A pre-#408 `daemon.toml` that omits
+    /// the key now gets the gate enabled. Operators may set
+    /// `vacuous_test_detection_enabled = false` to opt out
+    /// (e.g. for non-Rust repos where cargo test is not applicable).
+    #[serde(default = "default_vacuous_test_detection_enabled")]
+    pub vacuous_test_detection_enabled: bool,
+    /// Issue #408 / bead jleechan-1a5e r3: path to the Cargo manifest the
+    /// vacuous-test detector passes to `cargo test --manifest-path`. On
+    /// dark-factory layout the only Cargo.toml is at `<repo>/daemon/
+    /// Cargo.toml`. DEFAULT `daemon/Cargo.toml` (resolved relative to
+    /// `repo_root` by `tick.rs`). Operators may override for repos with
+    /// a different layout.
+    #[serde(default = "default_vacuous_test_manifest_path")]
+    pub vacuous_test_manifest_path: String,
 }
 
 /// Default head-stability window (bead jleechan-zeij / issue #322 r3): 30s,
@@ -111,6 +131,20 @@ fn default_held_recheck_cooldown_secs() -> u64 {
 /// r3): 5s, per the Codex review's "3 attempts over ≥5s".
 fn default_reroll_death_confirm_secs() -> u64 {
     5
+}
+
+/// Default for `vacuous_test_detection_enabled` (issue #408 / bead
+/// jleechan-1a5e r3): TRUE — the runtime vacuous-test detector is wired
+/// into gate 6 by default. Matches the `vacuous.rs:21` comment that has
+/// long claimed this gate existed.
+fn default_vacuous_test_detection_enabled() -> bool {
+    true
+}
+
+/// Default for `vacuous_test_manifest_path` (issue #408 r3): `daemon/
+/// Cargo.toml` — the only Cargo manifest in the dark-factory repo.
+fn default_vacuous_test_manifest_path() -> String {
+    "daemon/Cargo.toml".to_string()
 }
 
 impl Config {
@@ -184,6 +218,10 @@ mod tests {
         assert_eq!(cfg.max_workers, 30);
         assert_eq!(cfg.max_batch, 15);
         assert_eq!(cfg.base_branch, "main");
+        // Issue #408 r3 P1-6: the example config ships with the
+        // vacuous-test detector ON (matching `vacuous.rs:21`).
+        assert!(cfg.vacuous_test_detection_enabled);
+        assert_eq!(cfg.vacuous_test_manifest_path, "daemon/Cargo.toml");
     }
     #[test]
     fn missing_key_is_config_error() {
@@ -231,6 +269,17 @@ spec_dir = ".factory/specs/"
         assert!(
             cfg.pre_gate_validation_enabled,
             "pre_gate_validation_enabled must default to true when absent"
+        );
+        // Issue #408 / bead jleechan-1a5e r3 (P1-6): the runtime
+        // vacuous-test detector is ON by default — a config that omits
+        // the key still gets the gate wired.
+        assert!(
+            cfg.vacuous_test_detection_enabled,
+            "vacuous_test_detection_enabled must default to true when absent"
+        );
+        assert_eq!(
+            cfg.vacuous_test_manifest_path, "daemon/Cargo.toml",
+            "vacuous_test_manifest_path must default to daemon/Cargo.toml when absent"
         );
     }
 

@@ -1891,6 +1891,143 @@ fn skeptic_verdict_to_line(v: &verifier::SkepticVerdict) -> String {
     }
 }
 
+/// Issue #408 / bead jleechan-1a5e r3 (P1-2 / P1-6): invoke the runtime
+/// vacuous-test detector from the gate path so beads actually hit it.
+/// Returns `VacuousRedGreenStatus` for the assessor to fold into
+/// `PrEvidence::vacuous_red_green_status`. Gated on
+/// `Config::vacuous_test_detection_enabled` (default true).
+///
+/// On failure paths (operator-disabled, no manifest path, no test files),
+/// the helper returns the structured "transient/no-op" status so the gate
+/// does NOT spuriously fail-closed.
+fn run_vacuous_red_green_check(
+    deps: &TickDeps,
+    bead_id: &str,
+    repo: &str,
+    snapshot: &crate::tools::PrSnapshot,
+) -> verifier::VacuousRedGreenStatus {
+    if !deps.cfg.vacuous_test_detection_enabled {
+        return verifier::VacuousRedGreenStatus::NotRun;
+    }
+    // The detector needs a Cargo manifest. The configured path is
+    // repo-root-relative (default `daemon/Cargo.toml`). We don't have a
+    // local checkout here — the daemon runs as a long-lived service
+    // outside the repo — so we fall back to NotRun for non-Rust repos
+    // and emit a one-line telemetry hint so operators can see why the
+    // gate is silent.
+    let manifest_path = std::path::Path::new(&deps.cfg.vacuous_test_manifest_path);
+    if !manifest_path.exists() {
+        // The configured manifest path does not exist on this daemon's
+        // filesystem — likely the daemon is running in a service
+        // environment without a checkout. Don't fail the gate on a
+        // missing filesystem artifact; surface as Pending so operators
+        // see the structured reason.
+        let _ = emit(
+            deps.telemetry_log,
+            bead_id,
+            0,
+            "Attested",
+            "VACUOUS_RED_GREEN_MANIFEST_MISSING",
+            serde_json::json!({}),
+            serde_json::json!({
+                "manifestPath": deps.cfg.vacuous_test_manifest_path,
+                "repo": repo,
+            }),
+        );
+        return verifier::VacuousRedGreenStatus::Pending(format!(
+            "manifest path {} not present on the daemon filesystem",
+            deps.cfg.vacuous_test_manifest_path
+        ));
+    }
+    // Filter the PR's changed files into the (path, FileClass) pairs the
+    // detector consumes. P1-5 scope: only test files in the PR diff are
+    // candidates; pre-existing test fns are scoped out inside the
+    // detector.
+    let changed: Vec<(std::path::PathBuf, crate::vacuous_red_green::FileClass)> = snapshot
+        .files
+        .iter()
+        .map(|f| {
+            let class = if f.path.contains("/tests/")
+                || f.path.starts_with("tests/")
+                || f.path.ends_with("_test.rs")
+            {
+                crate::vacuous_red_green::FileClass::Test
+            } else {
+                crate::vacuous_red_green::FileClass::Production
+            };
+            (std::path::PathBuf::from(&f.path), class)
+        })
+        .collect();
+    let cwd = std::path::Path::new(".");
+    match crate::vacuous_red_green::check_red_green(
+        cwd,
+        manifest_path,
+        &snapshot.head_sha,
+        &changed,
+    ) {
+        Ok(report) => {
+            // r3 (cursor-agent fix (a) + (c)): fold the report through
+            // the deterministic `to_gate_status` helper instead of the
+            // r1 inline boolean check. The helper distinguishes Pending
+            // (every observation is NEVER_RAN / COMPILE_FAILED, so the
+            // gate cannot verify) from Failed (real defect) from
+            // Verified (genuine red-green). It also flags
+            // `ignored_without_skip_reason` as a hard Red.
+            let status = crate::vacuous_red_green::to_gate_status(&report);
+            match &status {
+                verifier::VacuousRedGreenStatus::Failed(reason)
+                | verifier::VacuousRedGreenStatus::Pending(reason) => {
+                    let kind = if matches!(
+                        status,
+                        verifier::VacuousRedGreenStatus::Failed(_)
+                    ) {
+                        "VACUOUS_RED_GREEN_FAILED"
+                    } else {
+                        "VACUOUS_RED_GREEN_PENDING"
+                    };
+                    let _ = emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        0,
+                        "Attested",
+                        kind,
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": reason,
+                            "repo": repo,
+                            "report": serde_json::to_value(&report)
+                                .unwrap_or(serde_json::json!({})),
+                        }),
+                    );
+                }
+                verifier::VacuousRedGreenStatus::Verified
+                | verifier::VacuousRedGreenStatus::NotRun => {}
+            }
+            status
+        }
+        Err(crate::vacuous_red_green::RedGreenError::NoChangedTests) => {
+            // PR has no test files — vacuous detection is N/A for this
+            // PR (e.g. a docs-only change). Verified, not Failed.
+            verifier::VacuousRedGreenStatus::Verified
+        }
+        Err(e) => {
+            let _ = emit(
+                deps.telemetry_log,
+                bead_id,
+                0,
+                "Attested",
+                "VACUOUS_RED_GREEN_PENDING",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "error": format!("{e}"),
+                    "repo": repo,
+                }),
+            );
+            verifier::VacuousRedGreenStatus::Pending(format!("{e}"))
+        }
+    }
+}
+
 fn skeptic_evidence(
     deps: &TickDeps,
     bead_id: &str,
@@ -2201,6 +2338,13 @@ fn skeptic_evidence(
         review_degraded,
         // Set in the fast tier from the canonical evidence marker (#323).
         evidence_gist_status: verifier::EvidenceGistStatus::NotProvided,
+        // Issue #408 / bead jleechan-1a5e r3 (P1-6): the runtime
+        // vacuous-test detector's status. Populated by the gate path
+        // (`run_fast_tier`'s per-bead assessment) — this function is the
+        // skeptic-only collection; the vacuous check happens after the
+        // PR snapshot is fetched so the manifest_path and changed-files
+        // list are available.
+        vacuous_red_green_status: verifier::VacuousRedGreenStatus::NotRun,
     })
 }
 
@@ -2997,6 +3141,22 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
             None => verifier::EvidenceGistStatus::NotProvided,
         };
+
+        // Issue #408 / bead jleechan-1a5e r3 (P1-2 / P1-6): the runtime
+        // vacuous-test detector is invoked HERE (the gate path), not just
+        // via the CLI wrapper. Without this, beads never hit the detector
+        // because the auto-merge-guard only consults the gate-7 verdict
+        // emitted by the existing skeptic_evidence flow. The detector is
+        // gated by `Config::vacuous_test_detection_enabled` so operators
+        // can opt out (default ON). The status flows into
+        // `evidence_floor_gate` via `vacuous_red_green_status`.
+        evidence.vacuous_red_green_status = run_vacuous_red_green_check(
+            deps,
+            bead_id,
+            &repo,
+            &snapshot,
+        );
+
         let report = verifier::assess(deps.scm, pr, &repo, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
         // jleechan-wzgl: log the full per-gate breakdown (all 7 gates,

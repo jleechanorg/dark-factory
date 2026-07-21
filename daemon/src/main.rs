@@ -720,6 +720,8 @@ mod tests {
             held_recheck_cooldown_secs: 900,
             repos: std::collections::HashMap::new(),
             pre_gate_validation_enabled: false,
+            vacuous_test_detection_enabled: false,
+            vacuous_test_manifest_path: "".to_string(),
         };
 
         let (project, _) = ao_runtime_binding(&cfg).unwrap();
