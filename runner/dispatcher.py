@@ -4,8 +4,18 @@ import fnmatch
 import re
 from typing import List, Tuple, Dict, Any
 from runner.rule_loader import Rule
-from runner.skeptic_gate_cli import invoke_reviewer
-from runner.skeptic_gate import evaluate, SkepticResult, build_prompt
+from runner.skeptic_gate_cli import invoke_reviewer as _invoke_reviewer_module_ref
+from runner.skeptic_gate import SkepticResult
+from runner import skeptic_gate_cli as _cli
+
+# Resolve build_prompt/evaluate/invoke_reviewer through the CLI module
+# at CALL TIME (not import time) so tests can
+# `monkeypatch.setattr(cli_mod, ...)` and observe the patch when the
+# dispatcher runs. The CLI module re-exports all three names from
+# `runner.skeptic_gate`/`runner.skeptic_gate_cli`; resolving through
+# `_cli.X` here makes the late-bound attribute lookup propagate. See
+# issue #386 r3 wiring + tests/test_skeptic_gate_cli_bead_id_r3.py and
+# tests/test_skeptic_gate_cli_contract_echo.py.
 
 class VerifierDispatcher:
     def __init__(self, cheap_reviewer: str = "gemini", cheap_model: str = "gemini-2.5-flash",
@@ -28,20 +38,34 @@ class VerifierDispatcher:
         return bool(re.match(regex, file_path))
 
     def rule_matches(self, rule: Rule, changed_files: List[str]) -> bool:
+        # A rule with an explicit `target_globs=["*"]` (or any glob that
+        # is a literal `*`) is a "matches everything" rule and should
+        # fire even when `changed_files` is empty — the latter is the
+        # dry-run / offline / empty-repo path where no SCM file list
+        # is available but the gate still needs to run the mandatory
+        # reviewer. Without this, the dispatcher's rule loop would
+        # silently no-op for any caller that has not yet populated
+        # `changed_files` (issue #386 r3 contract-echo plumbing; tests
+        # `test_skeptic_gate_cli_bead_id_r3.py` rely on this).
+        if not changed_files:
+            for glob in rule.target_globs:
+                if glob == "*" or glob == "**" or glob.endswith("/*"):
+                    return True
         for f in changed_files:
             for glob in rule.target_globs:
                 if self.match_glob(f, glob):
                     return True
         return False
 
-    def build_rule_prompt(self, rule: Rule, repo: str, pr_number: int, head_sha: str, base_sha: str, diff: str, implementation_identity: str) -> str:
-        base_prompt = build_prompt(
+    def build_rule_prompt(self, rule: Rule, repo: str, pr_number: int, head_sha: str, base_sha: str, diff: str, implementation_identity: str, contract=None) -> str:
+        base_prompt = _cli.build_prompt(
             repo=repo,
             pr_number=pr_number,
             head_sha=head_sha,
             base_sha=base_sha,
             diff=diff,
-            implementation_identity=implementation_identity
+            implementation_identity=implementation_identity,
+            contract=contract,
         )
         return (
             f"{base_prompt}\n\n"
@@ -52,7 +76,7 @@ class VerifierDispatcher:
             f"{rule.prompt}\n"
         )
 
-    def dispatch(self, rules: List[Rule], changed_files: List[str], diff: str, repo: str, pr_number: int, head_sha: str, base_sha: str, implementation_identity: str) -> List[Tuple[Rule, SkepticResult]]:
+    def dispatch(self, rules: List[Rule], changed_files: List[str], diff: str, repo: str, pr_number: int, head_sha: str, base_sha: str, implementation_identity: str, contract=None) -> List[Tuple[Rule, SkepticResult]]:
         matching_rules = [r for r in rules if self.rule_matches(r, changed_files)]
         if not matching_rules:
             return []
@@ -61,7 +85,7 @@ class VerifierDispatcher:
 
         def run_one(rule: Rule) -> Tuple[Rule, SkepticResult]:
             prompt = self.build_rule_prompt(
-                rule, repo, pr_number, head_sha, base_sha, diff, implementation_identity
+                rule, repo, pr_number, head_sha, base_sha, diff, implementation_identity, contract=contract
             )
             reviewer = rule.reviewer
             model = rule.model
@@ -73,8 +97,8 @@ class VerifierDispatcher:
                     reviewer = self.cheap_reviewer
                     model = self.cheap_model
 
-            stdout, err = invoke_reviewer(reviewer, model, prompt)
-            res = evaluate(
+            stdout, err = _cli.invoke_reviewer(reviewer, model, prompt)
+            res = _cli.evaluate(
                 review_output=stdout,
                 review_error=err,
                 repo=repo,
@@ -84,6 +108,7 @@ class VerifierDispatcher:
                 base_sha="unknown",
                 diff=diff,
                 reviewer=reviewer,
+                contract=contract,
             )
 
             # Enforce security checks: binding and provenance (self-review rejection)
