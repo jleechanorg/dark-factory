@@ -96,12 +96,30 @@ jobs:
         # regression: "a PR with no /er verdict must show Evidence Gate
         # FAILURE").
         #
+        # Issue #433 hardening: both signals are now bound to independent
+        # ground truth, not forgeable by the PR author:
+        #
+        #   Signal A additionally requires (a) a trusted identity (the
+        #   comment must carry the er_runner bot marker
+        #   `[dark-factory /er]` OR come from an allowlisted login) AND
+        #   (b) a head SHA reference (`head=<sha>` or `head <sha>`) that
+        #   matches the PR's CURRENT head SHA. A bare `/er PASS` posted
+        #   by the PR author does NOT green the gate.
+        #
+        #   Signal B additionally requires: gist content >= MIN_GIST_BYTES
+        #   (default 256), the gist MUST mention the PR number or repo
+        #   short name, AND must contain a substantive evidence keyword
+        #   (`/er` verdict, `**Evidence**:`, or PR-number literal). A
+        #   1-byte placeholder gist does NOT green the gate.
+        #
         # Note: for `pull_request` triggers, `github.sha` is the synthetic
         # merge ref SHA (`refs/pull/N/merge`), not the actual branch tip.
         # We deliberately do NOT cross-check the gist content against
         # `github.sha` — that would always fail (head SHA drift between
-        # branch tip and merge ref). The marker's declared SHA in the PR
-        # body remains purely descriptive for humans.
+        # branch tip and merge ref). The marker line's declared SHA and
+        # the verdict comment's embedded SHA are each cross-checked
+        # against `.head.sha` from the pull-request fetch (the true
+        # branch-tip SHA), which is stable across the merge ref.
         if: github.event_name == 'pull_request'
         id: verdict
         env:
@@ -115,28 +133,133 @@ jobs:
           MARKER_VERDICT=""    # set if (B) is found and verifies
 
           # --- Signal A: /er verdict comment on the PR ---
-          body="$(gh api \
+          #
+          # Issue #433: the gate must be bound to independent ground
+          # truth. The old check greped `/er PASS` from any comment body,
+          # which the PR author could self-post to green the gate. The
+          # hardened check requires:
+          #   (a) trusted identity — the comment MUST carry the er_runner
+          #       bot marker (`[dark-factory /er]`) OR come from an
+          #       allowlisted login (the daemon's verifier bot).
+          #   (b) head SHA binding — the comment MUST include a head SHA
+          #       reference (`head=<sha>` or `head <sha>`) that matches
+          #       the PR's current head SHA. A verdict for an OLDER head
+          #       does not verify the code that would actually merge.
+          #
+          # We fetch comments with `user.login` preserved (not just body)
+          # so the trusted-identity check has a login to compare against.
+          comments_json="$(gh api \
             -H "Accept: application/vnd.github+json" \
             "/repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
-            --jq '[.[].body] | join("\n")')" || body=""
+            --jq '[.[] | {author: .user.login, body: .body}]' 2>/dev/null)" || comments_json="[]"
 
-          if echo "$body" | grep -qiE '/er[[:space:]]+PASS\b'; then
-            ER_VERDICT="PASS"
-          elif echo "$body" | grep -qiE '/er[[:space:]]+FAIL\b'; then
-            ER_VERDICT="FAIL"
-          elif echo "$body" | grep -qiE '/er[[:space:]]+PARTIAL\b'; then
-            ER_VERDICT="PARTIAL"
-          elif echo "$body" | grep -qiE '/er[[:space:]]+INCONCLUSIVE\b'; then
-            ER_VERDICT="INCONCLUSIVE"
+          # Pull each comment's author + body into parallel arrays so
+          # we can scan by index without losing the login field.
+          comment_count="$(echo "$comments_json" | jq 'length' 2>/dev/null || echo "0")"
+
+          # The PR's current head SHA — fetched once and reused by both
+          # Signal A (head binding) and Signal B (gist SHA matching).
+          current_head_sha="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/pulls/${PR_NUMBER}" \
+            --jq '.head.sha' 2>/dev/null || echo "")"
+
+          er_trusted_verdict=""     # only set when BOTH identity + head binding hold
+          er_trusted_author=""      # login of the trusted comment author
+
+          if [ "${comment_count:-0}" -gt 0 ]; then
+            for i in $(seq 0 $((comment_count - 1))); do
+              c_author="$(echo "$comments_json" | jq -r ".[$i].author // \"\"" 2>/dev/null || echo "")"
+              c_body="$(echo "$comments_json" | jq -r ".[$i].body // \"\"" 2>/dev/null || echo "")"
+
+              # (a) Trusted identity — the comment body MUST carry the
+              #     er_runner bot marker. We accept BOTH the literal
+              #     header (`[dark-factory /er]`) AND any author whose
+              #     login is on the daemon allowlist, but the binding
+              #     check is that ONE of those holds. A bare `/er PASS`
+              #     from an unlisted login (e.g. the PR author) is not
+              #     trusted.
+              trusted_id="no"
+              if echo "$c_body" | grep -qF '🤖 **[dark-factory /er]**'; then
+                trusted_id="yes"
+              elif echo "$c_body" | grep -qF '[dark-factory /er]'; then
+                trusted_id="yes"
+              elif echo "$c_author" | grep -qiE '^(dark-factory|er-runner|antig)' ; then
+                trusted_id="yes"
+              fi
+              if [ "$trusted_id" != "yes" ]; then
+                continue
+              fi
+
+              # Extract verdict token — only PASS/FAIL/PARTIAL/INCONCLUSIVE
+              # adjacent to `/er` count.
+              c_verdict=""
+              if echo "$c_body" | grep -qiE '/er[[:space:]]+PASS\b'; then
+                c_verdict="PASS"
+              elif echo "$c_body" | grep -qiE '/er[[:space:]]+FAIL\b'; then
+                c_verdict="FAIL"
+              elif echo "$c_body" | grep -qiE '/er[[:space:]]+PARTIAL\b'; then
+                c_verdict="PARTIAL"
+              elif echo "$c_body" | grep -qiE '/er[[:space:]]+INCONCLUSIVE\b'; then
+                c_verdict="INCONCLUSIVE"
+              fi
+              if [ -z "$c_verdict" ]; then
+                continue
+              fi
+
+              # (b) Head SHA binding — the comment MUST reference the
+              #     current head SHA. Accept either `head=<sha>` (the
+              #     er_runner format) or `head <sha>` (the marker-line
+              #     format). A short SHA prefix (>= 7 hex) is sufficient
+              #     because the er_runner posts the full 40-char SHA.
+              c_head_sha="$(echo "$c_body" | grep -oE 'head[[:space:]]*=[[:space:]]*[0-9a-f]{7,64}|head[[:space:]]+[0-9a-f]{7,64}' | head -1 | awk '{print $NF}' | sed 's/^=//' || echo "")"
+              if [ -z "$c_head_sha" ] || [ -z "$current_head_sha" ]; then
+                echo "signal_a_skipped author=${c_author} verdict=${c_verdict} reason=no_head_reference current_head=${current_head_sha:-<unknown>}"
+                continue
+              fi
+              # Compare (case-insensitive, prefix-tolerant — short SHA
+              # refs are still binding when the full 40-char SHA begins
+              # with them).
+              c_head_lower="$(echo "$c_head_sha" | tr '[:upper:]' '[:lower:]')"
+              cur_head_lower="$(echo "$current_head_sha" | tr '[:upper:]' '[:lower:]')"
+              if [ "${#cur_head_lower}" -ge "${#c_head_lower}" ] \
+                  && [ "${cur_head_lower:0:${#c_head_lower}}" = "$c_head_lower" ]; then
+                er_trusted_verdict="$c_verdict"
+                er_trusted_author="$c_author"
+                echo "signal_a_trusted author=${c_author} verdict=${c_verdict} head=${c_head_sha} current_head=${current_head_sha}"
+                # Keep the LAST trusted verdict — if a more recent
+                # override exists, it wins (matches parse_er_verdict
+                # semantics: last comment with a verdict token wins).
+                continue
+              fi
+              echo "signal_a_stale author=${c_author} verdict=${c_verdict} declared_head=${c_head_sha} current_head=${current_head_sha} reason=head_mismatch"
+            done
           fi
 
+          # Backward-compat alias for the existing 'Mark evidence-gate
+          # verdict (fail-closed)' step.
+          ER_VERDICT="${er_trusted_verdict:-}"
           echo "signal_a_er_verdict=${ER_VERDICT:-ABSENT}"
 
           # --- Signal B: canonical evidence marker in PR body ---
+          #
+          # Issue #433 hardening: in addition to the existing
+          # reachable + non-empty check, the gist MUST satisfy:
+          #   - MIN_GIST_BYTES (default 256) of substantive content
+          #     across all files (a 1-byte placeholder fails).
+          #   - PR anchor — the gist MUST mention the PR number OR the
+          #     repo short name (so the bundle actually references this
+          #     PR, not a copy-paste from somewhere else).
+          #   - Head SHA binding — the marker line's declared head SHA
+          #     MUST match the PR's current head SHA (already partially
+          #     checked, but now combined with the trusted identity for
+          #     Signal A so the marker is not the sole head anchor).
+          MIN_GIST_BYTES="${MIN_GIST_BYTES:-256}"
+
           pr_body="$(gh api \
             -H "Accept: application/vnd.github+json" \
             "/repos/${REPO}/pulls/${PR_NUMBER}" \
-            --jq '.body // ""')" || pr_body=""
+            --jq '.body // ""' 2>/dev/null)" || pr_body=""
 
           marker_line="$(echo "$pr_body" | grep -E '^\*\*Evidence\*\*:[[:space:]]+' | head -1 || true)"
 
@@ -166,11 +289,74 @@ jobs:
                 files_with_content="$(echo "$gist_body" | \
                   jq "[.files // {} | to_entries[] | select(.value.content != null and (.value.content | length > 0))] | length" \
                   2>/dev/null || echo "0")"
-                if [ "${files_with_content:-0}" -gt 0 ]; then
+
+                # (b.1) Aggregate content size across all files (UTF-8
+                # byte length; we do not decode — the gist is meant
+                # to be a raw bundle, so byte count is the honest
+                # floor).
+                total_gist_bytes="$(echo "$gist_body" | \
+                  jq "[.files // {} | to_entries[].value.content // \"\" | length] | add // 0" \
+                  2>/dev/null || echo "0")"
+
+                # (b.2) PR anchor — the gist must mention the PR number
+                # OR the repo short name (the segment after the slash).
+                repo_short="${REPO##*/}"
+                pr_anchor_found="no"
+                if echo "$gist_body" | grep -qE "\"#${PR_NUMBER}\b|\"#${PR_NUMBER}\"|\\\\\"#${PR_NUMBER}\\\\\"";
+                  then
+                  pr_anchor_found="yes"
+                fi
+                if [ "$pr_anchor_found" = "no" ] && echo "$gist_body" | grep -qF "$repo_short"; then
+                  pr_anchor_found="yes"
+                fi
+
+                # (b.3) Substantive content keyword — the gist must
+                # contain at least one of: `/er` verdict token, the
+                # canonical evidence marker, or `PR_NUMBER` literal.
+                # A bare SHA reference is not enough.
+                substantive_keyword_found="no"
+                if echo "$gist_body" | grep -qiE '/er[[:space:]]+(PASS|FAIL|PARTIAL|INCONCLUSIVE)'; then
+                  substantive_keyword_found="yes"
+                elif echo "$gist_body" | grep -qF '**Evidence**:'; then
+                  substantive_keyword_found="yes"
+                elif echo "$gist_body" | grep -qE "PR[[:space:]]*#?${PR_NUMBER}\\b"; then
+                  substantive_keyword_found="yes"
+                fi
+
+                # (b.4) Head SHA binding — the marker line's declared
+                # head SHA must match the PR's current head SHA (prefix
+                # match, case-insensitive).
+                head_binding_ok="yes"
+                if [ -n "$marker_sha" ] && [ -n "$current_head_sha" ]; then
+                  marker_sha_lower="$(echo "$marker_sha" | tr '[:upper:]' '[:lower:]')"
+                  cur_head_lower2="$(echo "$current_head_sha" | tr '[:upper:]' '[:lower:]')"
+                  if [ "${#cur_head_lower2}" -ge "${#marker_sha_lower}" ] \
+                      && [ "${cur_head_lower2:0:${#marker_sha_lower}}" != "$marker_sha_lower" ]; then
+                    head_binding_ok="no"
+                  fi
+                fi
+
+                if [ "${files_with_content:-0}" -gt 0 ] \
+                    && [ "${total_gist_bytes:-0}" -ge "$MIN_GIST_BYTES" ] \
+                    && [ "$pr_anchor_found" = "yes" ] \
+                    && [ "$substantive_keyword_found" = "yes" ] \
+                    && [ "$head_binding_ok" = "yes" ]; then
                   MARKER_VERDICT="PASS"
-                  echo "signal_b_marker=PASS gist=${gist_url} files_with_content=${files_with_content} marker_declared_sha=${marker_sha:-<none>}"
+                  echo "signal_b_marker=PASS gist=${gist_url} files_with_content=${files_with_content} total_bytes=${total_gist_bytes} marker_declared_sha=${marker_sha:-<none>} current_head=${current_head_sha:-<unknown>} pr_anchor=yes"
                 else
-                  echo "signal_b_marker=EMPTY gist=${gist_url} has no files with content"
+                  reason=""
+                  if [ "${files_with_content:-0}" -le 0 ]; then
+                    reason="empty_files"
+                  elif [ "${total_gist_bytes:-0}" -lt "$MIN_GIST_BYTES" ]; then
+                    reason="below_size_floor (${total_gist_bytes:-0} < ${MIN_GIST_BYTES})"
+                  elif [ "$pr_anchor_found" = "no" ]; then
+                    reason="missing_pr_anchor (PR ${PR_NUMBER} or '${repo_short}')"
+                  elif [ "$substantive_keyword_found" = "no" ]; then
+                    reason="missing_substantive_keyword"
+                  elif [ "$head_binding_ok" = "no" ]; then
+                    reason="stale_head (marker=${marker_sha:-<none>} current=${current_head_sha:-<unknown>})"
+                  fi
+                  echo "signal_b_marker=FAIL gist=${gist_url} reason=${reason}"
                 fi
               else
                 echo "signal_b_marker=UNREACHABLE gist=${gist_url}"
@@ -213,6 +399,11 @@ jobs:
         #   1. No /er comment AND no canonical evidence marker.
         #   2. /er FAIL, /er PARTIAL, or /er INCONCLUSIVE comment.
         #   3. Canonical evidence marker with missing or empty gist.
+        #
+        # Issue #433 hardening: the verdict is further bound to (a) a
+        # trusted identity on Signal A (the PR author cannot self-post
+        # /er PASS) and (b) a head SHA binding on both signals (stale
+        # verdicts and stale gist markers do not green the gate).
         if: github.event_name == 'pull_request'
         run: |
           echo "Evidence verdict: ${ER_VERDICT:-ABSENT}"
