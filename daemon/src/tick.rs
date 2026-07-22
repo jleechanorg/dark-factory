@@ -2292,10 +2292,25 @@ fn vacuous_red_green_for_pr(
     let manifest = match crate::vacuous_red_green::find_cargo_manifest(&repo_root) {
         Some(m) => m,
         None => {
-            return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
-                "no Cargo.toml reachable from {}",
-                repo_root.display()
-            ));
+            // jleechan-ni1k / issue #437 bonus: dark-factory's daemon
+            // crate lives at `<repo_root>/daemon/Cargo.toml`, not at the
+            // repo root. The walk-up `find_cargo_manifest` returns None
+            // on this nested-crate layout, surfacing `ManifestMissing`
+            // on the very repo the gate is supposed to vet. Fall back
+            // to a bounded recursive search (skips `target` /
+            // `node_modules` / `.git`, capped at depth 4) so a nested
+            // crate manifest is reachable. If both lookups fail, we
+            // keep the original error message so operators see both
+            // paths attempted.
+            match crate::vacuous_red_green::find_cargo_manifest_recursive(&repo_root, 4) {
+                Some(m) => m,
+                None => {
+                    return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
+                        "no Cargo.toml reachable from {} (walk-up + recursive depth-4 both failed)",
+                        repo_root.display()
+                    ));
+                }
+            }
         }
     };
 
