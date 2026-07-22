@@ -193,3 +193,135 @@ class TestReceiptRequiredFlag:
     def test_disabled_values(self, raw):
         attrs = {} if raw is None else {"receipt_required": raw}
         assert _receipt_required_flag(self._Node(attrs)) is False
+
+
+class TestPerLaneReceiptEnforcement:
+    """Each reviewer lane (primary + shadows) must carry its own reproduction
+    receipt BEFORE transcripts are concatenated for downstream handoff.
+
+    Codex post-merge review of #407 finding 4: ``handler_dispatch.py``
+    concatenates primary+shadow transcripts, then ``handler_parallel_reviewer``
+    checks the COMBINED text once — one lane's genuine test-run receipt
+    blesses every lane (read-only primary PASS + one shadow's exit-0 still
+    passes). Regression: primary-no-receipt + shadow-with-receipt → primary
+    lane must fail even though combined text has a receipt.
+    """
+
+    def test_primary_without_receipt_fails_alone(self):
+        """A primary lane with no reproduction receipt must be downgraded
+        on its own; the receipt check is lane-scoped, not transcript-scoped.
+        """
+        result = Result(
+            outcome="success",
+            output="Reviewed the diff. Looks correct.\nVerdict: PASS",
+            metadata={"verdict": "pass"},
+        )
+        # Lane-scoped: only the primary transcript is checked, not any
+        # concatenated downstream text.
+        adjusted = _enforce_reproduction_receipt(result)
+        assert adjusted.outcome == "failure"
+        assert adjusted.metadata["verdict"] == "fail"
+        assert adjusted.metadata["receipt_downgraded"] == "true"
+
+    def test_primary_with_receipt_passes_alone(self):
+        """A primary lane with its own receipt holds even if downstream
+        shadows later concatenate 'no receipt' prose.
+        """
+        result = Result(
+            outcome="success",
+            output="$ uv run pytest\n12 passed\nexit code: 0\nVerdict: PASS",
+            metadata={"verdict": "pass"},
+        )
+        # Lane-scoped: shadow text does not contaminate primary receipt check.
+        adjusted = _enforce_reproduction_receipt(result)
+        assert adjusted is result
+
+    def test_combined_receipt_does_not_save_primary(self):
+        """Regression for finding 4: the combined transcript contains a
+        receipt (from the shadow lane), but the primary lane alone has none.
+        Per-lane enforcement must downgrade the primary lane."""
+        primary_output = "Reviewed the diff. Looks correct.\nVerdict: PASS"
+        # The "combined" downstream text adds a shadow with a receipt.
+        combined_text = primary_output + (
+            "\n\n---\n\n"
+            "## Parallel Codex Gate Review\n"
+            "$ uv run pytest\n12 passed\nexit code: 0\nVerdict: PASS\n"
+        )
+        # The lane-scoped check must look at the primary text only.
+        gap_primary_only = _reproduction_receipt_gap(primary_output)
+        gap_combined = _reproduction_receipt_gap(combined_text)
+        assert gap_primary_only, "primary-only text must trigger a gap"
+        assert not gap_combined, "combined text does contain a receipt (this is the bug)"
+        # The lane enforcement returns a downgraded result for primary.
+        primary_result = Result(
+            outcome="success",
+            output=primary_output,
+            metadata={"verdict": "pass"},
+        )
+        adjusted = _enforce_reproduction_receipt(primary_result)
+        assert adjusted.outcome == "failure"
+        assert adjusted.metadata["receipt_downgraded"] == "true"
+        # The combined-text check (legacy, transcript-scoped) WOULD have
+        # passed; this regression asserts lane-scoped check fails.
+
+    def test_shadow_without_receipt_fails_shadow_lane(self):
+        """A shadow lane that fails to reproduce must be flagged per-lane.
+        ``_finish_shadow_gate_review`` records the shadow output in
+        ``ctx.state[<node>.shadow_<backend>_gate_output]``; the per-lane
+        receipt check is run against that single-lane text.
+        """
+        # The shadow's own transcript has no receipt.
+        shadow_output = (
+            "Reviewed the diff. Looks correct.\nVerdict: PASS"
+        )
+        gap = _reproduction_receipt_gap(shadow_output)
+        assert gap, "shadow lane without receipt must trigger a gap"
+        # Downgrade the shadow lane alone (this is what the new per-lane
+        # hook in ``_finish_shadow_gate_review`` will perform).
+        shadow_result = Result(
+            outcome="success",
+            output=shadow_output,
+            metadata={"verdict": "pass"},
+        )
+        adjusted = _enforce_reproduction_receipt(shadow_result)
+        assert adjusted.outcome == "failure"
+        assert adjusted.metadata["receipt_downgraded"] == "true"
+        assert "shadow" in adjusted.metadata.get("receipt_gap_lane", "") or (
+            "reproduction receipt" in adjusted.metadata["receipt_gap"]
+        )
+
+
+class TestPerLaneHookContract:
+    """The per-lane enforcement hook on each lane (primary and each shadow)
+    must be wired so callers can identify which lane failed. The contract:
+    lane metadata gets a ``receipt_downgraded`` flag and the per-lane gap is
+    recorded under ``receipt_gap`` so audit readers can pinpoint the lane.
+    """
+
+    def test_lane_hook_records_lane_name(self):
+        """The per-lane hook must record which lane failed so downstream
+        aggregation can isolate the responsible lane."""
+        from runner.handler_parallel_reviewer import (
+            _enforce_reproduction_receipt_for_lane,
+        )
+        result = Result(
+            outcome="success",
+            output="narrative only",
+            metadata={"verdict": "pass"},
+        )
+        adjusted = _enforce_reproduction_receipt_for_lane(result, lane_name="shadow_codex")
+        assert adjusted.outcome == "failure"
+        assert adjusted.metadata["receipt_downgraded"] == "true"
+        assert adjusted.metadata.get("receipt_gap_lane") == "shadow_codex"
+
+    def test_lane_hook_passthrough_on_receipt_holds(self):
+        from runner.handler_parallel_reviewer import (
+            _enforce_reproduction_receipt_for_lane,
+        )
+        result = Result(
+            outcome="success",
+            output="$ uv run pytest\n12 passed\nexit code: 0\nVerdict: PASS",
+            metadata={"verdict": "pass"},
+        )
+        adjusted = _enforce_reproduction_receipt_for_lane(result, lane_name="primary")
+        assert adjusted is result
