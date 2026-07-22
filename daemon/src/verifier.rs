@@ -95,9 +95,11 @@ impl GateResult {
 
 /// Full assessment for one PR: every gate's verdict plus the aggregate
 /// `all_green` flag. `all_green` is `true` only when every one of the 8
-/// gates is `Green` — a single `Unknown` gate forces `all_green=false` in
-/// exactly the same way a `Red` gate does (can't-verify is not "pass"), but
-/// the two remain distinguishable via `results` for diagnosis/routing.
+/// gates (`Ci`, `NoConflicts`, `CodeRabbitApproved`, `BugbotClean`,
+/// `CommentsResolved`, `EvidenceFloor`, `Skeptic`, `VacuousRedGreen`) is
+/// `Green` — a single `Unknown` gate forces `all_green=false` in exactly
+/// the same way a `Red` gate does (can't-verify is not "pass"), but the
+/// two remain distinguishable via `results` for diagnosis/routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateReport {
     pub results: [(GateName, GateResult); 8],

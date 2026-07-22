@@ -70,19 +70,11 @@ The 8 named gates, in `GateReport.results` order, are:
 ## Headline invariants (carried over from the deleted workflow)
 
 > **1. Skeptic is a daemon-side gate; no GH workflow fires it.**
-> **2. The recorded Skeptic verdict is consumed verbatim by
->    `parse_skeptic_verdict`; `warn` is non-blocking, `pass|warn` is
->    green, `fail` is red.**
-> **3. The Skeptic key MUST appear in every `GATE_ASSESSMENT` payload
->    (pinned by `daemon/factory-overlay.sh::REQUIRED_KEYS`).**
-> **4. The Skeptic gate never executes PR-head Python on the
->    credentialed runner — the reviewer is a daemon-side subprocess
->    with allow-listed env (no `GITHUB_TOKEN`, no `HOME`, no
->    `OPENCLAW_*` / `HERMES_*` / `SLACK_*` secrets).**
-> **5. Skeptic verdicts without execution-evidence fields
->    (`TEST_RUN_EVIDENCE`, `LINT_RUN_EVIDENCE`, `GREP_CITES`,
->    `HEAD_COMMIT_VERIFIED`) are rejected as evidence-free
->    (fail-closed, issue #384).**
+> **2. The recorded Skeptic verdict is consumed by `parse_skeptic_verdict` (raw-output parsing of the marker `verdict: pass|warn|fail`). `parse_skeptic_verdict` is NOT judgment — it only matches the marker token and returns the verdict plus the remainder of the body. The `verifier::skeptic_gate` helper then maps `Pass`/`Warn` → `Green` and `Fail` → `Red`. `pass|warn` is green only when `review_degraded` is `false`.**
+> **3. `assess` may override `Pass`/`Warn` to `Red` when `review_degraded` is `true` (bead `jleechan-984e` / issue #385, PR #394). The override is enforced at the `assess` site (after `assess` has the full `PrEvidence` and can attribute the reason to the cross-model failure rather than to the gate-7 verdict itself); doing it inside `skeptic_gate` would force that helper to know about `review_degraded` AND about the Stage-1 `mock_llm` exemption (already encoded in `compute_review_degraded`'s empty-family filter). The assess-site wiring keeps `skeptic_gate` verdict-only.**
+> **4. The Skeptic key MUST appear in every `GATE_ASSESSMENT` payload (pinned by `daemon/factory-overlay.sh::REQUIRED_KEYS`).**
+> **5. The Skeptic gate never executes PR-head Python on the credentialed runner — the reviewer is a daemon-side subprocess with allow-listed env (no `GITHUB_TOKEN`, no `HOME`, no `OPENCLAW_*` / `HERMES_*` / `SLACK_*` secrets).**
+> **6. Skeptic verdicts without execution-evidence fields (`TEST_RUN_EVIDENCE`, `LINT_RUN_EVIDENCE`, `GREP_CITES`, `HEAD_COMMIT_VERIFIED`) are rejected as evidence-free (fail-closed, issue #384).**
 
 ## Historical content
 

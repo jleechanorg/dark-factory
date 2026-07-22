@@ -222,7 +222,15 @@ Each fast-tick, the daemon independently evaluates the PR against the full **8-g
         `codex` (running GPT-5.5) -> `claude-code` (running Sonnet) -> `agy` -> `minimax`.
         The chain distinguishes between **transient failures** (API timeouts, rate limits, 5xx errors) and **substantive failures** (model produced wrong/empty answer, context overflow). Transient failures trigger a retry of the **same** model (up to 2 retries with exponential backoff) before falling back to the next model. Substantive failures fall back immediately. This distinction avoids double-billing for retry-able failures while still guaranteeing review completion.
     *   **Contract-echo + PriorFinding**: The Skeptic verdict must echo each acceptance criterion of the governing bead with a per-item `pass | warn | fail` marker and re-state prior findings (issue #386 / bead `jleechan-pq08`). The verifier rejects verdicts missing the echo or dropping prior findings (PR #412 / bead `jleechan-ijod`).
-8.  **Vacuous red/green**: Runtime vacuous-test detector verdict (gate 8, added by PR #387 / bead `jleechan-ijod`). The detector computes a verdict from `PrEvidence.vacuous_red_green` (`Vacuous` → `Red`; `GreenFailed` / `BaselineFailed` / `NoChangedTests` / `ManifestMissing` → `Unknown`; test-repo PRs and PRs with no test files → `Green` so the gate never blocks the test-repo fast lane). Vacuous-test regressions — pattern-matched PASS verdicts on test counts that were never actually executed — fail the PR at this gate.
+8.  **Vacuous red/green**: Runtime vacuous-test detector verdict (gate 8, added by PR #387 / bead `jleechan-ijod`). The detector computes a verdict from `PrEvidence.vacuous_red_green`. The mapping to `GateResult` is canonical and lives in `daemon/src/verifier.rs::vacuous_red_green_gate` (issue #387 r6 / PR #413):
+    *   `NotProvided` → `Green` (test-repo PRs and PRs with no test files have nothing to measure; the gate must not block)
+    *   `Genuine` → `Green`
+    *   `Vacuous` → `Red` (real defect: targeted tests pass on the reverted production tree)
+    *   `BaselineFailed` → `Green` (infra can't materialise the base worktree — no `GH_TOKEN` in CI, `gh pr view` failed, etc. The detector has no actionable signal; mapping to `Unknown` would make `all_green=false` for every PR on a runner without credentials and deadlock the bead in `Attested`. Infra failures fall through to the existing logger/Healer surfaces rather than blocking READY.)
+    *   `GreenFailed` → `Unknown` (the detector has a partial signal it can't resolve — the bead gets one more tick to re-evaluate rather than being promoted with an unverified gate)
+    *   `NoChangedTests` → `Unknown`
+    *   `ManifestMissing` → `Unknown`
+    Vacuous-test regressions — pattern-matched PASS verdicts on test counts that were never actually executed — fail the PR at this gate.
 
 Additional floors and optimizations are enforced:
 
