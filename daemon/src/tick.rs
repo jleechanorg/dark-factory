@@ -343,6 +343,18 @@ pub fn run_tick(
     }
 
     let mut summary = TickSummary::default();
+    // jleechan-1s2q / issue #444: per-tick escalation comment budget,
+    // shared across all cap-escalation sites so the dispatch pass is
+    // guaranteed scheduling time regardless of how many beads in the
+    // loop are trying to post SCM comments this tick. Constructed once
+    // at the top of the tick and threaded through every site that
+    // might attempt a comment, including the recovery step's permanent-
+    // fail short-circuit (`handle_scm_comment_failure` reads it on
+    // missing-target and permanent-parse calls so retry loops don't
+    // re-call SCM). See `MAX_ESCALATION_COMMENT_ATTEMPTS_PER_TICK` for
+    // the ceiling and the rationale.
+    let mut escalation_comment_budget_remaining: u32 =
+        MAX_ESCALATION_COMMENT_ATTEMPTS_PER_TICK;
 
     let slow_tier_due = {
         let ratio = (deps.cfg.slow_tick_secs / deps.cfg.fast_tick_secs.max(1)).max(1);
@@ -357,7 +369,7 @@ pub fn run_tick(
     // fires when the slow tier is due (matches the shell overlay's cadence
     // — `recover-held` was never per-fast-tick).
     if slow_tier_due {
-        run_recovery_step(deps, &mut summary)?;
+        run_recovery_step(deps, &mut summary, &mut escalation_comment_budget_remaining)?;
     }
 
     // jleechan-54ky / sub-fix for jleechan-gib: split the SQL-level "increment
@@ -892,7 +904,7 @@ pub fn run_tick(
     }
 
     if slow_tier_due {
-        run_slow_tier(deps, &mut summary)?;
+        run_slow_tier(deps, &mut summary, &mut escalation_comment_budget_remaining)?;
     }
 
     run_fast_tier(deps, &mut summary)?;
@@ -929,7 +941,11 @@ pub fn run_tick(
 /// active-overlay wedge-detection loop in `run_tick` so a freshly-QUEUED
 /// bead is not immediately re-parked by the timebox/wedge checks in the
 /// same tick.
-fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
+fn run_recovery_step(
+    deps: &TickDeps,
+    summary: &mut TickSummary,
+    budget_remaining: &mut u32,
+) -> Result<(), DaemonError> {
     let recovered = deps
         .store
         .recover_human_held(MAX_HUMAN_HELD_RECOVERY_ATTEMPT)?;
@@ -956,46 +972,48 @@ fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), D
         if escalation_already_recorded(deps, &overlay.bead_id)? {
             continue;
         }
-        let comment_body = format!(
-            "🤖 **[dark-factory]** Escalation required: bead `{}` is HUMAN_HELD at attempt {} (max automated recovery attempts: {}). Automation will not silently requeue it again.",
-            overlay.bead_id, overlay.attempt, MAX_HUMAN_HELD_RECOVERY_ATTEMPT
-        );
-        if let Err(err) = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body) {
-            if is_missing_scm_target_error(&err) {
-                record_local_escalation_fallback(
-                    deps,
-                    &overlay.bead_id,
-                    "human_held_recovery_attempt_cap_reached",
-                )?;
-                summary.beads_escalated_locally += 1;
-                emit(
-                    deps.telemetry_log,
-                    &overlay.bead_id,
-                    overlay.attempt,
-                    OverlayState::HumanHeld.as_str(),
-                    "ESCALATED_LOCALLY",
-                    serde_json::json!({}),
-                    serde_json::json!({
-                        "reason": "human_held_recovery_attempt_cap_reached",
-                        "max_attempt": MAX_HUMAN_HELD_RECOVERY_ATTEMPT,
-                        "pr_number": overlay.pr_number,
-                        "branch": overlay.branch,
-                        "scm_error": err.to_string(),
-                    }),
-                )?;
-                continue;
-            }
+        // jleechan-1s2q / issue #444: per-tick budget on escalation
+        // comment attempts. When the budget is exhausted, skip the
+        // SCM comment for this bead this tick — the bead stays
+        // escalation-eligible and the next tick will retry. The
+        // `ESCALATION_BUDGET_DEFERRED` event is emitted so an operator
+        // can see "we have beads waiting to escalate but the per-tick
+        // budget is the binding constraint this tick".
+        if *budget_remaining == 0 {
             emit(
                 deps.telemetry_log,
                 &overlay.bead_id,
                 overlay.attempt,
                 OverlayState::HumanHeld.as_str(),
-                "ESCALATION_NOTIFICATION_FAILED",
+                "ESCALATION_BUDGET_DEFERRED",
                 serde_json::json!({}),
                 serde_json::json!({
                     "reason": "human_held_recovery_attempt_cap_reached",
-                    "error": err.to_string(),
+                    "max_attempt": MAX_HUMAN_HELD_RECOVERY_ATTEMPT,
+                    "pr_number": overlay.pr_number,
+                    "branch": overlay.branch,
                 }),
+            )?;
+            continue;
+        }
+        *budget_remaining -= 1;
+        let comment_body = format!(
+            "🤖 **[dark-factory]** Escalation required: bead `{}` is HUMAN_HELD at attempt {} (max automated recovery attempts: {}). Automation will not silently requeue it again.",
+            overlay.bead_id, overlay.attempt, MAX_HUMAN_HELD_RECOVERY_ATTEMPT
+        );
+        if let Err(err) = post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body) {
+            // jleechan-1s2q: route the failure through the shared classifier
+            // so the missing-target, permanent-parse, and transient cases
+            // each get their own operator-visible handling (issue #444).
+            handle_scm_comment_failure(
+                deps,
+                summary,
+                &overlay.bead_id,
+                overlay.attempt,
+                overlay.pr_number,
+                overlay.branch.as_deref(),
+                &err,
+                "human_held_recovery_attempt_cap_reached",
             )?;
             continue;
         }
@@ -1025,7 +1043,11 @@ fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), D
 
 /// Slow tier: intake new beads, route each freshly-queued bead, dispatch as
 /// many QUEUED beads as the safety envelope (30/15) allows.
-fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
+fn run_slow_tier(
+    deps: &TickDeps,
+    summary: &mut TickSummary,
+    budget_remaining: &mut u32,
+) -> Result<(), DaemonError> {
     // jleechan-gib: recovery has already run at the top of this tick via
     // `run_recovery_step` (it must run BEFORE the active-overlay wedge loop
     // so freshly-QUEUED beads aren't immediately re-parked by wedge
@@ -1418,46 +1440,46 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 if escalation_already_recorded(deps, &failure.bead_id)? {
                     continue;
                 }
+                // jleechan-1s2q / issue #444: per-tick budget on escalation
+                // comment attempts. Defer when consumed; emit a marker so
+                // operators can see the budget — not a transient error — is
+                // the binding constraint this tick.
+                if *budget_remaining == 0 {
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_BUDGET_DEFERRED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "transient_spawn_retry_cap_exceeded",
+                            "branch": failure.branch.as_deref(),
+                        }),
+                    )?;
+                    continue;
+                }
+                *budget_remaining -= 1;
                 let comment_body = format!(
                     "🤖 **[dark-factory]** Escalation required: bead `{}` failed to spawn a worker session more than {} consecutive times (transient errors only — e.g. AO session-cap pressure). Automation parked it HUMAN_HELD instead of retrying indefinitely; please check target-repo session capacity before requeuing.",
                     failure.bead_id, MAX_TRANSIENT_SPAWN_RETRY
                 );
                 if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
                 {
-                    if is_missing_scm_target_error(&err) {
-                        record_local_escalation_fallback(
-                            deps,
-                            &failure.bead_id,
-                            "transient_spawn_retry_cap_exceeded",
-                        )?;
-                        summary.beads_escalated_locally += 1;
-                        emit(
-                            deps.telemetry_log,
-                            &failure.bead_id,
-                            failure.attempt,
-                            OverlayState::HumanHeld.as_str(),
-                            "ESCALATED_LOCALLY",
-                            serde_json::json!({}),
-                            serde_json::json!({
-                                "reason": "transient_spawn_retry_cap_exceeded",
-                                "max_transient_spawn_retry": MAX_TRANSIENT_SPAWN_RETRY,
-                                "branch": failure.branch.as_deref(),
-                                "scm_error": err.to_string(),
-                            }),
-                        )?;
-                        continue;
-                    }
-                    emit(
-                        deps.telemetry_log,
+                    // jleechan-1s2q / issue #444: route through the shared
+                    // classifier — missing-target falls back to local
+                    // durable marker; permanent parse failures emit
+                    // ESCALATION_UNDELIVERABLE and stop retrying;
+                    // transient failures log and continue.
+                    handle_scm_comment_failure(
+                        deps,
+                        summary,
                         &failure.bead_id,
                         failure.attempt,
-                        OverlayState::HumanHeld.as_str(),
-                        "ESCALATION_NOTIFICATION_FAILED",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "reason": "transient_spawn_retry_cap_exceeded",
-                            "error": err.to_string(),
-                        }),
+                        None,
+                        failure.branch.as_deref(),
+                        &err,
+                        "transient_spawn_retry_cap_exceeded",
                     )?;
                     continue;
                 }
@@ -1514,40 +1536,41 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 if escalation_already_recorded(deps, &failure.bead_id)? {
                     continue;
                 }
+                // jleechan-1s2q / issue #444: per-tick budget on escalation
+                // comment attempts — defer when the budget is consumed so
+                // the dispatch pass is never starved by an escalation backlog.
+                if *budget_remaining == 0 {
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_BUDGET_DEFERRED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "unmapped_repo",
+                        }),
+                    )?;
+                    continue;
+                }
+                *budget_remaining -= 1;
                 let comment_body = format!(
                     "🤖 **[dark-factory]** Escalation required: bead `{}` had no resolvable repo identity at dispatch time (no `target_repo:` body field, no `external_ref` with a parseable `owner/repo#N` prefix, no adopted-PR context, and no other intake-side repo signal). Automation parked it HUMAN_HELD rather than silently defaulting to the daemon's global `target_repo` (which would have routed it to a wrong repo — confirmed 5x on 2026-07-18: yvfe/vmy2/46dk/s9ba/txtd). Operator action: supply an explicit `target_repo: <owner>/<repo>` line in the bead body, set `external_ref = \"<owner>/<repo>#NNN\"`, or file under an issue/PR labeled `factory` so intake can resolve the repo from the GitHub external_ref.",
                     failure.bead_id
                 );
                 if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
                 {
-                    if is_missing_scm_target_error(&err) {
-                        record_local_escalation_fallback(deps, &failure.bead_id, "unmapped_repo")?;
-                        summary.beads_escalated_locally += 1;
-                        emit(
-                            deps.telemetry_log,
-                            &failure.bead_id,
-                            failure.attempt,
-                            OverlayState::HumanHeld.as_str(),
-                            "ESCALATED_LOCALLY",
-                            serde_json::json!({}),
-                            serde_json::json!({
-                                "reason": "unmapped_repo",
-                                "scm_error": err.to_string(),
-                            }),
-                        )?;
-                        continue;
-                    }
-                    emit(
-                        deps.telemetry_log,
+                    // jleechan-1s2q / issue #444: shared classifier — see
+                    // `handle_scm_comment_failure`.
+                    handle_scm_comment_failure(
+                        deps,
+                        summary,
                         &failure.bead_id,
                         failure.attempt,
-                        OverlayState::HumanHeld.as_str(),
-                        "ESCALATION_NOTIFICATION_FAILED",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "reason": "unmapped_repo",
-                            "error": err.to_string(),
-                        }),
+                        None,
+                        failure.branch.as_deref(),
+                        &err,
+                        "unmapped_repo",
                     )?;
                     continue;
                 }
@@ -1593,44 +1616,38 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 if escalation_already_recorded(deps, &failure.bead_id)? {
                     continue;
                 }
+                // jleechan-1s2q / issue #444: per-tick budget.
+                if *budget_remaining == 0 {
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_BUDGET_DEFERRED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "unmapped_target_repo",
+                        }),
+                    )?;
+                    continue;
+                }
+                *budget_remaining -= 1;
                 let comment_body = format!(
                     "🤖 **[dark-factory]** Escalation required: bead `{}` claims a `target_repo` with no matching `[repos.*]` config entry (and it is not the daemon's global `target_repo`). Automation parked it HUMAN_HELD rather than guessing which repo/AO-project to dispatch into; please add a `[repos.\"<repo>\"]` entry to `config/daemon.toml` (or correct the bead's `target_repo`) before requeuing.",
                     failure.bead_id
                 );
                 if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
                 {
-                    if is_missing_scm_target_error(&err) {
-                        record_local_escalation_fallback(
-                            deps,
-                            &failure.bead_id,
-                            "unmapped_target_repo",
-                        )?;
-                        summary.beads_escalated_locally += 1;
-                        emit(
-                            deps.telemetry_log,
-                            &failure.bead_id,
-                            failure.attempt,
-                            OverlayState::HumanHeld.as_str(),
-                            "ESCALATED_LOCALLY",
-                            serde_json::json!({}),
-                            serde_json::json!({
-                                "reason": "unmapped_target_repo",
-                                "scm_error": err.to_string(),
-                            }),
-                        )?;
-                        continue;
-                    }
-                    emit(
-                        deps.telemetry_log,
+                    // jleechan-1s2q / issue #444: shared classifier.
+                    handle_scm_comment_failure(
+                        deps,
+                        summary,
                         &failure.bead_id,
                         failure.attempt,
-                        OverlayState::HumanHeld.as_str(),
-                        "ESCALATION_NOTIFICATION_FAILED",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "reason": "unmapped_target_repo",
-                            "error": err.to_string(),
-                        }),
+                        None,
+                        failure.branch.as_deref(),
+                        &err,
+                        "unmapped_target_repo",
                     )?;
                     continue;
                 }
@@ -1679,6 +1696,23 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 if escalation_already_recorded(deps, &failure.bead_id)? {
                     continue;
                 }
+                // jleechan-1s2q / issue #444: per-tick budget.
+                if *budget_remaining == 0 {
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_BUDGET_DEFERRED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "reason": "worktree_remote_mismatch",
+                            "branch": failure.branch.as_deref(),
+                        }),
+                    )?;
+                    continue;
+                }
+                *budget_remaining -= 1;
                 let comment_body = format!(
                     "🤖 **[dark-factory]** Escalation required: bead `{}`'s spawned worktree had a git remote that does NOT match the bead's resolved repo. Automation killed the session and parked it HUMAN_HELD rather than risk the coder pushing to the wrong repo (jleechan-9sh5 / jleechan-bqdv); please verify the target AO project's local checkout/remotes before requeuing. Details: {}",
                     failure.bead_id,
@@ -1686,38 +1720,16 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 );
                 if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
                 {
-                    if is_missing_scm_target_error(&err) {
-                        record_local_escalation_fallback(
-                            deps,
-                            &failure.bead_id,
-                            "worktree_remote_mismatch",
-                        )?;
-                        summary.beads_escalated_locally += 1;
-                        emit(
-                            deps.telemetry_log,
-                            &failure.bead_id,
-                            failure.attempt,
-                            OverlayState::HumanHeld.as_str(),
-                            "ESCALATED_LOCALLY",
-                            serde_json::json!({}),
-                            serde_json::json!({
-                                "reason": "worktree_remote_mismatch",
-                                "scm_error": err.to_string(),
-                            }),
-                        )?;
-                        continue;
-                    }
-                    emit(
-                        deps.telemetry_log,
+                    // jleechan-1s2q / issue #444: shared classifier.
+                    handle_scm_comment_failure(
+                        deps,
+                        summary,
                         &failure.bead_id,
                         failure.attempt,
-                        OverlayState::HumanHeld.as_str(),
-                        "ESCALATION_NOTIFICATION_FAILED",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "reason": "worktree_remote_mismatch",
-                            "error": err.to_string(),
-                        }),
+                        None,
+                        failure.branch.as_deref(),
+                        &err,
+                        "worktree_remote_mismatch",
                     )?;
                     continue;
                 }
@@ -3472,6 +3484,41 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         count, bead_id
                     );
                     if let Err(err) = post_scm_comment_by_bead_id(deps, bead_id, &comment_body) {
+                        // jleechan-1s2q / issue #444: a permanent parse-level
+                        // SCM error (e.g. an unparseable `external_ref`) MUST
+                        // stop retrying — mirror the missing-target terminal-
+                        // park path but emit ESCALATION_UNDELIVERABLE so the
+                        // operator sees the failure shape distinctly.
+                        if is_permanent_scm_target_error(&err) {
+                            overlay.state = OverlayState::HumanHeld;
+                            overlay.attempt = MAX_HUMAN_HELD_RECOVERY_ATTEMPT;
+                            set_human_hold_reason(
+                                &mut overlay,
+                                HumanHoldReason::UnknownOnlyGateCapped,
+                            );
+                            deps.store.save(&overlay)?;
+                            record_local_escalation_fallback(
+                                deps,
+                                bead_id,
+                                "unknown_only_gate_report_with_er_runner_capped",
+                            )?;
+                            summary.beads_parked_human_held += 1;
+                            emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::HumanHeld.as_str(),
+                                "ESCALATION_UNDELIVERABLE",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "reason": "unknown_only_gate_report_with_er_runner_capped",
+                                    "er_runner_attempts": count,
+                                    "pr_number": pr,
+                                    "scm_error": err.to_string(),
+                                }),
+                            )?;
+                            continue;
+                        }
                         if is_missing_scm_target_error(&err) {
                             // Unlike the other two cap-escalation sites, this
                             // bead has NOT been parked HUMAN_HELD yet (that
@@ -3860,6 +3907,156 @@ const MISSING_SCM_TARGET_ERROR_MARKER: &str = "no SCM comment target found";
 /// incident: 45 beads stuck in exactly this state with zero durable trace).
 fn is_missing_scm_target_error(err: &DaemonError) -> bool {
     matches!(err, DaemonError::Config(msg) if msg.contains(MISSING_SCM_TARGET_ERROR_MARKER))
+}
+
+/// jleechan-1s2q / issue #444: `Tracker::comment_external` returns
+/// `DaemonError::Parse("invalid external_ref format for comment: ...")`
+/// when the bead's `external_ref` cannot be parsed into a `(repo, issue)`
+/// pair — e.g. an unparseable ref like `local-bad-ref`. The current code
+/// path treated this as a transient failure and re-attempted every tick,
+/// emitting `ESCALATION_NOTIFICATION_FAILED` repeatedly while dispatch was
+/// starved (5 beads hung in this exact state for ~90s/tick on 2026-07-22).
+///
+/// A parse failure is permanent by definition (the input string is not
+/// going to magically become parseable on retry). Calling this function
+/// lets escalation call sites stop retrying and mark the bead
+/// `escalation_undeliverable` (operator-visible, terminal for the retry
+/// loop) — the same fail-closed approach `is_missing_scm_target_error` was
+/// introduced for at the `no SCM comment target found` shape. Both belong
+/// to the same family: "this bead cannot deliver an SCM comment no matter
+/// how many times we retry, so stop trying and surface the failure
+/// durably to an operator."
+fn is_permanent_scm_target_error(err: &DaemonError) -> bool {
+    matches!(err, DaemonError::Parse(msg) if msg.contains("invalid external_ref format for comment"))
+}
+
+/// Per-tick budget for escalation comment attempts. Caps the work the
+/// tick does against `comment_external` so a backlog of escalation-ready
+/// beads can't starve the dispatcher (jleechan-1s2q / issue #444: the
+/// 2026-07-22 incident had 9 looping beads continuously re-attempting
+/// SCM comments while a legitimately QUEUED bead sat undispatched for 65
+/// minutes — `beadsDispatched=0` for 10 consecutive TICKs).
+///
+/// `MAX_ESCALATION_COMMENT_ATTEMPTS_PER_TICK = 2` is intentionally tight:
+/// in normal operation every escalation site is short-circuited by the
+/// `ESCALATION_SENTINEL_ATTEMPT` dedup gate on the second visit, so the
+/// budget only matters when something is wrong (the same condition being
+/// escalated on every tick, or new permanent failures showing up). Two is
+/// enough headroom for both classes to land their first + second attempts
+/// across consecutive ticks without monopolizing the tick; raise it only
+/// if dashboards show escalation backlogs outpacing the dispatcher with
+/// the current value.
+const MAX_ESCALATION_COMMENT_ATTEMPTS_PER_TICK: u32 = 2;
+
+/// Outcome of `handle_scm_comment_failure`. Drives whether the caller
+/// `continue`s (CapEscalationStop, TransientFailureLogOnly — fall through
+/// to next bead regardless) or takes a different action (Success path
+/// is handled by the caller BEFORE this function is called; this enum
+/// covers only the post-failure branches).
+#[derive(Debug, PartialEq, Eq)]
+enum CapEscalationStopKind {
+    /// Permanent failure (`DaemonError::Parse` "invalid external_ref
+    /// format for comment"). Recorded locally + sentinel written, terminal
+    /// for the retry loop. Caller MUST `continue`.
+    PermanentUndeliverable,
+    /// Missing target (`DaemonError::Config "no SCM comment target
+    /// found"). Recorded locally, terminal for the retry loop. Caller
+    /// MUST `continue`.
+    MissingTarget,
+    /// Transient error (anything else). Logged with
+    /// `ESCALATION_NOTIFICATION_FAILED`, retried next tick. Caller MUST
+    /// `continue`.
+    TransientFailure,
+}
+
+/// Shared body for the post-`post_scm_comment_by_bead_id` failure branch
+/// at every `human_held_recovery_attempt_cap_reached`-style escalation
+/// site (jleechan-1s2q). Centralizing the logic here means the three
+/// failure shapes are classified in exactly one place, so the fix for
+/// issue #444 (permanent-failure stop, missing-target stop, transient
+/// retry) is uniform across the daemon instead of applied piecemeal.
+///
+/// `reason` is the per-site escalation reason used for the local-marker
+/// `park_reason` and the `ESCALATION_REQUIRED`/`ESCALATED_LOCALLY`/
+/// `ESCALATION_UNDELIVERABLE` telemetry event. Returns the failure kind
+/// so the caller can decide whether to `continue` (always — for any of the
+/// three outcomes, the escalation has been fully handled for this tick).
+///
+/// Takes `&str` identifiers instead of `&BeadOverlay` so call sites that
+/// hand back a `DispatchFailure` (which carries `(bead_id, attempt, branch)`
+/// but not pr_number or overlay mutability) can use the same shared helper
+/// without reconstructing a throwaway `BeadOverlay`.
+// 8 args is intentional: every cap-escalation site has the exact same
+// input shape (bead id + attempt + branch + pr_number + reason), and
+// collapsing them into a single struct would defeat the centralized
+// helper's whole point (uniform logic across heterogeneous call sites).
+#[allow(clippy::too_many_arguments)]
+fn handle_scm_comment_failure(
+    deps: &TickDeps,
+    summary: &mut TickSummary,
+    bead_id: &str,
+    attempt: u32,
+    pr_number: Option<u64>,
+    branch: Option<&str>,
+    err: &DaemonError,
+    reason: &str,
+) -> Result<CapEscalationStopKind, DaemonError> {
+    if is_permanent_scm_target_error(err) {
+        // jleechan-1s2q / issue #444: a permanent parse-level SCM error
+        // (e.g. an unparseable `external_ref`) cannot succeed on retry.
+        // Record a durable, operator-visible terminal marker and write the
+        // ESCALATION_SENTINEL_ATTEMPT row so the next tick short-circuits
+        // via `escalation_already_recorded` before ever reaching
+        // `comment_external` again.
+        record_local_escalation_fallback(deps, bead_id, reason)?;
+        emit(
+            deps.telemetry_log,
+            bead_id,
+            attempt,
+            OverlayState::HumanHeld.as_str(),
+            "ESCALATION_UNDELIVERABLE",
+            serde_json::json!({}),
+            serde_json::json!({
+                "reason": reason,
+                "scm_error": err.to_string(),
+                "pr_number": pr_number,
+                "branch": branch,
+            }),
+        )?;
+        return Ok(CapEscalationStopKind::PermanentUndeliverable);
+    }
+    if is_missing_scm_target_error(err) {
+        record_local_escalation_fallback(deps, bead_id, reason)?;
+        summary.beads_escalated_locally += 1;
+        emit(
+            deps.telemetry_log,
+            bead_id,
+            attempt,
+            OverlayState::HumanHeld.as_str(),
+            "ESCALATED_LOCALLY",
+            serde_json::json!({}),
+            serde_json::json!({
+                "reason": reason,
+                "scm_error": err.to_string(),
+                "pr_number": pr_number,
+                "branch": branch,
+            }),
+        )?;
+        return Ok(CapEscalationStopKind::MissingTarget);
+    }
+    emit(
+        deps.telemetry_log,
+        bead_id,
+        attempt,
+        OverlayState::HumanHeld.as_str(),
+        "ESCALATION_NOTIFICATION_FAILED",
+        serde_json::json!({}),
+        serde_json::json!({
+            "reason": reason,
+            "error": err.to_string(),
+        }),
+    )?;
+    Ok(CapEscalationStopKind::TransientFailure)
 }
 
 /// Local park_reason marker prefix written on `bead_overlay` when

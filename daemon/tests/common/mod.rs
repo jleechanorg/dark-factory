@@ -46,6 +46,13 @@ pub struct FakeTracker {
     pub create_bead_fail_for_ref: RefCell<Option<(String, String)>>,
     pub fail_next_fetch_candidates: RefCell<Option<String>>,
     pub fail_next_comment: RefCell<Option<String>>,
+    /// jleechan-1s2q: scripts `comment_external` to fail with a PERMANENT
+    /// `DaemonError::Parse` shape, the exact "invalid external_ref format"
+    /// shape `CliTracker::comment_external` returns for an unparseable ref
+    /// (e.g. `local-...` or a malformed GitHub URL). Consumed once, used by
+    /// the issue #444 regression test to prove the daemon stops retrying
+    /// instead of looping `ESCALATION_NOTIFICATION_FAILED` every tick.
+    pub perm_fail_next_comment: RefCell<Option<String>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -144,6 +151,13 @@ impl Tracker for FakeTracker {
         self.calls
             .borrow_mut()
             .push(format!("comment_external({external_ref},{body})"));
+        // jleechan-1s2q: PERMANENT failure shape (DaemonError::Parse) takes
+        // priority over the transient Tool shape so tests can script the
+        // exact "unparseable external_ref" error path that hung 5 beads
+        // for ~90s per tick in the 2026-07-22 incident.
+        if let Some(msg) = self.perm_fail_next_comment.borrow_mut().take() {
+            return Err(DaemonError::Parse(msg));
+        }
         if let Some(stderr) = self.fail_next_comment.borrow_mut().take() {
             return Err(DaemonError::Tool {
                 tool: "br".into(),

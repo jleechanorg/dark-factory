@@ -25,6 +25,7 @@ fn fake_tracker_records_calls_and_returns_scripted_response() {
         create_bead_fail_for_ref: Default::default(),
         fail_next_fetch_candidates: Default::default(),
         fail_next_comment: Default::default(),
+        perm_fail_next_comment: Default::default(),
         calls: Default::default(),
     };
 

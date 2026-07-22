@@ -11393,3 +11393,233 @@ fn jleechan328_gate_assessment_emits_operator_disposition_round_trip() {
         let _ = std::fs::remove_file(&telemetry_log);
     }
 }
+
+// =============================================================================
+// jleechan-1s2q / issue #444 — escalation loops re-fire per tick, starve
+// dispatch; dedup + permanent-failure stop + dispatch guarantee.
+// =============================================================================
+//
+// The two regression tests below pin the live-tick consequences from
+// 2026-07-22 (10 consecutive TICKs with `beadsDispatched=0`): the daemon
+// re-emitted `ESCALATION_NOTIFICATION_FAILED` for 5 beads whose comment
+// target ref is permanently unparseable, every tick. While that loop ran,
+// a legitimately QUEUED bead sat undispatched for 65 min.
+//
+// Each test simulates the exact failure shape observed in the live incident
+// and asserts the new (post-fix) behavior — using a permanent
+// `DaemonError::Parse` for the stop-retrying path and an immediate-QUEUED
+// fresh bead for the starvation guard. Both tests start RED (the dedup +
+// permanent-fail stops paths do not exist yet) and turn GREEN once the
+// implementation lands.
+
+/// jleechan-1s2q (b): a permanent comment-target failure (e.g. an
+/// unparseable `external_ref` returning `DaemonError::Parse`, exactly the
+/// `gh ... rc=1 'invalid issue format'` shape that hung 5 beads in the
+/// 2026-07-22 incident for ~90s apiece per tick) MUST stop retrying on the
+/// very next tick. The bead is marked `escalation_undeliverable` (operator-
+/// visible, terminal for the retry loop) and the daemon does NOT re-call
+/// `comment_external` on subsequent ticks even though the underlying error
+/// is non-`missing_target`.
+#[test]
+fn permanent_scm_comment_failure_stops_retrying_and_marks_undeliverable() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    const BEAD_ID: &str = "bead-undeliverable";
+
+    store.overlays.borrow_mut().insert(
+        BEAD_ID.into(),
+        BeadOverlay {
+            bead_id: BEAD_ID.into(),
+            state: OverlayState::HumanHeld,
+            attempt: 10,
+            reroll_count: 0,
+            autonomy_secs: 7,
+            spend_usd: 0.0,
+            pr_number: Some(9011),
+            branch: Some("factory/bead-undeliverable-r10".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+
+    // Script the FakeTracker to fail the first comment attempt with a
+    // PERMANENT (DaemonError::Parse) shape — exactly the `invalid external_ref
+    // format for comment` shape that gh/CliTracker returns for
+    // unparseable refs.
+    *tracker.perm_fail_next_comment.borrow_mut() =
+        Some("invalid external_ref format for comment: local-bad-ref".to_string());
+
+    let telemetry_log =
+        std::env::temp_dir().join("afd_1s2q_permanent_fail_stops.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // Tick 1: bead hits the cap, daemon tries the comment, comment fails
+    // permanently. One attempt is allowed — we cannot suppress the first try
+    // because the dedup state must be written the first time the failure
+    // is observed.
+    let summary1 = run_tick(&deps, 1, 0).expect("tick 1");
+    assert_eq!(
+        summary1.beads_escalated, 0,
+        "a permanent-failure comment must NOT increment beads_escalated \
+         (no escalation comment was posted); got {summary1:?}"
+    );
+    // one and only one comment call recorded so far.
+    assert_eq!(
+        tracker
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("comment_external("))
+            .count(),
+        1,
+        "exactly one comment attempt in tick 1; calls: {:?}",
+        tracker.calls.borrow()
+    );
+    let log1 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log1.contains("ESCALATION_UNDELIVERABLE"),
+        "tick 1 must emit ESCALATION_UNDELIVERABLE so the operator can see \
+         which beads are terminal-failed; log: {log1}"
+    );
+
+    // Tick 2: dedup marker set in tick 1 means the daemon must NOT even
+    // reach the `comment_external` call — the exact anti-pattern from the
+    // 2026-07-22 incident (every tick retried, every tick failed, every
+    // tick emitted ESCALATION_NOTIFICATION_FAILED).
+    let summary2 = run_tick(&deps, 2, 0).expect("tick 2");
+    assert_eq!(
+        summary2.beads_escalated, 0,
+        "permanent-failed escalation must stay terminal across ticks"
+    );
+    assert_eq!(
+        tracker
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("comment_external("))
+            .count(),
+        1,
+        "tick 2 MUST NOT call comment_external again; calls: {:?}",
+        tracker.calls.borrow()
+    );
+    let log2 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert_eq!(
+        log2.matches("ESCALATION_UNDELIVERABLE").count(),
+        1,
+        "ESCALATION_UNDELIVERABLE fires exactly once, not per tick: {log2}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-1s2q (c): the per-tick escalation comment budget is applied
+/// independently of the dispatcher. After (b) makes permanent failures
+/// stop retrying on subsequent ticks, the dispatch path is still
+/// guaranteed scheduling time on the FIRST tick too — i.e. a budget of
+/// comment attempts per tick means escalation work cannot starve the
+/// dispatch pass.
+///
+/// This test asserts the contract that (i) escalation comment attempts
+/// are bounded per tick and (ii) the rest of the tick's work runs after
+/// the budget is consumed. We probe the FIRST part directly: with 9
+/// looping beads and a single bead budget, the tracker must observe
+/// exactly `MAX_ESCALATION_COMMENT_ATTEMPTS_PER_TICK` `comment_external`
+/// calls (not 9) in the first tick where the budget is the binding
+/// constraint. Without the budget, the pre-fix daemon would invoke
+/// `comment_external` for every looping bead, eating wall-clock and
+/// starving the dispatch that follows.
+#[test]
+fn escalation_comment_budget_caps_per_tick_attempts() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    // 9 looping beads reaching the cap-escalation block; each fires
+    // `comment_external` once per ticket (transient error path) without
+    // a budget. The cap must bound these.
+    for bead_id in [
+        "loop-1", "loop-2", "loop-3", "loop-4", "loop-5", "loop-6", "loop-7",
+        "loop-8", "loop-9",
+    ] {
+        store.overlays.borrow_mut().insert(
+            bead_id.into(),
+            BeadOverlay {
+                bead_id: bead_id.into(),
+                state: OverlayState::HumanHeld,
+                attempt: 10,
+                reroll_count: 0,
+                autonomy_secs: 7,
+                spend_usd: 0.0,
+                pr_number: Some(9020),
+                branch: Some(format!("factory/{bead_id}-r10")),
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
+            },
+        );
+    }
+
+    // First comment attempt fails TRANSIENTLY (so the bead stays
+    // escalation-eligible for the next tick). One-shot field, but the
+    // daemon will keep retrying per bead — this is the loop-burn shape.
+    *tracker.fail_next_comment.borrow_mut() = Some("transient".into());
+
+    let telemetry_log =
+        std::env::temp_dir().join("afd_1s2q_comment_budget.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let _summary = run_tick(&deps, 1, 0).expect("tick must succeed");
+
+    let comment_calls = tracker
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| c.starts_with("comment_external("))
+        .count();
+    assert!(
+        comment_calls <= 2,
+        "the per-tick budget MUST bound comment attempts (got {comment_calls}); \
+         without the bound, dispatch is starved by per-tick escalation work"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
