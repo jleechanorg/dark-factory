@@ -720,6 +720,7 @@ mod tests {
             held_recheck_cooldown_secs: 900,
             repos: std::collections::HashMap::new(),
             pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
         };
 
         let (project, _) = ao_runtime_binding(&cfg).unwrap();

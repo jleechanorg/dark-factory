@@ -46,6 +46,13 @@ pub struct FakeTracker {
     pub create_bead_fail_for_ref: RefCell<Option<(String, String)>>,
     pub fail_next_fetch_candidates: RefCell<Option<String>>,
     pub fail_next_comment: RefCell<Option<String>>,
+    /// 1s2q-escalation-dedup Task 2: scripts `comment_external` to fail with a
+    /// PERMANENT (non-transient) `DaemonError::Config`, simulating the live
+    /// incident where `gh` returned `invalid issue format: "local-xxx"` and the
+    /// daemon kept re-firing `ESCALATION_NOTIFICATION_FAILED` every ~90s. When
+    /// set, this takes precedence over `fail_next_comment` so a test can drive
+    /// the terminal-marking path. Consumed once.
+    pub fail_next_comment_permanent: RefCell<Option<String>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -144,6 +151,9 @@ impl Tracker for FakeTracker {
         self.calls
             .borrow_mut()
             .push(format!("comment_external({external_ref},{body})"));
+        if let Some(msg) = self.fail_next_comment_permanent.borrow_mut().take() {
+            return Err(DaemonError::Config(msg));
+        }
         if let Some(stderr) = self.fail_next_comment.borrow_mut().take() {
             return Err(DaemonError::Tool {
                 tool: "br".into(),
@@ -1175,7 +1185,23 @@ pub struct FakeStateStore {
     /// Bead jleechan-yoqy / issue #323: per-bead last-/er evidence-marker hash
     /// (mirrors the `last_er_evidence_hash` column), for the retrigger tests.
     pub last_er_evidence_hash: RefCell<HashMap<String, String>>,
+    /// 1s2q-escalation-dedup: per-(bead_id, reason) escalation ledger rows
+    /// (mirrors the `escalation_ledger` SQLite table). Each entry is
+    /// `(context_hash, last_emitted_epoch, terminal)`. Used by the fake's
+    /// `escalation_should_emit`/`record_escalation_emit`/
+    /// `mark_escalation_undeliverable` impls so tick-integration tests can
+    /// exercise the dedup + terminal-marking paths without a real SQLite DB.
+    pub escalation_ledger:
+        RefCell<HashMap<(String, String), EscalationLedgerEntry>>,
     pub calls: RefCell<Vec<String>>,
+}
+
+/// In-memory mirror of one `escalation_ledger` row for `FakeStateStore`.
+#[derive(Debug, Clone, Default)]
+pub struct EscalationLedgerEntry {
+    pub context_hash: String,
+    pub last_emitted_epoch: u64,
+    pub terminal: bool,
 }
 
 impl FakeStateStore {
@@ -1466,5 +1492,72 @@ impl StateStore for FakeStateStore {
             .borrow()
             .get(&(bead_id.to_string(), attempt))
             .map(|(_, _, feedback_text)| feedback_text.clone()))
+    }
+
+    fn escalation_should_emit(
+        &self,
+        bead_id: &str,
+        reason: &str,
+        context_hash: &str,
+        now_epoch: u64,
+        refire_secs: u64,
+    ) -> Result<bool, DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "escalation_should_emit({bead_id},{reason})"
+        ));
+        match self
+            .escalation_ledger
+            .borrow()
+            .get(&(bead_id.to_string(), reason.to_string()))
+        {
+            None => Ok(true),
+            Some(entry) => {
+                if entry.terminal {
+                    return Ok(false);
+                }
+                if entry.context_hash != context_hash {
+                    return Ok(true);
+                }
+                Ok(now_epoch.saturating_sub(entry.last_emitted_epoch) >= refire_secs)
+            }
+        }
+    }
+
+    fn record_escalation_emit(
+        &self,
+        bead_id: &str,
+        reason: &str,
+        context_hash: &str,
+        now_epoch: u64,
+    ) -> Result<(), DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "record_escalation_emit({bead_id},{reason})"
+        ));
+        let mut ledger = self.escalation_ledger.borrow_mut();
+        let entry = ledger
+            .entry((bead_id.to_string(), reason.to_string()))
+            .or_default();
+        entry.context_hash = context_hash.to_string();
+        entry.last_emitted_epoch = now_epoch;
+        // record_escalation_emit never flips terminal on (only
+        // mark_escalation_undeliverable does), but it must not clear an
+        // already-terminal flag either.
+        Ok(())
+    }
+
+    fn mark_escalation_undeliverable(
+        &self,
+        bead_id: &str,
+        reason: &str,
+    ) -> Result<(), DaemonError> {
+        self.calls.borrow_mut().push(format!(
+            "mark_escalation_undeliverable({bead_id},{reason})"
+        ));
+        let mut ledger = self.escalation_ledger.borrow_mut();
+        let entry = ledger
+            .entry((bead_id.to_string(), reason.to_string()))
+            .or_default();
+        entry.terminal = true;
+        Ok(())
     }
 }

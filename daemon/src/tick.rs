@@ -76,6 +76,25 @@ pub struct TickSummary {
     /// churn). The fast tier keeps assessing on each tick; this counter
     /// just records the holds placed this tick.
     pub beads_held_disposition_required: usize,
+    /// 1s2q-escalation-dedup: escalation events (ESCALATION_REQUIRED /
+    /// ESCALATION_NOTIFICATION_FAILED) suppressed this tick because the
+    /// context hash was unchanged AND the backoff window
+    /// (`Config::escalation_refire_secs`) had not elapsed since the last
+    /// emit for the same `(bead_id, reason)`. Counted in the per-tick TICK
+    /// summary line, not as per-bead telemetry (avoiding the very spam this
+    /// dedup exists to stop).
+    pub escalations_suppressed: usize,
+    /// 1s2q-escalation-dedup Task 2: escalations marked terminal
+    /// ("escalation_undeliverable") this tick because the notification
+    /// failure was caused by a PERMANENT (non-transient per
+    /// `DaemonError::is_transient`) gh error that will never resolve (e.g.
+    /// `invalid issue format: "local-xxx"`). Each such marking emits ONE
+    /// final `ESCALATION_UNDELIVERABLE` event and sets `terminal = 1` in the
+    /// `escalation_ledger` so `escalation_should_emit` returns `Ok(false)`
+    /// on every future tick — stopping the live incident where
+    /// `ESCALATION_NOTIFICATION_FAILED` re-fired every ~90s for beads with
+    /// permanent gh errors despite `human_held_recovery_attempt_cap_reached`.
+    pub escalations_undeliverable: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -208,6 +227,130 @@ fn emit(
             metrics,
             context,
         },
+    )
+}
+
+/// 1s2q-escalation-dedup: compute a deterministic hex hash of the serialized
+/// `context` JSON for an escalation event. Used as the dedup key in the
+/// `escalation_ledger` — two events with the same stable context fields
+/// produce the same hash, so a re-fire with identical context is suppressed
+/// within the backoff window. Uses `std::hash::DefaultHasher` (the repo has a
+/// strict 5-dependency budget and no `sha2` crate); the hash is formatted as
+/// 16-char lowercase hex. This is NOT a cryptographic hash — it only needs to
+/// be deterministic and collision-resistant across the small space of
+/// per-bead escalation contexts, which `DefaultHasher` satisfies.
+fn escalation_context_hash(context: &serde_json::Value) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    // Serialize to a canonical JSON string so key ordering is stable regardless
+    // of how the `serde_json::json!` macro laid the object out.
+    let serialized = serde_json::to_string(context).unwrap_or_else(|_| String::new());
+    serialized.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// 1s2q-escalation-dedup: the current unix epoch in seconds. Centralized so
+/// every escalation dedup check in a single tick shares the same `now_epoch`
+/// (avoids sub-second skew making a same-tick re-fire look like it's past
+/// backoff). Matches the `SystemTime::now()...as_secs()` pattern already used
+/// throughout tick.rs.
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// 1s2q-escalation-dedup: consult the `escalation_ledger` before emitting an
+/// escalation event. Returns `Ok((true, hash))` (proceed with emit) when no
+/// prior record exists, the context hash changed, or the backoff window has
+/// elapsed. Returns `Ok((false, hash))` (suppress) when the same context was
+/// emitted within `cfg.escalation_refire_secs`. The returned `hash` is the
+/// deterministic hex digest of `context` — pass it to
+/// `record_escalation_emit_dedup` after the emit so the ledger row is stamped
+/// without re-borrowing `context` (which `emit` consumes by ownership). On
+/// suppression, the caller increments `summary.escalations_suppressed` and
+/// skips the emit (no per-bead suppression telemetry — the count goes in the
+/// TICK summary).
+fn escalation_dedup_should_emit(
+    deps: &TickDeps,
+    bead_id: &str,
+    reason: &str,
+    context: &serde_json::Value,
+    now_epoch: u64,
+) -> Result<(bool, String), DaemonError> {
+    let context_hash = escalation_context_hash(context);
+    let should = deps.store.escalation_should_emit(
+        bead_id,
+        reason,
+        &context_hash,
+        now_epoch,
+        deps.cfg.escalation_refire_secs,
+    )?;
+    Ok((should, context_hash))
+}
+
+/// 1s2q-escalation-dedup: record (upsert) the escalation ledger row after a
+/// successful emit. Takes the precomputed `context_hash` (returned by
+/// `escalation_dedup_should_emit`) rather than re-borrowing the `context`
+/// value that `emit` has already consumed by ownership.
+fn record_escalation_emit_dedup(
+    deps: &TickDeps,
+    bead_id: &str,
+    reason: &str,
+    context_hash: &str,
+    now_epoch: u64,
+) -> Result<(), DaemonError> {
+    deps.store
+        .record_escalation_emit(bead_id, reason, context_hash, now_epoch)
+}
+
+/// 1s2q-escalation-dedup Task 2: when a notification failure (`Err` from
+/// `post_scm_comment_by_bead_id`) is caused by a PERMANENT (non-transient per
+/// `DaemonError::is_transient`) gh error — e.g. `invalid issue format:
+/// "local-xxx"` — the error will never resolve on retry. Mark the
+/// `(bead_id, reason)` escalation ledger row terminal
+/// (`mark_escalation_undeliverable` → `terminal = 1`), emit ONE final
+/// `ESCALATION_UNDELIVERABLE` event, and bump the per-tick counter. On every
+/// future tick `escalation_should_emit` returns `Ok(false)` for this row
+/// (terminal check precedes hash/backoff), so no re-emit occurs — stopping
+/// the live incident where `ESCALATION_NOTIFICATION_FAILED` re-fired every
+/// ~90s for beads with permanent gh errors. The caller MUST have already
+/// excluded the `is_missing_scm_target_error` case (which has its own
+/// terminal local-fallback path) before calling this.
+fn mark_escalation_undeliverable_and_emit(
+    deps: &TickDeps,
+    summary: &mut TickSummary,
+    bead_id: &str,
+    attempt: u32,
+    lifecycle_state: &str,
+    reason: &str,
+    err: &DaemonError,
+) -> Result<(), DaemonError> {
+    deps.store.mark_escalation_undeliverable(bead_id, reason)?;
+    // Record the escalation sentinel so `escalation_already_recorded` at the
+    // top of each site returns `true` on future ticks — the permanent-error
+    // path must be truly terminal (ONE final event, no re-attempt). Mirrors
+    // `record_local_escalation_fallback`, which also calls `record_escalation`
+    // for the same reason. Without this, the `escalation_already_recorded`
+    // guard (which only checks `review_rejection`, set on the SUCCESS path)
+    // would not block, and the permanent-error branch would re-fire every
+    // tick — the exact live incident this task fixes.
+    record_escalation(deps, bead_id, reason)?;
+    summary.escalations_undeliverable += 1;
+    emit(
+        deps.telemetry_log,
+        bead_id,
+        attempt,
+        lifecycle_state,
+        "ESCALATION_UNDELIVERABLE",
+        serde_json::json!({}),
+        serde_json::json!({
+            "reason": reason,
+            "error": err.to_string(),
+            "permanent": true,
+        }),
     )
 }
 
@@ -348,17 +491,6 @@ pub fn run_tick(
         let ratio = (deps.cfg.slow_tick_secs / deps.cfg.fast_tick_secs.max(1)).max(1);
         tick_index.is_multiple_of(ratio)
     };
-
-    // jleechan-gib: automated HUMAN_HELD exit (Rust port of shell
-    // `recover-held`). Runs at the TOP of the tick, BEFORE the active-overlay
-    // wedge-detection loop, so that a bead recovered this tick cannot also be
-    // parked this same tick (otherwise the wedge check would re-park a
-    // freshly-QUEUED bead before dispatch can make progress). Recovery only
-    // fires when the slow tier is due (matches the shell overlay's cadence
-    // — `recover-held` was never per-fast-tick).
-    if slow_tier_due {
-        run_recovery_step(deps, &mut summary)?;
-    }
 
     // jleechan-54ky / sub-fix for jleechan-gib: split the SQL-level "increment
     // every active row" into list + per-row bump so we can pause the autonomy
@@ -895,6 +1027,21 @@ pub fn run_tick(
         run_slow_tier(deps, &mut summary)?;
     }
 
+    // jleechan-gib: automated HUMAN_HELD exit (Rust port of shell
+    // `recover-held`). Runs AFTER `run_slow_tier` so that dispatch of
+    // already-QUEUED beads (from prior ticks) happens BEFORE any
+    // recovery/escalation work each tick — this guarantees a QUEUED bead is
+    // dispatched on the first available slow tick and can never be starved by
+    // an escalation backlog aborting the tick via `?` before dispatch runs.
+    // The active-overlay wedge loop above only processes DISPATCHED/ATTESTED
+    // beads (via `list_active_overlays`), so a freshly-recovered QUEUED bead
+    // is never re-parked by it; placing recovery after the wedge loop is safe.
+    // Recovery only fires when the slow tier is due (matches the shell
+    // overlay's cadence — `recover-held` was never per-fast-tick).
+    if slow_tier_due {
+        run_recovery_step(deps, &mut summary)?;
+    }
+
     run_fast_tier(deps, &mut summary)?;
 
     emit(
@@ -914,6 +1061,8 @@ pub fn run_tick(
             "beadsEscalated": summary.beads_escalated,
             "beadsEscalatedLocally": summary.beads_escalated_locally,
             "beadsHeldDispositionRequired": summary.beads_held_disposition_required,
+            "escalationsSuppressed": summary.escalations_suppressed,
+            "escalationsUndeliverable": summary.escalations_undeliverable,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
@@ -925,10 +1074,12 @@ pub fn run_tick(
 /// `recover-held`). Requeues only allow-listed retry-safe `HUMAN_HELD`
 /// beads below `MAX_HUMAN_HELD_RECOVERY_ATTEMPT` whose durable overlay has
 /// no session handle, increments `attempt`, and zeros `autonomy_secs`.
-/// Unknown/possibly-live holds fail closed. Must run BEFORE the
-/// active-overlay wedge-detection loop in `run_tick` so a freshly-QUEUED
-/// bead is not immediately re-parked by the timebox/wedge checks in the
-/// same tick.
+/// Unknown/possibly-live holds fail closed. Runs AFTER `run_slow_tier` in
+/// `run_tick` so that dispatch of already-QUEUED beads happens before any
+/// recovery/escalation work; recovered beads become QUEUED and are
+/// dispatched on the NEXT slow tick. The active-overlay wedge loop only
+/// processes DISPATCHED/ATTESTED beads, so a freshly-recovered QUEUED bead
+/// is never re-parked by it.
 fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
     let recovered = deps
         .store
@@ -985,6 +1136,34 @@ fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), D
                 )?;
                 continue;
             }
+            if !err.is_transient() {
+                mark_escalation_undeliverable_and_emit(
+                    deps,
+                    summary,
+                    &overlay.bead_id,
+                    overlay.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "human_held_recovery_attempt_cap_reached",
+                    &err,
+                )?;
+                continue;
+            }
+            let ctx = serde_json::json!({
+                "reason": "human_held_recovery_attempt_cap_reached",
+                "error": err.to_string(),
+            });
+            let now_epoch = now_epoch_secs();
+            let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                deps,
+                &overlay.bead_id,
+                "human_held_recovery_attempt_cap_reached",
+                &ctx,
+                now_epoch,
+            )?;
+            if !should_emit {
+                summary.escalations_suppressed += 1;
+                continue;
+            }
             emit(
                 deps.telemetry_log,
                 &overlay.bead_id,
@@ -992,10 +1171,14 @@ fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), D
                 OverlayState::HumanHeld.as_str(),
                 "ESCALATION_NOTIFICATION_FAILED",
                 serde_json::json!({}),
-                serde_json::json!({
-                    "reason": "human_held_recovery_attempt_cap_reached",
-                    "error": err.to_string(),
-                }),
+                ctx,
+            )?;
+            record_escalation_emit_dedup(
+                deps,
+                &overlay.bead_id,
+                "human_held_recovery_attempt_cap_reached",
+                &ctx_hash,
+                now_epoch,
             )?;
             continue;
         }
@@ -1005,20 +1188,40 @@ fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), D
             "human_held_recovery_attempt_cap_reached",
         )?;
         summary.beads_escalated += 1;
-        emit(
-            deps.telemetry_log,
+        let ctx = serde_json::json!({
+            "reason": "human_held_recovery_attempt_cap_reached",
+            "max_attempt": MAX_HUMAN_HELD_RECOVERY_ATTEMPT,
+            "pr_number": overlay.pr_number,
+            "branch": overlay.branch,
+        });
+        let now_epoch = now_epoch_secs();
+        let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+            deps,
             &overlay.bead_id,
-            overlay.attempt,
-            OverlayState::HumanHeld.as_str(),
-            "ESCALATION_REQUIRED",
-            serde_json::json!({}),
-            serde_json::json!({
-                "reason": "human_held_recovery_attempt_cap_reached",
-                "max_attempt": MAX_HUMAN_HELD_RECOVERY_ATTEMPT,
-                "pr_number": overlay.pr_number,
-                "branch": overlay.branch,
-            }),
+            "human_held_recovery_attempt_cap_reached",
+            &ctx,
+            now_epoch,
         )?;
+        if !should_emit {
+            summary.escalations_suppressed += 1;
+        } else {
+            emit(
+                deps.telemetry_log,
+                &overlay.bead_id,
+                overlay.attempt,
+                OverlayState::HumanHeld.as_str(),
+                "ESCALATION_REQUIRED",
+                serde_json::json!({}),
+                ctx,
+            )?;
+            record_escalation_emit_dedup(
+                deps,
+                &overlay.bead_id,
+                "human_held_recovery_attempt_cap_reached",
+                &ctx_hash,
+                now_epoch,
+            )?;
+        }
     }
     Ok(())
 }
@@ -1026,11 +1229,11 @@ fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), D
 /// Slow tier: intake new beads, route each freshly-queued bead, dispatch as
 /// many QUEUED beads as the safety envelope (30/15) allows.
 fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
-    // jleechan-gib: recovery has already run at the top of this tick via
-    // `run_recovery_step` (it must run BEFORE the active-overlay wedge loop
-    // so freshly-QUEUED beads aren't immediately re-parked by wedge
-    // detection). The freshly-recovered QUEUED beads are picked up by the
-    // routing_candidates loop below, so they get dispatched this same tick.
+    // jleechan-gib: recovery runs AFTER this slow-tier dispatch pass (see
+    // `run_tick`), so freshly-recovered QUEUED beads are NOT dispatched this
+    // same tick — they are dispatched on the NEXT slow tick. This is the
+    // required dispatch-scheduling guarantee: already-QUEUED beads (from prior
+    // ticks) are dispatched before any recovery/escalation work each tick.
     let mut pr_intake_bead_ids = HashSet::new();
     let (pr_adoptions, pr_skip_outcomes) =
         intake::normalize_labeled_prs(deps.scm, deps.tracker, deps.cfg)?;
@@ -1055,6 +1258,25 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 let _ = deps
                     .tracker
                     .comment_external(&adopted.external_ref, &comment_body);
+                let ctx = serde_json::json!({
+                    "reason": "adoption_branch_collision",
+                    "branch": adopted.head_ref_name,
+                    "registered_bead": owner,
+                    "registered_bead_live": owner_live,
+                    "external_ref": adopted.external_ref,
+                });
+                let now_epoch = now_epoch_secs();
+                let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                    deps,
+                    &adopted.bead_id,
+                    "adoption_branch_collision",
+                    &ctx,
+                    now_epoch,
+                )?;
+                if !should_emit {
+                    summary.escalations_suppressed += 1;
+                    continue;
+                }
                 summary.beads_escalated += 1;
                 emit(
                     deps.telemetry_log,
@@ -1063,13 +1285,14 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     OverlayState::HumanHeld.as_str(),
                     "ESCALATION_REQUIRED",
                     serde_json::json!({}),
-                    serde_json::json!({
-                        "reason": "adoption_branch_collision",
-                        "branch": adopted.head_ref_name,
-                        "registered_bead": owner,
-                        "registered_bead_live": owner_live,
-                        "external_ref": adopted.external_ref,
-                    }),
+                    ctx,
+                )?;
+                record_escalation_emit_dedup(
+                    deps,
+                    &adopted.bead_id,
+                    "adoption_branch_collision",
+                    &ctx_hash,
+                    now_epoch,
                 )?;
                 continue;
             }
@@ -1447,6 +1670,34 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         )?;
                         continue;
                     }
+                    if !err.is_transient() {
+                        mark_escalation_undeliverable_and_emit(
+                            deps,
+                            summary,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "transient_spawn_retry_cap_exceeded",
+                            &err,
+                        )?;
+                        continue;
+                    }
+                    let ctx = serde_json::json!({
+                        "reason": "transient_spawn_retry_cap_exceeded",
+                        "error": err.to_string(),
+                    });
+                    let now_epoch = now_epoch_secs();
+                    let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                        deps,
+                        &failure.bead_id,
+                        "transient_spawn_retry_cap_exceeded",
+                        &ctx,
+                        now_epoch,
+                    )?;
+                    if !should_emit {
+                        summary.escalations_suppressed += 1;
+                        continue;
+                    }
                     emit(
                         deps.telemetry_log,
                         &failure.bead_id,
@@ -1454,28 +1705,52 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         OverlayState::HumanHeld.as_str(),
                         "ESCALATION_NOTIFICATION_FAILED",
                         serde_json::json!({}),
-                        serde_json::json!({
-                            "reason": "transient_spawn_retry_cap_exceeded",
-                            "error": err.to_string(),
-                        }),
+                        ctx,
+                    )?;
+                    record_escalation_emit_dedup(
+                        deps,
+                        &failure.bead_id,
+                        "transient_spawn_retry_cap_exceeded",
+                        &ctx_hash,
+                        now_epoch,
                     )?;
                     continue;
                 }
                 record_escalation(deps, &failure.bead_id, "transient_spawn_retry_cap_exceeded")?;
                 summary.beads_escalated += 1;
-                emit(
-                    deps.telemetry_log,
+                let ctx = serde_json::json!({
+                    "reason": "transient_spawn_retry_cap_exceeded",
+                    "max_transient_spawn_retry": MAX_TRANSIENT_SPAWN_RETRY,
+                    "branch": failure.branch.as_deref(),
+                });
+                let now_epoch = now_epoch_secs();
+                let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                    deps,
                     &failure.bead_id,
-                    failure.attempt,
-                    OverlayState::HumanHeld.as_str(),
-                    "ESCALATION_REQUIRED",
-                    serde_json::json!({}),
-                    serde_json::json!({
-                        "reason": "transient_spawn_retry_cap_exceeded",
-                        "max_transient_spawn_retry": MAX_TRANSIENT_SPAWN_RETRY,
-                        "branch": failure.branch.as_deref(),
-                    }),
+                    "transient_spawn_retry_cap_exceeded",
+                    &ctx,
+                    now_epoch,
                 )?;
+                if !should_emit {
+                    summary.escalations_suppressed += 1;
+                } else {
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_REQUIRED",
+                        serde_json::json!({}),
+                        ctx,
+                    )?;
+                    record_escalation_emit_dedup(
+                        deps,
+                        &failure.bead_id,
+                        "transient_spawn_retry_cap_exceeded",
+                        &ctx_hash,
+                        now_epoch,
+                    )?;
+                }
                 continue;
             }
 
@@ -1537,6 +1812,34 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         )?;
                         continue;
                     }
+                    if !err.is_transient() {
+                        mark_escalation_undeliverable_and_emit(
+                            deps,
+                            summary,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "unmapped_repo",
+                            &err,
+                        )?;
+                        continue;
+                    }
+                    let ctx = serde_json::json!({
+                        "reason": "unmapped_repo",
+                        "error": err.to_string(),
+                    });
+                    let now_epoch = now_epoch_secs();
+                    let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                        deps,
+                        &failure.bead_id,
+                        "unmapped_repo",
+                        &ctx,
+                        now_epoch,
+                    )?;
+                    if !should_emit {
+                        summary.escalations_suppressed += 1;
+                        continue;
+                    }
                     emit(
                         deps.telemetry_log,
                         &failure.bead_id,
@@ -1544,24 +1847,48 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         OverlayState::HumanHeld.as_str(),
                         "ESCALATION_NOTIFICATION_FAILED",
                         serde_json::json!({}),
-                        serde_json::json!({
-                            "reason": "unmapped_repo",
-                            "error": err.to_string(),
-                        }),
+                        ctx,
+                    )?;
+                    record_escalation_emit_dedup(
+                        deps,
+                        &failure.bead_id,
+                        "unmapped_repo",
+                        &ctx_hash,
+                        now_epoch,
                     )?;
                     continue;
                 }
                 record_escalation(deps, &failure.bead_id, "unmapped_repo")?;
                 summary.beads_escalated += 1;
-                emit(
-                    deps.telemetry_log,
+                let ctx = serde_json::json!({"reason": "unmapped_repo"});
+                let now_epoch = now_epoch_secs();
+                let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                    deps,
                     &failure.bead_id,
-                    failure.attempt,
-                    OverlayState::HumanHeld.as_str(),
-                    "ESCALATION_REQUIRED",
-                    serde_json::json!({}),
-                    serde_json::json!({"reason": "unmapped_repo"}),
+                    "unmapped_repo",
+                    &ctx,
+                    now_epoch,
                 )?;
+                if !should_emit {
+                    summary.escalations_suppressed += 1;
+                } else {
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_REQUIRED",
+                        serde_json::json!({}),
+                        ctx,
+                    )?;
+                    record_escalation_emit_dedup(
+                        deps,
+                        &failure.bead_id,
+                        "unmapped_repo",
+                        &ctx_hash,
+                        now_epoch,
+                    )?;
+                }
                 continue;
             }
 
@@ -1620,6 +1947,34 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         )?;
                         continue;
                     }
+                    if !err.is_transient() {
+                        mark_escalation_undeliverable_and_emit(
+                            deps,
+                            summary,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "unmapped_target_repo",
+                            &err,
+                        )?;
+                        continue;
+                    }
+                    let ctx = serde_json::json!({
+                        "reason": "unmapped_target_repo",
+                        "error": err.to_string(),
+                    });
+                    let now_epoch = now_epoch_secs();
+                    let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                        deps,
+                        &failure.bead_id,
+                        "unmapped_target_repo",
+                        &ctx,
+                        now_epoch,
+                    )?;
+                    if !should_emit {
+                        summary.escalations_suppressed += 1;
+                        continue;
+                    }
                     emit(
                         deps.telemetry_log,
                         &failure.bead_id,
@@ -1627,24 +1982,48 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         OverlayState::HumanHeld.as_str(),
                         "ESCALATION_NOTIFICATION_FAILED",
                         serde_json::json!({}),
-                        serde_json::json!({
-                            "reason": "unmapped_target_repo",
-                            "error": err.to_string(),
-                        }),
+                        ctx,
+                    )?;
+                    record_escalation_emit_dedup(
+                        deps,
+                        &failure.bead_id,
+                        "unmapped_target_repo",
+                        &ctx_hash,
+                        now_epoch,
                     )?;
                     continue;
                 }
                 record_escalation(deps, &failure.bead_id, "unmapped_target_repo")?;
                 summary.beads_escalated += 1;
-                emit(
-                    deps.telemetry_log,
+                let ctx = serde_json::json!({"reason": "unmapped_target_repo"});
+                let now_epoch = now_epoch_secs();
+                let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                    deps,
                     &failure.bead_id,
-                    failure.attempt,
-                    OverlayState::HumanHeld.as_str(),
-                    "ESCALATION_REQUIRED",
-                    serde_json::json!({}),
-                    serde_json::json!({"reason": "unmapped_target_repo"}),
+                    "unmapped_target_repo",
+                    &ctx,
+                    now_epoch,
                 )?;
+                if !should_emit {
+                    summary.escalations_suppressed += 1;
+                } else {
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_REQUIRED",
+                        serde_json::json!({}),
+                        ctx,
+                    )?;
+                    record_escalation_emit_dedup(
+                        deps,
+                        &failure.bead_id,
+                        "unmapped_target_repo",
+                        &ctx_hash,
+                        now_epoch,
+                    )?;
+                }
                 continue;
             }
 
@@ -1707,6 +2086,34 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         )?;
                         continue;
                     }
+                    if !err.is_transient() {
+                        mark_escalation_undeliverable_and_emit(
+                            deps,
+                            summary,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "worktree_remote_mismatch",
+                            &err,
+                        )?;
+                        continue;
+                    }
+                    let ctx = serde_json::json!({
+                        "reason": "worktree_remote_mismatch",
+                        "error": err.to_string(),
+                    });
+                    let now_epoch = now_epoch_secs();
+                    let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                        deps,
+                        &failure.bead_id,
+                        "worktree_remote_mismatch",
+                        &ctx,
+                        now_epoch,
+                    )?;
+                    if !should_emit {
+                        summary.escalations_suppressed += 1;
+                        continue;
+                    }
                     emit(
                         deps.telemetry_log,
                         &failure.bead_id,
@@ -1714,24 +2121,48 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         OverlayState::HumanHeld.as_str(),
                         "ESCALATION_NOTIFICATION_FAILED",
                         serde_json::json!({}),
-                        serde_json::json!({
-                            "reason": "worktree_remote_mismatch",
-                            "error": err.to_string(),
-                        }),
+                        ctx,
+                    )?;
+                    record_escalation_emit_dedup(
+                        deps,
+                        &failure.bead_id,
+                        "worktree_remote_mismatch",
+                        &ctx_hash,
+                        now_epoch,
                     )?;
                     continue;
                 }
                 record_escalation(deps, &failure.bead_id, "worktree_remote_mismatch")?;
                 summary.beads_escalated += 1;
-                emit(
-                    deps.telemetry_log,
+                let ctx = serde_json::json!({"reason": "worktree_remote_mismatch"});
+                let now_epoch = now_epoch_secs();
+                let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                    deps,
                     &failure.bead_id,
-                    failure.attempt,
-                    OverlayState::HumanHeld.as_str(),
-                    "ESCALATION_REQUIRED",
-                    serde_json::json!({}),
-                    serde_json::json!({"reason": "worktree_remote_mismatch"}),
+                    "worktree_remote_mismatch",
+                    &ctx,
+                    now_epoch,
                 )?;
+                if !should_emit {
+                    summary.escalations_suppressed += 1;
+                } else {
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_REQUIRED",
+                        serde_json::json!({}),
+                        ctx,
+                    )?;
+                    record_escalation_emit_dedup(
+                        deps,
+                        &failure.bead_id,
+                        "worktree_remote_mismatch",
+                        &ctx_hash,
+                        now_epoch,
+                    )?;
+                }
                 continue;
             }
 
@@ -3511,6 +3942,36 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             )?;
                             continue;
                         }
+                        if !err.is_transient() {
+                            mark_escalation_undeliverable_and_emit(
+                                deps,
+                                summary,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::Attested.as_str(),
+                                "unknown_only_gate_report_with_er_runner_capped",
+                                &err,
+                            )?;
+                            continue;
+                        }
+                        let ctx = serde_json::json!({
+                            "reason": "unknown_only_gate_report_with_er_runner_capped",
+                            "er_runner_attempts": count,
+                            "pr_number": pr,
+                            "error": err.to_string(),
+                        });
+                        let now_epoch = now_epoch_secs();
+                        let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                            deps,
+                            bead_id,
+                            "unknown_only_gate_report_with_er_runner_capped",
+                            &ctx,
+                            now_epoch,
+                        )?;
+                        if !should_emit {
+                            summary.escalations_suppressed += 1;
+                            continue;
+                        }
                         emit(
                             deps.telemetry_log,
                             bead_id,
@@ -3518,12 +3979,14 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             OverlayState::Attested.as_str(),
                             "ESCALATION_NOTIFICATION_FAILED",
                             serde_json::json!({}),
-                            serde_json::json!({
-                                "reason": "unknown_only_gate_report_with_er_runner_capped",
-                                "er_runner_attempts": count,
-                                "pr_number": pr,
-                                "error": err.to_string(),
-                            }),
+                            ctx,
+                        )?;
+                        record_escalation_emit_dedup(
+                            deps,
+                            bead_id,
+                            "unknown_only_gate_report_with_er_runner_capped",
+                            &ctx_hash,
+                            now_epoch,
                         )?;
                         continue;
                     }
@@ -3538,19 +4001,39 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     )?;
                     summary.beads_escalated += 1;
                     summary.beads_parked_human_held += 1;
-                    emit(
-                        deps.telemetry_log,
+                    let ctx = serde_json::json!({
+                        "reason": "unknown_only_gate_report_with_er_runner_capped",
+                        "er_runner_attempts": count,
+                        "pr_number": pr,
+                    });
+                    let now_epoch = now_epoch_secs();
+                    let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                        deps,
                         bead_id,
-                        overlay.attempt,
-                        OverlayState::HumanHeld.as_str(),
-                        "ESCALATION_REQUIRED",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "reason": "unknown_only_gate_report_with_er_runner_capped",
-                            "er_runner_attempts": count,
-                            "pr_number": pr,
-                        }),
+                        "unknown_only_gate_report_with_er_runner_capped",
+                        &ctx,
+                        now_epoch,
                     )?;
+                    if !should_emit {
+                        summary.escalations_suppressed += 1;
+                    } else {
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "ESCALATION_REQUIRED",
+                            serde_json::json!({}),
+                            ctx,
+                        )?;
+                        record_escalation_emit_dedup(
+                            deps,
+                            bead_id,
+                            "unknown_only_gate_report_with_er_runner_capped",
+                            &ctx_hash,
+                            now_epoch,
+                        )?;
+                    }
                     continue;
                 }
                 emit(

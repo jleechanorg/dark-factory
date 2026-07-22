@@ -54,6 +54,7 @@ fn test_cfg() -> Config {
         held_recheck_cooldown_secs: 900,
         repos: std::collections::HashMap::new(),
         pre_gate_validation_enabled: false,
+        escalation_refire_secs: 3600,
     }
 }
 
@@ -387,6 +388,12 @@ fn run_tick_never_calls_dispatch_when_router_parses_no_verdict() {
     assert_eq!(summary.beads_routed, 0);
     assert_eq!(summary.beads_dispatched, 0);
     assert_eq!(summary.beads_parked_human_held, 1);
+    // Under the dispatch-scheduling-guarantee ordering, `run_recovery_step`
+    // runs AFTER `run_slow_tier` on slow ticks, so the freshly-parked
+    // unroutable bead (attempt 1 < cap, session_id already NULL) is
+    // immediately requeued to QUEUED in the same tick. The bead is still
+    // never dispatched — the spawn count assertion below is the real guard.
+    assert_eq!(summary.beads_recovered_from_held, 1);
 
     let spawn_call_count = sessions
         .calls
@@ -400,7 +407,11 @@ fn run_tick_never_calls_dispatch_when_router_parses_no_verdict() {
     );
 
     let overlay = store.load("fake-bead-1").unwrap().unwrap();
-    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        overlay.state,
+        OverlayState::Queued,
+        "unroutable bead is parked then recovered to QUEUED in the same tick under the new ordering"
+    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
@@ -1318,12 +1329,29 @@ fn test_wedge_detection_attested_session_stalled() {
         telemetry_log: &telemetry_log,
     };
 
-    // Run tick
+    // Run tick. With the dispatch-scheduling-guarantee ordering
+    // (wedge loop → slow_tier → recovery → fast_tier), the wedge loop
+    // parks the stalled bead HUMAN_HELD, then `run_recovery_step` (which
+    // now runs AFTER the wedge loop on slow ticks) immediately requeues
+    // it to QUEUED in the same tick — the session was already killed and
+    // its handle cleared by the wedge park, so `recover_human_held`'s
+    // `session_id IS NULL` predicate is satisfied. The bead ends QUEUED,
+    // ready for redispatch on the next slow tick. The park still happens
+    // (asserted via `beads_parked_human_held` and the `session_stalled`
+    // telemetry), which is what this test is really proving.
     let summary = run_tick(&deps, 1, 10).unwrap();
     assert_eq!(summary.beads_parked_human_held, 1);
+    assert_eq!(
+        summary.beads_recovered_from_held, 1,
+        "recovery runs after the wedge loop and requeues the freshly-parked bead"
+    );
 
     let o = store.load("bead-stalled").unwrap().unwrap();
-    assert_eq!(o.state, OverlayState::HumanHeld);
+    assert_eq!(
+        o.state,
+        OverlayState::Queued,
+        "wedge-parked bead is recovered to QUEUED in the same tick under the new ordering"
+    );
     assert_eq!(
         o.session_id, None,
         "positive terminal proof must be persisted with the recoverable hold"
@@ -1640,12 +1668,16 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
         "local-ahead bead MUST still park — the ubas guard requires \
          is_remote_ahead=true (strict ancestor predicate), not just SHA inequality"
     );
+    assert_eq!(
+        summary.beads_recovered_from_held, 1,
+        "recovery runs after the wedge loop and requeues the freshly-parked bead"
+    );
 
     let o = store.load("bead-local-ahead").unwrap().unwrap();
     assert_eq!(
         o.state,
-        OverlayState::HumanHeld,
-        "local-ahead bead must end up HUMAN_HELD, not stay ATTESTED behind a bypass"
+        OverlayState::Queued,
+        "wedge-parked bead is recovered to QUEUED in the same tick under the new ordering"
     );
 
     let logs = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
@@ -1751,12 +1783,16 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
         summary.beads_parked_human_held, 1,
         "diverged bead MUST still park — SHA inequality is too weak a guard"
     );
+    assert_eq!(
+        summary.beads_recovered_from_held, 1,
+        "recovery runs after the wedge loop and requeues the freshly-parked bead"
+    );
 
     let o = store.load("bead-diverged").unwrap().unwrap();
     assert_eq!(
         o.state,
-        OverlayState::HumanHeld,
-        "diverged bead must end up HUMAN_HELD, not stay ATTESTED"
+        OverlayState::Queued,
+        "wedge-parked bead is recovered to QUEUED in the same tick under the new ordering"
     );
 
     let logs = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
@@ -4171,34 +4207,55 @@ fn adopted_pr_that_never_goes_green_escalates_at_recovery_cap_and_dedups() {
     assert_eq!(overlay0.pr_number, Some(PR_NUMBER));
     assert_eq!(overlay0.branch.as_deref(), Some(BRANCH));
 
-    // Ticks 1..=9: each tick's `run_recovery_step` requeues the still-
-    // HUMAN_HELD bead (attempt < 10), the same tick's re-adoption pass
-    // (`run_slow_tier`) immediately re-attests it against the still-open PR,
-    // and `run_fast_tier`'s gate assessment sees the same permanently-red
-    // snapshot and re-parks it HUMAN_HELD — all organically, no manual state
-    // mutation. After this loop `attempt` must equal 10 (the cap).
-    for tick_index in 1..=9u64 {
+    // Ticks 1..=18: under the dispatch-scheduling-guarantee ordering, each
+    // recovery cycle now takes TWO slow ticks instead of one:
+    //   - Odd tick (1,3,…,17): `run_recovery_step` (which now runs AFTER
+    //     `run_slow_tier`) requeues the still-HUMAN_HELD bead → QUEUED and
+    //     increments `attempt`. No dispatch or gate assessment happens this
+    //     tick (the bead is QUEUED, not ATTESTED, when `run_fast_tier` runs).
+    //   - Even tick (2,4,…,18): `run_slow_tier` dispatches the QUEUED bead,
+    //     re-attesting it against the still-open PR; `run_recovery_step` has
+    //     no HUMAN_HELD bead to recover; `run_fast_tier`'s gate assessment
+    //     sees the same permanently-red snapshot and re-parks HUMAN_HELD.
+    // After 9 two-tick cycles `attempt` must equal 10 (the cap).
+    for tick_index in 1..=18u64 {
         let summary = run_tick(&deps, tick_index, 0)
             .unwrap_or_else(|e| panic!("tick {tick_index} should succeed: {e:?}"));
-        assert_eq!(
-            summary.beads_recovered_from_held, 1,
-            "tick {tick_index}: bead below the cap must be recovered from HUMAN_HELD"
-        );
+        let is_recovery_tick = tick_index % 2 == 1;
+        let expected_attempt = (tick_index.div_ceil(2) + 1) as u32;
+        if is_recovery_tick {
+            assert_eq!(
+                summary.beads_recovered_from_held, 1,
+                "tick {tick_index}: recovery requeues the HUMAN_HELD bead"
+            );
+        } else {
+            assert_eq!(
+                summary.beads_recovered_from_held, 0,
+                "tick {tick_index}: no HUMAN_HELD bead to recover (bead is ATTESTED at recovery time)"
+            );
+        }
         assert_eq!(
             summary.beads_escalated, 0,
             "tick {tick_index}: bead below the cap must not escalate yet"
         );
         let overlay = store.load(BEAD_ID).unwrap().unwrap();
         assert_eq!(
-            overlay.state,
-            OverlayState::HumanHeld,
-            "tick {tick_index}: bead must re-park HUMAN_HELD after re-adoption + failed gate assessment"
+            overlay.attempt, expected_attempt,
+            "tick {tick_index}: attempt must be {expected_attempt}"
         );
-        assert_eq!(
-            overlay.attempt,
-            (tick_index as u32) + 1,
-            "tick {tick_index}: attempt must advance by exactly one recovery cycle"
-        );
+        if is_recovery_tick {
+            assert_eq!(
+                overlay.state,
+                OverlayState::Queued,
+                "tick {tick_index}: bead must be QUEUED after recovery (dispatched next tick)"
+            );
+        } else {
+            assert_eq!(
+                overlay.state,
+                OverlayState::HumanHeld,
+                "tick {tick_index}: bead must re-park HUMAN_HELD after re-adoption + failed gate assessment"
+            );
+        }
     }
     let at_cap = store.load(BEAD_ID).unwrap().unwrap();
     assert_eq!(
@@ -4207,11 +4264,11 @@ fn adopted_pr_that_never_goes_green_escalates_at_recovery_cap_and_dedups() {
     );
     assert_eq!(at_cap.state, OverlayState::HumanHeld);
 
-    // Tick 10: attempt (10) is no longer `< MAX_HUMAN_HELD_RECOVERY_ATTEMPT`
+    // Tick 19: attempt (10) is no longer `< MAX_HUMAN_HELD_RECOVERY_ATTEMPT`
     // (10), so recovery MUST stop retrying and instead escalate: a real
     // escalation comment is posted through `post_scm_comment_by_bead_id`,
     // and the escalation sentinel row is recorded.
-    let summary_cap = run_tick(&deps, 10, 0).expect("cap tick should succeed");
+    let summary_cap = run_tick(&deps, 19, 0).expect("cap tick should succeed");
     assert_eq!(
         summary_cap.beads_recovered_from_held, 0,
         "bead at the cap must NOT be recovered again"
@@ -4255,12 +4312,12 @@ fn adopted_pr_that_never_goes_green_escalates_at_recovery_cap_and_dedups() {
         "cap escalation telemetry must be emitted; got: {log}"
     );
 
-    // Tick 11: dedup check. The bead is still HUMAN_HELD at attempt 10, so
+    // Tick 20: dedup check. The bead is still HUMAN_HELD at attempt 10, so
     // `run_recovery_step` finds it again via `human_held_at_or_above_attempt`,
     // but `escalation_already_recorded` (the `ESCALATION_SENTINEL_ATTEMPT`
-    // rejection-table row written by tick 10's `record_escalation`) must
+    // rejection-table row written by tick 19's `record_escalation`) must
     // suppress a second escalation comment.
-    let summary_dedup = run_tick(&deps, 11, 0).expect("dedup tick should succeed");
+    let summary_dedup = run_tick(&deps, 20, 0).expect("dedup tick should succeed");
     assert_eq!(
         summary_dedup.beads_escalated, 0,
         "an already-escalated capped bead must not escalate again"
@@ -4366,6 +4423,138 @@ fn capped_human_held_comment_failure_retries_before_recording_escalation() {
 }
 
 #[test]
+fn permanent_gh_error_marks_escalation_undeliverable_and_never_retries() {
+    // 1s2q-escalation-dedup Task 2: a permanent (non-transient) gh error from
+    // `post_scm_comment_by_bead_id` (e.g. `invalid issue format: "local-xxx"`)
+    // will never resolve on retry. The daemon must mark the escalation ledger
+    // row terminal, emit ONE final `ESCALATION_UNDELIVERABLE` event, and
+    // never re-emit `ESCALATION_NOTIFICATION_FAILED` on subsequent ticks —
+    // stopping the live incident where the failed notification re-fired every
+    // ~90s.
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    store.overlays.borrow_mut().insert(
+        "bead-perm-err".into(),
+        BeadOverlay {
+            bead_id: "bead-perm-err".into(),
+            state: OverlayState::HumanHeld,
+            attempt: 10,
+            reroll_count: 0,
+            autonomy_secs: 7,
+            spend_usd: 0.0,
+            pr_number: Some(9005),
+            branch: Some("factory/bead-perm-err-r10".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+    // Permanent (non-transient) error — DaemonError::Config is NOT transient.
+    *tracker.fail_next_comment_permanent.borrow_mut() =
+        Some("invalid issue format: \"local-xxx\"".into());
+
+    let telemetry_log =
+        std::env::temp_dir().join("afd_permanent_gh_error_undeliverable.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // Tick 1: permanent error → one ESCALATION_UNDELIVERABLE, terminal mark set.
+    let summary = run_tick(&deps, 1, 0).expect("permanent error should not abort tick");
+    assert_eq!(
+        summary.escalations_undeliverable, 1,
+        "a permanent error must mark exactly one escalation undeliverable"
+    );
+    assert_eq!(
+        summary.beads_escalated, 0,
+        "a permanent error must NOT record a successful escalation"
+    );
+    assert_eq!(
+        summary.escalations_suppressed, 0,
+        "first occurrence is not a dedup suppression"
+    );
+    // The sentinel IS recorded by the terminal-marking helper (it calls
+    // `record_escalation` so `escalation_already_recorded` blocks re-entry on
+    // future ticks — the permanent-error path is truly terminal).
+    assert!(
+        store
+            .load_rejection("bead-perm-err", u32::MAX)
+            .unwrap()
+            .is_some(),
+        "sentinel must be recorded so future ticks skip re-attempt"
+    );
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("ESCALATION_UNDELIVERABLE"),
+        "permanent error must emit ESCALATION_UNDELIVERABLE; got: {log}"
+    );
+    assert!(
+        log.contains("\"permanent\":true"),
+        "ESCALATION_UNDELIVERABLE must carry permanent:true; got: {log}"
+    );
+    // The TICK summary must record the counter.
+    assert!(
+        log.contains("\"escalationsUndeliverable\":1"),
+        "TICK summary must include escalationsUndeliverable; got: {log}"
+    );
+
+    // Tick 2: the sentinel was recorded by the terminal-marking helper, so
+    // `escalation_already_recorded` at the top of the site returns true →
+    // the bead is skipped entirely (no re-attempt, no re-emit). The comment
+    // is NOT retried.
+    let summary2 = run_tick(&deps, 2, 0).expect("second tick must not abort");
+    assert_eq!(
+        summary2.escalations_undeliverable, 0,
+        "second tick must NOT re-mark terminal (sentinel blocks re-entry)"
+    );
+    assert_eq!(
+        summary2.beads_escalated, 0,
+        "second tick must still not record a successful escalation"
+    );
+    let log2 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let undeliverable_count = log2.matches("ESCALATION_UNDELIVERABLE").count();
+    assert_eq!(
+        undeliverable_count, 1,
+        "exactly one ESCALATION_UNDELIVERABLE event across both ticks; got {undeliverable_count}"
+    );
+    assert!(
+        !log2.contains("ESCALATION_NOTIFICATION_FAILED"),
+        "permanent error must never emit ESCALATION_NOTIFICATION_FAILED; got: {log2}"
+    );
+    // The comment was attempted exactly once (tick 1 only).
+    let comment_count = tracker
+        .calls
+        .borrow()
+        .iter()
+        .filter(|call| call.contains("comment_external(owner/repo#9005,"))
+        .count();
+    assert_eq!(
+        comment_count, 1,
+        "comment must be attempted exactly once (no retry on tick 2)"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
 fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalation() {
     let scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -4419,14 +4608,24 @@ fn capped_human_held_candidate_lookup_failure_retries_before_recording_escalatio
         telemetry_log: &telemetry_log,
     };
 
-    let summary = run_tick(&deps, 1, 0).expect("lookup failure should not abort tick");
-    assert_eq!(summary.beads_escalated, 0);
+    // Tick 1: under the dispatch-scheduling-guarantee ordering, `run_slow_tier`
+    // runs BEFORE `run_recovery_step`. The transient `fetch_candidates` failure
+    // hits `run_slow_tier`'s intake call first and aborts the tick via `?`
+    // before recovery/escalation can run. The fail-next token is consumed, so
+    // the next tick's `fetch_candidates` succeeds and the escalation retry
+    // proceeds. This is the intended behavior: a dispatch-tier failure is more
+    // critical than a pending escalation, so it wins the `?` propagation.
+    let result1 = run_tick(&deps, 1, 0);
+    assert!(
+        result1.is_err(),
+        "tick 1 should abort: slow_tier's fetch_candidates fails before recovery runs; got {result1:?}"
+    );
     assert!(
         store
             .load_rejection("bead-held-fallback", u32::MAX)
             .unwrap()
             .is_none(),
-        "sentinel must stay absent when the fallback target lookup fails"
+        "sentinel must stay absent when the tick aborts before escalation"
     );
 
     let summary2 = run_tick(&deps, 2, 0).expect("second tick should retry lookup and comment");
@@ -8225,8 +8424,22 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
         summary_cap.beads_escalated, 1,
         "the cap-exceeding failure must escalate exactly once"
     );
+    // Under the dispatch-scheduling-guarantee ordering, `run_recovery_step`
+    // runs AFTER `run_slow_tier` on slow ticks. The dispatch path parks the
+    // bead HUMAN_HELD (attempt 1, below the recovery cap of 10), then
+    // recovery immediately requeues it to QUEUED in the same tick. The park
+    // and escalation still happen (asserted above) — that is the real guard
+    // against silent livelock.
+    assert_eq!(
+        summary_cap.beads_recovered_from_held, 1,
+        "recovery requeues the freshly-parked bead in the same tick"
+    );
     let capped_overlay = store.load(BEAD_ID).unwrap().unwrap();
-    assert_eq!(capped_overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        capped_overlay.state,
+        OverlayState::Queued,
+        "bead is parked then recovered to QUEUED in the same tick under the new ordering"
+    );
     assert_eq!(
         capped_overlay.spawn_failure_count,
         MAX_TRANSIENT_SPAWN_RETRY + 1
@@ -8262,16 +8475,13 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
         "cap escalation telemetry must be emitted; got: {log}"
     );
 
-    // Tick 16: dedup check. `run_recovery_step` runs before `run_slow_tier`
-    // every tick and will find this bead again via
-    // `human_held_at_or_above_attempt` (its `attempt` is still 1, untouched
-    // by the spawn-retry counter, so it's actually BELOW
-    // MAX_HUMAN_HELD_RECOVERY_ATTEMPT and gets auto-recovered to QUEUED —
-    // then, in the very same tick, dispatch is retried and spawn fails
-    // again). Because `spawn_failure_count` was NOT reset by recovery, this
-    // must re-trip the cap and re-park immediately rather than granting a
-    // fresh 15-retry budget, and `escalation_already_recorded` must prevent
-    // a second escalation comment.
+    // Tick 16: dedup check. `run_slow_tier` runs first — the QUEUED bead
+    // (recovered at the end of tick 15) is dispatched again, spawn fails
+    // again, and because `spawn_failure_count` was NOT reset by recovery
+    // (still > 15) the dispatch path re-parks HUMAN_HELD immediately rather
+    // than granting a fresh 15-retry budget. Then `run_recovery_step`
+    // requeues it to QUEUED again. `escalation_already_recorded` must
+    // prevent a second escalation comment.
     let summary_dedup = run_tick(&deps, 16, 0).expect("dedup tick should succeed");
     assert_eq!(
         summary_dedup.beads_escalated, 0,
@@ -8286,9 +8496,10 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
     let final_overlay = store.load(BEAD_ID).unwrap().unwrap();
     assert_eq!(
         final_overlay.state,
-        OverlayState::HumanHeld,
-        "a bead whose spawn is permanently broken must not be left cycling QUEUED<->DISPATCHING \
-         forever even across the automated HUMAN_HELD recovery step"
+        OverlayState::Queued,
+        "a bead whose spawn is permanently broken is re-parked by dispatch then requeued by \
+         recovery each tick — it never silently disappears, and the one-time escalation comment \
+         above is the human-visible signal"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -8592,6 +8803,14 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
         "exactly one bead (B) should park on this tick"
     );
     assert_eq!(summary_cap.beads_escalated, 1);
+    // Under the dispatch-scheduling-guarantee ordering, `run_recovery_step`
+    // runs AFTER `run_slow_tier` and requeues the freshly-parked bead B
+    // (attempt 1 < recovery cap) to QUEUED in the same tick. The park and
+    // escalation still happen (asserted above); bead A is unaffected.
+    assert_eq!(
+        summary_cap.beads_recovered_from_held, 1,
+        "recovery requeues bead B in the same tick it is parked"
+    );
 
     let a_final = store.load(BEAD_A).unwrap().unwrap();
     assert_eq!(
@@ -8602,7 +8821,11 @@ fn mixed_batch_deferred_backpressure_and_genuine_transient_failures_are_independ
     assert_eq!(a_final.spawn_failure_count, 0);
 
     let b_final = store.load(BEAD_B).unwrap().unwrap();
-    assert_eq!(b_final.state, OverlayState::HumanHeld);
+    assert_eq!(
+        b_final.state,
+        OverlayState::Queued,
+        "bead B is parked then recovered to QUEUED in the same tick under the new ordering"
+    );
     assert_eq!(b_final.spawn_failure_count, MAX_TRANSIENT_SPAWN_RETRY + 1);
 
     let escalation_comment_count_for =
@@ -11392,4 +11615,305 @@ fn jleechan328_gate_assessment_emits_operator_disposition_round_trip() {
         );
         let _ = std::fs::remove_file(&telemetry_log);
     }
+}
+
+/// Plan Task 4(a) / dispatch-scheduling-guarantee regression: 9 looping
+/// escalation beads (HUMAN_HELD at the recovery cap) + 1 legitimately QUEUED
+/// bead. Under the dispatch-scheduling-guarantee ordering (`run_slow_tier`
+/// runs BEFORE `run_recovery_step`), the QUEUED bead MUST get
+/// `TASK_DISPATCHED` on the first tick, even though `run_recovery_step`
+/// processes 9 escalation beads afterward.
+///
+/// This is the live incident regression: a legitimately QUEUED bead sat
+/// undispatched 65+ minutes while escalation/recovery work re-fired every
+/// tick before dispatch could run. With the ordering change, dispatch runs
+/// first and cannot be starved by an escalation backlog.
+#[test]
+fn dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog() {
+    const QUEUED_BEAD_ID: &str = "queued-bead-42";
+
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // Seed 9 HUMAN_HELD beads at the recovery cap (attempt=10). Each tick,
+    // `run_recovery_step` finds them via `human_held_at_or_above_attempt`
+    // and escalates (posts an SCM comment + records the sentinel). These are
+    // the "looping escalation" beads that, under the OLD ordering, ran
+    // BEFORE dispatch and could starve it.
+    for i in 0..9u32 {
+        let bead_id = format!("escalation-bead-{i}");
+        let pr_number = 1000 + i as u64;
+        store
+            .save(&BeadOverlay {
+                bead_id: bead_id.clone(),
+                state: OverlayState::HumanHeld,
+                attempt: 10,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: Some(pr_number),
+                branch: Some(format!("factory/{bead_id}-r10")),
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".to_string()),
+            })
+            .unwrap();
+    }
+
+    // Seed 1 QUEUED bead in the tracker + store. This is the bead that MUST
+    // be dispatched on the first tick despite the 9 escalation beads.
+    tracker.candidates.borrow_mut().push(Bead {
+        id: QUEUED_BEAD_ID.into(),
+        title: "Legitimately queued bead".into(),
+        description: String::new(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#9999".into()),
+    });
+    store
+        .save(&BeadOverlay {
+            bead_id: QUEUED_BEAD_ID.into(),
+            state: OverlayState::Queued,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: None,
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("owner/repo".to_string()),
+        })
+        .unwrap();
+
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_dispatch_guarantee_escalation_backlog_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // Run one tick. Under the new ordering, `run_slow_tier` (dispatch) runs
+    // BEFORE `run_recovery_step` (escalation). The QUEUED bead MUST be
+    // dispatched on this first tick.
+    let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
+
+    // The QUEUED bead must be dispatched.
+    assert_eq!(
+        summary.beads_dispatched, 1,
+        "the QUEUED bead must be dispatched on the first tick despite 9 escalation beads"
+    );
+    let queued_overlay = store.load(QUEUED_BEAD_ID).unwrap().unwrap();
+    assert_eq!(
+        queued_overlay.state,
+        OverlayState::Dispatched,
+        "the QUEUED bead must reach DISPATCHED state"
+    );
+
+    // Verify TASK_DISPATCHED telemetry was emitted for the QUEUED bead.
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("TASK_DISPATCHED") && log.contains(QUEUED_BEAD_ID),
+        "TASK_DISPATCHED must be emitted for the QUEUED bead; got: {log}"
+    );
+
+    // The 9 escalation beads must have been processed by `run_recovery_step`
+    // (which now runs AFTER dispatch).
+    assert_eq!(
+        summary.beads_escalated, 9,
+        "all 9 escalation beads at the recovery cap must be escalated"
+    );
+
+    // Verify escalation telemetry was emitted.
+    assert!(
+        log.contains("ESCALATION_REQUIRED"),
+        "escalation telemetry must be emitted for the cap beads; got: {log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Plan Task 4(b) / 1s2q-escalation-dedup tick-level regression: an
+/// identical-payload escalation emits once on the first tick, is suppressed
+/// on the second tick (same context hash, within the
+/// `escalation_refire_secs` backoff window), and re-emits on a third tick
+/// after the escalation context changes (different `pr_number`/`branch` →
+/// different context hash).
+///
+/// This exercises the full tick loop's dedup path —
+/// `escalation_dedup_should_emit` + `record_escalation_emit_dedup` — at the
+/// integration level, complementing the StateStore unit tests in `state.rs`
+/// that cover the dedup logic in isolation.
+///
+/// Implementation note: on the HUMAN_HELD recovery-cap success path,
+/// `record_escalation` (the sentinel) is called BEFORE the dedup check. The
+/// sentinel causes `escalation_already_recorded` to return `true` on the next
+/// tick, skipping the bead entirely before the dedup logic runs. To exercise
+/// the dedup across ticks, this test clears the sentinel between ticks —
+/// simulating the real-world scenario where an operator manually recovers a
+/// bead (clearing the sentinel), the bead is re-dispatched, fails again, and
+/// returns to HUMAN_HELD at the recovery cap. The dedup ledger entry persists
+/// across this recovery cycle, so the dedup correctly suppresses re-emission
+/// of the same `ESCALATION_REQUIRED` telemetry event until the context
+/// changes.
+#[test]
+fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_emits() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    // Seed a HUMAN_HELD bead at the recovery cap (attempt=10) with a
+    // pr_number so `post_scm_comment_by_bead_id` succeeds (the success path
+    // emits ESCALATION_REQUIRED).
+    let bead_id = "bead-dedup-tick";
+    store.save(&BeadOverlay {
+        bead_id: bead_id.into(),
+        state: OverlayState::HumanHeld,
+        attempt: 10,
+        reroll_count: 0,
+        autonomy_secs: 0,
+        spend_usd: 0.0,
+        pr_number: Some(9006),
+        branch: Some("factory/bead-dedup-r10".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: Some("owner/repo".to_string()),
+    }).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_escalation_dedup_tick_level_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // ── Tick 1: first escalation → ESCALATION_REQUIRED emitted ──
+    let summary1 = run_tick(&deps, 0, 0).expect("tick 1 should succeed");
+    assert_eq!(
+        summary1.beads_escalated, 1,
+        "tick 1: bead must be escalated (comment posted, sentinel recorded)"
+    );
+    assert_eq!(
+        summary1.escalations_suppressed, 0,
+        "tick 1: first occurrence must NOT be suppressed"
+    );
+    let log1 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log1.contains("ESCALATION_REQUIRED"),
+        "tick 1: ESCALATION_REQUIRED must be emitted; got: {log1}"
+    );
+    // The dedup ledger must have a row for this (bead_id, reason).
+    assert!(
+        store
+            .escalation_ledger
+            .borrow()
+            .contains_key(&(bead_id.into(), "human_held_recovery_attempt_cap_reached".into())),
+        "tick 1: dedup ledger must have a row after emit"
+    );
+    // The sentinel must be recorded (success path).
+    assert!(
+        store.load_rejection(bead_id, u32::MAX).unwrap().is_some(),
+        "tick 1: sentinel must be recorded on success path"
+    );
+
+    // ── Simulate operator recovery + re-hold: clear the sentinel ──
+    // In production, an operator can manually recover a bead (e.g. via
+    // `recover-held`), clearing the escalation sentinel. The bead is then
+    // re-dispatched, fails, and returns to HUMAN_HELD at the recovery cap.
+    // The dedup ledger entry persists across this cycle.
+    store
+        .rejections
+        .borrow_mut()
+        .remove(&(bead_id.into(), u32::MAX));
+
+    // ── Tick 2: same context → ESCALATION_REQUIRED suppressed by dedup ──
+    let summary2 = run_tick(&deps, 1, 0).expect("tick 2 should succeed");
+    assert_eq!(
+        summary2.escalations_suppressed, 1,
+        "tick 2: same context hash within backoff must be suppressed; got summary: {summary2:?}"
+    );
+    let log2 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    // ESCALATION_REQUIRED should appear only once (from tick 1), not twice.
+    let escalation_required_count = log2.matches("ESCALATION_REQUIRED").count();
+    assert_eq!(
+        escalation_required_count, 1,
+        "tick 2: ESCALATION_REQUIRED must NOT be re-emitted (same context, within backoff); \
+         total count across ticks 1+2 should be 1; got: {escalation_required_count}"
+    );
+
+    // ── Simulate operator recovery + re-hold: clear the sentinel again ──
+    store
+        .rejections
+        .borrow_mut()
+        .remove(&(bead_id.into(), u32::MAX));
+
+    // ── Change the context: update pr_number and branch ──
+    // The ESCALATION_REQUIRED context JSON for the HUMAN_HELD recovery-cap
+    // path includes `pr_number` and `branch`, so changing them changes the
+    // context hash, causing the dedup to allow re-emission.
+    let mut overlay = store.load(bead_id).unwrap().unwrap();
+    overlay.pr_number = Some(9007);
+    overlay.branch = Some("factory/bead-dedup-r10-v2".into());
+    store.save(&overlay).unwrap();
+
+    // ── Tick 3: changed context → ESCALATION_REQUIRED re-emits ──
+    let summary3 = run_tick(&deps, 2, 0).expect("tick 3 should succeed");
+    assert_eq!(
+        summary3.escalations_suppressed, 0,
+        "tick 3: changed context hash must NOT be suppressed"
+    );
+    assert_eq!(
+        summary3.beads_escalated, 1,
+        "tick 3: bead must be escalated again (new context)"
+    );
+    let log3 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let escalation_required_count = log3.matches("ESCALATION_REQUIRED").count();
+    assert_eq!(
+        escalation_required_count, 2,
+        "tick 3: ESCALATION_REQUIRED must re-emit after context change; \
+         total count across ticks 1+2+3 should be 2; got: {escalation_required_count}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
 }
