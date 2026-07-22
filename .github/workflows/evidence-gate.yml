@@ -119,34 +119,62 @@ jobs:
           # but well below real pytest output, command transcripts, or
           # log captures (issue #433).
           MIN_GIST_SIZE: "256"
+          # Comma-separated allowlist of GitHub logins whose `/er`
+          # comments are accepted for Signal A identity (issue #433
+          # follow-up, jleechan-ifkt). The daemon er_runner posts via
+          # the operator's `gh` CLI, so the commenter's login IS the
+          # operator's login. The PR author cannot impersonate that
+          # login, so `c_login` membership is the unforgeable identity
+          # proof. The literal `🤖 **[dark-factory /er]**` allowlist
+          # marker stays as defense-in-depth.
+          EVIDENCE_TRUSTED_LOGINS: "jleechan2015"
         run: |
           set -euo pipefail
 
           ER_VERDICT=""        # set if (A) is found
           MARKER_VERDICT=""    # set if (B) is found and verifies
 
-          # Fetch the PR's current head SHA so we can verify that any
-          # `/er` verdict comment references the SAME head the gate is
-          # running on (issue #433). A stale `/er PASS` from an older
-          # head must not green the gate.
+          # Fetch the PR's current head SHA + last-update timestamp so we
+          # can verify that any `/er` verdict comment was posted at or
+          # after the most recent commit on the head branch (issue #433
+          # freshness binding, jleechan-ifkt follow-up). The daemon
+          # er_runner comment does NOT embed a literal `head <sha>`
+          # token in its body — it wraps the reviewer reply in a
+          # marker-only fence. So we anchor freshness to `updated_at`
+          # (== the most recent commit-push on the head branch) against
+          # the comment's `created_at`. Both are ISO 8601 UTC and
+          # lexically comparable in bash.
           pr_head_sha="$(gh api \
             -H "Accept: application/vnd.github+json" \
             "/repos/${REPO}/pulls/${PR_NUMBER}" \
             --jq '.head.sha // ""' 2>/dev/null)" || pr_head_sha=""
           pr_head_short="$(echo "${pr_head_sha}" | cut -c1-7)"
-          echo "pr_head_sha=${pr_head_sha:-<none>} pr_head_short=${pr_head_short:-<none>}"
+          pr_updated_at="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/pulls/${PR_NUMBER}" \
+            --jq '.updated_at // ""' 2>/dev/null)" || pr_updated_at=""
+          echo "pr_head_sha=${pr_head_sha:-<none>} pr_head_short=${pr_head_short:-<none>} pr_updated_at=${pr_updated_at:-<none>}"
 
-          # --- Signal A: /er verdict comment on the PR (hardened, issue #433) ---
-          # Identity check: only comments carrying the literal er_runner
-          # allowlist marker `🤖 **[dark-factory /er]**` (or its
-          # bracket-stripped form `[dark-factory /er]`) are considered.
-          # Head-SHA check: the comment must reference the current head
-          # SHA via a `head <sha>` token. Stale-head verdicts are
-          # rejected.
+          # --- Signal A: /er verdict comment on the PR (hardened, issue #433 + jleechan-ifkt) ---
+          # Identity binding (two-factor):
+          #   (1) The comment body carries the literal er_runner allowlist
+          #       marker `🤖 **[dark-factory /er]**` (or the bracket-
+          #       stripped form `[dark-factory /er]`), which is emitted
+          #       ONLY by `daemon/src/er_runner.rs:191`.
+          #   (2) The commenter's `c_login` is in the
+          #       `EVIDENCE_TRUSTED_LOGINS` allowlist (default: the
+          #       operator gh account). The PR author cannot impersonate
+          #       that login, so this is the unforgeable identity proof
+          #       (issue #433 follow-up, jleechan-ifkt).
+          # Freshness binding (jleechan-ifkt, codex-connector P1 #2):
+          #   The comment must be posted at or after `pr_updated_at`
+          #   (== the most recent commit on the head branch). Stale
+          #   comments from older heads fail this check. Both timestamps
+          #   are ISO 8601 UTC and lexically comparable in bash.
           comments_json="$(gh api \
             -H "Accept: application/vnd.github+json" \
             "/repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
-            --jq '[.[] | {login: .user.login, body: .body}]' 2>/dev/null)" || comments_json="[]"
+            --jq '[.[] | {login: .user.login, body: .body, created_at: .created_at}]' 2>/dev/null)" || comments_json="[]"
 
           if [ -n "${pr_head_sha}" ] && [ "${comments_json}" != "[]" ]; then
             # NOTE (issue #433 follow-up, jleechan-ifkt): do NOT iterate
@@ -160,34 +188,39 @@ jobs:
             # "${rows[@]}"` so each jq-compact line is delivered intact.
             mapfile -t rows < <(echo "${comments_json}" | jq -c '.[]' 2>/dev/null || true)
             for row in "${rows[@]}"; do
-              c_body="$(echo "${row}" | jq -r '.body // ""')"
-              c_login="$(echo "${row}" | jq -r '.login // ""')"
+              c_body="$(echo "${row}" | jq -r '.body // ""' 2>/dev/null || echo "")"
+              c_login="$(echo "${row}" | jq -r '.login // ""' 2>/dev/null || echo "")"
+              c_created_at="$(echo "${row}" | jq -r '.created_at // ""' 2>/dev/null || echo "")"
 
-              # Skip comments that do NOT carry the er_runner allowlist
-              # marker (issue #433 identity binding).
-              if ! echo "${c_body}" | grep -qF '🤖 **[dark-factory /er]**' \
-                 && ! echo "${c_body}" | grep -qF '[dark-factory /er]'; then
-                echo "skip_comment author=${c_login} reason=no_er_runner_marker"
+              # (1) Two-factor identity: er_runner marker AND login in
+              # EVIDENCE_TRUSTED_LOGINS allowlist.
+              marker_present=0
+              if echo "${c_body}" | grep -qF '🤖 **[dark-factory /er]**' \
+                 || echo "${c_body}" | grep -qF '[dark-factory /er]'; then
+                marker_present=1
+              fi
+              if [ "${marker_present}" -ne 1 ]; then
+                echo "skip_comment author=${c_login} created_at=${c_created_at} reason=no_er_runner_marker"
                 continue
               fi
 
-              # Extract any `head <sha>` token (full or short) from the
-              # comment body. Accept either `head <40hex>` or
-              # `head <7hex>` so the daemon's hash formats both pass.
-              c_head_sha="$(echo "${c_body}" | \
-                grep -oiE 'head[[:space:]]+[0-9a-f]{7,40}' | \
-                awk '{print $2}' | head -1 || true)"
-
-              # The comment must reference the CURRENT head SHA. If the
-              # comment has no head SHA token, treat it as stale (issue
-              # #433: stale-head verdicts must not green the gate).
-              if [ -z "${c_head_sha}" ]; then
-                echo "skip_comment author=${c_login} reason=no_head_sha_token"
+              trusted_login=0
+              IFS=',' read -r -a trusted_logins <<< "${EVIDENCE_TRUSTED_LOGINS:-}"
+              for tl in "${trusted_logins[@]}"; do
+                if [ "${c_login}" = "${tl// /}" ]; then
+                  trusted_login=1
+                  break
+                fi
+              done
+              if [ "${trusted_login}" -ne 1 ]; then
+                echo "skip_comment author=${c_login} created_at=${c_created_at} reason=login_not_in_trusted_allowlist"
                 continue
               fi
-              if [ "${c_head_sha}" != "${pr_head_sha}" ] \
-                 && [ "${c_head_sha}" != "${pr_head_short}" ]; then
-                echo "skip_comment author=${c_login} reason=stale_head c_head_sha=${c_head_sha} pr_head_sha=${pr_head_sha}"
+
+              # (2) Freshness binding: comment created_at >= pr_updated_at.
+              if [ -n "${c_created_at}" ] && [ -n "${pr_updated_at}" ] \
+                 && [ "${c_created_at}" \< "${pr_updated_at}" ]; then
+                echo "skip_comment author=${c_login} reason=stale_comment_before_pr_update c_created_at=${c_created_at} pr_updated_at=${pr_updated_at}"
                 continue
               fi
 
@@ -195,19 +228,19 @@ jobs:
               # verbatim reply.
               if echo "${c_body}" | grep -qiE '/er[[:space:]]+PASS\b'; then
                 ER_VERDICT="PASS"
-                echo "signal_a_trusted_er_verdict=PASS author=${c_login} head_sha=${c_head_sha}"
+                echo "signal_a_trusted_er_verdict=PASS author=${c_login} created_at=${c_created_at} pr_head_sha=${pr_head_sha}"
                 break
               elif echo "${c_body}" | grep -qiE '/er[[:space:]]+FAIL\b'; then
                 ER_VERDICT="FAIL"
-                echo "signal_a_trusted_er_verdict=FAIL author=${c_login} head_sha=${c_head_sha}"
+                echo "signal_a_trusted_er_verdict=FAIL author=${c_login} created_at=${c_created_at} pr_head_sha=${pr_head_sha}"
                 break
               elif echo "${c_body}" | grep -qiE '/er[[:space:]]+PARTIAL\b'; then
                 ER_VERDICT="PARTIAL"
-                echo "signal_a_trusted_er_verdict=PARTIAL author=${c_login} head_sha=${c_head_sha}"
+                echo "signal_a_trusted_er_verdict=PARTIAL author=${c_login} created_at=${c_created_at} pr_head_sha=${pr_head_sha}"
                 break
               elif echo "${c_body}" | grep -qiE '/er[[:space:]]+INCONCLUSIVE\b'; then
                 ER_VERDICT="INCONCLUSIVE"
-                echo "signal_a_trusted_er_verdict=INCONCLUSIVE author=${c_login} head_sha=${c_head_sha}"
+                echo "signal_a_trusted_er_verdict=INCONCLUSIVE author=${c_login} created_at=${c_created_at} pr_head_sha=${pr_head_sha}"
                 break
               fi
               echo "skip_comment author=${c_login} reason=trusted_no_verdict_token"
@@ -264,12 +297,15 @@ jobs:
                   jq -r '[.files // {} | to_entries[].value.content // ""] | join("\n")' \
                   2>/dev/null || echo "")"
 
-                # Mention check (issue #433): the gist must reference
-                # this PR (by PR_NUMBER) or this repo (by REPO). A
-                # placeholder gist with neither fails.
+                # Mention check (issue #433 + jleechan-ifkt follow-up):
+                # the gist must reference this PR (by PR_NUMBER) or this
+                # repo (by REPO). The PR-number check uses `-w`
+                # (word-boundary) so PR `#42` is not matched by
+                # timestamps, byte counts, or other incidental numeric
+                # token runs (CodeRabbit review on jleechan-ifkt).
                 pr_mention=0
                 repo_mention=0
-                if echo "${gist_content_all}" | grep -qF "${PR_NUMBER}"; then
+                if echo "${gist_content_all}" | grep -qwF "${PR_NUMBER}"; then
                   pr_mention=1
                 fi
                 if echo "${gist_content_all}" | grep -qF "${REPO}"; then
@@ -322,18 +358,24 @@ jobs:
           echo "ER_REASON=${REASON}" >> "$GITHUB_ENV"
 
       - name: Mark evidence-gate verdict (fail-closed)
-        # Issue #424 + #433: the verdict is BOUND to independent ground
-        # truth (an /er comment from the trusted er_runner OR a canonical
-        # evidence marker with substantive gist), not echoed from this
-        # template. The gate fails closed in four cases:
+        # Issue #424 + #433 + jleechan-ifkt follow-ups: the verdict is
+        # BOUND to independent ground truth (an /er comment from a
+        # er_runner operator-account login OR a canonical evidence
+        # marker with substantive gist), not echoed from this template.
+        # The gate fails closed in six cases:
         #   1. No /er comment AND no canonical evidence marker.
         #   2. /er FAIL, /er PARTIAL, or /er INCONCLUSIVE comment.
         #   3. /er PASS without the er_runner allowlist marker
-        #      (issue #433 identity binding).
-        #   4. /er PASS referencing an OLDER head SHA, or canonical
+        #      (issue #433 identity binding — defense in depth).
+        #   4. /er PASS from a login outside the trusted allowlist
+        #      OR posted before the PR's latest commit timestamp
+        #      (jleechan-ifkt follow-up, identity + freshness).
+        #   5. /er PASS referencing an OLDER head SHA, or canonical
         #      evidence marker with placeholder/empty gist, or
         #      canonical evidence marker with gist content that does
-        #      not mention PR number or repo (issue #433).
+        #      not mention the PR number or repo (issue #433).
+        #   6. `gh` / `jq` / `curl` transient errors during the
+        #      evidence-fingerprinting step (set -euo pipefail).
         if: github.event_name == 'pull_request'
         run: |
           echo "Evidence verdict: ${ER_VERDICT:-ABSENT}"

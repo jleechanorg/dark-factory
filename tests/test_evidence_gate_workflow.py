@@ -577,19 +577,37 @@ def test_signal_a_requires_head_sha_reference() -> None:
     # delegates the SHA comparison to a separate verification step. In
     # either case the workflow's verdict-decision text must contain a
     # SHA comparison expression or a "stale" branch.
+    #
+    # jleechan-ifkt follow-up (codex-connector P1 #2, ID 3627133006):
+    # the daemon `🤖 **[dark-factory /er]**` review verdict body does
+    # NOT embed a literal `head <sha>` token. Freshness is anchored to
+    # the comment's `created_at` vs the PR's `updated_at` (== the most
+    # recent commit on the head branch). Both are ISO 8601 UTC so
+    # lexical bash `<` comparison is sufficient.
+    #
+    # NOTE (CodeRabbit review on jleechan-ifkt, ID 3627363108): the
+    # Python `re` module does NOT support POSIX bracket expressions like
+    # `[[:space:]]` — those patterns were silently dead-code in the
+    # pre-fix test. Use `\s` (which DOES work) plus other explicit
+    # signal-name patterns as fallbacks.
     head_sha_signals = [
-        r"head[[:space:]]+[0-9a-f]{7,40}",
+        r"head\s+[0-9a-f]{7,40}",
         r"\bhead_sha\b",
         r"\bstale\b",
         r"\bSTALE\b",
         r"sha_short",
         r"head_sha_seen",
         r"\$marker_sha\b",
+        r"\bc_created_at\b",
+        r"\bpr_updated_at\b",
     ]
     assert any(re.search(pat, text) for pat in head_sha_signals), (
-        "Signal A must require the verdict comment to carry a `head <sha>` "
-        "reference (issue #433) — a bare `/er PASS` from an older head is "
-        "forgeable. The verifier step must parse or compare the SHA."
+        "Signal A must bind the verdict to the current head (issue #433) "
+        "— either by parsing a `head <sha>` token from the comment, or "
+        "by anchoring freshness to the comment's `created_at` vs the PR's "
+        "`updated_at` (jleechan-ifkt follow-up). A bare `/er PASS` from "
+        "an older head is forgeable. The verifier step must compare one "
+        "or the other."
     )
 
 
@@ -825,4 +843,96 @@ def test_signal_a_iteration_must_not_word_split_jq_output() -> None:
         "`mapfile -t rows < <(jq -c '.[]')` followed by "
         "`for row in \"${rows[@]}\"` so each JSON object is delivered "
         "intact (issue #433 follow-up, jleechan-ifkt)."
+    )
+
+
+def test_signal_a_iteration_must_not_word_split_jq_output() -> None:
+    """Issue jleechan-ifkt follow-up, ID 3627132993 (codex-connector P1):
+    the per-comment iteration loop MUST NOT word-split unquoted command
+    substitution output. The naive `for row in $(echo "${json}" | jq -c '.[]')`
+    pattern word-splits each JSON object on its inner whitespace, so on any
+    comment whose body contains a space the first iteration fragment is
+    invalid JSON and the inner `jq -r '.body'` fails with
+    "Unfinished string at EOF". With `set -euo pipefail` the whole step
+    then exits 5 before Signal B ever runs — leaving the gate red even when
+    the PR body carries a valid `**Evidence**:` marker.
+
+    Fix: pipe `jq -c '.[]'` into `mapfile -t` and iterate
+    `"${rows[@]}"`, so each jq-compact line is delivered intact.
+    """
+    text = _verdict_step_text(_load_workflow())
+    assert "mapfile -t rows" in text, (
+        "Signal A must use `mapfile -t` to capture jq-compact per-row "
+        "output, then iterate `for row in \"${rows[@]}\"` so each line "
+        "stays intact even when the comment body contains whitespace. "
+        "(issue jleechan-ifkt, codex-connector P1 #1)"
+    )
+    # Negative pin: the naive unquoted pattern must not reappear.
+    assert not re.search(
+        r"for\s+row\s+in\s+\$\(\s*echo", text
+    ), "Forbidden: `for row in $(echo ${json} | jq ...)` word-splits comment JSON."
+
+
+def test_signal_a_must_bind_trusted_login_allowlist() -> None:
+    """Issue jleechan-ifkt follow-up, IDs 3627133014 (codex-connector P1)
+    + 3627363091 (CodeRabbit CRITICAL): Signal A identity MUST be bound to
+    a `c_login` allowlist of trusted operator accounts, not to a copyable
+    literal marker. The PR author can copy the `🤖 **[dark-factory /er]**`
+    marker into a self-posted comment, but cannot impersonate the
+    operator's GitHub login. The `c_login` check is the unforgeable
+    identity proof.
+    """
+    text = _verdict_step_text(_load_workflow())
+    assert "EVIDENCE_TRUSTED_LOGINS" in text, (
+        "Signal A must declare an `EVIDENCE_TRUSTED_LOGINS` env var "
+        "(CSV) of GitHub logins whose `/er` comments are accepted — the "
+        "unforgeable identity check. (issue jleechan-ifkt, codex-connector "
+        "P1 #3 + CodeRabbit CRITICAL)"
+    )
+    assert "trusted_login" in text, (
+        "Signal A must compute a `trusted_login` flag from the parsed "
+        "`c_login` against the EVIDENCE_TRUSTED_LOGINS allowlist. "
+        "(issue jleechan-ifkt, codex-connector P1 #3)"
+    )
+
+
+def test_signal_a_freshness_must_bind_comment_created_at_to_pr_updated_at() -> None:
+    """Issue jleechan-ifkt follow-up, ID 3627133006 (codex-connector P1):
+    the daemon `🤖 **[dark-factory /er]**` review verdicts do NOT embed a
+    literal `head <sha>` token in the comment body — they wrap the
+    reviewer's reply in a marker-only fence. So Signal A freshness must
+    bind to data the daemon + GitHub API already expose: the comment's
+    `created_at` must be ON OR AFTER the PR's `updated_at` (== the most
+    recent commit on the head branch). A stale comment from an older
+    head fails this check, even though it carries the marker.
+    """
+    text = _signal_a_text(_load_workflow())
+    assert "c_created_at" in text and "pr_updated_at" in text, (
+        "Signal A must require the comment's `c_created_at` to be on or "
+        "after the PR's `pr_updated_at` (freshness binding — issue "
+        "jleechan-ifkt, codex-connector P1 #2)."
+    )
+    # The stale-skip uses bash lexical comparison:
+    # [ "${c_created_at}" \< "${pr_updated_at}" ].
+    # Verify both variables appear inside a single bash [ ... ] test.
+    skip_blocks = re.findall(r"\[ [^\]]*c_created_at[^\]]*pr_updated_at[^\]]*\]", text)
+    assert skip_blocks, (
+        "Signal A must perform a lexical comparison between `c_created_at` "
+        "and `pr_updated_at` (stale-comment skip, bash `<` test). "
+        "(issue jleechan-ifkt, codex-connector P1 #2)"
+    )
+
+
+def test_signal_b_pr_number_mention_uses_word_boundary() -> None:
+    """Issue jleechan-ifkt follow-up, ID 3627363093 (CodeRabbit Minor):
+    `grep -qF "${PR_NUMBER}"` treats the PR id as a substring, so PR #42
+    is "mentioned" by any content containing `42` (timestamps, byte
+    counts, other IDs). Use a word-boundary match so an incidental digit
+    run does not satisfy the check.
+    """
+    text = _signal_b_text(_load_workflow())
+    assert "grep -qwF \"${PR_NUMBER}\"" in text or 'grep -qwF "${PR_NUMBER}"' in text, (
+        "Signal B's PR-number mention check must use `grep -qwF` "
+        "(word-boundary) so PR #42 is not matched by incidental "
+        "numeric token runs. (issue jleechan-ifkt, CodeRabbit Minor)"
     )
