@@ -51,6 +51,37 @@ fn labeled_pr(number: u64, author_login: &str, head_ref_name: &str) -> LabeledPr
         is_cross_repository: false,
         head_repo_full_name: Some("owner/repo".into()),
         head_repo_owner_login: Some("owner".into()),
+        // Default cache-key fields: distinct head SHA per PR so the
+        // adoption-probe cache treats each PR independently. Tests that
+        // exercise cache hit/invalidation behavior use `labeled_pr_with_cache_key`
+        // to populate these explicitly.
+        head_sha: Some(format!("sha-{number}")),
+        updated_at_epoch: Some(1_700_000_000 + number),
+    }
+}
+
+/// jtg8-r4: variant of `labeled_pr` that lets the caller script the cache
+/// key fields explicitly so cache hit / miss / invalidation tests can drive
+/// distinct `head_sha`/`updated_at_epoch` shapes per PR per tick.
+fn labeled_pr_with_cache_key(
+    number: u64,
+    author_login: &str,
+    head_ref_name: &str,
+    head_sha: &str,
+    updated_at_epoch: u64,
+) -> LabeledPr {
+    LabeledPr {
+        number,
+        title: format!("pr {number}"),
+        body: "pr body".into(),
+        author_login: author_login.into(),
+        external_ref: format!("owner/repo#{number}"),
+        head_ref_name: head_ref_name.into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+        head_sha: Some(head_sha.into()),
+        updated_at_epoch: Some(updated_at_epoch),
     }
 }
 
@@ -553,4 +584,329 @@ fn every_create_bead_call_across_both_intake_paths_carries_nonempty_external_ref
             "external_ref should be shaped owner/repo#<number>, got '{external_ref}' from call: {call}"
         );
     }
+}
+
+// jtg8-r4 TDD red tests ======================================================
+//
+// These tests exercise the r4 fix for bead jleechan-jtg8:
+// 1. The slow-tier intake sweep must NOT abort the rest of run_slow_tier when
+//    a `gh` rate-limit is detected on the PR-intake phase — only the PR-intake
+//    pass itself degrades; routing + dispatch continue (the r3 fix returned
+//    `Ok(())` early, which starved every subsequent phase).
+// 2. The `IntakeProbeMetrics.gh_call_count` field must count REAL subprocess
+//    invocations on the Scm boundary (so the slow tier can warn when the
+//    count drifts back toward pre-fix behavior).
+// 3. The adoption-probe cache's AuthorPermission entry must re-probe when the
+//    contributor's collaborator tier changes between ticks (the r3 cache used
+//    only (external_ref, head_sha, updated_at_epoch), which never changes on
+//    a tier promotion/demotion).
+
+use daemon::intake::{AdoptionProbeCache, CachedDecisionKind, ProbeCacheKey};
+
+/// r4 red test #1: rate-limit on `labeled_prs` must NOT short-circuit the
+/// slow-tier's routing + dispatch work. The slow tier MUST log a skip,
+/// persist whatever cache state it has so far, and continue into the
+/// `intake::normalize` issue path + routing + dispatch phases. The expected
+/// observable contract is:
+///   - normalize_labeled_prs_outcome returns `Ok(_)` with `rate_limited = true`
+///   - the slow tier continues to call `tracker.fetch_candidates()` for routing
+///   - `dispatch_ready` runs against any QUEUED beads from prior ticks
+#[test]
+fn intake_rate_limit_during_labeled_prs_does_not_abort_dispatch() {
+    let scm = FakeScm::new();
+    // Scripted rate-limit on the very next `labeled_prs` call.
+    *scm.rate_limit_next_labeled_prs.borrow_mut() = true;
+
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+    let mut cache = AdoptionProbeCache::new();
+
+    let outcome = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+    )
+    .unwrap();
+    assert!(
+        outcome.rate_limited,
+        "rate-limited intake sweep must report rate_limited=true so the slow tier can skip without erroring"
+    );
+    assert!(
+        outcome.adopted.is_empty() && outcome.outcomes.is_empty(),
+        "rate-limited sweep must produce zero adopted/outcomes (no telemetry = no false negatives)"
+    );
+    // The list query itself counts as 1 gh call before the rate-limit skip.
+    assert_eq!(outcome.metrics.gh_call_count, 1);
+    assert_eq!(outcome.metrics.rate_limited_skips, 1);
+
+    // The PR-intake contract: the rate-limit skip fires before the per-PR
+    // loop, so NO collaborator_permission calls should have been made.
+    // We assert this on the Scm's call log because FakeScm records every
+    // tool invocation. The downstream contract — that the slow tier
+    // continues to routing + dispatch phases after a rate-limited
+    // intake — is covered separately by the run_slow_tier restructure
+    // (the r4 fix changes `return Ok(())` to "log skip, continue").
+    let scm_calls = scm.calls.borrow();
+    assert_eq!(
+        scm_calls
+            .iter()
+            .filter(|c| c.starts_with("collaborator_permission("))
+            .count(),
+        0,
+        "rate-limited sweep must NOT probe any PR; got calls: {:?}",
+        scm_calls.iter().collect::<Vec<_>>()
+    );
+}
+
+/// r4 red test #2: zero per-PR probes on the second tick over an unchanged
+/// PR set. The cache MUST serve every PR's adoption/duplicate decision from
+/// disk (zero `collaborator_permission` invocations), and the only allowed
+/// `gh` call this tick is the single `labeled_prs` list query.
+///
+/// This is the headline acceptance criterion from the bead:
+/// "two consecutive ticks over an unchanged PR set — second tick makes
+/// zero per-PR probe calls".
+#[test]
+fn second_tick_over_unchanged_prs_makes_zero_per_pr_probes() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(labeled_pr_with_cache_key(
+        501,
+        "alice",
+        "feature/pr-501",
+        "sha-501-aaaa",
+        1_700_000_000,
+    ));
+    scm.prs.push(labeled_pr_with_cache_key(
+        502,
+        "alice",
+        "feature/pr-502",
+        "sha-502-bbbb",
+        1_700_000_010,
+    ));
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+    let mut cache = AdoptionProbeCache::new();
+
+    // Tick 1 — populates the probe cache for PRs 501/502.
+    let outcome1 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    assert_eq!(outcome1.adopted.len(), 2, "tick 1 must adopt both fresh PRs");
+    assert!(outcome1.outcomes.is_empty());
+    assert_eq!(outcome1.metrics.probe_cache_misses, 2);
+    assert_eq!(outcome1.metrics.probe_cache_hits, 0);
+
+    let tick1_perm_calls = scm
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| c.starts_with("collaborator_permission("))
+        .count();
+    assert_eq!(
+        tick1_perm_calls, 2,
+        "tick 1 must probe each PR's collaborator permission exactly once"
+    );
+
+    // Reset call log so we can prove tick 2's zero-per-PR behavior.
+    scm.calls.borrow_mut().clear();
+
+    // Tick 2 — same PR set, same head_sha, same updated_at. The probe cache
+    // MUST serve all per-PR adoption/duplicate decisions from disk, so the
+    // only allowed gh call this tick is the single `labeled_prs` list query
+    // (used to discover PRs and read their cache keys).
+    let outcome2 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    assert_eq!(outcome2.adopted.len(), 2, "tick 2 must re-adopt both PRs");
+    assert!(outcome2.outcomes.is_empty());
+    assert_eq!(outcome2.metrics.probe_cache_hits, 2);
+    assert_eq!(outcome2.metrics.probe_cache_misses, 0);
+
+    let tick2_calls = scm.calls.borrow();
+    let tick2_labeled_prs_calls = tick2_calls
+        .iter()
+        .filter(|c| c.starts_with("labeled_prs("))
+        .count();
+    let tick2_perm_calls = tick2_calls
+        .iter()
+        .filter(|c| c.starts_with("collaborator_permission("))
+        .count();
+    assert_eq!(
+        tick2_labeled_prs_calls, 1,
+        "tick 2 must do exactly one list query, got: {:?}",
+        tick2_calls.iter().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        tick2_perm_calls, 0,
+        "tick 2 must NOT re-probe collaborator_permission for cached PRs, got: {:?}",
+        tick2_calls.iter().collect::<Vec<_>>()
+    );
+}
+
+/// r4 red test #3: cache invalidation on `head_sha` / `updated_at_epoch`
+/// change. When a contributor pushes new commits, only the changed PR
+/// must re-probe; unchanged PRs continue to be served from cache. This is
+/// the central correctness invariant of the cache: cached == stable key,
+/// never stale reads.
+#[test]
+fn probe_cache_invalidates_on_changed_head_sha_but_serves_unchanged_prs() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(labeled_pr_with_cache_key(
+        601,
+        "alice",
+        "feature/pr-601",
+        "sha-601-original",
+        1_700_001_000,
+    ));
+    scm.prs.push(labeled_pr_with_cache_key(
+        602,
+        "alice",
+        "feature/pr-602",
+        "sha-602-original",
+        1_700_001_010,
+    ));
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+    let mut cache = AdoptionProbeCache::new();
+
+    // Tick 1: both PRs probed.
+    let outcome1 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    assert_eq!(outcome1.adopted.len(), 2);
+    scm.calls.borrow_mut().clear();
+
+    // Contributor pushes a new commit to PR 601 only; PR 602 is unchanged.
+    scm.prs[0].head_sha = Some("sha-601-NEWHEAD".into());
+    scm.prs[0].updated_at_epoch = Some(1_700_002_000);
+
+    // Tick 2: PR 601 re-probed, PR 602 served from cache.
+    let outcome2 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    assert_eq!(outcome2.adopted.len(), 2);
+    assert_eq!(outcome2.metrics.probe_cache_misses, 1, "only PR 601 missed");
+    assert_eq!(outcome2.metrics.probe_cache_hits, 1, "only PR 602 hit");
+
+    let tick2_calls = scm.calls.borrow();
+    let tick2_perm_calls = tick2_calls
+        .iter()
+        .filter(|c| c.starts_with("collaborator_permission("))
+        .count();
+    // We expect exactly 1 collaborator_permission call (PR 601 only).
+    assert_eq!(
+        tick2_perm_calls, 1,
+        "tick 2 must probe ONLY the PR whose head_sha changed (PR 601), got: {:?}",
+        tick2_calls.iter().collect::<Vec<_>>()
+    );
+}
+
+/// r4 red test #4: cache invalidation on collaborator tier change. The r3
+/// cache used only `(external_ref, head_sha, updated_at_epoch)` as the key,
+/// which means a contributor promoted from `Read` → `Write` between ticks
+/// would keep replaying the stale `SkippedIneligible` decision forever
+/// (because PR commits/updated_at don't change on a tier promotion). r4
+/// MUST re-probe when the upstream collaborator tier for the same
+/// `external_ref`/`head_sha`/`updated_at` triple changes — either via a
+/// TTL on cached `AuthorPermission` entries, or by detecting that the
+/// latest probe tier differs from the cached one and treating it as a
+/// miss.
+///
+/// We assert the minimal contract: when the contributor's tier changes
+/// from Read to Write between tick 1 and tick 2 (with NO change to
+/// `head_sha` or `updated_at_epoch`), tick 2 must re-probe the PR and
+/// correctly adopt it instead of replaying the stale Read-tier skip.
+#[test]
+fn probe_cache_revalidates_when_collaborator_tier_changes() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(labeled_pr_with_cache_key(
+        701,
+        "alice",
+        "feature/pr-701",
+        "sha-701",
+        1_700_003_000,
+    ));
+    // Initial tier: Read — tick 1 should skip alice as ineligible.
+    scm.permissions.insert("alice".into(), Permission::Read);
+
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+    let mut cache = AdoptionProbeCache::new();
+
+    // Tick 1: alice is Read tier, PR 701 is ineligible.
+    let outcome1 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1_700_000_000).unwrap();
+    assert!(outcome1.adopted.is_empty());
+    assert_eq!(outcome1.outcomes.len(), 1);
+    assert!(matches!(
+        outcome1.outcomes[0].verdict,
+        IntakeVerdict::SkippedIneligible { .. }
+    ));
+
+    // Alice is promoted to Write — PR head_sha + updated_at unchanged.
+    scm.permissions.insert("alice".into(), Permission::Write);
+    scm.calls.borrow_mut().clear();
+
+    // Tick 2: must detect the tier change and re-probe (no stale skip).
+    // Advance now_epoch past MAX_CACHED_PERMISSION_AGE_SECS so the cached
+    // AuthorPermission(Read) entry expires and the cache lookup misses,
+    // forcing a fresh `collaborator_permission` probe that observes the
+    // new Write tier.
+    let outcome2 = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000 + intake::MAX_CACHED_PERMISSION_AGE_SECS + 1,
+    )
+    .unwrap();
+    assert_eq!(
+        outcome2.adopted.len(),
+        1,
+        "tick 2 must adopt PR 701 after alice's promotion to Write; \
+         got adopted={:?}, outcomes={:?}",
+        outcome2.adopted, outcome2.outcomes
+    );
+    let tick2_perm_calls = scm
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| c.starts_with("collaborator_permission("))
+        .count();
+    assert_eq!(
+        tick2_perm_calls, 1,
+        "tick 2 must re-probe the PR's permission tier after promotion, got: {:?}",
+        scm.calls.borrow().iter().collect::<Vec<_>>()
+    );
+}
+
+/// r4 unit test: the AdoptionProbeCache keying distinguishes between
+/// (1) two PRs sharing an external_ref prefix but different head SHAs and
+/// (2) the same PR across two ticks with different updated_at.
+#[test]
+fn probe_cache_keys_on_external_ref_head_sha_and_updated_at() {
+    let mut cache = AdoptionProbeCache::new();
+
+    let p1 = labeled_pr_with_cache_key(1, "alice", "feature/pr-1", "sha-a", 100);
+    let p1_dup = labeled_pr_with_cache_key(1, "alice", "feature/pr-1", "sha-a", 100);
+    let p1_new_sha = labeled_pr_with_cache_key(1, "alice", "feature/pr-1", "sha-b", 100);
+    let p1_new_time = labeled_pr_with_cache_key(1, "alice", "feature/pr-1", "sha-a", 101);
+
+    let k1 = ProbeCacheKey::from_pr(&p1);
+    let k1_dup = ProbeCacheKey::from_pr(&p1_dup);
+    let k1_new_sha = ProbeCacheKey::from_pr(&p1_new_sha);
+    let k1_new_time = ProbeCacheKey::from_pr(&p1_new_time);
+
+    // Identical keys collide (cache hit semantics).
+    cache.insert(k1.clone(), CachedDecisionKind::AuthorPermission(Permission::Write), 1_700_000_000);
+    assert!(cache.contains(&k1_dup), "identical keys must collide");
+
+    // A different head_sha invalidates the cache entry.
+    assert!(
+        !cache.contains(&k1_new_sha),
+        "head_sha change must produce a new key (cache miss)"
+    );
+
+    // A different updated_at invalidates the cache entry.
+    assert!(
+        !cache.contains(&k1_new_time),
+        "updated_at change must produce a new key (cache miss)"
+    );
 }

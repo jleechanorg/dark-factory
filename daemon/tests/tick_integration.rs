@@ -24,6 +24,7 @@ mod common;
 
 use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker, FakeVcs};
 use daemon::config::Config;
+
 use daemon::er_runner;
 use daemon::errors::DaemonError;
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
@@ -1817,6 +1818,8 @@ fn factory_labeled_existing_pr_is_adopted_and_verified_without_spawn() {
         is_cross_repository: false,
         head_repo_full_name: Some("owner/repo".into()),
         head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
     });
     scm.permissions.insert("alice".into(), Permission::Write);
     scm.pr_snapshots.insert(
@@ -1902,6 +1905,8 @@ fn factory_labeled_existing_pr_second_tick_reuses_tracking_bead_without_spawn() 
         is_cross_repository: false,
         head_repo_full_name: Some("owner/repo".into()),
         head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
     });
     scm.permissions.insert("alice".into(), Permission::Write);
     scm.pr_snapshots.insert(
@@ -1982,6 +1987,8 @@ fn factory_labeled_existing_pr_without_session_is_not_parked_as_stalled() {
         is_cross_repository: false,
         head_repo_full_name: Some("owner/repo".into()),
         head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
     });
     scm.permissions.insert("alice".into(), Permission::Write);
     let mut stale_unknown = qdw_green_snapshot(703, Vec::new());
@@ -2044,6 +2051,8 @@ fn factory_labeled_pr_branch_collision_is_refused_without_stealing_mapping() {
         is_cross_repository: false,
         head_repo_full_name: Some("owner/repo".into()),
         head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
     });
     scm.permissions.insert("alice".into(), Permission::Write);
 
@@ -2151,6 +2160,8 @@ fn fork_labeled_pr_never_registers_branch_at_tick_level() {
         is_cross_repository: true,
         head_repo_full_name: Some("mallory-fork/repo".into()),
         head_repo_owner_login: Some("mallory-fork".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
     });
     scm.permissions.insert("mallory".into(), Permission::Write);
 
@@ -2236,6 +2247,8 @@ fn adopted_non_green_pr_parks_human_held_with_v1_escalation() {
         is_cross_repository: false,
         head_repo_full_name: Some("owner/repo".into()),
         head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
     });
     scm.permissions.insert("alice".into(), Permission::Write);
     let mut snapshot = qdw_green_snapshot(
@@ -2340,6 +2353,8 @@ fn adopted_red_pr_stage2_reroll_spawns_remediation_session_leaves_pr_open() {
         is_cross_repository: false,
         head_repo_full_name: Some("owner/repo".into()),
         head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
     });
     scm.permissions.insert("alice".into(), Permission::Write);
     let mut snapshot = qdw_green_snapshot(
@@ -2479,6 +2494,8 @@ fn adopted_red_pr_stage2_reroll_spawn_failure_parks_human_held_with_escalation()
         is_cross_repository: false,
         head_repo_full_name: Some("owner/repo".into()),
         head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
     });
     scm.permissions.insert("alice".into(), Permission::Write);
     let mut snapshot = qdw_green_snapshot(
@@ -2598,6 +2615,8 @@ fn adopted_red_pr_structural_only_red_gates_holds_disposition_required_not_rerol
         is_cross_repository: false,
         head_repo_full_name: Some("owner/repo".into()),
         head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
     });
     scm.permissions.insert("alice".into(), Permission::Write);
     let mut snapshot = qdw_green_snapshot(
@@ -2731,6 +2750,8 @@ fn adopted_red_pr_mixed_red_gates_still_rerolls() {
         is_cross_repository: false,
         head_repo_full_name: Some("owner/repo".into()),
         head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
     });
     scm.permissions.insert("alice".into(), Permission::Write);
     let mut snapshot = qdw_green_snapshot(
@@ -4152,6 +4173,8 @@ fn adopted_pr_that_never_goes_green_escalates_at_recovery_cap_and_dedups() {
         is_cross_repository: false,
         head_repo_full_name: Some("owner/repo".into()),
         head_repo_owner_login: Some("owner".into()),
+        head_sha: Some("sha-stub".into()),
+        updated_at_epoch: Some(1_700_000_000),
     });
     scm.permissions.insert("alice".into(), Permission::Write);
     let mut snapshot = qdw_green_snapshot(

@@ -34,6 +34,9 @@ daemon.pid
 bd.sock
 sync-state.json
 
+# jtg8-r4: adoption-probe cache (runtime data, not source)
+adoption_probe_cache.json
+
 # Worktree redirect file
 redirect
 

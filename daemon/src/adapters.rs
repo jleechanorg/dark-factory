@@ -200,6 +200,51 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
     }
 }
 
+/// jtg8: parse GitHub's RFC3339 timestamp into epoch seconds. Used by the
+/// adoption-probe cache to key per-PR probes on `updated_at`. Returns `None`
+/// for any unparseable input — the daemon treats `None` as "uncacheable"
+/// (preserves pre-fix behavior for missing/malformed upstream fields).
+pub(crate) fn parse_rfc3339_to_epoch_secs(s: &str) -> Option<u64> {
+    // Strip fractional seconds (we only care about second precision for the
+    // cache key — anything sub-second doesn't change adoption decisions) and
+    // the trailing `Z` so the date/time parser below sees plain numbers.
+    let trimmed = s.trim();
+    let no_frac = trimmed.split('.').next().unwrap_or(trimmed);
+    let no_tz = no_frac.trim_end_matches('Z');
+    let parts: Vec<&str> = no_tz.split(['-', ':', 'T']).collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let year: i64 = parts[0].parse().ok()?;
+    let month: i64 = parts[1].parse().ok()?;
+    let day: i64 = parts[2].parse().ok()?;
+    let hour: i64 = parts[3].parse().ok()?;
+    let minute: i64 = parts[4].parse().ok()?;
+    let second: i64 = parts[5].parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Howard Hinnant's days-from-civil algorithm — pure integer math, no
+    // chrono dependency. Converts a Gregorian date into days since the
+    // Unix epoch (1970-01-01). Equivalent to chrono's NaiveDate conversion
+    // but avoids the dep.
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 9)
+    } else {
+        (year, month - 3)
+    };
+    let era = y.div_euclid(400);
+    let yoe = (y - era * 400) as u64;
+    let m_idx = m as u64;
+    let doy = (153 * m_idx + 2) / 5 + day as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe as i64 - 719_468;
+    if days < 0 {
+        return None;
+    }
+    Some((days as u64) * 86_400 + (hour as u64) * 3_600 + (minute as u64) * 60 + second as u64)
+}
+
 /// jleechan-mdgr defense-in-depth: recovers the real `<repo>#<pr>` comment
 /// target from the "double external_ref suffix" corruption, where a bead
 /// that already had a valid `parse_external_ref`-shaped ref ALSO got a
@@ -363,7 +408,14 @@ impl CliScm {
                 "gh",
                 &[
                     "api",
-                    &format!("repos/{}/pulls/{}", self.repo, issue.number),
+                    // jtg8: also fetch head SHA + updated_at so the adoption-probe
+                    // cache can short-circuit per-PR probes on unchanged keys.
+                    // The previous /pulls/{n} response did not include these and
+                    // forced a per-PR re-probe every tick.
+                    &format!(
+                        "repos/{}/pulls/{}?fields=number,head,updated_at",
+                        self.repo, issue.number
+                    ),
                 ],
                 30,
             )?;
@@ -374,6 +426,30 @@ impl CliScm {
                     issue.number
                 ))
             })?;
+            // jtg8: capture head_sha + updated_at from the extended response.
+            // These fields live alongside `head` in the same JSON object; we
+            // deserialize via a separate inline struct so a missing field
+            // doesn't break older gh versions that omit them.
+            let (head_sha_opt, updated_at_epoch_opt) = {
+                #[derive(serde::Deserialize)]
+                struct RestPullExt {
+                    #[serde(default)]
+                    head_sha: Option<String>,
+                    #[serde(default)]
+                    updated_at: Option<String>,
+                }
+                serde_json::from_str::<RestPullExt>(&pull_out[json_start..])
+                    .ok()
+                    .map(|ext| {
+                        (
+                            ext.head_sha,
+                            ext.updated_at
+                                .as_deref()
+                                .and_then(parse_rfc3339_to_epoch_secs),
+                        )
+                    })
+                    .unwrap_or((None, None))
+            };
             let head_repo_full_name = pull
                 .head
                 .repo
@@ -403,6 +479,12 @@ impl CliScm {
                 is_cross_repository,
                 head_repo_full_name,
                 head_repo_owner_login,
+                // jtg8: populated from the extended /pulls/{n} response when
+                // available; otherwise `None` and the daemon treats the PR as
+                // uncacheable (probes fresh every tick — preserves old
+                // behavior on schema-drifted gh versions).
+                head_sha: head_sha_opt,
+                updated_at_epoch: updated_at_epoch_opt,
             });
         }
         Ok(prs)
@@ -531,7 +613,9 @@ impl Scm for CliScm {
                 "--limit",
                 "1000",
                 "--json",
-                "number,title,body,author,headRefName,isCrossRepository,headRepositoryOwner",
+                // jtg8: also fetch headRefOid + updatedAt so the adoption-probe
+                // cache can short-circuit per-PR probes on unchanged keys.
+                "number,title,body,author,headRefName,isCrossRepository,headRepositoryOwner,headRefOid,updatedAt",
             ],
             30,
         ) {
@@ -550,6 +634,12 @@ impl Scm for CliScm {
             is_cross_repository: bool,
             #[serde(rename = "headRepositoryOwner")]
             head_repository_owner: Option<GhAuthor>,
+            // jtg8: cache key fields. `headRefOid` is the head commit SHA;
+            // `updatedAt` is the PR's last-modified timestamp.
+            #[serde(rename = "headRefOid")]
+            head_ref_oid: Option<String>,
+            #[serde(rename = "updatedAt")]
+            updated_at: Option<String>,
         }
         #[derive(serde::Deserialize)]
         struct GhAuthor {
@@ -561,16 +651,27 @@ impl Scm for CliScm {
         })?;
         Ok(prs
             .into_iter()
-            .map(|pr| LabeledPr {
-                number: pr.number,
-                title: pr.title,
-                body: pr.body.unwrap_or_default(),
-                author_login: pr.author.map(|a| a.login).unwrap_or_default(),
-                external_ref: format!("{}#{}", self.repo, pr.number),
-                head_ref_name: pr.head_ref_name,
-                is_cross_repository: pr.is_cross_repository,
-                head_repo_full_name: None,
-                head_repo_owner_login: pr.head_repository_owner.map(|owner| owner.login),
+            .map(|pr| {
+                // jtg8: parse GitHub's RFC3339 updatedAt into epoch seconds
+                // for the cache key. Returns None on parse failure (the
+                // daemon treats None as "uncacheable" and probes fresh).
+                let updated_at_epoch = pr
+                    .updated_at
+                    .as_deref()
+                    .and_then(parse_rfc3339_to_epoch_secs);
+                LabeledPr {
+                    number: pr.number,
+                    title: pr.title,
+                    body: pr.body.unwrap_or_default(),
+                    author_login: pr.author.map(|a| a.login).unwrap_or_default(),
+                    external_ref: format!("{}#{}", self.repo, pr.number),
+                    head_ref_name: pr.head_ref_name,
+                    is_cross_repository: pr.is_cross_repository,
+                    head_repo_full_name: None,
+                    head_repo_owner_login: pr.head_repository_owner.map(|owner| owner.login),
+                    head_sha: pr.head_ref_oid,
+                    updated_at_epoch,
+                }
             })
             .collect())
     }
