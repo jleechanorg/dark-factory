@@ -145,6 +145,38 @@ CREATE TABLE IF NOT EXISTS review_rejection (
   PRIMARY KEY (bead_id, attempt)
 );
 
+-- Escalation dedup ledger (1s2q-escalation-dedup): per-(bead_id, reason) record
+-- of the last emitted ESCALATION_REQUIRED / ESCALATION_NOTIFICATION_FAILED
+-- event's context hash + epoch. The tick engine consults this before emitting:
+-- a re-fire is suppressed unless the context hash CHANGED or the last emit is
+-- older than `Config::escalation_refire_secs` (default 1h). Stops the live
+-- incident where a bead with an identical permanent condition re-fired every
+-- ~40s. Legacy DBs that pre-date this table get it via the idempotent
+-- `ensure_escalation_ledger_table` migration in `SqliteStateStore::open`
+-- (probes `sqlite_master` then `CREATE TABLE IF NOT EXISTS` — safe to call
+-- repeatedly). Separate from `review_rejection` (the permanent one-time guard
+-- via `escalation_already_recorded`): the ledger is a backoff guard layered
+-- ON TOP of that permanent guard.
+CREATE TABLE IF NOT EXISTS escalation_ledger (
+  bead_id           TEXT NOT NULL,
+  reason            TEXT NOT NULL,
+  context_hash      TEXT NOT NULL,
+  last_emitted_epoch INTEGER NOT NULL,
+  -- 1s2q-escalation-dedup Task 2: when 1, this (bead_id, reason) row is
+  -- terminal ("escalation_undeliverable") — a permanent (non-transient) gh
+  -- error classified by `!DaemonError::is_transient()` made the notification
+  -- undeliverable, so the daemon must NEVER re-emit ESCALATION_REQUIRED /
+  -- ESCALATION_NOTIFICATION_FAILED for it again. `escalation_should_emit`
+  -- returns `Ok(false)` unconditionally when `terminal = 1`, regardless of
+  -- context hash or backoff window. Set once by `mark_escalation_undeliverable`
+  -- alongside a single final `ESCALATION_UNDELIVERABLE` event; never cleared.
+  -- Older DBs that pre-date this column get it via the idempotent
+  -- `ensure_escalation_ledger_terminal_column` migration in
+  -- `SqliteStateStore::open` (probes `pragma_table_info` then `ALTER TABLE`).
+  terminal          INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (bead_id, reason)
+);
+
 -- /er runner state (bead jleechan-qqq): per-bead attempt counter + last
 -- attempt timestamp (unix epoch seconds). Used by `er_runner::maybe_run`
 -- to enforce a per-bead attempt cap (default MAX_ER_RUNNER_ATTEMPTS=3)
