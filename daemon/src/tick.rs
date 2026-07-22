@@ -50,6 +50,16 @@ pub struct TickDeps<'a> {
 /// counts").
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TickSummary {
+    /// jleechan-jtg8: count of gh REST calls observed by the slow-tier
+    /// intake sweep this tick. Emitted as `INTAKE_GH_CALLS` telemetry per
+    /// slow tick. The contract is that a steady-state tick (no new
+    /// factory-labeled candidates) makes O(1) calls — one `labeled_prs`
+    /// list call per repo, zero per-PR probes because already-adopted
+    /// PRs short-circuit before `collaborator_permission`. The warn
+    /// threshold is intentionally conservative: 5 gh calls/tick is
+    /// already suspicious for steady state and worth an operator
+    /// alert before the 5000/hr core bucket exhausts.
+    pub intake_gh_calls: u32,
     pub beads_created: usize,
     pub beads_routed: usize,
     pub beads_dispatched: usize,
@@ -1235,8 +1245,9 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // required dispatch-scheduling guarantee: already-QUEUED beads (from prior
     // ticks) are dispatched before any recovery/escalation work each tick.
     let mut pr_intake_bead_ids = HashSet::new();
+    let mut intake_metrics = intake::IntakeMetrics::default();
     let (pr_adoptions, pr_skip_outcomes) =
-        intake::normalize_labeled_prs(deps.scm, deps.tracker, deps.cfg)?;
+        intake::normalize_labeled_prs(deps.scm, deps.tracker, deps.cfg, &mut intake_metrics)?;
     // jleechan-eazj: every factory-labeled PR that did NOT result in an
     // adoption still gets exactly one verdict event here, unconditionally —
     // before the adoption loop below runs any I/O of its own.
@@ -1360,7 +1371,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         )?;
     }
 
-    let (created, issue_skip_outcomes) = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
+    let (created, issue_skip_outcomes) = intake::normalize(deps.scm, deps.tracker, deps.cfg, &mut intake_metrics)?;
     // jleechan-eazj: same unconditional per-candidate guarantee as the PR
     // path above — every factory-labeled issue that did NOT result in a
     // newly-created bead still gets exactly one verdict event.
@@ -2218,6 +2229,28 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
         }
     }
+
+    // jleechan-jtg8: emit a per-tick `INTAKE_GH_CALLS` telemetry line so
+    // operators can graph the burn vector and trip a warn at the first
+    // sign of a 5000/hr bucket exhaustion. The count comes from
+    // `intake_metrics.gh_calls`, which `normalize_labeled_prs` /
+    // `normalize` already incremented for each gh call they made (one
+    // per `labeled_prs`/`labeled_issues` list call + one per
+    // `collaborator_permission` for genuinely new candidates). Steady
+    // state should be O(1); anything over 5 calls/tick is worth
+    // investigating before the next hourly exhaust.
+    summary.intake_gh_calls = intake_metrics.gh_calls;
+    let threshold: u32 = 5;
+    let exceeded = summary.intake_gh_calls > threshold;
+    let _ = emit(
+        deps.telemetry_log,
+        "_intake",
+        1,
+        "INTAKE",
+        if exceeded { "INTAKE_GH_CALLS_HIGH" } else { "INTAKE_GH_CALLS" },
+        serde_json::json!({"intake_gh_calls": summary.intake_gh_calls, "threshold": threshold, "exceeded": exceeded}),
+        serde_json::json!({}),
+    );
 
     Ok(())
 }

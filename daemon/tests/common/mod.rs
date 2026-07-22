@@ -381,6 +381,67 @@ impl Scm for FakeScm {
     }
 }
 
+/// jleechan-jtg8: minimal Scm fake that returns a 403-shaped
+/// `DaemonError::Tool` from `labeled_prs` on every call, modeling
+/// `gh api` rate-limit exhaustion during the intake sweep. All other
+/// methods delegate to an inner `FakeScm` so tests can mix and match
+/// (e.g. rate-limited PR list + working collaborator permissions for a
+/// new PR that survived a prior tick).
+#[derive(Default)]
+pub struct RateLimitedScm {
+    pub inner: FakeScm,
+}
+
+impl RateLimitedScm {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Scm for RateLimitedScm {
+    fn labeled_issues(&self, _label: &str) -> Result<Vec<Issue>, DaemonError> {
+        Err(DaemonError::Tool {
+            tool: "gh".into(),
+            rc: 1,
+            stderr: "gh issue list: API rate limit exceeded for user ID 13840161".into(),
+        })
+    }
+    fn labeled_prs(&self, _label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
+        Err(DaemonError::Tool {
+            tool: "gh".into(),
+            rc: 1,
+            stderr: "gh pr list: API rate limit exceeded for user ID 13840161".into(),
+        })
+    }
+    fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError> {
+        self.inner.collaborator_permission(login)
+    }
+    fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError> {
+        self.inner.pr_snapshot(pr)
+    }
+    fn pr_snapshot_for_repo(&self, repo: &str, pr: u64) -> Result<PrSnapshot, DaemonError> {
+        self.inner.pr_snapshot_for_repo(repo, pr)
+    }
+    fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
+        self.inner.close_pr(pr, comment)
+    }
+    fn close_pr_for_repo(&self, repo: &str, pr: u64, comment: &str) -> Result<(), DaemonError> {
+        self.inner.close_pr_for_repo(repo, pr, comment)
+    }
+    fn remote_branch_last_commit(&self, branch: &str) -> Result<Option<u64>, DaemonError> {
+        self.inner.remote_branch_last_commit(branch)
+    }
+    fn open_pr_head_ref_for_repo(&self, repo: &str, pr: u64) -> Result<PrHeadBranch, DaemonError> {
+        self.inner.open_pr_head_ref_for_repo(repo, pr)
+    }
+    fn pr_number_for_branch(&self, repo: &str, branch: &str) -> Result<Option<u64>, DaemonError> {
+        self.inner.pr_number_for_branch(repo, branch)
+    }
+    fn gist_nonempty(&self, gist_id: &str) -> Result<Option<bool>, DaemonError> {
+        self.inner.gist_nonempty(gist_id)
+    }
+}
+
 /// Scripted `Sessions` fake: active-count + spawn/attach return a caller-set
 /// `SessionId`, `is_quiescent` returns the scripted bool.
 pub struct FakeSessions {

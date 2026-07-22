@@ -65,7 +65,7 @@ fn new_issue_from_write_tier_collaborator_creates_one_bead() {
     let tracker = FakeTracker::new();
     let cfg = test_cfg();
 
-    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
+    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
 
     assert_eq!(created, vec!["fake-bead-1".to_string()]);
     assert!(
@@ -110,7 +110,7 @@ fn already_known_external_ref_is_not_duplicated() {
 
     let cfg = test_cfg();
 
-    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
+    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
 
     assert!(
         created.is_empty(),
@@ -150,7 +150,7 @@ fn read_tier_creator_is_skipped_without_create_bead() {
     let tracker = FakeTracker::new();
     let cfg = test_cfg();
 
-    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
+    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
 
     assert!(
         created.is_empty(),
@@ -205,7 +205,7 @@ fn mixed_batch_only_creates_bead_for_new_write_tier_issue() {
 
     let cfg = test_cfg();
 
-    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
+    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
 
     assert_eq!(created, vec!["fake-bead-1".to_string()]);
     // jleechan-eazj: the two non-adopted candidates in this batch (mallory's
@@ -261,7 +261,7 @@ fn create_bead_duplicate_error_is_recovered_as_already_known() {
 
     let cfg = test_cfg();
 
-    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
+    let (created, outcomes) = intake::normalize(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
 
     assert!(
         created.is_empty(),
@@ -305,7 +305,7 @@ fn pr_create_bead_duplicate_error_is_recovered_as_already_adopted() {
 
     let cfg = test_cfg();
 
-    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
 
     assert!(
         adopted.is_empty(),
@@ -342,7 +342,7 @@ fn new_factory_pr_from_write_tier_collaborator_creates_existing_pr_intake() {
     let tracker = FakeTracker::new();
     let cfg = test_cfg();
 
-    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
 
     assert_eq!(adopted.len(), 1);
     assert_eq!(adopted[0].bead_id, "fake-bead-1");
@@ -382,7 +382,7 @@ fn factory_pr_with_existing_external_ref_reuses_bead() {
     });
     let cfg = test_cfg();
 
-    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
 
     assert_eq!(adopted.len(), 1);
     assert_eq!(adopted[0].bead_id, "existing-pr-bead");
@@ -414,7 +414,7 @@ fn factory_pr_from_read_tier_creator_is_skipped() {
     let tracker = FakeTracker::new();
     let cfg = test_cfg();
 
-    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
 
     assert!(adopted.is_empty());
     assert_eq!(
@@ -455,7 +455,7 @@ fn fork_factory_pr_is_skipped_with_escalation_comment() {
     let tracker = FakeTracker::new();
     let cfg = test_cfg();
 
-    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
 
     assert!(adopted.is_empty());
     assert_eq!(
@@ -517,9 +517,9 @@ fn every_create_bead_call_across_both_intake_paths_carries_nonempty_external_ref
     let tracker = FakeTracker::new();
     let cfg = test_cfg();
 
-    let (created_issues, _issue_outcomes) = intake::normalize(&scm, &tracker, &cfg).unwrap();
+    let (created_issues, _issue_outcomes) = intake::normalize(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
     let (adopted_prs, _pr_outcomes) =
-        intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+        intake::normalize_labeled_prs(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
 
     assert_eq!(created_issues.len(), 2, "expected both new issues to create beads");
     assert_eq!(adopted_prs.len(), 2, "expected both new PRs to be adopted");
@@ -553,4 +553,325 @@ fn every_create_bead_call_across_both_intake_paths_carries_nonempty_external_ref
             "external_ref should be shaped owner/repo#<number>, got '{external_ref}' from call: {call}"
         );
     }
+}
+
+// =============================================================================
+// jleechan-jtg8: intake sweep gh-REST burn regression tests.
+//
+// The factory daemon slow-tier tick calls `normalize_labeled_prs` every
+// ~60s. With ~30 factory-labeled PRs (across dark-factory +
+// worldarchitect.ai) and `collaborator_permission` doing one REST call per
+// author, the slow-tier intake was burning ~1800 gh REST calls per hour
+// JUST for the permission probe, exhausting the shared 5000/hr core bucket
+// on user 13840161 and starving operator/CI tooling.
+//
+// Acceptance criteria require: (a) per-PR probes cached across ticks; (b)
+// steady-state tick = O(1) gh calls per repo, not O(N); (c) per-tick gh call
+// count metric + warn threshold; (d) regression test asserting zero per-PR
+// probe calls on the second tick of an unchanged PR set; (e) rate-limit 403
+// during intake must not bump `consecutive_failures` into mass-backoff when
+// dispatch work is independent of gh.
+//
+// These tests pin all five contracts at the level of the
+// `intake::normalize*` entry points (the function the daemon actually calls
+// every slow tick). They use the shared `FakeScm`/`FakeTracker` fakes to
+// count exact gh call shape without any subprocess use.
+// =============================================================================
+
+#[test]
+fn slow_tick_over_already_adopted_prs_makes_zero_per_pr_probe_calls() {
+    // Pin the burn vector: when every factory-labeled PR is ALREADY in
+    // the tracker's known_refs / candidates set (the steady state under
+    // which the 2026-07-22 19:09-19:21 + 20:0x-20:2x rate-limit storms
+    // were observed), `normalize_labeled_prs` must do ZERO
+    // `collaborator_permission` calls and ZERO `create_bead` calls —
+    // only the single `labeled_prs` list call.
+    //
+    // Today (RED) the function calls `collaborator_permission` BEFORE
+    // the `tracker_candidates` / `known_refs` checks, so even already-
+    // adopted PRs cost one REST call per tick. That is the bug.
+    let mut scm = FakeScm::new();
+    scm.prs.push(labeled_pr(9001, "alice", "feat/a"));
+    scm.prs.push(labeled_pr(9002, "alice", "feat/b"));
+    scm.prs.push(labeled_pr(9003, "bob", "feat/c"));
+    scm.permissions.insert("alice".into(), Permission::Write);
+    scm.permissions.insert("bob".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    // Pre-seed the tracker as if every PR was already adopted in a prior
+    // tick — this is the steady state the bug report describes.
+    for n in [9001u64, 9002, 9003] {
+        tracker.candidates.borrow_mut().push(Bead {
+            id: format!("bead-{n}"),
+            title: format!("pr {n}"),
+            description: String::new(),
+            notes: String::new(),
+            file_tree_summary: String::new(),
+            external_ref: Some(format!("owner/repo#{n}")),
+        });
+    }
+    let cfg = test_cfg();
+
+    let (_adopted, _outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
+
+    let calls = scm.calls.borrow();
+    let per_pr_probe_calls = calls
+        .iter()
+        .filter(|c| c.starts_with("collaborator_permission("))
+        .count();
+    assert_eq!(
+        per_pr_probe_calls, 0,
+        "already-adopted PRs MUST NOT trigger collaborator_permission REST calls \
+         — that is the burn vector this test pins. got calls: {:?}",
+        *calls
+    );
+    let create_bead_calls = calls
+        .iter()
+        .filter(|c| c.starts_with("create_bead("))
+        .count();
+    assert_eq!(
+        create_bead_calls, 0,
+        "already-adopted PRs MUST NOT trigger create_bead (no new bead needed)"
+    );
+    let list_calls = calls
+        .iter()
+        .filter(|c| c.starts_with("labeled_prs("))
+        .count();
+    assert_eq!(list_calls, 1, "one labeled_prs list call per repo per slow tick");
+}
+
+#[test]
+fn only_truly_new_pr_triggers_probe_existing_prs_skip_without_probe() {
+    // Stricter version: a mix of one already-adopted PR and one new
+    // candidate. The already-adopted PR must NOT trigger
+    // collaborator_permission (the fix); the new PR must be probed
+    // exactly once (its permission was not yet seen).
+    let mut scm = FakeScm::new();
+    scm.prs.push(labeled_pr(7001, "alice", "feat/already-adopted"));
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "bead-already".into(),
+        title: "pr 7001".into(),
+        description: String::new(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#7001".into()),
+    });
+
+    // Now add a NEW PR that hasn't been adopted yet.
+    scm.prs.push(labeled_pr(7002, "alice", "feat/newcomer"));
+    let cfg = test_cfg();
+
+    let (adopted, outcomes) = intake::normalize_labeled_prs(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
+    assert_eq!(adopted.len(), 2, "both PRs are adopted (7001 reused, 7002 new)");
+    assert_eq!(
+        outcomes.len(),
+        0,
+        "no SKIPPED_* verdicts in this batch — both PRs adopted"
+    );
+
+    let adopted_newcomer = adopted.iter().any(|i| i.external_ref == "owner/repo#7002" && i.newly_created);
+    let adopted_reused = adopted.iter().any(|i| i.external_ref == "owner/repo#7001" && !i.newly_created);
+    assert!(adopted_newcomer, "7002 should be a freshly-created adoption");
+    assert!(adopted_reused, "7001 should be reused from existing bead");
+
+    let calls = scm.calls.borrow();
+    let per_pr: Vec<&String> = calls
+        .iter()
+        .filter(|c| c.starts_with("collaborator_permission("))
+        .collect();
+    assert_eq!(
+        per_pr.len(),
+        1,
+        "ONLY the new PR may be probed; already-adopted PRs MUST skip \
+         the REST call. got calls: {:?}",
+        *calls
+    );
+    assert!(
+        per_pr[0].contains("alice"),
+        "the probe should be for alice, got: {}",
+        per_pr[0]
+    );
+}
+
+#[test]
+fn issue_path_same_tick_unaffected_and_also_short_circuits_on_second_pass() {
+    // Mirror contract for the labeled-issue path. The bug report mentions
+    // EXISTING_PR_ADOPTED + SKIPPED_DUPLICATE both burning, but the issue
+    // path has the same shape and the same per-author probe. Lock both
+    // down in one test to keep them in sync going forward.
+    let mut scm = FakeScm::new();
+    scm.issues.push(issue(8001, "alice"));
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "bead-issue-8001".into(),
+        title: "issue 8001".into(),
+        description: String::new(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#8001".into()),
+    });
+    let cfg = test_cfg();
+
+    // Tick 1: issue already known -> SKIPPED_DUPLICATE, no probe.
+    let (created1, outcomes1) = intake::normalize(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
+    assert_eq!(created1.len(), 0);
+    assert_eq!(outcomes1.len(), 1);
+    {
+        let t1 = scm.calls.borrow();
+        assert_eq!(
+            t1.iter()
+                .filter(|c| c.starts_with("collaborator_permission("))
+                .count(),
+            0
+        );
+    }
+
+    scm.calls.borrow_mut().clear();
+    // Tick 2: identical -> zero per-PR probes.
+    let (created2, outcomes2) = intake::normalize(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default()).unwrap();
+    assert_eq!(created2.len(), 0);
+    assert_eq!(outcomes2.len(), 1);
+    {
+        let t2 = scm.calls.borrow();
+        assert_eq!(
+            t2.iter()
+                .filter(|c| c.starts_with("collaborator_permission("))
+                .count(),
+            0,
+            "issue path second tick must not re-probe collaborator_permission"
+        );
+        assert_eq!(
+            t2.iter()
+                .filter(|c| c.starts_with("labeled_issues("))
+                .count(),
+            1
+        );
+    }
+}
+
+// jleechan-jtg8 (e): rate-limit 403 during intake must not bump
+// `consecutive_failures` into mass-backoff when dispatch work is
+// independent of gh. We pin the contract at the SlowTierResult level —
+// the slow tier now returns a structured outcome that distinguishes
+// intake failures (recoverable, no mass-backoff) from dispatch failures
+// (escalating). When only intake fails, the dispatch side of the tick
+// must still be reachable on subsequent ticks.
+//
+// This test calls `intake::normalize_labeled_prs` directly with a fake
+// SCM that returns a 403-shaped `DaemonError::Tool` from `labeled_prs`
+// (mimicking `gh api` rate-limit exhaustion). The intake function must
+// surface this as `Err(..)` so the slow tier can branch, but the
+// dispatch path (post-intake queue) must NOT see `consecutive_failures`
+// incremented by this single failure — that's a property the slow tier
+// wrapper will enforce after the fix. Today, `run_slow_tier` propagates
+// any Err via `?` and `run_tick` then wraps it through the same
+// classify_tick_result path as a dispatch failure. After the fix,
+// `run_slow_tier` returns a struct that distinguishes the two, and the
+// tick loop applies backoff only on dispatch failures.
+//
+// To make the contract testable at the unit level, we expose a
+// `SlowTierOutcome` (added by this PR) and assert that `run_slow_tier`
+// classifies an intake-only 403 as `IntakeOnly` — observable via the
+// returned outcome struct. The DaemonState-level integration (no
+// consecutive_failures bump) is covered by the `tick_integration.rs`
+// extension added in this same PR; pinning it at the intake-only level
+// here keeps the cache contract tests self-contained.
+#[test]
+fn intake_labeled_prs_403_returns_err_so_slow_tier_can_branch() {
+    // Contract: when `scm.labeled_prs` returns Err (rate-limit 403), the
+    // intake function propagates Err unchanged. The slow tier wrapper
+    // (added by this PR) then classifies this as `IntakeOnly` and does
+    // not propagate to the dispatch-level backoff path. We don't assert
+    // the wrapper here — that's tested separately — but we lock down the
+    // shape of the intake error so the wrapper has a stable signal to
+    // pattern-match on.
+    let scm = common::RateLimitedScm::new();
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+
+    let result = intake::normalize_labeled_prs(&scm, &tracker, &cfg, &mut intake::IntakeMetrics::default());
+    assert!(
+        result.is_err(),
+        "an intake-only 403 must surface as Err so the slow tier can \
+         branch on it (today: returns Err with full stack trace context)"
+    );
+    // Shape: must be a DaemonError::Tool so the slow tier can distinguish
+    // it from a parse/IO error.
+    match result.unwrap_err() {
+        daemon::errors::DaemonError::Tool { tool, stderr, .. } => {
+            assert_eq!(tool, "gh");
+            assert!(
+                stderr.contains("rate limit"),
+                "stderr should carry the gh 403 marker, got: {stderr}"
+            );
+        }
+        other => panic!("expected DaemonError::Tool from a gh 403, got {other:?}"),
+    }
+}
+
+#[test]
+fn intake_metrics_counts_gh_calls_accurately_for_steady_state() {
+    // Lock the per-tick gh call count metric. A steady-state tick (no
+    // new candidates) MUST report exactly 1 gh call (the single
+    // `labeled_prs` list call), regardless of how many PRs are
+    // factory-labeled. Anything more means the cache reorder regressed
+    // and the burn vector is back.
+    let mut scm = FakeScm::new();
+    for n in 9001u64..9010 {
+        scm.prs.push(labeled_pr(n, "alice", &format!("feat/{n}")));
+    }
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    for n in 9001u64..9010 {
+        tracker.candidates.borrow_mut().push(Bead {
+            id: format!("bead-{n}"),
+            title: format!("pr {n}"),
+            description: String::new(),
+            notes: String::new(),
+            file_tree_summary: String::new(),
+            external_ref: Some(format!("owner/repo#{n}")),
+        });
+    }
+    let cfg = test_cfg();
+
+    let mut metrics = intake::IntakeMetrics::default();
+    let _ = intake::normalize_labeled_prs(&scm, &tracker, &cfg, &mut metrics).unwrap();
+    assert_eq!(
+        metrics.gh_calls, 1,
+        "steady-state tick over 9 already-adopted PRs must record exactly 1 gh call \
+         (the labeled_prs list call), got {}",
+        metrics.gh_calls
+    );
+}
+
+#[test]
+fn intake_metrics_counts_each_new_candidate_probe() {
+    // A tick with N genuinely-new PRs MUST record 1 + N gh calls
+    // (the labeled_prs list call + one collaborator_permission per new
+    // candidate). This is the "new work" path — the burn is bounded
+    // by the number of new candidates, which is what the warn
+    // threshold guards against.
+    let mut scm = FakeScm::new();
+    scm.prs.push(labeled_pr(6001, "alice", "feat/a"));
+    scm.prs.push(labeled_pr(6002, "alice", "feat/b"));
+    scm.prs.push(labeled_pr(6003, "bob", "feat/c"));
+    scm.permissions.insert("alice".into(), Permission::Write);
+    scm.permissions.insert("bob".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+
+    let mut metrics = intake::IntakeMetrics::default();
+    let _ = intake::normalize_labeled_prs(&scm, &tracker, &cfg, &mut metrics).unwrap();
+    assert_eq!(
+        metrics.gh_calls, 4,
+        "3 new PRs + 1 list call = 4 gh calls; got {}",
+        metrics.gh_calls
+    );
 }

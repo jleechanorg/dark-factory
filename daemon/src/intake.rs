@@ -164,12 +164,25 @@ fn same_repo_pr(pr: &LabeledPr, cfg: &Config) -> bool {
 /// function via `return Err(..)`, which propagates through `run_slow_tier`
 /// to `main()` and calls `std::process::exit(1)`, so no candidate after the
 /// failing one in the same fetch batch was ever visited, let alone logged.
+/// jleechan-jtg8: intake-pass metrics. `gh_calls` counts gh REST/CLI
+/// invocations observed during the intake pass — list calls + per-PR
+/// permission probes for genuinely new candidates only. Steady-state
+/// calls (no new factory-labeled candidates) make ~1 call per repo
+/// (the `labeled_prs` list call); a passing threshold of 5/tick is the
+/// jleechan-jtg8 contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IntakeMetrics {
+    pub gh_calls: u32,
+}
+
 pub fn normalize(
     scm: &dyn Scm,
     tracker: &dyn Tracker,
     cfg: &Config,
+    metrics: &mut IntakeMetrics,
 ) -> Result<(Vec<String>, Vec<IntakeOutcome>), DaemonError> {
     let issues = scm.labeled_issues(FACTORY_LABEL)?;
+    metrics.gh_calls = metrics.gh_calls.saturating_add(1);
     if issues.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -189,6 +202,16 @@ pub fn normalize(
             continue;
         }
 
+        // jleechan-jtg8: collaborator_permission is now ONLY called for
+        // genuinely new candidates. The prior control flow probed every
+        // labeled issue every slow tick (regardless of whether the issue
+        // had a bead) — combined with `labeled_issues` returning ~30
+        // issues per repo per tick, that was a sustained gh-REST burn
+        // even for already-adopted work. The local `known_refs` set is
+        // authoritative for "is this issue already being driven", so we
+        // defer the REST probe until we know the issue is new. Mirrors
+        // the matching change in `normalize_labeled_prs` above.
+        //
         // Write-tier authorization gate (spec §4.2.3): only Write/Admin may
         // trigger dispatch. Lower tiers are skipped, not errored — the skip
         // itself is the audit trail the caller records via telemetry, keyed
@@ -196,6 +219,7 @@ pub fn normalize(
         // *determine* the permission tier (e.g. a transient GitHub API
         // error) is recorded as Errored for this candidate only — it must
         // not abort the rest of the batch.
+        metrics.gh_calls = metrics.gh_calls.saturating_add(1);
         let permission = match scm.collaborator_permission(&issue.author_login) {
             Ok(p) => p,
             Err(e) => {
@@ -287,8 +311,10 @@ pub fn normalize_labeled_prs(
     scm: &dyn Scm,
     tracker: &dyn Tracker,
     cfg: &Config,
+    metrics: &mut IntakeMetrics,
 ) -> Result<(Vec<ExistingPrIntake>, Vec<IntakeOutcome>), DaemonError> {
     let prs = scm.labeled_prs(FACTORY_LABEL)?;
+    metrics.gh_calls = metrics.gh_calls.saturating_add(1);
     if prs.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -319,28 +345,18 @@ pub fn normalize_labeled_prs(
             continue;
         }
 
-        let permission = match scm.collaborator_permission(&pr.author_login) {
-            Ok(p) => p,
-            Err(e) => {
-                outcomes.push(IntakeOutcome {
-                    external_ref: pr.external_ref.clone(),
-                    verdict: IntakeVerdict::Errored {
-                        reason: e.to_string(),
-                    },
-                });
-                continue;
-            }
-        };
-        if !permission.is_write_tier() {
-            outcomes.push(IntakeOutcome {
-                external_ref: pr.external_ref.clone(),
-                verdict: IntakeVerdict::SkippedIneligible {
-                    precondition: format!("author_permission_below_write_tier:{permission:?}"),
-                },
-            });
-            continue;
-        }
-
+        // jleechan-jtg8: short-circuit BEFORE `collaborator_permission`.
+        // Already-adopted / already-known PRs do NOT need a per-tick REST
+        // permission probe — that call was the burn vector
+        // (~30 PRs × 1 call/tick = ~1800 calls/hr, exhausting the shared
+        // 5000/hr core bucket on user 13840161). The local tracker state
+        // is authoritative for "is this PR already being driven by a
+        // bead" — `collaborator_permission` is only needed for genuinely
+        // new candidates whose permission tier has never been evaluated.
+        // The reorder is provably safe: the prior control flow treated
+        // these candidates as either Adopted (already-tracker_candidates)
+        // or SkippedDuplicate (already-known_refs); both terminal states
+        // are reachable from here without consulting the SCM.
         if let Some(bead) = tracker_candidates
             .iter()
             .find(|bead| bead.external_ref.as_deref() == Some(pr.external_ref.as_str()))
@@ -359,6 +375,29 @@ pub fn normalize_labeled_prs(
             outcomes.push(IntakeOutcome {
                 external_ref: pr.external_ref.clone(),
                 verdict: IntakeVerdict::SkippedDuplicate,
+            });
+            continue;
+        }
+
+        metrics.gh_calls = metrics.gh_calls.saturating_add(1);
+        let permission = match scm.collaborator_permission(&pr.author_login) {
+            Ok(p) => p,
+            Err(e) => {
+                outcomes.push(IntakeOutcome {
+                    external_ref: pr.external_ref.clone(),
+                    verdict: IntakeVerdict::Errored {
+                        reason: e.to_string(),
+                    },
+                });
+                continue;
+            }
+        };
+        if !permission.is_write_tier() {
+            outcomes.push(IntakeOutcome {
+                external_ref: pr.external_ref.clone(),
+                verdict: IntakeVerdict::SkippedIneligible {
+                    precondition: format!("author_permission_below_write_tier:{permission:?}"),
+                },
             });
             continue;
         }
