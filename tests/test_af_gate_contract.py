@@ -3,10 +3,14 @@
 Contract test: verifies gate-count/naming consistency across the /af system.
 
 This test ensures that:
-1. daemon/src/verifier.rs::GateName enum defines exactly 7 gates
+1. daemon/src/verifier.rs::GateName enum defines exactly 8 gates
 2. Documentation files don't claim a different gate count
 3. factory-overlay.sh's required-key set matches the Rust verifier
 4. No operator-facing instructions contain direct sqlite3 mutation commands
+
+(Gate 8 = `vacuous_red_green`, added in PR #389 / r5 commit 175c6ad for
+issue #387, bead jleechan-ijod — the runtime vacuous-test detector verdict
+propagated from `PrEvidence.vacuous_red_green`.)
 
 Run: .venv/bin/python -m pytest tests/test_af_gate_contract.py -v
 """
@@ -50,6 +54,7 @@ def extract_gate_names_from_rust() -> set[str]:
         'CommentsResolved': 'comments_resolved',
         'EvidenceFloor': 'evidence_review',
         'Skeptic': 'skeptic',
+        'VacuousRedGreen': 'vacuous_red_green',
     }
 
     json_keys = set()
@@ -62,10 +67,17 @@ def extract_gate_names_from_rust() -> set[str]:
     return json_keys
 
 
-def test_rust_verifier_has_7_gates():
-    """Verify daemon/src/verifier.rs::GateName has exactly 7 variants."""
+def test_rust_verifier_has_8_gates():
+    """Verify daemon/src/verifier.rs::GateName has exactly 8 variants.
+
+    Issue #387 (bead jleechan-ijod) added gate 8 (`VacuousRedGreen`) in
+    PR #389 / r5 commit 175c6ad. Keep this assertion in lock-step with the
+    enum (verifier.rs:26-43) AND the `factory-overlay.sh` REQUIRED_KEYS
+    (line 285) AND the canonical-vocabulary comment block at the top of
+    `GateName::as_str` (verifier.rs:46-61).
+    """
     gates = extract_gate_names_from_rust()
-    assert len(gates) == 7, f"Expected 7 gates, got {len(gates)}: {gates}"
+    assert len(gates) == 8, f"Expected 8 gates, got {len(gates)}: {gates}"
     print(f"✓ Rust verifier has {len(gates)} gates: {sorted(gates)}")
 
 
