@@ -782,3 +782,47 @@ def test_one_byte_gist_does_not_green_gate() -> None:
         )
         == "FAIL"
     )
+
+
+def test_signal_a_iteration_must_not_word_split_jq_output() -> None:
+    """Signal A MUST iterate jq-compact JSON lines without word-splitting.
+
+    Issue #433 follow-up (jleechan-ifkt): the hardened Signal A originally
+    used `for row in $(echo "${comments_json}" | jq -c '.[]')` which
+    word-splits each JSON object on its inner whitespace (the `"` in jq
+    output are NOT bash quoting). On any PR whose comments contain spaces,
+    the first iteration fragment is invalid JSON, `jq -r '.body // ""'`
+    fails with "Unfinished string at EOF", `set -euo pipefail` exits 5,
+    and Signal B never runs — leaving the gate red even when a valid
+    `**Evidence**:` marker is present in the PR body.
+
+    The fix uses `mapfile -t rows < <(jq -c '.[]')` followed by
+    `for row in "${rows[@]}"`, which preserves each jq-compact line intact.
+
+    This test pins the iteration pattern so the regression cannot recur.
+    """
+    text = _signal_a_text(_load_workflow())
+    # Strip YAML comment lines so documentation referencing the bad
+    # pattern cannot accidentally satisfy or fail the assertion.
+    code_lines = [
+        line for line in text.splitlines()
+        if not line.lstrip().startswith("#")
+    ]
+    code_text = "\n".join(code_lines)
+    # The fragile pattern MUST NOT appear in actual code (anywhere outside
+    # a `#` comment). Match on a bash loop opening with `for row in $(`.
+    assert "for row in $(" not in code_text, (
+        "Signal A iterates `for row in $(jq ...)` which word-splits each "
+        "JSON object on inner whitespace. On any PR with comments "
+        "containing spaces, this crashes with `jq: Unfinished string at "
+        "EOF`, exits 5, and prevents Signal B from ever running. "
+        "Use `mapfile -t rows < <(jq -c '.[]')` + `for row in \"${rows[@]}\"` "
+        "instead. (issue #433 follow-up, jleechan-ifkt)"
+    )
+    # The safe pattern MUST appear in code.
+    assert "mapfile" in code_text and "for row in \"${rows[@]}\"" in code_text, (
+        "Signal A must iterate jq-compact JSON lines via "
+        "`mapfile -t rows < <(jq -c '.[]')` followed by "
+        "`for row in \"${rows[@]}\"` so each JSON object is delivered "
+        "intact (issue #433 follow-up, jleechan-ifkt)."
+    )

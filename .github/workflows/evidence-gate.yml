@@ -149,7 +149,17 @@ jobs:
             --jq '[.[] | {login: .user.login, body: .body}]' 2>/dev/null)" || comments_json="[]"
 
           if [ -n "${pr_head_sha}" ] && [ "${comments_json}" != "[]" ]; then
-            for row in $(echo "${comments_json}" | jq -c '.[]' 2>/dev/null); do
+            # NOTE (issue #433 follow-up, jleechan-ifkt): do NOT iterate
+            # jq-compact output via unquoted command substitution. Bash
+            # word-splits each JSON object on its inner whitespace (the
+            # double quotes in jq output are NOT bash quoting), so the
+            # first iteration fragment is invalid JSON, `jq -r '.body // ""'`
+            # fails with "Unfinished string at EOF", `set -euo pipefail`
+            # exits 5, and Signal B never runs even when the PR body has
+            # a valid `**Evidence**:` marker. Use `mapfile` + `for ... in
+            # "${rows[@]}"` so each jq-compact line is delivered intact.
+            mapfile -t rows < <(echo "${comments_json}" | jq -c '.[]' 2>/dev/null || true)
+            for row in "${rows[@]}"; do
               c_body="$(echo "${row}" | jq -r '.body // ""')"
               c_login="$(echo "${row}" | jq -r '.login // ""')"
 
