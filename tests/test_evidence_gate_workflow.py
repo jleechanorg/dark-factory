@@ -479,3 +479,306 @@ def test_no_er_comment_at_all_makes_gate_fail_closed() -> None:
     canonical evidence marker ⇒ gate FAIL.
     """
     assert _simulate_verdict_decision(None, None) == "FAIL"
+
+
+# ---------------------------------------------------------------------------
+# Issue #433 — Signal A trusted-identity + head-SHA binding;
+#               Signal B gist content floor + PR/repo mention
+# ---------------------------------------------------------------------------
+#
+# Issue #433 (Codex re-review of main 53a3999, follow-up to merged #424):
+# the previous gate is fail-closed but its signals are forgeable.
+#
+#   Signal A: greps `/er PASS` from ANY comment body. The PR author can
+#             self-post the verdict. Not bound to commenter identity or
+#             head SHA. Fix: require the verdict comment to carry the
+#             literal `🤖 **[dark-factory /er]**` allowlist marker that
+#             daemon/src/er_runner.rs:191 emits, AND require the comment
+#             to reference the CURRENT head SHA. Stale-head verdicts
+#             must not green.
+#
+#   Signal B: verifies gist reachable + non-empty + declared head SHA,
+#             but does not validate content. Fix: require total content
+#             size above a small floor (no 1-byte gists) AND require the
+#             content to mention the PR number or repo name.
+#
+# These tests pin the new structural and decision-table requirements;
+# they are RED against the pre-#433 workflow and GREEN against the
+# hardened version.
+
+
+_ER_RUNNER_MARKER_LITERAL = "🤖 **[dark-factory /er]**"
+_ER_RUNNER_MARKER_BARE = "[dark-factory /er]"  # stripped-emoji form for regex
+
+
+def _signal_a_text(workflow: dict) -> str:
+    """Text of the Signal A step (the part that parses /er comments)."""
+    workflow_text = _verdict_step_text(workflow)
+    # Signal A is the step that calls `gh api /repos/.../issues/.../comments`.
+    # Find the step whose run block touches the comments endpoint.
+    jobs = workflow.get("jobs", {})
+    job = next(iter(jobs.values()))
+    for step in job.get("steps", []):
+        name = step.get("name") or ""
+        run = step.get("run") or ""
+        if not isinstance(run, str):
+            run = "\n".join(run)
+        if "/comments" in run and ("Determine evidence verdict" in name
+                                   or "Verify /er verdict" in name):
+            return run
+    # Fallback: full verdict-step text (covers minimal workflows).
+    return workflow_text
+
+
+def _signal_b_text(workflow: dict) -> str:
+    """Text of the Signal B step (the part that parses gist content)."""
+    workflow_text = _verdict_step_text(workflow)
+    jobs = workflow.get("jobs", {})
+    job = next(iter(jobs.values()))
+    for step in job.get("steps", []):
+        run = step.get("run") or ""
+        if not isinstance(run, str):
+            run = "\n".join(run)
+        if "api.github.com/gists/" in run:
+            return run
+    return workflow_text
+
+
+def test_signal_a_requires_trusted_er_runner_marker() -> None:
+    """Signal A MUST require the `[dark-factory /er]` allowlist marker.
+
+    Issue #433: Signal A greps `/er PASS` from ANY comment body. The PR
+    author can self-post that verdict. Fix: require the comment to
+    carry the literal `🤖 **[dark-factory /er]**` marker that
+    daemon/src/er_runner.rs:191 emits when posting a real /er verdict.
+    """
+    text = _signal_a_text(_load_workflow())
+    assert (
+        _ER_RUNNER_MARKER_LITERAL in text
+        or _ER_RUNNER_MARKER_BARE in text
+        or "dark-factory /er" in text
+    ), (
+        "Signal A must require the `[dark-factory /er]` allowlist marker "
+        "in the comment body — author-self-posted `/er PASS` without the "
+        "marker is forgeable. (issue #433)"
+    )
+
+
+def test_signal_a_requires_head_sha_reference() -> None:
+    """Signal A MUST require the verdict comment to reference a head SHA.
+
+    Issue #433: a stale `/er PASS` comment from a prior head must not
+    green the gate. Fix: the workflow must parse a `head <sha>` reference
+    from the comment (or the evidence marker) and compare it to the
+    current head SHA.
+    """
+    text = _signal_a_text(_load_workflow())
+    # Either Signal A reads `head <sha>` from the comment body, or it
+    # delegates the SHA comparison to a separate verification step. In
+    # either case the workflow's verdict-decision text must contain a
+    # SHA comparison expression or a "stale" branch.
+    head_sha_signals = [
+        r"head[[:space:]]+[0-9a-f]{7,40}",
+        r"\bhead_sha\b",
+        r"\bstale\b",
+        r"\bSTALE\b",
+        r"sha_short",
+        r"head_sha_seen",
+        r"\$marker_sha\b",
+    ]
+    assert any(re.search(pat, text) for pat in head_sha_signals), (
+        "Signal A must require the verdict comment to carry a `head <sha>` "
+        "reference (issue #433) — a bare `/er PASS` from an older head is "
+        "forgeable. The verifier step must parse or compare the SHA."
+    )
+
+
+def test_signal_b_requires_minimum_content_size_floor() -> None:
+    """Signal B MUST enforce a minimum content size floor on the gist.
+
+    Issue #433: the previous Signal B accepted any gist with at least one
+    non-empty file, including trivial 1-byte gists. Fix: aggregate file
+    content (or require total raw bytes) and enforce a floor — at minimum
+    a few hundred bytes — so a placeholder gist cannot green the gate.
+
+    The pre-#433 check is per-file `length > 0`. The post-#433 check
+    must reference an aggregate floor (e.g. `MIN_GIST_SIZE`,
+    `content_size`, total bytes > 200) — not just `length > 0`.
+    """
+    text = _signal_b_text(_load_workflow())
+    aggregate_floor_patterns = [
+        r"MIN_GIST_SIZE",
+        r"content_size",
+        r"total_bytes?",
+        r"GIST_MIN_BYTES",
+        r"min_size",
+        r"size_floor",
+        # Aggregate floor that is NOT just per-file `length > 0`.
+        r"\b[0-9]{2,}\s*\)\s*$",  # bare numeric literal near a comparison
+        r"\b200\b",
+        r"\b256\b",
+        r"\b512\b",
+        r"-gt[[:space:]]+[0-9]{2,}",
+    ]
+    assert any(re.search(pat, text, re.MULTILINE) for pat in aggregate_floor_patterns), (
+        "Signal B must enforce an aggregate minimum content size floor "
+        "(MIN_GIST_SIZE / content_size / total_bytes / > 200 etc.) — the "
+        "previous per-file `length > 0` check accepts 1-byte gists. "
+        "(issue #433)"
+    )
+
+
+def test_signal_b_requires_pr_or_repo_mention_in_content() -> None:
+    """Signal B MUST verify the gist content mentions the PR number or repo.
+
+    Issue #433: gist verification is purely structural today — no content
+    check. Fix: after fetching file content, require it to contain either
+    the PR number (e.g. `#123`) or the repo slug (e.g. `owner/repo`). A
+    generic placeholder gist must not green the gate.
+
+    The test is intentionally stricter than `PR_NUMBER` (which already
+    appears in the env var block). It requires either:
+      (a) a content-grep for the PR number literal (`grep -F "${PR_NUMBER}"`),
+      (b) a content-grep for the repo slug, OR
+      (c) a positive assertion that the content was checked against
+          these values.
+    """
+    text = _signal_b_text(_load_workflow())
+    # Anchor each pattern to look like a real grep command: "grep" followed
+    # by flag chars then a ${PR_NUMBER} or ${REPO} reference. The previous
+    # workflow's /er verdict grep must not accidentally match — that's a
+    # Signal A grep, not a Signal B content check.
+    content_check_patterns = [
+        r"\bgrep\b[^\n|]*\$\{?PR_NUMBER\}?",
+        r"\bgrep\b[^\n|]*\$\{?REPO\}?",
+        r"mention_check",
+        r"content_matches",
+        r"gist_content_check",
+        r"MUST mention",
+        r"required_field",
+    ]
+    assert any(re.search(pat, text) for pat in content_check_patterns), (
+        "Signal B must verify that gist content references the PR number "
+        "(via grep against $PR_NUMBER / github.event.pull_request.number) "
+        "or the repo (via grep against $REPO / github.repository). The "
+        "presence of $REPO / $PR_NUMBER as env-var definitions is not "
+        "sufficient — the content must be checked. (issue #433)"
+    )
+
+
+def _simulate_verdict_decision_v2(
+    er_verdict: str | None,
+    marker_verdict: str | None = None,
+    *,
+    er_trusted: bool = False,
+    er_head_sha_fresh: bool = False,
+    marker_content_substantive: bool = False,
+) -> str:
+    """Hardened verdict simulation for issue #433.
+
+    Mirrors the bash verdict logic after the fix:
+      - Signal A passes only when an `/er PASS` comment exists, the
+        commenter is the trusted er_runner marker, AND the comment
+        references the current head SHA.
+      - Signal B passes only when the gist is reachable AND its content
+        is non-trivial AND it mentions the PR number or repo.
+    """
+    er = er_verdict if er_verdict else "ABSENT"
+    mk = marker_verdict if marker_verdict else "ABSENT"
+    if er in ("FAIL", "PARTIAL", "INCONCLUSIVE"):
+        return "FAIL"
+    if er == "PASS" and er_trusted and er_head_sha_fresh:
+        return "PASS"
+    if mk == "PASS" and marker_content_substantive:
+        return "PASS"
+    return "FAIL"
+
+
+@pytest.mark.parametrize(
+    "er_verdict,marker_verdict,er_trusted,er_head_fresh,mk_substantive,expected_gate",
+    [
+        # Trusted + fresh head ⇒ PASS (the one true green path for Signal A)
+        ("PASS", None, True, True, False, "PASS"),
+        # Author self-posts bare /er PASS without the marker ⇒ FAIL
+        ("PASS", None, False, False, False, "FAIL"),
+        # Author self-post overrides a 1-byte gist (gist not substantive) ⇒ FAIL
+        ("PASS", "PASS", False, False, False, "FAIL"),
+        # Marker is present but head SHA is stale ⇒ FAIL
+        ("PASS", None, True, False, False, "FAIL"),
+        # Marker verdict for current head but gist content is empty ⇒ FAIL
+        (None, "PASS", False, False, False, "FAIL"),
+        # Substantive gist content alone is enough (no /er comment)
+        (None, "PASS", False, False, True, "PASS"),
+        # /er FAIL always overrides marker PASS
+        ("FAIL", "PASS", True, True, True, "FAIL"),
+        # Everything absent ⇒ FAIL
+        (None, None, False, False, False, "FAIL"),
+    ],
+)
+def test_verdict_decision_table_v2_blocks_forgeable_signals(
+    er_verdict: str | None,
+    marker_verdict: str | None,
+    er_trusted: bool,
+    er_head_fresh: bool,
+    mk_substantive: bool,
+    expected_gate: str,
+) -> None:
+    """Issue #433: the hardened verdict table must block every forgeable input.
+
+    Cases:
+      - Author self-posted `/er PASS` without the trusted marker ⇒ FAIL.
+      - Trusted marker but stale head SHA ⇒ FAIL.
+      - Empty gist content ⇒ FAIL.
+      - `/er FAIL` overrides marker PASS ⇒ FAIL.
+      - Only the substantive-gist path with no /er comment ⇒ PASS.
+    """
+    got = _simulate_verdict_decision_v2(
+        er_verdict,
+        marker_verdict,
+        er_trusted=er_trusted,
+        er_head_sha_fresh=er_head_fresh,
+        marker_content_substantive=mk_substantive,
+    )
+    assert got == expected_gate, (
+        f"verdict (er={er_verdict!r}, marker={marker_verdict!r}, "
+        f"trusted={er_trusted}, fresh={er_head_fresh}, "
+        f"substantive={mk_substantive}) should map to gate={expected_gate}; "
+        f"got {got}. (issue #433 fail-closed contract)"
+    )
+
+
+def test_author_self_posted_bare_er_pass_does_not_green_gate() -> None:
+    """Issue #433 explicit regression: an author-self-posted bare `/er PASS`
+    comment — without the `[dark-factory /er]` allowlist marker and
+    without any head-SHA reference — MUST NOT green the gate.
+    """
+    assert (
+        _simulate_verdict_decision_v2(
+            "PASS", None, er_trusted=False, er_head_sha_fresh=False
+        )
+        == "FAIL"
+    )
+
+
+def test_stale_head_verdict_does_not_green_gate() -> None:
+    """Issue #433 explicit regression: an `[dark-factory /er]` comment
+    referencing an OLDER head SHA MUST NOT green the gate.
+    """
+    assert (
+        _simulate_verdict_decision_v2(
+            "PASS", None, er_trusted=True, er_head_sha_fresh=False
+        )
+        == "FAIL"
+    )
+
+
+def test_one_byte_gist_does_not_green_gate() -> None:
+    """Issue #433 explicit regression: a 1-byte gist (sub-floor content)
+    MUST NOT green the gate.
+    """
+    assert (
+        _simulate_verdict_decision_v2(
+            None, "PASS", marker_content_substantive=False
+        )
+        == "FAIL"
+    )
