@@ -480,6 +480,15 @@ pub enum VacuousRedGreenStatus {
     /// was reachable from the working tree. Fail-closed rather than
     /// silently reporting `Vacuous` on tests that never ran.
     ManifestMissing(String),
+    /// Bead jleechan-sb4b: the runtime detector could not locate a cargo
+    /// binary on PATH, in `$HOME/.cargo/bin/cargo`, or via `rustup which
+    /// cargo`. The detector would otherwise surface a misleading
+    /// `GreenFailed: git error: spawn cargo test: No such file or
+    /// directory` on every assessment; this variant names the real cause
+    /// (the toolchain is missing) and surfaces it as a structured
+    /// `Unknown` so operators can fix the PATH/CARGO_HOME rather than
+    /// chasing ghost git errors.
+    CargoNotFound(String),
 }
 
 /// Bead jleechan-yoqy / issue #323: fail-closed verification result for the
@@ -905,6 +914,9 @@ fn vacuous_red_green_gate(evidence: &PrEvidence) -> GateResult {
         ),
         VacuousRedGreenStatus::ManifestMissing(reason) => GateResult::Unknown(format!(
             "runtime red-green vacuous-test detector: manifest missing: {reason}"
+        )),
+        VacuousRedGreenStatus::CargoNotFound(reason) => GateResult::Unknown(format!(
+            "runtime red-green vacuous-test detector: cargo binary not found: {reason}"
         )),
     }
 }

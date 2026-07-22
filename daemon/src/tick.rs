@@ -2899,6 +2899,13 @@ fn translate_error(e: crate::vacuous_red_green::RedGreenError) -> verifier::Vacu
             verifier::VacuousRedGreenStatus::GreenFailed(format!("working-tree revert failed: {s}"))
         }
         RedGreenError::Git(s) => verifier::VacuousRedGreenStatus::GreenFailed(format!("git error: {s}")),
+        // Bead jleechan-sb4b: surface the missing toolchain as a
+        // structured signal. The previous failure mode was a misleading
+        // `GreenFailed: git error: spawn cargo test: No such file or
+        // directory` on every assessment — operators couldn't tell that
+        // the daemon's PATH lacked cargo. The new variant names the
+        // real cause and hints at the fix.
+        RedGreenError::CargoNotFound(s) => verifier::VacuousRedGreenStatus::CargoNotFound(s),
     }
 }
 

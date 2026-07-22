@@ -385,3 +385,24 @@ fn verdict_precedence_baseline_failed_beats_vacuous() {
     };
     assert_eq!(outcome.verdict(), Verdict::BaselineFailed);
 }
+
+/// Bead jleechan-sb4b: the `CargoNotFound` error variant must NOT be
+/// classified as the misleading `GreenFailed` that the previous
+/// `Git("spawn cargo test: No such file or directory")` produced. The
+/// `Display` impl must name `cargo` so operators can immediately see
+/// the toolchain is missing (not git).
+#[test]
+fn cargo_not_found_error_message_is_not_misleading_git_error() {
+    use daemon::vacuous_red_green::RedGreenError;
+    let e = RedGreenError::CargoNotFound("not on PATH".to_string());
+    let msg = format!("{e}");
+    assert!(
+        msg.contains("cargo"),
+        "CargoNotFound must name cargo (got: {msg:?})"
+    );
+    assert!(
+        !msg.contains("git"),
+        "CargoNotFound must NOT mention git — that's the misleading \
+         message this bead replaces (got: {msg:?})"
+    );
+}
