@@ -846,6 +846,70 @@ pub fn find_cargo_manifest(repo_root: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Bounded recursive manifest search (jleechan-ni1k / issue #437 bonus).
+/// The walk-up `find_cargo_manifest` cannot find a manifest when the
+/// crate lives at a path BELOW the daemon's CWD (dark-factory's
+/// `daemon/Cargo.toml` is the canonical example: the repo root has no
+/// `Cargo.toml`, so the walk-up returns `None` and the detector surfaces
+/// `ManifestMissing: no Cargo.toml reachable from /home/jleechan/projects/
+/// dark-factory`). This helper walks the directory tree to a fixed
+/// `max_depth` and returns the FIRST `Cargo.toml` it finds, skipping
+/// `target`, `node_modules`, `.git`, and `Cargo.lock`-only directories
+/// (a `Cargo.lock` without a sibling `Cargo.toml` is not a crate).
+///
+/// Why bounded: a malicious or unusually deep tree (e.g. an attacker
+/// uploads a 1000-entry `node_modules`-shaped payload) cannot cost real
+/// seconds per tick. The cap at 4 covers dark-factory's layout
+/// (`<repo_root>/daemon/Cargo.toml`) with headroom.
+///
+/// Order matters: the root `Cargo.toml` is checked first (preserving the
+/// legacy walk-up fast path for single-crate repos), then a depth-first
+/// walk of immediate children, then depth-2, etc. We return on the first
+/// match — the daemon only needs ONE manifest to gate the PR.
+pub fn find_cargo_manifest_recursive(repo_root: &Path, max_depth: usize) -> Option<PathBuf> {
+    // Skip noisy subtrees — these almost never host the crate manifest
+    // and add entries to every tick's traversal cost. `target` is rustc
+    // build output, `node_modules` is JS, `.git` is the VCS database.
+    const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git"];
+
+    // Depth 0: the root itself (fast path; preserves legacy walk-up
+    // behavior for single-crate repos).
+    let root_candidate = repo_root.join("Cargo.toml");
+    if root_candidate.exists() {
+        return Some(root_candidate);
+    }
+
+    // Depth 1..=max_depth: BFS so the first match is the shallowest one.
+    let mut frontier: Vec<PathBuf> = std::iter::once(repo_root.to_path_buf()).collect();
+    for _depth in 1..=max_depth {
+        let mut next_frontier: Vec<PathBuf> = Vec::with_capacity(frontier.len() * 4);
+        for dir in &frontier {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => continue, // unreadable dir (perms, vanished) — skip silently
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if SKIP_DIRS.iter().any(|s| *s == name_str) {
+                    continue;
+                }
+                let candidate = p.join("Cargo.toml");
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+                next_frontier.push(p);
+            }
+        }
+        frontier = next_frontier;
+    }
+    None
+}
+
 /// Run cargo test against the working tree (or a worktree under
 /// `baseline_root` for the baseline-main phase) using the resolved
 /// manifest. Issue #387 r5 finding 3: `--manifest-path` is required
@@ -1254,6 +1318,118 @@ fn b() {
         let body_b = bodies_full.iter().find(|(_, _, n)| *n == "b").unwrap();
         let body_text = &src[body_b.0..body_b.1];
         assert!(body_text.contains("let x = 1"));
+    }
+
+    // ---- jleechan-ni1k / issue #437 bonus: nested-crate manifest
+    // discovery. dark-factory is a nested-crate layout (`daemon/Cargo.toml`
+    // at the crate root, NOT the repo root). The legacy walk-up
+    // `find_cargo_manifest` cannot find a manifest on this layout — the
+    // detector surfaced `ManifestMissing: no Cargo.toml reachable from
+    // /home/jleechan/projects/dark-factory` during PR #435's assessment.
+    // The fix is a bounded recursive downward search (`find_cargo_
+    // manifest_recursive`) that walks up to `max_depth` levels looking
+    // for the first `Cargo.toml`. These tests pin that contract: it
+    // finds a top-level manifest (fast-path), finds a nested manifest
+    // (the dark-factory layout), skips `target`/`node_modules`/`.git`,
+    // and respects the depth bound so a malicious tree can't burn
+    // wall-clock per tick.
+
+    #[test]
+    fn find_cargo_manifest_recursive_finds_root_level_manifest() {
+        let dir = tempdir_unique("vacuous-root");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        let found = find_cargo_manifest_recursive(&dir, 4).unwrap();
+        assert!(found.ends_with("Cargo.toml"));
+        assert_eq!(
+            std::fs::canonicalize(found).unwrap(),
+            std::fs::canonicalize(dir.join("Cargo.toml")).unwrap()
+        );
+    }
+
+    #[test]
+    fn find_cargo_manifest_recursive_finds_nested_manifest() {
+        // Reproduce the dark-factory layout: repo_root has NO Cargo.toml,
+        // but repo_root/daemon/Cargo.toml exists.
+        let dir = tempdir_unique("vacuous-nested");
+        std::fs::create_dir(dir.join("daemon")).unwrap();
+        std::fs::write(
+            dir.join("daemon").join("Cargo.toml"),
+            "[package]\nname=\"daemon\"\n",
+        )
+        .unwrap();
+        // Sanity check: the walk-up helper returns None here, proving the
+        // recursive helper is doing real work.
+        assert!(
+            find_cargo_manifest(&dir).is_none(),
+            "walk-up must not find a nested manifest; the recursive helper \
+             exists exactly because the walk-up fails on nested crates"
+        );
+        let found = find_cargo_manifest_recursive(&dir, 4).unwrap();
+        let found_canon = std::fs::canonicalize(found).unwrap();
+        let expected = std::fs::canonicalize(dir.join("daemon").join("Cargo.toml")).unwrap();
+        assert_eq!(found_canon, expected);
+    }
+
+    #[test]
+    fn find_cargo_manifest_recursive_skips_target_node_modules_git() {
+        // A tree where the only Cargo.toml lives inside `target/...`
+        // must NOT be picked up — `target/` is build output, not a crate.
+        let dir = tempdir_unique("vacuous-skip");
+        std::fs::create_dir_all(dir.join("target").join("build")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(
+            dir.join("target").join("Cargo.toml"),
+            "[package]\nname=\"build-output\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("node_modules").join("Cargo.toml"),
+            "[package]\nname=\"node-dep\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".git").join("Cargo.toml"),
+            "[package]\nname=\"git-internal\"\n",
+        )
+        .unwrap();
+        let found = find_cargo_manifest_recursive(&dir, 4);
+        assert!(
+            found.is_none(),
+            "must not surface a manifest from target/node_modules/.git; got {found:?}"
+        );
+    }
+
+    #[test]
+    fn find_cargo_manifest_recursive_respects_max_depth() {
+        // A manifest 5 levels deep with max_depth=3 must NOT be returned.
+        let dir = tempdir_unique("vacuous-depth");
+        let deep = dir.join("a").join("b").join("c").join("d").join("e");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("Cargo.toml"), "[package]\nname=\"deep\"\n").unwrap();
+        assert!(
+            find_cargo_manifest_recursive(&dir, 3).is_none(),
+            "depth=3 must not reach a/b/c/d/e/Cargo.toml"
+        );
+        let found = find_cargo_manifest_recursive(&dir, 6).unwrap();
+        assert!(found.ends_with("Cargo.toml"));
+    }
+
+    /// Create a unique temp directory under `std::env::temp_dir()`. The
+    /// directory is NOT auto-cleaned (Rust tests don't share a global
+    /// fixture lifetime), but the name encodes the test pid + nanos so
+    /// concurrent test runs don't collide. Lives inside `unit_tests`
+    /// to avoid `clippy::items_after_test_module` (the original trailing
+    /// `_silence_unused` was removed for the same reason).
+    fn tempdir_unique(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("vacuous_{label}_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }
 

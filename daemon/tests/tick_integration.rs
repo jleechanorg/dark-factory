@@ -7124,13 +7124,13 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     let predicate_block: String = guard_src
         .lines()
         .skip(40) // 0-indexed: line 41 (1-indexed) of auto-merge-guard.sh
-        .take(64) // lines 41..=104 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh's `sed -n '41,104p'` (PR #328 / bze8.1 added head_sha / canonical gate-key set / operator_disposition)
+        .take(74) // lines 41..=114 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh's `sed -n '41,114p'` (jleechan-ni1k / issue #437 P2 widened to 8 required gates + P1 LIVE_HEAD_MISSING branch; previously 41..=104)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
         predicate_block.contains("g.items()"),
         "extracted predicate block drifted from auto-merge-guard.sh's actual \
-         line range 41-104 (line numbers may have shifted); block:\n{predicate_block}"
+         line range 41-114 (line numbers may have shifted); block:\n{predicate_block}"
     );
 
     use std::io::Write as _;
