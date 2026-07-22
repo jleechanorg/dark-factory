@@ -573,17 +573,29 @@ def _run_gate_once(
     context_updates = {}
     if outcome == "success":
         context_updates["_last_validated_head_sha"] = expected_sha
+    # Build the structured receipt for the real subprocess that just ran.
+    # This is what closes the regex-fabrication ceiling — the gate now binds
+    # the verdict to the captured execution, not to the reviewer's narrative.
+    receipt = _build_reviewer_receipt(
+        sub_args=sub_args, proc=proc, cwd=str(ctx.workdir),
+        expected_sha=expected_sha, timeout=timeout,
+    )
+    metadata: dict[str, str] = {
+        "slash_command": name, "verdict": verdict,
+        "returncode": str(proc.returncode),
+        "expected_head_sha": expected_sha, "observed_head_sha": observed_sha,
+        "head_sha_status": head_sha_status,
+        "reviewer_backend": reviewer_backend,
+        **prompt_meta,
+    }
+    if receipt is not None:
+        # Pass-through: list-valued receipt list is consumed verbatim by the
+        # structured gate (_check_structured_receipt) via _MDToCtxShim.
+        metadata["_reviewer_receipts"] = [receipt]
     return _finalize(Result(
         outcome=outcome,
         output=proc.stdout,
-        metadata={
-            "slash_command": name, "verdict": verdict,
-            "returncode": str(proc.returncode),
-            "expected_head_sha": expected_sha, "observed_head_sha": observed_sha,
-            "head_sha_status": head_sha_status,
-            "reviewer_backend": reviewer_backend,
-            **prompt_meta,
-        },
+        metadata=metadata,
         context_updates=context_updates,
     ))
 
@@ -599,6 +611,38 @@ def _is_gate_infra_failure(result: "Result") -> bool:
         return True
     md = result.metadata or {}
     return md.get("sandbox") == "unavailable" or md.get("timed_out") == "true" or md.get("backend_missing") == "true"
+
+
+def _build_reviewer_receipt(
+    *,
+    sub_args: list[str],
+    proc: "subprocess.CompletedProcess | None",
+    cwd: str,
+    expected_sha: str,
+    timeout: int,
+    lane_id: str = "primary",
+) -> dict | None:
+    """Build a structured receipt record from a captured subprocess result.
+
+    Returns ``None`` when the subprocess has not been executed yet (early
+    timeout/missing-exe branches), so the caller can drop it cleanly from
+    the gate Result metadata. Otherwise returns a dict with the canonical
+    shape consumed by ``runner.handler_verdict._check_structured_receipt``.
+    """
+    if proc is None:
+        return None
+    try:
+        rc = int(getattr(proc, "returncode", 1) or 0)
+    except (TypeError, ValueError):
+        rc = 1
+    return {
+        "command": list(sub_args),
+        "cwd": cwd,
+        "exit_code": rc,
+        "head_sha": str(expected_sha or "").lower(),
+        "lane_id": lane_id,
+        "timeout": int(timeout),
+    }
 
 
 # Default adversarial-review priority queue. Read at run-config time

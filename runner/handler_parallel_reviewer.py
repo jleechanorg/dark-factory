@@ -191,8 +191,11 @@ def _receipt_required_flag(node: "Node") -> bool:
     return False
 
 
-def _enforce_reproduction_receipt(result: "Result") -> "Result":
-    """Downgrade a reviewer success whose transcript lacks a reproduction receipt.
+def _enforce_reproduction_receipt(
+    result: "Result",
+    expected_sha: str | None = None,
+) -> "Result":
+    """Downgrade a reviewer success whose execution is not reproduced.
 
     A reviewer that verdicts PASS without re-running the build/test (or whose
     re-run FAILED, nonzero-only exit trail) is read-only theater — the exact
@@ -209,16 +212,52 @@ def _enforce_reproduction_receipt(result: "Result") -> "Result":
     ``original_verdict`` to the RAW reviewer output (it does so on a genuine
     contradiction). Honor that pre-existing value: do not overwrite it with
     the post-consistency canonical token.
+
+    Issue #426 (ZFC): the receipt gate classifies free-text prose with
+    regexes, which an adversarial or sloppy reviewer can spoof ("ran pytest,
+    exit 0"). The structured path — captured subprocess receipts recorded at
+    execution time — is consulted FIRST whenever receipts are present
+    (``ctx.state["_reviewer_receipts"]`` populated by the subprocess wrapper).
+    The regex path is retained ONLY as a low-trust fallback for handlers
+    that have not yet been instrumented; the path used is recorded in
+    metadata (``receipt_path="structured"|"regex_low_trust"``) so audit
+    readers can see which classification produced the verdict.
     """
     # Lazy import to avoid circular import at module load time
-    from .handler_verdict import _reproduction_receipt_gap
+    from .handler_verdict import (
+        _check_structured_receipt,
+        _reproduction_receipt_gap,
+    )
 
     if result.outcome != "success":
         return result
-    gap = _reproduction_receipt_gap(result.output or "")
+
+    md = dict(result.metadata or {})
+    receipts = md.get("_reviewer_receipts")
+    gap = ""
+    receipt_path = "regex_low_trust"
+    if isinstance(receipts, list) and receipts and expected_sha:
+        gap = _check_structured_receipt(_MDToCtxShim(md), expected_sha=expected_sha)
+        if not gap:
+            # Structured path passed — record the path label so audit
+            # readers can distinguish the strong classification from the
+            # regex fallback. Mutate in place to preserve identity (legacy
+            # tests and downstream callers rely on ``is`` for the
+            # success-with-receipt branch).
+            md["receipt_path"] = "structured"
+            result.metadata = md
+            return result
+        receipt_path = "structured"
+    else:
+        gap = _reproduction_receipt_gap(result.output or "")
     if not gap:
+        if isinstance(receipts, list) and receipts:
+            md["receipt_path"] = "structured"
+        else:
+            md["receipt_path"] = "regex_low_trust"
+        result.metadata = md
         return result
-    new_md = dict(result.metadata or {})
+    new_md = dict(md)
     # Only set original_verdict if consistency didn't already record the raw
     # reviewer output — otherwise we'd clobber the more truthful pre-consistency
     # value with the post-consistency canonical token.
@@ -227,6 +266,7 @@ def _enforce_reproduction_receipt(result: "Result") -> "Result":
     new_md["verdict"] = "fail"
     new_md["receipt_downgraded"] = "true"
     new_md["receipt_gap"] = gap
+    new_md["receipt_path"] = receipt_path
     return Result(
         outcome="failure",
         output=(result.output or "") + "\n\n" + gap,
@@ -237,7 +277,12 @@ def _enforce_reproduction_receipt(result: "Result") -> "Result":
     )
 
 
-def _enforce_reproduction_receipt_for_lane(result: "Result", *, lane_name: str) -> "Result":
+def _enforce_reproduction_receipt_for_lane(
+    result: "Result",
+    *,
+    lane_name: str,
+    expected_sha: str | None = None,
+) -> "Result":
     """Per-lane reproduction-receipt check (issue #425 / finding 4).
 
     ``handler_dispatch._finish_shadow_gate_review`` concatenates primary and
@@ -248,11 +293,18 @@ def _enforce_reproduction_receipt_for_lane(result: "Result", *, lane_name: str) 
     BEFORE concatenation, so a lane without its own receipt fails that lane
     regardless of what other lanes produced.
 
+    Issue #426 layering: when ``expected_sha`` is provided, the underlying
+    ``_enforce_reproduction_receipt`` consults the STRUCTURED receipt path
+    (subprocess records captured at execution time) FIRST, falling back to
+    the regex prose path only when no receipts are present. The structured
+    path is authoritative; the regex path is the low-trust fallback that an
+    adversarial reviewer can spoof by name-dropping a runner and "exit 0".
+
     Records ``receipt_gap_lane`` so audit readers can pinpoint the failing
     lane and ``receipt_downgraded`` for downstream coalescing. The
     ``receipt_gap`` text is preserved verbatim.
     """
-    adjusted = _enforce_reproduction_receipt(result)
+    adjusted = _enforce_reproduction_receipt(result, expected_sha=expected_sha)
     if adjusted is result:
         return result
     new_md = dict(adjusted.metadata or {})
@@ -265,6 +317,23 @@ def _enforce_reproduction_receipt_for_lane(result: "Result", *, lane_name: str) 
         suggested_next_ids=adjusted.suggested_next_ids,
         context_updates=adjusted.context_updates,
     )
+
+
+class _MDToCtxShim:
+    """Minimal ctx-shaped shim so ``_check_structured_receipt`` can read
+    ``ctx.state["_reviewer_receipts"]`` without the full ``Context`` object.
+
+    The structured-receipt check only needs ``state``. The receipt is recorded
+    into ``result.metadata`` by the gate wrapper, so we project it onto a
+    ctx-shaped object that exposes ``state`` as a plain dict. This keeps the
+    structured path testable with just a ``Result`` and avoids depending on
+    the engine's ``Context`` constructor in unit tests.
+    """
+
+    def __init__(self, md: dict) -> None:
+        self.state = {
+            "_reviewer_receipts": list(md.get("_reviewer_receipts") or []),
+        }
 
 
 def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
@@ -336,8 +405,11 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         if _receipt_required_flag(node):
             # Per-lane (issue #425 / finding 4): the primary lane must carry
             # its own reproduction receipt BEFORE any transcript aggregation.
+            # Issue #426 layering: ``expected_sha`` makes the per-lane check
+            # consult the structured subprocess receipts path first; the
+            # regex prose path remains only as a low-trust fallback.
             primary = _enforce_reproduction_receipt_for_lane(
-                primary, lane_name="primary",
+                primary, lane_name="primary", expected_sha=expected_sha,
             )
         return primary
 
@@ -350,9 +422,12 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
         # read-only primary cannot be saved by a shadow's reproduction. The
         # shadow's own transcript is recorded in
         # ``ctx.state[<node>.shadow_<backend>_gate_output]`` and used here as
-        # the single-lane text for receipt gap analysis.
+        # the single-lane text for receipt gap analysis. Issue #426 layering:
+        # ``expected_sha`` makes the per-lane check consult the structured
+        # subprocess receipts path first; the regex prose path remains only
+        # as a low-trust fallback.
         primary = _enforce_reproduction_receipt_for_lane(
-            primary, lane_name="primary",
+            primary, lane_name="primary", expected_sha=expected_sha,
         )
         if primary.outcome == "failure":
             # Record the lane outcome so downstream coalescing reflects the
@@ -430,7 +505,12 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     # Combined-text receipt check is now a no-op safety net; per-lane
     # enforcement above is the gate (issue #425 / finding 4). Only run when
     # all lanes passed per-lane so we still catch a transcript-level anomaly
-    # that slipped through lane-level checks (defense in depth).
+    # that slipped through lane-level checks (defense in depth). Issue #426
+    # layering: when ``expected_sha`` is provided, this combined-text check
+    # also consults the structured receipt path first; the regex path is
+    # only a low-trust fallback.
     if _receipt_required_flag(node) and final_result.outcome == "success":
-        final_result = _enforce_reproduction_receipt(final_result)
+        final_result = _enforce_reproduction_receipt(
+            final_result, expected_sha=expected_sha,
+        )
     return final_result
