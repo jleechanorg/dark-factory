@@ -87,6 +87,25 @@ pub struct Config {
     /// tests that don't script `open_pr_head_refs` set it explicitly `false`.
     #[serde(default = "default_pre_gate_validation_enabled")]
     pub pre_gate_validation_enabled: bool,
+    /// jleechan-1s2q / issue #444 r2: per-tick ceiling on escalation comment
+    /// attempts that cap-escalation sites collectively consume. Pre-r2 the
+    /// ceiling lived in a hard-coded `MAX_ESCALATION_COMMENT_ATTEMPTS_PER_TICK`
+    /// constant in `tick.rs`, which was convenient for the first revision but
+    /// left operators without a knob when a real escalation backlog
+    /// outpaces the dispatcher (`beadsDispatched=0` for 10 consecutive TICKs
+    /// on 2026-07-22 with the default). Default 2 — matches the r1 ceiling
+    /// exactly, so existing production behavior is unchanged when the key
+    /// is absent; operators that need a higher ceiling during a known
+    /// `HumanHeld` recovery storm can bump this via `escalation_comment_budget
+    /// = 4` (or similar) in `config/daemon.toml`.
+    ///
+    /// Setting this to `0` is fail-closed: every cap-escalation comment
+    /// would skip this tick (`ESCALATION_BUDGET_DEFERRED`), and the bead's
+    /// `escalation_already_recorded` sentinel would never be written, so
+    /// the loop would burn on every tick — set to `0` only as a deliberate
+    /// pause while you triage upstream.
+    #[serde(default = "default_escalation_comment_budget")]
+    pub escalation_comment_budget: u32,
 }
 
 /// Default head-stability window (bead jleechan-zeij / issue #322 r3): 30s,
@@ -111,6 +130,13 @@ fn default_held_recheck_cooldown_secs() -> u64 {
 /// r3): 5s, per the Codex review's "3 attempts over ≥5s".
 fn default_reroll_death_confirm_secs() -> u64 {
     5
+}
+
+/// Default per-tick escalation comment budget (jleechan-1s2q / issue #444
+/// r2): 2 — the same value the r1 hard-coded constant used, so operators
+/// who never set the new config key keep the exact pre-r2 behavior.
+fn default_escalation_comment_budget() -> u32 {
+    2
 }
 
 impl Config {
@@ -232,6 +258,46 @@ spec_dir = ".factory/specs/"
             cfg.pre_gate_validation_enabled,
             "pre_gate_validation_enabled must default to true when absent"
         );
+        // jleechan-1s2q / issue #444 r2: a config that omits
+        // `escalation_comment_budget` must default to `2` — the same value
+        // the r1 hard-coded constant used, so existing production behavior
+        // is unchanged when the key is absent. Operators that need a higher
+        // ceiling during a known `HumanHeld` recovery storm can set
+        // `escalation_comment_budget = 4` (or similar) in `daemon.toml`.
+        assert_eq!(
+            cfg.escalation_comment_budget, 2,
+            "escalation_comment_budget must default to 2 when absent"
+        );
+    }
+
+    #[test]
+    fn escalation_comment_budget_can_be_overridden_explicitly() {
+        // jleechan-1s2q / issue #444 r2: operators can raise the per-tick
+        // budget above the r1 default; setting it to `4` must round-trip
+        // and not conflict with the r1 hard-coded constant (which the
+        // `tick.rs` initialization now reads from `cfg`).
+        let dir = std::env::temp_dir().join("afd_cfg_test_budget_override");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("budget_override.toml");
+        std::fs::write(
+            &p,
+            r#"
+target_repo = "owner/repo"
+base_branch = "main"
+stage = 1
+max_workers = 30
+max_batch = 15
+fast_tick_secs = 10
+slow_tick_secs = 30
+autonomy_timebox_secs = 10800
+budget_warn_usd = 20.0
+spec_dir = ".factory/specs/"
+escalation_comment_budget = 4
+"#,
+        )
+        .unwrap();
+        let cfg = load(&p).unwrap();
+        assert_eq!(cfg.escalation_comment_budget, 4);
     }
 
     #[test]

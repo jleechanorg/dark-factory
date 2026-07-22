@@ -1508,6 +1508,9 @@ mod tests {
             held_recheck_cooldown_secs: 900,
             repos: std::collections::HashMap::new(),
             pre_gate_validation_enabled: false,
+            // jleechan-1s2q / issue #444 r2: tests use the same default as
+            // production so the per-tick budget cap is observable.
+            escalation_comment_budget: 2,
         }
     }
 

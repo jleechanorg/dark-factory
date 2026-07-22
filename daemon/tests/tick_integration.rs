@@ -54,6 +54,11 @@ fn test_cfg() -> Config {
         held_recheck_cooldown_secs: 900,
         repos: std::collections::HashMap::new(),
         pre_gate_validation_enabled: false,
+        // jleechan-1s2q / issue #444 r2: tests use the same default as
+        // production (`default_escalation_comment_budget`) so the budget-
+        // capping regression test can compare against `== 2` without
+        // diverging from the r1 behavior the daemon shipped with.
+        escalation_comment_budget: 2,
     }
 }
 

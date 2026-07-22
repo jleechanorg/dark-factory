@@ -720,6 +720,10 @@ mod tests {
             held_recheck_cooldown_secs: 900,
             repos: std::collections::HashMap::new(),
             pre_gate_validation_enabled: false,
+            // jleechan-1s2q / issue #444 r2: config-driven budget cap; the
+            // test uses the production default so the per-tick budget cap
+            // is observable.
+            escalation_comment_budget: 2,
         };
 
         let (project, _) = ao_runtime_binding(&cfg).unwrap();

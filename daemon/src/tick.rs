@@ -351,10 +351,10 @@ pub fn run_tick(
     // might attempt a comment, including the recovery step's permanent-
     // fail short-circuit (`handle_scm_comment_failure` reads it on
     // missing-target and permanent-parse calls so retry loops don't
-    // re-call SCM). See `MAX_ESCALATION_COMMENT_ATTEMPTS_PER_TICK` for
-    // the ceiling and the rationale.
+    // re-call SCM). The ceiling lives on `Config::escalation_comment_budget`
+    // (r2) so operators can tune it without recompiling; default 2.
     let mut escalation_comment_budget_remaining: u32 =
-        MAX_ESCALATION_COMMENT_ATTEMPTS_PER_TICK;
+        deps.cfg.escalation_comment_budget;
 
     let slow_tier_due = {
         let ratio = (deps.cfg.slow_tick_secs / deps.cfg.fast_tick_secs.max(1)).max(1);
@@ -3937,15 +3937,17 @@ fn is_permanent_scm_target_error(err: &DaemonError) -> bool {
 /// SCM comments while a legitimately QUEUED bead sat undispatched for 65
 /// minutes — `beadsDispatched=0` for 10 consecutive TICKs).
 ///
-/// `MAX_ESCALATION_COMMENT_ATTEMPTS_PER_TICK = 2` is intentionally tight:
-/// in normal operation every escalation site is short-circuited by the
-/// `ESCALATION_SENTINEL_ATTEMPT` dedup gate on the second visit, so the
-/// budget only matters when something is wrong (the same condition being
-/// escalated on every tick, or new permanent failures showing up). Two is
-/// enough headroom for both classes to land their first + second attempts
-/// across consecutive ticks without monopolizing the tick; raise it only
-/// if dashboards show escalation backlogs outpacing the dispatcher with
-/// the current value.
+/// In r2 the value moved to `Config::escalation_comment_budget` (default
+/// `2` via `default_escalation_comment_budget`), so operators can tune
+/// it via `config/daemon.toml` without recompiling. The constant here
+/// still defines the literal `2` only as the source of truth that the
+/// default function and `Config` field both reference — do NOT use it
+/// for runtime budget checks; read `cfg.escalation_comment_budget`
+/// instead. `2` is intentionally tight: in normal operation every
+/// escalation site is short-circuited by the `ESCALATION_SENTINEL_ATTEMPT`
+/// dedup gate on the second visit, so the budget only matters when
+/// something is wrong (the same condition being escalated on every tick,
+/// or new permanent failures showing up).
 const MAX_ESCALATION_COMMENT_ATTEMPTS_PER_TICK: u32 = 2;
 
 /// Outcome of `handle_scm_comment_failure`. Drives whether the caller
