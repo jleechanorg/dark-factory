@@ -272,9 +272,12 @@ gate-assessment)
   python3 - "$4" <<'PYGA' || die "invalid gates json"
 import json, sys
 g = json.loads(sys.argv[1])
-# 7 required gates (canonical source: daemon/src/verifier.rs::GateName).
+# 8 required gates (canonical source: daemon/src/verifier.rs::GateName).
 # code_standards and zfc are optional advisory keys — accepted but not required.
 # See bead jleechan-1gft for tracking the optional expansion to real automated gates.
+# Gate 8 (`vacuous_red_green`, bead jleechan-ijod / issue #387) was added in
+# PR #389 / r5 commit 175c6ad — runtime vacuous-test detector verdict
+# propagated from PrEvidence.vacuous_red_green.
 #
 # Verdict value shape (jleechan-240 additive expansion):
 #   * String:  "pass" | "warn" | "fail" | "unknown"
@@ -282,7 +285,7 @@ g = json.loads(sys.argv[1])
 # Legacy aliases "green"/"red"/"unknown" map to "pass"/"fail"/"unknown".
 # Unknown verdict tokens are rejected (no keyword routing — only the
 # invoking model decides pass|warn|fail).
-REQUIRED_KEYS = {"ci_green","no_conflicts","coderabbit","bugbot","comments_resolved","evidence_review","skeptic"}
+REQUIRED_KEYS = {"ci_green","no_conflicts","coderabbit","bugbot","comments_resolved","evidence_review","skeptic","vacuous_red_green"}
 OPTIONAL_KEYS = {"code_standards","zfc"}
 ALIAS = {"green":"pass","red":"fail","warn":"warn","unknown":"unknown","pass":"pass","fail":"fail"}
 VALID = {"pass","warn","fail","unknown"}

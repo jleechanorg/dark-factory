@@ -117,39 +117,39 @@ assert "state after pr-opened" "ATTESTED" "$state"
 pr="$(sqlite3 "$AFD_DB" "SELECT pr_number FROM bead_overlay WHERE bead_id='test-roundtrip';")"
 assert "pr_number after pr-opened" "7888" "$pr"
 
-# 11. gate-assessment ATTESTED, all-green (7 required gates + optional code_standards/zfc)
-gates='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","code_standards":"green","zfc":"green"}'
+# 11. gate-assessment ATTESTED, all-green (8 required gates + optional code_standards/zfc)
+gates='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","vacuous_red_green":"green","code_standards":"green","zfc":"green"}'
 out="$("$OVERLAY" gate-assessment test-roundtrip 7888 "$gates")"
 assert "gate-assessment all-green → true" "true" "$(echo "$out" | head -1)"
 assert "gate-assessment cooldown=false" "cooldown_ready=false" "$(echo "$out" | tail -1)"
 
-# 11a. gate-assessment ATTESTED, 7-gate schema (code_standards/zfc now optional)
+# 11a. gate-assessment ATTESTED, 8-gate schema (code_standards/zfc now optional)
 # Pull the bead back to ATTESTED to re-run gate-assessment (was READY).
 "$OVERLAY" intake-upsert test-9gates 'nine gate test' >/dev/null
 "$OVERLAY" route-record test-9gates STANDARD_PATH >/dev/null
 "$OVERLAY" dispatch-record test-9gates fix/nine-gates >/dev/null
 "$OVERLAY" pr-opened test-9gates 7889 https://github.com/jleechanorg/worldarchitect.ai/pull/7889 >/dev/null
-gates9='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","code_standards":"green","zfc":"green"}'
+gates9='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","vacuous_red_green":"green","code_standards":"green","zfc":"green"}'
 out9="$("$OVERLAY" gate-assessment test-9gates 7889 "$gates9")"
-assert "gate-assessment 7-gate+optional schema → true" "true" "$(echo "$out9" | head -1)"
+assert "gate-assessment 8-gate+optional schema → true" "true" "$(echo "$out9" | head -1)"
 
 # 11b. gate-assessment with optional zfc=red → false (optional keys still count in all_green when present)
 "$OVERLAY" intake-upsert test-zfc-red 'zfc red test' >/dev/null
 "$OVERLAY" route-record test-zfc-red STANDARD_PATH >/dev/null
 "$OVERLAY" dispatch-record test-zfc-red fix/zfc-red >/dev/null
 "$OVERLAY" pr-opened test-zfc-red 7890 https://github.com/jleechanorg/worldarchitect.ai/pull/7890 >/dev/null
-gates_zfc_red='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","code_standards":"green","zfc":"red"}'
+gates_zfc_red='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","vacuous_red_green":"green","code_standards":"green","zfc":"red"}'
 out_zfc="$("$OVERLAY" gate-assessment test-zfc-red 7890 "$gates_zfc_red")"
-assert "gate-assessment 7-gate+optional zfc=red → false (all keys count in all_green)" "false" "$(echo "$out_zfc" | head -1)"
+assert "gate-assessment 8-gate+optional zfc=red → false (all keys count in all_green)" "false" "$(echo "$out_zfc" | head -1)"
 
-# 11c. gate-assessment accepts legacy 7-gate JSON (now the canonical contract)
-"$OVERLAY" intake-upsert test-legacy 'legacy 7-gate test' >/dev/null
+# 11c. gate-assessment accepts canonical 8-gate schema (see REQUIRED_KEYS in factory-overlay.sh: vacuous_red_green required since PR #413 / issue #387 r6).
+"$OVERLAY" intake-upsert test-legacy 'legacy 8-gate test' >/dev/null
 "$OVERLAY" route-record test-legacy STANDARD_PATH >/dev/null
 "$OVERLAY" dispatch-record test-legacy fix/legacy-gates >/dev/null
 "$OVERLAY" pr-opened test-legacy 7891 https://github.com/jleechanorg/worldarchitect.ai/pull/7891 >/dev/null
-gates_legacy7='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green"}'
+gates_legacy7='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","vacuous_red_green":"green"}'
 out_legacy="$("$OVERLAY" gate-assessment test-legacy 7891 "$gates_legacy7")"
-assert "gate-assessment accepts canonical 7-gate schema" "true" "$(echo "$out_legacy" | head -1)"
+assert "gate-assessment accepts canonical 8-gate schema" "true" "$(echo "$out_legacy" | head -1)"
 
 # 11d. gate-assessment accepts pass/warn/fail (jleechan-240 expansion).
 # Warn is NON-blocking: a single warn still yields all_green=true so the
@@ -159,7 +159,7 @@ assert "gate-assessment accepts canonical 7-gate schema" "true" "$(echo "$out_le
 "$OVERLAY" route-record test-pass-warn STANDARD_PATH >/dev/null
 "$OVERLAY" dispatch-record test-pass-warn fix/pass-warn-branch >/dev/null
 "$OVERLAY" pr-opened test-pass-warn 7892 https://github.com/jleechanorg/worldarchitect.ai/pull/7892 >/dev/null
-gates_pw='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","code_standards":"pass","zfc":"warn"}'
+gates_pw='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","vacuous_red_green":"pass","code_standards":"pass","zfc":"warn"}'
 out_pw="$("$OVERLAY" gate-assessment test-pass-warn 7892 "$gates_pw")"
 assert "gate-assessment warn verdict → all_green true" "true" "$(echo "$out_pw" | head -1)"
 
@@ -171,7 +171,7 @@ assert "gate-assessment warn verdict → all_green true" "true" "$(echo "$out_pw
 "$OVERLAY" route-record test-evidence STANDARD_PATH >/dev/null
 "$OVERLAY" dispatch-record test-evidence fix/evidence-branch >/dev/null
 "$OVERLAY" pr-opened test-evidence 7893 https://github.com/jleechanorg/worldarchitect.ai/pull/7893 >/dev/null
-gates_ev='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","code_standards":"pass","zfc":{"verdict":"pass","evidence":[{"path":"runner/handlers.py","line":42,"msg":"no banned patterns"}]}}'
+gates_ev='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","vacuous_red_green":"pass","code_standards":"pass","zfc":{"verdict":"pass","evidence":[{"path":"runner/handlers.py","line":42,"msg":"no banned patterns"}]}}'
 out_ev="$("$OVERLAY" gate-assessment test-evidence 7893 "$gates_ev")"
 assert "gate-assessment structured-evidence → all_green true" "true" "$(echo "$out_ev" | head -1)"
 
@@ -180,14 +180,14 @@ assert "gate-assessment structured-evidence → all_green true" "true" "$(echo "
 "$OVERLAY" route-record test-ev-fail STANDARD_PATH >/dev/null
 "$OVERLAY" dispatch-record test-ev-fail fix/ev-fail-branch >/dev/null
 "$OVERLAY" pr-opened test-ev-fail 7894 https://github.com/jleechanorg/worldarchitect.ai/pull/7894 >/dev/null
-gates_evf='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","code_standards":"pass","zfc":{"verdict":"fail","evidence":[{"path":"daemon/factory-overlay.sh","line":201,"msg":"keyword blacklist enforced in app code"}]}}'
+gates_evf='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","vacuous_red_green":"pass","code_standards":"pass","zfc":{"verdict":"fail","evidence":[{"path":"daemon/factory-overlay.sh","line":201,"msg":"keyword blacklist enforced in app code"}]}}'
 out_evf="$("$OVERLAY" gate-assessment test-ev-fail 7894 "$gates_evf")"
 assert "gate-assessment fail+evidence → all_green false" "false" "$(echo "$out_evf" | head -1)"
 
 # 11g. bounded fix loop (jleechan-240): a fail gate → reroll-verdict
 # (reroll_worthy) → HUMAN_HELD → recover-held → QUEUED. This proves the
 # new /code-standards + /zfc gates route failed verdicts through the same
-# bounded fix loop as the original 7 gates (no parallel implementation).
+# bounded fix loop as the original 8 gates (no parallel implementation).
 "$OVERLAY" reroll-verdict test-ev-fail 7894 reroll_worthy "zfc: keyword in app code" >/dev/null
 state_evf="$(sqlite3 "$AFD_DB" "SELECT state FROM bead_overlay WHERE bead_id='test-ev-fail';")"
 assert "zfc fail → reroll-verdict → HUMAN_HELD" "HUMAN_HELD" "$state_evf"
@@ -204,7 +204,7 @@ assert "zfc fix-loop → recover-held → QUEUED" "QUEUED" "$state_evf2"
 "$OVERLAY" route-record test-unknown STANDARD_PATH >/dev/null
 "$OVERLAY" dispatch-record test-unknown fix/unknown-branch >/dev/null
 "$OVERLAY" pr-opened test-unknown 7895 https://github.com/jleechanorg/worldarchitect.ai/pull/7895 >/dev/null
-gates_uk='{"ci_green":"unknown","no_conflicts":"unknown","coderabbit":"unknown","bugbot":"unknown","comments_resolved":"unknown","evidence_review":"unknown","skeptic":"unknown","code_standards":"unknown","zfc":"unknown"}'
+gates_uk='{"ci_green":"unknown","no_conflicts":"unknown","coderabbit":"unknown","bugbot":"unknown","comments_resolved":"unknown","evidence_review":"unknown","skeptic":"unknown","vacuous_red_green":"unknown","code_standards":"unknown","zfc":"unknown"}'
 out_uk="$("$OVERLAY" gate-assessment test-unknown 7895 "$gates_uk")"
 assert "gate-assessment all-unknown → all_green false (waits for tick)" "false" "$(echo "$out_uk" | head -1)"
 
@@ -262,7 +262,7 @@ ticked="$(grep -c '"eventType": "TICK"' "$AFD_LOG")"
 "$OVERLAY" dispatch-record test-closed fix/closed-branch >/dev/null
 "$OVERLAY" pr-opened test-closed 1234 https://github.com/jleechanorg/worldarchitect.ai/pull/1234 >/dev/null
 # emit a clean gate-assessment first so closed-after-merge path triggers
-gates='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","code_standards":"green","zfc":"green"}'
+gates='{"ci_green":"green","no_conflicts":"green","coderabbit":"green","bugbot":"green","comments_resolved":"green","evidence_review":"green","skeptic":"green","vacuous_red_green":"green","code_standards":"green","zfc":"green"}'
 "$OVERLAY" gate-assessment test-closed 1234 "$gates" >/dev/null
 echo "closed" > /tmp/br-status
 out="$("$OVERLAY" bead-closed-check test-closed)"
@@ -277,7 +277,7 @@ assert "bead-closed-check → ready after merge" "ready" "$out"
 "$OVERLAY" route-record test-closed-fail STANDARD_PATH >/dev/null
 "$OVERLAY" dispatch-record test-closed-fail fix/closed-fail-branch >/dev/null
 "$OVERLAY" pr-opened test-closed-fail 1235 https://github.com/jleechanorg/worldarchitect.ai/pull/1235 >/dev/null
-gates_fail='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","code_standards":"pass","zfc":"fail"}'
+gates_fail='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","vacuous_red_green":"pass","code_standards":"pass","zfc":"fail"}'
 "$OVERLAY" gate-assessment test-closed-fail 1235 "$gates_fail" >/dev/null
 echo "closed" > /tmp/br-status
 out_fail="$("$OVERLAY" bead-closed-check test-closed-fail)"
@@ -292,7 +292,7 @@ assert "fail-gate closed-bead → HUMAN_HELD (not READY)" "HUMAN_HELD" "$state_f
 "$OVERLAY" route-record test-closed-evfail STANDARD_PATH >/dev/null
 "$OVERLAY" dispatch-record test-closed-evfail fix/closed-evfail-branch >/dev/null
 "$OVERLAY" pr-opened test-closed-evfail 1236 https://github.com/jleechanorg/worldarchitect.ai/pull/1236 >/dev/null
-gates_evfail='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","code_standards":"pass","zfc":{"verdict":"fail","evidence":[{"path":"daemon/factory-overlay.sh","line":201,"msg":"keyword in app code"}]}}'
+gates_evfail='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","vacuous_red_green":"pass","code_standards":"pass","zfc":{"verdict":"fail","evidence":[{"path":"daemon/factory-overlay.sh","line":201,"msg":"keyword in app code"}]}}'
 "$OVERLAY" gate-assessment test-closed-evfail 1236 "$gates_evfail" >/dev/null
 echo "closed" > /tmp/br-status
 out_evfail="$("$OVERLAY" bead-closed-check test-closed-evfail)"
