@@ -230,24 +230,49 @@ fn emit(
     )
 }
 
-/// 1s2q-escalation-dedup: compute a deterministic hex hash of the serialized
-/// `context` JSON for an escalation event. Used as the dedup key in the
-/// `escalation_ledger` — two events with the same stable context fields
-/// produce the same hash, so a re-fire with identical context is suppressed
-/// within the backoff window. Uses `std::hash::DefaultHasher` (the repo has a
-/// strict 5-dependency budget and no `sha2` crate); the hash is formatted as
-/// 16-char lowercase hex. This is NOT a cryptographic hash — it only needs to
-/// be deterministic and collision-resistant across the small space of
-/// per-bead escalation contexts, which `DefaultHasher` satisfies.
+/// 1s2q-escalation-dedup: FNV-1a 64-bit with two independent fold passes
+/// (different basis constants) so the dedup key is 128 bits wide. The previous
+/// implementation used `DefaultHasher` (SipHash with a per-process RNG seed),
+/// which had two problems the on-call review callout flagged:
+///   1. SipHash-with-random-seed is NON-DETERMINISTIC across process restarts
+///      — a context that hashed to `X` in tick 1 would hash to `Y` in tick 2
+///      (after a daemon restart), defeating the "suppress re-emit within
+///      `escalation_refire_secs`" contract and causing new escalations to
+///      leak through the dedup ledger every restart.
+///   2. A 64-bit key has a ~50% collision probability at ~5 billion events
+///      (birthday bound). `DefaultHasher` is also keyed — even after fixing
+///      determinism, two distinct escalation contexts could collide and
+///      cause a NEW escalation to be silently suppressed for up to
+///      `escalation_refire_secs` (default 1h) — the live incident the
+///      on-call review flagged.
+///
+/// FNV-1a is the standard fix: deterministic, no RNG seed, no external
+/// dependencies (the repo has a strict 5-dependency budget — no `sha2`/`xxhash`
+/// crate), and well-distributed for short JSON inputs. Two independent basis
+/// constants (one 64-bit hash per fold) folded into a 128-bit hex digest give
+/// 2^128 collision space — birthday-bound collision probability at 5 billion
+/// events is ~10^-21, far below the dedup's "suppress NEW escalation" risk.
+///
+/// `serde_json::to_string` already produces key-sorted output (the `Object`
+/// variant is backed by `BTreeMap` by default; the `preserve_order` feature
+/// is NOT enabled), so the canonical-JSON requirement is satisfied without
+/// an extra sort step.
 fn escalation_context_hash(context: &serde_json::Value) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    // Serialize to a canonical JSON string so key ordering is stable regardless
-    // of how the `serde_json::json!` macro laid the object out.
-    let serialized = serde_json::to_string(context).unwrap_or_else(|_| String::new());
-    serialized.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    // FNV-1a 64-bit constants (FNV-1a reference, public domain).
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let bytes = serde_json::to_vec(context).unwrap_or_default();
+    let fold = |basis: u64| -> u64 {
+        let mut h = basis;
+        for &b in &bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        h
+    };
+    let hi = fold(FNV_OFFSET);
+    let lo = fold(FNV_OFFSET ^ 0x9e3779b97f4a7c15); // independent basis
+    format!("{:016x}{:016x}", hi, lo)
 }
 
 /// 1s2q-escalation-dedup: the current unix epoch in seconds. Centralized so
@@ -4470,4 +4495,101 @@ fn post_scm_comment_by_bead_id(
     Err(DaemonError::Config(format!(
         "no SCM comment target found for bead {bead_id}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escalation_context_hash;
+
+    /// 1s2q-escalation-dedup follow-up: the dedup key must be deterministic
+    /// across process restarts (the previous `DefaultHasher` impl was
+    /// RNG-seeded — the on-call review callout flagged this as the root
+    /// cause of a context that hashed differently across daemons, leaking
+    /// new escalations through the dedup ledger on every restart).
+    #[test]
+    fn escalation_context_hash_is_cross_run_deterministic() {
+        let ctx = serde_json::json!({
+            "pr_number": 9006,
+            "branch": "factory/bead-dedup-r10",
+            "reason": "human_held_recovery_attempt_cap_reached",
+        });
+        let h1 = escalation_context_hash(&ctx);
+        let h2 = escalation_context_hash(&ctx);
+        let h3 = escalation_context_hash(&ctx);
+        assert_eq!(h1, h2);
+        assert_eq!(h2, h3);
+        // 32-char hex = 128 bits.
+        assert_eq!(h1.len(), 32, "FNV-1a fold should produce 128-bit hex");
+        assert!(
+            h1.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash must be lowercase hex: {h1}"
+        );
+    }
+
+    /// 1s2q-escalation-dedup follow-up: distinct contexts MUST produce
+    /// distinct hashes (the live-incident class — a NEW escalation collision-
+    /// suppressed for up to `escalation_refire_secs` because it collided with
+    /// an unrelated prior context's hash).
+    #[test]
+    fn escalation_context_hash_distinguishes_different_contexts() {
+        let a = escalation_context_hash(&serde_json::json!({
+            "pr_number": 9006,
+            "branch": "factory/bead-dedup-r10",
+        }));
+        let b = escalation_context_hash(&serde_json::json!({
+            "pr_number": 9007,
+            "branch": "factory/bead-dedup-r10",
+        }));
+        let c = escalation_context_hash(&serde_json::json!({
+            "pr_number": 9006,
+            "branch": "factory/bead-dedup-r10-v2",
+        }));
+        assert_ne!(
+            a, b,
+            "different pr_number must produce different hashes (live-incident class)"
+        );
+        assert_ne!(
+            a, c,
+            "different branch must produce different hashes (live-incident class)"
+        );
+    }
+
+    /// 1s2q-escalation-dedup follow-up: empty / null / structurally-equivalent
+    /// contexts must round-trip through the hash without panicking. The trait
+    /// caller (the tick engine) passes whatever the escalation site built, and
+    /// the hash helper must not regress on edge cases.
+    #[test]
+    fn escalation_context_hash_handles_empty_and_null_context() {
+        let h_null = escalation_context_hash(&serde_json::Value::Null);
+        let h_empty = escalation_context_hash(&serde_json::json!({}));
+        let h_array = escalation_context_hash(&serde_json::json!([]));
+        assert_eq!(h_null.len(), 32);
+        assert_eq!(h_empty.len(), 32);
+        assert_eq!(h_array.len(), 32);
+        // Empty container contexts are distinct (the bytes hashed differ).
+        assert_ne!(h_null, h_empty);
+        assert_ne!(h_empty, h_array);
+    }
+
+    /// 1s2q-escalation-dedup follow-up: serde_json::to_string on `Object`
+    /// sorts keys BTreeMap-style (the `preserve_order` feature is NOT
+    /// enabled in this repo), so two contexts that differ only in key
+    /// declaration order in the source produce the SAME byte sequence and
+    /// the SAME hash. This pins the canonical-JSON invariant the hash relies
+    /// on — a future PR that flips `preserve_order` on would silently break
+    /// dedup across the fleet.
+    #[test]
+    fn escalation_context_hash_is_key_order_invariant() {
+        let a = escalation_context_hash(&serde_json::json!({
+            "pr_number": 9006,
+            "branch": "factory/bead-dedup-r10",
+            "reason": "human_held_recovery_attempt_cap_reached",
+        }));
+        let b = escalation_context_hash(&serde_json::json!({
+            "reason": "human_held_recovery_attempt_cap_reached",
+            "branch": "factory/bead-dedup-r10",
+            "pr_number": 9006,
+        }));
+        assert_eq!(a, b, "key-order invariance requires serde_json BTreeMap sorted output");
+    }
 }

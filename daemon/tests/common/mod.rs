@@ -1494,6 +1494,20 @@ impl StateStore for FakeStateStore {
             .map(|(_, _, feedback_text)| feedback_text.clone()))
     }
 
+    fn clear_escalation_sentinel(&self, bead_id: &str) -> Result<(), DaemonError> {
+        // Tests use the canonical `u32::MAX` sentinel slot (matching
+        // `ESCALATION_SENTINEL_ATTEMPT` in tick.rs). Drops the row at
+        // `(bead_id, u32::MAX)` so the next tick's `escalation_already_recorded`
+        // returns false and the dedup path is exercised fresh.
+        self.calls
+            .borrow_mut()
+            .push(format!("clear_escalation_sentinel({bead_id})"));
+        self.rejections
+            .borrow_mut()
+            .remove(&(bead_id.to_string(), u32::MAX));
+        Ok(())
+    }
+
     fn escalation_should_emit(
         &self,
         bead_id: &str,

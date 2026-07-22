@@ -250,6 +250,20 @@ pub trait StateStore {
         bead_id: &str,
         attempt: u32,
     ) -> Result<Option<(String, String)>, DaemonError>;
+    /// 1s2q follow-up: clear the escalation sentinel row for a bead —
+    /// the synthetic `review_rejection` row keyed on `u32::MAX` that the
+    /// tick engine records on every successful escalation emit. The
+    /// production recovery loop (operator clears the bead, re-dispatches,
+    /// fails again, returns to HUMAN_HELD) clears the sentinel implicitly
+    /// because the bead's `attempt` rolls forward; tests that want to
+    /// exercise the dedup path across multiple ticks within the SAME
+    /// `attempt` need a way to clear the sentinel without a full
+    /// attempt-rolling operator cycle. Default `Ok(())` for stores that
+    /// don't track the sentinel (no-op) so legacy fakes that don't
+    /// exercise the dedup-against-real-DB path stay simple.
+    fn clear_escalation_sentinel(&self, _bead_id: &str) -> Result<(), DaemonError> {
+        Ok(())
+    }
     /// Read back the raw feedback text for a stored rejection (companion to
     /// `load_rejection`, which only returns `(reviewer, feedback_hash)`). The
     /// reroll circuit-breaker's semantic comparison (spec §4.2.6) needs the
@@ -1611,6 +1625,22 @@ impl StateStore for SqliteStateStore {
             .map_err(|e| tool_err("load_rejection_text", e))
     }
 
+    fn clear_escalation_sentinel(&self, bead_id: &str) -> Result<(), DaemonError> {
+        // Production uses `attempt = u32::MAX` as the sentinel slot
+        // (`ESCALATION_SENTINEL_ATTEMPT` in daemon/src/tick.rs). A
+        // narrowed DELETE here means a future miss in the sentinel
+        // slot value (e.g. a different `u32::MAX` casing) would surface
+        // as the sentinel still being present after clear — the test
+        // asserts `load_rejection(bead_id, u32::MAX) == None` after.
+        self.conn
+            .execute(
+                "DELETE FROM review_rejection WHERE bead_id = ?1 AND attempt = ?2",
+                params![bead_id, u32::MAX as i64],
+            )
+            .map_err(|e| tool_err("clear_escalation_sentinel", e))?;
+        Ok(())
+    }
+
     fn er_runner_attempt(&self, bead_id: &str) -> Result<(u32, Option<u64>), DaemonError> {
         // Schema migration: the columns were added after the initial release;
         // older DB files won't have them. Detect that by attempting the
@@ -2494,6 +2524,239 @@ mod tests {
             .expect("last_er_runner_attempt_at column should exist after migration");
         assert_eq!(count_col, 1);
         assert_eq!(last_col, 1);
+    }
+
+    /// 1s2q follow-up: the cursor-agent PR #447 review callout flagged that
+    /// the migration tests use a 3-column `bead_overlay` stub —
+    /// `ensure_escalation_ledger_table_migrates_legacy_db` (line ~3473) only
+    /// declares `bead_id`, `state`, `updated_at` — which obscures whether
+    /// migrations would silently lose real production data when applied
+    /// against a DB with the full set of older columns. This test:
+    ///   1. Builds a "production-shaped legacy" DB on disk: every column
+    ///      the production schema has, EXCEPT the most recent additions
+    ///      (`last_er_evidence_hash` and `DISPOSITION_REQUIRED` in the CHECK
+    ///      list) that 1s2q r3 introduced. Inserts two real-shape rows
+    ///      (one HUMAN_HELD, one ATTESTED) so every migration has data to
+    ///      touch.
+    ///   2. Calls `SqliteStateStore::open()` (the same path the daemon
+    ///      takes on every startup) which transitively runs the
+    ///      `ensure_disposition_required_state`, `ensure_escalation_ledger_table`,
+    ///      and `ensure_escalation_ledger_terminal_column` migrations.
+    ///   3. Asserts every pre-existing row is byte-identical to the input
+    ///      (state, attempt, reroll_count, autonomy_secs, spend_usd,
+    ///      pr_number, branch, session_id, is_adopted, spawn_failure_count,
+    ///      pre_session_head_sha, park_reason, target_repo, reroll_deferral_count,
+    ///      held_recheck_after) AND the new columns/table/CHECK are added.
+    ///
+    /// Catches the silent data-loss class the cursor-based review flagged:
+    /// a `rebuild_table_ddl` mismatch or a misnamed column in the
+    /// column-intersection copy would zero out production overlays on the
+    /// next daemon restart.
+    #[test]
+    fn open_migrates_production_shaped_legacy_db_preserves_rows() {
+        use rusqlite::Connection;
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "dark-factory-production-shape-migrate-{}-{}.sqlite",
+            std::process::id(),
+            now_iso8601().replace([':', '-', 'T', 'Z'], "")
+        ));
+        let _cleanup = TempFileGuard(path.clone());
+
+        // The legacy CHECK list excludes DISPOSITION_REQUIRED (which 1s2q r3
+        // adds). The legacy column list excludes `last_er_evidence_hash`
+        // (jleechan-yoqy / issue #323 added it). Every other column is the
+        // production schema's full set — exhaustive enumeration so the test
+        // fails loudly if a future column lands in the schema without
+        // appearing here.
+        let legacy_ddl = "CREATE TABLE bead_overlay (
+            bead_id TEXT PRIMARY KEY,
+            state TEXT NOT NULL CHECK (state IN
+                ('QUEUED','DISPATCHING','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',
+                 'REDISPATCHED','BUDGET_HELD','HUMAN_HELD')),
+            attempt INTEGER NOT NULL DEFAULT 1,
+            reroll_count INTEGER NOT NULL DEFAULT 0,
+            autonomy_secs INTEGER NOT NULL DEFAULT 0,
+            spend_usd REAL NOT NULL DEFAULT 0,
+            pr_number INTEGER,
+            branch TEXT,
+            session_id TEXT,
+            updated_at TEXT NOT NULL,
+            attempt_er_runner_count INTEGER NOT NULL DEFAULT 0,
+            last_er_runner_attempt_at INTEGER,
+            is_adopted INTEGER NOT NULL DEFAULT 0,
+            spawn_failure_count INTEGER NOT NULL DEFAULT 0,
+            pre_session_head_sha TEXT,
+            park_reason TEXT,
+            target_repo TEXT,
+            reroll_deferral_count INTEGER NOT NULL DEFAULT 0,
+            held_recheck_after INTEGER
+        )";
+        let auxiliary_ddl = "CREATE TABLE branch_registry (
+            branch TEXT PRIMARY KEY, bead_id TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE review_rejection (
+            bead_id TEXT NOT NULL, attempt INTEGER NOT NULL, reviewer TEXT NOT NULL,
+            feedback_hash TEXT NOT NULL, feedback_text TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY (bead_id, attempt)
+        );";
+
+        // Seed two production-shape rows with non-default values for every
+        // column — a migration that drops or transforms a column would
+        // produce a different row after open().
+        let seed_rows = [
+            (
+                "legacy-attested",
+                "ATTESTED",
+                3,    // attempt
+                1,    // reroll_count
+                7200, // autonomy_secs (nonzero)
+                14.5, // spend_usd (nonzero)
+                9006,                       // pr_number
+                "factory/legacy-attested-r3", // branch
+                "sess-legacy-live",          // session_id (non-null)
+                1,                           // is_adopted
+                2,                           // spawn_failure_count
+                "abc123def",                 // pre_session_head_sha
+                "session_stalled",           // park_reason
+                "owner/worldai",             // target_repo
+                4,                           // reroll_deferral_count
+                1_800_000_000,               // held_recheck_after
+                "2026-07-22T00:00:00Z",      // updated_at
+            ),
+            (
+                "legacy-human-held",
+                "HUMAN_HELD",
+                10,
+                0,
+                0,
+                0.0,
+                9007,
+                "factory/legacy-human-held-r10",
+                "", // empty session_id — recoverable attempt
+                0,
+                0,
+                "", // empty pre_session_head_sha — non-adopted
+                "transient_spawn_retry_cap_exceeded",
+                "", // empty target_repo — legacy null
+                0,
+                0, // 0 held_recheck_after
+                "2026-07-22T01:00:00Z",
+            ),
+        ];
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(legacy_ddl).unwrap();
+            conn.execute_batch(auxiliary_ddl).unwrap();
+            for row in &seed_rows {
+                conn.execute(
+                    "INSERT INTO bead_overlay (bead_id, state, attempt, reroll_count, \
+                     autonomy_secs, spend_usd, pr_number, branch, session_id, updated_at, \
+                     is_adopted, spawn_failure_count, pre_session_head_sha, park_reason, \
+                     target_repo, reroll_deferral_count, held_recheck_after) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    rusqlite::params![
+                        row.0,                    // bead_id
+                        row.1,                    // state
+                        row.2,                    // attempt
+                        row.3,                    // reroll_count
+                        row.4,                    // autonomy_secs
+                        row.5,                    // spend_usd
+                        row.6,                    // pr_number
+                        row.7,                    // branch
+                        if row.8.is_empty() { None } else { Some(row.8) }, // session_id
+                        row.15,                   // updated_at
+                        row.9,                    // is_adopted
+                        row.10,                   // spawn_failure_count
+                        if row.11.is_empty() { None } else { Some(row.11) }, // pre_session_head_sha
+                        if row.12.is_empty() { None } else { Some(row.12) }, // park_reason
+                        if row.13.is_empty() { None } else { Some(row.13) }, // target_repo
+                        row.14,                   // reroll_deferral_count
+                        row.16,                   // held_recheck_after
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        // The path the daemon takes on every startup.
+        let store = SqliteStateStore::open(&path).expect("open must succeed on production-shape legacy DB");
+
+        // (a) New column added.
+        let conn = Connection::open(&path).unwrap();
+        let has_last_er_hash: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('bead_overlay') \
+                 WHERE name = 'last_er_evidence_hash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_last_er_hash, 1, "last_er_evidence_hash must be added");
+
+        // (b) New table added.
+        let has_ledger: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'escalation_ledger'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_ledger, 1, "escalation_ledger must be created");
+
+        // (c) New state accepted (CHECK rebuild).
+        conn.execute(
+            "INSERT INTO bead_overlay (bead_id, state, updated_at) \
+             VALUES ('post-migrate-new', 'DISPOSITION_REQUIRED', '2026-07-22T02:00:00Z')",
+            [],
+        )
+        .expect("DISPOSITION_REQUIRED must be accepted after migration");
+
+        // (d) Pre-existing rows are byte-identical — every column, every
+        // value. This is the silent data-loss guard the cursor-agent review
+        // callout flagged: a misnamed column in the REBUILD_TABLE_DDL
+        // column-intersection copy would zero out production overlays on
+        // the next daemon restart. The exhaustive list below names every
+        // column the production schema has today, so a future migration
+        // that drops a column from the canonical list surfaces here.
+        for row in &seed_rows {
+            let bead_id = row.0;
+            let reloaded = store.load(bead_id).unwrap().unwrap_or_else(|| {
+                panic!("legacy row {bead_id} must be preserved after open()-time migration")
+            });
+            assert_eq!(reloaded.bead_id, bead_id);
+            assert_eq!(reloaded.state, OverlayState::from_str(row.1).unwrap(), "state mismatch for {bead_id}");
+            assert_eq!(reloaded.attempt, row.2 as u32, "attempt mismatch for {bead_id}");
+            assert_eq!(reloaded.reroll_count, row.3 as u32, "reroll_count mismatch for {bead_id}");
+            assert_eq!(reloaded.autonomy_secs, row.4 as u64, "autonomy_secs mismatch for {bead_id}");
+            assert!(
+                (reloaded.spend_usd - row.5).abs() < 1e-9,
+                "spend_usd mismatch for {bead_id}: got {}",
+                reloaded.spend_usd
+            );
+            assert_eq!(reloaded.pr_number, Some(row.6 as u64), "pr_number mismatch for {bead_id}");
+            assert_eq!(reloaded.branch.as_deref(), Some(row.7), "branch mismatch for {bead_id}");
+            let expected_session = if row.8.is_empty() { None } else { Some(row.8) };
+            assert_eq!(reloaded.session_id.as_deref(), expected_session, "session_id mismatch for {bead_id}");
+            assert_eq!(reloaded.is_adopted, row.9 != 0, "is_adopted mismatch for {bead_id}");
+            assert_eq!(reloaded.spawn_failure_count, row.10 as u32, "spawn_failure_count mismatch for {bead_id}");
+            let expected_pre_sha = if row.11.is_empty() { None } else { Some(row.11) };
+            assert_eq!(reloaded.pre_session_head_sha.as_deref(), expected_pre_sha, "pre_session_head_sha mismatch for {bead_id}");
+            let expected_park = if row.12.is_empty() { None } else { Some(row.12) };
+            assert_eq!(reloaded.park_reason.as_deref(), expected_park, "park_reason mismatch for {bead_id}");
+            let expected_repo = if row.13.is_empty() { None } else { Some(row.13) };
+            assert_eq!(reloaded.target_repo.as_deref(), expected_repo, "target_repo mismatch for {bead_id}");
+        }
+
+        // (e) Re-open is idempotent (no double-ALTER, no CHECK churn).
+        let _store2 = SqliteStateStore::open(&path).expect("second open must be idempotent");
+        let final_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bead_overlay", [], |row| row.get(0))
+            .unwrap();
+        // 2 seed rows + 1 post-migration insert = 3.
+        assert_eq!(final_count, 3, "every row must survive the second open()");
     }
 
     /// The real-SQLite policy requeues only retry-safe no-session rows under

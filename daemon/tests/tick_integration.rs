@@ -26,7 +26,7 @@ use common::{FakeLlm, FakeScm, FakeSessions, FakeStateStore, FakeTracker, FakeVc
 use daemon::config::Config;
 use daemon::er_runner;
 use daemon::errors::DaemonError;
-use daemon::state::{BeadOverlay, OverlayState, StateStore};
+use daemon::state::{BeadOverlay, OverlayState, SqliteStateStore, StateStore};
 use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
 use daemon::tools::{
     Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrHeadBranch, PrSnapshot, Scm,
@@ -11902,6 +11902,306 @@ fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_e
     assert_eq!(
         summary3.escalations_suppressed, 0,
         "tick 3: changed context hash must NOT be suppressed"
+    );
+    assert_eq!(
+        summary3.beads_escalated, 1,
+        "tick 3: bead must be escalated again (new context)"
+    );
+    let log3 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let escalation_required_count = log3.matches("ESCALATION_REQUIRED").count();
+    assert_eq!(
+        escalation_required_count, 2,
+        "tick 3: ESCALATION_REQUIRED must re-emit after context change; \
+         total count across ticks 1+2+3 should be 2; got: {escalation_required_count}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// 1s2q follow-up: real-`SqliteStateStore` variant of the dispatch-ordering
+/// regression test. Companion to
+/// `dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog`.
+/// The FakeStateStore covers the trait-level wiring; this test exercises
+/// the SAME scenario through the production `SqliteStateStore` so a SQL-
+/// level regression (e.g. a missing WHERE clause, a stale JOIN in the
+/// dispatch path, a `RETURNING` clause that drops a column) cannot hide
+/// behind the fake's in-memory lookup.
+#[test]
+fn dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog_sqlite() {
+    const QUEUED_BEAD_ID: &str = "queued-bead-sqlite";
+
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"single small change"}"#.into(),
+    ));
+    let store = SqliteStateStore::open_in_memory_with_schema(
+        include_str!("../../daemon/contracts/schema.sql"),
+    )
+    .expect("sqlite store must open");
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // Seed 9 HUMAN_HELD beads at the recovery cap (attempt=10) — exactly
+    // mirroring the FakeStateStore variant.
+    for i in 0..9u32 {
+        let bead_id = format!("escalation-bead-sqlite-{i}");
+        let pr_number = 1100 + i as u64;
+        store
+            .save(&BeadOverlay {
+                bead_id: bead_id.clone(),
+                state: OverlayState::HumanHeld,
+                attempt: 10,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: Some(pr_number),
+                branch: Some(format!("factory/{bead_id}-r10")),
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: Some("owner/repo".to_string()),
+            })
+            .unwrap();
+    }
+
+    // Seed 1 QUEUED bead.
+    tracker.candidates.borrow_mut().push(Bead {
+        id: QUEUED_BEAD_ID.into(),
+        title: "Legitimately queued bead (sqlite variant)".into(),
+        description: String::new(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#9999".into()),
+    });
+    store
+        .save(&BeadOverlay {
+            bead_id: QUEUED_BEAD_ID.into(),
+            state: OverlayState::Queued,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: None,
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("owner/repo".to_string()),
+        })
+        .unwrap();
+
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_dispatch_guarantee_sqlite_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
+
+    // The QUEUED bead must be dispatched (the ordering invariant).
+    assert_eq!(
+        summary.beads_dispatched, 1,
+        "the QUEUED bead must be dispatched on the first tick despite 9 escalation beads (sqlite variant)"
+    );
+    let queued_overlay = store.load(QUEUED_BEAD_ID).unwrap().unwrap();
+    assert_eq!(
+        queued_overlay.state,
+        OverlayState::Dispatched,
+        "the QUEUED bead must reach DISPATCHED state (sqlite variant)"
+    );
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("TASK_DISPATCHED") && log.contains(QUEUED_BEAD_ID),
+        "TASK_DISPATCHED must be emitted for the QUEUED bead; got: {log}"
+    );
+
+    // The 9 escalation beads must have been processed.
+    assert_eq!(
+        summary.beads_escalated, 9,
+        "all 9 escalation beads at the recovery cap must be escalated"
+    );
+    assert!(
+        log.contains("ESCALATION_REQUIRED"),
+        "escalation telemetry must be emitted for the cap beads; got: {log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// 1s2q follow-up: real-`SqliteStateStore` variant of the escalation_dedup
+/// tick-level regression. Companion to
+/// `escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_emits`.
+/// The fake's in-memory `escalation_ledger` mirrors the production SQL
+/// table, but the dedup logic is split between
+/// `tick::escalation_dedup_should_emit` (which reads
+/// `StateStore::escalation_should_emit`) and the SQL implementation in
+/// `SqliteStateStore`. A SQL bug (e.g. a stale query plan, a missing
+/// `terminal = 0` check, a `>=` vs `>` slip) would only surface here.
+#[test]
+fn escalation_dedup_tick_level_identical_payload_suppressed_changed_context_re_emits_sqlite() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = SqliteStateStore::open_in_memory_with_schema(
+        include_str!("../../daemon/contracts/schema.sql"),
+    )
+    .expect("sqlite store must open");
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    let bead_id = "bead-dedup-tick-sqlite";
+    store.save(&BeadOverlay {
+        bead_id: bead_id.into(),
+        state: OverlayState::HumanHeld,
+        attempt: 10,
+        reroll_count: 0,
+        autonomy_secs: 0,
+        spend_usd: 0.0,
+        pr_number: Some(19006),
+        branch: Some("factory/bead-dedup-tick-sqlite-r10".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: Some("owner/repo".to_string()),
+    }).unwrap();
+
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_escalation_dedup_tick_level_sqlite_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    // ── Tick 1: first escalation → ESCALATION_REQUIRED emitted ──
+    let summary1 = run_tick(&deps, 0, 0).expect("tick 1 should succeed");
+    assert_eq!(summary1.beads_escalated, 1, "tick 1: bead must be escalated");
+    assert_eq!(summary1.escalations_suppressed, 0, "tick 1: first occurrence must NOT be suppressed");
+    let log1 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log1.contains("ESCALATION_REQUIRED"),
+        "tick 1: ESCALATION_REQUIRED must be emitted; got: {log1}"
+    );
+
+    // The dedup ledger MUST have a row for this (bead_id, reason) — via
+    // the StateStore trait, not via FakeStateStore's private field. Use
+    // a future epoch and a non-zero refire window so the suppression check
+    // excludes the "hash changed" path (the prior emit's hash is whatever
+    // the FNV-1a fold produces for the production context) — what we
+    // actually want to verify is that the prior row's `last_emitted_epoch`
+    // is set, which emits-false with a small now_epoch delta would NOT
+    // confirm. The cleanest invariant: a hash-changed lookup within the
+    // backoff window must return `true` (the production-side dedup
+    // contract the live-incident class needs to preserve — context
+    // changed → re-emit, regardless of last emit's epoch).
+    assert!(
+        store
+            .escalation_should_emit(
+                bead_id,
+                "human_held_recovery_attempt_cap_reached",
+                "different-hash",
+                1,
+                999_999,
+            )
+            .unwrap(),
+        "tick 1: changed-hash within backoff must re-emit (sqlite variant)"
+    );
+    // And a no-row lookup (a brand new (bead_id, reason) tuple) must emit.
+    assert!(
+        store
+            .escalation_should_emit(
+                bead_id,
+                "different-reason",
+                "any-hash",
+                1,
+                999_999,
+            )
+            .unwrap(),
+        "tick 1: a different (bead_id, reason) tuple must emit (per-reason keying)"
+    );
+
+    // The sentinel must be recorded on the success path.
+    assert!(
+        store
+            .load_rejection(bead_id, u32::MAX)
+            .unwrap()
+            .is_some(),
+        "tick 1: sentinel must be recorded on success path"
+    );
+
+    // ── Simulate operator recovery + re-hold: clear the sentinel ──
+    // The tick engine's sentinel is the synthetic `review_rejection` row
+    // keyed on `u32::MAX`. The new `clear_escalation_sentinel` trait
+    // method drops that row so the next tick can re-enter the escalation
+    // path (mirroring the fake's `store.rejections.borrow_mut().remove(...)`
+    // line in the companion variant).
+    store.clear_escalation_sentinel(bead_id).unwrap();
+    assert!(
+        store
+            .load_rejection(bead_id, u32::MAX)
+            .unwrap()
+            .is_none(),
+        "tick 1→2: clear_escalation_sentinel must drop the sentinel row"
+    );
+
+    // ── Tick 2: same context → ESCALATION_REQUIRED suppressed by dedup ──
+    let summary2 = run_tick(&deps, 1, 0).expect("tick 2 should succeed");
+    assert_eq!(
+        summary2.escalations_suppressed, 1,
+        "tick 2: same context hash within backoff must be suppressed (sqlite variant); got summary: {summary2:?}"
+    );
+    let log2 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let escalation_required_count = log2.matches("ESCALATION_REQUIRED").count();
+    assert_eq!(
+        escalation_required_count, 1,
+        "tick 2: ESCALATION_REQUIRED must NOT be re-emitted (same context, within backoff); \
+         total count across ticks 1+2 should be 1; got: {escalation_required_count}"
+    );
+
+    // ── Simulate operator recovery + re-hold: clear the sentinel again ──
+    store.clear_escalation_sentinel(bead_id).unwrap();
+
+    // ── Change the context: update pr_number and branch ──
+    let mut overlay = store.load(bead_id).unwrap().unwrap();
+    overlay.pr_number = Some(19007);
+    overlay.branch = Some("factory/bead-dedup-tick-sqlite-r10-v2".into());
+    store.save(&overlay).unwrap();
+
+    // ── Tick 3: changed context → ESCALATION_REQUIRED re-emits ──
+    let summary3 = run_tick(&deps, 2, 0).expect("tick 3 should succeed");
+    assert_eq!(
+        summary3.escalations_suppressed, 0,
+        "tick 3: changed context hash must NOT be suppressed (sqlite variant)"
     );
     assert_eq!(
         summary3.beads_escalated, 1,
