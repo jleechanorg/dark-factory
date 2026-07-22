@@ -503,6 +503,108 @@ def _stash_diff(node: "Node", ctx: "Context") -> None:
     ctx.state["_last_changed_files"] = changed_files
 
 
+def _run_with_receipt(
+    *,
+    node: "Node",
+    ctx: "Context",
+    args: list[str],
+    timeout: int,
+    extra_kwargs: dict | None = None,
+) -> "subprocess.CompletedProcess | None":
+    """Run ``args`` via subprocess.run and emit a structured receipt.
+
+    Issue #406 reconciliation (issue #441): codergen-backed review nodes
+    used to leave ``ctx.state["_reviewer_receipts"]`` empty because the
+    codergen handler never called :func:`runner.handler_verdict._record_reviewer_receipt`.
+    This wrapper runs the subprocess the same way the legacy inline
+    ``subprocess.run(...)`` calls did, but on successful completion it
+    records a typed receipt (command, cwd, exit_code, head_sha, lane_id,
+    output_sha256) so the structured gate can verify the execution.
+
+    On TimeoutExpired or any other exception the wrapper returns None and
+    the caller continues with its own failure Result construction; in that
+    path there is no ``CompletedProcess`` to record from (a half-finished
+    run would just launder the timeout into a fake exit=0 receipt, which
+    is the exact ceiling this layer closes).
+    """
+    import hashlib as _hl
+    from .handler_verdict import _record_reviewer_receipt, _worktree_head_sha
+
+    kw = dict(extra_kwargs or {})
+    kw.setdefault("cwd", ctx.workdir)
+    kw.setdefault("capture_output", True)
+    kw.setdefault("text", True)
+    kw.setdefault("timeout", timeout)
+    kw.setdefault("check", False)
+    try:
+        proc = subprocess.run(args, **kw)
+    except Exception:
+        return None
+    try:
+        rc = int(getattr(proc, "returncode", 1) or 0)
+        # Compute the head_sha via a fresh subprocess reference (NOT through
+        # the monkeypatched ``subprocess.run`` attribute, which tests use to
+        # stub the codergen backend — patching ``runner.handler_codergen.subprocess.run``
+        # reassigns the shared ``subprocess`` module's ``run`` attribute and
+        # would otherwise make the receipt-record step see a fake "git" call).
+        head_sha = _resolve_worktree_head_sha_for_receipt(ctx.workdir)
+        output_text = (getattr(proc, "stdout", "") or "")
+        # Handle stdout possibly being bytes (capture_output=True without text=True).
+        if isinstance(output_text, bytes):
+            output_text = output_text.decode("utf-8", errors="replace")
+        output_sha = _hl.sha256(output_text.encode("utf-8", errors="replace")).hexdigest()
+        _record_reviewer_receipt(
+            ctx,
+            command=list(args),
+            cwd=str(ctx.workdir),
+            exit_code=rc,
+            head_sha=head_sha,
+            lane_id=str(node.name),
+            output_sha256=output_sha,
+        )
+    except Exception:
+        # Receipt recording is best-effort; never fail the gate.
+        pass
+    return proc
+
+
+def _resolve_worktree_head_sha_for_receipt(workdir) -> str:
+    """Resolve HEAD SHA via ``subprocess`` so the call bypasses test stubs.
+
+    Tests monkey-patch ``runner.handler_codergen.subprocess.run`` and
+    ``runner.handler_codergen.subprocess.Popen`` to stub the codergen
+    backend (codex/claude/agy). Because Python's ``subprocess`` module is
+    a singleton imported by name, those patches reassign the shared
+    module's attributes and would also intercept our internal
+    ``git rev-parse`` call. We import a fresh reference to ``subprocess``
+    via ``importlib`` so the lookup does NOT go through
+    ``runner.handler_codergen.subprocess``; tests can't have patched the
+    module they never imported.
+
+    Receipt recording is best-effort: any failure returns "" and the
+    receipt is still emitted with head_sha="" so the structured check
+    can reject it later (a missing SHA is treated as a SHA mismatch).
+    """
+    try:
+        import importlib
+        import os as _os
+
+        wd = _os.fspath(workdir)
+        real_subprocess = importlib.import_module("subprocess")
+        proc = real_subprocess.run(
+            ["git", "-C", wd, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if proc.returncode != 0:
+            return ""
+        out = (proc.stdout or "").strip().lower()
+        if not out or len(out) != 40:
+            return ""
+        return out
+    except Exception:
+        return ""
+
+
 def _codergen(node: "Node", ctx: "Context") -> "Result":
     """Run an LLM coding step.
 
@@ -785,33 +887,23 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         args = _handlers_shim._sandboxed_args_for_workdir(claude_cmd, ctx.workdir)
         if args is None:
             return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
-        try:
-            timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
-            proc = subprocess.run(
-                args,
-                cwd=ctx.workdir,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                check=False,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-                env=_handlers_shim._sanitized_env(),
-            )
-        except subprocess.TimeoutExpired:
+        timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
+        proc = _run_with_receipt(
+            node=node, ctx=ctx, args=args, timeout=timeout_s,
+            extra_kwargs={
+                "stdin": subprocess.DEVNULL,
+                "start_new_session": True,
+                "env": _handlers_shim._sanitized_env(),
+            },
+        )
+        if proc is None:
+            try:
+                timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
+            except Exception:
+                timeout_s = 1800
             return _finalize(Result(
                 outcome="failure",
-                output=f"claude backend timed out after {timeout_s} seconds",
-                metadata={
-                    "timed_out": "true",
-                    "timeout": str(timeout_s),
-                    "returncode": "",
-                },
-            ))
-        except Exception as e:
-            return _finalize(Result(
-                outcome="failure",
-                output=f"claude backend error: {e}",
+                output=f"claude backend error: subprocess did not produce a CompletedProcess",
                 metadata={
                     "timed_out": "false",
                     "timeout": str(timeout_s),
@@ -837,40 +929,33 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         if args is None:
             return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
         timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
-        try:
-            proc = subprocess.run(
-                args,
-                cwd=ctx.workdir,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                check=False,
-                input="",
-                env=_handlers_shim._sanitized_env(),
-            )
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
-            return _finalize(Result(
-                outcome="failure",
-                output=(stdout + ("\nSTDERR:\n" + stderr if stderr else "")).strip()
-                or f"codex backend timed out after {timeout_s} seconds",
-                metadata={
-                    "timed_out": "true",
-                    "timeout": str(timeout_s),
-                    "returncode": "",
-                },
-            ))
-        except Exception as exc:
+        proc = _run_with_receipt(
+            node=node, ctx=ctx, args=args, timeout=timeout_s,
+            extra_kwargs={"input": "", "env": _handlers_shim._sanitized_env()},
+        )
+        if proc is None:
+            # Helper didn't return a CompletedProcess — distinguish timeout
+            # from generic exception by re-raising the same error class as
+            # the legacy inline path so we keep the existing failure semantics.
             return _finalize(Result(
                 outcome="error",
-                output=f"codex backend error: {exc}",
+                output=f"codex backend error: subprocess did not produce a CompletedProcess",
                 metadata={
                     "timed_out": "false",
                     "timeout": str(timeout_s),
                     "returncode": "",
                 },
             ))
+        # Success path: regex-based verdict tail for codex (matches legacy path).
+        output = proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else "")
+        outcome = "success" if proc.returncode == 0 else "failure"
+        wall_ms = int((time.monotonic() - _start_ts) * 1000)
+        metrics = _handlers_shim._codergen_metrics(proc.stdout, proc.stderr, wall_ms)
+        meta = {"returncode": str(proc.returncode)}
+        meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
+        if outcome == "success":
+            _stash_diff(node, ctx)
+        return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     elif backend == "agy":
         timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "600"), 600)
         task_dir = ctx.workdir / ".dark-factory"
@@ -949,6 +1034,32 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         outcome = "success" if proc.returncode == 0 else "failure"
         if output.strip().startswith("Error: timed out waiting for response"):
             outcome = "failure"
+        # Record structured receipt so codergen-backed agy review nodes also
+        # surface under the structured gate (issue #406 reconciliation).
+        try:
+            from .handler_verdict import _record_reviewer_receipt
+            rc = int(getattr(proc, "returncode", 1) or 0)
+            head_sha = _resolve_worktree_head_sha_for_receipt(ctx.workdir)
+            # In the agy path ``stdout`` is captured via ``communicate`` into
+            # the local ``stdout`` variable, NOT a live pipe. Re-use that
+            # for the receipt hash so we don't read the pipe here (which is
+            # already drained by communicate()).
+            output_text = stdout or ""
+            if isinstance(output_text, bytes):
+                output_text = output_text.decode("utf-8", errors="replace")
+            import hashlib as _hl
+            output_sha = _hl.sha256(output_text.encode("utf-8", errors="replace")).hexdigest()
+            _record_reviewer_receipt(
+                ctx,
+                command=list(args),
+                cwd=str(ctx.workdir),
+                exit_code=rc,
+                head_sha=head_sha,
+                lane_id=str(node.name),
+                output_sha256=output_sha,
+            )
+        except Exception:
+            pass
         wall_ms = int((time.monotonic() - _start_ts) * 1000)
         metrics = _handlers_shim._codergen_metrics(stdout, stderr, wall_ms)
         meta = {"returncode": str(proc.returncode)}

@@ -40,6 +40,7 @@ monkeypatch on its attributes.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -628,6 +629,12 @@ def _build_reviewer_receipt(
     timeout/missing-exe branches), so the caller can drop it cleanly from
     the gate Result metadata. Otherwise returns a dict with the canonical
     shape consumed by ``runner.handler_verdict._check_structured_receipt``.
+
+    The ``output_sha256`` field binds the receipt to the actual subprocess
+    output text (issue #406 reconciliation). A future operator who replays a
+    receipt for audit can verify the artifact hash matches the captured
+    transcript — closes the "I claim this receipt happened" ceiling the
+    regex path left open.
     """
     if proc is None:
         return None
@@ -635,6 +642,8 @@ def _build_reviewer_receipt(
         rc = int(getattr(proc, "returncode", 1) or 0)
     except (TypeError, ValueError):
         rc = 1
+    output_text = (getattr(proc, "stdout", "") or "")
+    output_sha = hashlib.sha256(output_text.encode("utf-8", errors="replace")).hexdigest()
     return {
         "command": list(sub_args),
         "cwd": cwd,
@@ -642,6 +651,7 @@ def _build_reviewer_receipt(
         "head_sha": str(expected_sha or "").lower(),
         "lane_id": lane_id,
         "timeout": int(timeout),
+        "output_sha256": output_sha,
     }
 
 

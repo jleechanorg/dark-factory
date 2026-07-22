@@ -329,6 +329,8 @@ def _record_reviewer_receipt(
     exit_code: int,
     head_sha: str,
     lane_id: str,
+    output_sha256: str = "",
+    ts: str = "",
 ) -> None:
     """Record a single reviewer-gate subprocess execution as a structured event.
 
@@ -338,6 +340,15 @@ def _record_reviewer_receipt(
     AND emitted to the structured event log so audit readers can correlate
     narrative PASSes against real subprocess runs.
 
+    The record carries every field the #406 contract calls out: command,
+    cwd, exit status, reviewer lane, target head SHA, and (when supplied)
+    an artifact hash binding the receipt to the captured subprocess output.
+    This is the surviving subset of the original commands_run.md design
+    after #407/#425/#426 layered the structured receipt path on top — the
+    in-memory record IS the contract; the optional ``commands_run.md`` file
+    is exposed via :func:`write_commands_run_sidecar` for graphs that want
+    a durable artifact alongside the in-memory list.
+
     State and event-log writes are best-effort — never fail the gate.
     """
     record = {
@@ -346,6 +357,8 @@ def _record_reviewer_receipt(
         "exit_code": int(exit_code),
         "head_sha": str(head_sha or "").lower(),
         "lane_id": str(lane_id),
+        "output_sha256": str(output_sha256 or ""),
+        "ts": str(ts or ""),
     }
     try:
         state = getattr(ctx, "state", None)
@@ -371,6 +384,7 @@ def _record_reviewer_receipt(
                     "head_sha": record["head_sha"],
                     "cwd": record["cwd"],
                     "command": " ".join(record["command"]),
+                    "output_sha256": record["output_sha256"],
                 },
             )
     except Exception:
@@ -453,3 +467,94 @@ def _reset_reviewer_receipts_for_test() -> None:
     the ctx.
     """
     return None
+
+
+# ---------------------------------------------------------------------------
+# commands_run.md sidecar writer (issue #406 reconciliation, issue #441).
+#
+# Issue #406 originally asked for a durable `commands_run.md` artifact written
+# alongside every gating review path, binding engine-captured command, exit
+# status, reviewer lane, target head SHA, and artifact hash. PR #407/#425/#426
+# landed the structured receipt path (``ctx.state["_reviewer_receipts"]``) as
+# the in-memory authoritative record, which closes the regex-fabrication ceiling
+# that #406 was patching against. Issue #441 asks for the surviving subset:
+# the structured record IS the contract; an optional on-disk sidecar is
+# exposed for graphs that want a durable artifact alongside the in-memory list.
+#
+# This writer is opt-in: callers must explicitly invoke it (typically the
+# gate subprocess wrapper) so the default path keeps receipts in-process only
+# and avoids leaking review transcripts to disk when not requested.
+# ---------------------------------------------------------------------------
+
+
+def write_commands_run_sidecar(
+    *,
+    run_id: str,
+    node_name: str,
+    attempt: int,
+    receipts: list[dict],
+) -> Optional[str]:
+    """Write a durable ``commands_run.md`` artifact for a gate attempt.
+
+    Each receipt becomes one YAML-style block so the file is human-readable
+    and grep-friendly. The artifact binds the four fields #406 calls out:
+
+      * engine-captured command (argv list)
+      * exit status (returncode)
+      * reviewer lane (``lane_id``)
+      * target head SHA (``head_sha``)
+      * artifact hash (``output_sha256`` when present, else ``-``)
+
+    Returns the absolute path on success, ``None`` when the run is unknown
+    or any I/O error occurs (writing the sidecar is best-effort and must
+    never fail a gate).
+    """
+    if not run_id or not isinstance(receipts, list) or not receipts:
+        return None
+    try:
+        import hashlib as _hl
+        import pathlib as _pl
+
+        # Hash the contents first so a single file path can be referenced from
+        # the in-memory receipt list without two writers racing on the same
+        # path. The hash is computed over the rendered text below; we compute
+        # it twice only on the empty case so the path is stable.
+        body_lines: list[str] = [
+            "# commands_run.md",
+            "",
+            f"run_id: {run_id}",
+            f"node: {node_name}",
+            f"attempt: {attempt}",
+            f"receipt_count: {len(receipts)}",
+            "",
+            "## Receipts",
+            "",
+        ]
+        for rec in receipts:
+            if not isinstance(rec, dict):
+                continue
+            cmd = rec.get("command") or []
+            if isinstance(cmd, list):
+                cmd_str = " ".join(str(x) for x in cmd)
+            else:
+                cmd_str = str(cmd)
+            body_lines.append(f"- lane_id: {rec.get('lane_id', '')}")
+            body_lines.append(f"  command: {cmd_str}")
+            body_lines.append(f"  cwd: {rec.get('cwd', '')}")
+            body_lines.append(f"  exit_code: {rec.get('exit_code', '')}")
+            body_lines.append(f"  head_sha: {rec.get('head_sha', '')}")
+            body_lines.append(f"  output_sha256: {rec.get('output_sha256', '-')}")
+            body_lines.append(f"  ts: {rec.get('ts', '')}")
+            body_lines.append("")
+        body = "\n".join(body_lines)
+        sha = _hl.sha256(body.encode("utf-8")).hexdigest()
+
+        run_dir = _pl.Path.home() / ".dark-factory" / "runs" / run_id
+        out_dir = run_dir / "commands_run"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_node = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(node_name)).strip("_") or "node"
+        path = out_dir / f"{attempt}_{safe_node}_{sha[:12]}.md"
+        path.write_text(body, encoding="utf-8")
+        return str(path)
+    except Exception:
+        return None
