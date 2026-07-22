@@ -2281,6 +2281,18 @@ fn vacuous_red_green_for_pr(
     // detector has no manifest to run against, and we surface that as
     // ManifestMissing rather than silently treating NEVER_RAN as a
     // vacuous pass (issue #387 r5 finding 3).
+    //
+    // jleechan-ni1k / issue #437 bonus: dark-factory is a nested-crate
+    // layout (the daemon's `Cargo.toml` lives at `daemon/Cargo.toml`,
+    // not at the repo root), so the walk-up `find_cargo_manifest` was
+    // returning `None` on the daemon CWD and every PR logged
+    // `ManifestMissing: no Cargo.toml reachable from
+    // /home/jleechan/projects/dark-factory`. The fix is a bounded
+    // downward search (`find_cargo_manifest_recursive`) used as a
+    // fallback when the walk-up misses. We keep the walk-up call first
+    // to preserve the existing fast path (no I/O when a root manifest
+    // exists) and only fall back to the recursive walk when the root
+    // is bare.
     let repo_root = match std::env::current_dir() {
         Ok(p) => p,
         Err(_) => {
@@ -2289,11 +2301,13 @@ fn vacuous_red_green_for_pr(
             );
         }
     };
-    let manifest = match crate::vacuous_red_green::find_cargo_manifest(&repo_root) {
+    let manifest = crate::vacuous_red_green::find_cargo_manifest(&repo_root)
+        .or_else(|| crate::vacuous_red_green::find_cargo_manifest_recursive(&repo_root, 4));
+    let manifest = match manifest {
         Some(m) => m,
         None => {
             return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
-                "no Cargo.toml reachable from {}",
+                "no Cargo.toml reachable from {} (walk-up and recursive both failed)",
                 repo_root.display()
             ));
         }

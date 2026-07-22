@@ -846,6 +846,59 @@ pub fn find_cargo_manifest(repo_root: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Bounded downward search for a `Cargo.toml` under `repo_root`. Used
+/// as a fallback by the production tick path (`tick.rs::vacuous_red_
+/// green_for_pr`) when `find_cargo_manifest` (walk-up) returns `None`
+/// because the daemon's own CWD is the dark-factory repo root but the
+/// crate itself lives at `daemon/Cargo.toml` (nested-crate layout).
+///
+/// jleechan-ni1k / issue #437 bonus: previously the detector logged
+/// `ManifestMissing: no Cargo.toml reachable from
+/// /home/jleechan/projects/dark-factory` on every PR — the daemon CWD
+/// has no ancestor `Cargo.toml`, and the walk-up search stops at the
+/// filesystem root. The recursive search finds the nested
+/// `daemon/Cargo.toml` and lets the gate invoke the detector against
+/// the right crate.
+///
+/// `max_depth` caps the recursion to keep the search bounded on large
+/// trees. The legacy walk-up helper has no parallel notion of depth
+/// because filesystem paths have natural parents; depth here is the
+/// only knob that prevents a multi-thousand-entry monorepo from
+/// costing real seconds per gate tick.
+///
+/// Well-known large trees (`target`, `node_modules`, `.git`) are
+/// skipped to keep the search out of uninteresting branches.
+pub fn find_cargo_manifest_recursive(repo_root: &Path, max_depth: usize) -> Option<PathBuf> {
+    const DIRS_TO_SKIP: &[&str] = &["target", "node_modules", ".git"];
+    let root_candidate = repo_root.join("Cargo.toml");
+    if root_candidate.exists() {
+        return Some(root_candidate);
+    }
+    fn walk(dir: &Path, remaining: usize, skip: &[&str]) -> Option<PathBuf> {
+        if remaining == 0 {
+            return None;
+        }
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if skip.iter().any(|s| *s == name_str.as_ref()) {
+                continue;
+            }
+            if path.is_dir() {
+                if let Some(found) = walk(&path, remaining - 1, skip) {
+                    return Some(found);
+                }
+            } else if name_str == "Cargo.toml" {
+                return Some(path);
+            }
+        }
+        None
+    }
+    walk(repo_root, max_depth, DIRS_TO_SKIP)
+}
+
 /// Run cargo test against the working tree (or a worktree under
 /// `baseline_root` for the baseline-main phase) using the resolved
 /// manifest. Issue #387 r5 finding 3: `--manifest-path` is required
@@ -1254,6 +1307,107 @@ fn b() {
         let body_b = bodies_full.iter().find(|(_, _, n)| *n == "b").unwrap();
         let body_text = &src[body_b.0..body_b.1];
         assert!(body_text.contains("let x = 1"));
+    }
+
+    // jleechan-ni1k / issue #437 bonus: the daemon's own CWD is the
+    // dark-factory repo root, but its `Cargo.toml` lives one level down at
+    // `daemon/Cargo.toml` (nested-crate layout). The legacy walk-up
+    // `find_cargo_manifest` only checks `repo_root/Cargo.toml` and each
+    // ancestor, so it returned `None` on the daemon CWD and the gate
+    // logged `ManifestMissing: no Cargo.toml reachable from
+    // /home/jleechan/projects/dark-factory`. The fix is a bounded
+    // downward search that finds the nested `daemon/Cargo.toml` and
+    // returns it as a fallback when the upward search misses.
+
+    /// Create a unique temp directory under `std::env::temp_dir()`. Caller
+    /// is responsible for removing it; `tempdir_raii` does the cleanup on
+    /// drop so a panicking test still removes its scaffolding.
+    struct TempDirRaii(std::path::PathBuf);
+    impl Drop for TempDirRaii {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn unique_tempdir(label: &str) -> TempDirRaii {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let p = std::env::temp_dir().join(format!(
+            "daemon_vrg_{label}_{pid}_{nanos}"
+        ));
+        std::fs::create_dir_all(&p).expect("create tempdir");
+        TempDirRaii(p)
+    }
+
+    #[test]
+    fn find_cargo_manifest_recursive_finds_nested_crate_in_subdir() {
+        let tmp = unique_tempdir("nested");
+        let root = &tmp.0;
+        let repo = root.join("repo");
+        let daemon_dir = repo.join("daemon");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        std::fs::write(
+            daemon_dir.join("Cargo.toml"),
+            "[package]\nname=\"d\"\nversion=\"0.0.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+
+        let found = find_cargo_manifest_recursive(&repo, 4)
+            .expect("recursive search must find the nested daemon/Cargo.toml");
+        let as_str = found.to_string_lossy();
+        assert!(
+            as_str.contains("daemon") && as_str.ends_with("Cargo.toml"),
+            "expected nested Cargo.toml, got {found:?}"
+        );
+    }
+
+    #[test]
+    fn find_cargo_manifest_recursive_returns_none_when_no_cargo_toml() {
+        let tmp = unique_tempdir("none");
+        let root = &tmp.0;
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join("nested").join("deeper")).unwrap();
+        // No Cargo.toml anywhere in the tree.
+        assert!(find_cargo_manifest_recursive(&repo, 4).is_none());
+    }
+
+    #[test]
+    fn find_cargo_manifest_recursive_prefers_root_when_present() {
+        // When the root HAS a Cargo.toml, the recursive search must
+        // return it (not a nested one) — preserves the legacy
+        // walk-up-first behavior at the same level.
+        let tmp = unique_tempdir("prefer_root");
+        let root = &tmp.0;
+        let nested = root.join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname=\"r\"\n").unwrap();
+        std::fs::write(nested.join("Cargo.toml"), "[package]\nname=\"s\"\n").unwrap();
+        let found = find_cargo_manifest_recursive(root, 4)
+            .expect("must find root Cargo.toml");
+        assert_eq!(found.file_name().and_then(|n| n.to_str()), Some("Cargo.toml"));
+        assert_eq!(found.parent().unwrap(), root);
+    }
+
+    #[test]
+    fn find_cargo_manifest_recursive_respects_depth_bound() {
+        // Sanity: the depth bound must NOT be exceeded. Construct a tree
+        // where Cargo.toml is exactly `depth` levels below the root and
+        // confirm a smaller bound misses it while a larger bound finds it.
+        let tmp = unique_tempdir("depth");
+        let root = &tmp.0;
+        let deep = root.join("a").join("b").join("c").join("d");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        // depth=2 must miss the 4-levels-deep manifest
+        assert!(find_cargo_manifest_recursive(root, 2).is_none());
+        // depth=8 must find it
+        assert!(
+            find_cargo_manifest_recursive(root, 8).is_some(),
+            "depth=8 should find the nested Cargo.toml"
+        );
     }
 }
 

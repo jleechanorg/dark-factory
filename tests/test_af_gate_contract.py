@@ -156,6 +156,67 @@ def test_factory_overlay_required_keys_match_verifier():
     print(f"✓ factory-overlay.sh required keys match verifier: {sorted(required_keys)}")
 
 
+def test_auto_merge_guard_required_keys_match_verifier():
+    """Verify daemon/scripts/auto-merge-guard.sh's `REQUIRED` set in the
+    `latest_assessment_no_red` python predicate matches the verifier's
+    canonical GateName vocabulary.
+
+    jleechan-ni1k / issue #437 P2 regression: PR #435 added gate 8
+    (`vacuous_red_green`) to verifier.rs and factory-overlay.sh but the
+    merge-guard predicate's `REQUIRED` set was left at 7 keys, so a
+    stale or unattested gate-8 could let a report strict-green. This
+    contract test pins the predicate's REQUIRED set to the verifier's
+    8-key vocabulary so future gate additions can't drift the two apart.
+    """
+    gates = extract_gate_names_from_rust()
+
+    guard_path = ROOT / "daemon" / "scripts" / "auto-merge-guard.sh"
+    content = guard_path.read_text()
+
+    # Extract the `REQUIRED = {...}` set from the python heredoc. The set
+    # is broken across multiple lines in the comment block above the
+    # assignment, so a single-line regex won't catch it — match the
+    # assignment line and walk forward to its closing `}` on a line by
+    # itself.
+    required_match = re.search(
+        r'REQUIRED\s*=\s*\{(.*?)\}',
+        content,
+        re.DOTALL,
+    )
+    if not required_match:
+        raise AssertionError(
+            f"Could not find REQUIRED = {{...}} set in {guard_path}"
+        )
+    keys_str = required_match.group(1)
+    required_keys = set(re.findall(r'"(\w+)"', keys_str))
+
+    missing = gates - required_keys
+    extra = required_keys - gates
+
+    errors = []
+    if missing:
+        errors.append(
+            f"Required keys missing in auto-merge-guard.sh: {sorted(missing)} "
+            f"(jleechan-ni1k P2 — strict-all-green can be promoted without these gates)"
+        )
+    if extra:
+        errors.append(
+            f"Extra keys in auto-merge-guard.sh not in verifier: {sorted(extra)}"
+        )
+    if len(required_keys) != len(gates):
+        errors.append(
+            f"Required key count mismatch: auto-merge-guard.sh has {len(required_keys)}, verifier has {len(gates)}"
+        )
+
+    if errors:
+        raise AssertionError(
+            "auto-merge-guard.sh REQUIRED-set drift:\n" + "\n".join(errors)
+        )
+    print(
+        f"✓ auto-merge-guard.sh REQUIRED set matches verifier: {sorted(required_keys)}"
+    )
+
+
 def test_no_direct_sqlite3_mutation_in_docs():
     """Verify no operator-facing docs contain direct sqlite3 mutation instructions."""
     doc_dirs = [

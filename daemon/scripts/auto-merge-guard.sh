@@ -44,17 +44,26 @@ try:
     g = ctx["gates"]
 except Exception:
     sys.exit(1)                                    # unparseable → block
-# jleechan-328 P1 #1 (exact-head binding): refuse to honour an assessment
-# whose recorded head_sha no longer matches the live PR head. Without
-# this check, the timer-driven merge path can reuse an all-green
-# assessment from an OLDER head (a push after a green assessment would
-# merge with stale gate evidence). Missing head_sha fails closed —
-# freshness is unprovable, so we block.
+# jleechan-328 P1 #1 + jleechan-ni1k #1 (exact-head binding, fail-closed on
+# missing live head): refuse to honour an assessment whose recorded
+# head_sha no longer matches the live PR head. Without this check, the
+# timer-driven merge path can reuse an all-green assessment from an OLDER
+# head (a push after a green assessment would merge with stale gate
+# evidence). Missing assessed head_sha fails closed — freshness
+# unprovable, so we block. Missing LIVE head_sha ALSO fails closed
+# (jleechan-ni1k / issue #437 P1): the prior `if live_head and ...` guard
+# silently skipped the comparison when `gh pr view --jq .headRefOid` failed
+# or returned empty (the `|| true` fallback at line ~119 swallows the
+# error), letting a stale assessment promote to merge on a gh-network blip.
+# Distinct STALE:LIVE_HEAD_MISSING reason so the Healer can group these
+# from generic HEAD_MISSING (which is the assessed-side counterpart).
 assessed_head = ctx.get("head_sha") or ""
 live_head = sys.argv[1] if len(sys.argv) > 1 else ""
 if not assessed_head:
     print("STALE:HEAD_MISSING"); sys.exit(1)
-if live_head and assessed_head != live_head:
+if not live_head:
+    print("STALE:LIVE_HEAD_MISSING"); sys.exit(1)
+if assessed_head != live_head:
     print("STALE:HEAD_MISMATCH:" + assessed_head[:12] + "->" + live_head[:12])
     sys.exit(1)
 # jleechan-328 P1 #3 (operator disposition round-trip): single canonical
@@ -77,16 +86,26 @@ def verdict(v):
     if isinstance(v, dict):
         return ALIAS.get(v.get("verdict",""), v.get("verdict",""))
     return v
-# jleechan-328 P1 #2 (fail-closed canonical gate-key set): a 1-key
-# `{"ci_green":"pass"}` subset MUST NOT pass — the predicate must prove
-# every canonical gate was actually assessed before strict-all-green can
-# hold. Canonical set is `daemon/src/verifier.rs::GateName::as_str()`,
-# kept in lockstep with `daemon/factory-overlay.sh` REQUIRED_KEYS and
-# `tests/scripts/test_auto_merge_guard_gate_vocabulary.sh`. Extra keys
-# (code_standards / zfc) are still permitted as optional overlays; only
-# the *absence* of a required key blocks the merge.
+# jleechan-328 P1 #2 + jleechan-ni1k #2 (fail-closed canonical gate-key
+# set): a 1-key `{"ci_green":"pass"}` subset MUST NOT pass — the predicate
+# must prove every canonical gate was actually assessed before strict-
+# all-green can hold. Canonical set is `daemon/src/verifier.rs::GateName::
+# as_str()`, kept in lockstep with `daemon/factory-overlay.sh`
+# REQUIRED_KEYS and `tests/scripts/test_auto_merge_guard_gate_vocabulary.
+# sh`. Extra keys (code_standards / zfc) are still permitted as optional
+# overlays; only the *absence* of a required key blocks the merge.
+#
+# jleechan-ni1k / issue #437 P2: gate 8 `vacuous_red_green` (added in
+# PR #431 / issue #387 r5) was previously MISSING from this set, so a
+# 7-key `{"ci_green":..,"skeptic":..}` report lacking the runtime
+# vacuous-test detector verdict could still strict-green even when gate 8
+# had never been assessed. Adding the key here closes that bypass; the
+# companion gate-vocabulary test
+# (tests/scripts/test_auto_merge_guard_gate_vocabulary.sh) covers the
+# symmetric case in `factory-overlay.sh` REQUIRED_KEYS.
 REQUIRED = {"ci_green","no_conflicts","coderabbit","bugbot",
-            "comments_resolved","evidence_review","skeptic"}
+            "comments_resolved","evidence_review","skeptic",
+            "vacuous_red_green"}
 present = set(g.keys())
 missing = sorted(REQUIRED - present)
 if missing:
