@@ -9454,16 +9454,34 @@ fn tick_deferred_reroll_stays_attested_and_reselects_next_tick() {
     assert_eq!(store.reroll_deferral_count("defer-bead").unwrap(), 1);
     assert_eq!(summary1.beads_parked_human_held, 0, "a defer is not a park");
 
-    // Tick 2: the SAME bead must be re-selected by run_fast_tier (proving
-    // ATTESTED re-eligibility through tick selection) and deferred again.
+    // Tick 2: the SAME bead is still ATTESTED, the same head_sha, and
+    // `reroll_deferral_count` is 1 from tick 1's deferred reroll. The
+    // jleechan-msmq guard skips gate re-assessment AND skips the reroll
+    // deferral this tick (the bead has not yet had time to land a fix,
+    // re-running the same deferral loop just races with the breaker).
+    // Tick 2 therefore logs VERIFIER_SKIPPED_REROLL_IN_PROGRESS instead
+    // of another gate assessment + another REROLL_QUIESCENCE_DEFERRED.
     let summary2 = run_tick(&deps, 2, 0).expect("tick 2 should succeed");
+    let log2 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
     assert_eq!(
-        summary2.gates_assessed, 1,
-        "tick 2 must re-select and re-assess the still-ATTESTED bead"
+        summary2.gates_assessed, 0,
+        "tick 2 with reroll_deferral_count > 0 must NOT re-gate-assess (jleechan-msmq skip guard); log:\n{log2}"
+    );
+    assert!(
+        log2.contains("VERIFIER_SKIPPED_REROLL_IN_PROGRESS"),
+        "tick 2 with reroll_deferral_count > 0 must emit the jleechan-msmq skip telemetry; log:\n{log2}"
     );
     let after2 = store.load("defer-bead").unwrap().unwrap();
-    assert_eq!(after2.state, OverlayState::Attested);
-    assert_eq!(store.reroll_deferral_count("defer-bead").unwrap(), 2);
+    assert_eq!(
+        after2.state,
+        OverlayState::Attested,
+        "tick 2 with deferred reroll must keep the bead ATTESTED, not park or advance"
+    );
+    assert_eq!(
+        store.reroll_deferral_count("defer-bead").unwrap(),
+        1,
+        "tick 2 must NOT increment the deferral counter again (the guard prevents re-entering the same defer loop)"
+    );
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
@@ -11045,5 +11063,156 @@ fn evidence_gate_transient_gist_error_is_pending_not_red() {
         !log.contains("REROLL_VERDICT_RECORDED") && !log.contains("PARKED_HUMAN_HELD"),
         "a transient gist error must not reroll or park; log:\n{log}"
     );
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// Bead jleechan-msmq: the verifier must NOT re-assess an unchanged PR head
+// SHA on a subsequent tick. Re-assessing a head that has not moved produces
+// a duplicate GATE_ASSESSMENT that races with the breaker (autonomy timebox
+// + circuit-breaker) and — when a fresh coder lane was just fabricated by a
+// deferred reroll — can park + kill_session the fresh lane before it has a
+// chance to push. The expected behavior:
+//   1. Tick N: bead is ATTESTED, head_sha = "sha-901". Verifier runs once,
+//      emits one GATE_ASSESSMENT for the bead.
+//   2. Tick N+1: same bead, same PR, same head_sha. Verifier SKIPS the
+//      snapshot+assess pipeline, emits a new telemetry event
+//      VERIFIER_SKIPPED_UNCHANGED_HEAD, and does NOT emit a duplicate
+//      GATE_ASSESSMENT.
+//   3. When the PR's head_sha changes (or branch changes), re-assessment
+//      resumes normally.
+#[test]
+fn msmq_verifier_skips_reassessment_when_reroll_deferred() {
+    // Bead jleechan-msmq: when an ATTESTED bead has `reroll_deferral_count
+    // > 0`, the daemon has already decided to re-roll this attempt AND
+    // that attempt DEFERRED (the live worker was still active / a
+    // transient probe error). The OLD PR's gate verdict cannot advance
+    // the bead (the reroll branch IS the advancement) and re-assessing
+    // it on every subsequent tick races with two breakers: the autonomy
+    // timebox (which can park + kill_session the fresh coder lane before
+    // its first push) and the circuit-breaker (which trips on identical
+    // red evidence at attempt 2).
+    //
+    // Expected contract:
+    //   1. Tick against an ATTESTED bead with reroll_deferral_count=0
+    //      → verifier assesses gates (one GATE_ASSESSMENT emit).
+    //   2. After a deferred reroll bumps reroll_deferral_count to 1,
+    //      a subsequent tick MUST emit VERIFIER_SKIPPED_REROLL_IN_PROGRESS
+    //      and NOT a duplicate GATE_ASSESSMENT for the OLD PR.
+    //
+    // This test does not exercise the reroll machinery itself — it seeds
+    // `reroll_deferral_count` directly via `incr_reroll_deferral` to
+    // keep the test focused on the guard contract rather than the
+    // (complex, brittle) reroll pipeline.
+
+    let mut scm = FakeScm::new();
+    let fresh_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let snap = PrSnapshot {
+        pr_number: 901,
+        ci_success: false, // RED CI
+        mergeable: true,
+        coderabbit_approved: true,
+        bugbot_error_count: 0,
+        unresolved_thread_count: Some(0),
+        head_sha: "sha-901".into(),
+        body: "".into(),
+        comments: vec![PrComment {
+            author: "reviewer".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: fresh_epoch.saturating_sub(60),
+        }],
+        files: Vec::new(),
+        updated_at_epoch: fresh_epoch,
+        ci_status: "red".into(),
+        coderabbit_status: "green".into(),
+        ci_pending: false,
+        head_committed_epoch: fresh_epoch.saturating_sub(120),
+    };
+    scm.pr_snapshots.insert(901, snap.clone());
+
+    let store = FakeStateStore::new();
+    let overlay = BeadOverlay {
+        bead_id: "bead-msmq".into(),
+        state: OverlayState::Attested,
+        attempt: 1,
+        reroll_count: 0, // first tick: no reroll in flight yet
+        autonomy_secs: 0,
+        spend_usd: 0.0,
+        pr_number: Some(901),
+        branch: Some("factory/bead-msmq-r1".into()),
+        session_id: None,
+        is_adopted: false,
+        spawn_failure_count: 0,
+        pre_session_head_sha: None,
+        park_reason: None,
+        target_repo: Some("owner/repo".into()),
+    };
+    store.save(&overlay).unwrap();
+    store.register_branch("bead-msmq", "factory/bead-msmq-r1").unwrap();
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let vcs = FakeVcs::new();
+    let mut cfg = test_cfg();
+    cfg.stage = 2; // Stage 2: actually execute reroll() so a deferred
+                   // reroll leaves `reroll_deferral_count > 0` on tick 1.
+    let telemetry_log = std::env::temp_dir().join("afd_msmq_skip_on_reroll.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm,
+        store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log,
+    };
+
+    // ---- Tick 1: reroll_deferral_count=0 → full gate assessment fires.
+    run_tick(&deps, 1, 0).expect("tick 1 must not error");
+    let log1 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log1.contains("\"eventType\":\"GATE_ASSESSMENT\""),
+        "tick 1 (reroll_deferral_count=0) must emit a GATE_ASSESSMENT; log:\n{log1}"
+    );
+    assert!(
+        !log1.contains("VERIFIER_SKIPPED_REROLL_IN_PROGRESS"),
+        "tick 1 (reroll_deferral_count=0) must NOT emit the skip telemetry; log:\n{log1}"
+    );
+
+    // ---- Simulate the post-deferred-reroll state: reroll::execute's
+    // `defer_or_cap` would have called `incr_reroll_deferral`, bumping
+    // the counter to 1. The bead is still ATTESTED with the OLD pr_number.
+    let _ = store.incr_reroll_deferral("bead-msmq");
+    let after1_deferral_count = store.reroll_deferral_count("bead-msmq").unwrap();
+    assert!(
+        after1_deferral_count >= 1,
+        "reroll_deferral_count must be >= 1 to seed the deferred-reroll state (got {after1_deferral_count})"
+    );
+
+    // ---- Tick 2: reroll_deferral_count > 0 → verifier MUST skip the
+    // duplicate gate assessment and emit VERIFIER_SKIPPED_REROLL_IN_PROGRESS.
+    run_tick(&deps, 2, 0).expect("tick 2 must not error");
+    let log2 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    let gate_assessment_count = log2
+        .matches("\"eventType\":\"GATE_ASSESSMENT\"")
+        .count();
+    assert_eq!(
+        gate_assessment_count, 1,
+        "tick 2 (reroll_deferral_count > 0) MUST NOT emit a second GATE_ASSESSMENT for the unchanged old PR; log:\n{log2}"
+    );
+    assert!(
+        log2.contains("VERIFIER_SKIPPED_REROLL_IN_PROGRESS"),
+        "tick 2 (reroll_deferral_count > 0) must emit VERIFIER_SKIPPED_REROLL_IN_PROGRESS; log:\n{log2}"
+    );
+    assert!(
+        log2.contains("\"prNumber\":901"),
+        "skip telemetry must carry prNumber provenance; log:\n{log2}"
+    );
+    assert!(
+        log2.contains("\"rerollDeferralCount\":"),
+        "skip telemetry must carry rerollDeferralCount provenance; log:\n{log2}"
+    );
+
     let _ = std::fs::remove_file(&telemetry_log);
 }
