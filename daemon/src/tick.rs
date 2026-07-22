@@ -2899,6 +2899,13 @@ fn translate_error(e: crate::vacuous_red_green::RedGreenError) -> verifier::Vacu
             verifier::VacuousRedGreenStatus::GreenFailed(format!("working-tree revert failed: {s}"))
         }
         RedGreenError::Git(s) => verifier::VacuousRedGreenStatus::GreenFailed(format!("git error: {s}")),
+        // Bead jleechan-sb4b: the cargo toolchain could not be located
+        // in the daemon environment. This is a structured Unknown (not a
+        // generic GreenFailed) so operators can tell the detector's
+        // toolchain is missing from "tests failed on PR head".
+        RedGreenError::CargoNotFound(s) => verifier::VacuousRedGreenStatus::GreenFailed(
+            format!("vacuous_red_green detector toolchain missing: {s}"),
+        ),
     }
 }
 

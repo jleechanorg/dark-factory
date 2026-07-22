@@ -15,7 +15,7 @@ WatchdogSec=7200s
 KillSignal=SIGINT
 TimeoutStopSec=30s
 Environment=HOME=@HOME@
-Environment=PATH=@HOME@/.local/bin:@HOME@/.npm-global/bin:@HOME@/.nvm/versions/node/v22.22.0/bin:@HOME@/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=@HOME@/.local/bin:@HOME@/.cargo/bin:@HOME@/.npm-global/bin:@HOME@/.nvm/versions/node/v22.22.0/bin:@HOME@/bin:/usr/local/bin:/usr/bin:/bin
 StandardOutput=append:@HOME@/Library/Logs/dark-factory/rust-daemon.out.log
 StandardError=append:@HOME@/Library/Logs/dark-factory/rust-daemon.err.log
 

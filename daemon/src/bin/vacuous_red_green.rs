@@ -16,7 +16,7 @@
 // when supplied, only the listed paths are considered. When omitted,
 // `git diff --name-only <base>...HEAD` is used to derive the list.
 
-use daemon::vacuous_red_green::{check_red_green, FileClass};
+use daemon::vacuous_red_green::{check_red_green, FileClass, RedGreenError};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -77,6 +77,19 @@ fn main() {
     let report = match check_red_green(&cwd, &base, &changed) {
         Ok(r) => r,
         Err(e) => {
+            // Bead jleechan-sb4b: emit a distinct exit code (3) when the
+            // detector's toolchain is missing so callers can tell "I
+            // can't even run the gate" apart from "the gate ran and
+            // failed". 2 remains the catch-all for other internal
+            // errors (git apply, worktree setup, etc.).
+            if matches!(e, RedGreenError::CargoNotFound(_)) {
+                eprintln!(
+                    "vacuous_red_green: cargo toolchain missing: {e}\n\
+                     hint: install rustup (https://rustup.rs) or set \
+                     CARGO_BIN=/path/to/cargo to override the lookup."
+                );
+                std::process::exit(3);
+            }
             eprintln!("vacuous_red_green: error: {e}");
             std::process::exit(2);
         }

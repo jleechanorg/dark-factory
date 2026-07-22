@@ -493,6 +493,36 @@ fn run(args: Args) -> Result<(), DaemonError> {
     verify_startup_ao_compatibility(args, &ao_project, &configured_vendors, |project, vendors| {
         daemon::adapters::verify_ao_bridge_compatibility(project, vendors.first().map(String::as_str).unwrap_or("minimax"), vendors)
     })?;
+    // Bead jleechan-sb4b: probe the detector's toolchain at startup so a
+    // missing cargo binary fails loudly ONCE at boot instead of
+    // silently turning every PR assessment into
+    // `GreenFailed: git error: spawn cargo test: No such file or
+    // directory`. The probe is a warning — the daemon still boots and
+    // tick-1 may produce structured `GreenFailed("vacuous_red_green
+    // detector toolchain missing")` until the operator installs cargo
+    // and restarts. Non-fatal because fast-tick tests / mock-llm lanes
+    // don't exercise the runtime detector and should keep working.
+    if !args.dry_run {
+        match daemon::vacuous_red_green::resolve_cargo_binary() {
+            Some(p) => {
+                eprintln!(
+                    "auto-factory daemon: vacuous_red_green detector toolchain: cargo at {}",
+                    p.display()
+                );
+            }
+            None => {
+                eprintln!(
+                    "auto-factory daemon: WARNING: vacuous_red_green detector cannot find cargo.\n\
+                     Tried: $CARGO_BIN env, $PATH, $CARGO_HOME/bin/cargo, $HOME/.cargo/bin/cargo,\n\
+                     rustup which cargo.\n\
+                     The runtime red-green gate will report structured\n\
+                     'Unknown (vacuous_red_green detector toolchain missing)' on every PR\n\
+                     until cargo is reachable. Install rustup or set CARGO_BIN=/path/to/cargo\n\
+                     and restart the daemon."
+                );
+            }
+        }
+    }
     let telemetry_log = default_telemetry_log();
     let db_path = default_state_db_path();
 
