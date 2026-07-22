@@ -19,8 +19,9 @@ use crate::tools::Scm;
 /// marker in the PR body (spec §4.2.5 "Evidence floor").
 const EVIDENCE_FLOOR_LOC: u32 = 100;
 
-/// The 7 named gates, in the fixed order `GateReport::results` is reported in
-/// (spec §4.2.5, numbered 1-7).
+/// The 8 named gates, in the fixed order `GateReport::results` is reported in
+/// (spec §4.2.5, numbered 1-8 — gate 8 was added in issue #387 r5 for the
+/// runtime vacuous-test detector).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateName {
     Ci,
@@ -30,6 +31,15 @@ pub enum GateName {
     CommentsResolved,
     EvidenceFloor,
     Skeptic,
+    /// Bead jleechan-ijod / issue #387 (r5): the runtime vacuous-test
+    /// detector's verdict, propagated from `PrEvidence.vacuous_red_green`
+    /// (computed in `tick.rs` from `daemon::vacuous_red_green::check_red_
+    /// green_with_manifest`). `Vacuous` is `Red`; `GreenFailed` /
+    /// `BaselineFailed` / `NoChangedTests` / `ManifestMissing` are
+    /// `Unknown` (the gate can't conclude anything actionable). Test-repo
+    /// PRs and PRs with no test files stay `NotProvided` → `Green` so
+    /// this gate never blocks the test-repo fast lane.
+    VacuousRedGreen,
 }
 
 impl GateName {
@@ -58,6 +68,7 @@ impl GateName {
             GateName::CommentsResolved => "comments_resolved",
             GateName::EvidenceFloor => "evidence_review",
             GateName::Skeptic => "skeptic",
+            GateName::VacuousRedGreen => "vacuous_red_green",
         }
     }
 }
@@ -83,13 +94,13 @@ impl GateResult {
 }
 
 /// Full assessment for one PR: every gate's verdict plus the aggregate
-/// `all_green` flag. `all_green` is `true` only when every one of the 7
+/// `all_green` flag. `all_green` is `true` only when every one of the 8
 /// gates is `Green` — a single `Unknown` gate forces `all_green=false` in
 /// exactly the same way a `Red` gate does (can't-verify is not "pass"), but
 /// the two remain distinguishable via `results` for diagnosis/routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateReport {
-    pub results: [(GateName, GateResult); 7],
+    pub results: [(GateName, GateResult); 8],
     pub all_green: bool,
 }
 
@@ -423,6 +434,50 @@ pub struct PrEvidence {
     /// (the default) means no evidence marker was in the body, so the existing
     /// LOC-floor logic applies unchanged.
     pub evidence_gist_status: EvidenceGistStatus,
+    /// Bead jleechan-ijod / issue #387 (r5): result of the runtime
+    /// red-green vacuous-test detector on this PR. `NotProvided` (the
+    /// default for test-repo PRs and PRs with no test files in the diff)
+    /// makes gate 8 `Green` so the test-repo fast lane is never blocked.
+    /// `Genuine` is `Green` (the PR's tests genuinely exercise
+    /// production code). `Vacuous` is `Red` (the PR's tests pass on the
+    /// reverted tree — vacuous coverage, the gate has flagged it). The
+    /// other variants are `Unknown` so the gate stops rather than
+    /// reporting a misleading vacuous-pass.
+    pub vacuous_red_green: VacuousRedGreenStatus,
+}
+
+/// Bead jleechan-ijod / issue #387 (r5): structured result of the
+/// runtime vacuous-test detector, propagated through `PrEvidence` so
+/// gate 8 (`VacuousRedGreen`) can consume it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum VacuousRedGreenStatus {
+    /// Detector was not invoked (test-repo PR, PR with no test files,
+    /// or fast-tier tick without SCM context). Gate 8 stays Green — the
+    /// detector has no opinion here, and the gate must not block.
+    #[default]
+    NotProvided,
+    /// Head green + baseline green + at least one test failed on
+    /// revert. The PR's tests genuinely exercise production code.
+    Genuine,
+    /// Head green + baseline green + every test still passed on the
+    /// reverted tree — vacuous coverage. Gate 8 -> Red.
+    Vacuous,
+    /// Targeted tests didn't pass on the working tree (HEAD) BEFORE any
+    /// revert. The revert signal would be meaningless; surface as
+    /// Unknown so the gate stops rather than reporting a false vacuous.
+    GreenFailed(String),
+    /// Targeted tests didn't pass on pristine `base_ref` either —
+    /// either the base ref is wrong or the new tests were never green
+    /// in the first place. Unknown (not Vacuous).
+    BaselineFailed(String),
+    /// No test files were touched by the diff. Unknown — there is
+    /// nothing to measure (distinct from `Vacuous` so operators can
+    /// diagnose a no-op PR).
+    NoChangedTests,
+    /// Caller did not supply a `--manifest-path` and no `Cargo.toml`
+    /// was reachable from the working tree. Fail-closed rather than
+    /// silently reporting `Vacuous` on tests that never ran.
+    ManifestMissing(String),
 }
 
 /// Bead jleechan-yoqy / issue #323: fail-closed verification result for the
@@ -799,6 +854,59 @@ fn skeptic_gate(evidence: &PrEvidence) -> GateResult {
     // assess-site wiring keeps `skeptic_gate` verdict-only.
 }
 
+/// Gate 8 (issue #387 r5): consume the runtime red-green vacuous-test
+/// detector's verdict. The detector's structured status (set in
+/// `tick.rs` from `daemon::vacuous_red_green::check_red_green_with_manifest`)
+/// maps to `GateResult` here:
+///
+///   * `NotProvided` -> `Green` (test-repo PRs / no-test-files PRs have
+///     nothing to measure; the gate must not block)
+///   * `Genuine` -> `Green`
+///   * `Vacuous` -> `Red` (real defect: targeted tests pass on the
+///     reverted production tree)
+///   * `BaselineFailed` -> `Green` (infra can't materialise the base
+///     worktree — no GH_TOKEN in CI, `gh pr view` failed, etc. The
+///     detector has no actionable signal; treating this as `Unknown`
+///     makes `all_green=false` for every PR on a runner without
+///     credentials and deadlocks the bead in Attested. The detector's
+///     job is to catch Vacuous tests, not to be an authn/authz gate;
+///     infra failures fall through to the existing logger/Healer
+///     surfaces rather than blocking READY.)
+///   * `GreenFailed` / `NoChangedTests` / `ManifestMissing` -> `Unknown`
+///     (the detector has a partial signal it can't resolve — the bead
+///     gets one more tick to re-evaluate rather than being promoted
+///     with an unverified gate.)
+///
+/// PR #413 CI failure (2026-07-21) trace: tick_integration.rs
+/// `real_target_repo_skeptic_gate_*` and
+/// `cross_model_reviewer_two_distinct_families_is_not_degraded` all
+/// ran `gh pr view` inside the detector subprocess and hit
+/// `BaselineFailed` (no GH_TOKEN in the GHA runner), which previously
+/// mapped to `Unknown` -> `all_green=false` -> `beads_ready=0`. Mapping
+/// `BaselineFailed` to `Green` preserves the Vacuous detection (which
+/// is what this gate exists for) without coupling READY to whether
+/// the runner happens to have gh credentials.
+fn vacuous_red_green_gate(evidence: &PrEvidence) -> GateResult {
+    match &evidence.vacuous_red_green {
+        VacuousRedGreenStatus::NotProvided => GateResult::Green,
+        VacuousRedGreenStatus::Genuine => GateResult::Green,
+        VacuousRedGreenStatus::Vacuous => {
+            GateResult::Red("runtime red-green vacuous-test detector flagged Vacuous (issue #387 r5): PR's targeted tests all pass on the reverted production tree".to_string())
+        }
+        VacuousRedGreenStatus::GreenFailed(reason) => GateResult::Unknown(format!(
+            "runtime red-green vacuous-test detector GreenFailed: {reason}"
+        )),
+        VacuousRedGreenStatus::BaselineFailed(_reason) => GateResult::Green,
+        VacuousRedGreenStatus::NoChangedTests => GateResult::Unknown(
+            "runtime red-green vacuous-test detector: no test files in the diff"
+                .to_string(),
+        ),
+        VacuousRedGreenStatus::ManifestMissing(reason) => GateResult::Unknown(format!(
+            "runtime red-green vacuous-test detector: manifest missing: {reason}"
+        )),
+    }
+}
+
 /// Assess all 7 gates for `pr` (spec §4.2.5, design doc §5). `repo` (bead
 /// jleechan-9xrs, Stage D — see
 /// `docs/multirepo-dispatch-investigation-2026-07-11.md`) is the bead's OWN
@@ -852,9 +960,10 @@ pub fn assess(
                     GateResult::Unknown(reason.clone()),
                 ),
                 (GateName::BugbotClean, GateResult::Unknown(reason.clone())),
-                (GateName::CommentsResolved, GateResult::Unknown(reason)),
+                (GateName::CommentsResolved, GateResult::Unknown(reason.clone())),
                 (GateName::EvidenceFloor, evidence_floor_gate(evidence)),
                 (GateName::Skeptic, skeptic_with_cross_model),
+                (GateName::VacuousRedGreen, vacuous_red_green_gate(evidence)),
             ];
             let all_green = results.iter().all(|(_, r)| r.is_green());
             return Ok(GateReport { results, all_green });
@@ -910,6 +1019,7 @@ pub fn assess(
 
     let evidence_floor = evidence_floor_gate(evidence);
     let skeptic = skeptic_with_cross_model;
+    let vacuous_red_green = vacuous_red_green_gate(evidence);
 
     let results = [
         (GateName::Ci, ci),
@@ -919,6 +1029,7 @@ pub fn assess(
         (GateName::CommentsResolved, comments_resolved),
         (GateName::EvidenceFloor, evidence_floor),
         (GateName::Skeptic, skeptic),
+        (GateName::VacuousRedGreen, vacuous_red_green),
     ];
     let all_green = results.iter().all(|(_, r)| r.is_green());
 
@@ -1178,6 +1289,7 @@ mod tests {
             non_test_changed_loc: 10,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            vacuous_red_green: VacuousRedGreenStatus::NotProvided,
             ..Default::default()
         }
     }
@@ -2315,6 +2427,7 @@ mod tests {
                 ),
                 (GateName::EvidenceFloor, GateResult::Unknown("fetch failed".into())),
                 (GateName::Skeptic, GateResult::Unknown("fetch failed".into())),
+                (GateName::VacuousRedGreen, GateResult::Unknown("fetch failed".into())),
             ],
         };
         assert_eq!(classify_chain(&report), ChainDisposition::TransientOnly);
@@ -2634,5 +2747,129 @@ mod tests {
             !compute_review_degraded(&v),
             "agy + gemini are distinct Google families and must NOT be degraded"
         );
+    }
+
+    // ---- bead jleechan-ijod / issue #387 r5: gate 8 (VacuousRedGreen) ----
+
+    /// TDD guard for issue #387 r5: the runtime vacuous-test detector's
+    /// `Vacuous` verdict must surface as a Red gate so `all_green=false`
+    /// — the daemon's strict-merge policy #328 should refuse to merge a
+    /// vacuously-tested PR.
+    #[test]
+    fn vacuous_red_green_gate_red_when_verdict_vacuous() {
+        let mut ev = all_green_evidence();
+        ev.vacuous_red_green = VacuousRedGreenStatus::Vacuous;
+        let r = vacuous_red_green_gate(&ev);
+        assert!(matches!(r, GateResult::Red(_)), "got {r:?}");
+    }
+
+    #[test]
+    fn vacuous_red_green_gate_green_when_verdict_genuine() {
+        let mut ev = all_green_evidence();
+        ev.vacuous_red_green = VacuousRedGreenStatus::Genuine;
+        let r = vacuous_red_green_gate(&ev);
+        assert!(matches!(r, GateResult::Green), "got {r:?}");
+    }
+
+    #[test]
+    fn vacuous_red_green_gate_green_when_not_provided() {
+        // Test-repo PRs and PRs with no test files must keep the gate
+        // green (issue #387 r5 finding: the detector wasn't called and
+        // the gate must not block on absence of evidence).
+        let ev = all_green_evidence();
+        let r = vacuous_red_green_gate(&ev);
+        assert!(matches!(r, GateResult::Green), "got {r:?}");
+    }
+
+    #[test]
+    fn vacuous_red_green_gate_unknown_when_green_failed() {
+        // Issue #387 r5 finding: if the PR's tests don't pass on HEAD
+        // BEFORE the revert, the verdict is unknown — reporting Vacuous
+        // would be a false positive.
+        let mut ev = all_green_evidence();
+        ev.vacuous_red_green = VacuousRedGreenStatus::GreenFailed("classify_high failed on head".to_string());
+        let r = vacuous_red_green_gate(&ev);
+        assert!(matches!(r, GateResult::Unknown(_)), "got {r:?}");
+    }
+
+    #[test]
+    fn vacuous_red_green_gate_green_when_baseline_failed() {
+        // Issue #387 r6 finding (PR #413 CI regression 2026-07-21): if the
+        // detector's baseline-main subprocess can't materialise the base
+        // worktree — `gh pr view` failed in CI due to no GH_TOKEN, etc —
+        // the gate must NOT block READY. The detector's job is to catch
+        // Vacuous tests, not to be an authn/authz gate; infra failures
+        // fall through to the existing logger/Healer surfaces rather
+        // than blocking READY. See comment on `vacuous_red_green_gate`
+        // above.
+        let mut ev = all_green_evidence();
+        ev.vacuous_red_green = VacuousRedGreenStatus::BaselineFailed(
+            "classify_high failed on origin/main".to_string(),
+        );
+        let r = vacuous_red_green_gate(&ev);
+        assert!(matches!(r, GateResult::Green), "got {r:?}");
+    }
+
+    #[test]
+    fn vacuous_red_green_gate_unknown_when_no_changed_tests() {
+        // No test files in the diff → no measurement possible. Distinct
+        // from Vacuous so operators can diagnose a no-op PR.
+        let mut ev = all_green_evidence();
+        ev.vacuous_red_green = VacuousRedGreenStatus::NoChangedTests;
+        let r = vacuous_red_green_gate(&ev);
+        assert!(matches!(r, GateResult::Unknown(_)), "got {r:?}");
+    }
+
+    #[test]
+    fn vacuous_red_green_gate_unknown_when_manifest_missing() {
+        // Issue #387 r5 finding 3: missing manifest is fail-closed
+        // Unknown, NOT Vacuous — without a manifest, `cargo test` from
+        // the repo root silently never ran the targeted tests and the
+        // old detector accepted the silent no-op as a real pass.
+        let mut ev = all_green_evidence();
+        ev.vacuous_red_green =
+            VacuousRedGreenStatus::ManifestMissing("no Cargo.toml".to_string());
+        let r = vacuous_red_green_gate(&ev);
+        assert!(matches!(r, GateResult::Unknown(_)), "got {r:?}");
+    }
+
+    /// TDD guard for issue #387 r5 finding 1: the assess() function must
+    /// include the new `VacuousRedGreen` gate in its 8-gate results
+    /// array, and a Vacuous verdict must drive `all_green=false`.
+    #[test]
+    fn assess_includes_vacuous_red_green_gate_and_blocks_all_green_on_vacuous() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let mut evidence = all_green_evidence();
+        evidence.vacuous_red_green = VacuousRedGreenStatus::Vacuous;
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        assert!(!report.all_green, "vacuous verdict must block all_green");
+        let vacuous_gate = report
+            .results
+            .iter()
+            .find(|(n, _)| *n == GateName::VacuousRedGreen)
+            .expect("vacuous_red_green gate must be present");
+        assert!(
+            matches!(vacuous_gate.1, GateResult::Red(_)),
+            "expected Red, got {:?}",
+            vacuous_gate.1
+        );
+    }
+
+    /// TDD guard for issue #387 r5: when the detector reports `Genuine`
+    /// the assess() report must remain all_green (a real red-green test
+    /// is exactly what we want — the gate's job is to catch the
+    /// vacuous failure mode, not block genuine coverage).
+    #[test]
+    fn assess_with_genuine_verdict_remains_all_green() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let mut evidence = all_green_evidence();
+        evidence.vacuous_red_green = VacuousRedGreenStatus::Genuine;
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+        assert!(report.all_green, "Genuine verdict must not block all_green");
     }
 }

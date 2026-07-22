@@ -272,9 +272,12 @@ gate-assessment)
   python3 - "$4" <<'PYGA' || die "invalid gates json"
 import json, sys
 g = json.loads(sys.argv[1])
-# 7 required gates (canonical source: daemon/src/verifier.rs::GateName).
+# 8 required gates (canonical source: daemon/src/verifier.rs::GateName).
 # code_standards and zfc are optional advisory keys — accepted but not required.
 # See bead jleechan-1gft for tracking the optional expansion to real automated gates.
+# Gate 8 (`vacuous_red_green`, bead jleechan-ijod / issue #387) was added in
+# PR #389 / r5 commit 175c6ad — runtime vacuous-test detector verdict
+# propagated from PrEvidence.vacuous_red_green.
 #
 # Verdict value shape (jleechan-240 additive expansion):
 #   * String:  "pass" | "warn" | "fail" | "unknown"
@@ -282,14 +285,10 @@ g = json.loads(sys.argv[1])
 # Legacy aliases "green"/"red"/"unknown" map to "pass"/"fail"/"unknown".
 # Unknown verdict tokens are rejected (no keyword routing — only the
 # invoking model decides pass|warn|fail).
-# Task 3 (reviewer-outage-resilience): "waived_vendor_unavailable" is a
-# canonical waiver token emitted for in-outage review-provider gates
-# (coderabbit / bugbot). It is neither "fail" nor "unknown", so it neither
-# blocks nor defers the merge; accepted explicitly so the token round-trips.
 REQUIRED_KEYS = {"ci_green","no_conflicts","coderabbit","bugbot","comments_resolved","evidence_review","skeptic","vacuous_red_green"}
 OPTIONAL_KEYS = {"code_standards","zfc"}
-ALIAS = {"green":"pass","red":"fail","warn":"warn","unknown":"unknown","pass":"pass","fail":"fail","waived_vendor_unavailable":"waived_vendor_unavailable"}
-VALID = {"pass","warn","fail","unknown","waived_vendor_unavailable"}
+ALIAS = {"green":"pass","red":"fail","warn":"warn","unknown":"unknown","pass":"pass","fail":"fail"}
+VALID = {"pass","warn","fail","unknown"}
 
 def normalize(v, key):
     if isinstance(v, str):
@@ -319,7 +318,7 @@ PYGA
   all_green="$(python3 - "$4" <<'PYGB'
 import json, sys
 g = json.loads(sys.argv[1])
-ALIAS = {"green":"pass","red":"fail","warn":"warn","unknown":"unknown","pass":"pass","fail":"fail","waived_vendor_unavailable":"waived_vendor_unavailable"}
+ALIAS = {"green":"pass","red":"fail","warn":"warn","unknown":"unknown","pass":"pass","fail":"fail"}
 def verdict(v):
     if isinstance(v, str):
         return ALIAS.get(v, v)
@@ -332,10 +331,7 @@ def verdict(v):
 # verifier hasn't gathered evidence yet and must wait for the next tick;
 # treating unknown as green would let stale beads race to READY without
 # independent review.
-# Task 3: "waived_vendor_unavailable" (in-outage review-provider gate) is
-# treated as non-blocking like "pass"/"warn" so a waived provider gate
-# does not block an otherwise-green assessment.
-print("true" if all(verdict(v) in ("pass","warn","waived_vendor_unavailable") for v in g.values()) else "false")
+print("true" if all(verdict(v) in ("pass","warn") for v in g.values()) else "false")
 PYGB
 )"
   prior_last="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$3[,}]" | tail -1 || true)"

@@ -8,6 +8,10 @@ This test ensures that:
 3. factory-overlay.sh's required-key set matches the Rust verifier
 4. No operator-facing instructions contain direct sqlite3 mutation commands
 
+(Gate 8 = `vacuous_red_green`, added in PR #389 / r5 commit 175c6ad for
+issue #387, bead jleechan-ijod — the runtime vacuous-test detector verdict
+propagated from `PrEvidence.vacuous_red_green`.)
+
 Run: .venv/bin/python -m pytest tests/test_af_gate_contract.py -v
 """
 import re
@@ -64,7 +68,18 @@ def extract_gate_names_from_rust() -> set[str]:
 
 
 def test_rust_verifier_has_8_gates():
+<<<<<<< HEAD
     """Verify daemon/src/verifier.rs::GateName has exactly 7 variants."""
+=======
+    """Verify daemon/src/verifier.rs::GateName has exactly 8 variants.
+
+    Issue #387 (bead jleechan-ijod) added gate 8 (`VacuousRedGreen`) in
+    PR #389 / r5 commit 175c6ad. Keep this assertion in lock-step with the
+    enum (verifier.rs:26-43) AND the `factory-overlay.sh` REQUIRED_KEYS
+    (line 285) AND the canonical-vocabulary comment block at the top of
+    `GateName::as_str` (verifier.rs:46-61).
+    """
+>>>>>>> 53a3999 (claude/antig: feat(daemon): runtime vacuous-red-green detector + gate-contract updates (#387))
     gates = extract_gate_names_from_rust()
     assert len(gates) == 8, f"Expected 8 gates, got {len(gates)}: {gates}"
     print(f"✓ Rust verifier has {len(gates)} gates: {sorted(gates)}")
