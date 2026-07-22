@@ -28,6 +28,7 @@ digraph gates {
         prefer_adversarial="true",
         n_shadows="3",
         gate_strict="true",
+        receipt_required="true",
         timeout=600
     ]
     gate_es [
