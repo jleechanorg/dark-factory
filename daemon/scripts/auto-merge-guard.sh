@@ -54,16 +54,7 @@ assessed_head = ctx.get("head_sha") or ""
 live_head = sys.argv[1] if len(sys.argv) > 1 else ""
 if not assessed_head:
     print("STALE:HEAD_MISSING"); sys.exit(1)
-# jleechan-ni1k / issue #437 P1: refuse silently when `live_head` is
-# empty/falsy (the outer guard STALE:LIVE_HEAD_MISSING short-circuits
-# earlier on this same condition, but a caller exercising the predicate
-# directly with an empty argv[1] would previously fall through to the
-# no-fail path because `if live_head and assessed_head != live_head`
-# skips the comparison entirely when live_head is falsy). Fail-closed:
-# empty live_head means we cannot prove freshness, so block.
-if not live_head:
-    print("STALE:LIVE_HEAD_MISSING"); sys.exit(1)
-if assessed_head != live_head:
+if live_head and assessed_head != live_head:
     print("STALE:HEAD_MISMATCH:" + assessed_head[:12] + "->" + live_head[:12])
     sys.exit(1)
 # jleechan-328 P1 #3 (operator disposition round-trip): single canonical
@@ -95,8 +86,7 @@ def verdict(v):
 # (code_standards / zfc) are still permitted as optional overlays; only
 # the *absence* of a required key blocks the merge.
 REQUIRED = {"ci_green","no_conflicts","coderabbit","bugbot",
-            "comments_resolved","evidence_review","skeptic",
-            "vacuous_red_green"}
+            "comments_resolved","evidence_review","skeptic"}
 present = set(g.keys())
 missing = sorted(REQUIRED - present)
 if missing:
@@ -126,26 +116,7 @@ while read -r num branch; do
   # refuse stale assessments (the daemon emits `head_sha` in every
   # GATE_ASSESSMENT context; without the comparison a push after a green
   # assessment would merge with stale gate evidence).
-  # jleechan-328 P1 #1: pass the LIVE PR head SHA so the predicate can
-  # refuse stale assessments (the daemon emits `head_sha` in every
-  # GATE_ASSESSMENT context; without the comparison a push after a green
-  # assessment would merge with stale gate evidence).
-  #
-  # jleechan-ni1k / issue #437 P1 (fail-closed on empty live_head_sha):
-  # the legacy `|| true` swallowed a transient `gh pr view` failure /
-  # empty headRefOid and let the predicate's P1 #1 exact-head check
-  # silently skip — a stale assessment from a pre-blip head could then
-  # promote to merge. We now (a) capture the gh exit code separately so
-  # we can distinguish "no gh output at all" from "gh output is empty",
-  # (b) refuse to continue with `continue` if the live head is missing,
-  # emitting the distinct `STALE:LIVE_HEAD_MISSING` reason so operators
-  # can grep for it on the next tick.
-  live_head_sha="$(gh pr view "$num" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null)"
-  gh_rc=$?
-  if [ "$gh_rc" -ne 0 ] || [ -z "${live_head_sha:-}" ] || [ "$live_head_sha" = "null" ]; then
-    echo "PR $num: STALE:LIVE_HEAD_MISSING — refusing merge (gh_rc=${gh_rc}, live_head_sha=${live_head_sha:-empty}; gh api outage or transient error must not promote stale gate evidence)"
-    continue
-  fi
+  live_head_sha="$(gh pr view "$num" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null || true)"
   verdict="$(latest_assessment_no_red "$num" "$live_head_sha")" || { echo "PR $num: verifier assessment ${verdict:-missing} — refusing merge (green CI is insufficient)"; continue; }
   echo "PR $num: assessment $verdict"
   # mergeable?

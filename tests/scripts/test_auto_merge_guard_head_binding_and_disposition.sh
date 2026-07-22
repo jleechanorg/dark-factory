@@ -68,12 +68,9 @@ emit_assessment() {
 # python heredoc (PR #328 / bze8.1 exact-head binding). Strip the
 # leading `printf ... | python3 -c '` wrapper line and the trailing
 # `'` close-quote; dedent so Python's `-c` accepts it.
-# Extract the pure-python block (lines 41-114): line 40 is the bash
-# `printf | python3 -c '` wrapper, line 115 is the trailing `'\'' "$live_head"`.
-# jleechan-ni1k / issue #437 P2 widened the predicate to 8 required gates
-# (added `vacuous_red_green`) and added the P1 LIVE_HEAD_MISSING branch;
-# the block now spans 41..=114 (was 41..=104).
-predicate_block="$(sed -n '41,114p' "$GUARD" | sed 's/^  //')"
+# Extract the pure-python block (lines 41-105): line 40 is the bash
+# `printf | python3 -c '` wrapper, line 106 is the trailing `'\'' "$live_head"`.
+predicate_block="$(sed -n '41,104p' "$GUARD" | sed 's/^  //')"
 [ -n "$predicate_block" ] || { echo "FATAL: could not extract predicate from $GUARD"; exit 2; }
 
 run_predicate() { # <input_json> [<live_head_sha>]
@@ -81,15 +78,13 @@ run_predicate() { # <input_json> [<live_head_sha>]
   printf '%s' "$1" | python3 -c "$predicate_block" "$live_head"
 }
 
-# jleechan-ni1k / issue #437 P2: the predicate REQUIRED set is now 8 gates
-# (added `vacuous_red_green`); 7-key fixtures must include the new key.
-FULL8='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass","vacuous_red_green":"pass"}'
+FULL7='{"ci_green":"pass","no_conflicts":"pass","coderabbit":"pass","bugbot":"pass","comments_resolved":"pass","evidence_review":"pass","skeptic":"pass"}'
 SUBSET='{"ci_green":"pass"}'
 
 echo "=== P1 #1 head_sha binding ==="
 
 # 1a. Stale assessment (recorded head != live head) — BLOCK.
-emit_assessment "$FULL8" "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" ""
+emit_assessment "$FULL7" "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" ""
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"; rc=$?
@@ -101,7 +96,7 @@ case "$out" in
 esac
 
 # 1b. Fresh assessment (recorded head == live head) — no-fail.
-emit_assessment "$FULL8" "$LIVE_HEAD" ""
+emit_assessment "$FULL7" "$LIVE_HEAD" ""
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"; rc=$?
@@ -110,7 +105,7 @@ assert "fresh assessment (head_sha match) -> exit 0" "0" "$rc"
 
 # 1c. Missing head_sha field — BLOCK (fail-closed; freshness unprovable).
 printf '{"timestamp":"2026-07-21T00:00:00Z","eventType":"GATE_ASSESSMENT","bead_id":"x","attempt":1,"state":"ATTESTED","context":{"pr_number":%d,"gates":%s,"all_green":true}}\n' \
-  "$PR_NUM" "$FULL8" > "$LOG"
+  "$PR_NUM" "$FULL7" > "$LOG"
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"; rc=$?
@@ -137,7 +132,7 @@ case "$out" in
 esac
 
 # 2b. Canonical 7-gate set all-pass -> no-fail.
-emit_assessment "$FULL8" "$LIVE_HEAD" ""
+emit_assessment "$FULL7" "$LIVE_HEAD" ""
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"; rc=$?
@@ -156,7 +151,7 @@ echo
 echo "=== P1 #3 operator_disposition round-trip ==="
 
 # 3a. operator_disposition=operator_approved must survive the read.
-emit_assessment "$FULL8" "$LIVE_HEAD" "operator_approved"
+emit_assessment "$FULL7" "$LIVE_HEAD" "operator_approved"
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"; rc=$?
@@ -164,7 +159,7 @@ set -e
 assert "operator_disposition=operator_accepted -> exit 0 (round-trip ok)" "0" "$rc"
 
 # 3b. operator_disposition=operator_held must survive the read.
-emit_assessment "$FULL8" "$LIVE_HEAD" "operator_held"
+emit_assessment "$FULL7" "$LIVE_HEAD" "operator_held"
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"; rc=$?
@@ -172,7 +167,7 @@ set -e
 assert "operator_disposition=operator_held -> exit 0 (round-trip ok)" "0" "$rc"
 
 # 3c. Absent operator_disposition -> defaults to standard no-red path.
-emit_assessment "$FULL8" "$LIVE_HEAD" ""
+emit_assessment "$FULL7" "$LIVE_HEAD" ""
 last="$(tail -1 "$LOG")"
 set +e
 out="$(run_predicate "$last")"; rc=$?

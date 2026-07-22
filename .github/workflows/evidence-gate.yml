@@ -77,62 +77,179 @@ jobs:
           EOF
 
       - name: Determine evidence verdict from external signals
-        # Issue #424: the gate must be bound to independent ground truth,
-        # not to its own template. We accept EITHER of two external signals:
+        # Issue #424 + #433: the gate must be bound to independent ground
+        # truth, not to its own template. We accept EITHER of two external
+        # signals, each hardened against forgery:
         #
-        #   A. An `/er PASS|FAIL|PARTIAL|INCONCLUSIVE` verdict comment posted
-        #      on the PR by an independent reviewer (the daemon's
-        #      daemon/src/er_runner.rs path, or any human reviewer). Only
-        #      `/er PASS` is a green gate.
+        #   A. An `/er PASS|FAIL|PARTIAL|INCONCLUSIVE` verdict comment
+        #      posted on the PR by the daemon's er_runner
+        #      (`daemon/src/er_runner.rs`), which marks its body with the
+        #      literal `🤖 **[dark-factory /er]**` allowlist marker (issue
+        #      #433). The marker is the binding identity check: the daemon
+        #      posts via the operator's `gh` account, so the author login
+        #      is NOT a discriminator — the literal marker IS.
+        #      Additionally, the verdict is bound to the CURRENT head SHA
+        #      via the PR's `.head.sha` field. A `/er PASS` whose body
+        #      references an OLDER head SHA does not green the gate.
         #
         #   B. A canonical evidence marker in the PR body of the form
-        #      `**Evidence**: <gist-url>` pointing at a public, non-empty
-        #      GitHub Gist. The implementing agent cannot forge a passing
-        #      signal — the gist must be a real, reachable, non-empty
-        #      public GitHub Gist (verified live via curl to
-        #      api.github.com/gists/<id>).
+        #      `**Evidence**: <gist-url>` pointing at a public, non-empty,
+        #      SUBSTANTIVE GitHub Gist (issue #433). Substantive means:
+        #        (i) aggregate content size >= MIN_GIST_SIZE bytes across
+        #            all files (placeholder gists fail), AND
+        #       (ii) at least one file references the PR number or the
+        #            repo slug (the gist must be evidence for THIS PR).
         #
-        # A PR with NEITHER signal fails closed (issue #424 explicit
-        # regression: "a PR with no /er verdict must show Evidence Gate
-        # FAILURE").
+        # A PR with NEITHER signal fails closed.
         #
         # Note: for `pull_request` triggers, `github.sha` is the synthetic
         # merge ref SHA (`refs/pull/N/merge`), not the actual branch tip.
-        # We deliberately do NOT cross-check the gist content against
-        # `github.sha` — that would always fail (head SHA drift between
-        # branch tip and merge ref). The marker's declared SHA in the PR
-        # body remains purely descriptive for humans.
+        # We do NOT cross-check gist content against `github.sha`. We DO
+        # cross-check the verdict comment's `head <sha>` token against
+        # the PR's `.head.sha` field (via `gh api pulls/{n}`), which is
+        # the branch tip at the moment the workflow ran.
         if: github.event_name == 'pull_request'
         id: verdict
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          # Minimum aggregate content size (bytes) across all gist files
+          # for Signal B. 256 bytes is well above any placeholder stub
+          # but well below real pytest output, command transcripts, or
+          # log captures (issue #433).
+          MIN_GIST_SIZE: "256"
+          # Comma-separated allowlist of GitHub logins whose `/er`
+          # comments are accepted for Signal A identity (issue #433
+          # follow-up, jleechan-ifkt). The daemon er_runner posts via
+          # the operator's `gh` CLI, so the commenter's login IS the
+          # operator's login. The PR author cannot impersonate that
+          # login, so `c_login` membership is the unforgeable identity
+          # proof. The literal `🤖 **[dark-factory /er]**` allowlist
+          # marker stays as defense-in-depth.
+          EVIDENCE_TRUSTED_LOGINS: "jleechan2015"
         run: |
           set -euo pipefail
 
           ER_VERDICT=""        # set if (A) is found
           MARKER_VERDICT=""    # set if (B) is found and verifies
 
-          # --- Signal A: /er verdict comment on the PR ---
-          body="$(gh api \
+          # Fetch the PR's current head SHA + last-update timestamp so we
+          # can verify that any `/er` verdict comment was posted at or
+          # after the most recent commit on the head branch (issue #433
+          # freshness binding, jleechan-ifkt follow-up). The daemon
+          # er_runner comment does NOT embed a literal `head <sha>`
+          # token in its body — it wraps the reviewer reply in a
+          # marker-only fence. So we anchor freshness to `updated_at`
+          # (== the most recent commit-push on the head branch) against
+          # the comment's `created_at`. Both are ISO 8601 UTC and
+          # lexically comparable in bash.
+          pr_head_sha="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/pulls/${PR_NUMBER}" \
+            --jq '.head.sha // ""' 2>/dev/null)" || pr_head_sha=""
+          pr_head_short="$(echo "${pr_head_sha}" | cut -c1-7)"
+          pr_updated_at="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/pulls/${PR_NUMBER}" \
+            --jq '.updated_at // ""' 2>/dev/null)" || pr_updated_at=""
+          echo "pr_head_sha=${pr_head_sha:-<none>} pr_head_short=${pr_head_short:-<none>} pr_updated_at=${pr_updated_at:-<none>}"
+
+          # --- Signal A: /er verdict comment on the PR (hardened, issue #433 + jleechan-ifkt) ---
+          # Identity binding (two-factor):
+          #   (1) The comment body carries the literal er_runner allowlist
+          #       marker `🤖 **[dark-factory /er]**` (or the bracket-
+          #       stripped form `[dark-factory /er]`), which is emitted
+          #       ONLY by `daemon/src/er_runner.rs:191`.
+          #   (2) The commenter's `c_login` is in the
+          #       `EVIDENCE_TRUSTED_LOGINS` allowlist (default: the
+          #       operator gh account). The PR author cannot impersonate
+          #       that login, so this is the unforgeable identity proof
+          #       (issue #433 follow-up, jleechan-ifkt).
+          # Freshness binding (jleechan-ifkt, codex-connector P1 #2):
+          #   The comment must be posted at or after `pr_updated_at`
+          #   (== the most recent commit on the head branch). Stale
+          #   comments from older heads fail this check. Both timestamps
+          #   are ISO 8601 UTC and lexically comparable in bash.
+          comments_json="$(gh api \
             -H "Accept: application/vnd.github+json" \
             "/repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
-            --jq '[.[].body] | join("\n")')" || body=""
+            --jq '[.[] | {login: .user.login, body: .body, created_at: .created_at}]' 2>/dev/null)" || comments_json="[]"
 
-          if echo "$body" | grep -qiE '/er[[:space:]]+PASS\b'; then
-            ER_VERDICT="PASS"
-          elif echo "$body" | grep -qiE '/er[[:space:]]+FAIL\b'; then
-            ER_VERDICT="FAIL"
-          elif echo "$body" | grep -qiE '/er[[:space:]]+PARTIAL\b'; then
-            ER_VERDICT="PARTIAL"
-          elif echo "$body" | grep -qiE '/er[[:space:]]+INCONCLUSIVE\b'; then
-            ER_VERDICT="INCONCLUSIVE"
+          if [ -n "${pr_head_sha}" ] && [ "${comments_json}" != "[]" ]; then
+            # NOTE (issue #433 follow-up, jleechan-ifkt): do NOT iterate
+            # jq-compact output via unquoted command substitution. Bash
+            # word-splits each JSON object on its inner whitespace (the
+            # double quotes in jq output are NOT bash quoting), so the
+            # first iteration fragment is invalid JSON, `jq -r '.body // ""'`
+            # fails with "Unfinished string at EOF", `set -euo pipefail`
+            # exits 5, and Signal B never runs even when the PR body has
+            # a valid `**Evidence**:` marker. Use `mapfile` + `for ... in
+            # "${rows[@]}"` so each jq-compact line is delivered intact.
+            mapfile -t rows < <(echo "${comments_json}" | jq -c '.[]' 2>/dev/null || true)
+            for row in "${rows[@]}"; do
+              c_body="$(echo "${row}" | jq -r '.body // ""' 2>/dev/null || echo "")"
+              c_login="$(echo "${row}" | jq -r '.login // ""' 2>/dev/null || echo "")"
+              c_created_at="$(echo "${row}" | jq -r '.created_at // ""' 2>/dev/null || echo "")"
+
+              # (1) Two-factor identity: er_runner marker AND login in
+              # EVIDENCE_TRUSTED_LOGINS allowlist.
+              marker_present=0
+              if echo "${c_body}" | grep -qF '🤖 **[dark-factory /er]**' \
+                 || echo "${c_body}" | grep -qF '[dark-factory /er]'; then
+                marker_present=1
+              fi
+              if [ "${marker_present}" -ne 1 ]; then
+                echo "skip_comment author=${c_login} created_at=${c_created_at} reason=no_er_runner_marker"
+                continue
+              fi
+
+              trusted_login=0
+              IFS=',' read -r -a trusted_logins <<< "${EVIDENCE_TRUSTED_LOGINS:-}"
+              for tl in "${trusted_logins[@]}"; do
+                if [ "${c_login}" = "${tl// /}" ]; then
+                  trusted_login=1
+                  break
+                fi
+              done
+              if [ "${trusted_login}" -ne 1 ]; then
+                echo "skip_comment author=${c_login} created_at=${c_created_at} reason=login_not_in_trusted_allowlist"
+                continue
+              fi
+
+              # (2) Freshness binding: comment created_at >= pr_updated_at.
+              if [ -n "${c_created_at}" ] && [ -n "${pr_updated_at}" ] \
+                 && [ "${c_created_at}" \< "${pr_updated_at}" ]; then
+                echo "skip_comment author=${c_login} reason=stale_comment_before_pr_update c_created_at=${c_created_at} pr_updated_at=${pr_updated_at}"
+                continue
+              fi
+
+              # Trusted + fresh: parse the verdict token from the
+              # verbatim reply.
+              if echo "${c_body}" | grep -qiE '/er[[:space:]]+PASS\b'; then
+                ER_VERDICT="PASS"
+                echo "signal_a_trusted_er_verdict=PASS author=${c_login} created_at=${c_created_at} pr_head_sha=${pr_head_sha}"
+                break
+              elif echo "${c_body}" | grep -qiE '/er[[:space:]]+FAIL\b'; then
+                ER_VERDICT="FAIL"
+                echo "signal_a_trusted_er_verdict=FAIL author=${c_login} created_at=${c_created_at} pr_head_sha=${pr_head_sha}"
+                break
+              elif echo "${c_body}" | grep -qiE '/er[[:space:]]+PARTIAL\b'; then
+                ER_VERDICT="PARTIAL"
+                echo "signal_a_trusted_er_verdict=PARTIAL author=${c_login} created_at=${c_created_at} pr_head_sha=${pr_head_sha}"
+                break
+              elif echo "${c_body}" | grep -qiE '/er[[:space:]]+INCONCLUSIVE\b'; then
+                ER_VERDICT="INCONCLUSIVE"
+                echo "signal_a_trusted_er_verdict=INCONCLUSIVE author=${c_login} created_at=${c_created_at} pr_head_sha=${pr_head_sha}"
+                break
+              fi
+              echo "skip_comment author=${c_login} reason=trusted_no_verdict_token"
+            done
           fi
 
           echo "signal_a_er_verdict=${ER_VERDICT:-ABSENT}"
 
-          # --- Signal B: canonical evidence marker in PR body ---
+          # --- Signal B: canonical evidence marker in PR body (hardened, issue #433) ---
           pr_body="$(gh api \
             -H "Accept: application/vnd.github+json" \
             "/repos/${REPO}/pulls/${PR_NUMBER}" \
@@ -163,14 +280,49 @@ jobs:
                 "https://api.github.com/gists/${gist_id}" 2>/dev/null)" || gist_body=""
 
               if [ -n "$gist_body" ] && [ "$gist_body" != "null" ]; then
+                # Count files with non-empty content (issue #424).
                 files_with_content="$(echo "$gist_body" | \
                   jq "[.files // {} | to_entries[] | select(.value.content != null and (.value.content | length > 0))] | length" \
                   2>/dev/null || echo "0")"
-                if [ "${files_with_content:-0}" -gt 0 ]; then
+
+                # Aggregate total content size across all gist files
+                # (issue #433 content floor). A placeholder 1-byte gist
+                # fails this check.
+                gist_content_size="$(echo "$gist_body" | \
+                  jq "[.files // {} | to_entries[].value.content // \"\" | length] | add // 0" \
+                  2>/dev/null || echo "0")"
+
+                # Concatenate all file contents for the mention check.
+                gist_content_all="$(echo "$gist_body" | \
+                  jq -r '[.files // {} | to_entries[].value.content // ""] | join("\n")' \
+                  2>/dev/null || echo "")"
+
+                # Mention check (issue #433 + jleechan-ifkt follow-up):
+                # the gist must reference this PR (by PR_NUMBER) or this
+                # repo (by REPO). The PR-number check uses `-w`
+                # (word-boundary) so PR `#42` is not matched by
+                # timestamps, byte counts, or other incidental numeric
+                # token runs (CodeRabbit review on jleechan-ifkt).
+                pr_mention=0
+                repo_mention=0
+                if echo "${gist_content_all}" | grep -qwF "${PR_NUMBER}"; then
+                  pr_mention=1
+                fi
+                if echo "${gist_content_all}" | grep -qF "${REPO}"; then
+                  repo_mention=1
+                fi
+
+                # The full substantive-gist check (issue #433):
+                #   files_with_content > 0 (issue #424 structural floor)
+                #   AND content_size >= MIN_GIST_SIZE (issue #433 size floor)
+                #   AND (mentions PR_NUMBER OR mentions REPO).
+                if [ "${files_with_content:-0}" -gt 0 ] \
+                   && [ "${gist_content_size:-0}" -ge "${MIN_GIST_SIZE}" ] \
+                   && { [ "${pr_mention}" -eq 1 ] || [ "${repo_mention}" -eq 1 ]; }; then
                   MARKER_VERDICT="PASS"
-                  echo "signal_b_marker=PASS gist=${gist_url} files_with_content=${files_with_content} marker_declared_sha=${marker_sha:-<none>}"
+                  echo "signal_b_marker=PASS gist=${gist_url} files_with_content=${files_with_content} content_size=${gist_content_size} min_size=${MIN_GIST_SIZE} pr_mention=${pr_mention} repo_mention=${repo_mention} marker_declared_sha=${marker_sha:-<none>}"
                 else
-                  echo "signal_b_marker=EMPTY gist=${gist_url} has no files with content"
+                  echo "signal_b_marker=INSUFFICIENT gist=${gist_url} files_with_content=${files_with_content} content_size=${gist_content_size} min_size=${MIN_GIST_SIZE} pr_mention=${pr_mention} repo_mention=${repo_mention}"
                 fi
               else
                 echo "signal_b_marker=UNREACHABLE gist=${gist_url}"
@@ -191,13 +343,13 @@ jobs:
             REASON="/er verdict is ${ER_VERDICT}"
           elif [ "$ER_VERDICT" = "PASS" ]; then
             FINAL="PASS"
-            REASON="/er PASS comment on PR"
+            REASON="/er PASS comment on PR (trusted er_runner marker + head SHA match)"
           elif [ "$MARKER_VERDICT" = "PASS" ]; then
             FINAL="PASS"
-            REASON="canonical evidence marker with verifiable gist"
+            REASON="canonical evidence marker with substantive gist (size>=${MIN_GIST_SIZE} + PR/repo mention)"
           else
             FINAL="FAIL"
-            REASON="no /er verdict and no canonical evidence marker with verifiable gist"
+            REASON="no /er verdict (trusted+fresh) and no canonical evidence marker with substantive gist"
           fi
 
           echo "evidence_final_verdict=${FINAL}"
@@ -206,13 +358,24 @@ jobs:
           echo "ER_REASON=${REASON}" >> "$GITHUB_ENV"
 
       - name: Mark evidence-gate verdict (fail-closed)
-        # Issue #424: the verdict is now BOUND to independent ground truth
-        # (an /er comment OR a canonical evidence marker with verifiable
-        # gist), not echoed from this template. The gate fails closed in
-        # three cases:
+        # Issue #424 + #433 + jleechan-ifkt follow-ups: the verdict is
+        # BOUND to independent ground truth (an /er comment from a
+        # er_runner operator-account login OR a canonical evidence
+        # marker with substantive gist), not echoed from this template.
+        # The gate fails closed in six cases:
         #   1. No /er comment AND no canonical evidence marker.
         #   2. /er FAIL, /er PARTIAL, or /er INCONCLUSIVE comment.
-        #   3. Canonical evidence marker with missing or empty gist.
+        #   3. /er PASS without the er_runner allowlist marker
+        #      (issue #433 identity binding — defense in depth).
+        #   4. /er PASS from a login outside the trusted allowlist
+        #      OR posted before the PR's latest commit timestamp
+        #      (jleechan-ifkt follow-up, identity + freshness).
+        #   5. /er PASS referencing an OLDER head SHA, or canonical
+        #      evidence marker with placeholder/empty gist, or
+        #      canonical evidence marker with gist content that does
+        #      not mention the PR number or repo (issue #433).
+        #   6. `gh` / `jq` / `curl` transient errors during the
+        #      evidence-fingerprinting step (set -euo pipefail).
         if: github.event_name == 'pull_request'
         run: |
           echo "Evidence verdict: ${ER_VERDICT:-ABSENT}"
@@ -231,9 +394,10 @@ jobs:
             *)
               echo "evidence_gate=FAIL"
               echo "Verdict: FAIL — no /er verdict and no canonical evidence marker."
-              echo "Either post /er PASS|FAIL|PARTIAL|INCONCLUSIVE as a PR comment,"
-              echo "or include **Evidence**: <gist-url> in the PR body pointing at a"
-              echo "public, non-empty gist."
+              echo "Either post /er PASS|FAIL|PARTIAL|INCONCLUSIVE as a PR comment"
+              echo "(with the [dark-factory /er] marker + current head SHA), or include"
+              echo "**Evidence**: <gist-url> in the PR body pointing at a public,"
+              echo "non-empty gist whose content mentions this PR or repo."
               exit 1
               ;;
           esac
