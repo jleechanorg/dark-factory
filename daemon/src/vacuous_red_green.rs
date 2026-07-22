@@ -151,6 +151,120 @@ pub enum RedGreenError {
     RestoreFailed(String),
     #[error("git command failed: {0}")]
     Git(String),
+    /// The runtime detector could not locate a cargo binary on PATH, in
+    /// `~/.cargo/bin/cargo`, or via `rustup which cargo`. The detector
+    /// cannot run any of the three phases without it. Bead jleechan-sb4b:
+    /// the daemon service environment previously lacked cargo on PATH and
+    /// every assessment reported `GreenFailed: git error: spawn cargo
+    /// test: No such file or directory` — a misleading "git error" that
+    /// hid the real cause (the toolchain was missing, not git). This
+    /// variant surfaces the real reason and hints at the fix.
+    #[error("cargo binary not found: {0}")]
+    CargoNotFound(String),
+}
+
+/// Result of locating the cargo binary for the runtime detector.
+/// Bead jleechan-sb4b: the daemon service environment previously lacked
+/// cargo on PATH, so the detector could never run. This enum lets the
+/// daemon's startup path (and the gate) surface `CargoNotFound` as a
+/// distinct, structured signal instead of collapsing into a generic
+/// `GreenFailed` reported per-PR.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CargoLocation {
+    /// `cargo` was on PATH (no absolute path resolved).
+    OnPath,
+    /// `cargo` resolved to an absolute path, e.g. `$HOME/.cargo/bin/cargo`.
+    Found(PathBuf),
+    /// No cargo binary was found anywhere on PATH, in the user
+    /// `~/.cargo/bin/cargo`, or via `rustup which cargo`. The detector
+    /// cannot run; the gate should classify this as a structured
+    /// `Unknown` (`CargoNotFound`) rather than `GreenFailed`.
+    NotFound,
+}
+
+/// Locate the cargo binary the detector should use. The lookup is
+/// intentionally additive — bare `cargo` on PATH wins, then
+/// `$HOME/.cargo/bin/cargo`, then `rustup which cargo` — so the daemon
+/// can run on systems where cargo is installed via rustup but not symlinked
+/// onto the system PATH (the systemd-unit context that surfaced bead
+/// jleechan-sb4b). The returned enum is the single source of truth for
+/// the gate's `CargoNotFound` signal.
+///
+/// `cargo_home` is supplied by the caller (typically `$HOME/.cargo`) so
+/// the resolver can be unit-tested without mutating the host env. When
+/// `None`, the resolver derives it from `HOME`/`USERPROFILE` like the
+/// daemon does at startup.
+pub fn resolve_cargo(cargo_home: Option<&Path>) -> CargoLocation {
+    // 1. Bare `cargo` on PATH — the simplest case.
+    if let Some(p) = which_cargo("cargo") {
+        if p.as_os_str().is_empty() {
+            return CargoLocation::OnPath;
+        }
+        return CargoLocation::Found(p);
+    }
+    // 2. `$HOME/.cargo/bin/cargo` — the rustup default install path.
+    if let Some(home) = cargo_home {
+        let direct = home.join("bin").join("cargo");
+        if direct.is_file() {
+            return CargoLocation::Found(direct);
+        }
+    }
+    // 3. `rustup which cargo` — the canonical answer when rustup is
+    // present but cargo's `bin` directory isn't on PATH (containers,
+    // systemd user units, etc.).
+    if let Some(p) = which_cargo_via_rustup() {
+        return CargoLocation::Found(p);
+    }
+    CargoLocation::NotFound
+}
+
+/// Resolve the cargo home directory from the daemon's environment for
+/// use as the fallback when `cargo` is not on PATH. Mirrors the
+/// production-side startup reasoning in `main.rs` — `CARGO_HOME` first,
+/// then `$HOME/.cargo`. Returns `None` when neither variable is set
+/// (the resolver then reports `NotFound`).
+pub fn cargo_home_from_env() -> Option<PathBuf> {
+    std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+}
+
+/// Internal helper: prefer `which` crate semantics implemented in
+/// std-only Rust so the daemon doesn't take a new dependency for a
+/// 20-line lookup. Returns `Some("")` for a bare-name hit on PATH (the
+/// caller can treat that as `OnPath`); `Some(<absolute>)` when
+/// `$PATH`/the provided lookup resolved an absolute file; `None` when
+/// nothing was found.
+fn which_cargo(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for entry in std::env::split_paths(&path_var) {
+        let candidate = entry.join(name);
+        if candidate.is_file() {
+            return Some(PathBuf::new()); // bare-name hit on PATH
+        }
+    }
+    let _ = name; // suppress unused warning for future expansion
+    let _ = path_var;
+    None
+}
+
+fn which_cargo_via_rustup() -> Option<PathBuf> {
+    let out = Command::new("rustup").args(["which", "cargo"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(out.stdout).ok()?;
+    let trimmed = path.trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(trimmed);
+    if p.is_file() {
+        Some(p)
+    } else {
+        None
+    }
 }
 
 /// Run the runtime red-green check against `repo_root`. `base_ref` is the
@@ -228,6 +342,13 @@ pub fn check_red_green_with_manifest(
         None => find_cargo_manifest(repo_root),
     };
 
+    // Bead jleechan-sb4b: resolve the cargo binary via the same fallback
+    // chain the startup check uses. The detector cannot run if cargo is
+    // missing, but we surface a structured `CargoNotFound` error instead
+    // of the previous misleading `git error: spawn cargo test: No such
+    // file or directory` so the gate reports a real cause.
+    let cargo_loc = resolve_cargo(cargo_home_from_env().as_deref());
+
     // Step 1: discover the diff-aware added/modified test fns + their
     // per-fn skip reasons across the changed test files. r6 contract
     // (issue #387 r6 P1 #5): scope at the fn level AND only emit fns that
@@ -266,6 +387,7 @@ pub fn check_red_green_with_manifest(
         &test_files,
         &targeted_tests,
         resolved_manifest.as_deref(),
+        cargo_loc.clone(),
     )?;
     if !head_pass.all_passed() {
         return Ok(RedGreenReport {
@@ -291,6 +413,7 @@ pub fn check_red_green_with_manifest(
         &test_files,
         &targeted_tests,
         resolved_manifest.as_deref(),
+        cargo_loc.clone(),
     )?;
     if !baseline_pass.all_passed() {
         return Ok(RedGreenReport {
@@ -326,6 +449,7 @@ pub fn check_red_green_with_manifest(
         &test_files,
         &targeted_tests,
         resolved_manifest.as_deref(),
+        cargo_loc.clone(),
     );
 
     if let Err(e) = restore_diff(repo_root, &production_diff) {
@@ -915,11 +1039,21 @@ pub fn find_cargo_manifest_recursive(repo_root: &Path, max_depth: usize) -> Opti
 /// manifest. Issue #387 r5 finding 3: `--manifest-path` is required
 /// so cargo executes the PR's crate regardless of cwd — without it,
 /// `NEVER_RAN` is treated as a real pass on multi-crate layouts.
+///
+/// Bead jleechan-sb4b: `cargo` is the binary chosen to run the tests;
+/// when PATH lacks cargo (the systemd-unit daemon context that surfaced
+/// this bead), the caller must supply a `CargoLocation` resolved via
+/// `resolve_cargo` so the detector can fall back to
+/// `$HOME/.cargo/bin/cargo` or `rustup which cargo`. When `cargo_loc`
+/// is `NotFound`, the detector returns `RedGreenError::CargoNotFound`
+/// instead of a misleading `git error: spawn cargo test: No such file or
+/// directory` (the previous failure mode).
 fn run_cargo_tests(
     repo_root: &Path,
     test_files: &[PathBuf],
     targeted_tests: &[String],
     manifest: Option<&Path>,
+    cargo_loc: CargoLocation,
 ) -> Result<CargoOutcome, RedGreenError> {
     if targeted_tests.is_empty() {
         return Ok(CargoOutcome {
@@ -927,6 +1061,19 @@ fn run_cargo_tests(
             compile_errored: false,
         });
     }
+
+    let cargo_bin = match &cargo_loc {
+        CargoLocation::OnPath => PathBuf::from("cargo"),
+        CargoLocation::Found(p) => p.clone(),
+        CargoLocation::NotFound => {
+            return Err(RedGreenError::CargoNotFound(
+                "cargo was not found on PATH, in $HOME/.cargo/bin/cargo, \
+                 or via `rustup which cargo`; install the toolchain or \
+                 set CARGO_HOME so the runtime detector can run."
+                    .to_string(),
+            ));
+        }
+    };
 
     let mut failing: Vec<String> = Vec::new();
     let mut compile_errored = false;
@@ -953,11 +1100,16 @@ fn run_cargo_tests(
             args.push("--exact".to_string());
         }
 
-        let out = Command::new("cargo")
+        let out = Command::new(&cargo_bin)
             .current_dir(repo_root)
             .args(&args)
             .output()
-            .map_err(|e| RedGreenError::Git(format!("spawn cargo test: {e}")))?;
+            .map_err(|e| {
+                RedGreenError::CargoNotFound(format!(
+                    "spawn {}: {e}; cargo binary not usable from this environment",
+                    cargo_bin.display()
+                ))
+            })?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -1009,6 +1161,7 @@ fn run_baseline_check(
     test_files: &[PathBuf],
     targeted_tests: &[String],
     manifest: Option<&Path>,
+    cargo_loc: CargoLocation,
 ) -> Result<CargoOutcome, RedGreenError> {
     // Build a temp worktree directory for the pristine base. We use
     // `git worktree add --detach` so the original working tree is
@@ -1053,7 +1206,7 @@ fn run_baseline_check(
         }
     });
 
-    let result = run_cargo_tests(&tmp, test_files, targeted_tests, baseline_manifest.as_deref());
+    let result = run_cargo_tests(&tmp, test_files, targeted_tests, baseline_manifest.as_deref(), cargo_loc);
 
     // Always clean up the worktree, even on error. We swallow cleanup
     // errors — the test outcome is the primary signal; a stale /tmp
@@ -1076,6 +1229,14 @@ fn run_baseline_check(
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    // Serializes tests that mutate the process-wide PATH/CARGO_HOME env
+    // vars. Rust runs tests in parallel by default, so without this lock
+    // a sibling test adding `.cargo/bin` to PATH races with a test
+    // trying to assert PATH is empty — the resolution result is then
+    // a coin-flip. The NOTIFY_ENV_LOCK pattern in main.rs uses the same
+    // idea.
+    static PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn discovers_plain_test_fn() {
@@ -1430,6 +1591,172 @@ fn b() {
             std::env::temp_dir().join(format!("vacuous_{label}_{}_{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ---- jleechan-sb4b: cargo binary resolution ----
+    //
+    // The systemd-unit daemon environment that surfaced bead
+    // jleechan-sb4b had no `cargo` on PATH, so the runtime detector
+    // surfaced `GreenFailed: git error: spawn cargo test: No such file or
+    // directory` on every assessment — a misleading "git error" that hid
+    // the real cause. The fix is twofold:
+    //
+    //   1. `resolve_cargo()` falls back to `$HOME/.cargo/bin/cargo` and
+    //      `rustup which cargo` so the detector can run when cargo is
+    //      installed via rustup but not symlinked onto PATH.
+    //   2. When the resolver returns `NotFound`, the detector returns
+    //      `RedGreenError::CargoNotFound` so the gate can surface a
+    //      structured "toolchain missing" signal rather than a generic
+    //      `GreenFailed`.
+    //
+    // These tests pin both behaviors. The PATH-stripped test reproduces
+    // the systemd-unit failure mode (PATH that doesn't contain cargo) and
+    // asserts the resolver finds a fake shim under a fake `cargo_home`.
+
+    // Test helper: returns the host PATH stripped of any directory that
+    // contains a `cargo` binary. This isolates the resolver from the
+    // host's cargo (which would otherwise mask the "missing toolchain"
+    // signal). The PATH_ENV_LOCK guard ensures no sibling test adds a
+    // cargo directory between the snapshot and the assertion.
+    fn path_without_cargo() -> std::ffi::OsString {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let filtered: Vec<std::path::PathBuf> = std::env::split_paths(&path)
+            .filter(|entry| !entry.join("cargo").is_file())
+            .collect();
+        std::env::join_paths(&filtered).unwrap_or_default()
+    }
+
+    #[test]
+    fn resolve_cargo_returns_not_found_when_path_and_cargo_home_both_empty() {
+        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // cargo_home pointing at an empty dir + a PATH that has no
+        // cargo binary anywhere. Resolver must surface NotFound without
+        // requiring PATH mutation (the test pins the resolver, not the
+        // environment).
+        let fake_home = tempdir_unique("cargo-empty");
+        // The host PATH almost certainly contains cargo, so strip cargo
+        // out for the duration of the resolver call.
+        let prev_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", path_without_cargo());
+        let res = resolve_cargo(Some(&fake_home));
+        match prev_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        assert_eq!(
+            res,
+            CargoLocation::NotFound,
+            "PATH-stripped + empty cargo_home must surface NotFound"
+        );
+    }
+
+    #[test]
+    fn resolve_cargo_finds_cargo_in_cargo_home_bin_when_path_is_empty() {
+        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Reproduce the systemd-unit failure mode: PATH without cargo,
+        // but `~/.cargo/bin/cargo` exists. The resolver must find it.
+        let fake_home = tempdir_unique("cargo-fallback");
+        let bin = fake_home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let shim = bin.join("cargo");
+        std::fs::write(&shim, "#!/bin/sh\necho ok\n").unwrap();
+        let prev_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", path_without_cargo());
+        let res = resolve_cargo(Some(&fake_home));
+        match prev_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        match res {
+            CargoLocation::Found(p) => {
+                let canonical = std::fs::canonicalize(&p).unwrap();
+                let expected = std::fs::canonicalize(&shim).unwrap();
+                assert_eq!(
+                    canonical, expected,
+                    "resolver must find the shim under cargo_home/bin"
+                );
+            }
+            other => panic!("expected CargoLocation::Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_cargo_prefers_path_over_cargo_home() {
+        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // When cargo is on PATH AND the cargo_home has a shim, the
+        // resolver must prefer PATH (no network/disk dependency for the
+        // common case). We strip the cargo from PATH first, then add a
+        // private dir containing a fake cargo, and assert OnPath is the
+        // chosen carrier.
+        let dir = tempdir_unique("cargo-prefer");
+        let bin = dir.join("path_bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("cargo"), "#!/bin/sh\nexit 0\n").unwrap();
+        // cargo_home also has a shim but it must NOT be chosen.
+        let fake_home = dir.join("cargo_home");
+        std::fs::create_dir_all(fake_home.join("bin")).unwrap();
+        std::fs::write(
+            fake_home.join("bin").join("cargo"),
+            "#!/bin/sh\nexit 99\n",
+        )
+        .unwrap();
+        let stripped = path_without_cargo();
+        let prev_path = std::env::var_os("PATH");
+        let new_path = std::env::join_paths(
+            std::iter::once(bin.clone()).chain(std::env::split_paths(&stripped)),
+        )
+        .unwrap();
+        std::env::set_var("PATH", &new_path);
+        let res = resolve_cargo(Some(&fake_home));
+        match prev_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        assert_eq!(
+            res,
+            CargoLocation::OnPath,
+            "PATH hit must win over cargo_home fallback"
+        );
+    }
+
+    #[test]
+    fn resolve_cargo_surfaces_not_found_when_path_is_empty() {
+        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Reproduce the systemd-unit failure mode: PATH-stripped (no
+        // cargo directories), cargo_home doesn't exist. The resolver
+        // must surface NotFound (or Found via rustup which cargo, when
+        // rustup is on the stripped PATH — extremely unlikely).
+        let fake_home = tempdir_unique("cargo-none");
+        let stripped = path_without_cargo();
+        let prev_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", &stripped);
+        let res = resolve_cargo(Some(&fake_home));
+        match prev_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        // When neither PATH nor cargo_home yields cargo, the resolver
+        // must surface NotFound (rustup is on the stripped PATH, so it
+        // can't help either).
+        assert_eq!(
+            res,
+            CargoLocation::NotFound,
+            "PATH-stripped + valid-but-empty cargo_home must surface NotFound"
+        );
+    }
+
+    #[test]
+    fn red_green_error_cargo_not_found_display_is_actionable() {
+        // The error message must NOT be the misleading "git error: spawn
+        // cargo test: No such file or directory" string that surfaced in
+        // the bead — it must name the toolchain and the fix.
+        let e = RedGreenError::CargoNotFound("test reason".to_string());
+        let msg = format!("{e}");
+        assert!(msg.contains("cargo"), "error must name cargo: {msg}");
+        assert!(
+            msg.contains("test reason"),
+            "error must include the embedded reason: {msg}"
+        );
     }
 }
 
