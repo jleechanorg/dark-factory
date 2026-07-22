@@ -377,7 +377,9 @@ def _record_reviewer_receipt(
         pass
 
 
-def _check_structured_receipt(ctx: Any, *, expected_sha: str) -> str:
+def _check_structured_receipt(
+    ctx: Any, *, expected_sha: str, codergen_receipts: list | None = None,
+) -> str:
     """Return "" if the structured receipts in ``ctx`` justify a PASS, else a gap.
 
     A reviewer's PASS is only trustworthy when at least one recorded receipt
@@ -390,6 +392,15 @@ def _check_structured_receipt(ctx: Any, *, expected_sha: str) -> str:
     Receipts with mismatched SHA or nonzero exit are still recorded for
     audit but do not satisfy the gate. Multiple receipts are OR-aggregated:
     one good receipt holds even when a setup/teardown step failed.
+
+    Two structured sources are honored at the SAME trust tier (both are
+    captured execution, not prose): engine-captured receipts in
+    ``ctx.state["_reviewer_receipts"]`` and codergen-sourced receipts passed
+    via ``codergen_receipts`` (produced by ``handler_codergen`` from a coder
+    worktree's ``commands_run.md``). A passing record in EITHER list
+    satisfies the gate; diagnostics aggregate across both sources so the
+    most informative reason surfaces. Regex-prose remains a separate
+    low-trust fallback handled by the caller.
     """
     expected = str(expected_sha or "").lower()
     if not expected:
@@ -398,8 +409,13 @@ def _check_structured_receipt(ctx: Any, *, expected_sha: str) -> str:
             "expected_sha is empty (worktree HEAD unavailable)"
         )
     state = getattr(ctx, "state", None)
-    receipts = state.get("_reviewer_receipts") if isinstance(state, dict) else None
-    if not isinstance(receipts, list) or not receipts:
+    engine_receipts = state.get("_reviewer_receipts") if isinstance(state, dict) else None
+    if not isinstance(engine_receipts, list):
+        engine_receipts = []
+    if not isinstance(codergen_receipts, list):
+        codergen_receipts = []
+    receipts = list(engine_receipts) + list(codergen_receipts)
+    if not receipts:
         return (
             "structured receipt: no execution recorded for this gate — "
             "the reviewer subprocess did not register a runner invocation; "

@@ -234,10 +234,18 @@ def _enforce_reproduction_receipt(
 
     md = dict(result.metadata or {})
     receipts = md.get("_reviewer_receipts")
+    codergen_receipts = md.get("_codergen_receipts")
+    has_structured = (
+        (isinstance(receipts, list) and receipts)
+        or (isinstance(codergen_receipts, list) and codergen_receipts)
+    )
     gap = ""
     receipt_path = "regex_low_trust"
-    if isinstance(receipts, list) and receipts and expected_sha:
-        gap = _check_structured_receipt(_MDToCtxShim(md), expected_sha=expected_sha)
+    if has_structured and expected_sha:
+        gap = _check_structured_receipt(
+            _MDToCtxShim(md), expected_sha=expected_sha,
+            codergen_receipts=codergen_receipts,
+        )
         if not gap:
             # Structured path passed — record the path label so audit
             # readers can distinguish the strong classification from the
@@ -251,7 +259,7 @@ def _enforce_reproduction_receipt(
     else:
         gap = _reproduction_receipt_gap(result.output or "")
     if not gap:
-        if isinstance(receipts, list) and receipts:
+        if has_structured:
             md["receipt_path"] = "structured"
         else:
             md["receipt_path"] = "regex_low_trust"
@@ -333,6 +341,7 @@ class _MDToCtxShim:
     def __init__(self, md: dict) -> None:
         self.state = {
             "_reviewer_receipts": list(md.get("_reviewer_receipts") or []),
+            "_codergen_receipts": list(md.get("_codergen_receipts") or []),
         }
 
 
