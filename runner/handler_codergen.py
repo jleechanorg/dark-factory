@@ -90,6 +90,15 @@ if TYPE_CHECKING:
 # needs the rest).
 _DIFF_MAX_CHARS = 50_000
 
+# commands_run.md (#406 artifact) exit-code line. Matches the forms the
+# implementing agent writes — ``exit code: N`` — plus the ``exit_code: N``
+# and ``exit: N`` variants, in the spirit of ``_RECEIPT_EXIT_RE`` in
+# handler_verdict.py. Parsing is mechanical line-format parsing only.
+_CMD_RUN_EXIT_RE = re.compile(
+    r"(?:exit[_ ]?code\s*[:=]\s*|exit\s*[:=]\s*)(\d+)\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class _ShadowCodexReview:
@@ -472,28 +481,7 @@ def _stash_diff(node: "Node", ctx: "Context") -> None:
     Writes both ``ctx.state["<node.name>.diff"]`` and ``ctx.state["_last_diff"]``,
     as well as ``ctx.state["<node.name>.changed_files"]`` and ``ctx.state["_last_changed_files"]``.
     """
-    workdir: "Path | str | None" = None
-    ao_wt = ctx.state.get("ao.worktree")
-    # Defense in depth: a forged or stale ``ao.worktree`` value could
-    # point ``git -C`` at an unintended repo. Validate before use;
-    # fall back to ``ctx.workdir`` if the AO worktree is missing,
-    # relative, traversing, or doesn't exist.
-    ao_wt_valid = False
-    if ao_wt:
-        ao_path = pathlib.Path(str(ao_wt))
-        if (
-            ao_path.is_absolute()
-            and ".." not in ao_path.parts
-            and ao_path.is_dir()
-        ):
-            ao_wt_valid = True
-    if ao_wt_valid:
-        workdir = str(ao_wt)
-    else:
-        try:
-            workdir = ctx.workdir
-        except AttributeError:
-            workdir = None
+    workdir = _codergen_workdir(ctx)
     diff = _capture_diff(workdir)
     ctx.state[f"{node.name}.diff"] = diff
     ctx.state["_last_diff"] = diff
@@ -501,6 +489,103 @@ def _stash_diff(node: "Node", ctx: "Context") -> None:
     changed_files = _capture_changed_files(workdir)
     ctx.state[f"{node.name}.changed_files"] = changed_files
     ctx.state["_last_changed_files"] = changed_files
+
+
+def _codergen_workdir(ctx: "Context") -> "Path | str | None":
+    """Resolve the worktree the coder ran in.
+
+    Prefers ``ctx.state["ao.worktree"]`` when it is an absolute, non-traversing
+    path to an existing directory (defense in depth against a forged/stale
+    value); otherwise falls back to ``ctx.workdir``. Shared by ``_stash_diff``
+    and ``_stash_codergen_receipt`` so both target the same tree.
+    """
+    ao_wt = ctx.state.get("ao.worktree")
+    if ao_wt:
+        ao_path = pathlib.Path(str(ao_wt))
+        if (
+            ao_path.is_absolute()
+            and ".." not in ao_path.parts
+            and ao_path.is_dir()
+        ):
+            return str(ao_wt)
+    try:
+        return ctx.workdir
+    except AttributeError:
+        return None
+
+
+def _parse_commands_run_md(text: str) -> list[tuple[str, int]]:
+    """Mechanical line-format parser for the ``commands_run.md`` #406 artifact.
+
+    The artifact is lines of ``$ <command>`` each followed by an
+    ``exit code: N`` line (``exit_code: N`` / ``exit: N`` also accepted).
+    Returns a list of ``(command, exit_code)`` pairs. Malformed lines — an
+    exit-code line with no preceding command, a command with no following
+    exit code, or an unparseable exit integer — are skipped without raising.
+    """
+    out: list[tuple[str, int]] = []
+    pending: str | None = None
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        if line.startswith("$ "):
+            pending = line[2:]
+            continue
+        m = _CMD_RUN_EXIT_RE.search(line)
+        if not m:
+            continue
+        if pending is None:
+            continue
+        try:
+            ec = int(m.group(1))
+        except ValueError:
+            continue
+        out.append((pending, ec))
+        pending = None
+    return out
+
+
+def _stash_codergen_receipt(node: "Node", ctx: "Context") -> None:
+    """Parse ``commands_run.md`` from the coder worktree into structured receipts.
+
+    On a SUCCESS outcome, if the worktree contains ``commands_run.md``, parse it
+    into the structured receipt record shape consumed by
+    ``runner.handler_verdict._check_structured_receipt`` and attach the list to
+    ``ctx.state["<node.name>.structured_receipt"]``. Absent file or no parsed
+    records => the key is left unset (existing behavior unchanged). All I/O is
+    best-effort; this never raises.
+    """
+    workdir = _codergen_workdir(ctx)
+    if not workdir:
+        return
+    commands_path = pathlib.Path(str(workdir)) / "commands_run.md"
+    if not commands_path.is_file():
+        return
+    try:
+        text = commands_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    parsed = _parse_commands_run_md(text)
+    if not parsed:
+        return
+    head_sha = ""
+    try:
+        sha = _handlers_shim._worktree_head_sha(pathlib.Path(str(workdir)))
+        if sha:
+            head_sha = sha
+    except Exception:
+        pass
+    cwd = str(workdir)
+    records = [
+        {
+            "command": [cmd],
+            "cwd": cwd,
+            "exit_code": ec,
+            "head_sha": head_sha,
+            "lane_id": node.name,
+        }
+        for cmd, ec in parsed
+    ]
+    ctx.state[f"{node.name}.structured_receipt"] = records
 
 
 def _codergen(node: "Node", ctx: "Context") -> "Result":
@@ -533,6 +618,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         outcome = pre if pre is not None else "success"
         if outcome == "success":
             _stash_diff(node, ctx)
+            _stash_codergen_receipt(node, ctx)
         return _finalize(Result(outcome=outcome, output=prompt_text, metadata=meta))
 
     if backend == "mock_llm":
@@ -584,6 +670,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             "wall_ms": str(wall_ms),
         }
         _stash_diff(node, ctx)
+        _stash_codergen_receipt(node, ctx)
         return _finalize(Result(outcome="success", output=content_text, metadata=meta))
 
     if backend == "ao":
@@ -676,6 +763,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
             if outcome == "success":
                 _stash_diff(node, ctx)
+                _stash_codergen_receipt(node, ctx)
             return _finalize(Result(
                 outcome=outcome,
                 output=f"ao spawn session={sess_name} worktree={worktree} activity={activity}",
@@ -762,6 +850,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
         if outcome == "success":
             _stash_diff(node, ctx)
+            _stash_codergen_receipt(node, ctx)
         return _finalize(Result(
             outcome=outcome,
             output=f"ao send session={session} activity={activity}",
@@ -828,6 +917,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
         if outcome == "success":
             _stash_diff(node, ctx)
+            _stash_codergen_receipt(node, ctx)
         return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     elif backend == "codex":
         args = _handlers_shim._sandboxed_args_for_workdir(
@@ -955,6 +1045,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
         if outcome == "success":
             _stash_diff(node, ctx)
+            _stash_codergen_receipt(node, ctx)
         return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     else:
         return _finalize(Result(outcome="failure", output=f"unknown backend {backend!r}"))
@@ -969,6 +1060,7 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
     meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
     if outcome == "success":
         _stash_diff(node, ctx)
+        _stash_codergen_receipt(node, ctx)
     return _finalize(Result(
         outcome=outcome,
         output=output,

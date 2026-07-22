@@ -45,7 +45,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .handler_core import Result
 
@@ -580,7 +580,7 @@ def _run_gate_once(
         sub_args=sub_args, proc=proc, cwd=str(ctx.workdir),
         expected_sha=expected_sha, timeout=timeout,
     )
-    metadata: dict[str, str] = {
+    metadata: dict[str, Any] = {
         "slash_command": name, "verdict": verdict,
         "returncode": str(proc.returncode),
         "expected_head_sha": expected_sha, "observed_head_sha": observed_sha,
@@ -592,6 +592,36 @@ def _run_gate_once(
         # Pass-through: list-valued receipt list is consumed verbatim by the
         # structured gate (_check_structured_receipt) via _MDToCtxShim.
         metadata["_reviewer_receipts"] = [receipt]
+    # Codergen-sourced receipts (Task 2): the codergen producer stashes
+    # parsed ``commands_run.md`` records into ``ctx.state`` under per-node
+    # keys ``"<node>.structured_receipt"``. The reviewer gate runs in a
+    # SEPARATE node from the codergen node, so the receipts are NOT under
+    # this gate's own key — gather every ``*.structured_receipt`` list from
+    # ``ctx.state`` and surface them under a parallel metadata key so the
+    # structured gate (_check_structured_receipt via _MDToCtxShim) can honor
+    # them at the same trust tier as engine-captured receipts. No new config;
+    # absent codergen receipts => the key is unset and behavior is unchanged.
+    #
+    # Cross-node gathering is intentional and by design. The plan describes
+    # "codergen lanes" (plural): more than one codergen node may run against
+    # the same HEAD, each producing its own structured receipt. The gather
+    # loop below intentionally OR-aggregates receipts from *every*
+    # ``*.structured_receipt`` key, not just the one belonging to a specific
+    # codergen node. This is safe because the SHA check above
+    # (``head_sha`` matching ``expected_sha``) binds each receipt to the
+    # graded *commit*, not to a specific codergen node: every receipt
+    # aggregated here already carries (and was validated against) the HEAD
+    # being graded. Therefore a passing receipt from ANY codergen lane that
+    # ran on the same HEAD legitimately satisfies the structured gate — the
+    # commit-level provenance is what matters, not which lane produced it.
+    codergen_receipts: list = []
+    state = getattr(ctx, "state", None)
+    if isinstance(state, dict):
+        for k, v in state.items():
+            if isinstance(k, str) and k.endswith(".structured_receipt") and isinstance(v, list):
+                codergen_receipts.extend(v)
+    if codergen_receipts:
+        metadata["_codergen_receipts"] = codergen_receipts
     return _finalize(Result(
         outcome=outcome,
         output=proc.stdout,
