@@ -35,20 +35,25 @@ assert() {
   fi
 }
 
+# Synthetic head SHA carried in every synthetic GATE_ASSESSMENT line so
+# the predicate's P1 #1 exact-head binding passes (PR #328 / bze8.1).
+LIVE_HEAD="0123456789abcdef0123456789abcdef01234567"
+
 # emit a synthetic GATE_ASSESSMENT line that the guard can grep against
 emit_assessment() { # <gates_json>
-  printf '{"timestamp":"2026-07-07T00:00:00Z","eventType":"GATE_ASSESSMENT","bead_id":"x","attempt":1,"state":"ATTESTED","context":{"pr_number":%d,"gates":%s,"all_green":true}}\n' "$PR_NUM" "$1" > "$LOG"
+  printf '{"timestamp":"2026-07-07T00:00:00Z","eventType":"GATE_ASSESSMENT","bead_id":"x","attempt":1,"state":"ATTESTED","context":{"pr_number":%d,"gates":%s,"all_green":true,"head_sha":"%s"}}\n' "$PR_NUM" "$1" "$LIVE_HEAD" > "$LOG"
 }
 
 # Extract the predicate as a standalone command via. Reuses the exact
-# python heredoc block that lives at lines 41-69 of the production
-# script (line 40 is the bash `printf ... | python3 -c '` wrapper and
-# line 70 is the trailing `'` close-quote, neither of which Python
-# accepts inside `-c`).
-predicate_block="$(sed -n '41,69p' "$GUARD")"
+# python heredoc block that lives at lines 41-105 of the production
+# script (PR #328 / bze8.1 added head_sha / canonical gate-key set /
+# operator_disposition; line 40 is the bash `printf ... | python3 -c '`
+# wrapper and line 106 is the trailing `'"$live_head"` close-arg, neither
+# of which Python accepts inside `-c`).
+predicate_block="$(sed -n '41,104p' "$GUARD" | sed 's/^  //')"
 
 run_predicate() { # <input_json>
-  printf '%s' "$1" | python3 -c "$predicate_block"
+  printf '%s' "$1" | python3 -c "$predicate_block" "$LIVE_HEAD"
 }
 
 echo "=== auto-merge-guard: gate vocabulary predicate ==="

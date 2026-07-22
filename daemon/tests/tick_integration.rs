@@ -7124,19 +7124,28 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     let predicate_block: String = guard_src
         .lines()
         .skip(40) // 0-indexed: line 41 (1-indexed) of auto-merge-guard.sh
-        .take(29) // lines 41..=69 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh's `sed -n '41,69p'`
+        .take(64) // lines 41..=104 inclusive, mirroring test_auto_merge_guard_gate_vocabulary.sh's `sed -n '41,104p'` (PR #328 / bze8.1 added head_sha / canonical gate-key set / operator_disposition)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
         predicate_block.contains("g.items()"),
         "extracted predicate block drifted from auto-merge-guard.sh's actual \
-         line range 41-69 (line numbers may have shifted); block:\n{predicate_block}"
+         line range 41-104 (line numbers may have shifted); block:\n{predicate_block}"
     );
 
     use std::io::Write as _;
+    // jleechan-328 P1 #1 (exact-head binding): the predicate reads the
+    // live head SHA from `sys.argv[1]` to refuse stale assessments.
+    // Pass the assessment's recorded `head_sha` so the live-head check
+    // matches and the predicate falls through to the cross-model verdict.
+    let predicate_live_head = context
+        .get("head_sha")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let mut child = std::process::Command::new("python3")
         .arg("-c")
         .arg(&predicate_block)
+        .arg(predicate_live_head)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -11221,4 +11230,166 @@ fn msmq_verifier_skips_reassessment_when_reroll_deferred() {
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
+}
+// --- jleechan-328 / bze8.1: P1 #1 (exact-head binding) + P1 #3 ---
+// (operator-disposition round-trip) daemon-side coverage. The shell-side
+// predicate (`daemon/scripts/auto-merge-guard.sh`'s
+// `latest_assessment_no_red`) refuses to honour an assessment whose
+// recorded `head_sha` no longer matches the live PR head, and reads
+// `operator_disposition` from the SAME key the daemon emits here.
+// These tests pin both fields in the GATE_ASSESSMENT context object so
+// the round-trip cannot silently regress.
+
+/// Helper: parse every GATE_ASSESSMENT line out of a telemetry log and
+/// return the JSON `context` object of the LAST one (the daemon emits
+/// one per ATTESTED bead per tick).
+fn last_gate_assessment_context(
+    log: &std::path::Path,
+) -> serde_json::Map<String, serde_json::Value> {
+    let raw = std::fs::read_to_string(log).unwrap_or_default();
+    let mut ctx: Option<serde_json::Map<String, serde_json::Value>> = None;
+    for line in raw.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if v.get("eventType").and_then(|s| s.as_str()) != Some("GATE_ASSESSMENT") {
+            continue;
+        }
+        if let Some(c) = v.get("context").and_then(|c| c.as_object()).cloned() {
+            ctx = Some(c);
+        }
+    }
+    ctx.unwrap_or_default()
+}
+
+#[test]
+fn jleechan328_gate_assessment_emits_head_sha_for_exact_head_binding() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // P1 #1: the assessment MUST carry the PR's current head SHA. We
+    // force a distinctive SHA so a regression that emits an empty or
+    // snapshot-fetched-from-a-different-PR value would diverge.
+    let pr_sha = "feedfacefeedfacefeedfacefeedfacefeedface";
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-headbind",
+        9103,
+        "factory/ev-headbind-r1",
+        &format!("**Evidence**: https://gist.github.com/u/goodgist (head {pr_sha})"),
+    );
+    scm.gists.insert("goodgist".into(), true);
+    // Override the snapshot's head_sha AFTER `evidence_bead` so the
+    // exact-head field has a deterministic, distinctive value to assert on.
+    scm.pr_snapshots.get_mut(&9103).unwrap().head_sha = pr_sha.into();
+
+    let telemetry_log = std::env::temp_dir().join("afd_yoqy_headbind.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let summary = run_tick(
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
+        1, 0,
+    )
+    .expect("tick must not error");
+    assert_eq!(summary.gates_assessed, 1);
+
+    let ctx = last_gate_assessment_context(&telemetry_log);
+    let emitted_head = ctx
+        .get("head_sha")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert_eq!(
+        emitted_head, pr_sha,
+        "GATE_ASSESSMENT context MUST carry the PR's current head_sha (P1 #1 \
+         exact-head binding); context:\n{ctx:?}"
+    );
+    // Canonical gate-key set (P1 #2): every GateName::as_str() value
+    // MUST be present in the emitted gates object — a regression that
+    // dropped a key would slip past a permissive shell predicate.
+    let gates = ctx
+        .get("gates")
+        .and_then(|v| v.as_object())
+        .expect("gates object missing");
+    for required in [
+        "ci_green",
+        "no_conflicts",
+        "coderabbit",
+        "bugbot",
+        "comments_resolved",
+        "evidence_review",
+        "skeptic",
+    ] {
+        assert!(
+            gates.contains_key(required),
+            "P1 #2 fail-closed canonical gate-key set: missing {required} in emitted gates"
+        );
+    }
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn jleechan328_gate_assessment_emits_operator_disposition_round_trip() {
+    // P1 #3 round-trip: the daemon reads `overlay.park_reason` and emits
+    // it under the SAME key the shell guard reads (`operator_disposition`).
+    // A regression that renamed either side (e.g. `park_reason_value`,
+    // `disposition`) would make the shell override unreachable.
+    for disposition in ["operator_approved", "operator_held", ""] {
+        let mut scm = FakeScm::new();
+        let tracker = FakeTracker::new();
+        let sessions = FakeSessions::new();
+        let llm = FakeLlm::new();
+        *llm.response.borrow_mut() = Some(Ok("pass".into()));
+        let store = FakeStateStore::new();
+        let cfg = test_cfg();
+        let vcs = FakeVcs::new();
+
+        let bead_id = format!("ev-disposition-{disposition}");
+        let pr = 9104u64;
+        let pr_sha = "feedfacefeedfacefeedfacefeedfacefeedface";
+        let body = format!("**Evidence**: https://gist.github.com/u/goodgist (head {pr_sha})");
+        evidence_bead(
+            &store,
+            &mut scm,
+            &bead_id,
+            pr,
+            &format!("factory/{bead_id}-r1"),
+            &body,
+        );
+        // Stamp the disposition under test onto the bead's `park_reason`:
+        // this is the producer site the daemon must read from.
+        let mut overlay = store.load(&bead_id).unwrap().unwrap();
+        overlay.park_reason = if disposition.is_empty() {
+            None
+        } else {
+            Some(disposition.into())
+        };
+        store.save(&overlay).unwrap();
+        scm.gists.insert("goodgist".into(), true);
+        scm.pr_snapshots.get_mut(&pr).unwrap().head_sha = pr_sha.into();
+
+        let telemetry_log = std::env::temp_dir().join(format!("afd_yoqy_disp_{disposition}.jsonl"));
+        let _ = std::fs::remove_file(&telemetry_log);
+        let summary = run_tick(
+            &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
+            1, 0,
+        )
+        .expect("tick must not error");
+        assert_eq!(summary.gates_assessed, 1);
+
+        let ctx = last_gate_assessment_context(&telemetry_log);
+        let emitted = ctx
+            .get("operator_disposition")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(
+            emitted, disposition,
+            "P1 #3 round-trip: daemon must emit operator_disposition={disposition:?} \
+             from overlay.park_reason; context:\n{ctx:?}"
+        );
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
 }

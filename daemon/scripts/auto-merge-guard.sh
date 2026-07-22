@@ -33,8 +33,8 @@ if [ "$recent" -ge "$MAX_PER_HOUR" ]; then
   exit 0
 fi
 
-latest_assessment_no_red() { # <pr_number> -> exit 0 if latest GATE_ASSESSMENT exists and has NO red/fail gate
-  local pr="$1" last
+latest_assessment_no_red() { # <pr_number> <live_head_sha> -> exit 0 if latest GATE_ASSESSMENT exists, matches the live PR head, and has NO red/fail gate
+  local pr="$1" live_head="$2" last
   last="$(grep '"eventType": *"GATE_ASSESSMENT"' "$LOG" 2>/dev/null | grep -E "\"pr_number\": *$pr[,}]" | tail -1)"
   [ -n "$last" ] || return 1                       # never assessed → block
   printf '%s' "$last" | python3 -c '
@@ -44,6 +44,24 @@ try:
     g = ctx["gates"]
 except Exception:
     sys.exit(1)                                    # unparseable → block
+# jleechan-328 P1 #1 (exact-head binding): refuse to honour an assessment
+# whose recorded head_sha no longer matches the live PR head. Without
+# this check, the timer-driven merge path can reuse an all-green
+# assessment from an OLDER head (a push after a green assessment would
+# merge with stale gate evidence). Missing head_sha fails closed —
+# freshness is unprovable, so we block.
+assessed_head = ctx.get("head_sha") or ""
+live_head = sys.argv[1] if len(sys.argv) > 1 else ""
+if not assessed_head:
+    print("STALE:HEAD_MISSING"); sys.exit(1)
+if live_head and assessed_head != live_head:
+    print("STALE:HEAD_MISMATCH:" + assessed_head[:12] + "->" + live_head[:12])
+    sys.exit(1)
+# jleechan-328 P1 #3 (operator disposition round-trip): single canonical
+# field emitted by tick.rs from overlay.park_reason. Surfaced here so the
+# shell override can read it from the same key the daemon emits; missing
+# → fall through to the standard no-red path (NOT a special token).
+operator_disposition = ctx.get("operator_disposition") or ""
 # jleechan-240 expand: gate values can be a string ("pass"|"warn"|"fail"|"unknown")
 # or a structured object {"verdict": "...", "evidence":[...]}; the merge-authority
 # guard must block on any fail verdict, not the literal "red" string the original
@@ -59,15 +77,32 @@ def verdict(v):
     if isinstance(v, dict):
         return ALIAS.get(v.get("verdict",""), v.get("verdict",""))
     return v
+# jleechan-328 P1 #2 (fail-closed canonical gate-key set): a 1-key
+# `{"ci_green":"pass"}` subset MUST NOT pass — the predicate must prove
+# every canonical gate was actually assessed before strict-all-green can
+# hold. Canonical set is `daemon/src/verifier.rs::GateName::as_str()`,
+# kept in lockstep with `daemon/factory-overlay.sh` REQUIRED_KEYS and
+# `tests/scripts/test_auto_merge_guard_gate_vocabulary.sh`. Extra keys
+# (code_standards / zfc) are still permitted as optional overlays; only
+# the *absence* of a required key blocks the merge.
+REQUIRED = {"ci_green","no_conflicts","coderabbit","bugbot",
+            "comments_resolved","evidence_review","skeptic"}
+present = set(g.keys())
+missing = sorted(REQUIRED - present)
+if missing:
+    print("FAIL:SUBSET_MISSING:" + ",".join(missing)); sys.exit(1)
 fails = [k for k,v in g.items() if verdict(v) == "fail"]
 if fails:
     print("FAIL:" + ",".join(fails)); sys.exit(1)   # any fail → block
 unknowns = [k for k,v in g.items() if verdict(v) == "unknown"]
+suffix = ""
+if operator_disposition:
+    suffix = " operator_disposition=" + operator_disposition
 if unknowns:
-    print("no-fail (unknowns defer: " + ",".join(unknowns) + ")")
+    print("no-fail (unknowns defer: " + ",".join(unknowns) + ")" + suffix)
 else:
-    print("no-fail (all gates cleared)")
-sys.exit(0)'
+    print("no-fail (all gates cleared)" + suffix)
+sys.exit(0)' "$live_head"
 }
 
 gh pr list --repo "$REPO" --state open --json number,headRefName \
@@ -77,7 +112,12 @@ while read -r num branch; do
   checks="$(gh pr checks "$num" --repo "$REPO" 2>/dev/null)"
   echo "$checks" | grep -qiE "pending|queued|in_progress" && { echo "PR $num: CI pending — skip"; continue; }
   echo "$checks" | grep -qi "fail" && { echo "PR $num: CI FAILED — skip (needs attention)"; continue; }
-  verdict="$(latest_assessment_no_red "$num")" || { echo "PR $num: verifier assessment ${verdict:-missing} — refusing merge (green CI is insufficient)"; continue; }
+  # jleechan-328 P1 #1: pass the LIVE PR head SHA so the predicate can
+  # refuse stale assessments (the daemon emits `head_sha` in every
+  # GATE_ASSESSMENT context; without the comparison a push after a green
+  # assessment would merge with stale gate evidence).
+  live_head_sha="$(gh pr view "$num" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null || true)"
+  verdict="$(latest_assessment_no_red "$num" "$live_head_sha")" || { echo "PR $num: verifier assessment ${verdict:-missing} — refusing merge (green CI is insufficient)"; continue; }
   echo "PR $num: assessment $verdict"
   # mergeable?
   [ "$(gh pr view "$num" --repo "$REPO" --json mergeable --jq .mergeable)" = "MERGEABLE" ] || { echo "PR $num: not MERGEABLE (conflicts) — skip"; continue; }
