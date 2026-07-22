@@ -188,7 +188,11 @@ impl Scm for NoopAdapters {
     fn labeled_issues(&self, _label: &str) -> Result<Vec<Issue>, DaemonError> {
         Ok(Vec::new())
     }
-    fn labeled_prs(&self, _label: &str) -> Result<Vec<daemon::tools::LabeledPr>, DaemonError> {
+    fn labeled_prs(
+        &self,
+        _label: &str,
+        _gh_calls: &mut u32,
+    ) -> Result<Vec<daemon::tools::LabeledPr>, DaemonError> {
         Ok(Vec::new())
     }
     fn collaborator_permission(&self, _login: &str) -> Result<Permission, DaemonError> {

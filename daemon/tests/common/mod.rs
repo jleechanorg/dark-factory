@@ -233,7 +233,13 @@ impl Scm for FakeScm {
         Ok(self.issues.clone())
     }
 
-    fn labeled_prs(&self, label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
+    fn labeled_prs(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
+        // jtg8-r5: count this list query toward the slow-tier
+        // `gh_call_count` metric — the fake doesn't shell out, so a
+        // single increment matches the primary `gh pr list` path
+        // (REST-fallback per-PR calls aren't reached here, since the
+        // fake short-circuits `labeled_prs_via_rest` entirely).
+        *gh_calls += 1;
         self.calls
             .borrow_mut()
             .push(format!("labeled_prs({label})"));

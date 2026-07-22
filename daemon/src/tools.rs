@@ -405,7 +405,15 @@ pub trait Tracker {
 /// TTL caches for repeated tick reads; a durable ETag cache is not wired yet.
 pub trait Scm {
     fn labeled_issues(&self, label: &str) -> Result<Vec<Issue>, DaemonError>;
-    fn labeled_prs(&self, label: &str) -> Result<Vec<LabeledPr>, DaemonError>;
+    /// Fetch labeled PRs. `gh_calls` is incremented by every `gh` (or
+    /// equivalent) subprocess the implementation makes — including the
+    /// REST fallback's per-PR `pulls/{n}` calls. The intake code adds
+    /// this into `IntakeProbeMetrics.gh_call_count` so the slow-tier
+    /// `INTAKE_GH_CALL_WARN_THRESHOLD` warning reflects real subprocess
+    /// invocations rather than counting the list query as 1 while
+    /// silently burning O(N) on the REST fallback (bead jtg8-r5, codex
+    /// P2 review "Count REST fallback subprocesses in gh metrics").
+    fn labeled_prs(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError>;
     fn collaborator_permission(&self, login: &str) -> Result<Permission, DaemonError>;
     fn pr_snapshot(&self, pr: u64) -> Result<PrSnapshot, DaemonError>;
     /// Repo-scoped variant of [`pr_snapshot`](Scm::pr_snapshot) (bead

@@ -5,8 +5,9 @@ mod common;
 
 use common::{FakeScm, FakeTracker};
 use daemon::config::Config;
+use daemon::errors::DaemonError;
 use daemon::intake::{self, IntakeVerdict};
-use daemon::tools::{Bead, Issue, LabeledPr, Permission};
+use daemon::tools::{Bead, Issue, LabeledPr, Permission, PrSnapshot, Scm};
 
 fn test_cfg() -> Config {
     Config {
@@ -908,5 +909,254 @@ fn probe_cache_keys_on_external_ref_head_sha_and_updated_at() {
     assert!(
         !cache.contains(&k1_new_time),
         "updated_at change must produce a new key (cache miss)"
+    );
+}
+
+// jtg8-r5 TDD red tests =====================================================
+//
+// r5 closes three remaining codex P2 review items left open on PR #455 (r4):
+//   1. REST fallback (`labeled_prs_via_rest`) must populate `head_sha` from
+//      `head.sha` (the real GitHub REST `/pulls/{n}` shape), not from a
+//      non-existent top-level `head_sha` field. Test lives in
+//      `adapters_integration.rs` because it's pure deserialization logic.
+//   2. AdoptionProbeCache entries with INCOMPLETE keys (None for any of
+//      `head_sha` / `updated_at_epoch`) must NOT be served as cache hits.
+//      The r4 cache stores entries whose key has `None` fields, and
+//      `contains_fresh` returns true on subsequent ticks; the r3 P2 review
+//      "Avoid caching PRs without complete cache keys" called this out
+//      because it silently turns an "uncacheable PR" into a stale-skip
+//      forever. Fix: `cache.insert` must refuse incomplete keys; tests
+//      below pin both halves (the API contract AND the integration path
+//      through `normalize_labeled_prs_outcome`).
+//   3. `IntakeProbeMetrics.gh_call_count` must count REAL `gh` subprocess
+//      invocations including the REST fallback's per-PR `pulls/{n}` calls.
+//      r4 only counted the list query (1); codex's P2 review "Count REST
+//      fallback subprocesses in gh metrics" flagged this because the
+//      slow-tier `gh_call_count >= INTAKE_GH_CALL_WARN_THRESHOLD` warning
+//      could never fire under the REST path. Fix: plumb `&mut gh_calls`
+//      through `Scm::labeled_prs` so each impl records its own invocations.
+
+/// r5 red test #2a: `AdoptionProbeCache::insert` MUST refuse keys with
+/// `None` fields. PR rows whose upstream `gh pr list` (or REST fallback)
+/// payload lacks `head_sha` / `updated_at_epoch` are "uncacheable" per
+/// the r4 docs — caching them would silently serve stale decisions on
+/// the next tick even though we have no signal to invalidate them.
+#[test]
+fn adoption_probe_cache_refuses_incomplete_keys() {
+    let mut cache = AdoptionProbeCache::new();
+    let now = 1_700_000_000;
+
+    // Complete key (Some, Some) — insert succeeds and is served back.
+    let pr_complete = labeled_pr_with_cache_key(101, "alice", "feature/pr-101", "sha-complete", 1_700_000_000);
+    let key_complete = ProbeCacheKey::from_pr(&pr_complete);
+    cache.insert(
+        key_complete.clone(),
+        CachedDecisionKind::AuthorPermission(Permission::Write),
+        now,
+    );
+    assert!(
+        cache.contains_fresh(&key_complete, now),
+        "complete-key insert must be a cache hit"
+    );
+
+    // Incomplete key: head_sha = None. Insert MUST be a no-op (the cache
+    // entry stays empty) so the daemon falls through to a fresh probe
+    // every tick instead of replaying a stale decision.
+    let mut pr_no_sha = pr_complete.clone();
+    pr_no_sha.head_sha = None;
+    let key_no_sha = ProbeCacheKey::from_pr(&pr_no_sha);
+    cache.insert(
+        key_no_sha.clone(),
+        CachedDecisionKind::AuthorPermission(Permission::Write),
+        now,
+    );
+    assert!(
+        !cache.contains(&key_no_sha),
+        "head_sha=None cache insert must be a no-op (uncacheable PR)"
+    );
+
+    // Incomplete key: updated_at_epoch = None. Same gate.
+    let mut pr_no_time = pr_complete.clone();
+    pr_no_time.updated_at_epoch = None;
+    let key_no_time = ProbeCacheKey::from_pr(&pr_no_time);
+    cache.insert(
+        key_no_time.clone(),
+        CachedDecisionKind::AuthorPermission(Permission::Write),
+        now,
+    );
+    assert!(
+        !cache.contains(&key_no_time),
+        "updated_at_epoch=None cache insert must be a no-op (uncacheable PR)"
+    );
+
+    // The complete-key entry is still served — refused inserts must NOT
+    // evict valid entries.
+    assert!(
+        cache.contains_fresh(&key_complete, now),
+        "refused inserts must not evict pre-existing complete-key entries"
+    );
+}
+
+/// r5 red test #2b: integration path — a PR whose REST fallback populates
+/// `head_sha = None` must NOT be served from cache on the second tick.
+/// Without the r5 fix, the r4 code stores the decision under
+/// `(external_ref, None, _)` and `contains_fresh` returns true, so tick 2
+/// skips the probe even though we have no signal to invalidate the
+/// decision.
+#[test]
+fn incomplete_key_pr_is_reprobed_every_tick() {
+    let mut scm = FakeScm::new();
+    // Script a PR with NO head_sha — simulating the r4 REST-fallback
+    // bug where `RestPullExt` looks for a non-existent top-level field.
+    let mut pr = labeled_pr_with_cache_key(901, "alice", "feature/pr-901", "sha-901", 1_700_000_000);
+    pr.head_sha = None;
+    pr.updated_at_epoch = Some(1_700_000_005);
+    scm.prs.push(pr);
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+    let mut cache = AdoptionProbeCache::new();
+
+    // Tick 1: probes alice (cache miss).
+    let _ = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+    )
+    .unwrap();
+
+    let tick1_perm_calls = scm
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| c.starts_with("collaborator_permission("))
+        .count();
+    assert_eq!(
+        tick1_perm_calls, 1,
+        "tick 1 must probe alice's permission exactly once (incomplete key, no cache hit possible)"
+    );
+
+    // Tick 2: same PR list, same incomplete key. r4 cached the decision
+    // under (external_ref, None, _), so a probe-skip would silently
+    // replay the stale Read tier (or whatever was first cached). The r5
+    // fix: refuse to cache incomplete keys, so tick 2 MUST re-probe.
+    scm.calls.borrow_mut().clear();
+    let _ = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+    )
+    .unwrap();
+
+    let tick2_perm_calls = scm
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| c.starts_with("collaborator_permission("))
+        .count();
+    assert_eq!(
+        tick2_perm_calls, 1,
+        "tick 2 must re-probe alice's permission because the cache key is incomplete (head_sha=None)"
+    );
+}
+
+/// r5 red test #3: `IntakeProbeMetrics.gh_call_count` must reflect REAL
+/// `gh` subprocess invocations including the per-PR REST fallback calls.
+/// The r4 design only counts the list query (1), so the
+/// `INTAKE_GH_CALL_WARN_THRESHOLD` warning never fires when `labeled_prs`
+/// falls back to `labeled_prs_via_rest` and burns N+1 core API calls per
+/// tick. This test pins the contract via the `Scm` trait plumbing — the
+/// `&mut gh_calls` parameter is incremented by every `run_tool` (or
+/// equivalent fake) inside `labeled_prs`, so the intake-side metric
+/// matches what actually crossed the daemon's tool boundary.
+///
+/// `FakeScm` doesn't shell out, so its `labeled_prs` increments the
+/// counter exactly once. The test simulates the REST fallback by having
+/// `FakeScm::labeled_prs` route through a scripted multi-call path that
+/// records (list query + 2 per-PR calls) into the counter — proving the
+/// metric reflects real subprocess invocations, not just a constant `1`.
+#[test]
+fn intake_metrics_gh_call_count_counts_real_subprocesses() {
+    use std::cell::Cell;
+
+    /// Scm impl that mimics the REST-fallback path: one `labeled_prs`
+    /// call results in multiple "subprocess" calls (the list query +
+    /// one `pulls/{n}` per PR). The count is reported via `&mut gh_calls`.
+    struct RestFallbackScm {
+        #[allow(dead_code)]
+        gh_calls: Cell<u32>,
+        recorded_calls: std::cell::RefCell<Vec<String>>,
+    }
+    impl RestFallbackScm {
+        fn new() -> Self {
+            Self {
+                gh_calls: Cell::new(0),
+                recorded_calls: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+    impl Scm for RestFallbackScm {
+        fn labeled_issues(&self, _label: &str) -> Result<Vec<Issue>, DaemonError> {
+            Ok(Vec::new())
+        }
+        fn labeled_prs(
+            &self,
+            label: &str,
+            gh_calls: &mut u32,
+        ) -> Result<Vec<LabeledPr>, DaemonError> {
+            // Mirrors the real REST fallback: 1 list query + 2 per-PR pulls.
+            *gh_calls += 1;
+            self.recorded_calls
+                .borrow_mut()
+                .push(format!("labeled_prs({label})"));
+            *gh_calls += 1;
+            self.recorded_calls.borrow_mut().push("pulls/1".into());
+            *gh_calls += 1;
+            self.recorded_calls.borrow_mut().push("pulls/2".into());
+            Ok(Vec::new())
+        }
+        fn collaborator_permission(
+            &self,
+            _login: &str,
+        ) -> Result<Permission, DaemonError> {
+            Ok(Permission::Write)
+        }
+        fn pr_snapshot(&self, _pr: u64) -> Result<PrSnapshot, DaemonError> {
+            unimplemented!()
+        }
+        fn close_pr(&self, _pr: u64, _comment: &str) -> Result<(), DaemonError> {
+            unimplemented!()
+        }
+        fn remote_branch_last_commit(&self, _branch: &str) -> Result<Option<u64>, DaemonError> {
+            unimplemented!()
+        }
+    }
+
+    let scm = RestFallbackScm::new();
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+    let mut cache = AdoptionProbeCache::new();
+
+    let outcome = intake::normalize_labeled_prs_outcome(
+        &scm,
+        &tracker,
+        &cfg,
+        &mut cache,
+        1_700_000_000,
+    )
+    .unwrap();
+
+    // The slow-tier metric MUST reflect the 3 real subprocess invocations
+    // (1 list + 2 per-PR pulls), not the r4 behavior of reporting `1`.
+    assert_eq!(
+        outcome.metrics.gh_call_count, 3,
+        "gh_call_count must equal the number of real subprocess invocations, \
+         including REST fallback per-PR pulls; got {}",
+        outcome.metrics.gh_call_count
     );
 }

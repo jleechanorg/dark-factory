@@ -95,6 +95,20 @@ impl ProbeCacheKey {
             updated_at_epoch: pr.updated_at_epoch,
         }
     }
+
+    /// jtg8-r5 (codex P2 "Avoid caching PRs without complete cache keys"):
+    /// a cache key is only usable for invalidation when ALL three fields
+    /// are populated. Any `None` field means "the upstream `gh pr list`
+    /// (or REST fallback) didn't return enough information to detect
+    /// changes" — caching under such a key would silently replay a stale
+    /// decision across ticks because we have no signal to invalidate on.
+    /// The r4 cache stored entries with `None` fields; the r5 fix gates
+    /// `cache.insert` on this predicate so incomplete-key PRs are
+    /// re-probed every tick (preserving pre-r4 behavior on schema-drifted
+    /// upstream payloads).
+    pub fn is_complete(&self) -> bool {
+        self.head_sha.is_some() && self.updated_at_epoch.is_some()
+    }
 }
 
 /// Cache entry — one row per (PR, cache-key) the slow tier has probed.
@@ -234,12 +248,23 @@ impl AdoptionProbeCache {
     /// Record a decision. Overwrites any prior entry for this key
     /// (idempotent within a single tick — `normalize_labeled_prs_with_cache`
     /// writes the entry only once per PR per pass).
+    ///
+    /// jtg8-r5 (codex P2 "Avoid caching PRs without complete cache keys"):
+    /// returns `false` and leaves the cache untouched when `key` has any
+    /// `None` field. The caller treats the insert as a no-op so the next
+    /// tick falls through to a fresh probe (preserves pre-r4 behavior on
+    /// schema-drifted upstream payloads that don't carry `head_sha` /
+    /// `updated_at_epoch`). Returns `true` on a real insert so callers /
+    /// tests can distinguish the two paths.
     pub fn insert(
         &mut self,
         key: ProbeCacheKey,
         decision: CachedDecisionKind,
         now_epoch: u64,
-    ) {
+    ) -> bool {
+        if !key.is_complete() {
+            return false;
+        }
         self.decisions.insert(
             key,
             CachedProbeDecision {
@@ -247,6 +272,7 @@ impl AdoptionProbeCache {
                 cached_at_epoch: now_epoch,
             },
         );
+        true
     }
 
     /// Drop entries older than `max_age_secs` from the cache. Defensive —
@@ -419,8 +445,15 @@ pub fn normalize_labeled_prs_outcome(
     now_epoch: u64,
 ) -> Result<LabeledPrsIntakeOutcome, DaemonError> {
     let mut metrics = IntakeProbeMetrics::default();
-    let prs_result = scm.labeled_prs(FACTORY_LABEL);
-    metrics.gh_call_count += 1;
+    // jtg8-r5: plumb the metric into `labeled_prs` so the REST fallback's
+    // per-PR `pulls/{n}` calls are reflected in `gh_call_count` (r4 only
+    // counted this single list-query increment, so the slow-tier
+    // `INTAKE_GH_CALL_WARN_THRESHOLD` warning never fired when the daemon
+    // was burning O(N) core API calls via the fallback path).
+    let prs_result = scm.labeled_prs(FACTORY_LABEL, &mut metrics.gh_call_count);
+    // Even on rate-limit, the impl incremented `gh_call_count` once for
+    // the failed list query — surface that in the metric so the warning
+    // sees the actual failure mode.
     let prs = match prs_result {
         Ok(p) => p,
         Err(e) if e.is_gh_rate_limit() => {
@@ -797,7 +830,13 @@ pub fn normalize_labeled_prs(
     tracker: &dyn Tracker,
     cfg: &Config,
 ) -> Result<(Vec<ExistingPrIntake>, Vec<IntakeOutcome>), DaemonError> {
-    let prs = scm.labeled_prs(FACTORY_LABEL)?;
+    // jtg8-r5: pass a counter into `labeled_prs` so any REST-fallback
+    // per-PR pulls show up in the metric alongside the list query (the
+    // legacy `normalize_labeled_prs` path doesn't surface the metric to
+    // telemetry, but the trait signature must stay uniform across both
+    // callers to avoid drift).
+    let mut legacy_gh_calls: u32 = 0;
+    let prs = scm.labeled_prs(FACTORY_LABEL, &mut legacy_gh_calls)?;
     if prs.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
