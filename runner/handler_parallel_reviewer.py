@@ -237,6 +237,36 @@ def _enforce_reproduction_receipt(result: "Result") -> "Result":
     )
 
 
+def _enforce_reproduction_receipt_for_lane(result: "Result", *, lane_name: str) -> "Result":
+    """Per-lane reproduction-receipt check (issue #425 / finding 4).
+
+    ``handler_dispatch._finish_shadow_gate_review`` concatenates primary and
+    shadow transcripts; the legacy combined-text receipt check then blessed
+    any lane whose concatenated downstream text contained a receipt. That
+    let a read-only primary PASS survive when a shadow happened to reproduce.
+    Per-lane enforcement runs the receipt gap on the SINGLE lane's transcript
+    BEFORE concatenation, so a lane without its own receipt fails that lane
+    regardless of what other lanes produced.
+
+    Records ``receipt_gap_lane`` so audit readers can pinpoint the failing
+    lane and ``receipt_downgraded`` for downstream coalescing. The
+    ``receipt_gap`` text is preserved verbatim.
+    """
+    adjusted = _enforce_reproduction_receipt(result)
+    if adjusted is result:
+        return result
+    new_md = dict(adjusted.metadata or {})
+    new_md["receipt_gap_lane"] = lane_name
+    return Result(
+        outcome=adjusted.outcome,
+        output=adjusted.output,
+        metadata=new_md,
+        preferred_label=adjusted.preferred_label,
+        suggested_next_ids=adjusted.suggested_next_ids,
+        context_updates=adjusted.context_updates,
+    )
+
+
 def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     """Run parallel reviewer lanes and pass combined evidence downstream."""
     import runner.handlers as _handlers_shim  # late-bound shim for monkeypatched helpers
@@ -304,14 +334,74 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
             primary, gate_strict=gate_strict,
         )
         if _receipt_required_flag(node):
-            primary = _enforce_reproduction_receipt(primary)
+            # Per-lane (issue #425 / finding 4): the primary lane must carry
+            # its own reproduction receipt BEFORE any transcript aggregation.
+            primary = _enforce_reproduction_receipt_for_lane(
+                primary, lane_name="primary",
+            )
         return primary
 
     result = primary
     shadow_outcomes = []
+    shadow_lane_outcomes: list[str] = []
+    if _receipt_required_flag(node):
+        # Per-lane receipt enforcement (issue #425 / finding 4). Run BEFORE
+        # transcript concatenation in ``_finish_shadow_gate_review`` so a
+        # read-only primary cannot be saved by a shadow's reproduction. The
+        # shadow's own transcript is recorded in
+        # ``ctx.state[<node>.shadow_<backend>_gate_output]`` and used here as
+        # the single-lane text for receipt gap analysis.
+        primary = _enforce_reproduction_receipt_for_lane(
+            primary, lane_name="primary",
+        )
+        if primary.outcome == "failure":
+            # Record the lane outcome so downstream coalescing reflects the
+            # primary failure rather than the shadow's success.
+            primary_lane_outcome = "failure"
+        else:
+            primary_lane_outcome = primary.outcome
+        shadow_lane_outcomes.append(primary_lane_outcome)
     for shadow in shadows:
         result = _finish_shadow_gate_review(result, shadow, node.name, expected_sha, timeout, ctx)
-        shadow_outcomes.append(str(result.metadata.get(f"shadow_{shadow.backend}_gate_outcome", "unknown")))
+        if _receipt_required_flag(node):
+            # Per-lane: each shadow must reproduce on its own transcript.
+            # ``_finish_shadow_gate_review`` stores the shadow's single-lane
+            # transcript in ``context_updates[<node>.shadow_<backend>_gate_output]``;
+            # we read it from there so the receipt gap is computed on the
+            # shadow's own text, NOT the concatenated downstream output.
+            shadow_output = str(
+                result.context_updates.get(f"{node.name}.shadow_{shadow.backend}_gate_output", "") or ""
+            )
+            shadow_result_for_receipt = Result(
+                outcome="success",
+                output=shadow_output,
+                metadata={"verdict": "pass"},
+            )
+            adjusted = _enforce_reproduction_receipt_for_lane(
+                shadow_result_for_receipt,
+                lane_name=f"shadow_{shadow.backend}",
+            )
+            if adjusted.outcome == "failure":
+                # Apply the shadow lane outcome to the merged result so
+                # downstream coalescing sees the per-lane failure.
+                md = dict(result.metadata)
+                md[f"shadow_{shadow.backend}_gate_outcome"] = "failure"
+                md[f"shadow_{shadow.backend}_gate_verdict"] = "fail"
+                md["receipt_downgraded"] = "true"
+                md["receipt_gap_lane"] = f"shadow_{shadow.backend}"
+                result = Result(
+                    outcome="failure",
+                    output=result.output,
+                    metadata=md,
+                    preferred_label=result.preferred_label,
+                    suggested_next_ids=result.suggested_next_ids,
+                    context_updates=result.context_updates,
+                )
+                shadow_outcomes.append("failure")
+            else:
+                shadow_outcomes.append(str(result.metadata.get(f"shadow_{shadow.backend}_gate_outcome", "unknown")))
+        else:
+            shadow_outcomes.append(str(result.metadata.get(f"shadow_{shadow.backend}_gate_outcome", "unknown")))
     final_outcome = _coalesce_parallel_outcome(primary.outcome, shadow_outcomes)
     shadow_reviews = {
         s.backend: {
@@ -337,6 +427,10 @@ def _parallel_reviewer(node: "Node", ctx: "Context") -> "Result":
     final_result = _handlers_shim._enforce_outcome_verdict_consistency(
         final_result, gate_strict=gate_strict,
     )
-    if _receipt_required_flag(node):
+    # Combined-text receipt check is now a no-op safety net; per-lane
+    # enforcement above is the gate (issue #425 / finding 4). Only run when
+    # all lanes passed per-lane so we still catch a transcript-level anomaly
+    # that slipped through lane-level checks (defense in depth).
+    if _receipt_required_flag(node) and final_result.outcome == "success":
         final_result = _enforce_reproduction_receipt(final_result)
     return final_result
