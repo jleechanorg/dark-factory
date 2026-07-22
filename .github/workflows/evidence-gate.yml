@@ -59,13 +59,20 @@ jobs:
         run: |
           cat <<'EOF'
           Ironclad binding: for runner/daemon/.github/workflows/ changes, the PR must
-          satisfy /green 7-PRODUCTION tier:
+          satisfy /green 8-PRODUCTION tier. The 8 gates mirror the canonical
+          `GateName` set in `daemon/src/verifier.rs` and the `REQUIRED_KEYS`
+          contract in `daemon/factory-overlay.sh`:
             1. CI green
             2. No merge conflicts
             3. CodeRabbit APPROVED
             4. Bugbot clean (zero error-severity)
             5. Inline comments resolved
             6. /er Evidence review PASS (this gate's parent trigger)
+            7. Skeptic (daemon-side, see `daemon/src/verifier.rs::GateName::Skeptic`
+               and the deleted `.github/workflows/skeptic-gate.yml` from PR #407 —
+               the GH workflow was removed; the daemon gate remains)
+            8. Vacuous red/green (daemon-side, runtime vacuous-test detector
+               added in PR #387 — `GateName::VacuousRedGreen`)
           The /er command on the PR fetches the evidence-review-bot verdict.
           EOF
 
