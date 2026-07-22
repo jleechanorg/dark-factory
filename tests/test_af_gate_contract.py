@@ -199,6 +199,101 @@ def test_no_direct_sqlite3_mutation_in_docs():
     print("✓ No direct sqlite3 mutation instructions in operator docs")
 
 
+def test_auto_merge_guard_required_keys_match_verifier():
+    """Pin daemon/scripts/auto-merge-guard.sh's predicate REQUIRED set to verifier.rs.
+
+    Background (jleechan-ni1k / issue #437 P2): PR #431 added gate 8
+    (`vacuous_red_green`) to `daemon/src/verifier.rs` and
+    `daemon/factory-overlay.sh`'s REQUIRED_KEYS, but
+    `daemon/scripts/auto-merge-guard.sh`'s predicate `REQUIRED` set was
+    left at 7 keys. A 7-key report that passed every other gate could
+    still strict-green because the predicate never required the runtime
+    vacuous-test detector's verdict. This contract test pins the guard's
+    REQUIRED set to the verifier's GateName enum (canonical source:
+    `daemon/src/verifier.rs::GateName::as_str`) so future gate additions
+    cannot drift one consumer from the others.
+    """
+    gates = extract_gate_names_from_rust()
+    guard_path = ROOT / "daemon" / "scripts" / "auto-merge-guard.sh"
+    content = guard_path.read_text()
+
+    # Extract the predicate's REQUIRED set. The guard has TWO sets in
+    # scope: REQUIRED (inside the python heredoc, used by the gate
+    # predicate) and the outer bash variable names. Match the python
+    # set literal (single-line `REQUIRED = {...}`).
+    required_match = re.search(
+        r'REQUIRED\s*=\s*\{([^}]+)\}',
+        content,
+    )
+    if not required_match:
+        raise AssertionError(
+            "Could not find REQUIRED set in auto-merge-guard.sh — has the "
+            "predicate block been rewritten? Path: "
+            f"{guard_path}"
+        )
+
+    keys_str = required_match.group(1)
+    required_keys = set(re.findall(r'"(\w+)"', keys_str))
+
+    missing = gates - required_keys
+    extra = required_keys - gates
+
+    errors = []
+    if missing:
+        errors.append(
+            f"REQUIRED set missing canonical gates: {sorted(missing)}"
+        )
+    if extra:
+        errors.append(
+            f"REQUIRED set has extra keys not in verifier: {sorted(extra)}"
+        )
+
+    if errors:
+        raise AssertionError(
+            "auto-merge-guard.sh predicate REQUIRED drift:\n"
+            + "\n".join(errors)
+        )
+    print(
+        f"✓ auto-merge-guard.sh predicate REQUIRED set matches verifier: "
+        f"{sorted(required_keys)}"
+    )
+
+
+def test_auto_merge_guard_has_no_failopen_on_empty_live_head():
+    """Pin the P1 fail-closed contract on empty live_head_sha.
+
+    Background (jleechan-ni1k / issue #437 P1): the outer guard ran
+    `gh pr view ... --jq .headRefOid 2>/dev/null || true` which silently
+    swallowed an empty headRefOid response. The fix is to detect the
+    empty string, emit a distinct `STALE:LIVE_HEAD_MISSING` reason, and
+    refuse to merge. This contract test pins that:
+      1. The script contains the `STALE:LIVE_HEAD_MISSING` reason token.
+      2. The script does NOT have `|| true` swallowing the headRefOid
+         lookup (the exact fail-open construct the fix targets).
+    """
+    guard_path = ROOT / "daemon" / "scripts" / "auto-merge-guard.sh"
+    content = guard_path.read_text()
+
+    errors = []
+    if "STALE:LIVE_HEAD_MISSING" not in content:
+        errors.append(
+            "auto-merge-guard.sh missing STALE:LIVE_HEAD_MISSING reason "
+            "(empty live_head_sha must fail-closed with a distinct token)"
+        )
+    if re.search(r"headRefOid[^\n]*\|\| *true", content):
+        errors.append(
+            "auto-merge-guard.sh still uses `|| true` to swallow empty "
+            "headRefOid — fail-open contract violated"
+        )
+
+    if errors:
+        raise AssertionError(
+            "auto-merge-guard.sh fail-open contract violation:\n"
+            + "\n".join(errors)
+        )
+    print("✓ auto-merge-guard.sh fail-closed on empty live_head_sha")
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
