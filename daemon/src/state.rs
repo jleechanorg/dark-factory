@@ -2496,6 +2496,394 @@ mod tests {
         assert_eq!(last_col, 1);
     }
 
+    /// Cross-model review P2 #2 (bead jleechan-n6mk, follow-up to PR #447):
+    /// the existing `open_migrates_legacy_db_missing_er_runner_columns` test
+    /// uses a 3-column `bead_overlay` stub — that hides migration regressions
+    /// in the long tail of `ensure_*_column` migrations and the disposition
+    /// CHECK rebuild, because a 3-column table can't exercise them. This test
+    /// uses a production-shaped fixture: a SQLite DB built from the EXACT
+    /// pre-PR-#447 schema (every column the current `schema.sql` declares,
+    /// EXCEPT the `escalation_ledger` table + its `terminal` column which
+    /// PR #447 introduces) populated with realistic rows in every table,
+    /// then asserts that `open()` migrates it to the current schema without
+    /// dropping, reordering, or rewriting any pre-existing row.
+    ///
+    /// The pre-PR-#447 fixture has the disposition-state CHECK missing
+    /// `DISPOSITION_REQUIRED` (which PR #387 introduced), so this test
+    /// simultaneously exercises the disposition-rebuild migration. Pre-PR-#447
+    /// legacy DBs are precisely the population that would hit that rebuild
+    /// path in production.
+    #[test]
+    fn open_migrates_production_shaped_legacy_db_preserves_every_row() {
+        use rusqlite::Connection;
+
+        // Tuple alias for the per-row overlay snapshot. The 11-element tuple
+        // is verbose enough to trip `clippy::type_complexity`, so we alias it
+        // here. The field order matches the SELECT in `pre_overlays` /
+        // `post_overlays`.
+        type OverlaySnapshotRow = (
+            String, // bead_id
+            String, // state
+            i64,    // attempt
+            Option<i64>,        // pr_number
+            Option<String>,     // branch
+            Option<String>,     // session_id
+            Option<String>,     // target_repo
+            Option<String>,     // park_reason
+            Option<String>,     // last_er_evidence_hash
+            Option<i64>,        // held_recheck_after
+            Option<String>,     // pre_session_head_sha
+        );
+
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "dark-factory-prod-shaped-migrate-{}-{}.sqlite",
+            std::process::id(),
+            now_iso8601().replace([':', '-', 'T', 'Z'], "")
+        ));
+        let _cleanup = TempFileGuard(path.clone());
+
+        // Build a production-shaped "legacy" DB: every table + column the
+        // current schema.sql declares, EXCEPT (a) `escalation_ledger` (PR
+        // #447 introduces it), and (b) the `terminal` column on
+        // `escalation_ledger` (PR #447 introduces it as a follow-up). The
+        // disposition CHECK is the pre-#387 variant (no
+        // `DISPOSITION_REQUIRED`) so the rebuild migration has real work to do.
+        //
+        // Column order in `bead_overlay` matches the canonical schema so
+        // any column-add migration is a `tail-append` (SQLite-safe) and
+        // doesn't trigger an unintended rebuild.
+        const LEGACY_SCHEMA: &str = r#"
+            CREATE TABLE bead_overlay (
+              bead_id       TEXT PRIMARY KEY,
+              state         TEXT NOT NULL CHECK (state IN
+                              ('QUEUED','DISPATCHING','DISPATCHED','ATTESTED','READY','RE_ROLL','RECOVERY',
+                               'REDISPATCHED','BUDGET_HELD','HUMAN_HELD')),
+              attempt       INTEGER NOT NULL DEFAULT 1,
+              reroll_count  INTEGER NOT NULL DEFAULT 0,
+              autonomy_secs INTEGER NOT NULL DEFAULT 0,
+              spend_usd     REAL    NOT NULL DEFAULT 0,
+              pr_number     INTEGER,
+              branch        TEXT,
+              session_id    TEXT,
+              updated_at    TEXT    NOT NULL,
+              attempt_er_runner_count INTEGER NOT NULL DEFAULT 0,
+              last_er_runner_attempt_at INTEGER,
+              is_adopted INTEGER NOT NULL DEFAULT 0,
+              spawn_failure_count INTEGER NOT NULL DEFAULT 0,
+              pre_session_head_sha TEXT,
+              park_reason TEXT,
+              target_repo TEXT,
+              reroll_deferral_count INTEGER NOT NULL DEFAULT 0,
+              held_recheck_after INTEGER,
+              last_er_evidence_hash TEXT
+            );
+            CREATE TABLE branch_registry (
+              branch     TEXT PRIMARY KEY,
+              bead_id    TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE review_rejection (
+              bead_id       TEXT NOT NULL,
+              attempt       INTEGER NOT NULL,
+              reviewer      TEXT NOT NULL,
+              feedback_hash TEXT NOT NULL,
+              feedback_text TEXT NOT NULL,
+              created_at    TEXT NOT NULL,
+              PRIMARY KEY (bead_id, attempt)
+            );
+            -- NOTE: no `escalation_ledger` table — that's what PR #447 adds.
+        "#;
+
+        // Seed realistic rows in every table. Each row is chosen so any of
+        // the migrations would visibly mangle it if they did a wrong table
+        // rebuild (e.g. NULL DEFAULTs being clobbered, CHECK constraint
+        // reordering altering the surviving set, etc.).
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(LEGACY_SCHEMA).unwrap();
+
+        // bead_overlay: cover every state value the legacy CHECK allows,
+        // plus every NOT-NULL column with a non-default value, plus every
+        // nullable column set to a non-NULL value (so a migration that
+        // dropped/reordered columns would change the visible row).
+        let mut inserted_overlays = Vec::new();
+        let mut seed_overlay = |bead_id: &str,
+                                state: &str,
+                                attempt: i64,
+                                pr_number: Option<i64>,
+                                branch: Option<&str>,
+                                session_id: Option<&str>,
+                                target_repo: Option<&str>,
+                                park_reason: Option<&str>,
+                                last_er_evidence_hash: Option<&str>,
+                                held_recheck_after: Option<i64>,
+                                pre_session_head_sha: Option<&str>| {
+            conn.execute(
+                "INSERT INTO bead_overlay \
+                 (bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
+                  pr_number, branch, session_id, updated_at, \
+                  attempt_er_runner_count, last_er_runner_attempt_at, is_adopted, \
+                  spawn_failure_count, pre_session_head_sha, park_reason, target_repo, \
+                  reroll_deferral_count, held_recheck_after, last_er_evidence_hash) \
+                 VALUES (?1, ?2, ?3, 0, 0, 0.0, ?4, ?5, ?6, '2026-07-22T00:00:00Z', \
+                         3, 1700000000, 1, 2, ?7, ?8, ?9, 4, ?10, ?11)",
+                rusqlite::params![
+                    bead_id, state, attempt, pr_number, branch, session_id,
+                    pre_session_head_sha, park_reason, target_repo,
+                    held_recheck_after, last_er_evidence_hash
+                ],
+            )
+            .unwrap();
+            inserted_overlays.push((
+                bead_id.to_string(),
+                state.to_string(),
+                attempt,
+                pr_number,
+                branch.map(String::from),
+                session_id.map(String::from),
+                target_repo.map(String::from),
+                park_reason.map(String::from),
+                last_er_evidence_hash.map(String::from),
+                held_recheck_after,
+                pre_session_head_sha.map(String::from),
+            ));
+        };
+
+        seed_overlay("bead-1", "QUEUED", 1, Some(101), Some("factory/bead-1-r1"), Some("sess-a"), Some("owner/repo1"), None, None, None, None);
+        seed_overlay("bead-2", "DISPATCHED", 2, Some(102), Some("factory/bead-2-r2"), Some("sess-b"), Some("owner/repo1"), None, Some("abc123"), None, None);
+        seed_overlay("bead-3", "ATTESTED", 3, Some(103), Some("factory/bead-3-r3"), Some("sess-c"), Some("owner/repo2"), None, None, Some(1700001000), Some("deadbeef1234"));
+        seed_overlay("bead-4", "READY", 4, Some(104), Some("factory/bead-4-r4"), None, None, None, Some("def456"), None, None);
+        seed_overlay("bead-5", "HUMAN_HELD", 10, Some(105), Some("factory/bead-5-r10"), None, None, Some("circuit-breaker-triggered"), None, None, None);
+        seed_overlay("bead-6", "DISPATCHING", 1, None, None, None, None, None, None, None, None);
+        seed_overlay("bead-7", "RE_ROLL", 2, Some(107), Some("factory/bead-7-r2"), Some("sess-g"), Some("owner/repo3"), None, None, None, None);
+        seed_overlay("bead-8", "RECOVERY", 3, Some(108), Some("factory/bead-8-r3"), None, Some("owner/repo3"), None, None, None, None);
+        seed_overlay("bead-9", "REDISPATCHED", 4, Some(109), Some("factory/bead-9-r4"), Some("sess-i"), Some("owner/repo1"), None, None, None, None);
+        seed_overlay("bead-10", "BUDGET_HELD", 5, Some(110), Some("factory/bead-10-r5"), None, None, Some("autonomy_timebox_exceeded"), None, Some(1700002000), None);
+
+        // branch_registry: a few rows that exercise the deletion-guard table.
+        conn.execute(
+            "INSERT INTO branch_registry (branch, bead_id, created_at) VALUES \
+             ('factory/bead-1-r1', 'bead-1', '2026-07-22T00:00:00Z'), \
+             ('factory/bead-2-r2', 'bead-2', '2026-07-22T00:00:01Z'), \
+             ('factory/bead-5-r10', 'bead-5', '2026-07-22T00:00:02Z')",
+            [],
+        ).unwrap();
+
+        // review_rejection: rows that exercise the per-bead rejection tracking.
+        conn.execute(
+            "INSERT INTO review_rejection (bead_id, attempt, reviewer, feedback_hash, feedback_text, created_at) VALUES \
+             ('bead-1', 1, 'cursor', 'hash-cursor-1', 'fake feedback 1', '2026-07-22T00:00:00Z'), \
+             ('bead-3', 3, 'coderabbit', 'hash-cr-3', 'fake feedback 3', '2026-07-22T00:00:01Z'), \
+             ('bead-5', 10, 'bugbot', 'hash-bb-10', 'fake feedback 5', '2026-07-22T00:00:02Z')",
+            [],
+        ).unwrap();
+
+        // Snapshot the entire DB before migration.
+        let pre_overlays: Vec<OverlaySnapshotRow> = {
+            let mut stmt = conn.prepare(
+                "SELECT bead_id, state, attempt, pr_number, branch, session_id, target_repo, \
+                        park_reason, last_er_evidence_hash, held_recheck_after, pre_session_head_sha \
+                 FROM bead_overlay ORDER BY bead_id",
+            ).unwrap();
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            }).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            pre_overlays.len(),
+            inserted_overlays.len(),
+            "fixture seed must round-trip pre-migration snapshot"
+        );
+
+        let pre_branches: Vec<(String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT branch, bead_id, created_at FROM branch_registry ORDER BY branch",
+            ).unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().map(|r| r.unwrap()).collect()
+        };
+        let pre_rejections: Vec<(String, i64, String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT bead_id, attempt, reviewer, feedback_hash, feedback_text, created_at \
+                 FROM review_rejection ORDER BY bead_id, attempt",
+            ).unwrap();
+            stmt.query_map([], |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))).unwrap().map(|r| r.unwrap()).collect()
+        };
+        drop(conn);
+
+        // ── Migrate: open() must apply every ensure_*_column + the disposition
+        //    rebuild + the escalation_ledger CREATE TABLE + the terminal
+        //    column ADD without losing any pre-existing row.
+        let _store = SqliteStateStore::open(&path).expect("production-shaped legacy DB must auto-migrate");
+
+        // Re-open: idempotency guard — second open() must NOT fail.
+        let _store2 = SqliteStateStore::open(&path).expect("second open must be idempotent");
+
+        let conn = Connection::open(&path).unwrap();
+
+        // 1) Every pre-existing bead_overlay row must be present with the
+        //    same per-column values. The migration only appends columns
+        //    with sensible defaults, so NULL values stay NULL and the
+        //    legacy CHECK migration can rewrite the table without losing
+        //    rows that survive the new (wider) CHECK constraint.
+        let post_overlays: Vec<OverlaySnapshotRow> = {
+            let mut stmt = conn.prepare(
+                "SELECT bead_id, state, attempt, pr_number, branch, session_id, target_repo, \
+                        park_reason, last_er_evidence_hash, held_recheck_after, pre_session_head_sha \
+                 FROM bead_overlay ORDER BY bead_id",
+            ).unwrap();
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            }).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            post_overlays, pre_overlays,
+            "every pre-existing bead_overlay row must be preserved byte-for-byte after migration; \
+             got pre={pre_overlays:?} post={post_overlays:?}"
+        );
+
+        // 2) branch_registry rows preserved.
+        let post_branches: Vec<(String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT branch, bead_id, created_at FROM branch_registry ORDER BY branch",
+            ).unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            post_branches, pre_branches,
+            "branch_registry rows must be preserved; got pre={pre_branches:?} post={post_branches:?}"
+        );
+
+        // 3) review_rejection rows preserved.
+        let post_rejections: Vec<(String, i64, String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT bead_id, attempt, reviewer, feedback_hash, feedback_text, created_at \
+                 FROM review_rejection ORDER BY bead_id, attempt",
+            ).unwrap();
+            stmt.query_map([], |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            post_rejections, pre_rejections,
+            "review_rejection rows must be preserved; got pre={pre_rejections:?} post={post_rejections:?}"
+        );
+
+        // 4) The new escalation_ledger table is present and empty
+        //    (migration does NOT backfill from review_rejection — the
+        //    ledger is populated lazily by `record_escalation_emit` on
+        //    the next escalation event).
+        let ledger_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM escalation_ledger", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ledger_count, 0, "escalation_ledger must start empty after migration");
+
+        // 5) The terminal column exists with the documented default (0).
+        //    `pragma_table_info.dflt_value` is TEXT (the literal SQL fragment
+        //    — "0", "NULL", or NULL for "no default"). For an `INTEGER NOT
+        //    NULL DEFAULT 0` column, that fragment is the string "0".
+        let terminal_default: String = conn
+            .query_row(
+                "SELECT COALESCE((SELECT \"dflt_value\" FROM pragma_table_info('escalation_ledger') \
+                                  WHERE name = 'terminal'), 'MISSING')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            terminal_default, "0",
+            "escalation_ledger.terminal must default to 0 (non-terminal)"
+        );
+
+        // 6) The bead_overlay CHECK constraint was widened by the disposition
+        //    rebuild — `DISPOSITION_REQUIRED` must now be insertable (it's
+        //    the only state value that proves the wider CHECK is live).
+        conn.execute(
+            "INSERT INTO bead_overlay \
+             (bead_id, state, attempt, updated_at) \
+             VALUES ('bead-new-disp', 'DISPOSITION_REQUIRED', 1, '2026-07-22T00:00:03Z')",
+            [],
+        ).expect("DISPOSITION_REQUIRED must be insertable after the disposition-rebuild migration");
+
+        // 7) The bead_overlay CHECK constraint still rejects garbage — pins
+        //    the constraint is wired up (not silently dropped).
+        let res = conn.execute(
+            "INSERT INTO bead_overlay \
+             (bead_id, state, attempt, updated_at) \
+             VALUES ('bead-bogus', 'NOT_A_REAL_STATE', 1, '2026-07-22T00:00:04Z')",
+            [],
+        );
+        assert!(
+            res.is_err(),
+            "CHECK constraint must still reject invalid state values after migration"
+        );
+
+        // 8) Row counts — the migration must NOT delete anything.
+        let overlay_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bead_overlay", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            overlay_count as usize,
+            inserted_overlays.len() + 1,
+            "bead_overlay must have {} seeded rows + 1 DISPOSITION_REQUIRED test row; got {}",
+            inserted_overlays.len(),
+            overlay_count
+        );
+
+        let branch_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM branch_registry", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            branch_count as usize,
+            pre_branches.len(),
+            "branch_registry must retain all pre-existing rows"
+        );
+
+        let rejection_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM review_rejection", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            rejection_count as usize,
+            pre_rejections.len(),
+            "review_rejection must retain all pre-existing rows"
+        );
+    }
+
     /// The real-SQLite policy requeues only retry-safe no-session rows under
     /// the cap and leaves capped or permanent rows held. The shell command
     /// delegates to this implementation so there is one recovery policy.
