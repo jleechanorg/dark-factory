@@ -170,6 +170,30 @@ impl DaemonError {
         }
     }
 
+    /// jtg8: True iff this error carries a `gh` 403 / API-rate-limit signal.
+    /// The gh CLI surfaces rate-limit exhaustion as either `gh: API rate
+    /// limit exceeded for installation ID ...` (GraphQL/REST) or as a
+    /// structured `gh api` 403 with the same phrase in stderr. The daemon
+    /// uses this predicate to short-circuit the slow-tier intake sweep
+    /// (degrade — skip the sweep, keep dispatch alive) WITHOUT triggering
+    /// the `consecutive_failures -> exponential backoff -> mass-park` loop
+    /// that the generic `is_transient()` arm drives. Live incident:
+    /// 2026-07-22 19:09-19:21 + 20:0x-20:2x — sustained rate-limit caused
+    /// 6 consecutive transient failures, 300s backoff each, starving every
+    /// other bead's fast-tier dispatch.
+    pub fn is_gh_rate_limit(&self) -> bool {
+        let DaemonError::Tool { tool, stderr, .. } = self else {
+            return false;
+        };
+        if tool != "gh" {
+            return false;
+        }
+        let lower = stderr.to_ascii_lowercase();
+        lower.contains("api rate limit exceeded")
+            || lower.contains("rate limit hit")
+            || (lower.contains("403") && lower.contains("rate limit"))
+    }
+
     /// Detects `br create --external-ref ...` failing because the ref is
     /// already tracked (`br`'s own uniqueness constraint on `external_ref`),
     /// e.g. `Error: Configuration error: External reference 'owner/repo#42'
@@ -425,5 +449,58 @@ mod tests {
             DaemonError::Parse("ao spawn --agent agy produced no SESSION= line".to_string()),
         )]);
         assert!(!err.is_transient());
+    }
+
+    /// jtg8: `is_gh_rate_limit()` is the dedicated predicate that detects a
+    /// 403/API-rate-limit on the `gh` CLI. The slow-tier intake sweep uses
+    /// this to skip a tick (no `consecutive_failures` bump) instead of
+    /// triggering the exponential-backoff retry loop.
+    #[test]
+    fn is_gh_rate_limit_detects_gh_api_rate_limit_exceeded() {
+        let err = DaemonError::Tool {
+            tool: "gh".to_string(),
+            rc: 1,
+            stderr: "gh: API rate limit exceeded for installation ID 12345".to_string(),
+        };
+        assert!(err.is_gh_rate_limit());
+    }
+
+    #[test]
+    fn is_gh_rate_limit_detects_403_with_rate_limit_keyword() {
+        let err = DaemonError::Tool {
+            tool: "gh".to_string(),
+            rc: 403,
+            stderr: "403 rate limit hit".to_string(),
+        };
+        assert!(err.is_gh_rate_limit());
+    }
+
+    #[test]
+    fn is_gh_rate_limit_false_for_non_gh_tool() {
+        let err = DaemonError::Tool {
+            tool: "br".to_string(),
+            rc: 1,
+            stderr: "API rate limit exceeded".to_string(),
+        };
+        assert!(
+            !err.is_gh_rate_limit(),
+            "non-gh tool with rate-limit-shape stderr must NOT trigger gh-rate-limit skip path"
+        );
+    }
+
+    #[test]
+    fn is_gh_rate_limit_false_for_unrelated_gh_error() {
+        let err = DaemonError::Tool {
+            tool: "gh".to_string(),
+            rc: 1,
+            stderr: "could not resolve host".to_string(),
+        };
+        assert!(!err.is_gh_rate_limit());
+    }
+
+    #[test]
+    fn is_gh_rate_limit_false_for_non_tool_error() {
+        let err = DaemonError::Timeout("gh list timed out".to_string());
+        assert!(!err.is_gh_rate_limit());
     }
 }

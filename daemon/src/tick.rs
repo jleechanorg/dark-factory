@@ -106,6 +106,14 @@ pub struct TickSummary {
 const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
 const ESCALATION_REVIEWER: &str = "dark-factory-escalation";
 const ESCALATION_SENTINEL_ATTEMPT: u32 = u32::MAX;
+// jtg8 acceptance #3: per-tick gh call count threshold above which the slow
+// tier logs a warning so operators can investigate before the core
+// rate-limit bucket exhausts. Pre-fix baseline was ~50 per slow tick
+// (one `gh api repos/.../pulls/N` call per factory-labeled PR plus the
+// per-PR `collaborator_permission` probe). Post-fix steady state is ~1
+// (the `gh pr list` query); per-PR probes are served from the adoption
+// probe cache. 20 is a generous in-between signal.
+const INTAKE_GH_CALL_WARN_THRESHOLD: u32 = 20;
 
 /// Bead jleechan-msmq: an ATTESTED bead with `reroll_count > 0` is in the
 /// reroll pipeline. The OLD PR's gate verdict cannot advance the bead
@@ -1314,8 +1322,46 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // required dispatch-scheduling guarantee: already-QUEUED beads (from prior
     // ticks) are dispatched before any recovery/escalation work each tick.
     let mut pr_intake_bead_ids = HashSet::new();
-    let (pr_adoptions, pr_skip_outcomes) =
-        intake::normalize_labeled_prs(deps.scm, deps.tracker, deps.cfg)?;
+    // jtg8: load the persistent adoption-probe cache from disk and use the
+    // rate-limit-aware variant. Cache is rewritten at the end of every slow
+    // pass (see below) so a daemon restart doesn't re-probe the entire
+    // factory-labeled PR set on its first tick.
+    let mut adoption_cache = intake::AdoptionProbeCache::load_or_default();
+    let (pr_adoptions, pr_skip_outcomes) = {
+        let outcome = intake::normalize_labeled_prs_outcome(
+            deps.scm,
+            deps.tracker,
+            deps.cfg,
+            &mut adoption_cache,
+        )?;
+        // jtg8 acceptance #3: warn when per-tick gh call count exceeds the
+        // slow-tier budget. The threshold (20) is generous — well below
+        // what the 2026-07-22 incident burned per tick (~50+), so a hit
+        // means we've drifted back toward pre-fix behavior and need to
+        // investigate before the core rate-limit bucket exhausts again.
+        if outcome.metrics.gh_call_count >= INTAKE_GH_CALL_WARN_THRESHOLD {
+            eprintln!(
+                "auto-factory daemon: WARNING slow-tier intake gh_call_count={} (threshold={}); \
+                 inspect adoption-probe cache before core rate-limit bucket exhausts",
+                outcome.metrics.gh_call_count, INTAKE_GH_CALL_WARN_THRESHOLD
+            );
+        }
+        // jtg8 acceptance #5: a rate-limited intake sweep degrades gracefully
+        // (no Err, no consecutive_failures bump) so dispatch/ledger work —
+        // which needs no gh calls — keeps running. The slow tier simply
+        // skips adoption this tick and returns the empty adopted/outcomes.
+        if outcome.rate_limited {
+            eprintln!(
+                "auto-factory daemon: slow-tier intake rate-limited by gh; \
+                 skipping adoption sweep this tick, dispatch continues"
+            );
+            // Best-effort cache persist (the cache may have grown this tick
+            // before the rate-limit hit on the next probe).
+            let _ = adoption_cache.persist();
+            return Ok(());
+        }
+        (outcome.adopted, outcome.outcomes)
+    };
     // jleechan-eazj: every factory-labeled PR that did NOT result in an
     // adoption still gets exactly one verdict event here, unconditionally —
     // before the adoption loop below runs any I/O of its own.
@@ -1446,6 +1492,11 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     for outcome in &issue_skip_outcomes {
         emit_intake_outcome(deps.telemetry_log, outcome)?;
     }
+    // jtg8: persist the adoption-probe cache at the end of every slow-tier
+    // pass so a daemon restart doesn't re-probe the entire factory-labeled
+    // PR set on its first tick. Best-effort: a failed write logs but does
+    // not abort the tick (a missing cache file is the same as a cold cache).
+    let _ = adoption_cache.persist();
     let tracker_candidates = deps.tracker.fetch_candidates()?;
     let mut routing_candidates: Vec<Bead> = Vec::new();
     for bead_id in &created {

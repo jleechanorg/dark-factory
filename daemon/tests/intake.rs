@@ -51,6 +51,12 @@ fn labeled_pr(number: u64, author_login: &str, head_ref_name: &str) -> LabeledPr
         is_cross_repository: false,
         head_repo_full_name: Some("owner/repo".into()),
         head_repo_owner_login: Some("owner".into()),
+        // jtg8: pre-existing helper used by tests that don't exercise the
+        // cache. `None` keys preserve the pre-fix behavior (probe fresh
+        // every tick) so the existing assertions about per-PR probe
+        // behavior remain valid.
+        head_sha: None,
+        updated_at_epoch: None,
     }
 }
 
@@ -553,4 +559,275 @@ fn every_create_bead_call_across_both_intake_paths_carries_nonempty_external_ref
             "external_ref should be shaped owner/repo#<number>, got '{external_ref}' from call: {call}"
         );
     }
+}
+
+// =============================================================================
+// jtg8: adoption-probe cache regression tests (acceptance criteria 1-4).
+// Telemetry shows the slow-tier intake sweep re-probes every factory-labeled
+// PR (dark-factory AND worldarchitect.ai) every ~60s with fresh gh REST calls
+// — exhausting the shared 5000/hr core bucket and starving operator/CI
+// tooling. The fix caches adoption/duplicate probes across ticks, keyed by
+// (external_ref, head_sha, updated_at_epoch), so unchanged PR lists cost 0
+// per-PR gh calls on subsequent ticks.
+// =============================================================================
+
+/// Helper: build a `LabeledPr` with full probe-cache fields populated. Use
+/// distinct `head_sha` / `updated_at_epoch` per PR so test scenarios can
+/// detect which probes the daemon short-circuited via cache vs. fired fresh.
+fn labeled_pr_with_cache_key(
+    number: u64,
+    author_login: &str,
+    head_ref_name: &str,
+    head_sha: &str,
+    updated_at_epoch: u64,
+) -> LabeledPr {
+    LabeledPr {
+        number,
+        title: format!("pr {number}"),
+        body: "pr body".into(),
+        author_login: author_login.into(),
+        external_ref: format!("owner/repo#{number}"),
+        head_ref_name: head_ref_name.into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("owner/repo".into()),
+        head_repo_owner_login: Some("owner".into()),
+        head_sha: Some(head_sha.into()),
+        updated_at_epoch: Some(updated_at_epoch),
+    }
+}
+
+/// Acceptance #4: two consecutive ticks over an UNCHANGED PR set must make
+/// ZERO per-PR probe calls in tick 2. The first tick is allowed one
+/// `labeled_prs` (list) call plus N per-PR probes (adoption / duplicate
+/// resolution), but tick 2 must serve everything from the probe cache — the
+/// `collaborator_permission` per-PR gh call is the dominant burn, so the
+/// invariant we assert is "no fresh collaborator_permission calls for any PR
+/// whose cache key was already populated by tick 1."
+#[test]
+fn second_tick_over_unchanged_prs_makes_zero_per_pr_probes() {
+    use daemon::intake::AdoptionProbeCache;
+
+    let mut scm = FakeScm::new();
+    scm.prs.push(labeled_pr_with_cache_key(
+        501,
+        "alice",
+        "feature/pr-501",
+        "sha-501-aaaa",
+        1_700_000_000,
+    ));
+    scm.prs.push(labeled_pr_with_cache_key(
+        502,
+        "alice",
+        "feature/pr-502",
+        "sha-502-bbbb",
+        1_700_000_010,
+    ));
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+    let mut cache = AdoptionProbeCache::new();
+
+    // Tick 1 — populates the probe cache for PRs 501/502.
+    let outcome1 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache).unwrap();
+    assert_eq!(outcome1.adopted.len(), 2, "tick 1 must adopt both fresh PRs");
+    assert!(outcome1.outcomes.is_empty());
+    assert_eq!(outcome1.metrics.probe_cache_misses, 2);
+    assert_eq!(outcome1.metrics.probe_cache_hits, 0);
+
+    let tick1_perm_calls = scm
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| c.starts_with("collaborator_permission("))
+        .count();
+    assert_eq!(
+        tick1_perm_calls, 2,
+        "tick 1 must probe each PR's collaborator permission exactly once"
+    );
+
+    // Reset call log so we can prove tick 2's zero-per-PR behavior.
+    scm.calls.borrow_mut().clear();
+
+    // Tick 2 — same PR set, same head_sha, same updated_at. The probe cache
+    // MUST serve all per-PR adoption/duplicate decisions from disk, so the
+    // only allowed gh call this tick is the single `labeled_prs` list query
+    // (used to discover PRs and read their cache keys).
+    let outcome2 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache).unwrap();
+    assert_eq!(outcome2.adopted.len(), 2, "tick 2 must re-adopt both PRs");
+    assert!(outcome2.outcomes.is_empty());
+    assert_eq!(outcome2.metrics.probe_cache_hits, 2);
+    assert_eq!(outcome2.metrics.probe_cache_misses, 0);
+
+    let tick2_calls = scm.calls.borrow();
+    let tick2_labeled_prs_calls = tick2_calls
+        .iter()
+        .filter(|c| c.starts_with("labeled_prs("))
+        .count();
+    let tick2_perm_calls = tick2_calls
+        .iter()
+        .filter(|c| c.starts_with("collaborator_permission("))
+        .count();
+    assert_eq!(
+        tick2_labeled_prs_calls, 1,
+        "tick 2 must do exactly one list query, got: {:?}",
+        tick2_calls.iter().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        tick2_perm_calls, 0,
+        "tick 2 must NOT re-probe collaborator_permission for cached PRs, got: {:?}",
+        tick2_calls.iter().collect::<Vec<_>>()
+    );
+}
+
+/// Acceptance #1: when a PR's head_sha OR updated_at_epoch changes between
+/// ticks (the contributor pushed new commits or the PR was edited), the
+/// probe cache MUST invalidate that PR's cached adoption/duplicate decisions
+/// and re-probe it. The other (unchanged) PRs must still be served from
+/// cache. This is the central correctness invariant: cached == stable key,
+/// never stale reads.
+#[test]
+fn probe_cache_invalidates_on_changed_head_sha_but_serves_unchanged_prs() {
+    use daemon::intake::AdoptionProbeCache;
+
+    let mut scm = FakeScm::new();
+    scm.prs.push(labeled_pr_with_cache_key(
+        601,
+        "alice",
+        "feature/pr-601",
+        "sha-601-original",
+        1_700_001_000,
+    ));
+    scm.prs.push(labeled_pr_with_cache_key(
+        602,
+        "alice",
+        "feature/pr-602",
+        "sha-602-original",
+        1_700_001_010,
+    ));
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+    let mut cache = AdoptionProbeCache::new();
+
+    // Tick 1: both PRs probed.
+    let outcome1 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache).unwrap();
+    assert_eq!(outcome1.adopted.len(), 2);
+    scm.calls.borrow_mut().clear();
+
+    // Contributor pushes a new commit to PR 601 only; PR 602 is unchanged.
+    scm.prs[0].head_sha = Some("sha-601-NEWHEAD".into());
+    scm.prs[0].updated_at_epoch = Some(1_700_002_000);
+
+    // Tick 2: PR 601 re-probed, PR 602 served from cache.
+    let outcome2 = intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache).unwrap();
+    assert_eq!(outcome2.adopted.len(), 2);
+    assert_eq!(outcome2.metrics.probe_cache_misses, 1, "only PR 601 missed");
+    assert_eq!(outcome2.metrics.probe_cache_hits, 1, "only PR 602 hit");
+
+    let tick2_calls = scm.calls.borrow();
+    let tick2_perm_calls = tick2_calls
+        .iter()
+        .filter(|c| c.starts_with("collaborator_permission("))
+        .count();
+    // We expect exactly 1 collaborator_permission call (PR 601 only).
+    assert_eq!(
+        tick2_perm_calls, 1,
+        "tick 2 must probe ONLY the PR whose head_sha changed (PR 601), got: {:?}",
+        tick2_calls.iter().collect::<Vec<_>>()
+    );
+}
+
+/// Acceptance #5: rate-limit exhaustion (403) during intake must not
+/// increment `consecutive_failures` into mass-backoff when the ledger/
+/// dispatch work needs no gh calls. When the daemon's intake sweep hits a
+/// 403 rate-limit, the slow tier must degrade (skip intake this tick, log
+/// the skip, return Ok) instead of returning Err to the tick scheduler.
+///
+/// This test exercises the slow-tier's rate-limit degradation path directly
+/// by feeding it a Scm whose `labeled_prs` call returns a `GhRateLimited`
+/// error. The expected behavior:
+///   - slow_tier returns Ok (not Err) so the tick loop's `consecutive_failures`
+///     counter stays at 0
+///   - a telemetry line records the rate-limit skip
+///   - dispatch/ledger work can continue
+///
+/// We expose this via a thin helper on `intake` that returns
+/// `(adopted, outcomes, rate_limited: bool)` so the slow-tier can detect the
+/// rate-limit without parsing tool stderr.
+#[test]
+fn intake_rate_limit_during_labeled_prs_does_not_error_out_slow_tier() {
+    use daemon::intake::AdoptionProbeCache;
+
+    // A scripted Scm whose first labeled_prs call returns a rate-limit
+    // error, simulating the live 2026-07-22 incident.
+    let scm = FakeScm::new();
+    *scm.rate_limit_next_labeled_prs.borrow_mut() = true;
+
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+    let mut cache = AdoptionProbeCache::new();
+
+    let outcome =
+        intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache).unwrap();
+    assert!(
+        outcome.rate_limited,
+        "rate-limited intake sweep must report rate_limited=true so the slow tier can skip without erroring"
+    );
+    assert!(
+        outcome.adopted.is_empty() && outcome.outcomes.is_empty(),
+        "rate-limited sweep must produce zero adopted/outcomes (no telemetry = no false negatives)"
+    );
+    assert_eq!(outcome.metrics.rate_limited_skips, 1);
+    assert_eq!(
+        outcome.metrics.gh_call_count, 1,
+        "the list query itself counts as 1 gh call before the rate-limit skip"
+    );
+}
+
+/// Acceptance #3: per-tick gh call count metric must be exposed so the
+/// daemon can emit a WARN when count exceeds a threshold. The metric MUST
+/// increment for every gh-tool call the slow tier makes (the list query
+/// counts as 1, each per-PR collaborator_permission counts as 1, etc.) and
+/// reset to zero at the start of each slow-tick pass.
+#[test]
+fn slow_tick_records_per_pr_probe_count_metric() {
+    use daemon::intake::AdoptionProbeCache;
+
+    let mut scm = FakeScm::new();
+    scm.prs.push(labeled_pr_with_cache_key(
+        701,
+        "alice",
+        "feature/pr-701",
+        "sha-701",
+        1_700_003_000,
+    ));
+    scm.permissions.insert("alice".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let cfg = test_cfg();
+    let mut cache = AdoptionProbeCache::new();
+
+    // First tick has no cache, so it probes PR 701 (1 collaborator_permission
+    // call + 1 list query). The metric must equal the gh call count.
+    let metrics =
+        intake::normalize_labeled_prs_with_metrics(&scm, &tracker, &cfg, &mut cache).unwrap();
+    // gh_call_count = 1 (list query) + 1 (per-PR permission probe) = 2
+    assert_eq!(
+        metrics.gh_call_count, 2,
+        "tick 1 must record 2 gh calls (1 list + 1 per-PR permission probe)"
+    );
+
+    // Second tick over unchanged PRs must record 0 gh probe calls (cache hit
+    // for the per-PR probe). The list query still counts as 1.
+    let metrics =
+        intake::normalize_labeled_prs_with_metrics(&scm, &tracker, &cfg, &mut cache).unwrap();
+    assert_eq!(
+        metrics.gh_call_count, 1,
+        "tick 2 must record 1 gh call (list query only; cache served the per-PR probe), got {}",
+        metrics.gh_call_count
+    );
+    assert_eq!(metrics.probe_cache_hits, 1);
+    assert_eq!(metrics.probe_cache_misses, 0);
 }

@@ -110,10 +110,26 @@ pub struct LabeledPr {
     pub is_cross_repository: bool,
     pub head_repo_full_name: Option<String>,
     pub head_repo_owner_login: Option<String>,
+    /// jtg8: the head commit SHA at the time `gh pr list` returned this row.
+    /// Used as the primary cache key for the adoption-probe cache — if the
+    /// SHA is unchanged between ticks, the daemon serves adoption/duplicate
+    /// decisions from cache and skips per-PR gh probes (`collaborator_permission`,
+    /// the REST `pulls/{n}` lookup). `None` when the upstream `gh pr list`
+    /// JSON did not include a head SHA (defensive — the daemon MUST treat
+    /// `None` as "uncacheable" and probe fresh every tick, preserving current
+    /// behavior on under-detailed upstream payloads).
+    pub head_sha: Option<String>,
+    /// jtg8: PR `updated_at` epoch seconds at the time `gh pr list` returned
+    /// this row. Secondary cache key alongside `head_sha`: edits to the PR
+    /// body or comments bump `updated_at` without changing `head_sha`, and
+    /// both must invalidate the cache for the per-PR permission / metadata
+    /// probes to stay fresh. `None` = uncacheable (same rationale as
+    /// `head_sha`).
+    pub updated_at_epoch: Option<u64>,
 }
 
 /// Collaborator permission tier, coarsened to the write-tier gate (spec §4.2.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Permission {
     None,
     Read,

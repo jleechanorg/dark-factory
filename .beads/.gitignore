@@ -39,3 +39,7 @@ redirect
 
 # bv (beads viewer) lock file
 .bv.lock
+
+# jtg8 adoption-probe cache (daemon runtime state, regenerated each slow-tier pass)
+adoption_probe_cache.json
+adoption_probe_cache.json.tmp
