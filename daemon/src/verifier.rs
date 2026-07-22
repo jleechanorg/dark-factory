@@ -1,4 +1,4 @@
-// Task 8: 7/8-green gate assessment (design doc §5, spec §4.2.5). Read-only —
+// Task 8: 8-green gate assessment (design doc §5, spec §4.2.5). Read-only —
 // this module only reads SCM state and returns a `GateReport`; it never
 // mutates a branch, closes a PR, or merges (that discipline lives in the
 // harness / dispatch layers, not here).
@@ -6,8 +6,8 @@
 // `PrSnapshot` (owned by `tools.rs`) carries gates 1-5's raw inputs (CI,
 // mergeable, CodeRabbit, Bugbot, unresolved thread count) but intentionally
 // has no fields for the evidence floor (gate 6: non-test changed LOC +
-// integration-evidence marker) or the Skeptic verdict (gate 7) — those two
-// gates' raw inputs don't come from `gh pr view`/GraphQL the way `PrSnapshot`
+// integration-evidence marker) or the Skeptic verdict (gate 7 of 8) — those
+// two gates' raw inputs don't come from `gh pr view`/GraphQL the way `PrSnapshot`
 // does, and this task's file-ownership boundary is `verifier.rs` only (Task 8
 // scope note: never edit `tools.rs`). `PrEvidence` is a `verifier`-local
 // input type carrying exactly that data, kept out of `PrSnapshot` so the tool
@@ -95,9 +95,11 @@ impl GateResult {
 
 /// Full assessment for one PR: every gate's verdict plus the aggregate
 /// `all_green` flag. `all_green` is `true` only when every one of the 8
-/// gates is `Green` — a single `Unknown` gate forces `all_green=false` in
-/// exactly the same way a `Red` gate does (can't-verify is not "pass"), but
-/// the two remain distinguishable via `results` for diagnosis/routing.
+/// gates (`Ci`, `NoConflicts`, `CodeRabbitApproved`, `BugbotClean`,
+/// `CommentsResolved`, `EvidenceFloor`, `Skeptic`, `VacuousRedGreen`) is
+/// `Green` — a single `Unknown` gate forces `all_green=false` in exactly
+/// the same way a `Red` gate does (can't-verify is not "pass"), but the
+/// two remain distinguishable via `results` for diagnosis/routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateReport {
     pub results: [(GateName, GateResult); 8],
@@ -383,7 +385,7 @@ pub fn parse_skeptic_verdict(raw: &str) -> Option<SkepticVerdict> {
 }
 
 /// `verifier`-local input for the two gates `PrSnapshot` doesn't cover: the
-/// evidence floor (gate 6) and the Skeptic review (gate 7). See the module
+/// evidence floor (gate 6) and the Skeptic review (gate 7 of 8). See the module
 /// doc comment for why these live here instead of on `tools::PrSnapshot`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PrEvidence {
