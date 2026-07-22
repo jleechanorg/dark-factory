@@ -479,3 +479,327 @@ def test_no_er_comment_at_all_makes_gate_fail_closed() -> None:
     canonical evidence marker ⇒ gate FAIL.
     """
     assert _simulate_verdict_decision(None, None) == "FAIL"
+
+
+# ---------------------------------------------------------------------------
+# Issue #433 — Evidence Gate signal hardening
+#
+# Codex post-merge review of #424 found that the now-fail-closed gate still
+# has TWO forgeable surfaces:
+#
+#   (a) Signal A grepped `/er PASS` from ANY comment body — no identity
+#       binding (PR author can self-post), no head-SHA binding (verdict for
+#       an older head still greens the gate).
+#
+#   (b) Signal B verified the gist is reachable + non-empty + head-SHA
+#       matches the marker line, but did NOT validate content beyond "files
+#       have non-empty content" — a 1-byte gist with a fake SHA line clears.
+#
+# Acceptance from issue #433:
+#   - Author-posted bare '/er PASS' does NOT green the gate.
+#   - er_runner-style verdict for the CURRENT head DOES green.
+#   - Stale-head verdict does NOT green.
+#   - 1-byte gist does NOT green.
+# ---------------------------------------------------------------------------
+
+
+def test_signal_a_requires_trusted_identity_marker() -> None:
+    """Signal A: the verdict step MUST require a trusted-identity marker
+    in the comment body — not just the `/er PASS` token.
+
+    Without this check, the PR author can post `/er PASS` as a PR comment
+    and the gate will accept it (issue #433 forgery surface).
+
+    The canonical trusted-identity marker is the er_runner comment header
+    `🤖 **[dark-factory /er]**` (see daemon/src/er_runner.rs:191). A
+    verifier-token (`AUTHOR="..."` env-var compare) or regex against the
+    comment body is acceptable; the binding check is that the grep is
+    NOT a bare token scan.
+    """
+    text = _verdict_step_text(_load_workflow())
+    assert "dark-factory /er" in text or "[dark-factory" in text or "AUTHOR" in text or "user.login" in text, (
+        "Signal A must require a trusted-identity marker in the comment "
+        "body (e.g. 'dark-factory /er' from er_runner.rs) OR an explicit "
+        "user-login compare — not a bare `/er PASS` grep. (issue #433)"
+    )
+
+
+def test_signal_a_captures_comment_author() -> None:
+    """Signal A: the verdict step MUST query PR comments in a shape that
+    preserves the comment author's login.
+
+    The default `gh api /repos/.../issues/<n>/comments` returns objects
+    with `user.login`; the workflow MUST thread that field through so the
+    trusted-identity check (see test_signal_a_requires_trusted_identity_
+    marker) has something to compare against. A bare `.body | join("\n")`
+    discards the author and re-opens the forgery hole.
+    """
+    text = _verdict_step_text(_load_workflow())
+    assert "user.login" in text or ".user.login" in text, (
+        "Signal A must capture `user.login` from the comment object so "
+        "the trusted-identity check has something to compare against. "
+        "A bare `.body | join(\"\\n\")` discards the author. (issue #433)"
+    )
+
+
+def test_signal_a_requires_current_head_sha_reference() -> None:
+    """Signal A: the verdict comment MUST reference the CURRENT PR head SHA.
+
+    Issue #433: a verdict comment that names an OLDER head does not
+    verify the code that would actually merge — it must be rejected.
+    The binding check is that the verdict-step text parses both a head
+    SHA reference AND matches it against the current PR head SHA.
+    """
+    text = _verdict_step_text(_load_workflow())
+    # The pattern below accepts either an explicit SHA regex AND a compare
+    # against the current head, OR a comment body that contains the
+    # canonical `head <sha>` literal that the marker line uses.
+    assert re.search(r"head[[:space:]]+\[?[0-9a-f]{7,64}", text) or re.search(
+        r"head_sha|HEAD_SHA|github\.event\.pull_request\.head\.sha", text
+    ), (
+        "Signal A must require the verdict comment to reference the "
+        "current head SHA — either by extracting `head <sha>` from the "
+        "comment body and comparing it to `github.event.pull_request.head.sha`, "
+        "or by capturing `head_sha` from the comment directly. (issue #433)"
+    )
+
+
+def test_signal_b_enforces_minimum_gist_content_size() -> None:
+    """Signal B: the verdict step MUST enforce a minimum gist content size.
+
+    Issue #433: a 1-byte gist with a fake `(head <sha>)` line clears
+    the old "files have non-empty content" check. The fix requires a
+    size floor across the gist's files (e.g. >= 256 bytes total) so a
+    placeholder cannot satisfy signal B.
+    """
+    text = _verdict_step_text(_load_workflow())
+    # Look for a size threshold constant in bash (e.g. `MIN_GIST_BYTES`,
+    # `> 256`, `length > N`).
+    assert re.search(r"MIN_GIST|MIN_BYTES|MIN_CONTENT|>=?\s*[0-9]{2,5}", text) or re.search(
+        r"length[[:space:]]*>", text
+    ), (
+        "Signal B must enforce a minimum gist content size — a 1-byte "
+        "gist must NOT green the gate. The check should be visible in "
+        "the verdict step text (e.g. a MIN_GIST_BYTES constant or a "
+        "`length > N` comparison). (issue #433)"
+    )
+
+
+def test_signal_b_requires_substantive_content_keywords() -> None:
+    """Signal B: the gist MUST contain at least one substantive
+    evidence keyword (PR number, repo name, or evidence marker).
+
+    Issue #433: a gist that contains only a SHA reference is forgeable —
+    the contract requires that the gist actually reference the PR it
+    purports to evidence (PR number or repo name) AND contain some
+    signal-bearing token (verdict, evidence marker, test runner name).
+    """
+    text = _verdict_step_text(_load_workflow())
+    # Acceptable: an explicit grep for a PR number ($PR_NUMBER), the
+    # canonical EVIDENCE_MARKER ("**Evidence**:"), or a verdict token
+    # (/er PASS|FAIL|PARTIAL|INCONCLUSIVE) inside the gist body.
+    has_pr_anchor = "PR_NUMBER" in text or "pull_request.number" in text or "REPO" in text
+    has_marker_anchor = "**Evidence**" in text or "EVIDENCE_MARKER" in text
+    has_verdict_anchor = "/er" in text or "er verdict" in text.lower()
+    assert has_pr_anchor and (has_marker_anchor or has_verdict_anchor), (
+        "Signal B must require the gist to mention the PR (PR_NUMBER or "
+        "REPO context) AND contain a substantive evidence token "
+        "(`**Evidence**:` or `/er` verdict). A bare SHA reference is not "
+        "enough. (issue #433)"
+    )
+
+
+def test_signal_b_fetches_gist_files_content_not_just_metadata() -> None:
+    """Signal B: the verdict step MUST fetch and inspect each gist file's
+    `content` field (not just the metadata wrapper).
+
+    Issue #433: the old check accepted any non-empty file list, but a
+    file with only `null` content (or an empty string) cleared it.
+    The fix must drill into `.files.<name>.content` for the size and
+    keyword checks.
+    """
+    text = _verdict_step_text(_load_workflow())
+    assert ".content" in text or "files_with_content" in text, (
+        "Signal B must inspect `.files.<name>.content` (or "
+        "`files_with_content`) to apply the size floor and keyword "
+        "checks. A bare file-list count is not enough. (issue #433)"
+    )
+
+
+# Issue #433 — bash-logic simulation for the hardened signal contract
+
+
+def _simulate_signal_a_decision(
+    comment_author: str | None,
+    comment_body: str | None,
+    current_head_sha: str,
+    declared_head_sha: str | None,
+) -> str:
+    """Mirror the hardened Signal A decision in 'Determine evidence verdict'.
+
+    Acceptance from issue #433:
+      - Author-posted bare '/er PASS' does NOT green (no trusted identity).
+      - er_runner-style verdict for current head DOES green.
+      - Stale-head verdict does NOT green.
+    """
+    if not comment_author or not comment_body:
+        return "FAIL"
+    # Trusted identity: must carry the er_runner header literal. The
+    # exact login compare is sufficient in production, but here we
+    # accept the body marker as the trusted-identity anchor (the bot
+    # posts under any login but always includes the literal).
+    if "dark-factory /er" not in comment_body:
+        return "FAIL"
+    # Verdict token: /er PASS|FAIL|PARTIAL|INCONCLUSIVE.
+    body_lower = comment_body.lower()
+    verdict = "ABSENT"
+    for token in ("pass", "fail", "partial", "inconclusive"):
+        if f"/er {token}" in body_lower or f"/er  {token}" in body_lower:
+            verdict = token.upper()
+            break
+    if verdict == "ABSENT":
+        return "FAIL"
+    if verdict in ("FAIL", "PARTIAL", "INCONCLUSIVE"):
+        return "FAIL"
+    # Head binding: the declared_head_sha must match the current head.
+    if declared_head_sha is None:
+        return "FAIL"
+    if declared_head_sha.lower() != current_head_sha.lower():
+        return "FAIL"
+    return "PASS"
+
+
+@pytest.mark.parametrize(
+    "author,body,current_sha,declared_sha,expected",
+    [
+        # Forgeable: PR author posts bare /er PASS (no identity marker).
+        ("jleechan", "/er PASS", "abcdef1234", None, "FAIL"),
+        # Forgeable: PR author posts bare /er PASS with SHA but no identity.
+        ("jleechan", "/er PASS (head abcdef1234)", "abcdef1234", "abcdef1234", "FAIL"),
+        # Trusted identity, current head: green.
+        (
+            "dark-factory-er[bot]",
+            "🤖 **[dark-factory /er]** Evidence review verdict:\n\n```\n/er PASS\n```\n\nhead=abcdef1234",
+            "abcdef1234",
+            "abcdef1234",
+            "PASS",
+        ),
+        # Trusted identity, STALE head: must NOT green.
+        (
+            "dark-factory-er[bot]",
+            "🤖 **[dark-factory /er]** ... /er PASS ... head=olderhead",
+            "abcdef1234",
+            "olderhead",
+            "FAIL",
+        ),
+        # No comment at all: fail.
+        (None, None, "abcdef1234", None, "FAIL"),
+    ],
+)
+def test_signal_a_trusted_identity_plus_head_binding(
+    author: str | None,
+    body: str | None,
+    current_sha: str,
+    declared_sha: str | None,
+    expected: str,
+) -> None:
+    """Issue #433 acceptance: only trusted-identity + current-head verdicts
+    may pass Signal A."""
+    assert (
+        _simulate_signal_a_decision(author, body, current_sha, declared_sha) == expected
+    ), f"Signal A (author={author!r}, sha={declared_sha!r}) should map to {expected}"
+
+
+def _simulate_signal_b_decision(
+    gist_files_content: list[tuple[str, str]],
+    pr_number: int,
+    repo: str,
+    declared_head_sha: str,
+    current_head_sha: str,
+) -> str:
+    """Mirror the hardened Signal B decision in 'Determine evidence verdict'.
+
+    Acceptance from issue #433:
+      - 1-byte gist fails.
+      - Gist missing PR number or repo fails.
+      - Gist with substantive content for the current head passes.
+    """
+    if not gist_files_content:
+        return "FAIL"
+    total_bytes = sum(len(content) for _, content in gist_files_content)
+    if total_bytes < 256:
+        return "FAIL"
+    combined = "\n".join(content for _, content in gist_files_content)
+    if str(pr_number) not in combined and repo.split("/")[-1] not in combined:
+        return "FAIL"
+    if declared_head_sha.lower() != current_head_sha.lower():
+        return "FAIL"
+    return "PASS"
+
+
+@pytest.mark.parametrize(
+    "files,pr,repo,declared,current,expected",
+    [
+        # 1-byte gist: must FAIL (issue #433 acceptance).
+        (
+            [("out.txt", "x")],
+            433, "owner/repo", "abc1234", "abc1234", "FAIL",
+        ),
+        # Substantive content for the current head: must PASS.
+        (
+            [
+                (
+                    "evidence.txt",
+                    "PR #433 / owner-repo\n/er PASS\nhead=abc1234\n"
+                    "integration tests run: 12 passed, 0 failed\n"
+                    "video: https://github.com/example/cast.cast\n"
+                    "test runner output excerpt:\n"
+                    "  test_signal_a_requires_trusted_identity_marker PASSED\n"
+                    "  test_signal_a_captures_comment_author PASSED\n"
+                    "  test_signal_b_enforces_minimum_gist_content_size PASSED\n"
+                    "  test_signal_b_requires_substantive_content_keywords PASSED\n"
+                    "  test_signal_a_trusted_identity_plus_head_binding PASSED\n",
+                )
+            ],
+            433, "owner/repo", "abc1234", "abc1234", "PASS",
+        ),
+        # Empty gist (no files): must FAIL.
+        (
+            [],
+            433, "owner/repo", "abc1234", "abc1234", "FAIL",
+        ),
+        # Substantive size but missing PR anchor: must FAIL.
+        (
+            [
+                (
+                    "log.txt",
+                    "this is a long enough file but does not reference the issue number or the org\n" * 8,
+                )
+            ],
+            433, "owner/repo", "abc1234", "abc1234", "FAIL",
+        ),
+        # Stale head: must FAIL.
+        (
+            [
+                (
+                    "evidence.txt",
+                    "PR #433 / owner-repo\n/er PASS\nhead=oldhead\n"
+                    "integration tests run: 12 passed, 0 failed\n" * 4,
+                )
+            ],
+            433, "owner/repo", "oldhead", "newhead", "FAIL",
+        ),
+    ],
+)
+def test_signal_b_content_floor(
+    files: list[tuple[str, str]],
+    pr: int,
+    repo: str,
+    declared: str,
+    current: str,
+    expected: str,
+) -> None:
+    """Issue #433 acceptance: gist must meet size floor + PR anchor + head binding."""
+    assert (
+        _simulate_signal_b_decision(files, pr, repo, declared, current) == expected
+    ), f"Signal B (bytes={sum(len(c) for _,c in files)}, declared={declared!r}) should map to {expected}"
