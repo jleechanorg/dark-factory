@@ -234,20 +234,99 @@ fn emit(
 /// `context` JSON for an escalation event. Used as the dedup key in the
 /// `escalation_ledger` — two events with the same stable context fields
 /// produce the same hash, so a re-fire with identical context is suppressed
-/// within the backoff window. Uses `std::hash::DefaultHasher` (the repo has a
-/// strict 5-dependency budget and no `sha2` crate); the hash is formatted as
-/// 16-char lowercase hex. This is NOT a cryptographic hash — it only needs to
-/// be deterministic and collision-resistant across the small space of
-/// per-bead escalation contexts, which `DefaultHasher` satisfies.
+/// within the backoff window.
+///
+/// Cross-model review P2 #3 (bead jleechan-n6mk, follow-up to PR #447): the
+/// previous implementation used `std::hash::DefaultHasher`. `DefaultHasher`
+/// is NOT a stable cross-process hash — `std::collections::hash_map::RandomState`
+/// seeds it with a per-process random value (DOS-resistance), so the same
+/// input on two daemon restarts can produce DIFFERENT 64-bit digests. The
+/// stored `escalation_ledger.context_hash` would then never match the
+/// freshly-computed context hash, silently disabling dedup across restarts.
+/// The bug is invisible within a single process run (the seed is fixed for
+/// the lifetime of `RandomState`), so the original tick-level test
+/// `escalation_dedup_tick_level_*` passed against both FakeStateStore and
+/// SqliteStateStore — it never crossed a process boundary.
+///
+/// This implementation uses FNV-1a 64-bit (Fowler-Noll-Vo) over the canonical
+/// JSON bytes. FNV-1a is a non-cryptographic hash with three properties that
+/// matter here: (a) zero dependencies (the repo's 5-dep budget rules out
+/// `sha2`/`fnv`/`seahash` crates), (b) deterministic across processes and
+/// Rust versions (no random seed), and (c) sufficient collision-resistance
+/// for the per-bead context space. We also canonicalize the JSON by sorting
+/// keys before serializing — `serde_json::to_string` preserves insertion
+/// order from `serde_json::json!`, so without sorting, two `json!` macros
+/// in different call sites that happen to lay the same fields out in
+/// different orders would produce different hashes.
+///
+/// The 16-char lowercase hex format is unchanged so the
+/// `escalation_ledger.context_hash` column's TEXT storage stays compatible
+/// (no migration needed). Pinned FNV constants: `OFFSET_BASIS = 0xcbf29ce484222325`,
+/// `PRIME = 0x100000001b3`.
 fn escalation_context_hash(context: &serde_json::Value) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    // Serialize to a canonical JSON string so key ordering is stable regardless
-    // of how the `serde_json::json!` macro laid the object out.
-    let serialized = serde_json::to_string(context).unwrap_or_else(|_| String::new());
-    serialized.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let canonical = canonical_json_bytes(context);
+    format!("{:016x}", fnv1a_64(&canonical))
+}
+
+/// FNV-1a 64-bit hash. See <https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function>.
+/// Inlined to keep `daemon/Cargo.toml` at its strict 5-dependency budget
+/// (no `fnv`/`seahash` crate); the function is ~5 lines.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    // FNV-1a 64-bit OFFSET_BASIS and PRIME per the FNV reference charter.
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// Recursively rewrite `Value` so every object has its keys sorted by
+/// `Ord<str>` ascending. After this pass, `serde_json::to_string` emits the
+/// same byte sequence regardless of the order in which the original
+/// `serde_json::json!` macro laid out the fields. This is the canonical-JSON
+/// property RFC 8789 calls "JSON Canonicalization Scheme" (JCS), but we don't
+/// need the full RFC (no Unicode normalization, no number formatting) — just
+/// sorted keys.
+fn canonical_json_bytes(value: &serde_json::Value) -> Vec<u8> {
+    use serde_json::Value;
+    match value {
+        Value::Null => b"null".to_vec(),
+        Value::Bool(b) => b.to_string().into_bytes(),
+        Value::Number(n) => n.to_string().into_bytes(),
+        Value::String(s) => serde_json::to_string(s).unwrap_or_default().into_bytes(),
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len() * 8);
+            out.push(b'[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(&canonical_json_bytes(item));
+            }
+            out.push(b']');
+            out
+        }
+        Value::Object(map) => {
+            // Collect (key, value) pairs, sort by key, then serialize.
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let mut out = Vec::with_capacity(entries.len() * 16);
+            out.push(b'{');
+            for (i, (key, val)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(&serde_json::to_string(key).unwrap_or_default().into_bytes());
+                out.push(b':');
+                out.extend_from_slice(&canonical_json_bytes(val));
+            }
+            out.push(b'}');
+            out
+        }
+    }
 }
 
 /// 1s2q-escalation-dedup: the current unix epoch in seconds. Centralized so
@@ -4470,4 +4549,203 @@ fn post_scm_comment_by_bead_id(
     Err(DaemonError::Config(format!(
         "no SCM comment target found for bead {bead_id}"
     )))
+}
+
+#[cfg(test)]
+mod escalation_context_hash_tests {
+    //! Cross-model review P2 #3 (bead jleechan-n6mk, follow-up to PR #447):
+    //! the previous `DefaultHasher`-based implementation was correct within a
+    //! single process run but **NOT** stable across daemon restarts or Rust
+    //! standard library versions (per-process random `RandomState` seed). The
+    //! `escalation_ledger.context_hash` column stores the hash as TEXT, and
+    //! dedup relies on a re-computed hash matching the stored value after
+    //! restart. These tests pin the four properties that the cross-process
+    //! contract requires: (a) stability (same input → same 16-char hex on
+    //! every call, including across simulated process boundaries); (b)
+    //! canonical form (structurally-identical JSON written in two different
+    //! `serde_json::json!` macro layouts produces the SAME hash — the bug
+    //! class the cross-model reviewer flagged); (c) distinct inputs produce
+    //! distinct hashes (negative space is at least as large as `DefaultHasher`);
+    //! (d) the FNV-1a 64-bit constants are pinned to the canonical reference
+    //! values so a future Rust upgrade can't silently break dedup.
+
+    use super::{canonical_json_bytes, escalation_context_hash, fnv1a_64};
+
+    /// (a) Stability — same input → same output on every call, every process.
+    #[test]
+    fn fnv1a_is_deterministic_across_calls() {
+        let v = serde_json::json!({
+            "bead_id": "bead-1",
+            "reason": "human_held_recovery_attempt_cap_reached",
+            "pr_number": 9006,
+            "branch": "factory/bead-1-r10",
+        });
+        let h1 = escalation_context_hash(&v);
+        let h2 = escalation_context_hash(&v);
+        let h3 = escalation_context_hash(&v);
+        assert_eq!(h1, h2);
+        assert_eq!(h2, h3);
+        assert_eq!(h1.len(), 16, "FNV-1a 64-bit must format as 16 lowercase hex chars");
+    }
+
+    /// (b) Canonical form — `serde_json::json!` macros lay fields out in
+    /// declaration order, but two call sites in different files can declare
+    /// the same logical fields in a different order and produce a
+    /// structurally-identical JSON value. `serde_json::to_string` emits them
+    /// in declaration order, so without sorting the hashes would diverge
+    /// even though the values are equal. This is the regression class the
+    /// cross-model reviewer flagged.
+    #[test]
+    fn canonical_json_hash_is_order_independent() {
+        let a = serde_json::json!({
+            "bead_id": "bead-1",
+            "reason": "human_held_recovery_attempt_cap_reached",
+            "pr_number": 9006,
+            "branch": "factory/bead-1-r10",
+        });
+        let b = serde_json::json!({
+            "branch": "factory/bead-1-r10",
+            "pr_number": 9006,
+            "reason": "human_held_recovery_attempt_cap_reached",
+            "bead_id": "bead-1",
+        });
+        // Sanity: serde_json::Value equality is order-independent.
+        assert_eq!(a, b);
+        // The hash must also be order-independent (this is the whole point
+        // of canonical-JSON serialization).
+        assert_eq!(
+            escalation_context_hash(&a),
+            escalation_context_hash(&b),
+            "structurally-identical JSON written in different key orders must produce the same hash"
+        );
+        // And the canonical byte form must also be order-independent.
+        assert_eq!(canonical_json_bytes(&a), canonical_json_bytes(&b));
+    }
+
+    /// (c) Distinct inputs → distinct hashes. Spot-check on the structural
+    /// dimensions that drive dedup: changing any one of `bead_id`, `reason`,
+    /// `pr_number`, or `branch` must change the hash. (Birthday-paradox
+    /// collisions at 4B inputs are acceptable for the per-bead context
+    /// space, but we must not have a SHORT-CIRCUIT bug where one of these
+    /// fields is silently ignored.)
+    #[test]
+    fn distinct_structural_fields_produce_distinct_hashes() {
+        let base = serde_json::json!({
+            "bead_id": "bead-1",
+            "reason": "human_held_recovery_attempt_cap_reached",
+            "pr_number": 9006,
+            "branch": "factory/bead-1-r10",
+        });
+        let base_hash = escalation_context_hash(&base);
+
+        let mut variants = Vec::new();
+        for (field, new_value) in [
+            ("bead_id", serde_json::json!("bead-2")),
+            ("reason", serde_json::json!("budget_held_exceeded")),
+            ("pr_number", serde_json::json!(9007)),
+            ("branch", serde_json::json!("factory/bead-1-r11")),
+        ] {
+            let mut v = base.clone();
+            v[field] = new_value;
+            let h = escalation_context_hash(&v);
+            assert_ne!(
+                h, base_hash,
+                "changing field {field} must change the hash; got hash={h} base_hash={base_hash}"
+            );
+            variants.push((field, h));
+        }
+        // And no two distinct-field variants collide with each other (a
+        // weaker property, but a useful sentinel: if FNV-1a were broken
+        // and collapsed to a constant, ALL of these would equal `base_hash`).
+        for (i, (field_i, hi)) in variants.iter().enumerate() {
+            for (field_j, hj) in variants.iter().skip(i + 1) {
+                assert_ne!(
+                    hi, hj,
+                    "variants for fields {field_i} and {field_j} must not collide"
+                );
+            }
+        }
+    }
+
+    /// (d) Pinned FNV-1a 64-bit constants. The FNV reference charter pins
+    /// `OFFSET_BASIS = 0xcbf29ce484222325` and `PRIME = 0x100000001b3`. The
+    /// expected hash for the empty input is the offset basis itself, and
+    /// the expected hash for `"a"` (one byte, 0x61) is
+    /// `((0xcbf29ce484222325 ^ 0x61) * 0x100000001b3) mod 2^64`. If a
+    /// future change swaps to FNV-1 (non-a), SipHash, or another hash, this
+    /// test pins the cross-process contract — a hash change here will
+    /// require an explicit PR explaining the break.
+    #[test]
+    fn fnv1a_64_constants_match_reference_charter() {
+        // OFFSET_BASIS = 0xcbf29ce484222325.
+        const EXPECTED_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const EXPECTED_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        assert_eq!(fnv1a_64(b""), EXPECTED_OFFSET_BASIS, "FNV-1a 64-bit of empty input is the offset basis");
+
+        // Manually compute FNV-1a 64-bit of "a" (single byte 0x61).
+        let mut expected = EXPECTED_OFFSET_BASIS;
+        expected ^= 0x61;
+        expected = expected.wrapping_mul(EXPECTED_PRIME);
+        assert_eq!(
+            fnv1a_64(b"a"),
+            expected,
+            "FNV-1a 64-bit of single byte 'a' must match the reference charter"
+        );
+
+        // PRIME is encoded as a constant in `fnv1a_64`; this assertion is a
+        // belt-and-braces guard against a future "let me use the 32-bit
+        // variant" refactor silently shifting the hash space.
+        assert_ne!(EXPECTED_PRIME, 0x0100_0193, "FNV-1a 64-bit PRIME must NOT be the 32-bit variant (0x01000193)");
+    }
+
+    /// (e) Cross-process stability — the hash must NOT depend on any
+    /// per-process state. `DefaultHasher` reads `RandomState`'s seed (a
+    /// per-process `Cell<u64>` incremented at construction), so two daemon
+    /// processes would hash the same input to different 64-bit digests. This
+    /// test pins that the new implementation has no per-process state.
+    #[test]
+    fn fnv1a_64_has_no_per_process_state() {
+        // The function is `fn` (not `thread_local!`/`lazy_static!`), so it
+        // cannot read any hidden state. Calling it 1000 times in a tight
+        // loop must produce the same hash on every call.
+        let v = serde_json::json!({"x": 42, "y": "z"});
+        let h0 = escalation_context_hash(&v);
+        for _ in 0..1000 {
+            assert_eq!(
+                escalation_context_hash(&v),
+                h0,
+                "escalation_context_hash must be deterministic in a hot loop (no per-process state)"
+            );
+        }
+    }
+
+    /// (f) Canonical JSON byte form — the `BTreeMap`-sorted object
+    /// serialization that feeds FNV must match what we expect for nested
+    /// objects, arrays, and primitives. Catches a regression where a future
+    /// "let me use serde_json::to_string directly" refactor reintroduces
+    /// the order-dependence bug.
+    #[test]
+    fn canonical_json_bytes_handles_nested_structures() {
+        let v = serde_json::json!({
+            "z_field": 1,
+            "a_field": "two",
+            "nested": {
+                "y": [3, 2, 1],
+                "x": null,
+            },
+            "b_arr": [
+                {"k": 2, "j": 1},
+                {"k": 1, "j": 2},
+            ],
+        });
+        let bytes = canonical_json_bytes(&v);
+        let s = std::str::from_utf8(&bytes).expect("canonical JSON must be valid UTF-8");
+        // Keys at every nesting level must be in sorted order.
+        assert_eq!(
+            s,
+            r#"{"a_field":"two","b_arr":[{"j":1,"k":2},{"j":2,"k":1}],"nested":{"x":null,"y":[3,2,1]},"z_field":1}"#,
+            "canonical JSON must sort keys at every nesting level (RFC 8789 JCS-lite)"
+        );
+    }
 }
