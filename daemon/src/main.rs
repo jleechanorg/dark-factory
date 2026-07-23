@@ -604,7 +604,8 @@ fn run(args: Args) -> Result<(), DaemonError> {
     // VENDOR_WAIVED / VENDOR_RECOVERED telemetry therefore could not
     // fire in production. This Mutex lives for the full `run`-scope so
     // every `TickDeps` borrow below stays valid for the daemon lifetime.
-    let vendor_health = Mutex::new(VendorHealthLedger::new());
+    let vendor_health = std::sync::Arc::new(std::sync::Mutex::new(VendorHealthLedger::new()));
+    daemon::vendor_health::set_global_ledger(vendor_health.clone());
 
     let deps = TickDeps {
         scm: scm.as_ref(),
@@ -615,7 +616,7 @@ fn run(args: Args) -> Result<(), DaemonError> {
         vcs: vcs.as_ref(),
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: Some(&vendor_health),
+        vendor_health: Some(&*vendor_health),
     };
 
     if args.once {

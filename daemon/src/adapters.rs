@@ -1180,17 +1180,27 @@ impl Scm for CliScm {
         let checks: Vec<GhCheck> = serde_json::from_str(&checks_out[json_start_c..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse gh pr checks JSON: {e}"))
         })?;
+        let mut filtered_checks = Vec::new();
+        for c in &checks {
+            let name_lower = c.name.to_lowercase();
+            if name_lower.contains("coderabbit") {
+                if crate::vendor_health::is_global_vendor_capped(crate::vendor_health::Vendor::CodeRabbit) {
+                    continue;
+                }
+            }
+            if name_lower.contains("bugbot") {
+                if crate::vendor_health::is_global_vendor_capped(crate::vendor_health::Vendor::Bugbot) {
+                    continue;
+                }
+            }
+            filtered_checks.push(c.clone());
+        }
         // jleechan-mdun follow-up (2026-07-28): gate 1 (CI) must only read
-        // check-runs it OWNS. The "Evidence Gate" workflow's check-run is
-        // gate 6's territory (evidence floor / /er verdict): a fresh factory
-        // PR legitimately opens with no evidence marker, so counting that
-        // check-run's failure as CI-red made gate 1 reroll every attempt
-        // before any evidence lane could attach a bundle — observed live on
-        // PR #485 (test + daemon-tests green, Evidence Gate failure →
-        // instant reroll; no attempt could ever converge).
-        let ci_owned_checks: Vec<&GhCheck> = checks
+        // check-runs it OWNS.
+        let ci_owned_checks: Vec<&GhCheck> = filtered_checks
             .iter()
             .filter(|c| !check_owned_by_dedicated_gate(&c.name))
+            .copied()
             .collect();
         let mut any_pending = false;
         let mut any_failed = false;
@@ -5568,6 +5578,7 @@ if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
   case "${GH_TEST_PRIMARY_CHECKS:-}" in
     fail) echo "gh: GraphQL API rate limit already exceeded" >&2; exit 1 ;;
     badjson) echo "not json"; exit 0 ;;
+    coderabbit_pending) echo '[{"state":"SUCCESS","bucket":"pass","name":"build"},{"state":"PENDING","bucket":"pending","name":"CodeRabbit"}]'; exit 0 ;;
     *) echo "[]"; exit 0 ;;
   esac
 fi
@@ -5758,6 +5769,46 @@ exit 1
         );
         assert!(snapshot.ci_pending);
         assert_eq!(snapshot.ci_status, "unknown");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capped_vendor_excluded_from_ci_success_and_status() {
+        use crate::vendor_health::{Vendor, VendorHealthLedger, CapObservation, CapSource};
+        use std::sync::{Arc, Mutex};
+
+        // 1. Without being capped, pending CodeRabbit makes CI success false and status unknown
+        let result = run_pr_snapshot_with_fake_gh("not_capped", "coderabbit_pending", "fail", 44);
+        let snapshot = result.expect("pr_snapshot must succeed");
+        assert!(!snapshot.ci_success);
+        assert!(snapshot.ci_pending);
+        assert_eq!(snapshot.ci_status, "unknown");
+
+        // 2. Set CodeRabbit as capped
+        let ledger = Arc::new(Mutex::new(VendorHealthLedger::new()));
+        for ts in 1..=3 {
+            ledger.lock().unwrap().record_cap(CapObservation {
+                vendor: Vendor::CodeRabbit,
+                source: CapSource::UnknownGateRepeated,
+                bead_id: format!("bead-{}", ts),
+                pr_number: 44,
+                ts_epoch: ts,
+                note: "test fixture".into(),
+            });
+        }
+        crate::vendor_health::set_global_ledger(ledger.clone());
+
+        // 3. With CodeRabbit capped, the pending CodeRabbit check is excluded, making CI green
+        let result = run_pr_snapshot_with_fake_gh("capped", "coderabbit_pending", "fail", 44);
+        let snapshot = result.expect("pr_snapshot must succeed");
+        assert!(snapshot.ci_success);
+        assert!(!snapshot.ci_pending);
+        assert_eq!(snapshot.ci_status, "green");
+
+        // Clean up global ledger
+        if let Some(l) = crate::vendor_health::GLOBAL_LEDGER.get() {
+            l.lock().unwrap().clear(Vendor::CodeRabbit);
+        }
     }
 }
 
