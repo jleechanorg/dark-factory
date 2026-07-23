@@ -124,6 +124,21 @@ impl VendorHealth {
     }
 }
 
+pub static GLOBAL_LEDGER: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<VendorHealthLedger>>> = std::sync::OnceLock::new();
+
+pub fn set_global_ledger(ledger: std::sync::Arc<std::sync::Mutex<VendorHealthLedger>>) {
+    let _ = GLOBAL_LEDGER.set(ledger);
+}
+
+pub fn is_global_vendor_capped(vendor: Vendor) -> bool {
+    if let Some(ledger_arc) = GLOBAL_LEDGER.get() {
+        if let Ok(ledger) = ledger_arc.lock() {
+            return ledger.health(vendor).is_capped();
+        }
+    }
+    false
+}
+
 /// In-memory per-vendor ledger. The daemon owns one of these and consults
 /// it from `verifier::assess` (and from the skeptic prompt construction).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

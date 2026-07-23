@@ -1180,16 +1180,31 @@ impl Scm for CliScm {
         let checks: Vec<GhCheck> = serde_json::from_str(&checks_out[json_start_c..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse gh pr checks JSON: {e}"))
         })?;
+        let mut filtered_checks = Vec::new();
+        for c in &checks {
+            let name_lower = c.name.to_lowercase();
+            if name_lower.contains("coderabbit") {
+                if crate::vendor_health::is_global_vendor_capped(crate::vendor_health::Vendor::CodeRabbit) {
+                    continue;
+                }
+            }
+            if name_lower.contains("bugbot") {
+                if crate::vendor_health::is_global_vendor_capped(crate::vendor_health::Vendor::Bugbot) {
+                    continue;
+                }
+            }
+            filtered_checks.push(c.clone());
+        }
         let mut any_pending = false;
         let mut any_failed = false;
-        for c in &checks {
+        for c in &filtered_checks {
             if c.bucket == "pending" {
                 any_pending = true;
             } else if c.bucket == "fail" || c.bucket == "cancel" {
                 any_failed = true;
             }
         }
-        let ci_status = if checks.is_empty() || any_pending {
+        let ci_status = if filtered_checks.is_empty() || any_pending {
             "unknown".to_string()
         } else if any_failed {
             "red".to_string()
@@ -1200,7 +1215,7 @@ impl Scm for CliScm {
         let iteration_stub =
             std::env::var("DARK_FACTORY_ITERATION_STUB").as_deref() == Ok("1");
         let ci_success = ci_success_from_check_buckets(
-            &checks.iter().map(|c| c.bucket.as_str()).collect::<Vec<_>>(),
+            &filtered_checks.iter().map(|c| c.bucket.as_str()).collect::<Vec<_>>(),
             iteration_stub,
         );
 
@@ -5519,6 +5534,7 @@ if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
   case "${GH_TEST_PRIMARY_CHECKS:-}" in
     fail) echo "gh: GraphQL API rate limit already exceeded" >&2; exit 1 ;;
     badjson) echo "not json"; exit 0 ;;
+    coderabbit_pending) echo '[{"state":"SUCCESS","bucket":"pass","name":"build"},{"state":"PENDING","bucket":"pending","name":"CodeRabbit"}]'; exit 0 ;;
     *) echo "[]"; exit 0 ;;
   esac
 fi
@@ -5709,6 +5725,46 @@ exit 1
         );
         assert!(snapshot.ci_pending);
         assert_eq!(snapshot.ci_status, "unknown");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capped_vendor_excluded_from_ci_success_and_status() {
+        use crate::vendor_health::{Vendor, VendorHealthLedger, CapObservation, CapSource};
+        use std::sync::{Arc, Mutex};
+
+        // 1. Without being capped, pending CodeRabbit makes CI success false and status unknown
+        let result = run_pr_snapshot_with_fake_gh("not_capped", "coderabbit_pending", "fail", 44);
+        let snapshot = result.expect("pr_snapshot must succeed");
+        assert!(!snapshot.ci_success);
+        assert!(snapshot.ci_pending);
+        assert_eq!(snapshot.ci_status, "unknown");
+
+        // 2. Set CodeRabbit as capped
+        let ledger = Arc::new(Mutex::new(VendorHealthLedger::new()));
+        for ts in 1..=3 {
+            ledger.lock().unwrap().record_cap(CapObservation {
+                vendor: Vendor::CodeRabbit,
+                source: CapSource::UnknownGateRepeated,
+                bead_id: format!("bead-{}", ts),
+                pr_number: 44,
+                ts_epoch: ts,
+                note: "test fixture".into(),
+            });
+        }
+        crate::vendor_health::set_global_ledger(ledger.clone());
+
+        // 3. With CodeRabbit capped, the pending CodeRabbit check is excluded, making CI green
+        let result = run_pr_snapshot_with_fake_gh("capped", "coderabbit_pending", "fail", 44);
+        let snapshot = result.expect("pr_snapshot must succeed");
+        assert!(snapshot.ci_success);
+        assert!(!snapshot.ci_pending);
+        assert_eq!(snapshot.ci_status, "green");
+
+        // Clean up global ledger
+        if let Some(l) = crate::vendor_health::GLOBAL_LEDGER.get() {
+            l.lock().unwrap().clear(Vendor::CodeRabbit);
+        }
     }
 }
 

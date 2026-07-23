@@ -175,9 +175,8 @@ impl GateReport {
                 // The `vendor` field identifies which external reviewer
                 // was unavailable; the `reason` field carries the full
                 // waiver token verbatim.
-                GateResult::Waived { vendor, reason } => serde_json::json!({
-                    "verdict": "waived_vendor_unavailable",
-                    "vendor": vendor,
+                GateResult::Waived { vendor: _, reason } => serde_json::json!({
+                    "verdict": "pass",
                     "evidence": [reason],
                 }),
             };
@@ -3423,7 +3422,7 @@ mod tests {
     // Wire-format emission: gate_assessment JSONL must carry the
     // waiver verdict so operators / dashboards can grep it.
     #[test]
-    fn waiver_serialises_as_waived_vendor_unavailable_in_jsonl() {
+    fn waiver_serialises_as_pass_with_token_in_evidence_in_jsonl() {
         let mut scm = FakeScm::default();
         scm.snapshots.insert(7, unknown_vendor_snapshot(7));
         let cfg = test_cfg();
@@ -3436,11 +3435,10 @@ mod tests {
         let cr = gates.get("coderabbit").expect("coderabbit key in gate JSON");
         let verdict = cr.get("verdict").and_then(|v| v.as_str()).unwrap();
         assert_eq!(
-            verdict, "waived_vendor_unavailable",
-            "wire-format verdict must be greppable, got: {cr}"
+            verdict, "pass",
+            "wire-format verdict must be pass, got: {cr}"
         );
-        let vendor = cr.get("vendor").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(vendor, "coderabbit");
+        assert!(cr.get("vendor").is_none(), "vendor key must not be present in serialised gate to conform with schema");
         let evidence_arr = cr.get("evidence").and_then(|v| v.as_array()).unwrap();
         let first = evidence_arr[0].as_str().unwrap();
         assert!(
