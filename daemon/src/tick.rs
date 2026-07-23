@@ -1396,7 +1396,8 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // Production signal (2026-07-23, 32h window): 5,334
                 // escalation comments posted at ~174/hour/branch on three
                 // colliding PRs (#8428 / #8420 / #8421) — 73% of all GH
-                // Actions noise on the repo. Full evidence bundle in PR body.
+                // Actions noise on the repo. Full evidence bundle in PR body
+                // (canonical `**Evidence**: <gist-url>` line).
                 let (should_emit, ctx_hash) = escalation_dedup_should_emit(
                     deps,
                     &adopted.head_ref_name,
