@@ -975,11 +975,18 @@ fn render_coder_prompt(
          - Do NOT force-push over commits you did not author.\n\
          - Work only within the task's scope; file follow-up notes rather \
          than expanding scope.\n\
-         - EVIDENCE (required to pass the evidence gate): publish a PUBLIC gist \
-         of your verification output (`gh gist create --public <file>`), then put \
-         this exact line in the PR body: `{evidence_marker} <gist-url> (head <sha>)` \
-         where <sha> is the PR head commit. The gist must be non-empty and its \
-         head <sha> must match the PR head.\n\
+         - EVIDENCE (required to pass the evidence gate): publish the gist as the \
+         FINAL step, AFTER every push, with the CURRENT head SHA. The \
+         ORDERED sequence is: (1) finish work, (2) push the FINAL revision \
+         to {branch}, (3) wait for CI, (4) capture the CURRENT head SHA \
+         (`gh pr view --json headRefOid -q .headRefOid`), (5) publish or \
+         RE-publish a PUBLIC gist of verification output (`gh gist create \
+         --public <file>` or `gh gist edit <id> --add <file>`), (6) update \
+         the PR body to `{evidence_marker} <gist-url> (head <current_sha>)` \
+         via `gh pr edit --body`, (7) re-run the Evidence Gate (the daemon \
+         does this on the next tick). Mid-session publication makes the gist \
+         head SHA go stale — rejected fast, NOT a full reroll. The gist must \
+         be non-empty and its head SHA must match the PR head.\n\
          {tree_block}",
         id = bead.id,
         title = bead.title,
@@ -999,9 +1006,21 @@ fn shrink_by(text: &mut String, excess: usize, marker: &str) {
     if let Some(pos) = text.rfind(marker) {
         text.truncate(pos);
     }
+    // jleechan-rln6: track whether the section was NON-empty before the
+    // shrink so the truncation marker is appended even when excess
+    // consumes the entire content. Pre-fix behavior left the marker off
+    // in the "excess >= text.len()" case, hiding from operators the fact
+    // that the section was sacrificed — a latent bug exposed by the
+    // rln6 EVIDENCE-block growth pushing the fixed boilerplate over the
+    // 4,000-char total cap and forcing `shrink_by` to absorb more than
+    // a single section's content. After the fix, the marker always
+    // announces the truncation when content was present, even if zero
+    // chars of the original survive (operator sees "[tree truncated]"
+    // and knows the section was sacrificed, not silently dropped).
+    let was_nonempty = !text.is_empty();
     let target = text.len().saturating_sub(excess).saturating_sub(marker.len());
     truncate_at_char_boundary(text, target);
-    if !text.is_empty() {
+    if was_nonempty {
         text.push_str(marker);
     }
 }
@@ -2842,6 +2861,80 @@ mod tests {
         );
     }
 
+    // jleechan-rln6: the EVIDENCE block must enumerate the ORDERED final-step
+    // sequence that coders were skipping (n6mk/jtg8/sb4b/jsby all published
+    // mid-session, leaving the gist head SHA stale by attestation time). The
+    // sequence must (a) be enumerated, (b) put capture/publish/update AFTER
+    // the final push, and (c) name the current head SHA as the one to use.
+    #[test]
+    fn coder_prompt_evidence_block_is_ordered_final_step_with_current_sha() {
+        let bead = Bead {
+            id: "bead-rln6".into(),
+            title: "rln6 prompt check".into(),
+            description: "x".into(),
+            notes: String::new(),
+            file_tree_summary: String::new(),
+            external_ref: None,
+        };
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/bead-rln6-r1",
+            "jleechanorg/dark-factory",
+            "origin",
+        );
+
+        // (a) Numbered enumeration present.
+        for needle in [
+            "(1) finish work",
+            "(2) push the FINAL revision",
+            "(3) wait for CI",
+            "(4) capture the CURRENT head SHA",
+            "(5) publish or RE-publish",
+            "(6) update the PR body",
+            "(7) re-run the Evidence Gate",
+        ] {
+            assert!(
+                prompt.contains(needle),
+                "evidence block missing ordered step '{needle}':\n{prompt}"
+            );
+        }
+
+        // (b) The capture-head-SHA step must appear AFTER the push step in
+        //     the prompt body — that's what makes the published gist
+        //     non-stale. Capture + update must use the literal phrase
+        //     "CURRENT head SHA" so coders don't substitute yesterday's SHA.
+        let push_pos = prompt
+            .find("(2) push the FINAL revision")
+            .expect("ordered push step present");
+        let capture_pos = prompt
+            .find("(4) capture the CURRENT head SHA")
+            .expect("capture-CURRENT-head-SHA step present");
+        assert!(
+            capture_pos > push_pos,
+            "capture-head-SHA step must follow push step (push@{push_pos}, capture@{capture_pos})"
+        );
+
+        // (c) The PR-body update template must show the live `<current_sha>`
+        //     placeholder, not a static SHA — coders must edit, not paste.
+        // The `format!` substitute renders the marker as `**Evidence**:`
+        // (the constant value); assert against that + the placeholder.
+        assert!(
+            prompt.contains(&format!(
+                "{} <gist-url> (head <current_sha>)",
+                crate::tools::EVIDENCE_MARKER
+            )),
+            "PR-body update template must use <current_sha> placeholder:\n{prompt}"
+        );
+
+        // (d) Mid-session publication is the failure mode this fixes. The
+        //     prompt must call out the consequence so coders stop doing it.
+        assert!(
+            prompt.contains("Mid-session publication")
+                && prompt.contains("rejected fast"),
+            "prompt must warn against mid-session evidence publication:\n{prompt}"
+        );
+    }
+
     #[test]
     fn coder_prompt_omits_empty_sections_and_truncates_long_bodies() {
         let bead = Bead {
@@ -3088,17 +3181,18 @@ mod tests {
             title: "Reconciliation priority".into(),
             // Sized so each section sits under its own per-section cap (no
             // pre-truncation marker) yet their SUM pushes the rendered
-            // prompt past the 4,096-char total cap — forcing the
+            // prompt past the 4,000-char total cap — forcing the
             // reconciliation pass to do real work in the documented
-            // priority order. With tree=3,000 + description=500 +
-            // notes=1,400 + boilerplate~700 ≈ 5,600 chars total, the
-            // excess (~1,500) absorbs entirely into the tree's first
-            // shrink pass; tree survives with the `[tree truncated]`
+            // priority order. With tree=3,500 + description=500 +
+            // notes=1,400 + boilerplate~1,100 (the rln6 EVIDENCE block grew
+            // the fixed boilerplate from ~700 to ~1,100 chars) ≈ 6,500 chars
+            // total, the excess (~2,500) absorbs entirely into the tree's
+            // first shrink pass; tree survives with the `[tree truncated]`
             // marker appended, while description and notes stay intact
             // (no further shrink passes needed).
             description: "D".repeat(500),
             notes: "OPERATOR_GUIDANCE_SENTINEL_DO_NOT_TRUNCATE".repeat(35), // ~1,400 chars
-            file_tree_summary: "x/".repeat(1_500), // 3,000 chars pre-render
+            file_tree_summary: "x/".repeat(1_750), // 3,500 chars pre-render
             external_ref: None,
         };
         let prompt = build_coder_prompt(

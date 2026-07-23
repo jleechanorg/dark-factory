@@ -95,6 +95,16 @@ pub struct TickSummary {
     /// `ESCALATION_NOTIFICATION_FAILED` re-fired every ~90s for beads with
     /// permanent gh errors despite `human_held_recovery_attempt_cap_reached`.
     pub escalations_undeliverable: usize,
+    /// jleechan-rln6: fast-rejected bead-ticks — beads whose gate assessment
+    /// ran but was short-circuited because the ONLY red gate was a stale
+    /// evidence marker (`EvidenceFloor` Red whose reason starts with
+    /// "evidence head"). Counted separately from `gates_assessed` so
+    /// operators can see the breakdown: the gate was assessed (still in
+    /// `gates_assessed`), the verdict was Red, but no park / no reroll
+    /// fired. Lets dashboards answer "how many lanes were saved from a
+    /// full reroll cycle by the fast-rejection path" without re-deriving
+    /// from telemetry.
+    pub gates_assessed_fast_rejected: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -106,6 +116,16 @@ pub struct TickSummary {
 const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
 const ESCALATION_REVIEWER: &str = "dark-factory-escalation";
 const ESCALATION_SENTINEL_ATTEMPT: u32 = u32::MAX;
+// jleechan-rln6: one-shot sentinel for the stale-evidence fast-rejection
+// path. Keyed on the SAME `save_rejection`/`load_rejection` infrastructure
+// the escalation dedup uses, so once the daemon has told the coder
+// session "your Evidence marker head SHA does not match PR head; refresh
+// via `gh pr edit --body`", subsequent ticks on the same bead do not
+// re-post the same comment (re-runs would spam the PR every minute until
+// the coder fixes it). Distinct from `ESCALATION_REVIEWER` so the two
+// one-shot flows never collide on the same `bead_id`/`attempt` row.
+const EVIDENCE_HEAD_STALE_REVIEWER: &str = "dark-factory-evidence-head-stale";
+const EVIDENCE_HEAD_STALE_SENTINEL_ATTEMPT: u32 = u32::MAX - 1;
 // jtg8-r4 acceptance #3: per-tick gh call count threshold above which the
 // slow tier logs a warning so operators can investigate before the core
 // rate-limit bucket exhausts. Pre-fix baseline was ~50 per slow tick
@@ -3852,10 +3872,106 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         && (want.starts_with(&got) || got.starts_with(&want))
                 };
                 if !head_matches {
-                    verifier::EvidenceGistStatus::Failed(format!(
+                    // jleechan-rln6: FAST-REJECTION PATH for stale evidence.
+                    // Pattern across 2026-07-22/23 lanes (n6mk/jtg8/sb4b/jsby)
+                    // — coders publish the gist mid-session, then keep pushing,
+                    // so the gist's head SHA goes stale by the time the daemon
+                    // reads the marker. The OLD code returned `Failed(...)` and
+                    // let the existing re-attestation loop churn the bead
+                    // every tick until the coder happened to refresh — the
+                    // typical outcome was a full reroll cycle (~20-40 min +
+                    // tokens) per miss. The NEW path (a) emits a structured
+                    // telemetry event `EVIDENCE_HEAD_STALE` so operators can
+                    // see the failure class, (b) posts a precise bead-notes-
+                    // style comment back to the coder session with the
+                    // exact `gh pr edit --body` recipe to refresh, and (c)
+                    // persists a one-shot sentinel so we do NOT re-post
+                    // the same comment every tick. The gate verdict still
+                    // returns `Failed(...)` so the rest of the chain stays
+                    // fail-closed — only the side-effects are added.
+                    //
+                    // PR #463 round-1 Codex P1 finding: the `continue` below
+                    // short-circuits the rest of `run_fast_tier`, including
+                    // the GATE_ASSESSMENT telemetry emit and the
+                    // auto-merge-guard's `latest_assessment_no_red` check.
+                    // The merge guard reads the LATEST GATE_ASSESSMENT for
+                    // `(pr_number, head_sha)`; if the fast-reject branch
+                    // skipped the emit, an older all-green assessment
+                    // (from before the marker went stale) would be the only
+                    // thing visible, and a merge on stale data could slip
+                    // through. The fix: emit the assessment BEFORE
+                    // short-circuiting the park/reroll path. The
+                    // `gate_assessment_context` is built identically to the
+                    // non-fast-reject branch, so the guard sees the same
+                    // shape and the fresh EvidenceFloor Red verdict
+                    // correctly suppresses a merge.
+                    let mismatch_reason = format!(
                         "evidence head {} does not match PR head {}",
                         parsed.head_sha, snapshot.head_sha
-                    ))
+                    );
+                    if !evidence_head_stale_already_recorded(deps, bead_id, &mismatch_reason)? {
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Attested.as_str(),
+                            "EVIDENCE_HEAD_STALE",
+                            serde_json::json!({
+                                "pr_number": pr,
+                                "parsed_head_sha": parsed.head_sha,
+                                "pr_head_sha": snapshot.head_sha,
+                            }),
+                            serde_json::json!({
+                                "reason": "evidence marker head SHA does not match PR head — fast rejection, no full reroll",
+                                "remediation": "gh pr edit --body with **Evidence**: <gist-url> (head <current_sha>) where <current_sha> = gh pr view --json headRefOid -q .headRefOid",
+                            }),
+                        )?;
+                        let comment_body = format!(
+                            "🤖 **[dark-factory]** Bead `{bead_id}` — your `**Evidence**:` marker references head `{parsed_sha}` but the PR head is now `{pr_sha}`. The Evidence Gate rejects this attestation WITHOUT triggering a reroll (fast rejection). To re-attest, refresh the PR body to the CURRENT head SHA:\n\n\
+                             ```\n\
+                             CURRENT=$(gh pr view --json headRefOid -q .headRefOid)\n\
+                             gh pr edit --body \"**Evidence**: <gist-url> (head $CURRENT)\"\n\
+                             ```\n\n\
+                             The fast tier will re-assess on the next tick once the marker matches the live head. Do NOT publish a fresh gist until you have the FINAL push SHA in hand — publishing mid-session is the failure mode this fix targets.",
+                            bead_id = bead_id,
+                            parsed_sha = parsed.head_sha,
+                            pr_sha = snapshot.head_sha,
+                        );
+                        // PR #463 round-1 Codex P2 finding #1: only persist
+                        // the sentinel on a successful comment post. If the
+                        // post fails transiently, leaving the sentinel
+                        // persisted would suppress the next tick's retry
+                        // and the coder would never receive the only
+                        // instructions that explain how to refresh the
+                        // marker. On error we emit a dedicated telemetry
+                        // event so operators can see the notification
+                        // failure, but the sentinel is left empty so the
+                        // next tick re-posts.
+                        match post_scm_comment_by_bead_id(deps, bead_id, &comment_body) {
+                            Ok(()) => {
+                                record_evidence_head_stale(deps, bead_id, &mismatch_reason)?;
+                            }
+                            Err(e) => {
+                                emit(
+                                    deps.telemetry_log,
+                                    bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Attested.as_str(),
+                                    "EVIDENCE_HEAD_STALE_NOTIFY_FAILED",
+                                    serde_json::json!({
+                                        "pr_number": pr,
+                                        "parsed_head_sha": parsed.head_sha,
+                                        "pr_head_sha": snapshot.head_sha,
+                                    }),
+                                    serde_json::json!({
+                                        "reason": "stale-evidence remediation comment post failed; sentinel NOT persisted so next tick will retry",
+                                        "error": e.to_string(),
+                                    }),
+                                )?;
+                            }
+                        }
+                    }
+                    verifier::EvidenceGistStatus::Failed(mismatch_reason)
                 } else {
                     match deps.scm.gist_nonempty(&parsed.gist_id) {
                         Ok(Some(true)) => verifier::EvidenceGistStatus::Verified,
@@ -3883,6 +3999,20 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         };
         let report = verifier::assess(deps.scm, pr, &repo, deps.cfg, &evidence)?;
         summary.gates_assessed += 1;
+        // jleechan-rln6 / PR #463 round-1 Codex P1 finding: the
+        // GATE_ASSESSMENT emit must happen BEFORE the fast-rejection
+        // `continue` short-circuit. `auto-merge-guard.sh` reads the LATEST
+        // GATE_ASSESSMENT for `(pr_number, head_sha)` to decide whether a
+        // no-red assessment exists; if the fast-reject branch skipped the
+        // emit, an older all-green assessment (made before the marker
+        // went stale) would be the only thing visible to the guard, and
+        // a merge on stale data could slip through. The fix: emit the
+        // assessment FIRST, then `continue` if the fast-reject applies.
+        // The `gate_assessment_context` is built identically to the
+        // non-fast-reject branch so the guard sees the same shape and
+        // the fresh EvidenceFloor Red verdict correctly suppresses a
+        // merge.
+        //
         // jleechan-wzgl: log the full per-gate breakdown (all 7 gates,
         // verdict + reason) plus the gate-7 reviewer vendor identity, not
         // just the aggregate `all_green` boolean — `report.to_json()` is
@@ -3939,6 +4069,48 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             serde_json::json!({}),
             gate_assessment_context,
         )?;
+
+        // jleechan-rln6: FAST-REJECTION short-circuit for a STALE evidence
+        // marker. When the ONLY red gate is `EvidenceFloor` AND its reason
+        // string contains the head-SHA mismatch class (emitted by the
+        // fast-rejection branch above as
+        // `"evidence contract: evidence head <X> does not match PR head <Y>"`),
+        // the daemon must NOT park (stage 1) or reroll (stage 2) the bead
+        // — those are the exact failure modes the rln6 acceptance
+        // criteria target (n6mk/jtg8/sb4b/jsby each lost a full reroll
+        // cycle to this pattern). The coder has been told exactly what
+        // to do via the `EVIDENCE_HEAD_STALE` event + the bead-notes-style
+        // comment posted above; the next tick after they refresh the
+        // marker will re-assess. Counting the gate in `gates_assessed`
+        // keeps telemetry consistent (the assessment DID happen), and
+        // the GATE_ASSESSMENT emit above is what tells the merge guard
+        // the fresh verdict, but `continue` skips the park/reroll/
+        // escalation branches below.
+        // We match on `"does not match PR head"` (the substring inside
+        // the `evidence_floor_gate` "evidence contract: …" envelope)
+        // rather than the prefix because `evidence_floor_gate` always
+        // prefixes its Red reason with `"evidence contract: "`.
+        if let Some((_, verifier::GateResult::Red(reason))) = report
+            .results
+            .iter()
+            .find(|(name, _)| *name == verifier::GateName::EvidenceFloor)
+        {
+            let only_evidence_is_stale = report
+                .results
+                .iter()
+                .all(|(name, result)| {
+                    *name == verifier::GateName::EvidenceFloor
+                        || !matches!(result, verifier::GateResult::Red(_))
+                })
+                && reason.contains("does not match PR head");
+            if only_evidence_is_stale {
+                summary.gates_assessed_fast_rejected += 1;
+                continue;
+            }
+        }
+        // (the GATE_ASSESSMENT emit was hoisted above the fast-reject
+        // short-circuit per PR #463 round-1 Codex P1 finding; see comment
+        // block at the top of this section.)
 
         if report.all_green {
             overlay.state = OverlayState::Ready;
@@ -4456,6 +4628,49 @@ fn escalation_already_recorded(deps: &TickDeps, bead_id: &str) -> Result<bool, D
             .load_rejection(bead_id, ESCALATION_SENTINEL_ATTEMPT)?,
         Some((reviewer, _)) if reviewer == ESCALATION_REVIEWER
     ))
+}
+
+/// jleechan-rln6: returns true once the daemon has already told this bead's
+/// coder session that the Evidence marker head SHA is stale for THIS
+/// specific `(parsed_sha, pr_sha)` mismatch tuple. The bead-level sentinel
+/// (`save_rejection`) keys on the same `(bead_id, attempt)` pair the
+/// escalation flow uses; distinct `reviewer` string keeps the two flows
+/// from colliding. PR #463 round-1 Codex P2 finding #2: the sentinel must
+/// be keyed by the mismatch tuple, not just the bead, so a fresh mismatch
+/// after the coder fixes the first one still re-posts the remediation.
+fn evidence_head_stale_already_recorded(
+    deps: &TickDeps,
+    bead_id: &str,
+    current_mismatch_reason: &str,
+) -> Result<bool, DaemonError> {
+    let row = deps
+        .store
+        .load_rejection(bead_id, EVIDENCE_HEAD_STALE_SENTINEL_ATTEMPT)?;
+    match row {
+        Some((reviewer, _)) if reviewer == EVIDENCE_HEAD_STALE_REVIEWER => {
+            let prev = deps
+                .store
+                .load_rejection_text(bead_id, EVIDENCE_HEAD_STALE_SENTINEL_ATTEMPT)?;
+            Ok(prev.as_deref() == Some(current_mismatch_reason))
+        }
+        _ => Ok(false),
+    }
+}
+
+/// jleechan-rln6: persist the stale-evidence fast-rejection sentinel. The
+/// `reason` field carries the precise (parsed.head_sha, snapshot.head_sha)
+/// pair so a follow-up operator audit can grep for the exact mismatch that
+/// fired the rejection without re-running the parser, AND so the
+/// `evidence_head_stale_already_recorded` dedup key is the actual mismatch
+/// tuple (PR #463 round-1 Codex P2 finding #2).
+fn record_evidence_head_stale(deps: &TickDeps, bead_id: &str, reason: &str) -> Result<(), DaemonError> {
+    deps.store.save_rejection(
+        bead_id,
+        EVIDENCE_HEAD_STALE_SENTINEL_ATTEMPT,
+        EVIDENCE_HEAD_STALE_REVIEWER,
+        reason,
+        reason,
+    )
 }
 
 fn record_escalation(deps: &TickDeps, bead_id: &str, reason: &str) -> Result<(), DaemonError> {

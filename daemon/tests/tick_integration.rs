@@ -11235,6 +11235,513 @@ fn evidence_gate_head_mismatch_fails_closed() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+// jleechan-rln6: when a coder's Evidence marker references a head SHA that
+// does NOT match the current PR head, the daemon must (a) emit a structured
+// `EVIDENCE_HEAD_STALE` telemetry event, (b) post a precise bead-notes-style
+// comment with the `gh pr edit --body` recipe back to the coder session,
+// (c) persist a one-shot sentinel so a SECOND tick on the same bead does
+// NOT re-post the same comment, and (d) leave the gate Red but NOT trigger
+// a full reroll. This test pins all four behaviors in one regression.
+#[test]
+fn rln6_evidence_head_stale_fast_rejects_with_one_shot_comment() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // Marker references a STALE head. PR head (snap.head_sha) is
+    // `deadbeefcafe` (set by `evidence_bead`); marker says `00000000stale`.
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-rln6-stale",
+        9106,
+        "factory/ev-rln6-stale-r1",
+        "**Evidence**: https://gist.github.com/u/goodgist (head 00000000stale)",
+    );
+    // Gist is fetchable+non-empty; the rejection is NOT about the gist —
+    // it is about the head SHA mismatch. The test would still fail-closed
+    // even without this insert.
+    scm.gists.insert("goodgist".into(), true);
+
+    let telemetry_log = std::env::temp_dir().join("afd_rln6_ev_stale.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick must not error");
+
+    // (d) Gate is Red — bead stays Attested, NOT HumanHeld, NOT Ready.
+    let overlay = store.load("ev-rln6-stale").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Attested,
+        "a stale-head Evidence marker must NOT promote the bead (fast-reject, stay Attested)"
+    );
+
+    // (a) EVIDENCE_HEAD_STALE telemetry event was emitted with the parsed
+    // and PR head SHAs in metrics and the remediation recipe in context.
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("EVIDENCE_HEAD_STALE"),
+        "EVIDENCE_HEAD_STALE telemetry event must be emitted; log:\n{log}"
+    );
+    assert!(
+        log.contains("00000000stale") && log.contains("deadbeefcafe"),
+        "telemetry must carry both parsed and PR head SHAs; log:\n{log}"
+    );
+    assert!(
+        log.contains("gh pr edit --body"),
+        "telemetry context must carry the remediation recipe; log:\n{log}"
+    );
+
+    // (b) The bead-notes-style comment was posted via `comment_external`
+    // (the daemon's existing bead-message channel), with the precise
+    // mismatch and the live `gh pr edit` recipe.
+    let calls = tracker.calls.borrow();
+    let stale_comment = calls.iter().find(|c| c.contains("EVIDENCE_HEAD_STALE")
+        || (c.contains("ev-rln6-stale") && c.contains("00000000stale") && c.contains("deadbeefcafe")));
+    assert!(
+        stale_comment.is_some(),
+        "the daemon must post a bead-notes-style comment carrying both SHAs and the remediation; calls:\n{calls:?}"
+    );
+    let body = stale_comment.unwrap();
+    assert!(
+        body.contains("gh pr edit --body"),
+        "the comment must carry the literal gh recipe; got: {body}"
+    );
+    assert!(
+        body.contains("gh pr view --json headRefOid"),
+        "the comment must show how to capture the CURRENT head SHA; got: {body}"
+    );
+
+    // (c) A SECOND tick on the same bead must NOT re-post the comment —
+    // the sentinel suppresses the spam.
+    let post_first = calls
+        .iter()
+        .filter(|c| c.contains("ev-rln6-stale") && c.contains("00000000stale"))
+        .count();
+    drop(calls);
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("second tick must not error");
+    let calls2 = tracker.calls.borrow();
+    let post_second = calls2
+        .iter()
+        .filter(|c| c.contains("ev-rln6-stale") && c.contains("00000000stale"))
+        .count();
+    assert_eq!(
+        post_second, post_first,
+        "the second tick on the same bead must NOT re-post the same comment (one-shot sentinel); \
+         first={post_first} second={post_second}"
+    );
+
+    // The bead must STILL be Attested — fast-rejection is not a state
+    // transition, it is a precise coder-facing message plus a red gate.
+    assert_eq!(
+        store.load("ev-rln6-stale").unwrap().unwrap().state,
+        OverlayState::Attested,
+        "fast-reject must leave the bead Attested, not HumanHeld, not Ready"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// Codex P1 finding (PR #463 round 1): the daemon must emit a
+// `GATE_ASSESSMENT` telemetry event BEFORE the fast-rejection `continue`
+// short-circuits the park/reroll path. `auto-merge-guard.sh` reads the latest
+// `GATE_ASSESSMENT` for `(pr_number, head_sha)` to decide whether a no-red
+// assessment exists; if the fast-reject branch skipped the emit, an older
+// all-green assessment (made before the evidence marker went stale) would
+// be the only thing visible to the guard, and a merge on stale data could
+// slip through. The fix: emit the assessment first, then `continue`. This
+// test pins that contract.
+#[test]
+fn rln6_v2_evidence_head_stale_emits_gate_assessment_before_fast_reject() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // Stale-head marker — same fixture as the original rln6 test, the only
+    // red gate will be EvidenceFloor with the "does not match PR head"
+    // reason so the fast-reject path fires.
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-rln6-v2-emit",
+        9107,
+        "factory/ev-rln6-v2-emit-r1",
+        "**Evidence**: https://gist.github.com/u/goodgist (head 00000000stale)",
+    );
+    scm.gists.insert("goodgist".into(), true);
+
+    let telemetry_log = std::env::temp_dir().join("afd_rln6_v2_emit.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick must not error");
+
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    // P1 contract: a GATE_ASSESSMENT line is emitted on the fast-reject tick
+    // so the merge guard sees the fresh EvidenceFloor Red verdict (with the
+    // current PR head SHA), not a stale all-green assessment from an older
+    // tick.
+    assert!(
+        log.contains("GATE_ASSESSMENT"),
+        "GATE_ASSESSMENT must be emitted on a fast-reject tick (P1 Codex fix); log:\n{log}"
+    );
+    // The fresh assessment MUST reference the live head SHA and the
+    // EvidenceFloor Red reason — operators can grep these to confirm the
+    // fast-reject path is the one that fired.
+    assert!(
+        log.contains("\"head_sha\"") && log.contains("deadbeefcafe"),
+        "the GATE_ASSESSMENT must carry the live PR head SHA so the merge \
+         guard cannot reuse an older all-green assessment; log:\n{log}"
+    );
+    assert!(
+        log.contains("evidence contract"),
+        "the GATE_ASSESSMENT must carry the EvidenceFloor Red reason so the \
+         guard sees why the gate is Red; log:\n{log}"
+    );
+
+    // Sanity: bead stays Attested, fast-rejection still applies.
+    assert_eq!(
+        store.load("ev-rln6-v2-emit").unwrap().unwrap().state,
+        OverlayState::Attested,
+        "fast-reject must still leave the bead Attested"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// Codex P2 finding #1 (PR #463 round 1): if `post_scm_comment_by_bead_id`
+// fails transiently on the stale-evidence notification attempt, the daemon
+// must NOT persist the one-shot sentinel — otherwise the next tick
+// suppresses the remediation comment and the coder never receives the
+// instructions to refresh the marker. The fix: bind the post result and
+// only call `record_evidence_head_stale` on `Ok(())`. On `Err(_)` the daemon
+// should emit a transient-notification telemetry and leave the sentinel
+// unsent so the next tick re-attempts the post. This test pins that
+// behavior end-to-end: script the first tick's comment to fail, assert
+// the sentinel is NOT persisted, then run a second tick with a working
+// comment and assert the comment is now posted (because the sentinel was
+// never recorded).
+#[test]
+fn rln6_v2_evidence_head_stale_does_not_persist_sentinel_on_comment_failure() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-rln6-v2-comment-fail",
+        9108,
+        "factory/ev-rln6-v2-comment-fail-r1",
+        "**Evidence**: https://gist.github.com/u/goodgist (head 00000000stale)",
+    );
+    scm.gists.insert("goodgist".into(), true);
+
+    // Script the next `comment_external` call to fail transiently. The
+    // FakeTracker plumbing routes both the bead-message path and the
+    // `post_scm_comment_by_bead_id` path through `comment_external` so this
+    // single flag covers both.
+    *tracker.fail_next_comment.borrow_mut() = Some("transient SCM error".to_string());
+
+    let telemetry_log = std::env::temp_dir().join("afd_rln6_v2_comment_fail.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("first tick must not error");
+
+    // Sentinel MUST NOT be persisted — the comment failed, so the next tick
+    // must be allowed to retry. `load_rejection` returns the `(reviewer, _)`
+    // pair; the daemon treats `(Some, EVIDENCE_HEAD_STALE_REVIEWER)` as
+    // "already notified". After a transient failure the slot must be empty.
+    let stored = store
+        .load_rejection("ev-rln6-v2-comment-fail", u32::MAX - 1)
+        .unwrap();
+    assert!(
+        stored.is_none(),
+        "the one-shot sentinel MUST NOT be persisted when the comment post \
+         fails transiently (P2 Codex fix #1); stored={stored:?}"
+    );
+
+    // The bead is still Attested (fast-reject still applies — the gate is
+    // still Red, we just skipped the side-effects because the comment
+    // failed).
+    assert_eq!(
+        store.load("ev-rln6-v2-comment-fail").unwrap().unwrap().state,
+        OverlayState::Attested,
+        "fast-reject must still leave the bead Attested even when the \
+         comment post fails"
+    );
+
+    // Second tick — comment path is now healthy. The sentinel is still
+    // empty so the daemon MUST post the remediation comment this time.
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("second tick must not error");
+
+    let calls = tracker.calls.borrow();
+    let post_count = calls
+        .iter()
+        .filter(|c| c.contains("ev-rln6-v2-comment-fail") && c.contains("00000000stale"))
+        .count();
+    assert!(
+        post_count >= 1,
+        "the second tick MUST post the remediation comment because the \
+         sentinel was not persisted on the first tick; calls:\n{calls:?}"
+    );
+
+    // After the successful second post, the sentinel IS persisted so a
+    // THIRD tick (same mismatch tuple) does not re-post.
+    let stored_after = store
+        .load_rejection("ev-rln6-v2-comment-fail", u32::MAX - 1)
+        .unwrap();
+    assert!(
+        stored_after.is_some(),
+        "after a successful comment post, the sentinel must be persisted so \
+         subsequent ticks with the same mismatch suppress re-posts"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// Codex P2 finding #2 (PR #463 round 1): the one-shot sentinel was keyed
+// on `(bead_id, attempt)` only. In normal recovery a coder fixes the first
+// `(parsed_sha, pr_sha)` mismatch, pushes another commit, and the marker
+// goes stale again with a NEW mismatch tuple. The old keying would
+// suppress the second notification because the bead is "already notified",
+// leaving the lane stuck with no fresh instructions. The fix: encode the
+// mismatch tuple in the stored reason; on each tick, load the previous
+// reason and compare to the current mismatch — only suppress when they
+// match. This test pins that contract end-to-end: tick 1 records
+// `(parsed=AAAA, pr=BBBB)`, the snapshot is then updated to a NEW pr_sha
+// `CCCC` while the marker still references `AAAA`, the next tick must
+// detect the NEW mismatch tuple and re-post the remediation comment.
+#[test]
+fn rln6_v2_evidence_head_stale_sentinel_resets_on_new_mismatch_tuple() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // Initial state: pr_sha=deadbeefcafe, marker references 00000000stale.
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-rln6-v2-tuple",
+        9109,
+        "factory/ev-rln6-v2-tuple-r1",
+        "**Evidence**: https://gist.github.com/u/goodgist (head 00000000stale)",
+    );
+    scm.gists.insert("goodgist".into(), true);
+
+    let telemetry_log = std::env::temp_dir().join("afd_rln6_v2_tuple.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // First tick — daemon posts the remediation, records the sentinel with
+    // the (parsed=00000000stale, pr=deadbeefcafe) tuple.
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("first tick must not error");
+
+    let calls_after_first = tracker.calls.borrow().len();
+    let stored_first = store
+        .load_rejection_text("ev-rln6-v2-tuple", u32::MAX - 1)
+        .unwrap();
+    assert!(
+        stored_first.is_some(),
+        "after the first successful post, the sentinel reason must be \
+         persisted (P2 Codex fix #2 depends on it)"
+    );
+    let first_reason = stored_first.unwrap();
+    assert!(
+        first_reason.contains("00000000stale") && first_reason.contains("deadbeefcafe"),
+        "the stored reason must encode the (parsed_sha, pr_sha) tuple; got: {first_reason}"
+    );
+
+    // Now simulate the recovery: the coder pushes a new commit, so the
+    // PR's `head_sha` advances to a NEW value (`feedfacefeed`), but the
+    // marker still references `00000000stale` — a fresh mismatch tuple.
+    {
+        let mut snap = scm.pr_snapshots.get(&9109).unwrap().clone();
+        snap.head_sha = "feedfacefeed".into();
+        scm.pr_snapshots.insert(9109, snap);
+    }
+
+    // Second tick — mismatch tuple is now
+    // (parsed=00000000stale, pr=feedfacefeed), distinct from the stored
+    // (parsed=00000000stale, pr=deadbeefcafe). The daemon MUST post a NEW
+    // remediation comment because the new tuple has not been notified.
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("second tick must not error");
+
+    let calls = tracker.calls.borrow();
+    // A comment referencing BOTH `00000000stale` AND `feedfacefeed` is the
+    // fresh notification (the old one referenced `deadbeefcafe`).
+    let fresh_post = calls
+        .iter()
+        .filter(|c| {
+            c.contains("ev-rln6-v2-tuple")
+                && c.contains("00000000stale")
+                && c.contains("feedfacefeed")
+        })
+        .count();
+    assert!(
+        fresh_post >= 1,
+        "the second tick MUST post a fresh remediation comment because the \
+         mismatch tuple changed (P2 Codex fix #2); calls:\n{calls:?}"
+    );
+    drop(calls);
+
+    // Sentinel is overwritten with the new tuple, so a THIRD tick (still on
+    // the same fresh mismatch tuple) does NOT re-post again. Count only
+    // `comment_external` calls (other call types — fetch_candidates,
+    // pr_snapshot — are also recorded in `tracker.calls`).
+    let comment_count_before = tracker
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| c.starts_with("comment_external("))
+        .count();
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("third tick must not error");
+    let comment_count_after = tracker
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| c.starts_with("comment_external("))
+        .count();
+    assert_eq!(
+        comment_count_after, comment_count_before,
+        "the third tick on the SAME fresh mismatch tuple must NOT re-post \
+         (sentinel persists for the new tuple); before={comment_count_before} after={comment_count_after}"
+    );
+
+    // Sanity: calls_after_first is what we started with before the second
+    // tick. We just need to know the test exercised the path.
+    let _ = calls_after_first;
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// r5 finding 2: an evidence marker LINE that is present but incomplete
 /// (missing gist URL or `(head <sha>)`) must FAIL the evidence gate
 /// (fail-closed) — not be treated as NotProvided.
