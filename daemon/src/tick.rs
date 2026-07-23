@@ -1377,13 +1377,6 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         if let Some(owner) = deps.store.bead_id_for_branch(&adopted.head_ref_name)? {
             if owner != adopted.bead_id {
                 let owner_live = deps.store.load(&owner)?.is_some();
-                let comment_body = format!(
-                    "🤖 **[dark-factory]** Escalation required: refusing factory PR adoption for branch `{}` because it is already registered to bead `{}`. Branch-key stealing is not allowed; please use a unique same-repo branch.",
-                    adopted.head_ref_name, owner
-                );
-                let _ = deps
-                    .tracker
-                    .comment_external(&adopted.external_ref, &comment_body);
                 let ctx = serde_json::json!({
                     "reason": "adoption_branch_collision",
                     "branch": adopted.head_ref_name,
@@ -1392,9 +1385,16 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     "external_ref": adopted.external_ref,
                 });
                 let now_epoch = now_epoch_secs();
+                // Bug jleechan-rouf (worldarchitect.ai#8428 / #8420 / #8421):
+                // each tick produces a NEW `adopted.bead_id` for the same
+                // colliding branch, so the historical dedup key (adopted.bead_id)
+                // never matched across ticks and the comment spammed every tick.
+                // Key the dedup on the stable branch instead — every colliding
+                // bead for the same branch collapses to one ledger row, and
+                // `cfg.escalation_refire_secs` (default 1h) gates the noise.
                 let (should_emit, ctx_hash) = escalation_dedup_should_emit(
                     deps,
-                    &adopted.bead_id,
+                    &adopted.head_ref_name,
                     "adoption_branch_collision",
                     &ctx,
                     now_epoch,
@@ -1403,6 +1403,13 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     summary.escalations_suppressed += 1;
                     continue;
                 }
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: refusing factory PR adoption for branch `{}` because it is already registered to bead `{}`. Branch-key stealing is not allowed; please use a unique same-repo branch.",
+                    adopted.head_ref_name, owner
+                );
+                let _ = deps
+                    .tracker
+                    .comment_external(&adopted.external_ref, &comment_body);
                 summary.beads_escalated += 1;
                 emit(
                     deps.telemetry_log,
@@ -1415,7 +1422,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 )?;
                 record_escalation_emit_dedup(
                     deps,
-                    &adopted.bead_id,
+                    &adopted.head_ref_name,
                     "adoption_branch_collision",
                     &ctx_hash,
                     now_epoch,
@@ -4811,6 +4818,154 @@ mod escalation_context_hash_tests {
             s,
             r#"{"a_field":"two","b_arr":[{"j":1,"k":2},{"j":2,"k":1}],"nested":{"x":null,"y":[3,2,1]},"z_field":1}"#,
             "canonical JSON must sort keys at every nesting level (RFC 8789 JCS-lite)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod adoption_branch_collision_dedup_tests {
+    //! Regression tests for bead jleechan-rouf (worldarchitect.ai#8428 / #8420 /
+    //! #8421: 5,334 duplicate `🤖 [dark-factory] Escalation required: refusing
+    //! factory PR adoption` comments posted in 32h — each slow-tick
+    //! `normalize_labeled_prs` pass produced a NEW `adopted.bead_id` for the
+    //! SAME colliding branch, so the historical dedup key
+    //! `escalation_ledger(bead_id, reason)` never matched across ticks and the
+    //! comment + ESCALATION_REQUIRED event spammed every slow tick.
+    //!
+    //! The fix re-keys dedup on the stable branch
+    //! (`escalation_ledger(branch, reason)`) so all colliding beads for the
+    //! same branch collapse to one ledger row, and
+    //! `cfg.escalation_refire_secs` (default 3600s) gates the noise.
+    //!
+    //! These tests pin the dedup contract against the real `SqliteStateStore`
+    //! (not the trait default) so a future schema migration that drops or
+    //! renames the column can't silently break the gate. Every test opens a
+    //! fresh in-memory DB so they can run in parallel without isolation
+    //! friction.
+
+    use crate::state::{SqliteStateStore, StateStore};
+
+    fn fresh_store() -> SqliteStateStore {
+        SqliteStateStore::open_in_memory_with_schema(include_str!("../contracts/schema.sql"))
+            .expect("open_in_memory_with_schema must succeed for fresh_db tests")
+    }
+
+    /// (a) Single colliding bead → first call returns `true` (allow emit),
+    /// second call within the backoff window returns `false` (suppress).
+    /// Replays the dedup contract on the bead_id-keyed path so a future
+    /// regression that breaks dedup entirely is caught here even if no
+    /// collision occurs.
+    #[test]
+    fn first_emit_allowed_second_within_window_suppressed_bead_key() {
+        let s = fresh_store();
+        let ctx = serde_json::json!({
+            "reason": "adoption_branch_collision",
+            "branch": "factory/collide-r1",
+            "registered_bead": "bead-owner",
+        });
+        let (first, h1) = (s.escalation_should_emit(
+            "bead-owner",
+            "adoption_branch_collision",
+            &crate::tick::escalation_context_hash(&ctx),
+            1_000,
+            3_600,
+        ).unwrap(), crate::tick::escalation_context_hash(&ctx));
+        assert!(first, "first emit must be allowed (no prior ledger row)");
+        s.record_escalation_emit(
+            "bead-owner",
+            "adoption_branch_collision",
+            &h1,
+            1_000,
+        ).unwrap();
+        let second = s.escalation_should_emit(
+            "bead-owner",
+            "adoption_branch_collision",
+            &h1,
+            1_100,
+            3_600,
+        ).unwrap();
+        assert!(!second, "second emit within backoff window must be suppressed");
+    }
+
+    /// (b) The bug class jleechan-rouf was the WRONG key — verifying that
+    /// when every colliding bead uses a DIFFERENT bead_id (the actual
+    /// production pattern: a fresh bead per tick), the bead-keyed dedup does
+    /// NOT suppress across beads. This pins the failure mode so a future
+    /// "let me revert to bead_key" refactor gets caught at code-review time.
+    #[test]
+    fn bead_key_dedup_does_not_suppress_across_different_bead_ids() {
+        let s = fresh_store();
+        let ctx = serde_json::json!({
+            "reason": "adoption_branch_collision",
+            "branch": "factory/collide-r1",
+            "registered_bead": "bead-owner",
+        });
+        let h = crate::tick::escalation_context_hash(&ctx);
+        // First colliding bead records the emit under ITS bead_id.
+        assert!(s.escalation_should_emit("bead-attacker-1", "adoption_branch_collision", &h, 1_000, 3_600).unwrap());
+        s.record_escalation_emit("bead-attacker-1", "adoption_branch_collision", &h, 1_000).unwrap();
+        // Second colliding bead has a DIFFERENT bead_id but the SAME
+        // (branch, reason) — bead-keyed dedup does NOT suppress.
+        assert!(
+            s.escalation_should_emit("bead-attacker-2", "adoption_branch_collision", &h, 1_100, 3_600).unwrap(),
+            "bead-keyed dedup is the BUG; second colliding bead's emit must NOT be suppressed under the broken key"
+        );
+    }
+
+    /// (c) The fix: re-key on the branch. Every colliding bead that uses the
+    /// SAME branch as the dedup key collapses to one ledger row, and the
+    /// second emit within the backoff window is suppressed. The bead_id
+    /// passed to `escalation_should_emit` is the branch string in
+    /// production — this test mirrors that pattern.
+    #[test]
+    fn branch_key_dedup_suppresses_across_colliding_beads() {
+        let s = fresh_store();
+        let ctx = serde_json::json!({
+            "reason": "adoption_branch_collision",
+            "branch": "factory/collide-r1",
+            "registered_bead": "bead-owner",
+        });
+        let h = crate::tick::escalation_context_hash(&ctx);
+        // First colliding bead's emit keys on the BRANCH, not the bead_id.
+        assert!(s.escalation_should_emit("factory/collide-r1", "adoption_branch_collision", &h, 1_000, 3_600).unwrap());
+        s.record_escalation_emit("factory/collide-r1", "adoption_branch_collision", &h, 1_000).unwrap();
+        // Second colliding bead — different bead_id but SAME branch — must
+        // be suppressed under the branch-keyed ledger.
+        assert!(
+            !s.escalation_should_emit("factory/collide-r1", "adoption_branch_collision", &h, 1_100, 3_600).unwrap(),
+            "branch-keyed dedup must suppress the second colliding bead's emit within the backoff window"
+        );
+        // After the backoff window elapses, the third colliding bead's emit
+        // must be allowed again (cooldown is per-branch, not one-shot).
+        assert!(
+            s.escalation_should_emit("factory/collide-r1", "adoption_branch_collision", &h, 5_000, 3_600).unwrap(),
+            "branch-keyed dedup must re-allow emit after escalation_refire_secs elapses"
+        );
+    }
+
+    /// (d) Different branches must not collide in the ledger — a fix that
+    /// accidentally keying on a too-coarse grain (e.g. just `reason`) would
+    /// silently suppress legitimate escalations on unrelated branches.
+    #[test]
+    fn branch_key_dedup_does_not_collide_across_different_branches() {
+        let s = fresh_store();
+        let h1 = crate::tick::escalation_context_hash(&serde_json::json!({
+            "reason": "adoption_branch_collision",
+            "branch": "factory/branch-a-r1",
+            "registered_bead": "bead-owner-a",
+        }));
+        let h2 = crate::tick::escalation_context_hash(&serde_json::json!({
+            "reason": "adoption_branch_collision",
+            "branch": "factory/branch-b-r1",
+            "registered_bead": "bead-owner-b",
+        }));
+        assert!(s.escalation_should_emit("factory/branch-a-r1", "adoption_branch_collision", &h1, 1_000, 3_600).unwrap());
+        s.record_escalation_emit("factory/branch-a-r1", "adoption_branch_collision", &h1, 1_000).unwrap();
+        // branch-b has its own ledger row — must not be suppressed by
+        // branch-a's recent emit.
+        assert!(
+            s.escalation_should_emit("factory/branch-b-r1", "adoption_branch_collision", &h2, 1_050, 3_600).unwrap(),
+            "different branches must NOT share a ledger row"
         );
     }
 }
