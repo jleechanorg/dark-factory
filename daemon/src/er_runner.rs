@@ -361,7 +361,7 @@ mod tests {
                 .push(format!("labeled_issues({label})"));
             Ok(self.issues.clone())
         }
-        fn labeled_prs(&self, label: &str) -> Result<Vec<crate::tools::LabeledPr>, DaemonError> {
+        fn labeled_prs(&self, label: &str, _gh_calls: &mut u32) -> Result<Vec<crate::tools::LabeledPr>, DaemonError> {
             self.calls.borrow_mut().push(format!("labeled_prs({label})"));
             Ok(Vec::new())
         }

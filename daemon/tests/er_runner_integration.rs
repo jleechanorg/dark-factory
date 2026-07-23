@@ -69,6 +69,7 @@ impl Scm for ScmMock {
     fn labeled_prs(
         &self,
         label: &str,
+        _gh_calls: &mut u32,
     ) -> Result<Vec<daemon::tools::LabeledPr>, daemon::errors::DaemonError> {
         self.calls.borrow_mut().push(format!("labeled_prs({label})"));
         Ok(Vec::new())

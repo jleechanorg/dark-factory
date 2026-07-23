@@ -200,6 +200,51 @@ fn parse_external_ref(external_ref: &str) -> Option<(String, String)> {
     }
 }
 
+/// jtg8: parse GitHub's RFC3339 timestamp into epoch seconds. Used by the
+/// adoption-probe cache to key per-PR probes on `updated_at`. Returns `None`
+/// for any unparseable input — the daemon treats `None` as "uncacheable"
+/// (preserves pre-fix behavior for missing/malformed upstream fields).
+pub(crate) fn parse_rfc3339_to_epoch_secs(s: &str) -> Option<u64> {
+    // Strip fractional seconds (we only care about second precision for the
+    // cache key — anything sub-second doesn't change adoption decisions) and
+    // the trailing `Z` so the date/time parser below sees plain numbers.
+    let trimmed = s.trim();
+    let no_frac = trimmed.split('.').next().unwrap_or(trimmed);
+    let no_tz = no_frac.trim_end_matches('Z');
+    let parts: Vec<&str> = no_tz.split(['-', ':', 'T']).collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let year: i64 = parts[0].parse().ok()?;
+    let month: i64 = parts[1].parse().ok()?;
+    let day: i64 = parts[2].parse().ok()?;
+    let hour: i64 = parts[3].parse().ok()?;
+    let minute: i64 = parts[4].parse().ok()?;
+    let second: i64 = parts[5].parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Howard Hinnant's days-from-civil algorithm — pure integer math, no
+    // chrono dependency. Converts a Gregorian date into days since the
+    // Unix epoch (1970-01-01). Equivalent to chrono's NaiveDate conversion
+    // but avoids the dep.
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 9)
+    } else {
+        (year, month - 3)
+    };
+    let era = y.div_euclid(400);
+    let yoe = (y - era * 400) as u64;
+    let m_idx = m as u64;
+    let doy = (153 * m_idx + 2) / 5 + day as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe as i64 - 719_468;
+    if days < 0 {
+        return None;
+    }
+    Some((days as u64) * 86_400 + (hour as u64) * 3_600 + (minute as u64) * 60 + second as u64)
+}
+
 /// jleechan-mdgr defense-in-depth: recovers the real `<repo>#<pr>` comment
 /// target from the "double external_ref suffix" corruption, where a bead
 /// that already had a valid `parse_external_ref`-shaped ref ALSO got a
@@ -310,7 +355,7 @@ impl CliScm {
         Self::new(repo.to_string())
     }
 
-    fn labeled_prs_via_rest(&self, label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
+    fn labeled_prs_via_rest(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
         let out = run_tool(
             "gh",
             &[
@@ -336,14 +381,97 @@ impl CliScm {
         struct RestUser {
             login: String,
         }
+
+        let json_start = out.find('[').unwrap_or(0);
+        let issues: Vec<RestIssue> = serde_json::from_str(&out[json_start..]).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse gh labeled PR REST list: {e}"))
+        })?;
+        let mut prs = Vec::new();
+        for issue in issues.into_iter().filter(|issue| issue.pull_request.is_some()) {
+            // jtg8-r5: count each per-PR `pulls/{n}` call so the
+            // slow-tier `gh_call_count` warning sees the real O(N) burn
+            // (the r4 implementation only counted the list query, so the
+            // warning never fired under the fallback path — codex P2).
+            *gh_calls += 1;
+            let pull_out = run_tool(
+                "gh",
+                &[
+                    "api",
+                    // jtg8-r5: now that `parse_rest_pull_payload` deserializes
+                    // `head.sha` and `updated_at` directly, the `?fields=`
+                    // filter is informational only — GitHub returns the full
+                    // pull object either way, and the parser is the canonical
+                    // surface for what fields we extract.
+                    &format!(
+                        "repos/{}/pulls/{}?fields=number,head,updated_at",
+                        self.repo, issue.number
+                    ),
+                ],
+                30,
+            )?;
+            let json_start = pull_out.find('{').unwrap_or(0);
+            // jtg8-r5: delegate to the canonical parser. The parser
+            // reads `head.sha` directly (GitHub's real REST shape), so
+            // REST-fallback PRs now carry `head_sha: Some(...)` and the
+            // adoption-probe cache can short-circuit per-PR probes on
+            // them just like the primary `gh pr list` path. r4 looked
+            // for a non-existent top-level `head_sha` field, which is
+            // the bug codex flagged in P2 review.
+            let (head_sha_opt, updated_at_epoch_opt, head_ref_name, head_repo_full_name, head_repo_owner_login, is_cross_repository) =
+                Self::parse_rest_pull_payload(&self.repo, &pull_out[json_start..])?;
+            prs.push(LabeledPr {
+                number: issue.number,
+                title: issue.title,
+                body: issue.body.unwrap_or_default(),
+                author_login: issue.user.map(|u| u.login).unwrap_or_default(),
+                external_ref: format!("{}#{}", self.repo, issue.number),
+                head_ref_name,
+                is_cross_repository,
+                head_repo_full_name,
+                head_repo_owner_login,
+                head_sha: head_sha_opt,
+                updated_at_epoch: updated_at_epoch_opt,
+            });
+        }
+        Ok(prs)
+    }
+
+    /// jtg8-r5 (P2 review "Populate the REST fallback SHA from head.sha"):
+    /// GitHub's `/pulls/{n}` REST response keeps the head SHA nested under
+    /// `head.sha`, NOT at a top-level `head_sha` field. The r4
+    /// `RestPullExt` struct looked for a top-level field and so every
+    /// REST-fallback PR came back with `head_sha = None`, making the
+    /// adoption-probe cache treat it as uncacheable — defeating the r4
+    /// fix on the REST fallback path. This parser is the canonical
+    /// deserializer for a single `/pulls/{n}` payload; the production
+    /// `labeled_prs_via_rest` loop delegates here so the unit tests can
+    /// exercise it directly without shelling out to a fake `gh`.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn parse_rest_pull_payload(
+        repo: &str,
+        pull_json: &str,
+    ) -> Result<
+        (
+            Option<String>, // head_sha
+            Option<u64>,    // updated_at_epoch
+            String,         // head_ref_name
+            Option<String>, // head_repo_full_name
+            Option<String>, // head_repo_owner_login
+            bool,           // is_cross_repository
+        ),
+        DaemonError,
+    > {
         #[derive(serde::Deserialize)]
         struct RestPull {
             head: RestHead,
+            #[serde(default)]
+            updated_at: Option<String>,
         }
         #[derive(serde::Deserialize)]
         struct RestHead {
             #[serde(rename = "ref")]
             ref_name: String,
+            sha: Option<String>,
             repo: Option<RestRepo>,
         }
         #[derive(serde::Deserialize)]
@@ -351,61 +479,158 @@ impl CliScm {
             full_name: Option<String>,
             owner: Option<RestUser>,
         }
-
-        let json_start = out.find('[').unwrap_or(0);
-        let issues: Vec<RestIssue> = serde_json::from_str(&out[json_start..]).map_err(|e| {
-            DaemonError::Parse(format!("failed to parse gh labeled PR REST list: {e}"))
-        })?;
-        let mut prs = Vec::new();
-        let target_owner = self.repo.split('/').next().unwrap_or_default();
-        for issue in issues.into_iter().filter(|issue| issue.pull_request.is_some()) {
-            let pull_out = run_tool(
-                "gh",
-                &[
-                    "api",
-                    &format!("repos/{}/pulls/{}", self.repo, issue.number),
-                ],
-                30,
-            )?;
-            let json_start = pull_out.find('{').unwrap_or(0);
-            let pull: RestPull = serde_json::from_str(&pull_out[json_start..]).map_err(|e| {
-                DaemonError::Parse(format!(
-                    "failed to parse gh pull REST response for PR #{}: {e}",
-                    issue.number
-                ))
-            })?;
-            let head_repo_full_name = pull
-                .head
-                .repo
-                .as_ref()
-                .and_then(|repo| repo.full_name.clone());
-            let head_repo_owner_login = pull
-                .head
-                .repo
-                .as_ref()
-                .and_then(|repo| repo.owner.as_ref().map(|owner| owner.login.clone()));
-            let is_cross_repository = head_repo_full_name
-                .as_ref()
-                .map(|repo| !repo.eq_ignore_ascii_case(&self.repo))
-                .or_else(|| {
-                    head_repo_owner_login
-                        .as_ref()
-                        .map(|owner| !owner.eq_ignore_ascii_case(target_owner))
-                })
-                .unwrap_or(false);
-            prs.push(LabeledPr {
-                number: issue.number,
-                title: issue.title,
-                body: issue.body.unwrap_or_default(),
-                author_login: issue.user.map(|u| u.login).unwrap_or_default(),
-                external_ref: format!("{}#{}", self.repo, issue.number),
-                head_ref_name: pull.head.ref_name,
-                is_cross_repository,
-                head_repo_full_name,
-                head_repo_owner_login,
-            });
+        #[derive(serde::Deserialize)]
+        struct RestUser {
+            login: String,
         }
-        Ok(prs)
+        let pull: RestPull = serde_json::from_str(pull_json).map_err(|e| {
+            DaemonError::Parse(format!("failed to parse gh pull REST response: {e}"))
+        })?;
+        let head_repo_full_name = pull
+            .head
+            .repo
+            .as_ref()
+            .and_then(|repo| repo.full_name.clone());
+        let head_repo_owner_login = pull
+            .head
+            .repo
+            .as_ref()
+            .and_then(|repo| repo.owner.as_ref().map(|owner| owner.login.clone()));
+        let target_owner = repo.split('/').next().unwrap_or_default();
+        let is_cross_repository = head_repo_full_name
+            .as_ref()
+            .map(|name| !name.eq_ignore_ascii_case(repo))
+            .or_else(|| {
+                head_repo_owner_login
+                    .as_ref()
+                    .map(|owner| !owner.eq_ignore_ascii_case(target_owner))
+            })
+            .unwrap_or(false);
+        Ok((
+            pull.head.sha,
+            pull.updated_at
+                .as_deref()
+                .and_then(parse_rfc3339_to_epoch_secs),
+            pull.head.ref_name,
+            head_repo_full_name,
+            head_repo_owner_login,
+            is_cross_repository,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod parse_rest_pull_payload_tests {
+    use super::CliScm;
+
+    /// jtg8-r5 red test #1: the canonical REST payload shape (head SHA
+    /// nested under `head.sha`) must produce a populated `head_sha`. The
+    /// r4 code looked for a non-existent top-level `head_sha` field and
+    /// so every REST-fallback PR came back with `head_sha = None`.
+    #[test]
+    fn parse_rest_pull_payload_extracts_head_sha_from_head_dot_sha() {
+        let payload = serde_json::json!({
+            "number": 42,
+            "head": {
+                "ref": "feature/jtg8-r5",
+                "sha": "abc123def456abc123def456abc123def456abc1",
+                "repo": {
+                    "full_name": "jleechanorg/dark-factory",
+                    "owner": { "login": "jleechanorg" },
+                },
+            },
+            "updated_at": "2026-07-22T18:00:00Z",
+        })
+        .to_string();
+        let (head_sha, updated_at_epoch, head_ref_name, head_repo_full_name, head_repo_owner_login, is_cross_repository) =
+            CliScm::parse_rest_pull_payload("jleechanorg/dark-factory", &payload).unwrap();
+        assert_eq!(
+            head_sha.as_deref(),
+            Some("abc123def456abc123def456abc123def456abc1"),
+            "head_sha must be populated from head.sha, not from a non-existent top-level field"
+        );
+        assert_eq!(
+            head_ref_name, "feature/jtg8-r5",
+            "head_ref_name must be populated from head.ref"
+        );
+        assert!(
+            updated_at_epoch.is_some(),
+            "updated_at must parse to an epoch second (got None for 2026-07-22T18:00:00Z)"
+        );
+        assert_eq!(
+            head_repo_full_name.as_deref(),
+            Some("jleechanorg/dark-factory"),
+            "head_repo_full_name must be populated from head.repo.full_name"
+        );
+        assert_eq!(
+            head_repo_owner_login.as_deref(),
+            Some("jleechanorg"),
+            "head_repo_owner_login must be populated from head.repo.owner.login"
+        );
+        assert!(
+            !is_cross_repository,
+            "same-repo PR must report is_cross_repository=false"
+        );
+    }
+
+    /// A fork PR (head lives in a different repo) must report
+    /// `is_cross_repository=true` and still populate head_sha / updated_at.
+    #[test]
+    fn parse_rest_pull_payload_detects_cross_repo_pr() {
+        let payload = serde_json::json!({
+            "number": 99,
+            "head": {
+                "ref": "contributor-patch",
+                "sha": "deadbeef00000000deadbeef00000000deadbeef",
+                "repo": {
+                    "full_name": "contributor/dark-factory-fork",
+                    "owner": { "login": "contributor" },
+                },
+            },
+            "updated_at": "2026-07-22T19:30:00Z",
+        })
+        .to_string();
+        let (head_sha, _updated_at_epoch, _head_ref_name, _head_repo_full_name, _head_repo_owner_login, is_cross_repository) =
+            CliScm::parse_rest_pull_payload("jleechanorg/dark-factory", &payload).unwrap();
+        assert_eq!(
+            head_sha.as_deref(),
+            Some("deadbeef00000000deadbeef00000000deadbeef"),
+            "fork PR head_sha must still be populated (cache key still populated for fork's branch SHA)"
+        );
+        assert!(
+            is_cross_repository,
+            "cross-repo PR must report is_cross_repository=true so the daemon's same-repo guard fires"
+        );
+    }
+
+    /// Missing `updated_at` (older gh versions) must NOT fail parsing —
+    /// `head_sha` still populates and `updated_at_epoch` is `None`,
+    /// matching the r4 `#[serde(default)]` tolerance pattern.
+    #[test]
+    fn parse_rest_pull_payload_tolerates_missing_updated_at() {
+        let payload = serde_json::json!({
+            "number": 1,
+            "head": {
+                "ref": "feat/x",
+                "sha": "f00d0000000000000000000000000000000000f0",
+                "repo": {
+                    "full_name": "jleechanorg/dark-factory",
+                    "owner": { "login": "jleechanorg" },
+                },
+            },
+        })
+        .to_string();
+        let (head_sha, updated_at_epoch, _head_ref_name, _head_repo_full_name, _head_repo_owner_login, _is_cross_repository) =
+            CliScm::parse_rest_pull_payload("jleechanorg/dark-factory", &payload).unwrap();
+        assert_eq!(
+            head_sha.as_deref(),
+            Some("f00d0000000000000000000000000000000000f0"),
+            "missing updated_at must not break head_sha parsing"
+        );
+        assert!(
+            updated_at_epoch.is_none(),
+            "missing updated_at must produce updated_at_epoch=None (uncacheable PR)"
+        );
     }
 }
 
@@ -515,7 +740,11 @@ impl Scm for CliScm {
         Ok(issues)
     }
 
-    fn labeled_prs(&self, label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
+    fn labeled_prs(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
+        // jtg8-r5: count the list query regardless of which branch we end
+        // up on (primary `gh pr list` or REST fallback). The fallback's
+        // per-PR pulls/{n} calls are counted inside `labeled_prs_via_rest`.
+        *gh_calls += 1;
         let out = match run_tool(
             "gh",
             &[
@@ -531,12 +760,14 @@ impl Scm for CliScm {
                 "--limit",
                 "1000",
                 "--json",
-                "number,title,body,author,headRefName,isCrossRepository,headRepositoryOwner",
+                // jtg8: also fetch headRefOid + updatedAt so the adoption-probe
+                // cache can short-circuit per-PR probes on unchanged keys.
+                "number,title,body,author,headRefName,isCrossRepository,headRepositoryOwner,headRefOid,updatedAt",
             ],
             30,
         ) {
             Ok(out) => out,
-            Err(_) => return self.labeled_prs_via_rest(label),
+            Err(_) => return self.labeled_prs_via_rest(label, gh_calls),
         };
         #[derive(serde::Deserialize)]
         struct GhPr {
@@ -550,6 +781,12 @@ impl Scm for CliScm {
             is_cross_repository: bool,
             #[serde(rename = "headRepositoryOwner")]
             head_repository_owner: Option<GhAuthor>,
+            // jtg8: cache key fields. `headRefOid` is the head commit SHA;
+            // `updatedAt` is the PR's last-modified timestamp.
+            #[serde(rename = "headRefOid")]
+            head_ref_oid: Option<String>,
+            #[serde(rename = "updatedAt")]
+            updated_at: Option<String>,
         }
         #[derive(serde::Deserialize)]
         struct GhAuthor {
@@ -561,16 +798,27 @@ impl Scm for CliScm {
         })?;
         Ok(prs
             .into_iter()
-            .map(|pr| LabeledPr {
-                number: pr.number,
-                title: pr.title,
-                body: pr.body.unwrap_or_default(),
-                author_login: pr.author.map(|a| a.login).unwrap_or_default(),
-                external_ref: format!("{}#{}", self.repo, pr.number),
-                head_ref_name: pr.head_ref_name,
-                is_cross_repository: pr.is_cross_repository,
-                head_repo_full_name: None,
-                head_repo_owner_login: pr.head_repository_owner.map(|owner| owner.login),
+            .map(|pr| {
+                // jtg8: parse GitHub's RFC3339 updatedAt into epoch seconds
+                // for the cache key. Returns None on parse failure (the
+                // daemon treats None as "uncacheable" and probes fresh).
+                let updated_at_epoch = pr
+                    .updated_at
+                    .as_deref()
+                    .and_then(parse_rfc3339_to_epoch_secs);
+                LabeledPr {
+                    number: pr.number,
+                    title: pr.title,
+                    body: pr.body.unwrap_or_default(),
+                    author_login: pr.author.map(|a| a.login).unwrap_or_default(),
+                    external_ref: format!("{}#{}", self.repo, pr.number),
+                    head_ref_name: pr.head_ref_name,
+                    is_cross_repository: pr.is_cross_repository,
+                    head_repo_full_name: None,
+                    head_repo_owner_login: pr.head_repository_owner.map(|owner| owner.login),
+                    head_sha: pr.head_ref_oid,
+                    updated_at_epoch,
+                }
             })
             .collect())
     }
