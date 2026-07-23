@@ -1203,7 +1203,7 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn labeled_prs(&self, _label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
+        fn labeled_prs(&self, _label: &str, _gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
             Ok(Vec::new())
         }
 

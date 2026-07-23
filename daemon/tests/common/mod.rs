@@ -208,6 +208,14 @@ pub struct FakeScm {
     /// r5 finding 3: gist ids whose fetch returns a TRANSIENT `Err` (gh
     /// outage) — the evidence gate must wait (Unknown), not fail.
     pub gists_transient: std::collections::HashSet<String>,
+    /// jtg8-r4: scripted rate-limit on the next `labeled_prs` call. When
+    /// `true`, the fake returns `DaemonError::Tool { tool: "gh", stderr:
+    /// "API rate limit exceeded ..." }` — the exact shape the daemon's
+    /// `is_gh_rate_limit()` predicate detects. Interior-mutable so the
+    /// fake can self-consume the flag without `&mut self`. The flag is
+    /// also recorded in the call log as `labeled_prs_rate_limited(...)`
+    /// so tests can prove the rate-limit branch fired.
+    pub rate_limit_next_labeled_prs: RefCell<bool>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -225,10 +233,30 @@ impl Scm for FakeScm {
         Ok(self.issues.clone())
     }
 
-    fn labeled_prs(&self, label: &str) -> Result<Vec<LabeledPr>, DaemonError> {
+    fn labeled_prs(&self, label: &str, gh_calls: &mut u32) -> Result<Vec<LabeledPr>, DaemonError> {
+        // jtg8-r5: count this list query toward the slow-tier
+        // `gh_call_count` metric — the fake doesn't shell out, so a
+        // single increment matches the primary `gh pr list` path
+        // (REST-fallback per-PR calls aren't reached here, since the
+        // fake short-circuits `labeled_prs_via_rest` entirely).
+        *gh_calls += 1;
         self.calls
             .borrow_mut()
             .push(format!("labeled_prs({label})"));
+        // jtg8-r4: scripted rate-limit on next call (consumed once). Mirrors
+        // the live 2026-07-22 gh 403 exhaustion; the daemon's
+        // `is_gh_rate_limit()` predicate detects this exact shape.
+        if *self.rate_limit_next_labeled_prs.borrow() {
+            *self.rate_limit_next_labeled_prs.borrow_mut() = false;
+            self.calls
+                .borrow_mut()
+                .push("labeled_prs_rate_limited".to_string());
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: "gh: API rate limit exceeded for installation ID 12345".into(),
+            });
+        }
         Ok(self.prs.clone())
     }
 

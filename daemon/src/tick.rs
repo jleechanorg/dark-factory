@@ -106,6 +106,14 @@ pub struct TickSummary {
 const MAX_HUMAN_HELD_RECOVERY_ATTEMPT: u32 = 10;
 const ESCALATION_REVIEWER: &str = "dark-factory-escalation";
 const ESCALATION_SENTINEL_ATTEMPT: u32 = u32::MAX;
+// jtg8-r4 acceptance #3: per-tick gh call count threshold above which the
+// slow tier logs a warning so operators can investigate before the core
+// rate-limit bucket exhausts. Pre-fix baseline was ~50 per slow tick
+// (one `gh api repos/.../pulls/N` call per factory-labeled PR plus the
+// per-PR `collaborator_permission` probe). Post-fix steady state is ~1
+// (the `gh pr list` query); per-PR probes are served from the adoption
+// probe cache. 20 is a generous in-between signal.
+const INTAKE_GH_CALL_WARN_THRESHOLD: u32 = 20;
 
 /// Bead jleechan-msmq: an ATTESTED bead with `reroll_count > 0` is in the
 /// reroll pipeline. The OLD PR's gate verdict cannot advance the bead
@@ -1314,8 +1322,47 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // required dispatch-scheduling guarantee: already-QUEUED beads (from prior
     // ticks) are dispatched before any recovery/escalation work each tick.
     let mut pr_intake_bead_ids = HashSet::new();
-    let (pr_adoptions, pr_skip_outcomes) =
-        intake::normalize_labeled_prs(deps.scm, deps.tracker, deps.cfg)?;
+    // jtg8-r4: load the persistent adoption-probe cache from disk and use
+    // the rate-limit-aware variant. The cache is rewritten at the end of
+    // every slow pass (see below) so a daemon restart doesn't re-probe
+    // the entire factory-labeled PR set on its first tick.
+    let mut adoption_cache = intake::AdoptionProbeCache::load_or_default();
+    let slow_tick_now = now_epoch_secs();
+    let intake_outcome = intake::normalize_labeled_prs_outcome(
+        deps.scm,
+        deps.tracker,
+        deps.cfg,
+        &mut adoption_cache,
+        slow_tick_now,
+    )?;
+    // jtg8-r4 acceptance #3: warn when per-tick gh call count exceeds the
+    // slow-tier budget. The threshold (20) is generous — well below what
+    // the 2026-07-22 incident burned per tick (~50+), so a hit means
+    // we've drifted back toward pre-fix behavior and need to investigate
+    // before the core rate-limit bucket exhausts again.
+    if intake_outcome.metrics.gh_call_count >= INTAKE_GH_CALL_WARN_THRESHOLD {
+        eprintln!(
+            "auto-factory daemon: WARNING slow-tier intake gh_call_count={} (threshold={}); \
+             inspect adoption-probe cache before core rate-limit bucket exhausts",
+            intake_outcome.metrics.gh_call_count, INTAKE_GH_CALL_WARN_THRESHOLD
+        );
+    }
+    let (pr_adoptions, pr_skip_outcomes) = if intake_outcome.rate_limited {
+        // jtg8-r4 acceptance #5 (r3 fix): a rate-limited intake sweep must
+        // DEGRADE — skip PR adoption this tick — but CONTINUE into the rest
+        // of run_slow_tier. The r3 fix `return Ok(())` early-aborted
+        // routing + dispatch and starved every other bead's dispatch.
+        // We just log a one-line skip and continue past this phase; the
+        // `consecutive_failures` counter never increments on rate-limit
+        // intake failures (the new variant returns Ok(_), not Err).
+        eprintln!(
+            "auto-factory daemon: slow-tier intake rate-limited by gh; \
+             skipping adoption sweep this tick, dispatch continues"
+        );
+        (Vec::new(), Vec::new())
+    } else {
+        (intake_outcome.adopted, intake_outcome.outcomes)
+    };
     // jleechan-eazj: every factory-labeled PR that did NOT result in an
     // adoption still gets exactly one verdict event here, unconditionally —
     // before the adoption loop below runs any I/O of its own.
@@ -2296,6 +2343,17 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 let _ = deps.tracker.comment_external(ext_ref, &comment_body);
             }
         }
+    }
+
+    // jtg8-r4: persist the adoption-probe cache at the end of every
+    // slow-tier pass so a daemon restart doesn't re-probe the entire
+    // factory-labeled PR set on its first tick. Best-effort: a failed
+    // write logs but does not abort the tick (a missing cache file is
+    // the same as a cold cache).
+    if let Err(e) = adoption_cache.persist() {
+        eprintln!(
+            "auto-factory daemon: WARNING failed to persist adoption-probe cache: {e}"
+        );
     }
 
     Ok(())
