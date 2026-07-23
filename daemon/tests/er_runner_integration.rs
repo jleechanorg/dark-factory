@@ -385,6 +385,9 @@ fn drive_one_tick(
             vcs: &VcsMock,
             cfg,
             telemetry_log,
+            // Bead jleechan-jsby: empty vendor-health ledger preserves
+            // pre-bead skeptic-prompt behavior in this integration test.
+            vendor_health: None,
         },
         0,
         0,

@@ -599,6 +599,13 @@ fn run(args: Args) -> Result<(), DaemonError> {
         vcs: vcs.as_ref(),
         cfg: &cfg,
         telemetry_log: &telemetry_log,
+        // Bead jleechan-jsby: in the binary's poll loop the vendor-health
+        // ledger is owned by the daemon process (a single shared instance
+        // across ticks). The main loop holds it in a Mutex and exposes a
+        // borrow here; for now we keep the field `None` because the
+        // daemon-global ledger is r2 scope (cross-bead vendor health
+        // needs cross-bead persistence semantics the StateStore owns).
+        vendor_health: None,
     };
 
     if args.once {

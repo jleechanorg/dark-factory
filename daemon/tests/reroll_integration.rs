@@ -497,6 +497,9 @@ fn test_tick_stage2_integration() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
+        // Bead jleechan-jsby: empty vendor-health ledger preserves pre-bead
+        // skeptic-prompt behavior in this integration test.
+        vendor_health: None,
     };
 
     // --- Tick 1: Intake -> Route -> Dispatch ---
@@ -579,6 +582,9 @@ fn test_tick_stage2_integration() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
+        // Bead jleechan-jsby: empty vendor-health ledger preserves pre-bead
+        // skeptic-prompt behavior in this integration test.
+        vendor_health: None,
     };
 
     // --- Tick 2: assess gates (fails) -> execute re-roll -> spec mutation -> recovery -> redispatched ---

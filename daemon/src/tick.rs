@@ -43,6 +43,43 @@ pub struct TickDeps<'a> {
     pub vcs: &'a dyn Vcs,
     pub cfg: &'a Config,
     pub telemetry_log: &'a Path,
+    /// Bead jleechan-jsby: vendor-health ledger the skeptic prompt
+    /// consults to know which vendors are structurally unavailable (and
+    /// therefore should NOT cause the skeptic to fail the lane for the
+    /// missing deliverable). Optional so existing test fakes / main's
+    /// poll loop don't have to thread a real ledger through; when
+    /// `None` the skeptic prompt is built with an empty waiver context
+    /// (the pre-bead behavior is preserved).
+    pub vendor_health: Option<&'a crate::vendor_health::VendorHealthLedger>,
+}
+
+impl<'a> TickDeps<'a> {
+    /// Bead jleechan-jsby: ergonomic constructor for tests and the binary's
+    /// poll loop that don't yet thread a vendor-health ledger. All other
+    /// fields are required.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        scm: &'a dyn Scm,
+        tracker: &'a dyn Tracker,
+        sessions: &'a dyn Sessions,
+        llm: &'a dyn Llm,
+        store: &'a dyn StateStore,
+        vcs: &'a dyn Vcs,
+        cfg: &'a Config,
+        telemetry_log: &'a Path,
+    ) -> Self {
+        Self {
+            scm,
+            tracker,
+            sessions,
+            llm,
+            store,
+            vcs,
+            cfg,
+            telemetry_log,
+            vendor_health: None,
+        }
+    }
 }
 
 /// Summary counters returned by `run_tick`, mirrored into the `TICK` telemetry
@@ -2438,7 +2475,13 @@ fn skeptic_evidence(
     // `er_runner::build_er_prompt` — makes the reviewer query the RIGHT repo
     // regardless of daemon cwd, instead of silently reviewing PR #{pr} in
     // whatever repo happened to be checked out.
-    let prompt = format!(
+    // Bead jleechan-jsby: build the skeptic-prompt body first, then inject
+    // the WAIVED-VENDORS section (acceptance criterion 3) so the skeptic
+    // reviewer does not penalize the lane for missing reviews from a
+    // structurally-unavailable vendor. When `deps.vendor_health` is `None`
+    // or the ledger has no waivers the prompt is unchanged (pre-bead
+    // behavior preserved).
+    let mut body = format!(
         "You are the Stage-1 Skeptic gate for an autonomous coding factory.\n\
          Review bead {bead_id}'s PR #{pr} in repo {repo} end-to-end (diff, \
          evidence, tests) and judge whether it is ready to merge:\n\
@@ -2448,6 +2491,13 @@ fn skeptic_evidence(
          Respond with exactly one line of the form:\n\
          pass|warn <note>|fail <reason>",
     );
+    if let Some(ledger) = deps.vendor_health {
+        let ctx = ledger.context();
+        if !ctx.is_empty() {
+            body = crate::vendor_health::skeptic_prompt_with_waivers(&body, &ctx);
+        }
+    }
+    let prompt = body;
 
     let coder_agent = std::env::var("DARK_FACTORY_CODER_DEFAULT")
         .or_else(|_| std::env::var("DARK_FACTORY_REVIEWER_DEFAULT"))
@@ -2741,6 +2791,11 @@ fn skeptic_evidence(
         // translating the verdict into a `VacuousRedGreenStatus` before
         // constructing `PrEvidence` here.
         vacuous_red_green: verifier::VacuousRedGreenStatus::NotProvided,
+        // Bead jleechan-jsby: vendor waiver starts unset; the fast tier
+        // consults the VendorHealthLedger and substitutes the
+        // `<vendor>:waived_vendor_unavailable` token when N consecutive
+        // capped assessments indicate structural unavailability.
+        vendor_waiver: None,
     })
 }
 
@@ -3600,6 +3655,45 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
         };
 
+        // Bead jleechan-jsby: consult the vendor-health ledger to discover
+        // which (if any) external reviewers are structurally unavailable and
+        // have an active waiver. When one is, the merge-authority key set
+        // substitutes the explicit `<vendor>:waived_vendor_unavailable`
+        // token, and the gate logic in `verifier::assess` consults the
+        // compensating coverage (`compensating_pass`) before granting
+        // all_green. Without a configured ledger every vendor is
+        // presumed Healthy and the pre-bead assessment is preserved.
+        if let Some(ledger) = deps.vendor_health {
+            // We only substitute ONE vendor waiver per PR (the most
+            // recent to escalate). Multi-vendor waivers land in a
+            // separate r2 (cross-bead vendor health state).
+            for vendor in ["coderabbit", "bugbot"] {
+                if matches!(
+                    ledger.status(vendor),
+                    crate::vendor_health::VendorStatus::Waived { .. }
+                ) {
+                    let token =
+                        crate::vendor_health::VendorWaiver::token_for(vendor);
+                    let compensating = verifier::compensating_pass(&evidence);
+                    evidence.vendor_waiver = Some(crate::vendor_health::VendorWaiver {
+                        vendor: vendor.to_string(),
+                        token: token.clone(),
+                        compensating_pass: compensating,
+                        bead_id: bead_id.to_string(),
+                    });
+                    let _ = crate::vendor_health::emit_vendor_waived(
+                        deps.telemetry_log,
+                        bead_id,
+                        vendor,
+                        crate::vendor_health::AUTO_ESCALATION_REASON,
+                        &token,
+                        now_epoch,
+                    );
+                    break;
+                }
+            }
+        }
+
         // Bead jleechan-msmq: skip gate re-assessment when this bead's prior
         // reroll attempt DEFERRED (`reroll_deferral_count > 0`,
         // `reroll::execute`'s `defer_or_cap` left the bead ATTESTED with
@@ -3922,7 +4016,17 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // transient handling below.
                 if deps.cfg.stage == 2
                     && matches!(
-                        verifier::classify_chain(&report),
+                        // Bead jleechan-jsby: use the waiver-aware chain
+                        // classifier when a vendor-health ledger is
+                        // configured; otherwise fall back to the legacy
+                        // `classify_chain` to keep the pre-bead behavior
+                        // identical.
+                        deps.vendor_health
+                            .map(|_ledger| verifier::classify_chain_with_waiver(
+                                &report,
+                                &evidence,
+                            ))
+                            .unwrap_or_else(|| verifier::classify_chain(&report)),
                         verifier::ChainDisposition::HoldDisposition
                     )
                 {

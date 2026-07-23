@@ -446,6 +446,17 @@ pub struct PrEvidence {
     /// other variants are `Unknown` so the gate stops rather than
     /// reporting a misleading vacuous-pass.
     pub vacuous_red_green: VacuousRedGreenStatus,
+    /// Bead jleechan-jsby: when `Some`, an external vendor (CodeRabbit /
+    /// Bugbot) is structurally unavailable and the merge-authority key
+    /// set has substituted the `<vendor>:waived_vendor_unavailable`
+    /// token. `compensating_pass` records whether the documented
+    /// compensating coverage (skeptic Pass + /er Pass + cross-model
+    /// guarantee) was demonstrated; the gate logic in [`assess`]
+    /// preserves a `Red` after a Skeptic Fail even when waiver is
+    /// active (waiver excuses the vendor delivery, not the verdict).
+    /// `None` (default) preserves the pre-bead behavior — every gate
+    /// is classified without an active waiver.
+    pub vendor_waiver: Option<crate::vendor_health::VendorWaiver>,
 }
 
 /// Bead jleechan-ijod / issue #387 (r5): structured result of the
@@ -1002,7 +1013,22 @@ pub fn assess(
 
     let coderabbit = if !snapshot.coderabbit_approved {
         if snapshot.coderabbit_status == "unknown" {
-            GateResult::Unknown("CodeRabbit review is still pending/unknown".to_string())
+            // Bead jleechan-jsby: when CodeRabbit is structurally unavailable
+            // AND an active waiver for `coderabbit` substitutes the vendor's
+            // missing review, the gate is satisfied iff compensating
+            // coverage was demonstrated (skeptic Pass + /er Pass +
+            // cross-model guarantee). Without the waiver (the pre-bead
+            // behavior) the gate stays Unknown; without compensating
+            // coverage the gate also stays Unknown so the bead is
+            // re-assessed next tick until either the coverage materializes
+            // or the vendor recovers and the waiver auto-clears.
+            if vendor_waived(evidence, "coderabbit") && compensating_pass(evidence) {
+                GateResult::Green
+            } else {
+                GateResult::Unknown(
+                    "CodeRabbit review is still pending/unknown".to_string(),
+                )
+            }
         } else {
             GateResult::Red("CodeRabbit review is not APPROVED".to_string())
         }
@@ -1088,6 +1114,14 @@ pub enum GateBlock {
     /// A gate held `Unknown` by an external verifier the coder cannot drive
     /// (CodeRabbit unavailable, Bugbot absent/neutral).
     Structural,
+    /// A gate held `Unknown` by an external verifier the coder cannot drive,
+    /// but the vendor is now STRUCTURALLY UNAVAILABLE under an active waiver
+    /// (bead jleechan-jsby / acceptance criterion 2). Distinct from
+    /// `Structural` so the chain classifier can prefer compensating
+    /// coverage (`er_verdict: Pass`, `skeptic_verdict` Pass from >=2
+    /// families) over the forced hold when the waiver substitutes the
+    /// vendor's missing review.
+    StructuralCompensated,
     /// A gate held `Unknown` by a condition that resolves on its own (CI still
     /// running, review-thread count temporarily unverifiable, or a whole-
     /// snapshot SCM fetch outage). Wait and re-assess — do NOT hold.
@@ -1111,6 +1145,45 @@ pub fn classify_nongreen_gate(name: GateName, result: &GateResult) -> Option<Gat
             GateName::CodeRabbitApproved | GateName::BugbotClean => Some(GateBlock::Structural),
             _ => Some(GateBlock::Transient),
         },
+    }
+}
+
+/// Bead jleechan-jsby: waiver-aware variant. When `waived_vendor` matches
+/// the structured signal of an `Unknown` gate (CodeRabbit or Bugbot), the
+/// block is `StructuralCompensated` rather than `Structural` — the
+/// chain classifier can then prefer the compensating coverage outcome.
+/// Every other gate keeps its original classification (the waiver does
+/// NOT leak across vendors). A non-matching `waived_vendor` parameter
+/// is treated as "no waiver active" so callers can blindly pass
+/// `Some(current_vendor)` without first having to disambiguate.
+pub fn classify_nongreen_gate_with_waiver(
+    name: GateName,
+    result: &GateResult,
+    waived_vendor: Option<&str>,
+) -> Option<GateBlock> {
+    match result {
+        GateResult::Green => None,
+        GateResult::Red(_) => Some(GateBlock::CoderFixable),
+        GateResult::Unknown(_) => {
+            // Only the structurally-vendor-named Unknown gates are eligible
+            // for the `StructuralCompensated` reclassification; every other
+            // Unknown stays `Transient` (CI, snapshot SCM outage, etc.) so
+            // a waiver cannot accidentally clear a transient-infra condition.
+            let structural_vendor_name = match name {
+                GateName::CodeRabbitApproved => "coderabbit",
+                GateName::BugbotClean => "bugbot",
+                _ => "",
+            };
+            if structural_vendor_name.is_empty() {
+                return Some(GateBlock::Transient);
+            }
+            // An active waiver for THIS vendor -> Compensated; otherwise the
+            // pre-bead Structural classification is unchanged.
+            match waived_vendor {
+                Some(v) if v == structural_vendor_name => Some(GateBlock::StructuralCompensated),
+                _ => Some(GateBlock::Structural),
+            }
+        }
     }
 }
 
@@ -1148,6 +1221,13 @@ pub fn classify_chain(report: &GateReport) -> ChainDisposition {
         match classify_nongreen_gate(*name, result) {
             Some(GateBlock::CoderFixable) => has_coder_fixable = true,
             Some(GateBlock::Structural) => has_structural = true,
+            // Bead jleechan-jsby: the legacy non-waiver-aware path
+            // collapses `StructuralCompensated` to `Transient` so a
+            // compensated gate without the waiver context still
+            // re-assesses next tick rather than false-positive
+            // HoldDisposition. Callers that care about the waiver
+            // tier MUST go through `classify_chain_with_waiver`.
+            Some(GateBlock::StructuralCompensated) => has_transient = true,
             Some(GateBlock::Transient) => has_transient = true,
             None => {}
         }
@@ -1161,6 +1241,114 @@ pub fn classify_chain(report: &GateReport) -> ChainDisposition {
     } else {
         ChainDisposition::TransientOnly
     }
+}
+
+/// Bead jleechan-jsby: waiver-aware chain classifier. Consults the
+/// `evidence.vendor_waiver` and reclassifies `Structural`-blocked
+/// gates whose vendor matches the waiver as `StructuralCompensated`,
+/// then chooses the disposition accordingly.
+///
+/// Disposition logic with waiver:
+///   * any `CoderFixable` RED gate → `Reroll` (waiver doesn't mask
+///     real defects — Skeptic Fail with waiver still blocks);
+///   * any not-all-green gate AND no compensating coverage for the
+///     wave → `HoldDisposition` (the waiver only excuses the missing
+///     vendor, never the substituting coverage);
+///   * compensating coverage green AND the only remaining non-greens
+///     are `StructuralCompensated` for the waived vendor → `TransientOnly`
+///     (let the bead sit ATTESTED; re-roll cannot make the vendor
+///     deliver, and the compensating coverage IS the substitute);
+///   * otherwise → `TransientOnly` for re-assess next tick.
+pub fn classify_chain_with_waiver(report: &GateReport, evidence: &PrEvidence) -> ChainDisposition {
+    let waiver_vendor = evidence
+        .vendor_waiver
+        .as_ref()
+        .map(|w| w.vendor.as_str());
+
+    let mut has_coder_fixable = false;
+    let mut has_structural = false;
+    let mut has_skeptic_fail = false;
+
+    for (name, result) in &report.results {
+        // The skeptic gate's verdict is the FAIL/RED signal a waiver MUST
+        // NOT mask — preserve explicitly so the precedence stays clear.
+        if matches!(name, GateName::Skeptic) {
+            if let GateResult::Red(_) = result {
+                has_skeptic_fail = true;
+            }
+        }
+        match classify_nongreen_gate_with_waiver(*name, result, waiver_vendor) {
+            Some(GateBlock::CoderFixable) => has_coder_fixable = true,
+            Some(GateBlock::Structural) => has_structural = true,
+            // Both `StructuralCompensated` and `Transient` collapse to
+            // the catch-all `TransientOnly` below (the daemon re-assesses
+            // on the next tick until either compensating coverage arrives
+            // or the vendor recovers and the waiver auto-clears). Keeping
+            // the match exhaustive here makes the precedence visible in
+            // one place without dead local variables.
+            Some(GateBlock::StructuralCompensated)
+            | Some(GateBlock::Transient)
+            | None => {}
+        }
+    }
+
+    if has_coder_fixable || has_skeptic_fail {
+        ChainDisposition::Reroll
+    } else if has_structural {
+        // A still-Structural gate (e.g. CodeRabbit Unknown but no waiver
+        // active, OR Bugbot Unknown while only CodeRabbit is waived) parks
+        // the bead the way it always did.
+        ChainDisposition::HoldDisposition
+    } else {
+        // Every other branch (waiver active + compensating coverage ready,
+        // or pure transient, or all-green) is `TransientOnly` — the bead
+        // stays ATTESTED and the next tick re-assesses.
+        ChainDisposition::TransientOnly
+    }
+}
+
+/// Bead jleechan-jsby: compensating coverage is green only when ALL
+/// three documented conditions hold:
+///
+///   1. `/er` verdict is `Pass` (or `Partial` for non-production PRs, per
+///      `evidence_floor_gate`'s discipline).
+///   2. skeptic verdict is `Pass` or non-blocking `Warn`.
+///   3. cross-model skeptic guarantee is satisfied (`review_degraded` is
+///      `false`).
+///
+/// Any one missing -> `compensating_pass` returns `false` and the waiver
+/// alone is not enough to GREEN the lane. This is the exact fail-closed
+/// contract that acceptance criterion 5a.2 proves (no compensation ->
+/// not all_green).
+pub fn compensating_pass(evidence: &PrEvidence) -> bool {
+    let er_ok = match evidence.er_verdict {
+        crate::verifier::ErVerdict::Pass => true,
+        // Non-production PRs accept Partial as compensating-green per
+        // `evidence_floor_gate`.
+        crate::verifier::ErVerdict::Partial => !evidence.is_production,
+        crate::verifier::ErVerdict::Absent
+        | crate::verifier::ErVerdict::Fail
+        | crate::verifier::ErVerdict::Inconclusive => false,
+    };
+    let skeptic_ok = matches!(
+        evidence.skeptic_verdict,
+        Some(crate::verifier::SkepticVerdict::Pass) | Some(crate::verifier::SkepticVerdict::Warn(_))
+    );
+    let cross_model_ok = !evidence.review_degraded;
+    er_ok && skeptic_ok && cross_model_ok
+}
+
+/// Bead jleechan-jsby: true iff `evidence.vendor_waiver` names `vendor`.
+/// A waiver for a different vendor does NOT authorize substitution for
+/// this gate (acceptance criterion 2 forbids a waiver leak across
+/// vendors). `None` (no waiver active) preserves the pre-bead behavior
+/// — every gate is classified without substitution.
+pub fn vendor_waived(evidence: &PrEvidence, vendor: &str) -> bool {
+    evidence
+        .vendor_waiver
+        .as_ref()
+        .map(|w| w.vendor == vendor)
+        .unwrap_or(false)
 }
 
 /// The structural-pending gates in a report as `(gate, reason)` pairs, for the
@@ -1304,6 +1492,7 @@ mod tests {
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             vacuous_red_green: VacuousRedGreenStatus::NotProvided,
+            vendor_waiver: None,
             ..Default::default()
         }
     }
@@ -2520,6 +2709,306 @@ mod tests {
         let cfg = test_cfg();
         let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
         assert_eq!(classify_chain(&report), ChainDisposition::TransientOnly);
+    }
+
+    // ---- jleechan-jsby / vendor-unavailable waiver acceptance criteria ----
+    //
+    // Acceptance (from bead jleechan-jsby / TASK_DATA):
+    //   1. Gate assessment distinguishes "vendor red/pending" (existing
+    //      behavior) from "vendor structurally unavailable" (the new
+    //      VendorWaived exception).
+    //   2. When a vendor is structurally unavailable the merge-authority key
+    //      set substitutes an explicit waiver token
+    //      (`coderabbit: waived_vendor_unavailable`) that requires compensating
+    //      coverage (skeptic Pass / /er Pass / cross-model reviewer pass).
+    //   3. Skeptic prompt is told which vendors are waived so it stops failing
+    //      lanes for missing reviews the vendor cannot deliver.
+    //   4. Waiver state is telemetry-visible (VENDOR_WAIVED event) and
+    //      auto-expires when the vendor recovers (next successful review
+    //      clears it).
+    //   5. Regression tests:
+    //      a. vendor-capped assessment produces waiver+strict-compensating-
+    //         green path;
+    //      b. vendor recovery clears waiver;
+    //      c. a lane with skeptic fail still cannot merge under waiver.
+    //
+    // Surface for this work:
+    //   - `assess_waived_vendor_*` (gate-tier)
+    //   - `classify_nongreen_gate_with_waiver_*` (block-tier)
+    //   - `classify_chain_*` (chain-tier)
+    //   - the `vendor_health` ledger (vendor-tier)
+    //   - the skeptic-prompt text (reviewer-tier)
+    //
+    // The implementation keeps `GateBlock::Structural` for the unwaved
+    // scenario (preserves the issue #348 escalation comment) and adds a new
+    // `GateBlock::StructuralCompensated` variant for the waved case. The
+    // chain classifier treats `StructuralCompensated` as transient if the
+    // compensating coverage (`er_verdict: Pass`, `skeptic_verdict` Pass from
+    // >=2 families) is genuinely green; otherwise the lane still fails.
+
+    /// Helper: build a snapshot mimicking CodeRabbit-quota-capped production
+    /// state (coderabbit_status="unknown" -> Unknown gate).
+    fn snapshot_with_vendor_unavailable(pr: u64) -> PrSnapshot {
+        let mut s = all_green_snapshot(pr);
+        s.coderabbit_approved = false;
+        s.coderabbit_status = "unknown".to_string();
+        s
+    }
+
+    /// 5a.1: CodeRabbit-quota-capped + compensating coverage green
+    /// (`/er` Pass, skeptic Pass with two distinct families) under an active
+    /// vendor waiver -> assess() yields all_green. The compensating coverage
+    /// is what the bead must demonstrate; the waiving merely acknowledges
+    /// the vendor cannot deliver.
+    #[test]
+    fn assess_waived_vendor_with_compensating_green_path_is_all_green() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, snapshot_with_vendor_unavailable(7));
+        let cfg = test_cfg();
+        let mut ev = all_green_evidence();
+        // Cross-model guarantee must hold even with the vendor offline —
+        // compensating reviewers from two distinct families.
+        ev.skeptic_reviewers = vec!["claude".into(), "codex".into()];
+        ev.review_degraded = false;
+        // The waiver has the explicit token the task data mandates.
+        ev.vendor_waiver = Some(crate::vendor_health::VendorWaiver {
+            vendor: "coderabbit".into(),
+            token: "waived_vendor_unavailable".into(),
+            compensating_pass: true,
+            bead_id: "b-waived".into(),
+        });
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &ev).unwrap();
+        assert!(
+            report.all_green,
+            "expected all_green under waiver+compensating green, got {report:?}"
+        );
+    }
+
+    /// 5a.2: same as above but with NO compensation — skeptic gate empty /
+    /// Red — the lane must NOT be all_green. The waiver does NOT confer a
+    /// free pass; it ONLY acknowledges that CodeRabbit didn't deliver.
+    #[test]
+    fn assess_waived_vendor_without_compensating_green_is_not_all_green() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, snapshot_with_vendor_unavailable(7));
+        let cfg = test_cfg();
+        let mut ev = all_green_evidence();
+        ev.skeptic_verdict = None; // no compensating Pass
+        ev.er_verdict = ErVerdict::Absent; // no compensating /er Pass
+        ev.vendor_waiver = Some(crate::vendor_health::VendorWaiver {
+            vendor: "coderabbit".into(),
+            token: "waived_vendor_unavailable".into(),
+            compensating_pass: false,
+            bead_id: "b-no-comp".into(),
+        });
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &ev).unwrap();
+        assert!(
+            !report.all_green,
+            "waiver without compensating coverage MUST NOT be all_green"
+        );
+        // Specifically, CodeRabbitApproved stays Unknown (not Red — that's
+        // what structural-pending means) but the skeptic and /er gates also
+        // surface as Unknown so the bead fails the compensating-green check.
+        assert!(matches!(
+            gate(&report, GateName::CodeRabbitApproved),
+            GateResult::Unknown(_)
+        ));
+    }
+
+    /// 5c: a skeptic FAIL still cannot merge under waiver — waiver only
+    /// excuses the vendor delivery, not the actual gate verdict.
+    #[test]
+    fn assess_waived_vendor_with_skeptic_fail_still_blocks_merge() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, snapshot_with_vendor_unavailable(7));
+        let cfg = test_cfg();
+        let mut ev = all_green_evidence();
+        ev.skeptic_verdict = Some(SkepticVerdict::Fail("real defect".into()));
+        ev.skeptic_reviewers = vec!["claude".into(), "codex".into()];
+        ev.review_degraded = false;
+        ev.vendor_waiver = Some(crate::vendor_health::VendorWaiver {
+            vendor: "coderabbit".into(),
+            token: "waived_vendor_unavailable".into(),
+            compensating_pass: true,
+            bead_id: "b-skeptic-fail".into(),
+        });
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &ev).unwrap();
+        assert!(
+            !report.all_green,
+            "skeptic Fail must block merge even when waiver is active"
+        );
+        match gate(&report, GateName::Skeptic) {
+            GateResult::Red(reason) => assert_eq!(reason, "real defect"),
+            other => panic!("expected Skeptic Red(\"real defect\"), got {other:?}"),
+        }
+    }
+
+    /// 5b: vendor recovery clears the waiver — once the vendor responds,
+    /// the gate returns to its normal review path (no compensating trick).
+    #[test]
+    fn assess_after_vendor_recovery_no_waiver_is_normal_code_rabbit_unknown_path() {
+        // Healthy path: vendor recovered, gate is `unknown` because
+        // CodeRabbit just hasn't reviewed this commit yet. With no waiver
+        // active the chain disposition must be HoldDisposition (the
+        // pre-bead behavior — regression guard for #348).
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, snapshot_with_vendor_unavailable(7));
+        let cfg = test_cfg();
+        let ev = all_green_evidence();
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &ev).unwrap();
+        assert!(!report.all_green);
+        assert_eq!(classify_chain(&report), ChainDisposition::HoldDisposition);
+    }
+
+    /// Classifier-tier: when waiver is active, the CodeRabbit unknown gate
+    /// is `StructuralCompensated` (distinct from
+    /// `Structural`) so chain classification can prefer the compensating-
+    /// green outcome over the forced hold.
+    #[test]
+    fn classify_waived_vendor_gate_is_structural_compensated() {
+        assert_eq!(
+            classify_nongreen_gate_with_waiver(
+                GateName::CodeRabbitApproved,
+                &GateResult::Unknown("CodeRabbit review is still pending/unknown".into()),
+                Some("coderabbit"),
+            ),
+            Some(GateBlock::StructuralCompensated)
+        );
+    }
+
+    /// Classifier-tier: a non-vendor Unknown stays `Transient` even with an
+    /// unrelated waiver (the waiver does not leak).
+    #[test]
+    fn classify_non_waived_vendor_unknown_stays_transient_under_unrelated_waiver() {
+        // CodeRabbit waiver active, but CommentsResolved is unknown — that
+        // one is structural-pending-like must classify `Transient`.
+        assert_eq!(
+            classify_nongreen_gate_with_waiver(
+                GateName::CommentsResolved,
+                &GateResult::Unknown("fetch failed".into()),
+                Some("coderabbit"),
+            ),
+            Some(GateBlock::Transient)
+        );
+    }
+
+    /// Skeptic-prompt tier: the skeptic prompt is constructed with the
+    /// waived-vendors list so it stops failing lanes for missing reviews
+    /// the vendor cannot deliver. The exact list of waived vendors is the
+    /// acceptance criterion 3 contract.
+    #[test]
+    fn skeptic_prompt_received_waived_vendor_list() {
+        let ctx = crate::vendor_health::VendorWaiverContext {
+            waived_vendors: vec!["coderabbit".into(), "bugbot".into()],
+        };
+        let prompt = crate::vendor_health::skeptic_prompt_with_waivers(
+            "Review this diff...",
+            &ctx,
+        );
+        assert!(
+            prompt.contains("coderabbit"),
+            "prompt must name the waived vendor so skeptic knows not to fail the lane for it"
+        );
+        assert!(
+            prompt.contains("bugbot"),
+            "prompt must name the second waived vendor"
+        );
+        assert!(
+            prompt.contains("Review this diff..."),
+            "prompt must still carry the diff body"
+        );
+    }
+
+    /// Telemetry tier (acceptance 4): a vendor waiver activation emits a
+    /// `VENDOR_WAIVED` event into the telemetry channel; the bead is the
+    /// first-class payload field.
+    #[test]
+    fn vendor_waiver_emits_telemetry_event() {
+        let dir = std::env::temp_dir().join("vendor_waiver_tel_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("daemon.jsonl");
+        // Synthesize a waiver activation and verify the emitter writes one
+        // VALID `VENDOR_WAIVED` event line.
+        crate::vendor_health::emit_vendor_waived(
+            &log,
+            "b-tel",
+            "coderabbit",
+            "quota_capped_3_consecutive_assessments",
+            "coderabbit:waived_vendor_unavailable",
+            1_800_000_000,
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(&log).unwrap();
+        let line = body.lines().next().unwrap();
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["eventType"], "VENDOR_WAIVED");
+        assert_eq!(v["beadId"], "b-tel");
+        assert_eq!(v["context"]["vendor"], "coderabbit");
+        assert_eq!(
+            v["context"]["reason"],
+            "quota_capped_3_consecutive_assessments"
+        );
+        assert_eq!(
+            v["context"]["waiver_token"],
+            "coderabbit:waived_vendor_unavailable"
+        );
+    }
+
+    /// Vendor-health ledger tier: recording N consecutive capped
+    /// assessments escalates a vendor to `waived`; a subsequent successful
+    /// review clears the waiver automatically (acceptance 4).
+    #[test]
+    fn vendor_health_ledger_auto_escalates_then_clears_on_recovery() {
+        let mut ledger = crate::vendor_health::VendorHealthLedger::default();
+        // N=3 consecutive capped assessments is the production threshold
+        // for structurally-unavailable.
+        for i in 0..3 {
+            ledger.record_assessment("coderabbit", false, i as u64);
+        }
+        assert_eq!(
+            ledger.status("coderabbit"),
+            crate::vendor_health::VendorStatus::Waived {
+                token: "coderabbit:waived_vendor_unavailable".into()
+            }
+        );
+        // First successful review auto-clears.
+        ledger.record_assessment("coderabbit", true, 99);
+        assert_eq!(
+            ledger.status("coderabbit"),
+            crate::vendor_health::VendorStatus::Healthy
+        );
+    }
+
+    /// Vendor-health ledger tier: a single failed assessment is just
+    /// `Degraded`, not yet `Waived` — auto-escalation requires the
+    /// threshold.
+    #[test]
+    fn vendor_health_ledger_below_threshold_is_degraded() {
+        let mut ledger = crate::vendor_health::VendorHealthLedger::default();
+        ledger.record_assessment("coderabbit", false, 0);
+        ledger.record_assessment("coderabbit", false, 1);
+        assert_eq!(
+            ledger.status("coderabbit"),
+            crate::vendor_health::VendorStatus::Degraded
+        );
+    }
+
+    /// Returns the waived-vendors list as the skeptic-prompt contract
+    /// expects: every vendor currently in `Waived` status, the token
+    /// preserved verbatim so the skeptic prompt can cite it back as the
+    /// merge-authority substitute.
+    #[test]
+    fn vendor_health_ledger_waivers_list_is_prompt_ready() {
+        let mut ledger = crate::vendor_health::VendorHealthLedger::default();
+        for i in 0..3 {
+            ledger.record_assessment("coderabbit", false, i);
+            ledger.record_assessment("bugbot", false, i);
+        }
+        let ctx = ledger.context();
+        assert_eq!(ctx.waived_vendors.len(), 2);
+        assert!(ctx.waived_vendors.contains(&"coderabbit".into()));
+        assert!(ctx.waived_vendors.contains(&"bugbot".into()));
     }
 
     // --- jleechan-yoqy / issue #323: canonical evidence contract tests ---

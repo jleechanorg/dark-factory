@@ -292,6 +292,8 @@ fn sqlite_dispatch_guarantee_queued_bead_dispatched_despite_escalation_backlog()
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
+                    // Bead jleechan-jsby: empty vendor-health ledger; pre-bead behavior preserved.
+                    vendor_health: None,
     };
 
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
@@ -374,6 +376,8 @@ fn sqlite_escalation_dedup_tick_level_identical_payload_suppressed_changed_conte
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
+                    // Bead jleechan-jsby: empty vendor-health ledger; pre-bead behavior preserved.
+                    vendor_health: None,
     };
 
     // ── Tick 1: first escalation → ESCALATION_REQUIRED emitted ──

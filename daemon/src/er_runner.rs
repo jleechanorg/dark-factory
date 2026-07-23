@@ -612,6 +612,11 @@ mod tests {
             vcs: &V,
             cfg,
             telemetry_log: std::path::Path::new("/tmp/afd_er_runner_unit_test.jsonl"),
+            // Bead jleechan-jsby: the er_runner unit-test builder does not
+            // exercise vendor waivers; the empty waiver context is the
+            // correct default (preserves pre-bead behavior for the unit
+            // tests).
+            vendor_health: None,
         }
     }
 
