@@ -386,6 +386,7 @@ fn drive_one_tick(
             vcs: &VcsMock,
             cfg,
             telemetry_log,
+            vendor_health: None,
         },
         0,
         0,

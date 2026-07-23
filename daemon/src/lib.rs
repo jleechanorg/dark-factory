@@ -24,3 +24,4 @@ pub mod vacuous_red_green;
 
 
 pub mod gates_compute;
+pub mod vendor_health;
