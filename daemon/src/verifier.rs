@@ -1034,6 +1034,50 @@ pub fn detect_vendor_recovery(
     recovered
 }
 
+/// Bead jleechan-jsby (r2): detect from a fresh snapshot whether any
+/// tracked vendor is showing a cap marker. ZFC-clean: keys ONLY on
+/// the snapshot's STRUCTURED fields (`coderabbit_status`,
+/// `coderabbit_approved`, `bugbot_error_count`). No keyword matching,
+/// no free-text inspection.
+///
+/// The cap marker is the inverse of the recovery signal:
+///   - CodeRabbit: status="unknown" AND not approved.
+///   - Bugbot: structurally unavailable (no comment-based status
+///     field, so the snapshot's "no errors" semantic is the only
+///     signal Bugbot is healthy — when the ledger says Bugbot is
+///     Capped and the snapshot has 0 errors, `detect_vendor_recovery`
+///     handles the cleared edge; here we want the OPPOSITE: any
+///     snapshot state that is NOT a clean approve is a "capped"
+///     observation relative to an already-capped vendor's absence).
+///
+/// Used by the fast tier's CI-wait timeout (operator guidance r2
+/// #3) to decide whether `ci_pending=true` is the vendor's
+/// commit-status context wedging the bead or a real CI wait.
+pub fn detect_vendor_cap(snapshot: &crate::tools::PrSnapshot) -> bool {
+    use crate::vendor_health::Vendor;
+    detect_vendor_cap_for(snapshot, Vendor::CodeRabbit)
+        || detect_vendor_cap_for(snapshot, Vendor::Bugbot)
+}
+
+/// Bead jleechan-jsby (r2): per-vendor cap detection. Matching
+/// `detect_vendor_recovery`'s inverse:
+///   - CodeRabbit: status="unknown" AND not approved (the cap marker
+///     the r1 PR #459 reviewer specifically called out).
+///   - Bugbot: error_count > 0 (the snapshot's "Bugbot found
+///     problems" signal).
+pub fn detect_vendor_cap_for(
+    snapshot: &crate::tools::PrSnapshot,
+    vendor: crate::vendor_health::Vendor,
+) -> bool {
+    use crate::vendor_health::Vendor;
+    match vendor {
+        Vendor::CodeRabbit => {
+            snapshot.coderabbit_status == "unknown" && !snapshot.coderabbit_approved
+        }
+        Vendor::Bugbot => snapshot.bugbot_error_count > 0,
+    }
+}
+
 /// Bead jleechan-jsby: apply a vendor waiver to an `Unknown` gate verdict.
 /// Returns `GateResult::Waived { vendor, reason }` when the vendor is
 /// structurally unavailable AND compensating coverage is green; returns
@@ -3142,7 +3186,7 @@ mod tests {
                 vendor: Vendor::CodeRabbit,
                 source: CapSource::UnknownGateRepeated,
                 bead_id: format!("bead-{ts}"),
-                pr_number: ts as u64,
+                pr_number: ts,
                 ts_epoch: ts,
                 note: "test fixture".into(),
             });
@@ -3157,7 +3201,7 @@ mod tests {
                 vendor: Vendor::Bugbot,
                 source: CapSource::UnknownGateRepeated,
                 bead_id: format!("bead-{ts}"),
-                pr_number: ts as u64,
+                pr_number: ts,
                 ts_epoch: ts,
                 note: "test fixture".into(),
             });
@@ -3452,7 +3496,7 @@ mod tests {
         let mut scm = FakeScm::default();
         scm.snapshots.insert(7, all_green_snapshot(7)); // CodeRabbit approved
         let cfg = test_cfg();
-        let mut evidence = all_green_evidence();
+        let _evidence = all_green_evidence();
         let mut ledger = capped_coderabbit_ledger();
         // Sanity: ledger says Capped before recovery.
         assert!(ledger.health(Vendor::CodeRabbit).is_capped());

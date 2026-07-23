@@ -497,6 +497,7 @@ fn test_tick_stage2_integration() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
+        vendor_health: None,
     };
 
     // --- Tick 1: Intake -> Route -> Dispatch ---
@@ -579,6 +580,7 @@ fn test_tick_stage2_integration() {
         vcs: &vcs,
         cfg: &cfg,
         telemetry_log: &telemetry_log,
+        vendor_health: None,
     };
 
     // --- Tick 2: assess gates (fails) -> execute re-roll -> spec mutation -> recovery -> redispatched ---

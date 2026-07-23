@@ -603,6 +603,7 @@ fn run(args: Args) -> Result<(), DaemonError> {
         vcs: vcs.as_ref(),
         cfg: &cfg,
         telemetry_log: &telemetry_log,
+        vendor_health: None,
     };
 
     if args.once {
