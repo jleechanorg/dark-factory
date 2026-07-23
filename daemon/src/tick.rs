@@ -1392,6 +1392,11 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // Key the dedup on the stable branch instead — every colliding
                 // bead for the same branch collapses to one ledger row, and
                 // `cfg.escalation_refire_secs` (default 1h) gates the noise.
+                //
+                // Production signal (2026-07-23, 32h window): 5,334
+                // escalation comments posted at ~174/hour/branch on three
+                // colliding PRs (#8428 / #8420 / #8421) — 73% of all GH
+                // Actions noise on the repo. Full evidence bundle in PR body.
                 let (should_emit, ctx_hash) = escalation_dedup_should_emit(
                     deps,
                     &adopted.head_ref_name,
