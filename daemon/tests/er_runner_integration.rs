@@ -343,6 +343,7 @@ fn all_green_snapshot(pr: u64) -> PrSnapshot {
         ci_status: "green".into(),
         coderabbit_status: "green".into(),
         ci_pending: false,
+        bugbot_pending: false,
         head_committed_epoch: 0,
     }
 }

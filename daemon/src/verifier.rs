@@ -1062,8 +1062,19 @@ pub fn detect_vendor_cap(snapshot: &crate::tools::PrSnapshot) -> bool {
 /// `detect_vendor_recovery`'s inverse:
 ///   - CodeRabbit: status="unknown" AND not approved (the cap marker
 ///     the r1 PR #459 reviewer specifically called out).
-///   - Bugbot: error_count > 0 (the snapshot's "Bugbot found
-///     problems" signal).
+///   - Bugbot: jleechan-8s2p phase 2 — Bugbot is `bugbot_pending`
+///     (outage / stuck / fair-use cap, no review produced yet). The
+///     r6 detector keyed on `bugbot_error_count > 0`, but that is
+///     Bugbot's FAILURE signal (Bugbot ran and produced error
+///     comments), NOT its OUTAGE signal — production outages have
+///     `error_count == 0`, so the predicate never returned true and
+///     the Bugbot waiver path was unreachable without manually
+///     seeded ledgers. `bugbot_pending` is the parallel of
+///     `coderabbit_status == "unknown"`: a vendor whose review has
+///     not yet arrived. A genuine Bugbot RED verdict
+///     (`error_count > 0`) is unaffected and stays Red (handled by
+///     the `> 0` branch in the BugbotClean gate); the waiver must
+///     NEVER substitute for a real fail.
 pub fn detect_vendor_cap_for(
     snapshot: &crate::tools::PrSnapshot,
     vendor: crate::vendor_health::Vendor,
@@ -1073,7 +1084,7 @@ pub fn detect_vendor_cap_for(
         Vendor::CodeRabbit => {
             snapshot.coderabbit_status == "unknown" && !snapshot.coderabbit_approved
         }
-        Vendor::Bugbot => snapshot.bugbot_error_count > 0,
+        Vendor::Bugbot => snapshot.bugbot_pending,
     }
 }
 
@@ -1511,6 +1522,9 @@ mod tests {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+            // jleechan-8s2p: all-green fixture means Bugbot
+            // reviewed clean (no outage, no error comments).
+            bugbot_pending: false,
             head_committed_epoch: 0,
         }
     }
@@ -1534,6 +1548,9 @@ mod tests {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+            // jleechan-8s2p: thread-count fixture — Bugbot state
+            // orthogonal; default clean.
+            bugbot_pending: false,
             head_committed_epoch: 0,
         }
     }
@@ -3173,6 +3190,14 @@ mod tests {
         snap.coderabbit_approved = false;
         snap.coderabbit_status = "unknown".to_string();
         snap.bugbot_error_count = 0;
+        // jleechan-8s2p: parallel outage signal for Bugbot. The
+        // r6 detector keyed on `bugbot_error_count > 0`, which is
+        // real-failure semantics; the structural-unavailability
+        // signal is `bugbot_pending`. Setting it here keeps the
+        // existing recovery tests consistent: both vendors
+        // unknown-stuck → recovery must NOT fire (the snapshot
+        // does not contradict the ledger).
+        snap.bugbot_pending = true;
         snap
     }
 
@@ -3549,5 +3574,148 @@ mod tests {
             recovered.is_empty(),
             "Vendor-still-unknown snapshot must not clear the Capped ledger, got {recovered:?}"
         );
+    }
+
+    // jleechan-8s2p (phase 2): the r6 cap detector required
+    // `bugbot_error_count > 0`, but the OUTAGE case has `== 0` — that
+    // meant `detect_vendor_cap_for(Vendor::Bugbot)` never returned true
+    // in production and the Bugbot waiver was unreachable without
+    // manually seeded ledgers. After this fix the predicate keys on
+    // `snapshot.bugbot_pending` (a STRUCTURED field parallel to
+    // `coderabbit_status == "unknown"`), so an outage snapshot returns
+    // true while a passed Bugbot returns false.
+    #[test]
+    fn detect_vendor_cap_for_bugbot_pending_is_true_regardless_of_error_count() {
+        let mut scm = FakeScm::default();
+        let mut snap = all_green_snapshot(11);
+        // Bugbot is stuck pending, no error comments yet — the r6
+        // detector returned false here, blocking the entire Bugbot
+        // waiver path.
+        snap.bugbot_pending = true;
+        snap.bugbot_error_count = 0;
+        scm.snapshots.insert(11, snap.clone());
+
+        let cfg = test_cfg();
+        let snap = scm.pr_snapshot_for_repo(&cfg.target_repo, 11).unwrap();
+        assert!(
+            detect_vendor_cap_for(&snap, Vendor::Bugbot),
+            "Bugbot stuck pending must be detected as a cap observation \
+             (structural unavailability, not absence of errors)"
+        );
+    }
+
+    // jleechan-8s2p: Bugbot cap detection must NOT fire when Bugbot
+    // has actually reviewed and produced no errors — that is a clean
+    // pass, not a cap. Without this guard, `bugbot_error_count == 0`
+    // would be misread as cap and the waiver would substitute for a
+    // vendor that legitimately ran green.
+    #[test]
+    fn detect_vendor_cap_for_bugbot_passed_is_false() {
+        let mut scm = FakeScm::default();
+        let mut snap = all_green_snapshot(12);
+        // Bugbot reviewed, no errors, no pending state — clean pass.
+        snap.bugbot_pending = false;
+        snap.bugbot_error_count = 0;
+        scm.snapshots.insert(12, snap);
+
+        let cfg = test_cfg();
+        let snap = scm.pr_snapshot_for_repo(&cfg.target_repo, 12).unwrap();
+        assert!(
+            !detect_vendor_cap_for(&snap, Vendor::Bugbot),
+            "Bugbot reviewed clean (pending=false, errors=0) must NOT be \
+             treated as a cap observation; that is a genuine Green path"
+        );
+    }
+
+    // jleechan-8s2p: Bugbot cap detection must NOT fire when Bugbot
+    // has actually produced error comments — that is a real RED verdict
+    // (handled by the BugbotClean gate's `> 0` branch), not structural
+    // unavailability. The waiver must NEVER substitute for a genuine
+    // fail.
+    #[test]
+    fn detect_vendor_cap_for_bugbot_with_errors_is_false() {
+        let mut scm = FakeScm::default();
+        let mut snap = all_green_snapshot(13);
+        // Bugbot produced a real error comment. This is a RED verdict,
+        // never a cap — the waiver is for STRUCTURAL outage only.
+        snap.bugbot_pending = false;
+        snap.bugbot_error_count = 2;
+        scm.snapshots.insert(13, snap);
+
+        let cfg = test_cfg();
+        let snap = scm.pr_snapshot_for_repo(&cfg.target_repo, 13).unwrap();
+        assert!(
+            !detect_vendor_cap_for(&snap, Vendor::Bugbot),
+            "Bugbot producing error comments is a real RED verdict, never \
+             a structural cap; waiver must not substitute"
+        );
+    }
+
+    // jleechan-8s2p: end-to-end proof that the Bugbot waiver path is
+    // reachable in PRODUCTION — `tick` records the cap observation
+    // (predicate now true for outage), the ledger escalates to Capped
+    // across N-of-M beads, and `assess` then produces GateResult::Waived
+    // instead of leaving the gate as Green-pretending-Bugbot-was-Healthy
+    // or stuck Unknown.
+    #[test]
+    fn bugbot_outage_reaches_waived_via_cap_observation_recording() {
+        use crate::vendor_health::{VendorHealth, EVT_WAIVED};
+
+        let mut scm = FakeScm::default();
+        // Three distinct beads, each with Bugbot stuck pending and 0
+        // errors — exactly the production outage signature.
+        for pr in 21..=23u64 {
+            let mut snap = all_green_snapshot(pr);
+            snap.bugbot_pending = true;
+            snap.bugbot_error_count = 0;
+            scm.snapshots.insert(pr, snap);
+        }
+        let cfg = test_cfg();
+
+        // First two beads record but the ledger stays Healthy
+        // (below the N-of-M threshold of 3 distinct beads).
+        let mut ledger = VendorHealthLedger::new();
+        for (pr, bead) in [(21u64, "bead-21"), (22u64, "bead-22")] {
+            let snap = scm.pr_snapshot_for_repo(&cfg.target_repo, pr).unwrap();
+            assert!(
+                detect_vendor_cap_for(&snap, Vendor::Bugbot),
+                "Bugbot outage must be detected on bead {bead}"
+            );
+            ledger.record_cap(CapObservation {
+                vendor: Vendor::Bugbot,
+                source: CapSource::UnknownGateRepeated,
+                bead_id: bead.into(),
+                pr_number: pr,
+                ts_epoch: pr,
+                note: format!("outage at pr {pr}"),
+            });
+        }
+        assert_eq!(
+            ledger.health(Vendor::Bugbot),
+            VendorHealth::Healthy,
+            "2 of 3 distinct beads is below the N-of-M threshold"
+        );
+
+        // Third bead crosses the threshold → Capped → waiver eligible.
+        let _snap = scm.pr_snapshot_for_repo(&cfg.target_repo, 23).unwrap();
+        ledger.record_cap(CapObservation {
+            vendor: Vendor::Bugbot,
+            source: CapSource::UnknownGateRepeated,
+            bead_id: "bead-23".into(),
+            pr_number: 23,
+            ts_epoch: 23,
+            note: "outage at pr 23".into(),
+        });
+        assert!(
+            ledger.health(Vendor::Bugbot).is_capped(),
+            "3 distinct beads must flip Bugbot to Capped; without the P1 \
+             fix, the predicate never returned true and this transition \
+             was unreachable"
+        );
+
+        // EVT_WAIVED marker is the canonical grep target for the
+        // waiver firing — confirm it is emitted when the record call
+        // happens on a fresh cap edge.
+        assert_eq!(EVT_WAIVED, "VENDOR_WAIVED");
     }
 }

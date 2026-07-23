@@ -539,6 +539,7 @@ fn test_tick_stage2_integration() {
             ci_status: "red".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );

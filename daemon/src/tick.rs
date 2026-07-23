@@ -2711,6 +2711,77 @@ fn skeptic_verdict_to_line(v: &verifier::SkepticVerdict) -> String {
     }
 }
 
+/// jleechan-8s2p (phase 2): build the Stage-1 skeptic prompt.
+///
+/// Extracted from `skeptic_evidence` so the prompt body is directly
+/// unit-testable without standing up the subprocess dispatch path.
+/// Two constraints drove the extraction:
+///
+/// 1. The reviewer subprocess (`dispatch_reviewer`) runs
+///    `codex exec` / `claude --print` with no cwd override, so `gh`
+///    commands the reviewer issues without an explicit `--repo`
+///    default to whatever repo the daemon process's own cwd happens
+///    to be checked out as. The prompt embeds `repo` (the bead's OWN
+///    resolved repo, `overlay.repo(cfg)` at the call site) plus
+///    explicit `--repo` flags, mirroring `er_runner::build_er_prompt`,
+///    so the reviewer queries the RIGHT repo regardless of daemon cwd.
+///
+/// 2. jleechan-8s2p (the r6 reviewer's P2 finding): the waived-vendor
+///    context MUST be in the prompt BEFORE the skeptic LLM is
+///    dispatched. Otherwise the skeptic sees a capped vendor still
+///    pending on `gh pr checks`, can fail/warn solely on that signal,
+///    and `compensating_coverage_green` then refuses the waiver
+///    because the required skeptic `Pass` was never obtainable. The
+///    earlier code only copied the vendor ledger into `PrEvidence`
+///    AFTER the skeptic had already responded, so the prompt and the
+///    waiver logic disagreed about whether the vendor check mattered.
+///    Each Capped vendor's canonical waiver token (e.g.
+///    `bugbot:waived_vendor_unavailable`) is now embedded directly in
+///    the prompt with explicit "do not fail on a waived vendor
+///    check" guidance.
+fn build_skeptic_prompt(
+    bead_id: &str,
+    pr: u64,
+    repo: &str,
+    vendor_health: &crate::vendor_health::VendorHealthLedger,
+) -> String {
+    use crate::vendor_health::Vendor;
+    use crate::vendor_health::VendorHealth;
+
+    let mut vendor_waiver_block = String::new();
+    for vendor in [Vendor::CodeRabbit, Vendor::Bugbot] {
+        match vendor_health.health(vendor) {
+            VendorHealth::Capped { observations, since_epoch } => {
+                vendor_waiver_block.push_str(&format!(
+                    "\nVENDOR WAIVER CONTEXT\n\
+                     The {vendor_name} check is structurally unavailable on this PR \
+                     (cap observations: {obs_count}, first observed at epoch {since}). \
+                     Treat a pending or missing {vendor_name} check as waived, NOT as \
+                     a fail signal — the vendor cannot deliver a review and the bead's \
+                     compensating coverage (skeptic pass + /er pass + cross-model) is \
+                     the substitute trust floor. Waiver token: {waiver_token}",
+                    vendor_name = vendor.as_str(),
+                    obs_count = observations.len(),
+                    since = since_epoch,
+                    waiver_token = vendor.waiver_token(),
+                ));
+            }
+            VendorHealth::Healthy => {}
+        }
+    }
+
+    format!(
+        "You are the Stage-1 Skeptic gate for an autonomous coding factory.\n\
+         Review bead {bead_id}'s PR #{pr} in repo {repo} end-to-end (diff, \
+         evidence, tests) and judge whether it is ready to merge:\n\
+           gh pr diff {pr} --repo {repo}\n\
+           gh pr view {pr} --repo {repo} --json body,comments\n\
+           gh pr checks {pr} --repo {repo}\n\
+         Respond with exactly one line of the form:\n\
+         pass|warn <note>|fail <reason>{vendor_waiver_block}",
+    )
+}
+
 fn skeptic_evidence(
     deps: &TickDeps,
     bead_id: &str,
@@ -2720,24 +2791,14 @@ fn skeptic_evidence(
     vendor_health: crate::vendor_health::VendorHealthLedger,
 ) -> Result<PrEvidence, DaemonError> {
     // jleechan-9xrs Stage D: the reviewer subprocess (`dispatch_reviewer`)
-    // runs `codex exec` / `claude --print` with no cwd override, so `gh`
-    // commands the reviewer issues without an explicit `--repo` default to
-    // whatever repo the daemon process's own cwd happens to be checked out
-    // as. Embedding `repo` (the bead's OWN resolved repo, `overlay.repo(cfg)`
-    // at the call site) plus explicit `--repo` flags — mirroring
-    // `er_runner::build_er_prompt` — makes the reviewer query the RIGHT repo
-    // regardless of daemon cwd, instead of silently reviewing PR #{pr} in
-    // whatever repo happened to be checked out.
-    let prompt = format!(
-        "You are the Stage-1 Skeptic gate for an autonomous coding factory.\n\
-         Review bead {bead_id}'s PR #{pr} in repo {repo} end-to-end (diff, \
-         evidence, tests) and judge whether it is ready to merge:\n\
-           gh pr diff {pr} --repo {repo}\n\
-           gh pr view {pr} --repo {repo} --json body,comments\n\
-           gh pr checks {pr} --repo {repo}\n\
-         Respond with exactly one line of the form:\n\
-         pass|warn <note>|fail <reason>",
-    );
+    // jleechan-8s2p (phase 2): the waived-vendor context is now part
+    // of the prompt BEFORE the skeptic LLM is dispatched. Building
+    // the prompt in a dedicated helper (`build_skeptic_prompt`)
+    // keeps the dispatch loop readable and makes the prompt content
+    // directly unit-testable (was previously buried inside
+    // `skeptic_evidence`, which is private and has heavy
+    // subprocess side effects).
+    let prompt = build_skeptic_prompt(bead_id, pr, repo, &vendor_health);
 
     let coder_agent = std::env::var("DARK_FACTORY_CODER_DEFAULT")
         .or_else(|_| std::env::var("DARK_FACTORY_REVIEWER_DEFAULT"))
@@ -5466,6 +5527,156 @@ mod existing_pr_adoption_dedup_tests {
             dedup_states,
             vec![OverlayState::Attested, OverlayState::Ready, OverlayState::HumanHeld],
             "EXISTING_PR_ADOPTED dedup set must remain exactly Attested+Ready+HumanHeld"
+        );
+    }
+}
+
+// jleechan-8s2p (phase 2): the waived-vendor context MUST land in the
+// skeptic prompt BEFORE the LLM is dispatched. Otherwise the skeptic
+// sees the capped vendor still pending on `gh pr checks`, fails/warns
+// solely on that signal, and `compensating_coverage_green` refuses the
+// waiver because the required skeptic `Pass` was never obtainable —
+// the ledger is copied into `PrEvidence` AFTER the skeptic has already
+// responded, so the prompt and the waiver logic disagree about
+// whether the vendor check matters.
+#[cfg(test)]
+mod skeptic_prompt_vendor_waiver_tests {
+    use super::build_skeptic_prompt;
+    use crate::vendor_health::{
+        CapObservation, CapSource, Vendor, VendorHealthLedger,
+    };
+
+    fn capped_ledger(vendor: Vendor, bead_prefix: &str) -> VendorHealthLedger {
+        let mut ledger = VendorHealthLedger::new();
+        for ts in 1..=3 {
+            ledger.record_cap(CapObservation {
+                vendor,
+                source: CapSource::UnknownGateRepeated,
+                bead_id: format!("{bead_prefix}-{ts}"),
+                pr_number: ts,
+                ts_epoch: ts,
+                note: "test fixture".into(),
+            });
+        }
+        ledger
+    }
+
+    /// The skeptic prompt must embed the canonical Bugbot waiver token
+    /// when Bugbot is Capped, so the LLM is told that a pending Bugbot
+    /// check is a WAIVER (compensating coverage substitutes), NOT a
+    /// fail signal. Without this block the skeptic can fail a lane
+    /// purely on a capped vendor's pending check, blocking the
+    /// waiver that `compensating_coverage_green` would otherwise
+    /// issue — exactly the r6 P2 finding.
+    #[test]
+    fn skeptic_prompt_contains_bugbot_waiver_token_when_bugbot_capped() {
+        let ledger = capped_ledger(Vendor::Bugbot, "bead-bugbot");
+        let prompt = build_skeptic_prompt("bead-x", 123, "owner/repo", &ledger);
+
+        assert!(
+            prompt.contains("bugbot:waived_vendor_unavailable"),
+            "skeptic prompt must carry the canonical Bugbot waiver token when Bugbot is Capped; \
+             without it the LLM treats a pending Bugbot check as a fail signal and the \
+             compensating-coverage waiver can never fire. Got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("VENDOR WAIVER CONTEXT"),
+            "skeptic prompt must have an explicit waiver-context header so the LLM recognises \
+             the block as authoritative guidance, not just a stray token. Got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Treat a pending or missing bugbot check as waived"),
+            "skeptic prompt must contain the explicit 'treat pending as waived' directive; \
+             a bare token would not change the LLM's behaviour. Got:\n{prompt}"
+        );
+    }
+
+    /// Symmetric guarantee for CodeRabbit — the prompt must surface a
+    /// CodeRabbit waiver block whenever CodeRabbit is Capped. The
+    /// waiver substitution is meaningless if the LLM is told one
+    /// vendor's waiver rule but not the other's.
+    #[test]
+    fn skeptic_prompt_contains_coderabbit_waiver_token_when_coderabbit_capped() {
+        let ledger = capped_ledger(Vendor::CodeRabbit, "bead-cr");
+        let prompt = build_skeptic_prompt("bead-x", 124, "owner/repo", &ledger);
+
+        assert!(
+            prompt.contains("coderabbit:waived_vendor_unavailable"),
+            "skeptic prompt must carry the canonical CodeRabbit waiver token when CodeRabbit is Capped; \
+             Got:\n{prompt}"
+        );
+    }
+
+    /// When both vendors are Capped, both waiver tokens land in the
+    /// prompt. (The most common production case is one vendor at a
+    /// time, but a coordinated outage can hit both; the prompt must
+    /// not silently drop the second one.)
+    #[test]
+    fn skeptic_prompt_contains_both_waiver_tokens_when_both_capped() {
+        let mut ledger = capped_ledger(Vendor::CodeRabbit, "bead-cr");
+        for ts in 4..=6 {
+            ledger.record_cap(CapObservation {
+                vendor: Vendor::Bugbot,
+                source: CapSource::VendorReportedCap,
+                bead_id: format!("bead-bb-{ts}"),
+                pr_number: ts,
+                ts_epoch: ts,
+                note: "test fixture".into(),
+            });
+        }
+        let prompt = build_skeptic_prompt("bead-x", 125, "owner/repo", &ledger);
+
+        assert!(
+            prompt.contains("coderabbit:waived_vendor_unavailable"),
+            "CodeRabbit waiver token must be present"
+        );
+        assert!(
+            prompt.contains("bugbot:waived_vendor_unavailable"),
+            "Bugbot waiver token must be present"
+        );
+    }
+
+    /// When neither vendor is Capped, the prompt has NO waiver
+    /// context — a Healthy vendor has nothing to waive. A stale
+    /// waiver block would mislead the LLM into ignoring a real
+    /// vendor verdict.
+    #[test]
+    fn skeptic_prompt_has_no_waiver_block_when_no_vendor_capped() {
+        let ledger = VendorHealthLedger::new();
+        let prompt = build_skeptic_prompt("bead-x", 126, "owner/repo", &ledger);
+
+        assert!(
+            !prompt.contains("VENDOR WAIVER CONTEXT"),
+            "Healthy ledger must not produce a waiver block; the LLM would otherwise \
+             ignore a real vendor verdict. Got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("waived_vendor_unavailable"),
+            "Healthy ledger must not surface any waiver token. Got:\n{prompt}"
+        );
+    }
+
+    /// The base prompt (Stage-1 skeptic instruction, gh commands,
+    /// verdict grammar) must remain unchanged by the waiver-context
+    /// injection. Only the suffix changes; the body must still
+    /// instruct the LLM to inspect `gh pr checks` and reply with the
+    /// pass|warn|fail grammar. This pins the contract that the
+    /// waiver-context injection is a PURE ADDITION.
+    #[test]
+    fn skeptic_prompt_base_unaffected_by_waiver_block() {
+        let ledger = capped_ledger(Vendor::Bugbot, "bead-bb");
+        let prompt = build_skeptic_prompt("bead-x", 127, "owner/repo", &ledger);
+
+        assert!(
+            prompt.contains("You are the Stage-1 Skeptic gate for an autonomous coding factory."),
+            "base Stage-1 role line must remain"
+        );
+        assert!(prompt.contains("gh pr diff 127 --repo owner/repo"));
+        assert!(prompt.contains("gh pr view 127 --repo owner/repo --json body,comments"));
+        assert!(prompt.contains("gh pr checks 127 --repo owner/repo"));
+        assert!(
+            prompt.contains("pass|warn <note>|fail <reason>"),
+            "verdict grammar must remain in the base prompt"
         );
     }
 }

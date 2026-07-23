@@ -913,6 +913,15 @@ impl Scm for CliScm {
                         ci_status,
                         coderabbit_status,
                         ci_pending: false,
+                        // jleechan-8s2p: offline cache path — Bugbot
+                        // outage state was not serialised before phase 2;
+                        // default to false (no outage known) so the
+                        // detector cannot accidentally fire on stale
+                        // cache hits. Test fixtures that need
+                        // bugbot_pending=true write a fresh snapshot via
+                        // `all_green_snapshot` + mutation, not the
+                        // offline cache.
+                        bugbot_pending: false,
                         head_committed_epoch: snap.head_committed_epoch.unwrap_or(0),
                     });
                 }
@@ -1180,6 +1189,19 @@ impl Scm for CliScm {
         let checks: Vec<GhCheck> = serde_json::from_str(&checks_out[json_start_c..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse gh pr checks JSON: {e}"))
         })?;
+        // jleechan-8s2p (phase 2): derive Bugbot's OUTAGE signal from the
+        // RAW `checks` array, BEFORE the cap-filter pass below. The
+        // filter drops a Capped vendor's check, which would otherwise
+        // hide the pending Bugbot from the snapshot and make the
+        // waiver path still unreachable even with the detector fix.
+        //
+        // Bugbot outage = a check run whose name matches Bugbot AND
+        // whose bucket is "pending" (the check has not yet produced
+        // pass/fail). Bugbot's review-comment surface (`error_count`)
+        // is a separate axis and does NOT participate in this signal.
+        let bugbot_pending = checks
+            .iter()
+            .any(|c| c.name.to_lowercase().contains("bugbot") && c.bucket == "pending");
         let mut filtered_checks = Vec::new();
         for c in &checks {
             let name_lower = c.name.to_lowercase();
@@ -1381,6 +1403,7 @@ impl Scm for CliScm {
             ci_status,
             coderabbit_status,
             ci_pending,
+            bugbot_pending,
             head_committed_epoch,
         };
         {

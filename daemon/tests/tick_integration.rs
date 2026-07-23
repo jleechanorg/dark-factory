@@ -166,6 +166,7 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -1329,6 +1330,7 @@ fn test_wedge_detection_attested_session_stalled() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -1449,6 +1451,7 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -1555,6 +1558,7 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             head_sha: same_sha.clone(),
             updated_at_epoch: now_epoch - 2000,
             ci_pending: false,
+        bugbot_pending: false,
             head_committed_epoch: 0,
             ci_success: true,
             mergeable: true,
@@ -1652,6 +1656,7 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             head_sha: "remote-head-stale".into(),
             updated_at_epoch: now_epoch - 2000,
             ci_pending: false,
+        bugbot_pending: false,
             head_committed_epoch: 0,
             ci_success: true,
             mergeable: true,
@@ -1769,6 +1774,7 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             head_sha: "remote-head-diverged".into(),
             updated_at_epoch: now_epoch - 2000,
             ci_pending: false,
+        bugbot_pending: false,
             head_committed_epoch: 0,
             ci_success: true,
             mergeable: true,
@@ -4015,6 +4021,7 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             ci_status: "unknown".into(),
             coderabbit_status: "approved".into(),
             ci_pending: true,
+        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -4109,6 +4116,7 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             ci_status: "red".into(),
             coderabbit_status: "approved".into(),
             ci_pending: false,
+        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -5101,6 +5109,7 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -5362,6 +5371,7 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             ci_status: "unknown".into(),
             coderabbit_status: "approved".into(),
             ci_pending: true,
+        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -5466,6 +5476,7 @@ fn attested_ci_pending_does_not_timebox_park() {
             ci_status: "unknown".into(),
             coderabbit_status: "approved".into(),
             ci_pending: true,
+        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -5682,6 +5693,7 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             ci_status: "success".into(),
             coderabbit_status: "approved".into(),
             ci_pending: false,
+        bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -5800,6 +5812,7 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -5979,6 +5992,7 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -6345,6 +6359,7 @@ fn qdw_green_snapshot(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         ci_status: "green".into(),
         coderabbit_status: "green".into(),
         ci_pending: false,
+        bugbot_pending: false,
         head_committed_epoch: 0,
     }
 }
@@ -6921,6 +6936,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -7114,6 +7130,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -7314,6 +7331,7 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -7509,6 +7527,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -8025,6 +8044,7 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -8224,6 +8244,7 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -8465,6 +8486,7 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         },
     );
@@ -9905,6 +9927,7 @@ fn seed_attested_red_ci_bead(
             ci_status: "red".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: now.saturating_sub(60),
         },
     );
@@ -10719,6 +10742,7 @@ fn slow_tier_dispatched_branch_mismatch_re_resolves_stale_pr_number() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: now.saturating_sub(60),
         },
     );
@@ -10875,6 +10899,7 @@ fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: now.saturating_sub(60),
         },
     );
@@ -11109,6 +11134,7 @@ fn slow_tier_pre_gate_validation_re_resolves_when_stored_pr_no_longer_open() {
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
             ci_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: now.saturating_sub(60),
         },
     );
@@ -12218,6 +12244,7 @@ fn msmq_verifier_skips_reassessment_when_reroll_deferred() {
         ci_status: "red".into(),
         coderabbit_status: "green".into(),
         ci_pending: false,
+        bugbot_pending: false,
         head_committed_epoch: fresh_epoch.saturating_sub(120),
     };
     scm.pr_snapshots.insert(901, snap.clone());
@@ -12846,6 +12873,7 @@ fn vendor_health_ledger_three_distinct_capped_beads_produce_waiver() {
             ci_status: "green".into(),
             coderabbit_status: "unknown".into(),
             ci_pending: false,
+            bugbot_pending: false,
             head_committed_epoch: 0,
         }
     }
@@ -13110,6 +13138,7 @@ fn vendor_health_ledger_ci_pending_with_capped_vendor_skips_wait() {
             ci_status: "pending".into(),
             coderabbit_status: "unknown".into(),
             ci_pending: true,
+        bugbot_pending: false,
             head_committed_epoch: 0,
             bugbot_pending: false,
         },
