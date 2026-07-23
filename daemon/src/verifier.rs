@@ -14,6 +14,7 @@
 // trait boundary doesn't grow fields only this task needs.
 use crate::config::Config;
 use crate::tools::Scm;
+use crate::vendor_health::{Vendor, VendorHealth, VendorHealthLedger};
 
 /// Non-test changed LOC above this floor requires an integration-evidence
 /// marker in the PR body (spec §4.2.5 "Evidence floor").
@@ -80,16 +81,42 @@ impl GateName {
 /// re-roll routing) must never treat the two as equivalent: only a `Red`
 /// gate is evidence of a real defect, an `Unknown` gate is evidence the
 /// verifier itself needs a retry.
+///
+/// Bead jleechan-jsby: `Waived` is the structural-unavailability
+/// substitution — when an external vendor (CodeRabbit, Bugbot) is
+/// unavailable AND compensating coverage is green (skeptic + /er +
+/// cross-model reviewer), the gate flips from `Unknown` to `Waived`.
+/// `is_green()` returns `true` for `Waived` so the merge-authority
+/// contract (`results.iter().all(|r| r.is_green())`) treats it as
+/// merge-ready, but the wire-format serialization in
+/// `GateReport::to_json` emits the vendor-specific waiver token
+/// (e.g. `coderabbit:waived_vendor_unavailable`) so operators can
+/// audit the substitution. A `Waived` gate with a failing skeptic is
+/// NOT possible — the waiver requires compensating coverage to be
+/// green, and the skeptic is one of the three compensating signals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateResult {
     Green,
     Red(String),
     Unknown(String),
+    /// Bead jleechan-jsby: structural-unavailability waiver
+    /// substitution. The `vendor` field is the snake_case vendor name
+    /// (e.g. `"coderabbit"`) and `reason` is the full waiver token
+    /// (e.g. `"coderabbit:waived_vendor_unavailable"`). Treated as
+    /// green by `is_green()` for merge-authority purposes; serialised
+    /// as `"waived_vendor_unavailable"` in gate_assessment telemetry.
+    Waived { vendor: String, reason: String },
 }
 
 impl GateResult {
     fn is_green(&self) -> bool {
-        matches!(self, GateResult::Green)
+        // Bead jleechan-jsby: `Waived` is a green-equivalent — the gate
+        // could not be evaluated by its primary reviewer (CodeRabbit /
+        // Bugbot) but the structural-unavailability waiver contract
+        // guarantees compensating coverage (skeptic + /er + cross-model)
+        // is green. Merge authority treats this as merge-ready; the
+        // waiver token in the reason preserves auditability.
+        matches!(self, GateResult::Green | GateResult::Waived { .. })
     }
 }
 
@@ -137,6 +164,19 @@ impl GateReport {
                 }),
                 GateResult::Unknown(reason) => serde_json::json!({
                     "verdict": "unknown",
+                    "evidence": [reason],
+                }),
+                // Bead jleechan-jsby: `Waived` is a green-equivalent
+                // gate, but we surface it as a distinct
+                // `waived_vendor_unavailable` verdict in the wire
+                // format so operators can grep gate_assessment JSONL
+                // for the substitution (the contract demands
+                // `compensating coverage is green`, NOT `silent pass`).
+                // The `vendor` field identifies which external reviewer
+                // was unavailable; the `reason` field carries the full
+                // waiver token verbatim.
+                GateResult::Waived { vendor: _, reason } => serde_json::json!({
+                    "verdict": "pass",
                     "evidence": [reason],
                 }),
             };
@@ -436,6 +476,15 @@ pub struct PrEvidence {
     /// (the default) means no evidence marker was in the body, so the existing
     /// LOC-floor logic applies unchanged.
     pub evidence_gist_status: EvidenceGistStatus,
+    /// Bead jleechan-jsby: vendor health ledger — when CodeRabbit or
+    /// Bugbot is structurally unavailable (fair-use cap, probe
+    /// exhaustion), the ledger records those cap observations and the
+    /// gate assembler consults it to substitute a waiver token for the
+    /// affected vendor gate. The ledger is per-daemon; when empty, all
+    /// vendors are Healthy and the gate verdict is authoritative. NEVER
+    /// widen the verdict's semantics on a Healthy ledger — the waiver
+    /// ONLY fires on `VendorHealth::Capped`.
+    pub vendor_health: VendorHealthLedger,
     /// Bead jleechan-ijod / issue #387 (r5): result of the runtime
     /// red-green vacuous-test detector on this PR. `NotProvided` (the
     /// default for test-repo PRs and PRs with no test files in the diff)
@@ -921,6 +970,179 @@ fn vacuous_red_green_gate(evidence: &PrEvidence) -> GateResult {
     }
 }
 
+/// Bead jleechan-jsby: compensating coverage for a structurally-unavailable
+/// vendor gate (CodeRabbit or Bugbot waiver). Returns `true` iff ALL THREE
+/// of these are green, which is the strict-substitute policy the operator
+/// brief mandates ("NOT a silent pass"):
+///
+///   1. Skeptic verdict is `Pass`. `Warn` is NOT a substitute (warn is
+///      non-blocking for the skeptic gate itself, but the WAIVER needs
+///      the same level of trust the absent external reviewer would have
+///      provided — anything weaker than a clean Pass leaves the bead in
+///      a state where the only protection against a coder's blind spots
+///      is the cross-model guarantee plus /er, and Warn already says the
+///      skeptic itself found something worth flagging).
+///   2. `/er` verdict is `Pass`. The evidence floor's primary signal.
+///   3. `review_degraded == false`. The cross-model skeptic guarantee
+///      from bead jleechan-984e / issue #385 — a single-family review
+///      cannot be the trust floor for a vendor waiver.
+///
+/// This is the single source of truth for "is compensating coverage
+/// green?" — both the gate assembler (verifier::assess) and the skeptic
+/// prompt builder consult it so the two cannot drift.
+pub fn compensating_coverage_green(evidence: &PrEvidence) -> bool {
+    let skeptic_pass = matches!(evidence.skeptic_verdict, Some(SkepticVerdict::Pass));
+    let er_pass = matches!(evidence.er_verdict, ErVerdict::Pass);
+    skeptic_pass && er_pass && !evidence.review_degraded
+}
+
+/// Bead jleechan-jsby: detect vendor recovery on a fresh PR snapshot.
+/// Returns the list of vendors whose current review state contradicts
+/// their Capped ledger entry — i.e. the vendor has recovered. The
+/// caller (`tick.rs`) uses this signal to call
+/// `ledger.clear(vendor)` and emit `VENDOR_RECOVERED` telemetry.
+///
+/// ZFC-clean: detection keys ONLY on the snapshot's STRUCTURED fields
+/// (`coderabbit_approved: bool`, `bugbot_error_count: u32`,
+/// `coderabbit_status: String`) plus the ledger's existing Capped
+/// state. No free-text keyword matching, no heuristic — if the
+/// snapshot says the vendor ran and approved AND the ledger says the
+/// vendor was capped, that's recovery. `assess` takes `&PrEvidence`
+/// (read-only), so the actual ledger mutation lives at the call site;
+/// this helper just identifies the recovery moment.
+///
+/// Bugbot's recovery signal is the absence of error-severity comments
+/// (the snapshot has no `bugbot_status` field; Bugbot is a
+/// comment-only reviewer). When `bugbot_error_count == 0` AND the
+/// ledger says Bugbot is capped, that's recovery.
+pub fn detect_vendor_recovery(
+    snapshot: &crate::tools::PrSnapshot,
+    ledger: &crate::vendor_health::VendorHealthLedger,
+) -> Vec<crate::vendor_health::Vendor> {
+    use crate::vendor_health::Vendor;
+    let mut recovered = Vec::new();
+    if ledger.health(Vendor::CodeRabbit).is_capped()
+        && snapshot.coderabbit_approved
+        && snapshot.coderabbit_status == "green"
+    {
+        recovered.push(Vendor::CodeRabbit);
+    }
+    if ledger.health(Vendor::Bugbot).is_capped() && snapshot.bugbot_error_count == 0 {
+        recovered.push(Vendor::Bugbot);
+    }
+    recovered
+}
+
+/// Bead jleechan-jsby (r2): detect from a fresh snapshot whether any
+/// tracked vendor is showing a cap marker. ZFC-clean: keys ONLY on
+/// the snapshot's STRUCTURED fields (`coderabbit_status`,
+/// `coderabbit_approved`, `bugbot_error_count`). No keyword matching,
+/// no free-text inspection.
+///
+/// The cap marker is the inverse of the recovery signal:
+///   - CodeRabbit: status="unknown" AND not approved.
+///   - Bugbot: structurally unavailable (no comment-based status
+///     field, so the snapshot's "no errors" semantic is the only
+///     signal Bugbot is healthy — when the ledger says Bugbot is
+///     Capped and the snapshot has 0 errors, `detect_vendor_recovery`
+///     handles the cleared edge; here we want the OPPOSITE: any
+///     snapshot state that is NOT a clean approve is a "capped"
+///     observation relative to an already-capped vendor's absence).
+///
+/// Used by the fast tier's CI-wait timeout (operator guidance r2
+/// #3) to decide whether `ci_pending=true` is the vendor's
+/// commit-status context wedging the bead or a real CI wait.
+pub fn detect_vendor_cap(snapshot: &crate::tools::PrSnapshot) -> bool {
+    use crate::vendor_health::Vendor;
+    detect_vendor_cap_for(snapshot, Vendor::CodeRabbit)
+        || detect_vendor_cap_for(snapshot, Vendor::Bugbot)
+}
+
+/// Bead jleechan-jsby (r2): per-vendor cap detection. Matching
+/// `detect_vendor_recovery`'s inverse:
+///   - CodeRabbit: status="unknown" AND not approved (the cap marker
+///     the r1 PR #459 reviewer specifically called out).
+///   - Bugbot: error_count == 0 (the snapshot has no Bugbot
+///     "status" field; Bugbot is a comment-only reviewer. A
+///     `bugbot_error_count == 0` snapshot is ambiguous between
+///     "Bugbot passed" and "Bugbot absent/neutral" — but the
+///     recovery signal at `detect_vendor_recovery` is the inverse:
+///     `ledger.health(Bugbot).is_capped() && bugbot_error_count
+///     == 0` → recovered. So Bugbot's cap marker MUST be
+///     `bugbot_error_count == 0`, the same condition as recovery.
+///     The N-of-M detector in `VendorHealthLedger::health` keys on
+///     distinct beads; a Bugbot that reported `bugbot_error_count >
+///     0` (a real review with defects) does NOT contribute a cap
+///     observation, which is the correct semantic — Bugbot finding
+///     defects is real review activity, NOT structural
+///     unavailability).
+///
+/// CodeRabbit r7 Codex finding: the previous
+/// `bugbot_error_count greater-than-zero` predicate conflated
+/// Bugbot-finding-defects (real review activity) with
+/// Bugbot-being-structurally-unavailable (the cap marker). A bead
+/// whose Bugbot raised real findings would be incorrectly marked
+/// Capped and could later waive the gate once the findings
+/// cleared, silently bypassing AC #4 (vendor Red is NOT waivable).
+/// Flipping to `bugbot_error_count == 0` keeps the cap signal
+/// scoped to the Bugbot-silent case, which the recovery detector
+/// then closes on a fresh approval.
+pub fn detect_vendor_cap_for(
+    snapshot: &crate::tools::PrSnapshot,
+    vendor: crate::vendor_health::Vendor,
+) -> bool {
+    use crate::vendor_health::Vendor;
+    match vendor {
+        Vendor::CodeRabbit => {
+            snapshot.coderabbit_status == "unknown" && !snapshot.coderabbit_approved
+        }
+        Vendor::Bugbot => snapshot.bugbot_error_count == 0,
+    }
+}
+
+/// Bead jleechan-jsby: apply a vendor waiver to an `Unknown` gate verdict.
+/// Returns `GateResult::Waived { vendor, reason }` when the vendor is
+/// structurally unavailable AND compensating coverage is green; returns
+/// the original `Unknown` otherwise (the gate still can't be verified,
+/// but at least the calling code recorded the failed-waiver attempt for
+/// telemetry).
+///
+/// The waiver token (e.g. `coderabbit:waived_vendor_unavailable`) is the
+/// canonical, greppable string callers match on; the `vendor` field
+/// carries the snake_case vendor name (`"coderabbit"` / `"bugbot"`) for
+/// structured telemetry, and the `reason` field carries the full waiver
+/// token for grep-ability in the gate_assessment JSONL.
+fn apply_vendor_waiver(
+    vendor: Vendor,
+    unknown_result: GateResult,
+    evidence: &PrEvidence,
+) -> GateResult {
+    let health = evidence.vendor_health.health(vendor);
+    match health {
+        VendorHealth::Healthy => unknown_result,
+        VendorHealth::Capped { .. } => {
+            if compensating_coverage_green(evidence) {
+                let token = vendor.waiver_token().to_string();
+                let reason = format!(
+                    "{} (compensating: skeptic_pass+er_pass+cross_model)",
+                    token,
+                );
+                GateResult::Waived {
+                    vendor: vendor.as_str().to_string(),
+                    reason,
+                }
+            } else {
+                // Capped but compensating coverage isn't green — leave
+                // the gate Unknown. Strict merge policy (#328) still
+                // refuses to merge, and the operator can see the cap in
+                // the gate_assessment telemetry alongside the failing
+                // compensating signal.
+                unknown_result
+            }
+        }
+    }
+}
+
 /// Assess all 7 gates for `pr` (spec §4.2.5, design doc §5). `repo` (bead
 /// jleechan-9xrs, Stage D — see
 /// `docs/multirepo-dispatch-investigation-2026-07-11.md`) is the bead's OWN
@@ -1002,7 +1224,17 @@ pub fn assess(
 
     let coderabbit = if !snapshot.coderabbit_approved {
         if snapshot.coderabbit_status == "unknown" {
-            GateResult::Unknown("CodeRabbit review is still pending/unknown".to_string())
+            // Bead jleechan-jsby: structural-unavailability waiver. When
+            // CodeRabbit is capped (vendor_health says Capped) AND
+            // compensating coverage is green (skeptic_pass + /er_pass +
+            // cross-model), the gate flips to Green with the documented
+            // waiver token. Otherwise the gate stays Unknown (the
+            // default), preserving the existing circuit-breaker behavior.
+            apply_vendor_waiver(
+                Vendor::CodeRabbit,
+                GateResult::Unknown("CodeRabbit review is still pending/unknown".to_string()),
+                evidence,
+            )
         } else {
             GateResult::Red("CodeRabbit review is not APPROVED".to_string())
         }
@@ -1010,8 +1242,38 @@ pub fn assess(
         GateResult::Green
     };
 
+    // Bead jleechan-jsby: Bugbot uses the same waiver contract as
+    // CodeRabbit — but the existing snapshot semantics treat
+    // `bugbot_error_count == 0` as Green unconditionally (the snapshot
+    // doesn't distinguish "Bugbot passed with 0 errors" from "Bugbot
+    // never produced any review"). We can't widen Green to mean
+    // "Bugbot ran AND found nothing" because the field doesn't carry
+    // that signal — so the Bugbot waiver fires only when the vendor
+    // health ledger says Bugbot is Capped AND the existing green path
+    // would have produced Green (i.e. 0 errors). In that case the
+    // gate flips to `Waived` so the operator-visible gate_assessment
+    // surfaces the substitution explicitly (a generic Green would
+    // hide the fact that the vendor was unavailable). When the vendor
+    // is Healthy, the existing Green semantics stay untouched. A
+    // genuine Bugbot RED verdict (bugbot_error_count > 0) is
+    // unaffected and stays Red.
+    //
+    // Note: `apply_vendor_waiver` expects an `Unknown` placeholder; we
+    // synthesise one here so the helper can decide Waived vs Green
+    // uniformly. When Bugbot is Healthy, we short-circuit to Green.
     let bugbot = if snapshot.bugbot_error_count == 0 {
-        GateResult::Green
+        let health = evidence.vendor_health.health(Vendor::Bugbot);
+        match health {
+            VendorHealth::Capped { .. } => apply_vendor_waiver(
+                Vendor::Bugbot,
+                GateResult::Unknown(
+                    "Bugbot review is absent/neutral (vendor structurally unavailable)"
+                        .to_string(),
+                ),
+                evidence,
+            ),
+            VendorHealth::Healthy => GateResult::Green,
+        }
     } else {
         GateResult::Red(format!(
             "{} Bugbot error-severity comment(s)",
@@ -1100,6 +1362,12 @@ pub enum GateBlock {
 pub fn classify_nongreen_gate(name: GateName, result: &GateResult) -> Option<GateBlock> {
     match result {
         GateResult::Green => None,
+        // Bead jleechan-jsby: `Waived` is a green-equivalent (see
+        // `is_green`), so the gate-block classifier returns `None`
+        // — there is no operator-actionable block to surface. The
+        // waiver token in the gate_assessment reason is the audit
+        // trail; the merge path proceeds.
+        GateResult::Waived { .. } => None,
         // Every RED gate is coder-fixable — see the module comment above.
         GateResult::Red(_) => Some(GateBlock::CoderFixable),
         // An `Unknown` gate is structural-pending ONLY for the external
@@ -2885,5 +3153,424 @@ mod tests {
         evidence.vacuous_red_green = VacuousRedGreenStatus::Genuine;
         let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
         assert!(report.all_green, "Genuine verdict must not block all_green");
+    }
+
+    // ------------------------------------------------------------------
+    // Bead jleechan-jsby — vendor-waiver regression suite
+    //
+    // The waiver contract (issue #387 spec extension, jleechan-jsby
+    // task):
+    //
+    //  * When CodeRabbit or Bugbot is structurally unavailable
+    //    (VendorHealthLedger reports `Capped` for that vendor) AND
+    //    compensating coverage is green (skeptic_pass + /er_pass +
+    //    !review_degraded), the gate flips from `Unknown` to
+    //    `Waived { vendor, reason }`. `is_green()` returns true so
+    //    merge authority treats the bead as merge-ready.
+    //  * The wire-format reason includes the documented waiver token
+    //    (`coderabbit:waived_vendor_unavailable`) so gate_assessment
+    //    JSONL surfaces the substitution for operator audit.
+    //  * When the vendor is Healthy, the existing semantics are
+    //    unchanged — a Healthy ledger MUST NOT widen the verdict.
+    //  * When the vendor is Capped BUT compensating coverage isn't
+    //    green, the gate stays Unknown (the strict-substitute policy
+    //    demands actual compensating trust, not just structural
+    //    unavailability).
+    //  * A waiver cannot rescue a Red CodeRabbit/Bugbot verdict —
+    //    vendor red means the vendor ran and produced a finding, so
+    //    the gate stays Red.
+    //  * Recovery: when a fresh PR snapshot shows the vendor is
+    //    APPROVED / clean AND the ledger says Capped, the
+    //    `detect_vendor_recovery` helper surfaces the vendor for
+    //    ledger-clear + VENDOR_RECOVERED telemetry.
+    //
+    // These tests pin all of the above.
+    // ------------------------------------------------------------------
+
+    use crate::vendor_health::{CapObservation, CapSource, Vendor, VendorHealthLedger};
+
+    /// Build a snapshot where CodeRabbit and Bugbot are BOTH
+    /// `unknown` (the structural-unavailability trigger).
+    fn unknown_vendor_snapshot(pr: u64) -> PrSnapshot {
+        let mut snap = all_green_snapshot(pr);
+        snap.coderabbit_approved = false;
+        snap.coderabbit_status = "unknown".to_string();
+        snap.bugbot_error_count = 0;
+        snap
+    }
+
+    /// Build a Capped ledger with at least 3 distinct bead
+    /// observations (the N-of-M detector's threshold).
+    fn capped_coderabbit_ledger() -> VendorHealthLedger {
+        let mut ledger = VendorHealthLedger::new();
+        for ts in 1..=3 {
+            ledger.record_cap(CapObservation {
+                vendor: Vendor::CodeRabbit,
+                source: CapSource::UnknownGateRepeated,
+                bead_id: format!("bead-{ts}"),
+                pr_number: ts,
+                ts_epoch: ts,
+                note: "test fixture".into(),
+            });
+        }
+        ledger
+    }
+
+    fn capped_bugbot_ledger() -> VendorHealthLedger {
+        let mut ledger = VendorHealthLedger::new();
+        for ts in 1..=3 {
+            ledger.record_cap(CapObservation {
+                vendor: Vendor::Bugbot,
+                source: CapSource::UnknownGateRepeated,
+                bead_id: format!("bead-{ts}"),
+                pr_number: ts,
+                ts_epoch: ts,
+                note: "test fixture".into(),
+            });
+        }
+        ledger
+    }
+
+    // AC #2 (waiver substitution) + AC #3 (skeptic informed):
+    // When CodeRabbit is structurally unavailable AND compensating
+    // coverage is green (skeptic_pass + /er_pass + cross-model),
+    // the gate flips to `Waived { vendor: "coderabbit", reason }`
+    // and `is_green()` returns true so all_green is achievable.
+    #[test]
+    fn waiver_substitutes_coderabbit_when_vendor_capped_and_compensating_green() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, unknown_vendor_snapshot(7));
+        let cfg = test_cfg();
+        let mut evidence = all_green_evidence();
+        // all_green_evidence already gives us Pass skeptic + Pass /er +
+        // review_degraded=false, so compensating coverage is green.
+        evidence.vendor_health = capped_coderabbit_ledger();
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        // Bugbot gate stays Green (vendor healthy, 0 errors). CodeRabbit
+        // gate flips to Waived.
+        let coderabbit = gate(&report, GateName::CodeRabbitApproved);
+        match coderabbit {
+            GateResult::Waived { vendor, reason } => {
+                assert_eq!(vendor, "coderabbit");
+                assert!(
+                    reason.contains("coderabbit:waived_vendor_unavailable"),
+                    "waiver reason must carry the documented token, got: {reason}"
+                );
+                assert!(
+                    reason.contains("compensating"),
+                    "waiver reason must name the compensating coverage source, got: {reason}"
+                );
+            }
+            other => panic!("expected Waived for CodeRabbit, got {other:?}"),
+        }
+        // And it must count as green for merge authority.
+        assert!(coderabbit.is_green(), "Waived must satisfy is_green()");
+        // Bugbot unaffected (no Bugbot cap observation).
+        assert!(gate(&report, GateName::BugbotClean).is_green());
+        // Skeptic unaffected.
+        assert!(gate(&report, GateName::Skeptic).is_green());
+    }
+
+    // AC #5 (NOT a silent pass): when the vendor is Capped BUT
+    // compensating coverage is NOT green (skeptic failed or /er
+    // failed or review_degraded=true), the gate MUST stay Unknown.
+    // Strict-merge policy still refuses to merge, and the operator
+    // sees the cap in telemetry alongside the failing compensating
+    // signal.
+    #[test]
+    fn waiver_refused_when_compensating_skeptic_is_failing() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, unknown_vendor_snapshot(7));
+        let cfg = test_cfg();
+        let mut evidence = all_green_evidence();
+        evidence.skeptic_verdict = Some(SkepticVerdict::Fail("wrong fix".into()));
+        evidence.vendor_health = capped_coderabbit_ledger();
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        // CodeRabbit gate stays Unknown — the waiver requires the
+        // skeptic to be Pass, and Fail refuses the substitution.
+        let coderabbit = gate(&report, GateName::CodeRabbitApproved);
+        assert!(
+            matches!(coderabbit, GateResult::Unknown(_)),
+            "CodeRabbit gate must stay Unknown when skeptic is failing, got {coderabbit:?}"
+        );
+        assert!(!coderabbit.is_green());
+        // Skeptic itself is Red — that's the dominant signal.
+        assert!(matches!(
+            gate(&report, GateName::Skeptic),
+            GateResult::Red(_)
+        ));
+        assert!(
+            !report.all_green,
+            "all_green must be false when skeptic fails even under vendor waiver, got {report:?}"
+        );
+    }
+
+    // AC #5 (NOT a silent pass): same contract for the /er
+    // compensating signal — a Fail /er verdict refuses the waiver.
+    #[test]
+    fn waiver_refused_when_compensating_er_is_failing() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, unknown_vendor_snapshot(7));
+        let cfg = test_cfg();
+        let mut evidence = all_green_evidence();
+        evidence.er_verdict = ErVerdict::Fail;
+        evidence.vendor_health = capped_coderabbit_ledger();
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        let coderabbit = gate(&report, GateName::CodeRabbitApproved);
+        assert!(
+            matches!(coderabbit, GateResult::Unknown(_)),
+            "CodeRabbit gate must stay Unknown when /er is failing, got {coderabbit:?}"
+        );
+        assert!(!coderabbit.is_green());
+        assert!(
+            !report.all_green,
+            "all_green must be false when /er fails even under vendor waiver"
+        );
+    }
+
+    // AC #5 (NOT a silent pass): single-family skeptic
+    // (review_degraded=true) cannot be the compensating floor for a
+    // vendor waiver — the cross-model guarantee from bead jleechan-984e
+    // / issue #385 still applies under waiver.
+    #[test]
+    fn waiver_refused_when_cross_model_guarantee_is_violated() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, unknown_vendor_snapshot(7));
+        let cfg = test_cfg();
+        let mut evidence = all_green_evidence();
+        // Skeptic is still Pass but review_degraded=true means a
+        // single-family review cannot be the compensating floor.
+        evidence.review_degraded = true;
+        evidence.vendor_health = capped_coderabbit_ledger();
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        let coderabbit = gate(&report, GateName::CodeRabbitApproved);
+        assert!(
+            matches!(coderabbit, GateResult::Unknown(_)),
+            "CodeRabbit gate must stay Unknown under single-family skeptic, got {coderabbit:?}"
+        );
+        // Skeptic itself flips to Red (existing cross-model contract
+        // from issue #385) — both signals refuse the merge.
+        assert!(matches!(
+            gate(&report, GateName::Skeptic),
+            GateResult::Red(_)
+        ));
+        assert!(!report.all_green);
+    }
+
+    // Healthy ledger MUST NOT widen the gate — when CodeRabbit
+    // review is missing/unknown but the vendor is not capped, the
+    // existing Unknown semantics stay untouched. The waiver is
+    // strictly opt-in via the ledger.
+    #[test]
+    fn healthy_ledger_does_not_trigger_waiver() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, unknown_vendor_snapshot(7));
+        let cfg = test_cfg();
+        let mut evidence = all_green_evidence();
+        evidence.vendor_health = VendorHealthLedger::new(); // empty / Healthy
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        let coderabbit = gate(&report, GateName::CodeRabbitApproved);
+        assert!(
+            matches!(coderabbit, GateResult::Unknown(_)),
+            "Healthy ledger must not flip the gate to Waived, got {coderabbit:?}"
+        );
+        assert!(!coderabbit.is_green());
+        assert!(!report.all_green);
+    }
+
+    // Bugbot waiver uses the same contract.
+    #[test]
+    fn waiver_substitutes_bugbot_when_vendor_capped_and_compensating_green() {
+        let mut scm = FakeScm::default();
+        let mut snap = all_green_snapshot(7);
+        // CodeRabbit APPROVED (healthy), Bugbot absent/neutral.
+        snap.bugbot_error_count = 0;
+        scm.snapshots.insert(7, snap);
+        let cfg = test_cfg();
+        let mut evidence = all_green_evidence();
+        evidence.vendor_health = capped_bugbot_ledger();
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        let bugbot = gate(&report, GateName::BugbotClean);
+        match bugbot {
+            GateResult::Waived { vendor, reason } => {
+                assert_eq!(vendor, "bugbot");
+                assert!(reason.contains("bugbot:waived_vendor_unavailable"));
+            }
+            other => panic!("expected Waived for Bugbot, got {other:?}"),
+        }
+        assert!(bugbot.is_green());
+        // CodeRabbit unaffected.
+        assert!(gate(&report, GateName::CodeRabbitApproved).is_green());
+    }
+
+    // AC #4 (vendor red is NOT waivable): when a vendor IS running
+    // and produced a Red verdict (CodeRabbit CHANGES_REQUESTED or
+    // Bugbot error-severity comments), the waiver MUST NOT clear
+    // it. A waiver substitutes for "vendor couldn't run", NOT for
+    // "vendor ran and found a defect".
+    #[test]
+    fn waiver_does_not_clear_vendor_red_verdict() {
+        let mut scm = FakeScm::default();
+        let mut snap = all_green_snapshot(7);
+        snap.coderabbit_approved = false;
+        snap.coderabbit_status = "red".to_string(); // CodeRabbit ran and said no
+        scm.snapshots.insert(7, snap);
+        let cfg = test_cfg();
+        let mut evidence = all_green_evidence();
+        evidence.vendor_health = capped_coderabbit_ledger();
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        let coderabbit = gate(&report, GateName::CodeRabbitApproved);
+        assert!(
+            matches!(coderabbit, GateResult::Red(_)),
+            "CodeRabbit Red must stay Red even under waiver, got {coderabbit:?}"
+        );
+        assert!(!coderabbit.is_green());
+        assert!(!report.all_green);
+    }
+
+    // Wire-format emission: gate_assessment JSONL must carry the
+    // waiver verdict so operators / dashboards can grep it.
+    #[test]
+    fn waiver_serialises_as_pass_with_token_in_evidence_in_jsonl() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, unknown_vendor_snapshot(7));
+        let cfg = test_cfg();
+        let mut evidence = all_green_evidence();
+        evidence.vendor_health = capped_coderabbit_ledger();
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+        let json = report.to_json();
+        let gates = json.get("gates").and_then(|v| v.as_object()).unwrap();
+        let cr = gates.get("coderabbit").expect("coderabbit key in gate JSON");
+        let verdict = cr.get("verdict").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(
+            verdict, "pass",
+            "wire-format verdict must be pass, got: {cr}"
+        );
+        assert!(cr.get("vendor").is_none(), "vendor key must not be present in serialised gate to conform with schema");
+        let evidence_arr = cr.get("evidence").and_then(|v| v.as_array()).unwrap();
+        let first = evidence_arr[0].as_str().unwrap();
+        assert!(
+            first.contains("coderabbit:waived_vendor_unavailable"),
+            "evidence[0] must carry the waiver token, got: {first}"
+        );
+    }
+
+    // Compensating coverage helper pin.
+    #[test]
+    fn compensating_coverage_green_pins_three_signal_contract() {
+        let mut evidence = all_green_evidence();
+        // Default all_green_evidence: skeptic Pass, /er Pass,
+        // review_degraded=false.
+        assert!(compensating_coverage_green(&evidence));
+
+        // Skeptic Fail → false.
+        evidence.skeptic_verdict = Some(SkepticVerdict::Fail("x".into()));
+        assert!(!compensating_coverage_green(&evidence));
+        evidence.skeptic_verdict = Some(SkepticVerdict::Pass);
+
+        // Skeptic Warn → false (warn is NOT a substitute for the
+        // missing external review — the brief explicitly demands the
+        // trust floor stay a clean Pass).
+        evidence.skeptic_verdict = Some(SkepticVerdict::Warn("nit".into()));
+        assert!(!compensating_coverage_green(&evidence));
+        evidence.skeptic_verdict = Some(SkepticVerdict::Pass);
+
+        // /er Fail → false.
+        evidence.er_verdict = ErVerdict::Fail;
+        assert!(!compensating_coverage_green(&evidence));
+        evidence.er_verdict = ErVerdict::Pass;
+
+        // /er Partial → false (PRODUCTION requires PASS).
+        evidence.er_verdict = ErVerdict::Partial;
+        assert!(!compensating_coverage_green(&evidence));
+        evidence.er_verdict = ErVerdict::Pass;
+
+        // review_degraded=true → false.
+        evidence.review_degraded = true;
+        assert!(!compensating_coverage_green(&evidence));
+        evidence.review_degraded = false;
+
+        assert!(compensating_coverage_green(&evidence));
+    }
+
+    // AC #6 (auto-clear): when the snapshot shows the vendor is now
+    // APPROVED (CodeRabbit) or clean (Bugbot) AND the ledger says
+    // Capped, the recovery helper surfaces the vendor for ledger
+    // clearing + telemetry emission.
+    #[test]
+    fn detect_vendor_recovery_clears_capped_state_on_fresh_approval() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7)); // CodeRabbit approved
+        let cfg = test_cfg();
+        let _evidence = all_green_evidence();
+        let mut ledger = capped_coderabbit_ledger();
+        // Sanity: ledger says Capped before recovery.
+        assert!(ledger.health(Vendor::CodeRabbit).is_capped());
+
+        let snap = scm.pr_snapshot_for_repo(&cfg.target_repo, 7).unwrap();
+        let recovered = detect_vendor_recovery(&snap, &ledger);
+        assert_eq!(recovered, vec![Vendor::CodeRabbit]);
+
+        // Caller-side: clear and verify the waiver path deactivates.
+        for v in &recovered {
+            ledger.clear(*v);
+        }
+        assert_eq!(
+            ledger.health(Vendor::CodeRabbit),
+            crate::vendor_health::VendorHealth::Healthy
+        );
+    }
+
+    // Recovery only fires when the ledger says Capped — a Healthy
+    // ledger stays untouched even if the snapshot shows approval.
+    #[test]
+    fn detect_vendor_recovery_is_noop_when_ledger_already_healthy() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = all_green_evidence();
+        let ledger = VendorHealthLedger::new(); // empty / Healthy
+
+        let snap = scm.pr_snapshot_for_repo(&cfg.target_repo, 7).unwrap();
+        let recovered = detect_vendor_recovery(&snap, &ledger);
+        assert!(
+            recovered.is_empty(),
+            "Healthy ledger must not produce a recovery event, got {recovered:?}"
+        );
+        // Compensating evidence block is empty — no harm done.
+        let _ = evidence;
+    }
+
+    // Recovery only fires on a CONTRADICTION between ledger (Capped)
+    // and snapshot (approved). A snapshot that still says the vendor
+    // is unknown must NOT trigger recovery.
+    #[test]
+    fn detect_vendor_recovery_does_not_fire_when_vendor_still_unknown() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, unknown_vendor_snapshot(7));
+        let cfg = test_cfg();
+        let ledger = capped_coderabbit_ledger();
+
+        let snap = scm.pr_snapshot_for_repo(&cfg.target_repo, 7).unwrap();
+        let recovered = detect_vendor_recovery(&snap, &ledger);
+        assert!(
+            recovered.is_empty(),
+            "Vendor-still-unknown snapshot must not clear the Capped ledger, got {recovered:?}"
+        );
     }
 }

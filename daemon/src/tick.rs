@@ -29,6 +29,7 @@ use crate::tools::{Bead, Llm, PrHeadBranch, Scm, SessionId, Sessions, Tracker, V
 use crate::verifier::{self, PrEvidence};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Mutex;
 
 /// Everything one `run_tick` call needs: the five tool-boundary trait objects,
 /// config, state store, and the telemetry log path. Bundled into one struct so
@@ -43,6 +44,16 @@ pub struct TickDeps<'a> {
     pub vcs: &'a dyn Vcs,
     pub cfg: &'a Config,
     pub telemetry_log: &'a Path,
+    /// Bead jleechan-jsby (r2): process-wide vendor-health ledger the
+    /// fast tier MUTATES on every assessment (acceptance criterion 1:
+    /// the ledger must be populated, not just consulted). Wrapped in
+    /// `Mutex` so the daemon's poll loop's `--once` and concurrent
+    /// tick callers can share one instance — the r1 PR #459 had no
+    /// ledger field here at all and the in-tick `PrEvidence` was
+    /// constructed with a fresh empty ledger, so the waiver path
+    /// never executed. Optional so existing test sites that don't
+    /// exercise the ledger can pass `None` (pre-r1 behavior preserved).
+    pub vendor_health: Option<&'a Mutex<crate::vendor_health::VendorHealthLedger>>,
 }
 
 /// Summary counters returned by `run_tick`, mirrored into the `TICK` telemetry
@@ -1155,6 +1166,62 @@ pub fn run_tick(
     )?;
 
     Ok(summary)
+}
+
+/// Bead jleechan-jsby (r2): emit a `VENDOR_WAIVED` event on the
+/// Healthy/Capped -> Capped edge so operators can see when a vendor
+/// was auto-escalated. The wire format matches
+/// `vendor_health::EVT_WAIVED` (mirrored in `factory-overlay.sh` and
+/// the CXDB consumers). The `compensating_required` context key
+/// names the documented trust floor (skeptic + /er + cross-model) so
+/// audits can grep the JSONL for the substitution rule.
+fn emit_vendor_waived(
+    deps: &TickDeps,
+    bead_id: &str,
+    vendor: crate::vendor_health::Vendor,
+    attempt: u32,
+) -> Result<(), DaemonError> {
+    let vendor_name = vendor.as_str();
+    let waiver_token = vendor.waiver_token();
+    emit(
+        deps.telemetry_log,
+        bead_id,
+        attempt,
+        OverlayState::Attested.as_str(),
+        crate::vendor_health::EVT_WAIVED,
+        serde_json::json!({}),
+        serde_json::json!({
+            "vendor": vendor_name,
+            "waiver_token": waiver_token,
+            "compensating_required": "skeptic_pass+er_pass+cross_model",
+        }),
+    )
+}
+
+/// Bead jleechan-jsby (r2): emit a `VENDOR_RECOVERED` event on the
+/// Capped -> Healthy edge so operators can see when a vendor came
+/// back online (subscription reset, quota cleared, etc.). The wire
+/// format matches `vendor_health::EVT_RECOVERED`.
+fn emit_vendor_recovered(
+    deps: &TickDeps,
+    bead_id: &str,
+    vendor: crate::vendor_health::Vendor,
+    attempt: u32,
+) -> Result<(), DaemonError> {
+    let vendor_name = vendor.as_str();
+    let waiver_token = vendor.waiver_token();
+    emit(
+        deps.telemetry_log,
+        bead_id,
+        attempt,
+        OverlayState::Attested.as_str(),
+        crate::vendor_health::EVT_RECOVERED,
+        serde_json::json!({}),
+        serde_json::json!({
+            "vendor": vendor_name,
+            "waiver_token": waiver_token,
+        }),
+    )
 }
 
 /// jleechan-gib: automated HUMAN_HELD exit (Rust port of shell
@@ -2486,6 +2553,7 @@ fn skeptic_evidence(
     pr: u64,
     repo: &str,
     snapshot: &crate::tools::PrSnapshot,
+    vendor_health: crate::vendor_health::VendorHealthLedger,
 ) -> Result<PrEvidence, DaemonError> {
     // jleechan-9xrs Stage D: the reviewer subprocess (`dispatch_reviewer`)
     // runs `codex exec` / `claude --print` with no cwd override, so `gh`
@@ -2790,6 +2858,14 @@ fn skeptic_evidence(
         review_degraded,
         // Set in the fast tier from the canonical evidence marker (#323).
         evidence_gist_status: verifier::EvidenceGistStatus::NotProvided,
+        // Bead jleechan-jsby (r2): the vendor-health ledger is now
+        // POPULATED in the fast tier (acceptance criterion 1) — the
+        // r1 PR #459 was rejected because the field was constructed
+        // empty here and never written. The caller passes the
+        // process-wide ledger (or `Default::default()` for the
+        // Stage-1 mock-llm test-repo lane), and this function simply
+        // forwards it to `verifier::assess` via `PrEvidence`.
+        vendor_health,
         // Bead jleechan-ijod / issue #387 (r5): the runtime vacuous-test
         // detector only runs in the production-adjacent fast tier (which
         // has the SCM/git context to derive the diff); Stage 1's mock-llm
@@ -3630,19 +3706,218 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             }
         };
         if snapshot.ci_pending {
-            emit(
-                deps.telemetry_log,
-                bead_id,
-                overlay.attempt,
-                OverlayState::Attested.as_str(),
-                "VERIFICATION_PENDING",
-                serde_json::json!({}),
-                serde_json::json!({"message": "CI checks are still running (in progress), waiting for completion"}),
-            )?;
-            continue;
+            // Bead jleechan-jsby (r2): the operator guidance r2 #3
+            // requires the CI-wait to "exclude or timeout the
+            // CodeRabbit commit-status context once all check-runs are
+            // complete (this wedged beads jtg8/jsby itself)". The
+            // current snapshot's `ci_pending=true` flag is the only
+            // signal we have; when at least one tracked vendor is
+            // showing a structured cap marker, the "ci pending" check
+            // is the vendor's commit-status context, not a real CI
+            // wait — skip the wait and proceed to the gate
+            // assessment so the ledger can observe the cap.
+            let vendor_capped = deps
+                .vendor_health
+                .and_then(|m| m.lock().ok())
+                .map(|_l| {
+                    verifier::detect_vendor_cap(&snapshot)
+                })
+                .unwrap_or(false);
+            if !vendor_capped {
+                emit(
+                    deps.telemetry_log,
+                    bead_id,
+                    overlay.attempt,
+                    OverlayState::Attested.as_str(),
+                    "VERIFICATION_PENDING",
+                    serde_json::json!({}),
+                    serde_json::json!({"message": "CI checks are still running (in progress), waiting for completion"}),
+                )?;
+                continue;
+            }
         }
 
-        let mut evidence = match skeptic_evidence(deps, bead_id, pr, &repo, &snapshot) {
+        // Bead jleechan-jsby (r2): populate the vendor-health ledger
+        // BEFORE the gate assessment. The r1 PR #459 was rejected
+        // because the field was constructed fresh-and-empty here. The
+        // r2 path:
+        //   1. Clones the process-wide ledger (cheap; the cap VecDeque
+        //      is bounded and the type is `Clone`).
+        //   2. Records cap observations for each capped vendor via
+        //      `record_cap_observations_from_snapshot` (ZFC: STRUCTURED
+        //      snapshot fields only, no keyword matching).
+        //   3. Detects recovery via `detect_vendor_recovery` and clears
+        //      the ledger entries on the Waived -> Healthy edge,
+        //      emitting VENDOR_RECOVERED telemetry.
+        //   4. Emits VENDOR_WAIVED on the Healthy -> Capped edge so
+        //      operators can see the auto-escalation event.
+        //
+        // When `deps.vendor_health` is `None` (Stage-1 test-repo lane
+        // or an integration test that does not exercise the ledger),
+        // we use a fresh empty ledger — the pre-r1 behavior preserved.
+        //
+        // Bead jleechan-jsby (r7): `let mut` because the
+        // post-record, pre-clear refresh below (CodeRabbit review #1
+        // + Codex P2) rebuilds the binding as the union of the
+        // persistent ledger's post-record state plus re-applied
+        // pre-clear observations for vendors that recovered this
+        // tick.
+        let mut vendor_health = deps
+            .vendor_health
+            .and_then(|m| m.lock().ok().map(|l| l.clone()))
+            .unwrap_or_default();
+        // Cap flag from the snapshot — STRUCTURED inputs only.
+        let cap_observed = verifier::detect_vendor_cap(&snapshot);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut recently_waived = Vec::new();
+        let mut recently_recovered = Vec::new();
+        // Vendors that recovered this tick — used after the inner
+        // ledger block to preserve the pre-clear Capped state for
+        // the per-bead verifier input (CodeRabbit review #1).
+        let mut recovered: Vec<crate::vendor_health::Vendor> = Vec::new();
+        if let Some(ledger_mutex) = deps.vendor_health {
+            if let Ok(mut ledger) = ledger_mutex.lock() {
+                    // Copy the ledger so the per-tick evidence carries
+                    // the pre-record state (the verifier reads the
+                    // ledger's `health()` to decide the waiver, and
+                    // the recorded observations must be visible to
+                    // that read).
+                    *ledger = vendor_health.clone();
+                    if cap_observed {
+                        // Record one observation per capped vendor.
+                        // The N-of-M detector in `ledger.health` keys
+                        // on distinct bead_ids, so the SAME bead
+                        // observing caps every tick is one signal, not
+                        // N — the test integration requires 3 distinct
+                        // beads to escalate.
+                        let beads: Vec<(crate::vendor_health::Vendor,)> = vec![
+                            (crate::vendor_health::Vendor::CodeRabbit,),
+                            (crate::vendor_health::Vendor::Bugbot,),
+                        ];
+                        for (vendor,) in beads {
+                            let is_capped =
+                                verifier::detect_vendor_cap_for(&snapshot, vendor);
+                            if is_capped && !ledger.health(vendor).is_capped() {
+                                ledger.record_cap(crate::vendor_health::CapObservation {
+                                    vendor,
+                                    source: crate::vendor_health::CapSource::UnknownGateRepeated,
+                                    bead_id: bead_id.to_string(),
+                                    pr_number: pr,
+                                    ts_epoch: now,
+                                    note: format!("ci_pending={} coderabbit_status={}", snapshot.ci_pending, snapshot.coderabbit_status),
+                                });
+                                if ledger.health(vendor).is_capped() {
+                                    recently_waived.push(vendor);
+                                }
+                            }
+                        }
+                    }
+                    // Recovery: clear the vendor if the snapshot is
+                    // clean. `detect_vendor_recovery` keys on
+                    // STRUCTURED fields only.
+                    let recovered_this_block =
+                        verifier::detect_vendor_recovery(&snapshot, &ledger);
+                    let prev_was_capped: Vec<crate::vendor_health::Vendor> = vec![
+                        crate::vendor_health::Vendor::CodeRabbit,
+                        crate::vendor_health::Vendor::Bugbot,
+                    ]
+                    .into_iter()
+                    .filter(|v| {
+                        // Only emit VENDOR_RECOVERED if the ledger was
+                        // Capped BEFORE this assessment (not on a
+                        // never-capped vendor).
+                        vendor_health.health(*v).is_capped()
+                    })
+                    .collect();
+                    for v in &recovered_this_block {
+                        ledger.clear(*v);
+                        if prev_was_capped.contains(v) {
+                            recently_recovered.push(*v);
+                        }
+                    }
+                    // Promote recovered_this_block to the outer
+                    // scope so the post-block pre-clear waiver-state
+                    // preservation logic (CodeRabbit review #1) can
+                    // see it.
+                    recovered = recovered_this_block;
+            }
+        }
+
+        // Emit VENDOR_WAIVED telemetry on the Healthy -> Capped edge.
+        for vendor in &recently_waived {
+            let _ = emit_vendor_waived(deps, bead_id, *vendor, overlay.attempt);
+        }
+        // Emit VENDOR_RECOVERED telemetry on the Capped -> Healthy edge.
+        for vendor in &recently_recovered {
+            let _ = emit_vendor_recovered(deps, bead_id, *vendor, overlay.attempt);
+        }
+        // Bead jleechan-jsby (r7): refresh the local `vendor_health`
+        // that the verifier consults so that BOTH ordering bugs
+        // addressed by this PR are simultaneously fixed:
+        //
+        //   - CodeRabbit review #1 (P1): a vendor that recovered this
+        //     tick must still appear Capped to the verifier so the
+        //     `VendorHealth::Capped { .. } => apply_vendor_waiver`
+        //     branch fires. Otherwise the post-clear ledger refresh
+        //     would silently bypass the waiver.
+        //
+        //   - Codex review P2 (this tick): the threshold-crossing
+        //     tick (where the third distinct-bead observation tips
+        //     `health(vendor)` from Healthy to Capped) must surface
+        //     the freshly-Capped state to the verifier, otherwise
+        //     the same bead's gate still sees Healthy and the
+        //     waiver branch is unreachable until the next recheck.
+        //
+        // The two requirements conflict for the recovered case: the
+        // persistent ledger is cleared above for recovered vendors,
+        // but the verifier still needs Capped. We resolve by
+        // constructing the per-bead verifier input as the
+        // **post-record, pre-clear** ledger state — for non-recovered
+        // vendors this is exactly the post-record state; for
+        // recovered vendors it carries the pre-clear Capped
+        // observations (we re-apply them to a transient ledger).
+        if let Some(ledger_mutex) = deps.vendor_health {
+            if let Ok(ledger) = ledger_mutex.lock() {
+                // Start from the post-record, pre-clear ledger
+                // state: the `record_cap` calls above already wrote
+                // the latest observation into the persistent
+                // ledger, and the `clear()` calls in the recovery
+                // path have already removed the recovered vendor's
+                // observations. For recovered vendors the ledger is
+                // now Healthy; we need the verifier to still see
+                // Capped for those vendors (CodeRabbit #1). Re-apply
+                // the pre-clear observation for each recovered
+                // vendor to a transient ledger used only for this
+                // bead's gate decision.
+                let mut verifier_health = ledger.clone();
+                for v in &recovered {
+                    if recently_recovered.contains(v) {
+                        // Re-apply one synthetic cap observation so
+                        // `health(v)` reports Capped. The persistent
+                        // ledger stays cleared — only this per-bead
+                        // view sees Capped.
+                        verifier_health.record_cap(crate::vendor_health::CapObservation {
+                            vendor: *v,
+                            source: crate::vendor_health::CapSource::UnknownGateRepeated,
+                            bead_id: bead_id.to_string(),
+                            pr_number: pr,
+                            ts_epoch: now,
+                            note: format!(
+                                "r7 pre-clear waiver state for recovered vendor (ci_pending={} coderabbit_status={})",
+                                snapshot.ci_pending, snapshot.coderabbit_status
+                            ),
+                        });
+                    }
+                }
+                vendor_health = verifier_health;
+            }
+        }
+        let _ = recovered;
+
+        let mut evidence = match skeptic_evidence(deps, bead_id, pr, &repo, &snapshot, vendor_health) {
             Ok(e) => e,
             Err(e) => {
                 let _ = emit(

@@ -612,6 +612,7 @@ mod tests {
             vcs: &V,
             cfg,
             telemetry_log: std::path::Path::new("/tmp/afd_er_runner_unit_test.jsonl"),
+        vendor_health: None,
         }
     }
 
