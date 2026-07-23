@@ -527,6 +527,7 @@ fn test_tick_stage2_integration() {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
+            bugbot_review_present: true,
             unresolved_thread_count: Some(0),
             head_sha: "head-sha-abc".into(),
             body: "".into(),

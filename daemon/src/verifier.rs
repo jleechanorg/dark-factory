@@ -1011,10 +1011,20 @@ pub fn compensating_coverage_green(evidence: &PrEvidence) -> bool {
 /// (read-only), so the actual ledger mutation lives at the call site;
 /// this helper just identifies the recovery moment.
 ///
-/// Bugbot's recovery signal is the absence of error-severity comments
-/// (the snapshot has no `bugbot_status` field; Bugbot is a
-/// comment-only reviewer). When `bugbot_error_count == 0` AND the
-/// ledger says Bugbot is capped, that's recovery.
+/// Bugbot's recovery signal is a FRESH Bugbot review observation with
+/// zero error-severity comments. The snapshot has no `bugbot_status`
+/// field; Bugbot is a comment-only reviewer. Recovery is therefore:
+/// `bugbot_review_present && bugbot_error_count == 0`.
+///
+/// jleechan-jsby r8: the r7 predicate `bugbot_error_count == 0` was
+/// both the cap-detection trigger AND the recovery trigger. A capped
+/// vendor that simply had no fresh Bugbot activity next tick would be
+/// instantly marked recovered on the absence of errors, without Bugbot
+/// ever having actually produced a clean review — a phantom recovery
+/// that churns the waiver. Recovery now requires the structured
+/// `bugbot_review_present` flag (set only when the snapshot fetch
+/// observed a Bugbot-authored comment on the current head); cap
+/// detection uses the inverse (see `detect_vendor_cap_for`).
 pub fn detect_vendor_recovery(
     snapshot: &crate::tools::PrSnapshot,
     ledger: &crate::vendor_health::VendorHealthLedger,
@@ -1027,7 +1037,10 @@ pub fn detect_vendor_recovery(
     {
         recovered.push(Vendor::CodeRabbit);
     }
-    if ledger.health(Vendor::Bugbot).is_capped() && snapshot.bugbot_error_count == 0 {
+    if ledger.health(Vendor::Bugbot).is_capped()
+        && snapshot.bugbot_review_present
+        && snapshot.bugbot_error_count == 0
+    {
         recovered.push(Vendor::Bugbot);
     }
     recovered
@@ -1058,35 +1071,37 @@ pub fn detect_vendor_cap(snapshot: &crate::tools::PrSnapshot) -> bool {
         || detect_vendor_cap_for(snapshot, Vendor::Bugbot)
 }
 
-/// Bead jleechan-jsby (r2): per-vendor cap detection. Matching
-/// `detect_vendor_recovery`'s inverse:
+/// Bead jleechan-jsby (r2, r8): per-vendor cap detection. STRICTLY
+/// inverse of `detect_vendor_recovery`'s success predicate:
 ///   - CodeRabbit: status="unknown" AND not approved (the cap marker
-///     the r1 PR #459 reviewer specifically called out).
-///   - Bugbot: error_count == 0 (the snapshot has no Bugbot
-///     "status" field; Bugbot is a comment-only reviewer. A
-///     `bugbot_error_count == 0` snapshot is ambiguous between
-///     "Bugbot passed" and "Bugbot absent/neutral" — but the
-///     recovery signal at `detect_vendor_recovery` is the inverse:
-///     `ledger.health(Bugbot).is_capped() && bugbot_error_count
-///     == 0` → recovered. So Bugbot's cap marker MUST be
-///     `bugbot_error_count == 0`, the same condition as recovery.
-///     The N-of-M detector in `VendorHealthLedger::health` keys on
-///     distinct beads; a Bugbot that reported `bugbot_error_count >
-///     0` (a real review with defects) does NOT contribute a cap
-///     observation, which is the correct semantic — Bugbot finding
-///     defects is real review activity, NOT structural
-///     unavailability).
+///     the r1 PR #459 reviewer specifically called out). The
+///     `coderabbit_approved && coderabbit_status == "green"` recovery
+///     condition is the structured "fresh CodeRabbit approved"
+///     signal; its inverse is the cap marker.
+///   - Bugbot: `bugbot_error_count == 0` (preserved verbatim from
+///     the r7 Codex finding; see below). Bugbot is a comment-only
+///     reviewer with no status field; `error_count == 0` is the
+///     only structured "Bugbot silent/no-defects" signal the
+///     snapshot carries, and the recovery detector
+///     (`detect_vendor_recovery`) is where the predicate is
+///     DISAMBIGUATED — recovery requires the additional
+///     `bugbot_review_present` flag (set by the snapshot fetch when
+///     a Bugbot-authored comment is observed on the current head),
+///     so the absence of an observation (silent/capped) cannot
+///     appear as a fresh success.
 ///
-/// CodeRabbit r7 Codex finding: the previous
+/// CodeRabbit r7 Codex finding preserved verbatim: the r6-era
 /// `bugbot_error_count greater-than-zero` predicate conflated
 /// Bugbot-finding-defects (real review activity) with
 /// Bugbot-being-structurally-unavailable (the cap marker). A bead
 /// whose Bugbot raised real findings would be incorrectly marked
 /// Capped and could later waive the gate once the findings
 /// cleared, silently bypassing AC #4 (vendor Red is NOT waivable).
-/// Flipping to `bugbot_error_count == 0` keeps the cap signal
-/// scoped to the Bugbot-silent case, which the recovery detector
-/// then closes on a fresh approval.
+/// The r7 flip to `bugbot_error_count == 0` was the correct fix;
+/// r8 ONLY adds the `bugbot_review_present` term on the RECOVERY
+/// side (see `detect_vendor_recovery`) to stop the
+/// phantom-recovery-on-absence failure mode without disturbing
+/// the r7-documented cap-detection predicate.
 pub fn detect_vendor_cap_for(
     snapshot: &crate::tools::PrSnapshot,
     vendor: crate::vendor_health::Vendor,
@@ -1257,6 +1272,13 @@ pub fn assess(
     // is Healthy, the existing Green semantics stay untouched. A
     // genuine Bugbot RED verdict (bugbot_error_count > 0) is
     // unaffected and stays Red.
+    //
+    // jleechan-jsby r8: the underlying `bugbot_error_count == 0`
+    // predicate for cap detection and recovery KEPT the r7 contract.
+    // The r8 fix is purely about RECOVERY — see `detect_vendor_recovery`,
+    // which now requires `bugbot_review_present && bugbot_error_count
+    // == 0`, so a capped vendor can no longer auto-clear on the
+    // ambient next-tick snapshot that happens to have 0 errors.
     //
     // Note: `apply_vendor_waiver` expects an `Unknown` placeholder; we
     // synthesise one here so the helper can decide Waived vs Green
@@ -1525,6 +1547,7 @@ mod tests {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
+            bugbot_review_present: true,
             unresolved_thread_count: Some(0),
             head_sha: "deadbeef".into(),
             body: "".into(),
@@ -1548,6 +1571,7 @@ mod tests {
             mergeable: true,
             coderabbit_approved: true,
             bugbot_error_count: 0,
+            bugbot_review_present: true,
             unresolved_thread_count: None, // Unknown - GraphQL failed
             head_sha: "deadbeef".into(),
             body: "".into(),
@@ -3191,11 +3215,20 @@ mod tests {
 
     /// Build a snapshot where CodeRabbit and Bugbot are BOTH
     /// `unknown` (the structural-unavailability trigger).
+    ///
+    /// jleechan-jsby r8: Bugbot's structural-unavailability marker is
+    /// now NOT-REVIEW-PRESENT (not `bugbot_error_count == 0`). This
+    /// fixture forces `bugbot_review_present = false` so the cap
+    /// detection branch fires even when the snapshot is otherwise
+    /// clean. Legacy r7 fixtures that ONLY set `bugbot_error_count =
+    /// 0` would silently flip to "Bugbot reviewed cleanly" under the
+    /// new contract.
     fn unknown_vendor_snapshot(pr: u64) -> PrSnapshot {
         let mut snap = all_green_snapshot(pr);
         snap.coderabbit_approved = false;
         snap.coderabbit_status = "unknown".to_string();
         snap.bugbot_error_count = 0;
+        snap.bugbot_review_present = false;
         snap
     }
 
@@ -3395,6 +3428,12 @@ mod tests {
         let mut snap = all_green_snapshot(7);
         // CodeRabbit APPROVED (healthy), Bugbot absent/neutral.
         snap.bugbot_error_count = 0;
+        // jleechan-jsby r8: Bugbot is silent (`!bugbot_review_present`)
+        // is the structural-unavailability marker; the previous r7
+        // fixture only set `bugbot_error_count = 0`, which under the
+        // r8 contract collapses to "no fresh observation" → forces
+        // `bugbot_review_present = false` to keep the cap branch.
+        snap.bugbot_review_present = false;
         scm.snapshots.insert(7, snap);
         let cfg = test_cfg();
         let mut evidence = all_green_evidence();
@@ -3571,6 +3610,200 @@ mod tests {
         assert!(
             recovered.is_empty(),
             "Vendor-still-unknown snapshot must not clear the Capped ledger, got {recovered:?}"
+        );
+    }
+
+    // ─── jleechan-jsby r8: regression tests for the cap-detection /
+    // recovery disambiguation. The r7 contract used the same predicate
+    // (`bugbot_error_count == 0`) for both cap detection and recovery,
+    // so a capped vendor was marked recovered on the next tick that
+    // happened to have zero Bugbot errors — a phantom recovery that
+    // auto-expired the waiver. Recovery now requires the structured
+    // `bugbot_review_present` flag (set only when the snapshot fetch
+    // observed a Bugbot-authored comment on the current head).
+
+    /// A capped Bugbot STAYS capped across ticks when the next snapshot
+    /// reports zero errors but Bugbot is still SILENT
+    /// (`!bugbot_review_present`). The r7 bug would auto-recover the
+    /// ledger on the absence of errors alone; r8 holds it Capped.
+    #[test]
+    fn detect_vendor_recovery_does_not_fire_when_bugbot_silent_with_zero_errors() {
+        // Build a snapshot mirroring the r7 phantom-recovery failure
+        // mode: error count == 0 (same as the r7 trigger) but Bugbot
+        // is genuinely silent — no comment observed on this head.
+        let mut snap = all_green_snapshot(7);
+        snap.bugbot_error_count = 0;
+        snap.bugbot_review_present = false; // ← Bugbot did NOT run.
+
+        let ledger = capped_bugbot_ledger();
+        // Sanity: ledger is Bugbot-Capped.
+        assert!(ledger.health(Vendor::Bugbot).is_capped());
+
+        let recovered = detect_vendor_recovery(&snap, &ledger);
+        assert!(
+            recovered.is_empty(),
+            "Capped Bugbot must NOT auto-recover on a silent snapshot with zero errors; got {recovered:?}"
+        );
+    }
+
+    /// The mirror of the above: a capped Bugbot DOES recover the
+    /// moment a fresh Bugbot review observation with zero errors
+    /// appears (`bugbot_review_present && bugbot_error_count == 0`).
+    /// The two tests together pin the r8 disambiguation contract.
+    #[test]
+    fn detect_vendor_recovery_fires_on_fresh_clean_bugbot_observation() {
+        let mut snap = all_green_snapshot(7);
+        snap.bugbot_error_count = 0;
+        snap.bugbot_review_present = true; // ← Bugbot ran and reviewed.
+
+        let mut ledger = capped_bugbot_ledger();
+        assert!(ledger.health(Vendor::Bugbot).is_capped());
+
+        let recovered = detect_vendor_recovery(&snap, &ledger);
+        assert_eq!(
+            recovered,
+            vec![Vendor::Bugbot],
+            "Capped Bugbot must recover on a fresh clean review observation; got {recovered:?}"
+        );
+
+        // Caller-side: clear and verify the cap is gone, leaving the
+        // waiver path deactivated.
+        for v in &recovered {
+            ledger.clear(*v);
+        }
+        assert_eq!(
+            ledger.health(Vendor::Bugbot),
+            crate::vendor_health::VendorHealth::Healthy
+        );
+    }
+
+    /// Cross-product matrix over (vendor × tick). Pins the full
+    /// disambiguation matrix so a future refactor cannot silently
+    /// collapse one predicate back into the other.
+    #[test]
+    fn detect_vendor_recovery_matrix_pins_cap_vs_recovery_disambiguation() {
+        // CodeRabbit matrix:
+        let cr_capped = capped_coderabbit_ledger();
+        // CodeRabbit: Capped + approved + green → recovered (true).
+        let cr_approved = {
+            let mut snap = all_green_snapshot(7);
+            snap.coderabbit_approved = true;
+            snap.coderabbit_status = "green".to_string();
+            snap
+        };
+        assert_eq!(
+            detect_vendor_recovery(&cr_approved, &cr_capped),
+            vec![Vendor::CodeRabbit],
+            "CR: capped + approved-and-green must recover"
+        );
+        // CodeRabbit: Capped + approved-but-not-green (status pending)
+        // must NOT recover (the status must be "green" — pending is
+        // not a structured success).
+        let cr_pending = {
+            let mut snap = all_green_snapshot(7);
+            snap.coderabbit_approved = true;
+            snap.coderabbit_status = "pending".to_string();
+            snap
+        };
+        assert!(
+            detect_vendor_recovery(&cr_pending, &cr_capped).is_empty(),
+            "CR: capped + approved-but-not-green must NOT recover"
+        );
+
+        // Bugbot matrix:
+        let bb_capped = capped_bugbot_ledger();
+        // Bugbot: Capped + fresh clean observation → recovered.
+        let bb_fresh_clean = {
+            let mut snap = all_green_snapshot(7);
+            snap.bugbot_error_count = 0;
+            snap.bugbot_review_present = true; // ← the r8 flag
+            snap
+        };
+        assert_eq!(
+            detect_vendor_recovery(&bb_fresh_clean, &bb_capped),
+            vec![Vendor::Bugbot],
+            "BB: capped + fresh-clean must recover"
+        );
+        // Bugbot: Capped + silent + zero errors → STAYS CAPPED (the
+        // r8 phantom-recovery regression pin).
+        let bb_silent_zero = {
+            let mut snap = all_green_snapshot(7);
+            snap.bugbot_error_count = 0;
+            snap.bugbot_review_present = false;
+            snap
+        };
+        assert!(
+            detect_vendor_recovery(&bb_silent_zero, &bb_capped).is_empty(),
+            "BB: capped + silent-zero must NOT recover (r8 regression pin)"
+        );
+        // Bugbot: Capped + Bugbot-with-errors → STAYS CAPPED (real
+        // defects are real review activity, not absence).
+        let bb_with_errors = {
+            let mut snap = all_green_snapshot(7);
+            snap.bugbot_error_count = 2;
+            snap.bugbot_review_present = true;
+            snap
+        };
+        assert!(
+            detect_vendor_recovery(&bb_with_errors, &bb_capped).is_empty(),
+            "BB: capped + observed-with-errors must NOT recover (errors block recovery)"
+        );
+    }
+
+    /// `waived_gate_outcome` semantics: the gate_assessment JSONL must
+    /// surface an explicit `verdict: pass` with the
+    /// `coderabbit:waived_vendor_unavailable` token in the `evidence`
+    /// array, NOT a bare `Green`. This pins the operator-visible
+    /// "explicit waiver" contract so the substitution is greppable in
+    /// production telemetry (the skeptic-flagged missing test).
+    #[test]
+    fn waiver_assess_outcome_is_pass_with_token_and_serialises_for_telemetry() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, unknown_vendor_snapshot(7));
+        let cfg = test_cfg();
+        let mut evidence = all_green_evidence();
+        evidence.vendor_health = capped_coderabbit_ledger();
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        // (1) The gate result is `Waived { vendor, reason }` — the
+        // explicit waiver variant, NOT a bare `Green`.
+        let cr = gate(&report, GateName::CodeRabbitApproved);
+        match cr {
+            GateResult::Waived { vendor, reason } => {
+                assert_eq!(vendor, "coderabbit");
+                assert!(
+                    reason.contains("coderabbit:waived_vendor_unavailable"),
+                    "waiver reason must carry the documented token, got: {reason}"
+                );
+            }
+            other => panic!("gate must emit Waived (not Green/Red/Unknown), got {other:?}"),
+        }
+        // (2) The waiver counts as green for merge authority — strict-
+        // merge policy consumes `is_green()`, which includes Waived.
+        assert!(
+            cr.is_green(),
+            "Waived must satisfy is_green() so the gate counts toward merge authority"
+        );
+        // (3) The wire-format JSON surfaces the token so operators can
+        // grep gate_assessment JSONL for `coderabbit:waived_vendor_unavailable`.
+        let json = report.to_json();
+        let gates = json.get("gates").and_then(|v| v.as_object()).unwrap();
+        let cr_json = gates.get("coderabbit").expect("coderabbit key in gate JSON");
+        let verdict = cr_json.get("verdict").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(
+            verdict, "pass",
+            "wire-format verdict must be 'pass' for a Waived gate, got: {cr_json}"
+        );
+        let evidence_arr = cr_json.get("evidence").and_then(|v| v.as_array()).unwrap();
+        let joined_evidence = evidence_arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined_evidence.contains("coderabbit:waived_vendor_unavailable"),
+            "evidence array must carry the documented waiver token for the operator-visible substitution, got: {joined_evidence}"
         );
     }
 }

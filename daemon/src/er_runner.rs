@@ -301,6 +301,7 @@ pub fn snapshot_with_comments(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         mergeable: true,
         coderabbit_approved: true,
         bugbot_error_count: 0,
+        bugbot_review_present: true,
         unresolved_thread_count: Some(0),
         head_sha: "deadbeef".into(),
         body: String::new(),

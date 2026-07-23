@@ -887,6 +887,12 @@ impl Scm for CliScm {
                     mergeable: bool,
                     coderabbit_approved: bool,
                     bugbot_error_count: u32,
+                    /// Default to `false` when the offline fixture predates
+                    /// jleechan-jsby r8 — absence of the field on disk
+                    /// means "no fresh Bugbot observation" by the new
+                    /// contract, which is the conservative default.
+                    #[serde(default)]
+                    bugbot_review_present: bool,
                     unresolved_thread_count: u32,
                     head_sha: String,
                     body: String,
@@ -904,6 +910,7 @@ impl Scm for CliScm {
                         mergeable: snap.mergeable,
                         coderabbit_approved: snap.coderabbit_approved,
                         bugbot_error_count: snap.bugbot_error_count,
+                        bugbot_review_present: snap.bugbot_review_present,
                         unresolved_thread_count: Some(snap.unresolved_thread_count),
                         head_sha: snap.head_sha,
                         body: snap.body,
@@ -1220,9 +1227,21 @@ impl Scm for CliScm {
         );
 
         let mut bugbot_error_count = 0;
+        // jleechan-jsby r8: track WHETHER any Bugbot-authored comment
+        // exists on the current head, regardless of severity. Bugbot
+        // is a comment-only reviewer with no status field; the ONLY
+        // structured signal a fresh Bugbot review happened is the
+        // presence of at least one Bugbot-authored comment on this
+        // head. Without this `bugbot_review_present` flag, the r7
+        // logic collapsed "Bugbot silent" and "Bugbot ran with no
+        // errors" into the same state (`bugbot_error_count == 0`), and
+        // the recovery detector cleared the cap on the next tick that
+        // happened to have no errors — phantom recovery.
+        let mut bugbot_review_present = false;
         for comment in &view.comments {
             let author = &comment.author.login;
             if author.contains("cursor") || author.contains("bugbot") {
+                bugbot_review_present = true;
                 let body = comment.body.to_lowercase();
                 if body.contains("error") || body.contains("fail") {
                     bugbot_error_count += 1;
@@ -1362,6 +1381,7 @@ impl Scm for CliScm {
             mergeable,
             coderabbit_approved,
             bugbot_error_count,
+            bugbot_review_present,
             unresolved_thread_count,
             head_sha: view.head_ref_oid,
             body: view.body,

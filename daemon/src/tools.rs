@@ -172,6 +172,24 @@ pub struct PrSnapshot {
     pub mergeable: bool,
     pub coderabbit_approved: bool,
     pub bugbot_error_count: u32,
+    /// True when a fresh Bugbot review observation was emitted for this
+    /// snapshot (a GitHub comment authored by the Bugbot account on this
+    /// PR's current head). False when Bugbot is silent (no comment
+    /// activity) OR when the fetch path couldn't prove a Bugbot
+    /// observation is present.
+    ///
+    /// jleechan-jsby r8: Bugbot cap-detection and recovery MUST NOT
+    /// collapse into the same predicate. `bugbot_error_count == 0` is
+    /// AMBIGUOUS: it means BOTH "no fresh Bugbot observation" (silent /
+    /// capped) AND "Bugbot ran and emitted a clean review" (recovered).
+    /// Without `bugbot_review_present`, the r7 ledger cleared a capped
+    /// vendor on the very next tick that reported `bugbot_error_count
+    /// == 0` regardless of whether Bugbot actually ran, which made the
+    /// waiver auto-expire on a phantom success and re-park the bead.
+    /// Recovery now requires `bugbot_review_present && bugbot_error_count
+    /// == 0`; cap detection uses the inverse (no fresh observation OR
+    /// observation contained errors).
+    pub bugbot_review_present: bool,
     /// Count of unresolved GitHub review threads, or `None` when the
     /// GraphQL fetch/parse failed and the count could not be proven.
     /// jleechan-kk64: `None` MUST be treated as unknown/unverifiable by
