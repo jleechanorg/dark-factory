@@ -11235,6 +11235,145 @@ fn evidence_gate_head_mismatch_fails_closed() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+// jleechan-rln6: when a coder's Evidence marker references a head SHA that
+// does NOT match the current PR head, the daemon must (a) emit a structured
+// `EVIDENCE_HEAD_STALE` telemetry event, (b) post a precise bead-notes-style
+// comment with the `gh pr edit --body` recipe back to the coder session,
+// (c) persist a one-shot sentinel so a SECOND tick on the same bead does
+// NOT re-post the same comment, and (d) leave the gate Red but NOT trigger
+// a full reroll. This test pins all four behaviors in one regression.
+#[test]
+fn rln6_evidence_head_stale_fast_rejects_with_one_shot_comment() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // Marker references a STALE head. PR head (snap.head_sha) is
+    // `deadbeefcafe` (set by `evidence_bead`); marker says `00000000stale`.
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-rln6-stale",
+        9106,
+        "factory/ev-rln6-stale-r1",
+        "**Evidence**: https://gist.github.com/u/goodgist (head 00000000stale)",
+    );
+    // Gist is fetchable+non-empty; the rejection is NOT about the gist —
+    // it is about the head SHA mismatch. The test would still fail-closed
+    // even without this insert.
+    scm.gists.insert("goodgist".into(), true);
+
+    let telemetry_log = std::env::temp_dir().join("afd_rln6_ev_stale.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick must not error");
+
+    // (d) Gate is Red — bead stays Attested, NOT HumanHeld, NOT Ready.
+    let overlay = store.load("ev-rln6-stale").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Attested,
+        "a stale-head Evidence marker must NOT promote the bead (fast-reject, stay Attested)"
+    );
+
+    // (a) EVIDENCE_HEAD_STALE telemetry event was emitted with the parsed
+    // and PR head SHAs in metrics and the remediation recipe in context.
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("EVIDENCE_HEAD_STALE"),
+        "EVIDENCE_HEAD_STALE telemetry event must be emitted; log:\n{log}"
+    );
+    assert!(
+        log.contains("00000000stale") && log.contains("deadbeefcafe"),
+        "telemetry must carry both parsed and PR head SHAs; log:\n{log}"
+    );
+    assert!(
+        log.contains("gh pr edit --body"),
+        "telemetry context must carry the remediation recipe; log:\n{log}"
+    );
+
+    // (b) The bead-notes-style comment was posted via `comment_external`
+    // (the daemon's existing bead-message channel), with the precise
+    // mismatch and the live `gh pr edit` recipe.
+    let calls = tracker.calls.borrow();
+    let stale_comment = calls.iter().find(|c| c.contains("EVIDENCE_HEAD_STALE")
+        || (c.contains("ev-rln6-stale") && c.contains("00000000stale") && c.contains("deadbeefcafe")));
+    assert!(
+        stale_comment.is_some(),
+        "the daemon must post a bead-notes-style comment carrying both SHAs and the remediation; calls:\n{calls:?}"
+    );
+    let body = stale_comment.unwrap();
+    assert!(
+        body.contains("gh pr edit --body"),
+        "the comment must carry the literal gh recipe; got: {body}"
+    );
+    assert!(
+        body.contains("gh pr view --json headRefOid"),
+        "the comment must show how to capture the CURRENT head SHA; got: {body}"
+    );
+
+    // (c) A SECOND tick on the same bead must NOT re-post the comment —
+    // the sentinel suppresses the spam.
+    let post_first = calls
+        .iter()
+        .filter(|c| c.contains("ev-rln6-stale") && c.contains("00000000stale"))
+        .count();
+    drop(calls);
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("second tick must not error");
+    let calls2 = tracker.calls.borrow();
+    let post_second = calls2
+        .iter()
+        .filter(|c| c.contains("ev-rln6-stale") && c.contains("00000000stale"))
+        .count();
+    assert_eq!(
+        post_second, post_first,
+        "the second tick on the same bead must NOT re-post the same comment (one-shot sentinel); \
+         first={post_first} second={post_second}"
+    );
+
+    // The bead must STILL be Attested — fast-rejection is not a state
+    // transition, it is a precise coder-facing message plus a red gate.
+    assert_eq!(
+        store.load("ev-rln6-stale").unwrap().unwrap().state,
+        OverlayState::Attested,
+        "fast-reject must leave the bead Attested, not HumanHeld, not Ready"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// r5 finding 2: an evidence marker LINE that is present but incomplete
 /// (missing gist URL or `(head <sha>)`) must FAIL the evidence gate
 /// (fail-closed) — not be treated as NotProvided.
