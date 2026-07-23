@@ -2948,6 +2948,12 @@ fn skeptic_evidence(
         review_degraded,
         // Set in the fast tier from the canonical evidence marker (#323).
         evidence_gist_status: verifier::EvidenceGistStatus::NotProvided,
+        // Bead jleechan-jsby: default-empty vendor health ledger. The
+        // Stage-1 mock-llm test-repo lane has no real vendors to track,
+        // so all vendor-health observations default to None and the
+        // waiver path stays inactive (Healthy). The fast tier in
+        // production populates this from real cap observations.
+        vendor_health: crate::vendor_health::VendorHealthLedger::new(),
         // Bead jleechan-ijod / issue #387 (r5): the runtime vacuous-test
         // detector only runs in the production-adjacent fast tier (which
         // has the SCM/git context to derive the diff); Stage 1's mock-llm
