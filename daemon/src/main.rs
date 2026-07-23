@@ -8,7 +8,9 @@ use daemon::errors::DaemonError;
 use daemon::state::{SqliteStateStore, StateStore};
 use daemon::tick::{run_tick, TickDeps};
 use daemon::tools::{Bead, Issue, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
+use daemon::vendor_health::VendorHealthLedger;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const MAX_TICK_BACKOFF_SECS: u64 = 300;
 
@@ -594,6 +596,16 @@ fn run(args: Args) -> Result<(), DaemonError> {
         )
     };
 
+    // Bead jleechan-jsby (r3): process-wide vendor-health ledger shared
+    // between `--once` and the poll loop. The r2 commit wired the field
+    // into TickDeps and the tick path, but main.rs left `vendor_health:
+    // None` — so the live daemon's fast tier created a fresh empty
+    // ledger per tick and never accumulated observations across beads.
+    // VENDOR_WAIVED / VENDOR_RECOVERED telemetry therefore could not
+    // fire in production. This Mutex lives for the full `run`-scope so
+    // every `TickDeps` borrow below stays valid for the daemon lifetime.
+    let vendor_health = Mutex::new(VendorHealthLedger::new());
+
     let deps = TickDeps {
         scm: scm.as_ref(),
         tracker: tracker.as_ref(),
@@ -603,7 +615,7 @@ fn run(args: Args) -> Result<(), DaemonError> {
         vcs: vcs.as_ref(),
         cfg: &cfg,
         telemetry_log: &telemetry_log,
-        vendor_health: None,
+        vendor_health: Some(&vendor_health),
     };
 
     if args.once {
