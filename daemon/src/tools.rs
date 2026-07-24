@@ -149,7 +149,7 @@ pub struct PrFile {
 }
 
 /// One gate's read from the SCM, gathered for the 7/8-green verifier (spec §4.2.5).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrSnapshot {
     pub pr_number: u64,
     pub ci_success: bool,
@@ -170,17 +170,6 @@ pub struct PrSnapshot {
     pub updated_at_epoch: u64,
     pub ci_status: String,
     pub coderabbit_status: String,
-    /// Bugbot/cursor review-bot status derived from GitHub check-runs whose
-    /// `name` (case-insensitive) contains "bugbot" or "cursor" (Task 1,
-    /// reviewer-outage-resilience). Parallel to `coderabbit_status`:
-    /// "green" = all such check-runs completed with success, "red" = any
-    /// completed with failure, "unknown" = any still pending OR no
-    /// bugbot/cursor check-runs exist at all (absence is NOT success —
-    /// fail-closed discipline matching `coderabbit_status`'s `None =>
-    /// "unknown"` arm). Consumed by the production assessment path in
-    /// `tick::run_fast_tier` to record vendor-health observations for the
-    /// `vendor_health` ledger.
-    pub bugbot_status: String,
     pub ci_pending: bool,
     /// Unix epoch (seconds) of the head commit's committer date, or 0 when
     /// unknown. jleechan-nplh: the freshness floor for `/er` verdict
@@ -193,14 +182,6 @@ pub struct PrSnapshot {
     /// timestamp, so this floor narrows the stale-verdict hole rather than
     /// closing it exactly.
     pub head_committed_epoch: u64,
-    /// Names of check-runs that are still pending (bucket == "pending"),
-    /// used by the verification step's outage-aware CI-pending override to
-    /// distinguish real CI from in-outage provider stale-pending statuses.
-    pub pending_check_names: Vec<String>,
-    /// (name, bucket) pairs for ALL check-runs, letting the verification
-    /// step recompute `ci_success`/`ci_status` after filtering out
-    /// in-outage provider checks during the grace-period override.
-    pub check_names_and_buckets: Vec<(String, String)>,
 }
 
 /// Parameters for spawning a new AO/`aow` session (design doc §4).
@@ -504,7 +485,58 @@ pub trait Scm {
         let _ = (repo, pr);
         Ok(PrHeadBranch::NotFound)
     }
+    /// Resolve the CURRENT open PR whose head ref is `branch` in `repo`
+    /// (bead jleechan-t40t, issue #326 branch-mismatch stale-state defect).
+    /// Returns `Ok(Some(pr))` when a single open PR is bound to `branch`,
+    /// `Ok(None)` when no such PR exists (or the lookup cannot positively
+    /// confirm one), or `Err` on a hard tool failure. Used by the slow-tier
+    /// DISPATCHED re-resolution path to detect drift between a bead's
+    /// recorded `pr_number` and the PR actually bound to its branch right
+    /// now — without this check, a stale `pr_number` (e.g. set from an AO
+    /// session that has since been superseded by a later PR on the same
+    /// branch) can keep a bead wedged DISPATCHED indefinitely: every tick
+    /// queries the wrong PR and the real PR is never gate-assessed.
+    /// `repo` should be `overlay.repo(cfg)`, not `cfg.target_repo`, so
+    /// cross-repo beads are observable. Default impl returns `Ok(None)`
+    /// unconditionally so existing test fakes and any impl that predates
+    /// this method keep their original behavior; `CliScm` overrides it to
+    /// actually call `gh pr list --head <branch>`.
+    fn pr_number_for_branch(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let _ = (repo, branch);
+        Ok(None)
+    }
+    /// Bead jleechan-yoqy / issue #323: verify a gist for the evidence gate.
+    ///
+    /// - `Ok(Some(true))` — fetchable AND non-empty (evidence Verified).
+    /// - `Ok(Some(false))` — fetchable but EMPTY (definitive Failed).
+    /// - `Ok(None)` — DEFINITIVELY not found: 404 / deleted / private (Failed).
+    /// - `Err(..)` — TRANSIENT (gh outage / network): the gate waits (Unknown),
+    ///   it does NOT churn a reroll (r5 finding 3).
+    ///
+    /// Default impl is `Err` ("unverifiable") so fakes and impls that predate
+    /// this method never accidentally pass the gate; `CliScm` overrides it to
+    /// run `gh api gists/<id>`.
+    fn gist_nonempty(&self, gist_id: &str) -> Result<Option<bool>, DaemonError> {
+        Err(DaemonError::Tool {
+            tool: "gh".into(),
+            rc: -1,
+            stderr: format!("gist_nonempty not implemented for this adapter (gist {gist_id})"),
+        })
+    }
 }
+
+/// Bead jleechan-yoqy / issue #323: the ONE canonical evidence marker literal.
+/// The coder-dispatch prompt requires the coder to put
+/// `**Evidence**: <gist-url> (head <sha>)` in the PR body; the `/er` reviewer
+/// contract references this same constant; and the verifier parser matches it
+/// (case-insensitive, with the `**` bold markers optional). Defining it once
+/// here — the shared low-level module every layer imports — guarantees the
+/// prompt, the reviewer contract, and the parser can never drift apart.
+pub const EVIDENCE_MARKER: &str = "**Evidence**:";
 
 /// Resolution of an [`Scm::open_pr_head_ref_for_repo`] lookup (bead
 /// jleechan-drive-pr-branch-binding-pcpr). A three-way result rather than
@@ -750,6 +782,26 @@ pub trait Vcs {
     fn create_branch_at_for_repo(&self, repo: &str, name: &str, sha: &str) -> Result<(), DaemonError> {
         let _ = repo;
         self.create_branch_at(name, sha)
+    }
+    /// Repo-scoped variant of ref deletion (bead jleechan-znmh / issue #341,
+    /// reroll idempotency on stale local `-rN` branches). When the daemon's
+    /// routed-repo `create_branch_at_for_repo` POST fails with HTTP 422
+    /// "Reference already exists" — meaning a PRIOR failed reroll attempt
+    /// left a `factory/<bead>-r<n>` ref behind in the routed repo, even
+    /// though the daemon's local checkout never created it — the reroll
+    /// must delete that stale ref via this entry point and retry the
+    /// create. Like `create_branch_at_for_repo`, this is a cross-repo
+    /// `gh api` operation decoupled from the daemon's own cwd (the same
+    /// shape as #349). Default impl is a no-op so existing single-repo
+    /// test fakes keep their original behaviour transparently; `CliVcs`
+    /// overrides it to `DELETE repos/<repo>/git/refs/heads/<name>`.
+    fn delete_branch_at_for_repo(
+        &self,
+        repo: &str,
+        name: &str,
+    ) -> Result<(), DaemonError> {
+        let _ = (repo, name);
+        Ok(())
     }
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError>;
     /// Budget-bounded [`head_sha`](Vcs::head_sha) (bead jleechan-zeij / issue

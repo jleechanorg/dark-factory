@@ -664,11 +664,8 @@ impl Scm for CliScm {
                         updated_at_epoch: snap.updated_at_epoch.unwrap_or(0),
                         ci_status,
                         coderabbit_status,
-                        bugbot_status: "green".to_string(),
                         ci_pending: false,
                         head_committed_epoch: snap.head_committed_epoch.unwrap_or(0),
-                        pending_check_names: vec![],
-                        check_names_and_buckets: vec![],
                     });
                 }
             }
@@ -944,20 +941,6 @@ impl Scm for CliScm {
                 any_failed = true;
             }
         }
-        // Task 2 (reviewer-outage-resilience): collect the pending
-        // check-run names and the full (name, bucket) list so the
-        // verification step's outage-aware CI-pending override can
-        // distinguish real CI from in-outage provider stale-pending
-        // statuses and recompute ci_success after waiving them.
-        let pending_check_names: Vec<String> = checks
-            .iter()
-            .filter(|c| c.bucket == "pending")
-            .map(|c| c.name.clone())
-            .collect();
-        let check_names_and_buckets: Vec<(String, String)> = checks
-            .iter()
-            .map(|c| (c.name.clone(), c.bucket.clone()))
-            .collect();
         let ci_status = if checks.is_empty() || any_pending {
             "unknown".to_string()
         } else if any_failed {
@@ -983,37 +966,6 @@ impl Scm for CliScm {
                 }
             }
         }
-
-        // Task 1 (reviewer-outage-resilience): derive bugbot_status from the
-        // check-runs list, parallel to coderabbit_status. Any check-run whose
-        // `name` (case-insensitive) contains "bugbot" or "cursor" that is
-        // pending -> "unknown"; all completed-success -> "green"; any
-        // completed-failure -> "red". If NO bugbot/cursor check-runs exist at
-        // all, status stays "unknown" (absence is NOT success — fail-closed
-        // discipline matching coderabbit_status's `None => "unknown"` arm).
-        let bugbot_status = {
-            let mut any_pending = false;
-            let mut any_failed = false;
-            let mut any_present = false;
-            for c in &checks {
-                let name_lower = c.name.to_lowercase();
-                if name_lower.contains("bugbot") || name_lower.contains("cursor") {
-                    any_present = true;
-                    if c.bucket == "pending" {
-                        any_pending = true;
-                    } else if c.bucket == "fail" || c.bucket == "cancel" {
-                        any_failed = true;
-                    }
-                }
-            }
-            if !any_present || any_pending {
-                "unknown".to_string()
-            } else if any_failed {
-                "red".to_string()
-            } else {
-                "green".to_string()
-            }
-        };
 
         let owner = self.repo.split('/').next().unwrap_or("").to_string();
         let repo = self.repo.split('/').nth(1).unwrap_or("").to_string();
@@ -1155,11 +1107,8 @@ impl Scm for CliScm {
             updated_at_epoch,
             ci_status,
             coderabbit_status,
-            bugbot_status,
             ci_pending,
             head_committed_epoch,
-            pending_check_names,
-            check_names_and_buckets,
         };
         {
             let mut cache = self.pr_snapshot_cache.lock().unwrap();
@@ -1194,6 +1143,101 @@ impl Scm for CliScm {
             Err(_) => return Ok(PrHeadBranch::NotFound),
         };
         Ok(parse_open_pr_head_ref(&out, repo))
+    }
+
+    /// Bead jleechan-t40t (issue #326): resolve the CURRENT open PR whose
+    /// head ref is `branch` in `repo`. Implementation issues
+    /// `gh pr list --head <branch> --repo <repo> --json number --jq '.[0].number'`
+    /// and parses the trimmed stdout as a `u64`. Mirrors the
+    /// slow-tier DISPATCHED re-resolution path in `tick.rs::run_slow_tier`
+    /// — both have to agree on the same branch→PR contract. `Err(_)` is
+    /// returned only on a hard `gh` failure; "no such PR" is `Ok(None)` so
+    /// callers can distinguish "transient tool error" (retry next tick)
+    /// from "the branch really has no open PR right now" (legitimate —
+    /// keep using the existing `pr_number` until one appears).
+    fn pr_number_for_branch(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        // jleechan-t40t (issue #326) r6: filter the lookup to SAME-REPO
+        // PRs only. `--repo owner/repo` scopes the LIST to that repo, but
+        // `--head <branch>` matches against `headRefName` which can
+        // collide with a fork PR's head branch name (r6 lesson from
+        // PR #305 — `gh pr list --head X --repo owner/repo` may surface
+        // a fork PR whose `headRefName == X` because the JSON payload
+        // includes `headRepository.nameWithOwner`). The jq filter
+        // selects only entries whose headRepository matches the queried
+        // repo, mirroring the same-repo guard `intake::same_repo_pr`
+        // already applies to PR adoption.
+        let jq_filter = format!(
+            ".[] | select(.headRepository.nameWithOwner == \"{repo}\") | .number"
+        );
+        let out = match run_tool(
+            "gh",
+            &[
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--repo",
+                repo,
+                "--json",
+                "number,headRepository",
+                "--jq",
+                &jq_filter,
+            ],
+            30,
+        ) {
+            Ok(o) => o,
+            Err(DaemonError::Tool { stderr, .. })
+                if stderr.contains("404")
+                    || stderr.contains("Not Found")
+                    || stderr.contains("not found") =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let trimmed = out.trim();
+        if trimmed.is_empty() || trimmed == "null" {
+            return Ok(None);
+        }
+        match trimmed.parse::<u64>() {
+            Ok(pr) => Ok(Some(pr)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Bead jleechan-yoqy / issue #323 (r5): `gh api gists/<id>` and report the
+    /// gist's verification state. A 404 (deleted / private / never existed) is
+    /// `Ok(None)` — a DEFINITIVE miss the evidence gate fails on. Any other gh
+    /// error is TRANSIENT (`Err`) — the gate waits rather than churning a
+    /// reroll on gh noise. A fetchable gist reports `Ok(Some(total_size > 0))`.
+    fn gist_nonempty(&self, gist_id: &str) -> Result<Option<bool>, DaemonError> {
+        // Sum the `size` of every file in the gist via jq; empty -> 0.
+        let out = match run_tool(
+            "gh",
+            &[
+                "api",
+                &format!("gists/{gist_id}"),
+                "--jq",
+                "[.files[].size] | add // 0",
+            ],
+            30,
+        ) {
+            Ok(out) => out,
+            Err(DaemonError::Tool { stderr, .. })
+                if stderr.contains("404")
+                    || stderr.contains("Not Found")
+                    || stderr.contains("not found") =>
+            {
+                return Ok(None); // definitively missing
+            }
+            Err(e) => return Err(e), // transient — the gate waits
+        };
+        let total: u64 = out.trim().parse().unwrap_or(0);
+        Ok(Some(total > 0))
     }
 
     fn close_pr(&self, pr: u64, comment: &str) -> Result<(), DaemonError> {
@@ -1608,14 +1652,100 @@ fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonErro
     ao_spawn_command_with_mode(agent, spec, false)
 }
 
+/// Maps legacy vendor aliases onto their canonical AO plugin names. The
+/// runtime and startup paths consult this single source so a renamed plugin
+/// never silently disappears from `--agent` argv or preflight checks.
+///
+/// `aow -> minimax` predates this PR (legacy minimax-by-AO alias).
+/// `agy -> antigravity` covers AO main's 2026-07-18 rename of the
+/// antigravity plugin; lane 222 burned a full spawn cycle before the
+/// jleechan-agy-vendor-name-drift-9lvs regression exposed the mismatch.
+pub fn canonical_for_alias(vendor: &str) -> Option<&'static str> {
+    match vendor {
+        "aow" => Some("minimax"),
+        "agy" => Some("antigravity"),
+        _ => None,
+    }
+}
+
+/// Fail-closed preflight over the daemon's configured vendor set against
+/// the bridge-reported AO plugin registry. This runs on EVERY startup —
+/// skipping it because the registry is empty/missing/malformed is what let
+/// the jleechan-9lvs drift class reach a per-bead spawn cycle in the first
+/// place. Distinct error messages keep triage cheap:
+///
+/// * registry error → `VendorRegistryError` (registry reachable, list broken)
+/// * empty registry → `VendorRegistryEmpty` (registry reachable, no plugins)
+/// * missing canonical vendor → `VendorNotInstalled` (each missing name listed)
+pub fn validate_configured_vendors(
+    installed_plugins: Result<&[String], &str>,
+    configured_vendors: &[String],
+) -> Result<(), DaemonError> {
+    let installed = match installed_plugins {
+        Ok(list) => list,
+        Err(message) => {
+            return Err(DaemonError::Config(format!(
+                "AO bridge reported a registry error while enumerating agent plugins ({}); refusing to start because the daemon cannot prove any configured vendor is installed",
+                message
+            )));
+        }
+    };
+    if installed.is_empty() {
+        return Err(DaemonError::Config(format!(
+            "AO bridge reported zero installed agent plugins (configured vendors: {}); refusing to start because a factory with zero coder plugins cannot dispatch",
+            configured_vendors.join(", ")
+        )));
+    }
+
+    // Dedup configured_vendors by their canonical form so that e.g.
+    // ['agy', 'antigravity'] is treated as a single vendor before we
+    // ask the registry whether it's installed.
+    let mut seen = std::collections::HashSet::new();
+    let mut canonical_chain: Vec<String> = Vec::new();
+    for vendor in configured_vendors {
+        let canonical = canonical_for_alias(vendor)
+            .map(str::to_string)
+            .unwrap_or_else(|| vendor.clone());
+        if canonical.is_empty() {
+            continue;
+        }
+        if seen.insert(canonical.clone()) {
+            canonical_chain.push(canonical);
+        }
+    }
+
+    let mut missing: Vec<String> = Vec::new();
+    for canonical in &canonical_chain {
+        if !installed.iter().any(|name| name == canonical) {
+            missing.push(canonical.clone());
+        }
+    }
+    if !missing.is_empty() {
+        return Err(DaemonError::Config(format!(
+            "AO plugin registry is missing configured vendor(s) {} (installed: {}); refusing to start so a renamed plugin cannot burn a full spawn cycle",
+            missing.join(", "),
+            installed.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// Runs the AO v0.1.3 preload in its read-only diagnostic mode. This checks
 /// the actual `ao` executable selected by the daemon's production PATH, its
 /// Node major version, package version, core APIs, configured project, and
 /// plugin resolution without performing preflight side effects, acquiring a
 /// spawn lock, creating a workspace, or launching a worker.
+///
+/// `configured_vendors` is the daemon's full deduped canonical vendor list
+/// (default + fallback chain, after alias resolution). The bridge diagnostic
+/// payload distinguishes three registry states via distinct JSON keys:
+/// `agentPlugins` (sorted array of installed plugin names) when the registry
+/// answered, `agentPluginsError` (string message) when the registry threw.
+/// An absent key is treated as a malformed payload and rejected.
 pub fn verify_ao_bridge_compatibility(
     ao_project: &str,
     agent: &str,
+    configured_vendors: &[String],
 ) -> Result<(), DaemonError> {
     let spec = SpawnSpec {
         bead_id: "daemon-startup-diagnostic".to_string(),
@@ -1667,6 +1797,55 @@ pub fn verify_ao_bridge_compatibility(
             "AO bridge compatibility diagnostic reported an incompatible runtime: {diagnostic}"
         )));
     }
+    // Three mutually-exclusive registry states, distinguished by separate
+    // JSON keys so the daemon cannot confuse "registry reachable but empty"
+    // (hard failure: factory cannot dispatch) with "registry threw" (also a
+    // hard failure, but the message names the underlying exception so the
+    // operator knows to fix the AO install, not the daemon config).
+    let registry_state: Result<Vec<String>, String> = match (
+        diagnostic.get("agentPlugins"),
+        diagnostic.get("agentPluginsError"),
+    ) {
+        (Some(_), Some(_)) => Err(
+            "AO bridge diagnostic carried BOTH agentPlugins and agentPluginsError; payload is malformed"
+                .to_string(),
+        ),
+        (Some(value), None) => match value.as_array() {
+            Some(array) => {
+                let mut names: Vec<String> = array
+                    .iter()
+                    .filter_map(|entry| entry.as_str().map(str::to_string))
+                    .collect();
+                names.sort();
+                names.dedup();
+                Ok(names)
+            }
+            None => Err(
+                "AO bridge diagnostic agentPlugins is not a JSON array".to_string(),
+            ),
+        },
+        (None, Some(value)) => Err(value
+            .as_str()
+            .unwrap_or("non-string agentPluginsError in bridge diagnostic")
+            .to_string()),
+        (None, None) => Err(
+            "AO bridge diagnostic payload omitted both agentPlugins and agentPluginsError; \
+             refusing to start because the daemon cannot prove any configured vendor is installed"
+                .to_string(),
+        ),
+    };
+    let installed_slice: Result<&[String], &str> = match &registry_state {
+        Ok(list) => Ok(list.as_slice()),
+        Err(message) => Err(message.as_str()),
+    };
+    validate_configured_vendors(installed_slice, configured_vendors).map_err(|error| {
+        match error {
+            DaemonError::Config(message) => DaemonError::Config(format!(
+                "AO bridge compatibility preflight failed: {message}"
+            )),
+            other => other,
+        }
+    })?;
     Ok(())
 }
 
@@ -1871,23 +2050,38 @@ impl CliSessions {
     fn spawn_with_fallback(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
         let fallback_str = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN")
             .unwrap_or_else(|_| "aow->claude-code->agy->minimax".to_string());
-        
-        let mut fallback_agents = Vec::new();
-        fallback_agents.push(self.agent.clone());
-        for part in fallback_str.split("->") {
-            let part_trimmed = part.trim().to_string();
-            let mapped_agent = if part_trimmed == "aow" {
-                "minimax".to_string()
-            } else {
-                part_trimmed
-            };
-            if !mapped_agent.is_empty() && !fallback_agents.contains(&mapped_agent) {
-                fallback_agents.push(mapped_agent);
-            }
-        }
-
+        let fallback_agents = build_runtime_fallback_chain(&self.agent, &fallback_str);
         fallback_spawn(&fallback_agents, |agent| self.run_spawn_process(agent, spec))
     }
+}
+
+/// Pure helper used by `CliSessions::spawn_with_fallback` (and unit-tested
+/// directly) that canonicalizes the runtime vendor chain through the same
+/// `canonical_for_alias` map the startup preflight uses. Dedup is by
+/// canonical form so a config that names both `agy` and `antigravity`
+/// doesn't try the same plugin twice.
+fn build_runtime_fallback_chain(default_agent: &str, fallback_str: &str) -> Vec<String> {
+    let canonicalize = |vendor: &str| -> String {
+        canonical_for_alias(vendor)
+            .map(str::to_string)
+            .unwrap_or_else(|| vendor.to_string())
+    };
+    let mut chain: Vec<String> = Vec::new();
+    let default_canonical = canonicalize(default_agent);
+    if !default_canonical.is_empty() {
+        chain.push(default_canonical);
+    }
+    for part in fallback_str.split("->") {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let canonical = canonicalize(trimmed);
+        if !canonical.is_empty() && !chain.contains(&canonical) {
+            chain.push(canonical);
+        }
+    }
+    chain
 }
 
 /// Walks `agents` in order, calling `attempt_spawn` for each until one
@@ -1927,8 +2121,54 @@ where
 
 #[cfg(test)]
 mod spawn_fallback_tests {
-    use super::fallback_spawn;
+    use super::{build_runtime_fallback_chain, fallback_spawn};
     use crate::errors::DaemonError;
+
+    // jleechan-9lvs r2 (CodeRabbit blocker on PR #362): the runtime --agent
+    // argv must canonicalize through the SAME alias map the startup
+    // preflight uses, otherwise preflight passes for `agy`->`antigravity`
+    // and runtime still spawns `--agent agy` and reproduces the failure
+    // mode this PR is meant to eliminate. This test exercises the helper
+    // directly so we never have to spin up a subprocess to assert
+    // argv-shape behavior.
+    #[test]
+    fn runtime_fallback_chain_never_emits_legacy_alias_after_agy_rename() {
+        // Default `agy` (legacy alias) plus a fallback chain that names
+        // both `agy` and `antigravity`. After canonicalization + dedup the
+        // chain must contain ONLY canonical plugin names; no literal
+        // `agy` or `aow` may survive.
+        let chain = build_runtime_fallback_chain("agy", "antigravity->agy->aow->minimax");
+
+        assert!(
+            !chain.iter().any(|v| v == "agy"),
+            "legacy alias `agy` must be canonicalized to `antigravity`; got: {chain:?}"
+        );
+        assert!(
+            !chain.iter().any(|v| v == "aow"),
+            "legacy alias `aow` must be canonicalized to `minimax`; got: {chain:?}"
+        );
+        // Both canonical plugins appear, order preserved (default first).
+        assert_eq!(
+            chain,
+            vec!["antigravity".to_string(), "minimax".to_string()]
+        );
+    }
+
+    #[test]
+    fn runtime_fallback_chain_preserves_passthrough_when_no_alias_matches() {
+        let chain = build_runtime_fallback_chain(
+            "minimax",
+            "claude-code->antigravity->agy",
+        );
+        assert_eq!(
+            chain,
+            vec![
+                "minimax".to_string(),
+                "claude-code".to_string(),
+                "antigravity".to_string(),
+            ]
+        );
+    }
 
     /// jleechan-r56m red proof: simulate all 3 vendors in a fallback chain
     /// failing with DIFFERENT, distinguishable errors. Today's aggregation
@@ -4181,6 +4421,28 @@ impl Vcs for CliVcs {
         Ok(())
     }
 
+    /// Bead jleechan-znmh / issue #341: delete a ref via the routed-repo
+    /// Data API. Companion to [`create_branch_at_for_repo`](Self::create_branch_at_for_repo):
+    /// when a prior failed reroll left a stale `factory/<bead>-r<n>` ref
+    /// behind (HTTP 422 on the next POST), the reroll calls this to clear
+    /// it before retrying the create. Cross-repo, cwd-independent —
+    /// identical plumbing shape to the create, mirroring how
+    /// `create_branch_at_for_repo` was added for issue #349.
+    fn delete_branch_at_for_repo(
+        &self,
+        repo: &str,
+        name: &str,
+    ) -> Result<(), DaemonError> {
+        let path = format!("repos/{}/git/refs/heads/{}", repo, name);
+        let out = run_tool(
+            "gh",
+            &["api", "--method", "DELETE", &path],
+            30,
+        )?;
+        let _ = out; // DELETE success returns 204; we don't need the body.
+        Ok(())
+    }
+
     fn head_sha(&self, branch: &str) -> Result<String, DaemonError> {
         self.head_sha_within(branch, 30)
     }
@@ -5615,5 +5877,134 @@ exit 1
             )),
             "ancestor_sha == descendant_sha must short-circuit to Ok(true)"
         );
+    }
+}
+
+// jleechan-agy-vendor-name-drift-9lvs (operator guidance, r2): the original
+// skeptic P1 from PR #321's head 7ade4ef2 was that
+// adapters.rs::verify_ao_bridge_compatibility skipped
+// validate_configured_vendors when `agentPlugins` was empty/missing/malformed
+// and the bridge deliberately emitted `[]` on registry errors, so startup
+// passed without proving resolved agents exist. r2 closes all three paths.
+#[cfg(test)]
+mod vendor_drift_preflight_r2_tests {
+    use super::{canonical_for_alias, validate_configured_vendors};
+
+    // jleechan-9lvs red proof #1: legacy `agy` must alias onto the renamed
+    // `antigravity` plugin name (AO main 2026-07-18 rename).
+    #[test]
+    fn legacy_agy_alias_resolves_to_canonical_antigravity_plugin() {
+        assert_eq!(canonical_for_alias("agy"), Some("antigravity"));
+    }
+
+    // Pre-existing legacy alias must still resolve.
+    #[test]
+    fn legacy_aow_alias_resolves_to_canonical_minimax_plugin() {
+        assert_eq!(canonical_for_alias("aow"), Some("minimax"));
+    }
+
+    // Non-legacy vendor names pass through unchanged so the bridge sees the
+    // exact plugin name the registry has.
+    #[test]
+    fn unknown_vendor_name_returns_no_alias() {
+        assert_eq!(canonical_for_alias("claude-code"), None);
+        assert_eq!(canonical_for_alias("antigravity"), None);
+        assert_eq!(canonical_for_alias(""), None);
+    }
+
+    // jleechan-9lvs acceptance: valid list with the agy alias resolves and
+    // the daemon accepts it as installed (the alias IS the configuration).
+    #[test]
+    fn valid_list_with_legacy_agy_alias_passes_preflight() {
+        let installed = vec!["antigravity".to_string(), "claude-code".to_string()];
+        let configured = vec!["agy".to_string(), "claude-code".to_string()];
+        assert!(validate_configured_vendors(Ok(&installed), &configured).is_ok());
+    }
+
+    // jleechan-9lvs r2 P1: genuine empty registry is a HARD failure. A
+    // factory with zero coder plugins cannot dispatch, so passing the
+    // preflight and only failing on the first bead is the exact bug class
+    // this PR is closing.
+    #[test]
+    fn empty_installed_plugin_list_fails_preflight_loud() {
+        let installed: Vec<String> = Vec::new();
+        let configured = vec!["minimax".to_string()];
+        let error = validate_configured_vendors(Ok(&installed), &configured)
+            .expect_err("empty registry must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("zero installed agent plugins"),
+            "empty-list error must name the registry state, got: {message}"
+        );
+        assert!(
+            message.contains("cannot dispatch"),
+            "empty-list error must call out that the factory cannot dispatch, got: {message}"
+        );
+    }
+
+    // jleechan-9lvs r2 P1: a registry error (list reachable but threw) is a
+    // distinct state from a genuinely-empty list. The error message must
+    // surface the underlying exception so the operator knows to fix the
+    // AO install (or restart AO), not the daemon config.
+    #[test]
+    fn registry_error_fails_preflight_with_distinct_message() {
+        let configured = vec!["minimax".to_string()];
+        let error = validate_configured_vendors(
+            Err("TypeError: registry.list is not a function"),
+            &configured,
+        )
+        .expect_err("registry error must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("registry error"),
+            "registry-error path must call out registry error, got: {message}"
+        );
+        assert!(
+            message.contains("TypeError"),
+            "registry-error path must propagate the underlying exception, got: {message}"
+        );
+        assert!(
+            !message.contains("zero installed agent plugins"),
+            "registry-error message must NOT be confused with empty-list, got: {message}"
+        );
+    }
+
+    // When the registry reports a non-empty list but the configured vendor
+    // (after alias) is missing, every missing name is reported in one error
+    // so a single fix covers every lane (jleechan-r56m aggregation property).
+    #[test]
+    fn missing_canonical_vendor_is_reported_alongside_installed_set() {
+        let installed = vec!["antigravity".to_string()];
+        let configured = vec!["agy".to_string(), "claude-code".to_string()];
+        let error = validate_configured_vendors(Ok(&installed), &configured)
+            .expect_err("missing claude-code must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("claude-code"),
+            "missing vendor must be named in the error, got: {message}"
+        );
+        assert!(
+            message.contains("antigravity"),
+            "installed set must be enumerated in the error, got: {message}"
+        );
+    }
+
+    // The configured vendor chain (default + fallback) is deduped by
+    // canonical form so a config that names both `agy` and `antigravity`
+    // does not double-list a vendor that aliases to the same plugin.
+    #[test]
+    fn duplicate_canonical_vendors_are_deduplicated_before_validation() {
+        // Both canonical targets must be installed for the dedup test —
+        // the assertion is that `agy`/`antigravity` collapse into ONE
+        // canonical entry, and `aow`/`minimax` collapse into ANOTHER, not
+        // that an incomplete installed set passes validation.
+        let installed = vec!["antigravity".to_string(), "minimax".to_string()];
+        let configured = vec![
+            "agy".to_string(),
+            "antigravity".to_string(),
+            "aow".to_string(),
+            "minimax".to_string(),
+        ];
+        assert!(validate_configured_vendors(Ok(&installed), &configured).is_ok());
     }
 }

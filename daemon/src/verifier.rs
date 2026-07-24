@@ -30,25 +30,9 @@ pub enum GateName {
     CommentsResolved,
     EvidenceFloor,
     Skeptic,
-    VacuousRedGreen,
 }
 
 impl GateName {
-    /// Task 3 (reviewer-outage-resilience): map a gate to the review-provider
-    /// vendor whose outage would waive it. `CodeRabbitApproved` → "coderabbit",
-    /// `BugbotClean` → "bugbot"; every other gate returns `None` and is NEVER
-    /// waived — skeptic, evidence, CI, comments_resolved, and vacuous_red_green
-    /// remain fully enforced and blocking even during a provider outage. This
-    /// is the single source of truth for the outage-annotation mapping so the
-    /// `to_json_with_outage` emitter and any future consumers cannot drift.
-    pub fn vendor_for_gate(&self) -> Option<&'static str> {
-        match self {
-            GateName::CodeRabbitApproved => Some("coderabbit"),
-            GateName::BugbotClean => Some("bugbot"),
-            _ => None,
-        }
-    }
-
     /// Canonical snake_case JSON key for this gate (jleechan-wzgl:
     /// GATE_ASSESSMENT serializes the full per-gate report). This is NOT a
     /// free choice — it MUST match three other already-checked-in
@@ -74,7 +58,6 @@ impl GateName {
             GateName::CommentsResolved => "comments_resolved",
             GateName::EvidenceFloor => "evidence_review",
             GateName::Skeptic => "skeptic",
-            GateName::VacuousRedGreen => "vacuous_red_green",
         }
     }
 }
@@ -106,7 +89,7 @@ impl GateResult {
 /// the two remain distinguishable via `results` for diagnosis/routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateReport {
-    pub results: [(GateName, GateResult); 8],
+    pub results: [(GateName, GateResult); 7],
     pub all_green: bool,
 }
 
@@ -131,44 +114,18 @@ impl GateReport {
     /// a one-element `evidence` list) — both shapes are accepted by
     /// `factory-overlay.sh`'s `normalize()`.
     pub fn to_json(&self) -> serde_json::Value {
-        self.to_json_with_outage(&[])
-    }
-
-    /// Task 3 (reviewer-outage-resilience): serialize the per-gate breakdown,
-    /// waiving in-outage provider gates. For each gate whose
-    /// `GateName::vendor_for_gate()` returns `Some(v)` and `v` is in
-    /// `in_outage_vendors`, the gate's verdict is replaced with the canonical
-    /// string `"waived_vendor_unavailable"` instead of the normal
-    /// "pass"/"fail"/"unknown" verdict. This token round-trips the gate-key
-    /// JSON schema both shell merge authorities (`auto-merge-guard.sh` and
-    /// `factory-overlay.sh`) read: it is neither "fail" nor "unknown", so it
-    /// neither blocks nor defers the merge, and it is explicitly accepted by
-    /// both scripts' ALIAS/VALID sets.
-    ///
-    /// Only the in-outage provider's OWN gate key is waived — every other gate
-    /// (skeptic, evidence, CI, comments_resolved, vacuous_red_green) keeps its
-    /// real verdict and remains fully enforced and blocking. `all_green` is
-    /// NOT recomputed here (it still reflects `assess`'s strict verdict); the
-    /// merge authorities read the per-gate `waived_vendor_unavailable` token
-    /// to decide non-blocking, so the aggregate flag is informational only.
-    pub fn to_json_with_outage(&self, in_outage_vendors: &[&str]) -> serde_json::Value {
         let mut gates = serde_json::Map::new();
         for (name, result) in &self.results {
-            let value = match name.vendor_for_gate() {
-                Some(v) if in_outage_vendors.contains(&v) => {
-                    serde_json::Value::String("waived_vendor_unavailable".to_string())
-                }
-                _ => match result {
-                    GateResult::Green => serde_json::Value::String("pass".to_string()),
-                    GateResult::Red(reason) => serde_json::json!({
-                        "verdict": "fail",
-                        "evidence": [reason],
-                    }),
-                    GateResult::Unknown(reason) => serde_json::json!({
-                        "verdict": "unknown",
-                        "evidence": [reason],
-                    }),
-                },
+            let value = match result {
+                GateResult::Green => serde_json::Value::String("pass".to_string()),
+                GateResult::Red(reason) => serde_json::json!({
+                    "verdict": "fail",
+                    "evidence": [reason],
+                }),
+                GateResult::Unknown(reason) => serde_json::json!({
+                    "verdict": "unknown",
+                    "evidence": [reason],
+                }),
             };
             gates.insert(name.as_str().to_string(), value);
         }
@@ -259,6 +216,64 @@ fn find_marker_verdict(raw: &str) -> Option<SkepticVerdict> {
 /// pass/warn/fail in the Python pipeline runner. Anything else is a parse
 /// failure, not a heuristic guess.
 ///
+/// Bead jleechan-984e / issue #385: vendor → model family. The taxonomy is
+/// the smallest grouping that gives a meaningful cross-model guarantee
+/// (different training, different failure modes) — `claude` and `minimax`
+/// share an Anthropic-compatible API surface but are operated by different
+/// organizations and counts as separate families; `codex` is OpenAI;
+/// `agy`/`gemini` are both Google-distributed (Antigravity CLI vs Gemini
+/// CLI); `cursor-agent` is Cursor's own model. The skeptic gate's
+/// `review_degraded` flag fires when the set of families that actually
+/// contributed is < 2; this helper is the single source of truth so the
+/// `dispatch_reviewer` list and the degraded calculation cannot drift.
+pub fn vendor_model_family(vendor: &str) -> &'static str {
+    match vendor {
+        "claude" => "anthropic",
+        "minimax" => "minimax",
+        "codex" => "openai",
+        "agy" => "google-antigravity",
+        "gemini" => "google-gemini",
+        "cursor-agent" | "cursor" => "cursor",
+        // Test-repo path: not a real family; the `review_degraded` rule
+        // explicitly excludes `mock_llm` from the family count (see
+        // `compute_review_degraded`), so returning `""` keeps it inert.
+        "mock_llm" => "",
+        // Unknown vendor labels must not silently collapse into a real
+        // family — they are excluded from the family count too, which
+        // makes a typo in `skeptic_reviewers` degrade-safe instead of
+        // accidentally passing the cross-model gate.
+        _ => "",
+    }
+}
+
+/// Bead jleechan-984e / issue #385: `true` iff the contributor list
+/// (`PrEvidence::skeptic_reviewers`) covers >= 2 DISTINCT non-empty model
+/// families per `vendor_model_family`. Special cases:
+///   - empty list → NOT degraded (no verdict means there is no
+///     cross-model guarantee TO violate; this is also the
+///     `skeptic_verdict=None` / total-outage `Err` path)
+///   - single non-empty family → DEGRADED (the production bug: only
+///     `claude` ran because codex is quota-dead)
+///   - two or more distinct families → NOT degraded (cross-model
+///     guarantee met)
+///   - `mock_llm` / unknown vendor labels are IGNORED (they have empty
+///     family strings per `vendor_model_family`), so the Stage-1
+///     test-repo path stays non-degraded even though its single mock
+///     judge has no cross-model sibling.
+pub fn compute_review_degraded(reviewers: &[String]) -> bool {
+    let families: std::collections::BTreeSet<&str> = reviewers
+        .iter()
+        .map(|v| vendor_model_family(v))
+        .filter(|f| !f.is_empty())
+        .collect();
+    // Empty: no verdict, no guarantee to violate. 1: single-family
+    // (degraded). 2+: cross-model guarantee met.
+    match families.len() {
+        0 | 1 => !families.is_empty(), // 1 family = degraded; 0 families = no verdict, not degraded
+        _ => false,
+    }
+}
+
 /// Strategy (spec Appendix C.3, mirrors `_parse_verdict`'s priority order):
 ///   1. Scan all lines for a marker (`verdict:`/`overall:`/`normalized:`,
 ///      case-insensitive) followed by a `pass|warn|fail` token; the LAST
@@ -364,9 +379,6 @@ pub struct PrEvidence {
     pub is_production: bool,
     /// Non-test changed LOC in the diff (spec §4.2.5 evidence floor).
     pub non_test_changed_loc: u32,
-    /// Whether the PR body/comments carry an integration-evidence marker
-    /// (Layer-2+ proof, not unit-only) for diffs over the LOC floor.
-    pub has_integration_evidence_marker: bool,
     /// The `/er` (evidence review) verdict (spec §4.2.5 gate 6). This is the
     /// PRIMARY gate-6 signal — the LOC floor below is an ADDITIONAL floor on
     /// top of it, not a substitute for it (hardening sweep P1, bead
@@ -389,6 +401,50 @@ pub struct PrEvidence {
     /// GATE_ASSESSMENT's provenance signal for confirming the gate-7
     /// reviewer was non-self and genuinely ran, not self-certified.
     pub skeptic_reviewers: Vec<String>,
+    /// Bead jleechan-984e / issue #385: `true` when the gate-7 reviewers that
+    /// actually contributed (`skeptic_reviewers` above) span fewer than TWO
+    /// distinct model families. A single-family review (e.g. only `claude`
+    /// because `codex` is quota-dead and `agy`/`cursor-agent` errored) shares
+    /// the coder's blind spots — every defect that reached main tonight
+    /// passed a claude-only skeptic and was caught by a different model
+    /// family executing the code. Strict merge policy (#328) treats this
+    /// flag as NOT strict-green, so a "green" assessment with
+    /// `review_degraded=true` cannot pass the unattended merge gate until a
+    /// cross-model vendor is restored. `false` when (a) zero or one vendors
+    /// ran (the test-repo `mock_llm` path and the total-outage path both
+    /// stay non-degraded: there is no cross-model guarantee to violate) or
+    /// (b) two or more distinct model families contributed. See
+    /// `vendor_model_family` for the family taxonomy.
+    pub review_degraded: bool,
+    /// Bead jleechan-yoqy / issue #323: result of verifying the canonical
+    /// evidence marker (`**Evidence**:` + gist URL + `(head <sha>)`) against
+    /// the live gist and the PR's current head. Computed in `tick.rs` (which
+    /// has the SCM adapter); `evidence_floor_gate` consults it. `NotProvided`
+    /// (the default) means no evidence marker was in the body, so the existing
+    /// LOC-floor logic applies unchanged.
+    pub evidence_gist_status: EvidenceGistStatus,
+}
+
+/// Bead jleechan-yoqy / issue #323: fail-closed verification result for the
+/// canonical evidence marker.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EvidenceGistStatus {
+    /// No canonical evidence marker in the PR body — the LOC-floor logic
+    /// decides the gate as before.
+    #[default]
+    NotProvided,
+    /// Marker present, gist fetchable and non-empty, and it references the
+    /// PR's current head SHA — the evidence contract is satisfied.
+    Verified,
+    /// Marker present but DEFINITIVELY invalid; the string is the distinct,
+    /// operator-facing reason (incomplete marker, gist not found, gist empty,
+    /// or head-SHA mismatch). Fail-closed → Red.
+    Failed(String),
+    /// Marker present and head-matched, but the gist could not be fetched due
+    /// to a TRANSIENT error (gh outage / network). r5 finding 3: this is
+    /// Unknown (wait and re-check), NOT a Red — a transient gh blip must not
+    /// churn a reroll. The string is the transient reason.
+    Pending(String),
 }
 
 /// Gate 6 (spec §4.2.5): green only when `/er` returned `Pass` AND the
@@ -430,14 +486,144 @@ fn evidence_floor_gate(evidence: &PrEvidence) -> GateResult {
         }
     }
 
-    if evidence.non_test_changed_loc <= EVIDENCE_FLOOR_LOC {
-        return GateResult::Green;
+    // Bead jleechan-yoqy / issue #323 (r5): the canonical evidence contract is
+    // the ONLY way a large diff's evidence goes green. A verified marker (gist
+    // fetchable + non-empty + head-matched) passes REGARDLESS of LOC; a
+    // present-but-invalid marker is a distinct Red (fail-closed); a transient
+    // gist-fetch failure is Unknown (wait, do not churn a reroll on gh noise).
+    match &evidence.evidence_gist_status {
+        EvidenceGistStatus::Verified => return GateResult::Green,
+        EvidenceGistStatus::Failed(reason) => {
+            return GateResult::Red(format!("evidence contract: {reason}"));
+        }
+        EvidenceGistStatus::Pending(reason) => {
+            return GateResult::Unknown(format!("evidence contract pending: {reason}"));
+        }
+        EvidenceGistStatus::NotProvided => {}
     }
-    if evidence.has_integration_evidence_marker {
+
+    // r5 finding 1: the legacy `has_integration_evidence_marker` substring
+    // floor is DELETED — it let a large diff go green with an unverified
+    // keyword and was the exact prior #323 bypass. Below the LOC floor a small
+    // diff needs no evidence gist; at/above it, only a VERIFIED canonical
+    // marker (handled above) greens the gate — otherwise it is Red.
+    if evidence.non_test_changed_loc <= EVIDENCE_FLOOR_LOC {
         GateResult::Green
     } else {
-        GateResult::Red("evidence floor".to_string())
+        GateResult::Red(
+            "evidence floor: a verified canonical **Evidence** gist is required for diffs \
+             above the non-test LOC floor"
+                .to_string(),
+        )
     }
+}
+
+/// Bead jleechan-yoqy / issue #323: a parsed canonical evidence reference from
+/// a PR body — the gist id and the head SHA the coder attested it covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedEvidence {
+    pub gist_id: String,
+    pub head_sha: String,
+}
+
+/// Parse the ONE canonical evidence marker from `body`. Matches
+/// [`crate::tools::EVIDENCE_MARKER`] (`**Evidence**:`) case-insensitively with
+/// the `**` bold markers optional, on a line that starts with the marker
+/// (leading whitespace and an optional `-` bullet tolerated). Extracts the
+/// gist id (last path segment of a `gist.github.com/...` URL) and the head SHA
+/// from a trailing `(head <sha>)`. Returns `None` if the marker, a gist URL,
+/// or the head SHA is absent — the exact prompt-mandated string
+/// `**Evidence**: <gist-url> (head <sha>)` round-trips through this parser.
+pub fn parse_evidence(body: &str) -> Option<ParsedEvidence> {
+    for line in body.lines() {
+        // Tolerate bold `**` markers by stripping asterisks for marker
+        // detection; URLs and SHAs never contain `*`.
+        let cleaned = line.replace('*', "");
+        let marker_idx = match cleaned.to_ascii_lowercase().find("evidence:") {
+            Some(i) => i,
+            None => continue,
+        };
+        // The marker must LEAD the line (only whitespace / a `-` bullet before
+        // it) so prose mentioning "evidence:" elsewhere isn't misread.
+        let prefix = cleaned[..marker_idx].trim();
+        if !prefix.trim_start_matches('-').trim().is_empty() {
+            continue;
+        }
+        let rest = &cleaned[marker_idx + "evidence:".len()..];
+        let gist_id = match extract_gist_id(rest) {
+            Some(id) => id,
+            None => continue,
+        };
+        let head_sha = match extract_head_sha(rest) {
+            Some(sha) => sha,
+            None => continue,
+        };
+        return Some(ParsedEvidence { gist_id, head_sha });
+    }
+    None
+}
+
+/// Extract the gist id (last non-empty path segment of a
+/// `gist.github.com/...` URL) from `text`.
+fn extract_gist_id(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let host = "gist.github.com/";
+    let host_idx = lower.find(host)?;
+    let after = &text[host_idx + host.len()..];
+    // The URL token ends at whitespace or a closing paren/angle bracket.
+    let url_token: &str = after
+        .split(|c: char| c.is_whitespace() || c == ')' || c == '>' || c == '(')
+        .next()
+        .unwrap_or("");
+    let id = url_token
+        .trim_end_matches('/')
+        .rsplit('/')
+        .find(|seg| !seg.is_empty())?
+        // Strip any URL fragment/query or trailing punctuation.
+        .split(['#', '?'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(['.', ',']);
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+/// Extract the head SHA from a trailing `(head <sha>)` clause in `text`
+/// (case-insensitive on `head`).
+fn extract_head_sha(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let key = "(head ";
+    let key_idx = lower.find(key)?;
+    let after = &text[key_idx + key.len()..];
+    let sha: &str = after
+        .split(|c: char| c.is_whitespace() || c == ')')
+        .find(|s| !s.is_empty())?;
+    let sha = sha.trim();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha.to_string())
+    }
+}
+
+/// Bead jleechan-yoqy / issue #323: a stable hash of the PR body's evidence
+/// marker, used by `er_runner` to detect an evidence-only body update (same
+/// head commit, changed gist) and re-trigger `/er`. `None` marker hashes to a
+/// fixed sentinel so "no marker" is distinguishable from any real marker.
+pub fn evidence_marker_hash(body: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match parse_evidence(body) {
+        Some(ev) => {
+            ev.gist_id.hash(&mut hasher);
+            ev.head_sha.hash(&mut hasher);
+        }
+        None => "<no-evidence-marker>".hash(&mut hasher),
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 pub fn parse_er_verdict(comments: &[crate::tools::PrComment]) -> ErVerdict {
@@ -576,21 +762,20 @@ pub fn calculate_non_test_loc(files: &[crate::tools::PrFile]) -> u32 {
     total
 }
 
-pub fn check_integration_marker(body: &str, comments: &[crate::tools::PrComment]) -> bool {
-    let lower_body = body.to_lowercase();
-    if lower_body.contains("has_integration_evidence_marker") 
-       || lower_body.contains("integration-evidence") 
-       || lower_body.contains("integration evidence") 
-    {
-        return true;
-    }
-    for comment in comments {
-        let lower_comment = comment.body.to_lowercase();
-        if lower_comment.contains("has_integration_evidence_marker") 
-           || lower_comment.contains("integration-evidence") 
-           || lower_comment.contains("integration evidence") 
-        {
-            return true;
+/// Bead jleechan-yoqy / issue #323 r5 (finding 2): is a canonical evidence
+/// marker line PRESENT in `body` at all, regardless of whether it fully parses
+/// into a gist + head SHA? Distinguishes "marker present but incomplete"
+/// (fail-closed) from "no marker at all" (LOC floor applies). Matches
+/// [`crate::tools::EVIDENCE_MARKER`] leading a line, `**` optional,
+/// case-insensitive — the same leading-marker rule as `parse_evidence`.
+pub fn has_evidence_marker(body: &str) -> bool {
+    for line in body.lines() {
+        let cleaned = line.replace('*', "");
+        if let Some(idx) = cleaned.to_ascii_lowercase().find("evidence:") {
+            let prefix = cleaned[..idx].trim();
+            if prefix.trim_start_matches('-').trim().is_empty() {
+                return true;
+            }
         }
     }
     false
@@ -603,6 +788,15 @@ fn skeptic_gate(evidence: &PrEvidence) -> GateResult {
         Some(SkepticVerdict::Warn(_)) => GateResult::Green, // warn is non-blocking (spec §4.2.5)
         Some(SkepticVerdict::Fail(reason)) => GateResult::Red(reason.clone()),
     }
+    // NOTE (bead jleechan-984e / issue #385): the cross-model guarantee is
+    // enforced BELOW this point via `assess`. A `Pass`/`Warn` verdict from a
+    // single-family skeptic (`review_degraded == true`) is converted to Red
+    // there, after `assess` has the full `PrEvidence` and can attribute the
+    // reason to the cross-model failure rather than to the gate-7 verdict
+    // itself. Doing it here would force this helper to know about
+    // `review_degraded` AND about the Stage-1 `mock_llm` exemption (which is
+    // already encoded in `compute_review_degraded`'s empty-family filter); the
+    // assess-site wiring keeps `skeptic_gate` verdict-only.
 }
 
 /// Assess all 7 gates for `pr` (spec §4.2.5, design doc §5). `repo` (bead
@@ -625,6 +819,23 @@ pub fn assess(
     cfg: &Config,
     evidence: &PrEvidence,
 ) -> Result<GateReport, crate::errors::DaemonError> {
+    // Bead jleechan-984e / issue #385: cross-model skeptic guarantee. The
+    // base skeptic verdict is the gate-7 parser's output; a Pass/Warn from
+    // a single-family review (`review_degraded == true`) is converted to Red
+    // here so strict merge policy (#328) refuses strict-green in that
+    // case. The `compute_review_degraded` filter already excludes the
+    // test-repo `mock_llm` path and the zero-vendors total-outage path, so
+    // this only fires when real vendors ran and they all belonged to the
+    // same family. Fail verdicts are already Red and are left alone — we
+    // do not mask the verdict's own reason with a cross-model one.
+    let skeptic_with_cross_model = match (skeptic_gate(evidence), evidence.review_degraded) {
+        (GateResult::Green, true) => GateResult::Red(
+            "cross-model skeptic guarantee violated: only one model family contributed to the review (issue #385, strict merge policy #328)"
+                .to_string(),
+        ),
+        (other, _) => other,
+    };
+
     let snapshot = match scm.pr_snapshot_for_repo(repo, pr) {
         Ok(snapshot) => snapshot,
         Err(e) => {
@@ -641,10 +852,9 @@ pub fn assess(
                     GateResult::Unknown(reason.clone()),
                 ),
                 (GateName::BugbotClean, GateResult::Unknown(reason.clone())),
-                (GateName::CommentsResolved, GateResult::Unknown(reason.clone())),
+                (GateName::CommentsResolved, GateResult::Unknown(reason)),
                 (GateName::EvidenceFloor, evidence_floor_gate(evidence)),
-                (GateName::Skeptic, skeptic_gate(evidence)),
-                (GateName::VacuousRedGreen, GateResult::Unknown(reason.clone())),
+                (GateName::Skeptic, skeptic_with_cross_model),
             ];
             let all_green = results.iter().all(|(_, r)| r.is_green());
             return Ok(GateReport { results, all_green });
@@ -699,16 +909,7 @@ pub fn assess(
     };
 
     let evidence_floor = evidence_floor_gate(evidence);
-    let skeptic = skeptic_gate(evidence);
-
-    // jleechan-5y4k (PR #472 followup): vacuous_red_green gate.
-    // Pulls the per-PR vacuous-red-green detector result off evidence
-    // (default: pass). When future iterations of the detector flag a
-    // vacuous red→green flip, the gate goes Red.
-    let vacuous_red_green = Some(true) // default: pass (no detector signal)
-        .as_ref()
-        .map(|passed| if *passed { GateResult::Green } else { GateResult::Red("vacuous red→green detected".to_string()) })
-        .unwrap_or(GateResult::Green);
+    let skeptic = skeptic_with_cross_model;
 
     let results = [
         (GateName::Ci, ci),
@@ -718,7 +919,6 @@ pub fn assess(
         (GateName::CommentsResolved, comments_resolved),
         (GateName::EvidenceFloor, evidence_floor),
         (GateName::Skeptic, skeptic),
-        (GateName::VacuousRedGreen, vacuous_red_green),
     ];
     let all_green = results.iter().all(|(_, r)| r.is_green());
 
@@ -940,11 +1140,8 @@ mod tests {
             updated_at_epoch: 0,
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
-            bugbot_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![],
         }
     }
 
@@ -966,11 +1163,8 @@ mod tests {
             updated_at_epoch: 0,
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
-            bugbot_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![],
         }
     }
 
@@ -982,7 +1176,6 @@ mod tests {
         PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1179,7 +1372,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 150,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1189,22 +1381,27 @@ mod tests {
 
         assert!(!report.all_green);
         match gate(&report, GateName::EvidenceFloor) {
-            GateResult::Red(reason) => assert_eq!(reason, "evidence floor"),
-            other => panic!("expected Red(\"evidence floor\"), got {other:?}"),
+            GateResult::Red(reason) => assert!(
+                reason.starts_with("evidence floor"),
+                "expected an evidence-floor Red, got: {reason}"
+            ),
+            other => panic!("expected Red(evidence floor), got {other:?}"),
         }
     }
 
+    /// r5 finding 1: a large diff greens the evidence gate ONLY via a VERIFIED
+    /// canonical evidence gist — the legacy substring marker no longer counts.
     #[test]
-    fn large_diff_with_evidence_marker_is_green() {
+    fn large_diff_with_verified_canonical_evidence_is_green() {
         let mut scm = FakeScm::default();
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 150,
-            has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            evidence_gist_status: EvidenceGistStatus::Verified,
             ..Default::default()
         };
 
@@ -1222,7 +1419,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 100, // exactly at the floor, not over it
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1242,7 +1438,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Fail("wrong fix".into())),
             ..Default::default()
@@ -1265,7 +1460,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Warn("minor nit".into())),
             ..Default::default()
@@ -1285,7 +1479,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: None,
             ..Default::default()
@@ -1298,6 +1491,164 @@ mod tests {
             gate(&report, GateName::Skeptic),
             GateResult::Unknown(_)
         ));
+    }
+
+    // --- Bead jleechan-984e / issue #385: review_degraded gate ---
+    //
+    // r1 (#391) plumbed the `review_degraded` flag into `PrEvidence` and
+    // GATE_ASSESSMENT telemetry. Strict merge policy (#328) requires that
+    // a single-family skeptic review cannot pass `all_green`. r2 wires the
+    // flag into `skeptic_gate` so a `Pass` verdict whose contributing
+    // reviewers span fewer than two distinct model families is Red (not
+    // Green). The flag is `false` for the test-repo `mock_llm` path and
+    // for the zero-vendors total-outage path (per `compute_review_degraded`),
+    // so neither regresses.
+    #[test]
+    fn skeptic_pass_with_review_degraded_is_red_not_green() {
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            skeptic_reviewers: vec!["claude".to_string()],
+            review_degraded: true,
+            ..Default::default()
+        };
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        assert!(!report.all_green, "issue #385: single-family Pass must NOT be all_green");
+        match gate(&report, GateName::Skeptic) {
+            GateResult::Red(reason) => assert!(
+                reason.contains("review_degraded") || reason.contains("cross-model"),
+                "Red reason must name the cross-model failure, got {reason:?}"
+            ),
+            other => panic!("expected Red for review_degraded Pass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skeptic_warn_with_review_degraded_is_red_not_green() {
+        // Same rule applies to Warn: warn is non-blocking for the verifier,
+        // but a single-family warn still violates the cross-model guarantee.
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Warn("minor nit".into())),
+            skeptic_reviewers: vec!["claude".to_string()],
+            review_degraded: true,
+            ..Default::default()
+        };
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        assert!(!report.all_green);
+        assert!(matches!(gate(&report, GateName::Skeptic), GateResult::Red(_)));
+    }
+
+    #[test]
+    fn skeptic_pass_with_two_families_is_green() {
+        // Healthy path: two distinct model families (claude=anthropic +
+        // codex=openai) → review_degraded=false → Pass stays Green.
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            skeptic_reviewers: vec!["claude".to_string(), "codex".to_string()],
+            review_degraded: false,
+            ..Default::default()
+        };
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        assert!(report.all_green, "two distinct families with Pass must be all_green");
+        assert!(gate(&report, GateName::Skeptic).is_green());
+    }
+
+    #[test]
+    fn skeptic_pass_with_mock_llm_is_green() {
+        // Stage-1 test-repo path: a single mock_llm Llm::judge call. Per
+        // `compute_review_degraded`, this sets review_degraded=false so
+        // the cross-model gate does not fire on test fixtures.
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            skeptic_reviewers: vec!["mock_llm".to_string()],
+            review_degraded: false,
+            ..Default::default()
+        };
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        assert!(report.all_green, "mock_llm Pass with review_degraded=false stays green");
+        assert!(gate(&report, GateName::Skeptic).is_green());
+    }
+
+    #[test]
+    fn skeptic_pass_with_empty_reviewers_is_green() {
+        // Zero-vendors total-outage path: no verdict was produced (but in
+        // this scenario a Pass was still recorded somehow). The skeptic
+        // gate's verdict is what matters; review_degraded stays false when
+        // no real vendors contributed. The cross-model gate does not fire.
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            skeptic_reviewers: vec![],
+            review_degraded: false,
+            ..Default::default()
+        };
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        assert!(report.all_green);
+        assert!(gate(&report, GateName::Skeptic).is_green());
+    }
+
+    #[test]
+    fn skeptic_fail_with_review_degraded_still_red() {
+        // A Red verdict wins regardless of review_degraded (the Fail reason
+        // is preserved).
+        let mut scm = FakeScm::default();
+        scm.snapshots.insert(7, all_green_snapshot(7));
+        let cfg = test_cfg();
+        let evidence = PrEvidence {
+            is_production: true,
+            non_test_changed_loc: 10,
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Fail("wrong fix".into())),
+            skeptic_reviewers: vec!["claude".to_string(), "agy".to_string()],
+            review_degraded: false,
+            ..Default::default()
+        };
+
+        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
+
+        assert!(!report.all_green);
+        match gate(&report, GateName::Skeptic) {
+            GateResult::Red(reason) => assert_eq!(reason, "wrong fix"),
+            other => panic!("expected Red('wrong fix'), got {other:?}"),
+        }
     }
 
     #[test]
@@ -1330,7 +1681,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10, // well under the floor
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Absent,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1379,7 +1729,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10, // well under the floor
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Fail,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1402,7 +1751,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1423,7 +1771,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 150,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1433,22 +1780,22 @@ mod tests {
 
         assert!(!report.all_green);
         match gate(&report, GateName::EvidenceFloor) {
-            GateResult::Red(reason) => assert_eq!(reason, "evidence floor"),
-            other => panic!("expected Red(\"evidence floor\"), got {other:?}"),
+            GateResult::Red(reason) => assert!(reason.starts_with("evidence floor"), "got: {reason}"),
+            other => panic!("expected Red(evidence floor), got {other:?}"),
         }
     }
 
     #[test]
-    fn er_pass_with_large_diff_and_evidence_marker_is_green() {
+    fn er_pass_with_large_diff_and_verified_evidence_is_green() {
         let mut scm = FakeScm::default();
         scm.snapshots.insert(7, all_green_snapshot(7));
         let cfg = test_cfg();
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 150,
-            has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: Some(SkepticVerdict::Pass),
+            evidence_gist_status: EvidenceGistStatus::Verified,
             ..Default::default()
         };
 
@@ -1468,7 +1815,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 150,
-            has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Absent,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1491,7 +1837,6 @@ mod tests {
         let evidence = PrEvidence {
             is_production: true,
             non_test_changed_loc: 150,
-            has_integration_evidence_marker: true,
             er_verdict: ErVerdict::Fail,
             skeptic_verdict: Some(SkepticVerdict::Pass),
             ..Default::default()
@@ -1530,96 +1875,6 @@ mod tests {
 
         let msg = "fail\nMore context.\nVerdict: PASS\nFooter mentions fail again.\n";
         assert_eq!(parse_skeptic_verdict(msg), Some(SkepticVerdict::Pass));
-    }
-
-    // --- Task 3 (reviewer-outage-resilience): outage annotation in gate results
-    //
-    // When a review provider is in-outage, its gate key in GATE_ASSESSMENT
-    // telemetry carries the canonical "waived_vendor_unavailable" token
-    // instead of the normal verdict. Only the provider's OWN gate is waived;
-    // every other gate keeps its real verdict and remains fully enforced.
-
-    #[test]
-    fn to_json_with_outage_waives_bugbot_gate_only() {
-        let mut scm = FakeScm::default();
-        scm.snapshots.insert(7, all_green_snapshot(7));
-        let cfg = test_cfg();
-        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
-
-        let json = report.to_json_with_outage(&["bugbot"]);
-        let gates = json.get("gates").unwrap().as_object().unwrap();
-        assert_eq!(
-            gates.get("bugbot").unwrap().as_str().unwrap(),
-            "waived_vendor_unavailable"
-        );
-        assert_eq!(gates.get("coderabbit").unwrap().as_str().unwrap(), "pass");
-    }
-
-    #[test]
-    fn to_json_with_outage_waives_both_providers() {
-        let mut scm = FakeScm::default();
-        scm.snapshots.insert(7, all_green_snapshot(7));
-        let cfg = test_cfg();
-        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
-
-        let json = report.to_json_with_outage(&["coderabbit", "bugbot"]);
-        let gates = json.get("gates").unwrap().as_object().unwrap();
-        assert_eq!(
-            gates.get("coderabbit").unwrap().as_str().unwrap(),
-            "waived_vendor_unavailable"
-        );
-        assert_eq!(
-            gates.get("bugbot").unwrap().as_str().unwrap(),
-            "waived_vendor_unavailable"
-        );
-        // Non-provider gates still pass.
-        assert_eq!(gates.get("ci_green").unwrap().as_str().unwrap(), "pass");
-        assert_eq!(gates.get("skeptic").unwrap().as_str().unwrap(), "pass");
-    }
-
-    #[test]
-    fn to_json_with_outage_empty_unchanged_from_to_json() {
-        // Empty outage list must produce identical output to to_json() so the
-        // healthy path is byte-identical to before Task 3.
-        let mut scm = FakeScm::default();
-        scm.snapshots.insert(7, all_green_snapshot(7));
-        let cfg = test_cfg();
-        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
-
-        assert_eq!(report.to_json(), report.to_json_with_outage(&[]));
-    }
-
-    #[test]
-    fn to_json_with_outage_preserves_red_and_unknown_for_other_gates() {
-        // A Red evidence gate + Unknown comments gate must stay Red/Unknown
-        // even when a provider is waived — the waiver covers ONLY the
-        // provider's own gate key.
-        let mut scm = FakeScm::default();
-        scm.snapshots.insert(7, snapshot_with_unknown_thread_count(7));
-        let cfg = test_cfg();
-        let evidence = PrEvidence {
-            is_production: true,
-            non_test_changed_loc: 150,
-            er_verdict: ErVerdict::Fail,
-            skeptic_verdict: Some(SkepticVerdict::Pass),
-            ..Default::default()
-        };
-        let report = assess(&scm, 7, &cfg.target_repo, &cfg, &evidence).unwrap();
-        assert!(!report.all_green);
-
-        let json = report.to_json_with_outage(&["coderabbit"]);
-        let gates = json.get("gates").unwrap().as_object().unwrap();
-        // coderabbit waived.
-        assert_eq!(
-            gates.get("coderabbit").unwrap().as_str().unwrap(),
-            "waived_vendor_unavailable"
-        );
-        // evidence_review stays Red (object form).
-        let ev = gates.get("evidence_review").unwrap().as_object().unwrap();
-        assert_eq!(ev.get("verdict").unwrap().as_str().unwrap(), "fail");
-        // comments_resolved stays Unknown (object form).
-        let cr = gates.get("comments_resolved").unwrap().as_object().unwrap();
-        assert_eq!(cr.get("verdict").unwrap().as_str().unwrap(), "unknown");
     }
 
     #[test]
@@ -1893,21 +2148,9 @@ mod tests {
         assert_eq!(calculate_non_test_loc(&files), 130);
     }
 
-    #[test]
-    fn test_check_integration_marker() {
-        use crate::tools::PrComment;
-        // PR body contains marker
-        assert!(check_integration_marker("Here is the has_integration_evidence_marker", &[]));
-        assert!(check_integration_marker("Here is the integration-evidence proof", &[]));
-        assert!(check_integration_marker("Here is the integration evidence proof", &[]));
-
-        // Comment contains marker
-        let comments = vec![PrComment { author: "alice".into(), body: "Found integration evidence".into(), created_at_epoch: 0 }];
-        assert!(check_integration_marker("No marker here", &comments));
-
-        // Neither contains marker
-        assert!(!check_integration_marker("No marker here", &[]));
-    }
+    // r5 finding 1: `check_integration_marker` (the legacy substring floor) is
+    // DELETED — the canonical verified evidence path is the only way a large
+    // diff's evidence goes green (see the evidence_gate_* tests below).
 
     #[test]
     fn test_evidence_floor_gate_production_vs_non_production() {
@@ -1915,7 +2158,6 @@ mod tests {
         let prod_pass = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: None,
             ..Default::default()
@@ -1925,7 +2167,6 @@ mod tests {
         let prod_partial = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Partial,
             skeptic_verdict: None,
             ..Default::default()
@@ -1936,7 +2177,6 @@ mod tests {
         let non_prod_partial = PrEvidence {
             is_production: false,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Partial,
             skeptic_verdict: None,
             ..Default::default()
@@ -1946,7 +2186,6 @@ mod tests {
         let non_prod_pass = PrEvidence {
             is_production: false,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Pass,
             skeptic_verdict: None,
             ..Default::default()
@@ -1957,7 +2196,6 @@ mod tests {
         let prod_fail = PrEvidence {
             is_production: true,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Fail,
             skeptic_verdict: None,
             ..Default::default()
@@ -1967,7 +2205,6 @@ mod tests {
         let non_prod_inconclusive = PrEvidence {
             is_production: false,
             non_test_changed_loc: 10,
-            has_integration_evidence_marker: false,
             er_verdict: ErVerdict::Inconclusive,
             skeptic_verdict: None,
             ..Default::default()
@@ -2078,10 +2315,6 @@ mod tests {
                 ),
                 (GateName::EvidenceFloor, GateResult::Unknown("fetch failed".into())),
                 (GateName::Skeptic, GateResult::Unknown("fetch failed".into())),
-                (
-                    GateName::VacuousRedGreen,
-                    GateResult::Unknown("fetch failed".into()),
-                ),
             ],
         };
         assert_eq!(classify_chain(&report), ChainDisposition::TransientOnly);
@@ -2160,5 +2393,246 @@ mod tests {
         let cfg = test_cfg();
         let report = assess(&scm, 7, &cfg.target_repo, &cfg, &all_green_evidence()).unwrap();
         assert_eq!(classify_chain(&report), ChainDisposition::TransientOnly);
+    }
+
+    // --- jleechan-yoqy / issue #323: canonical evidence contract tests ---
+
+    /// ROUND-TRIP: the EXACT string the coder-dispatch prompt mandates
+    /// (`{EVIDENCE_MARKER} <gist-url> (head <sha>)`) must parse back to the
+    /// gist id and head SHA. This is the contract that ties the prompt, the
+    /// reviewer, and the parser to one literal.
+    #[test]
+    fn evidence_marker_round_trips_from_prompt_mandated_string() {
+        let gist_id = "abc123def456";
+        let head = "deadbeefcafe";
+        // Build exactly as the prompt instructs, using the shared constant.
+        let line = format!(
+            "{} https://gist.github.com/octocat/{gist_id} (head {head})",
+            crate::tools::EVIDENCE_MARKER
+        );
+        let body = format!("Some PR description.\n\n{line}\n\nMore text.");
+        let parsed = parse_evidence(&body).expect("prompt-mandated evidence line must parse");
+        assert_eq!(parsed.gist_id, gist_id);
+        assert_eq!(parsed.head_sha, head);
+    }
+
+    #[test]
+    fn evidence_marker_parse_tolerates_case_and_missing_bold_and_bullet() {
+        // Bold markers optional, case-insensitive, leading `-` bullet tolerated.
+        let body = "- evidence: https://gist.github.com/u/deadid (head abc123)";
+        let parsed = parse_evidence(body).unwrap();
+        assert_eq!(parsed.gist_id, "deadid");
+        assert_eq!(parsed.head_sha, "abc123");
+
+        // Bare gist URL with no user path segment.
+        let body2 = "**EVIDENCE**: https://gist.github.com/onlyid (head ffff)";
+        let parsed2 = parse_evidence(body2).unwrap();
+        assert_eq!(parsed2.gist_id, "onlyid");
+    }
+
+    #[test]
+    fn evidence_marker_absent_or_incomplete_parses_none() {
+        assert_eq!(parse_evidence("no marker here"), None);
+        // Prose mentioning evidence mid-line is not the marker.
+        assert_eq!(
+            parse_evidence("we added evidence: see the tests"),
+            None,
+            "a non-gist evidence line must not falsely parse"
+        );
+        // Marker + gist but no (head ..) clause.
+        assert_eq!(
+            parse_evidence("**Evidence**: https://gist.github.com/u/x"),
+            None
+        );
+    }
+
+    #[test]
+    fn evidence_marker_hash_changes_with_gist_and_is_stable() {
+        let a = "**Evidence**: https://gist.github.com/u/g1 (head h1)";
+        let b = "**Evidence**: https://gist.github.com/u/g2 (head h1)"; // gist changed
+        let none = "no evidence marker";
+        assert_eq!(evidence_marker_hash(a), evidence_marker_hash(a), "stable");
+        assert_ne!(
+            evidence_marker_hash(a),
+            evidence_marker_hash(b),
+            "an evidence-only gist change must change the hash"
+        );
+        assert_ne!(evidence_marker_hash(a), evidence_marker_hash(none));
+    }
+
+    fn evidence_with_status(status: EvidenceGistStatus) -> PrEvidence {
+        PrEvidence {
+            is_production: false,
+            non_test_changed_loc: 500, // above the LOC floor
+            er_verdict: ErVerdict::Pass,
+            skeptic_verdict: Some(SkepticVerdict::Pass),
+            evidence_gist_status: status,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn evidence_gate_verified_is_green_even_above_loc_floor() {
+        let ev = evidence_with_status(EvidenceGistStatus::Verified);
+        assert!(matches!(evidence_floor_gate(&ev), GateResult::Green));
+    }
+
+    #[test]
+    fn evidence_gate_failed_is_red_with_distinct_text() {
+        let ev = evidence_with_status(EvidenceGistStatus::Failed(
+            "evidence gist abc is empty".to_string(),
+        ));
+        match evidence_floor_gate(&ev) {
+            GateResult::Red(reason) => {
+                assert!(
+                    reason.contains("evidence contract") && reason.contains("empty"),
+                    "distinct evidence-failure text expected, got: {reason}"
+                );
+            }
+            other => panic!("expected Red, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evidence_gate_not_provided_above_floor_is_red_no_legacy_bypass() {
+        // r5 finding 1: no canonical marker + above the LOC floor => Red. The
+        // legacy substring floor that used to green this is deleted.
+        let ev = evidence_with_status(EvidenceGistStatus::NotProvided);
+        match evidence_floor_gate(&ev) {
+            GateResult::Red(reason) => assert!(
+                reason.starts_with("evidence floor"),
+                "got: {reason}"
+            ),
+            other => panic!("expected Red(evidence floor), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evidence_gate_pending_is_unknown_not_red() {
+        // r5 finding 3: a transient gist-fetch failure must be Unknown (wait),
+        // never Red (which would churn a reroll on gh noise).
+        let ev = evidence_with_status(EvidenceGistStatus::Pending(
+            "gist g fetch failed transiently".to_string(),
+        ));
+        match evidence_floor_gate(&ev) {
+            GateResult::Unknown(reason) => assert!(
+                reason.contains("pending"),
+                "expected a pending Unknown, got: {reason}"
+            ),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    // jleechan-984e / issue #385: vendor → model family taxonomy.
+    // Tests assert the EXACT family strings, not just distinctness, so
+    // any future rename or family merge fails loudly instead of silently
+    // collapsing two "different" vendors into one family.
+    #[test]
+    fn vendor_model_family_known_vendors() {
+        assert_eq!(vendor_model_family("claude"), "anthropic");
+        assert_eq!(vendor_model_family("minimax"), "minimax");
+        assert_eq!(vendor_model_family("codex"), "openai");
+        assert_eq!(vendor_model_family("agy"), "google-antigravity");
+        assert_eq!(vendor_model_family("gemini"), "google-gemini");
+        assert_eq!(vendor_model_family("cursor-agent"), "cursor");
+        // Bare `cursor` alias must map to the same family so dispatch
+        // routing and telemetry stay consistent regardless of which
+        // spelling the priority list uses.
+        assert_eq!(vendor_model_family("cursor"), "cursor");
+    }
+
+    #[test]
+    fn vendor_model_family_unknown_and_mock_return_empty() {
+        // Unknown / mock labels must NOT silently collapse into a real
+        // family — `compute_review_degraded` filters empty families, so
+        // returning `""` here keeps them inert rather than accidentally
+        // satisfying the cross-model guarantee.
+        assert_eq!(vendor_model_family("mock_llm"), "");
+        assert_eq!(vendor_model_family("nonsense_vendor"), "");
+        assert_eq!(vendor_model_family(""), "");
+    }
+
+    // jleechan-984e / issue #385: `compute_review_degraded` is true iff
+    // the contributor set covers fewer than TWO distinct non-empty
+    // model families.
+    #[test]
+    fn compute_review_degraded_empty_is_false() {
+        // Zero contributors cannot violate the cross-model guarantee.
+        assert!(!compute_review_degraded(&[]));
+    }
+
+    #[test]
+    fn compute_review_degraded_single_family_is_true() {
+        // The exact production scenario from the issue: codex quota-dead,
+        // agy/cursor-agent errored, so only claude contributed.
+        let v = vec!["claude".to_string()];
+        assert!(
+            compute_review_degraded(&v),
+            "single claude contributor must be review_degraded (issue #385 acceptance)"
+        );
+    }
+
+    #[test]
+    fn compute_review_degraded_two_distinct_families_is_false() {
+        // Codex (openai) + claude (anthropic) → two distinct families →
+        // strict merge policy can treat this as strict-green.
+        let v = vec!["codex".to_string(), "claude".to_string()];
+        assert!(
+            !compute_review_degraded(&v),
+            "codex+claude (two distinct families) must NOT be degraded"
+        );
+    }
+
+    #[test]
+    fn compute_review_degraded_same_family_deduped_is_true() {
+        // Two contributors from the SAME family — a same-model review —
+        // shares the coder's blind spots and must be flagged degraded.
+        // `agy` and `gemini` both come from Google but they are distinct
+        // families in the taxonomy, so this test specifically uses two
+        // claude contributors (impossible in practice but defensive).
+        let v = vec!["claude".to_string(), "claude".to_string()];
+        assert!(
+            compute_review_degraded(&v),
+            "duplicate claude contributors (single family) must be degraded"
+        );
+    }
+
+    #[test]
+    fn compute_review_degraded_agy_and_cursor_are_two_families() {
+        // The exact healthy-path acceptance case from the issue:
+        // `agy` falls through and a different-family vendor (cursor)
+        // also contributed — degraded MUST be false.
+        let v = vec!["agy".to_string(), "cursor-agent".to_string()];
+        assert!(
+            !compute_review_degraded(&v),
+            "agy + cursor-agent are distinct families and must NOT be degraded"
+        );
+    }
+
+    #[test]
+    fn compute_review_degraded_mock_llm_does_not_count() {
+        // The Stage-1 test-repo path produces a `["mock_llm"]` list —
+        // `vendor_model_family("mock_llm") == ""` so the family set is
+        // empty and the degraded flag is false (no real cross-model
+        // guarantee to violate in the test path).
+        let v = vec!["mock_llm".to_string()];
+        assert!(
+            !compute_review_degraded(&v),
+            "test-repo mock_llm-only contributor must NOT be flagged \
+             degraded (no real family to cross-check against)"
+        );
+    }
+
+    #[test]
+    fn compute_review_degraded_google_split_is_two_families() {
+        // agy (Google Antigravity) and gemini (Google Gemini CLI) are
+        // operated as separate CLIs/quota pools per the dispatch_reviewer
+        // comment, so they count as two distinct families even though
+        // both are Google-distributed.
+        let v = vec!["agy".to_string(), "gemini".to_string()];
+        assert!(
+            !compute_review_degraded(&v),
+            "agy + gemini are distinct Google families and must NOT be degraded"
+        );
     }
 }

@@ -320,8 +320,8 @@ fn test_cfg() -> Config {
         reroll_head_stability_window_secs: 1,
         reroll_death_confirm_secs: 0,
         held_recheck_cooldown_secs: 900,
-        escalation_refire_secs: 3600,
         repos: std::collections::HashMap::new(),
+        pre_gate_validation_enabled: false,
     }
 }
 
@@ -340,11 +340,8 @@ fn all_green_snapshot(pr: u64) -> PrSnapshot {
         updated_at_epoch: 0,
         ci_status: "green".into(),
         coderabbit_status: "green".into(),
-        bugbot_status: "green".into(),
         ci_pending: false,
         head_committed_epoch: 0,
-        pending_check_names: vec![],
-        check_names_and_buckets: vec![],
     }
 }
 

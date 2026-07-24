@@ -241,6 +241,99 @@ mod tests {
         assert!(ext.security_redaction_encountered);
     }
 
+    /// Recording fake LLM: captures the prompt the constraint-extract
+    /// path passes to `judge()` so the test can assert the verbatim
+    /// text reaches the LLM-extract prompt. This is the Rust side of
+    /// the r3 end-to-end invariant from issue #386 gap 6: a contract-
+    /// failed gate MUST emit a failure reason that contains the
+    /// verbatim acceptance-item text, and that text MUST flow through
+    /// `constraints::extract`'s LLM prompt so the next-round worker's
+    /// constraint block carries the exact problem, not a paraphrase.
+    struct RecordingLlm {
+        last_prompt: std::sync::Mutex<String>,
+        reply: String,
+    }
+    impl RecordingLlm {
+        fn new(reply: String) -> Self {
+            Self {
+                last_prompt: std::sync::Mutex::new(String::new()),
+                reply,
+            }
+        }
+        fn last_prompt(&self) -> String {
+            self.last_prompt.lock().unwrap().clone()
+        }
+    }
+    impl Llm for RecordingLlm {
+        fn judge(&self, prompt: &str) -> Result<String, DaemonError> {
+            *self.last_prompt.lock().unwrap() = prompt.to_string();
+            Ok(self.reply.clone())
+        }
+    }
+
+    /// End-to-end Rust test for the r3 contract-echo redispatch loop
+    /// (issue #386 gap 6): the failure reason emitted by a contract-
+    /// failed gate (Python SkepticResult.reason) is fed to the
+    /// daemon's `constraints::extract` as `review_text`. The verbatim
+    /// acceptance-item text MUST reach the LLM-extract prompt so the
+    /// next-round worker's constraints carry the exact problem.
+    ///
+    /// This mirrors `tests/test_skeptic_contract_echo_redispatch.py`
+    /// on the Rust side and proves the wiring without spawning the
+    /// daemon subprocess.
+    #[test]
+    fn test_extract_receives_unaddressed_verbatim_from_contract_failed_gate() {
+        // Simulate SkepticResult.reason from a contract-failed gate
+        // whose required=true acceptance item was N-A'd away. The
+        // text "required=true acceptance items must NOT be N-A-
+        // eligible" is the exact acceptance-item text from the bead.
+        let review_text = "\
+            UNADDRESSED ACCEPTANCE ITEMS:\n\
+            - A2 [REQUIRED]: required=true acceptance items must NOT be N-A-eligible\n\
+            \n\
+            Reviewer returned N-A for required=true item A2; \
+            gate fails closed per spec §4.2.5. Required items cannot \
+            be skipped.\n";
+        let reply = r#"{"inhibitionSpecs":[],"positiveAssertions":["required=true acceptance items must NOT be N-A-eligible"],"securityRedactionEncountered":false}"#.to_string();
+        let llm = RecordingLlm::new(reply);
+        let ext = extract(&llm, review_text).unwrap();
+        // The verbatim acceptance-item text MUST appear in the LLM
+        // prompt that the daemon's extractor sends. If it doesn't,
+        // the next-round worker only sees a paraphrase, which is
+        // exactly the failure mode r3 fixes.
+        let prompt = llm.last_prompt();
+        assert!(
+            prompt.contains("required=true acceptance items must NOT be N-A-eligible"),
+            "verbatim acceptance-item text must reach the constraint-extract LLM prompt; got prompt: {prompt:?}",
+        );
+        // Sanity: the extractor must surface that verbatim text as a
+        // positive assertion (the LLM mirrored it back), which is what
+        // gets appended to the bead's spec.toml for the next roll.
+        assert!(
+            ext.positive_assertions.iter().any(|s| s.contains("required=true acceptance items must NOT be N-A-eligible")),
+            "verbatim acceptance-item text must surface in positive_assertions; got: {:?}",
+            ext.positive_assertions,
+        );
+    }
+
+    /// Companion to the test above: even when the LLM reply contains
+    /// NO usable JSON, the prompt must still carry the verbatim text
+    /// (so a misbehaving LLM doesn't lose the constraint). The
+    /// extractor will return Err, but the prompt was correct.
+    #[test]
+    fn test_extract_prompt_carries_verbatim_text_on_unparseable_reply() {
+        let review_text = "\
+            UNADDRESSED ACCEPTANCE ITEMS:\n\
+            - A1 [REQUIRED]: the wire format MUST carry the bead ID\n";
+        let llm = RecordingLlm::new("not json".to_string());
+        let _ = extract(&llm, review_text);
+        let prompt = llm.last_prompt();
+        assert!(
+            prompt.contains("the wire format MUST carry the bead ID"),
+            "verbatim text must reach the prompt even on unparseable reply; got: {prompt:?}",
+        );
+    }
+
     #[test]
     fn test_append_mutation() {
         let temp_dir = std::env::temp_dir().join("acd_constraints_test");

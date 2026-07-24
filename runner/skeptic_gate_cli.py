@@ -51,6 +51,7 @@ from typing import List, Optional, Tuple
 
 from runner.skeptic_gate import (
     MARKER,
+    BeadContract,
     ReadBackCheck,
     SkepticResult,
     aggregate_results,
@@ -59,6 +60,8 @@ from runner.skeptic_gate import (
     evaluate,
     extract_implementation_identity_from_commit,
     format_comment,
+    load_bead_contract,
+    load_bead_contract_from_bead,
     verify_published_comment,
     verify_provenance,
 )
@@ -734,8 +737,46 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="Disable performance logging under --perf-log-dir.",
     )
+    parser.add_argument(
+        "--contract-file",
+        default=os.environ.get("SKEPTIC_CONTRACT_FILE", ""),
+        help=(
+            "Path to a JSON file describing the bead's contract (issue #386). "
+            "When supplied, the reviewer prompt embeds the bead's prior "
+            "findings + acceptance items and the gate requires per-item "
+            "verdicts (ADDRESSED / NOT-ADDRESSED / N-A). Without this flag "
+            "the gate runs the legacy 10-field contract (issue #384)."
+        ),
+    )
+    parser.add_argument(
+        "--bead-id",
+        default=os.environ.get("SKEPTIC_BEAD_ID", ""),
+        help=(
+            "Bead id (e.g. 'jleechan-pq08') — when supplied, the gate loads "
+            "the contract from the live `br show --json <id>` source via "
+            "`load_bead_contract_from_bead`. Closes r3 gap 2 (no bead-loading "
+            "path). Mutually exclusive with --contract-file; if both are set "
+            "the CLI fails closed (exit 2) — never silently pick one."
+        ),
+    )
+    parser.add_argument(
+        "--br-bin",
+        default=os.environ.get("SKEPTIC_BR_BIN", "br"),
+        help=(
+            "Path to the `br` binary used by --bead-id. Defaults to `br` "
+            "on PATH. Override for self-hosted runners where the binary "
+            "is pinned at a non-default path."
+        ),
+    )
     args = parser.parse_args(argv)
     env = os.environ
+
+    if args.contract_file and args.bead_id:
+        raise SystemExit(
+            "[skeptic-gate] FATAL: --contract-file and --bead-id are mutually "
+            "exclusive; supply one or the other (or neither for the legacy "
+            "10-field contract, issue #384)."
+        )
 
     reviewers = _parse_reviewers(args.reviewers_json)
 
@@ -833,6 +874,58 @@ def main(argv: Optional[list[str]] = None) -> int:
         repo, args.pr_number, head_sha
     )
 
+    # ---- 3a. Load bead contract (issue #386 r3) -----------------------------
+    # When the workflow operator wires `--contract-file` or `--bead-id`,
+    # the gate must enforce per-item verdicts against the bead's
+    # acceptance items. A missing or unreadable contract source is a
+    # hard error — we never silently fall back to the legacy 10-field
+    # contract when the operator asked for the contract-echo step.
+    contract: Optional[BeadContract] = None
+    if args.contract_file:
+        try:
+            contract = load_bead_contract(args.contract_file)
+        except (ValueError, TypeError, FileNotFoundError, json.JSONDecodeError) as exc:
+            print(
+                f"[skeptic-gate] contract load failed: {exc}; "
+                "refusing to gate without the operator-supplied contract",
+                file=sys.stderr,
+            )
+            _emit_perf_log(
+                perf_log_dir=args.perf_log_dir,
+                enabled=not args.no_perf_log,
+                repo=repo,
+                pr_number=args.pr_number,
+                head_sha=head_sha,
+                outcome="failure",
+                duration_ms=int((time.monotonic() - _perf_start) * 1000),
+            )
+            return 2
+    elif args.bead_id:
+        # r3 gap 2: load the contract from `br show --json <bead_id>`
+        # so production never depends on a hand-authored contract file.
+        # `load_bead_contract_from_bead` fails closed on subprocess or
+        # parse errors — never silently fabricates a contract.
+        try:
+            contract = load_bead_contract_from_bead(
+                args.bead_id, br_bin=args.br_bin or "br"
+            )
+        except (RuntimeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            print(
+                f"[skeptic-gate] bead contract load failed for {args.bead_id!r}: {exc}; "
+                "refusing to gate without the operator-supplied contract",
+                file=sys.stderr,
+            )
+            _emit_perf_log(
+                perf_log_dir=args.perf_log_dir,
+                enabled=not args.no_perf_log,
+                repo=repo,
+                pr_number=args.pr_number,
+                head_sha=head_sha,
+                outcome="failure",
+                duration_ms=int((time.monotonic() - _perf_start) * 1000),
+            )
+            return 2
+
     # ---- 4. Build prompt ----------------------------------------------------
     prompt = build_prompt(
         repo=repo,
@@ -841,6 +934,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         base_sha="unknown",
         diff=diff,
         implementation_identity=implementation_identity,
+        contract=contract,
     )
 
     print(
@@ -878,6 +972,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             base_sha="unknown",
             diff=diff,
             reviewer=reviewer_name,
+            contract=contract,
         )
         per_reviewer.append(result)
         print(

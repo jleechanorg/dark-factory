@@ -9,9 +9,8 @@
 
 use daemon::errors::DaemonError;
 use daemon::state::{
-    BeadOverlay,
-    HumanHoldReason, OverlayState, StateStore, VendorHealth,
-    is_permanent_human_hold_reason, set_human_hold_reason,
+    is_permanent_human_hold_reason, set_human_hold_reason, BeadOverlay, HumanHoldReason,
+    OverlayState, StateStore,
 };
 use daemon::tools::{
     Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionActivity,
@@ -164,6 +163,16 @@ pub struct FakeScm {
     pub permissions: HashMap<String, Permission>,
     pub pr_snapshots: HashMap<u64, PrSnapshot>,
     pub remote_branches: HashMap<String, Option<u64>>,
+    /// jleechan-t40t (issue #326): scripted `pr_number_for_branch` lookups,
+    /// keyed by `(repo, branch)`. `Some(pr)` is a confirmed open PR bound
+    /// to that branch in that repo; absence of a key means "no open PR
+    /// bound" (`Ok(None)`), mirroring the real `CliScm` resolution path.
+    pub pr_numbers_for_branch: HashMap<(String, String), Option<u64>>,
+    /// jleechan-t40t r12 (issue #326): scripted TRANSIENT failure of
+    /// `pr_number_for_branch`, keyed by `(repo, branch)`. When present the
+    /// method returns `DaemonError::Tool` (the `gh` failure shape), used to
+    /// prove the fail-closed "keep DISPATCHED, do not promote" path.
+    pub pr_number_for_branch_errors: HashMap<(String, String), String>,
     /// jleechan-drive-pr-branch-binding-pcpr: scripted open-PR lookups,
     /// keyed by `(repo, pr_number)`. Absence of a key (the `Default` case)
     /// means `PrHeadBranch::NotFound`, matching the real `CliScm` fail-safe
@@ -171,6 +180,24 @@ pub struct FakeScm {
     /// same-repo open PR, or `PrHeadBranch::Fork` for a confirmed open PR
     /// whose head lives on a fork (the fail-closed guard).
     pub open_pr_head_refs: HashMap<(String, u64), PrHeadBranch>,
+    /// jleechan-znmh (issue #341, reroll PR-already-terminal tolerance):
+    /// scripted close failure keyed by `(repo, pr_number)`. When present,
+    /// `close_pr_for_repo` / `close_pr` returns
+    /// `DaemonError::Tool { tool: "gh", rc: 1, stderr }` — the exact shape
+    /// `gh pr close --repo <x> <n>` produces when the PR is already merged,
+    /// already closed, or in a closed state. A reroll must classify this
+    /// signature as a tolerant supersede (clear `pr_number`, emit
+    /// `REROLL_PR_ALREADY_MERGED` telemetry, continue), not wedge the bead
+    /// on a transient tool error.
+    pub pr_already_terminal: HashMap<(String, u64), String>,
+    /// jleechan-yoqy / issue #323: scripted gist state keyed by gist id.
+    /// present + `true` = fetchable + non-empty (`Ok(Some(true))`), present +
+    /// `false` = fetchable + empty (`Ok(Some(false))`), absent = definitively
+    /// not found (`Ok(None)`). See `gists_transient` for the transient case.
+    pub gists: HashMap<String, bool>,
+    /// r5 finding 3: gist ids whose fetch returns a TRANSIENT `Err` (gh
+    /// outage) — the evidence gate must wait (Unknown), not fail.
+    pub gists_transient: std::collections::HashSet<String>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -241,6 +268,16 @@ impl Scm for FakeScm {
         self.calls
             .borrow_mut()
             .push(format!("close_pr({pr},{comment})"));
+        if let Some(stderr) = self
+            .pr_already_terminal
+            .get(&("default".to_string(), pr))
+        {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: stderr.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -250,10 +287,25 @@ impl Scm for FakeScm {
     /// entry, so the regression test can prove reroll closes the bead's
     /// OWN PR (in its resolved repo) rather than `cfg.target_repo`'s
     /// same-numbered PR.
+    ///
+    /// jleechan-znmh / issue #341: when the bead's PR has been merged
+    /// or closed out-of-band (e.g. a prior failed reroll closed it, or
+    /// an external process force-closed it), `gh pr close --repo <x> <n>`
+    /// exits 1 with "cannot close: pull request #<n> is already merged"
+    /// or "is already in a closed state". The reroll must treat that as
+    /// a tolerant supersede (clear pr_number, continue) rather than
+    /// wedging the bead on a transient tool error.
     fn close_pr_for_repo(&self, repo: &str, pr: u64, comment: &str) -> Result<(), DaemonError> {
         self.calls
             .borrow_mut()
             .push(format!("close_pr_for_repo({repo},{pr},{comment})"));
+        if let Some(stderr) = self.pr_already_terminal.get(&(repo.to_string(), pr)) {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: stderr.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -277,6 +329,45 @@ impl Scm for FakeScm {
             .get(&(repo.to_string(), pr))
             .cloned()
             .unwrap_or(PrHeadBranch::NotFound))
+    }
+
+    fn pr_number_for_branch(&self, repo: &str, branch: &str) -> Result<Option<u64>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("pr_number_for_branch({repo},{branch})"));
+        if let Some(stderr) = self
+            .pr_number_for_branch_errors
+            .get(&(repo.to_string(), branch.to_string()))
+        {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: stderr.clone(),
+            });
+        }
+        Ok(self
+            .pr_numbers_for_branch
+            .get(&(repo.to_string(), branch.to_string()))
+            .copied()
+            .flatten())
+    }
+
+    fn gist_nonempty(&self, gist_id: &str) -> Result<Option<bool>, DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("gist_nonempty({gist_id})"));
+        if self.gists_transient.contains(gist_id) {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr: format!("gist {gist_id} fetch failed (transient gh outage)"),
+            });
+        }
+        match self.gists.get(gist_id) {
+            Some(nonempty) => Ok(Some(*nonempty)),
+            // Absent = definitively not found (404).
+            None => Ok(None),
+        }
     }
 }
 
@@ -422,9 +513,7 @@ impl FakeSessions {
     }
 
     pub fn fail_stop_for(&self, session_id: &str) {
-        self.fail_stop_for
-            .borrow_mut()
-            .push(session_id.to_string());
+        self.fail_stop_for.borrow_mut().push(session_id.to_string());
     }
 
     pub fn fail_spawn_deferred_for(&self, bead_id: &str) {
@@ -542,7 +631,10 @@ impl Sessions for FakeSessions {
             .borrow_mut()
             .push(format!("spawn({})", spec.bead_id));
         if self.panic_after_spawn_for.borrow().contains(&spec.bead_id) {
-            panic!("scripted process death after external spawn for {}", spec.bead_id);
+            panic!(
+                "scripted process death after external spawn for {}",
+                spec.bead_id
+            );
         }
         if self.fail_spawn_for.borrow().contains(&spec.bead_id) {
             return Err(DaemonError::Tool {
@@ -551,16 +643,10 @@ impl Sessions for FakeSessions {
                 stderr: format!("scripted spawn failure for {}", spec.bead_id),
             });
         }
-        if self
-            .fail_spawn_cleanup_for
-            .borrow()
-            .contains(&spec.bead_id)
-        {
+        if self.fail_spawn_cleanup_for.borrow().contains(&spec.bead_id) {
             return Err(DaemonError::SpawnCleanupFailed {
                 session: format!("leaked-{}", spec.bead_id),
-                spawn_error: Box::new(DaemonError::Parse(
-                    "scripted invalid spawn metadata".into(),
-                )),
+                spawn_error: Box::new(DaemonError::Parse("scripted invalid spawn metadata".into())),
                 cleanup_error: Box::new(DaemonError::Tool {
                     tool: "ao".into(),
                     rc: 1,
@@ -770,6 +856,16 @@ pub struct FakeVcs {
     /// exercises the adopted-branch "needs a human" path (bead jleechan-tfs1)
     /// without ever touching a real `git` subprocess.
     pub fail_push_fix_commit_for: RefCell<Vec<String>>,
+    /// jleechan-znmh (issue #341, reroll branch-create idempotency): scripted
+    /// stale-branch-exists lookup keyed by `(repo, branch_name)`. When
+    /// present, the fake's `create_branch_at_for_repo` returns
+    /// `DaemonError::Tool { tool: "gh", rc: 1, stderr }` — the exact shape
+    /// `gh api --method POST repos/<repo>/git/refs` produces when the GH
+    /// Data API replies HTTP 422 with "Reference already exists". A reroll
+    /// must classify this signature as a stale local `-rN` branch left
+    /// behind by a prior failed attempt, delete-and-retry the create,
+    /// and continue — not wedge the bead on a transient tool error.
+    pub stale_branch_exists_at: RefCell<HashMap<(String, String), String>>,
     pub calls: RefCell<Vec<String>>,
     /// Real-wall-clock HEAD SHA scripting for the reroll quiescence-timeout
     /// race tests: `(branch, [(instant, sha), ...])` sorted ascending by
@@ -879,6 +975,15 @@ impl Vcs for FakeVcs {
     /// shells out to the daemon's local git), masking the cross-repo bug.
     /// The fake simply records the call so tests can assert that reroll
     /// routed through the per-repo entry point with the bead's repo.
+    ///
+    /// jleechan-znmh / issue #341: when `stale_branch_exists_at` has an
+    /// entry for `(repo, name)`, the fake returns the scripted 422-shaped
+    /// error so the reroll's delete-and-retry path can be exercised
+    /// without a real git subprocess. The entry is consumed on first
+    /// use — modeling the real `gh` behaviour where the stale ref has
+    /// been deleted by the reroll's `delete_branch_at_for_repo` call,
+    /// so a subsequent create POST succeeds. Tests that do not script a
+    /// stale branch get a clean success (the default legacy behaviour).
     fn create_branch_at_for_repo(
         &self,
         repo: &str,
@@ -888,6 +993,34 @@ impl Vcs for FakeVcs {
         self.calls
             .borrow_mut()
             .push(format!("create_branch_at_for_repo({repo},{name},{sha})"));
+        if let Some(stderr) = self
+            .stale_branch_exists_at
+            .borrow_mut()
+            .remove(&(repo.to_string(), name.to_string()))
+        {
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr,
+            });
+        }
+        Ok(())
+    }
+
+    /// jleechan-znmh / issue #341: stub for the new delete-and-retry
+    /// entry point. The default trait impl is a no-op; tests that need
+    /// to assert the reroll called this method with the routed repo can
+    /// override via a wrapper. Recording the call here lets us verify
+    /// the reroll reached the recovery branch on a scripted stale
+    /// `create_branch_at_for_repo` 422.
+    fn delete_branch_at_for_repo(
+        &self,
+        repo: &str,
+        name: &str,
+    ) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("delete_branch_at_for_repo({repo},{name})"));
         Ok(())
     }
 
@@ -1042,18 +1175,6 @@ pub struct FakeStateStore {
     /// Bead jleechan-yoqy / issue #323: per-bead last-/er evidence-marker hash
     /// (mirrors the `last_er_evidence_hash` column), for the retrigger tests.
     pub last_er_evidence_hash: RefCell<HashMap<String, String>>,
-    /// 1s2q-escalation-dedup: per-(bead_id, reason) escalation ledger rows
-    /// (mirrors the `escalation_ledger` SQLite table). Each entry is
-    /// `(context_hash, last_emitted_epoch, terminal)`. Used by the fake's
-    /// `escalation_should_emit`/`record_escalation_emit`/
-    /// `mark_escalation_undeliverable` impls so tick-integration tests can
-    /// exercise the dedup + terminal-marking paths without a real SQLite DB.
-    pub escalation_ledger:
-        RefCell<HashMap<(String, String), EscalationLedgerEntry>>,
-    /// Task 1 (reviewer-outage-resilience): per-vendor health rows mirroring
-    /// the `vendor_health` SQLite table, so tick-integration tests can exercise
-    /// the outage/recovery transition paths without a real SQLite DB.
-    pub vendor_health: RefCell<HashMap<String, VendorHealth>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -1187,8 +1308,17 @@ impl StateStore for FakeStateStore {
         for overlay in self.overlays.borrow_mut().values_mut() {
             // Mirror the production allow-list and its durable no-session
             // proof so integration fakes cannot hide duplicate-spawn bugs.
-            let is_permanent =
-                is_permanent_human_hold_reason(overlay.park_reason.as_deref());
+            // jleechan-t40t r6: production `state.rs::recover_human_held`
+            // (line ~1239) clears `pr_number = NULL` and
+            // `session_id = NULL` so the recovered overlay does NOT carry
+            // the dead PR/session from the prior (failed) attempt into
+            // the new dispatch — `dispatch_ready` overwrites `branch`
+            // but leaves the other fields, so the fast tier would
+            // otherwise treat the freshly-QUEUED row as already ATTESTED
+            // against the dead PR and re-park on the same gate. Mirror
+            // this contract exactly so integration tests exercise the
+            // SAME recovery semantics the production daemon ships with.
+            let is_permanent = is_permanent_human_hold_reason(overlay.park_reason.as_deref());
             if overlay.state == OverlayState::HumanHeld
                 && overlay.attempt < max_attempt
                 && !is_permanent
@@ -1198,6 +1328,8 @@ impl StateStore for FakeStateStore {
                 overlay.attempt += 1;
                 overlay.autonomy_secs = 0;
                 overlay.park_reason = None;
+                overlay.pr_number = None;
+                overlay.session_id = None;
                 recovered.push(overlay.clone());
             }
         }
@@ -1248,7 +1380,9 @@ impl StateStore for FakeStateStore {
         self.calls
             .borrow_mut()
             .push(format!("reset_reroll_deferral({bead_id})"));
-        self.reroll_deferrals.borrow_mut().insert(bead_id.to_string(), 0);
+        self.reroll_deferrals
+            .borrow_mut()
+            .insert(bead_id.to_string(), 0);
         Ok(())
     }
 
@@ -1263,6 +1397,20 @@ impl StateStore for FakeStateStore {
         self.held_recheck_after
             .borrow_mut()
             .insert(bead_id.to_string(), epoch);
+        Ok(())
+    }
+
+    fn last_er_evidence_hash(&self, bead_id: &str) -> Result<Option<String>, DaemonError> {
+        Ok(self.last_er_evidence_hash.borrow().get(bead_id).cloned())
+    }
+
+    fn set_er_evidence_hash(&self, bead_id: &str, hash: &str) -> Result<(), DaemonError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("set_er_evidence_hash({bead_id})"));
+        self.last_er_evidence_hash
+            .borrow_mut()
+            .insert(bead_id.to_string(), hash.to_string());
         Ok(())
     }
 
@@ -1319,132 +1467,4 @@ impl StateStore for FakeStateStore {
             .get(&(bead_id.to_string(), attempt))
             .map(|(_, _, feedback_text)| feedback_text.clone()))
     }
-
-    fn escalation_should_emit(
-        &self,
-        bead_id: &str,
-        reason: &str,
-        context_hash: &str,
-        now_epoch: u64,
-        refire_secs: u64,
-    ) -> Result<bool, DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "escalation_should_emit({bead_id},{reason})"
-        ));
-        match self
-            .escalation_ledger
-            .borrow()
-            .get(&(bead_id.to_string(), reason.to_string()))
-        {
-            None => Ok(true),
-            Some(entry) => {
-                if entry.terminal {
-                    return Ok(false);
-                }
-                if entry.context_hash != context_hash {
-                    return Ok(true);
-                }
-                Ok(now_epoch.saturating_sub(entry.last_emitted_epoch) >= refire_secs)
-            }
-        }
-    }
-
-    fn record_escalation_emit(
-        &self,
-        bead_id: &str,
-        reason: &str,
-        context_hash: &str,
-        now_epoch: u64,
-    ) -> Result<(), DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "record_escalation_emit({bead_id},{reason})"
-        ));
-        let mut ledger = self.escalation_ledger.borrow_mut();
-        let entry = ledger
-            .entry((bead_id.to_string(), reason.to_string()))
-            .or_default();
-        entry.context_hash = context_hash.to_string();
-        entry.last_emitted_epoch = now_epoch;
-        // record_escalation_emit never flips terminal on (only
-        // mark_escalation_undeliverable does), but it must not clear an
-        // already-terminal flag either.
-        Ok(())
-    }
-
-    fn mark_escalation_undeliverable(
-        &self,
-        bead_id: &str,
-        reason: &str,
-    ) -> Result<(), DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "mark_escalation_undeliverable({bead_id},{reason})"
-        ));
-        let mut ledger = self.escalation_ledger.borrow_mut();
-        let entry = ledger
-            .entry((bead_id.to_string(), reason.to_string()))
-            .or_default();
-        entry.terminal = true;
-        Ok(())
-    }
-
-    fn vendor_health(&self, vendor: &str) -> Result<Option<VendorHealth>, DaemonError> {
-        self.calls
-            .borrow_mut()
-            .push(format!("vendor_health({vendor})"));
-        Ok(self.vendor_health.borrow().get(vendor).cloned())
-    }
-
-    fn record_vendor_observation(
-        &self,
-        vendor: &str,
-        is_outage_marker: bool,
-        is_success: bool,
-        head_sha: &str,
-        now_epoch: u64,
-        consecutive_pending_threshold: u32,
-    ) -> Result<VendorHealth, DaemonError> {
-        self.calls.borrow_mut().push(format!(
-            "record_vendor_observation({vendor},{is_outage_marker},{is_success})"
-        ));
-        let mut map = self.vendor_health.borrow_mut();
-        let row = map
-            .entry(vendor.to_string())
-            .or_insert(VendorHealth {
-                vendor: vendor.to_string(),
-                in_outage: false,
-                consecutive_pending: 0,
-                outage_observations: 0,
-                success_observations: 0,
-                last_success_head: None,
-                last_outage_epoch: None,
-                last_observed_head: None,
-                last_observed_epoch: None,
-            });
-        row.last_observed_head = Some(head_sha.to_string());
-        row.last_observed_epoch = Some(now_epoch);
-        if is_success {
-            row.success_observations += 1;
-            row.consecutive_pending = 0;
-            row.last_success_head = Some(head_sha.to_string());
-            if row.in_outage {
-                row.in_outage = false;
-            }
-        } else if is_outage_marker {
-            row.outage_observations += 1;
-            row.consecutive_pending += 1;
-            if row.consecutive_pending >= consecutive_pending_threshold && !row.in_outage {
-                row.in_outage = true;
-                row.last_outage_epoch = Some(now_epoch);
-            }
-        }
-        Ok(row.clone())
-    }
-}
-
-// jsby vendor_health test stub.
-#[derive(Clone, Debug, Default)]
-pub struct EscalationLedgerEntry {
-    pub context_hash: String,
-    pub last_emitted_epoch: u64,
-    pub terminal: bool,
 }

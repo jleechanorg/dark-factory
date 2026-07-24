@@ -159,6 +159,71 @@ fn same_underlying_issue(llm: &dyn Llm, prior_text: &str, new_text: &str) -> Res
     Ok(parsed.same_underlying_issue)
 }
 
+/// Bead jleechan-znmh / issue #341 (reroll reuse-or-reset idempotency):
+/// classify `gh api --method POST repos/<repo>/git/refs` failures whose
+/// canonical stderr signature indicates the routed repo ALREADY has a
+/// `refs/heads/<name>` (HTTP 422, "Reference already exists"). The exact
+/// signature across recent `gh` versions is
+/// `"Reference already exists (refs/heads/<name>)"`, but it can also
+/// surface inside a longer stderr that includes HTTP body noise — so we
+/// match the `(refs/heads/<name>)` parenthetical against any tool
+/// error whose stderr mentions a ref. A prior failed reroll attempt
+/// leaving a stale `factory/<bead>-r<n>` ref behind in the routed repo
+/// is structurally the only way `create_branch_at_for_repo` can hit
+/// this signature on a freshly-incremented `-r<n>` branch, so the
+/// classification is sound.
+///
+/// This is a structural string match on tool stderr — not a model
+/// judgment call — so it is ZFC-clean (deterministic transformation
+/// over the tool's own canonical error string, no semantic routing).
+fn is_ref_already_exists(err: &DaemonError, name: &str) -> bool {
+    let target = format!("(refs/heads/{name})");
+    if let DaemonError::Tool { stderr, .. } = err {
+        stderr.contains(&target)
+    } else {
+        false
+    }
+}
+
+/// Bead jleechan-znmh / issue #341 (reroll PR-already-terminal tolerance):
+/// classify `gh pr close --repo <repo> <n>` failures whose canonical
+/// stderr signature indicates the PR is already merged or already
+/// closed — i.e. the prior failed reroll's close attempt (or an
+/// out-of-band operator action) terminated the PR between the reroll's
+/// snapshot and its close attempt. The exact `gh` strings across
+/// recent versions:
+///
+/// - `"cannot close: pull request #<n> is already merged"`
+/// - `"cannot close: pull request #<n> is already closed"`
+/// - `"<n> is already in a closed state"`
+///
+/// All three indicate the reroll has ALREADY achieved its
+/// supersede-the-old-PR goal; tolerating them keeps the bead out of
+/// `RE_ROLL` wedge.
+///
+/// Also structural string match — ZFC-clean.
+fn is_pr_already_terminal(err: &DaemonError) -> bool {
+    if let DaemonError::Tool { stderr, .. } = err {
+        stderr.contains("already merged")
+            || stderr.contains("already closed")
+            || stderr.contains("is already in a closed state")
+    } else {
+        false
+    }
+}
+
+/// Pull the stderr string out of a `DaemonError::Tool` for telemetry
+/// (other variants have no relevant stderr, so we fall back to the
+/// `Display` impl). Used by step 7 to record what `gh` actually said on
+/// a tolerated PR-already-merged supersede.
+fn format_tool_stderr(err: &DaemonError) -> String {
+    if let DaemonError::Tool { stderr, .. } = err {
+        stderr.clone()
+    } else {
+        format!("{err}")
+    }
+}
+
 pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcome, DaemonError> {
     // 1. Lock & Freshness Guard
     let latest = deps.store.load(&bead.bead_id)?;
@@ -434,8 +499,43 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
     // push. `create_branch_at_for_repo` POSTs a `refs/heads/<name>`
     // ref via `gh api repos/<repo>/git/refs` — cross-repo ref
     // creation that does NOT depend on the daemon's local checkout.
-    deps.vcs
-        .create_branch_at_for_repo(&bead_repo, &new_branch, &base_sha)?;
+    //
+    // jleechan-znmh / issue #341: must be reuse-or-reset-idempotent.
+    // A prior failed reroll attempt can leave a stale
+    // `factory/<bead>-r<n>` ref behind in the routed repo (the live
+    // failure for jleechan-9rkz, 2026-07-18 — first reroll created
+    // `factory/jleechan-9rkz-r2`, then errored on step 7; the next
+    // retry's create POST hit HTTP 422 "Reference already exists
+    // (refs/heads/factory/jleechan-9rkz-r2)" and wedged the bead).
+    // Classify that stderr, delete the stale ref via the new
+    // `delete_branch_at_for_repo` cross-repo entry point, and retry
+    // the create. Non-422 errors still propagate.
+    match deps
+        .vcs
+        .create_branch_at_for_repo(&bead_repo, &new_branch, &base_sha)
+    {
+        Ok(()) => {}
+        Err(e) if is_ref_already_exists(&e, &new_branch) => {
+            emit_telemetry(
+                deps.telemetry_log,
+                &bead.bead_id,
+                bead.attempt,
+                bead.state.as_str(),
+                "REROLL_STALE_BRANCH_DETECTED",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "staleBranch": new_branch,
+                    "repo": bead_repo,
+                    "stderr": format_tool_stderr(&e),
+                }),
+            )?;
+            deps.vcs
+                .delete_branch_at_for_repo(&bead_repo, &new_branch)?;
+            deps.vcs
+                .create_branch_at_for_repo(&bead_repo, &new_branch, &base_sha)?;
+        }
+        Err(e) => return Err(e),
+    }
 
     emit_telemetry(
         deps.telemetry_log,
@@ -466,18 +566,56 @@ pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcom
         // jleechan-wuts / issue #349: `bead_repo` is shared with step 4
         // (above) so both git-side and gh-side reroll ops target the
         // same routed repo for the same bead on the same tick.
-        deps.scm.close_pr_for_repo(&bead_repo, pr_number, &comment)?;
-        bead.pr_number = None;
+        //
+        // jleechan-znmh / issue #341: even with `close_pr_for_repo`
+        // targeting the routed repo, the bead's PR may STILL be already
+        // merged/closed at the moment we call close — a previous failed
+        // reroll closed it, an external process merged it, or an
+        // operator force-closed it. The live failure for jleechan-8jxr
+        // (2026-07-18) was exactly this: a separate process merged the
+        // PR between the reroll's snapshot and its close attempt, and
+        // `gh pr close` then errored with "cannot close: pull request
+        // #<n> is already merged". We treat this as a SUCCESSFUL
+        // SUPERSEDE — the goal of step 7 (close the superseded PR) has
+        // already been achieved out-of-band — clear `pr_number` and
+        // continue. Genuine close failures (network errors, permissions,
+        // wrong repo) still propagate as `DaemonError::Tool`.
+        match deps
+            .scm
+            .close_pr_for_repo(&bead_repo, pr_number, &comment)
+        {
+            Ok(()) => {
+                bead.pr_number = None;
 
-        emit_telemetry(
-            deps.telemetry_log,
-            &bead.bead_id,
-            bead.attempt,
-            bead.state.as_str(),
-            "REROLL_PR_CLOSED",
-            serde_json::json!({}),
-            serde_json::json!({"prNumber": pr_number, "comment": comment, "repo": bead_repo}),
-        )?;
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_PR_CLOSED",
+                    serde_json::json!({}),
+                    serde_json::json!({"prNumber": pr_number, "comment": comment, "repo": bead_repo}),
+                )?;
+            }
+            Err(e) if is_pr_already_terminal(&e) => {
+                emit_telemetry(
+                    deps.telemetry_log,
+                    &bead.bead_id,
+                    bead.attempt,
+                    bead.state.as_str(),
+                    "REROLL_PR_ALREADY_MERGED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "prNumber": pr_number,
+                        "repo": bead_repo,
+                        "stderr": format_tool_stderr(&e),
+                        "disposition": "tolerated_supersede"
+                    }),
+                )?;
+                bead.pr_number = None;
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     // 8. Constraint Extraction & Spec Mutation
@@ -1010,7 +1148,6 @@ fn execute_adopted(
                 .clone()
                 .unwrap_or_else(|| adopted_repo.clone()),
             push_remote: "origin".to_string(),
-            source: crate::config::RoutingSource::GlobalTarget,
         }
     });
     let spec = SpawnSpec {

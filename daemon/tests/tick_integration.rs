@@ -28,7 +28,9 @@ use daemon::er_runner;
 use daemon::errors::DaemonError;
 use daemon::state::{BeadOverlay, OverlayState, StateStore};
 use daemon::tick::{combine_dual_verdict, run_tick, TickDeps};
-use daemon::tools::{Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrHeadBranch, PrSnapshot, Scm};
+use daemon::tools::{
+    Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrHeadBranch, PrSnapshot, Scm,
+};
 use daemon::verifier::SkepticVerdict;
 
 fn test_cfg() -> Config {
@@ -50,8 +52,8 @@ fn test_cfg() -> Config {
         reroll_head_stability_window_secs: 1,
         reroll_death_confirm_secs: 0,
         held_recheck_cooldown_secs: 900,
-        escalation_refire_secs: 3600,
         repos: std::collections::HashMap::new(),
+        pre_gate_validation_enabled: false,
     }
 }
 
@@ -136,6 +138,14 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
     let mut overlay = overlay_after_tick1;
     overlay.pr_number = Some(101);
     store.save(&overlay).unwrap();
+    // jleechan-t40t r6: the slow-tier branch→PR re-resolution now
+    // fail-closed-clears stale pr_number when the branch has no live PR.
+    // Script the fake branch→PR lookup so the gate-assessment path
+    // proceeds against the live PR 101 (not None).
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), "factory/fake-bead-1-r1".into()),
+        Some(101),
+    );
     scm.pr_snapshots.insert(
         101,
         PrSnapshot {
@@ -154,10 +164,6 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
             coderabbit_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
     // The router call already happened in tick 1; re-script the same `FakeLlm`
@@ -441,13 +447,13 @@ fn run_tick_emits_dispatched_only_for_actual_dispatch_successes() {
                 session_id: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            // jleechan-8jxr r2: real intake-persisted overlays carry a
-            // resolved `target_repo`; the old `None` here relied on the
-            // pre-fix silent default to `cfg.target_repo`. Update the
-            // test fixture to reflect production reality.
-            target_repo: Some("owner/repo".to_string()),
+                pre_session_head_sha: None,
+                park_reason: None,
+                // jleechan-8jxr r2: real intake-persisted overlays carry a
+                // resolved `target_repo`; the old `None` here relied on the
+                // pre-fix silent default to `cfg.target_repo`. Update the
+                // test fixture to reflect production reality.
+                target_repo: Some("owner/repo".to_string()),
             })
             .unwrap();
     }
@@ -984,7 +990,8 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
     // handle (the durable record pointing at a session that was never
     // ours to own) without touching AO.
     assert_eq!(
-        held.session_id, None,
+        held.session_id,
+        None,
         "session_branch_mismatch park MUST drop the bad overlay handle so \
          the leaked record cannot poison future redispatches of THIS bead \
          via the AO dedup guard. Calls: {:?}",
@@ -1002,10 +1009,7 @@ fn test_dispatch_integrity_sweep_parks_session_branch_mismatch() {
          legitimate worker. Calls: {:?}",
         sessions.calls.borrow()
     );
-    assert_eq!(
-        held.park_reason.as_deref(),
-        Some("session_branch_mismatch")
-    );
+    assert_eq!(held.park_reason.as_deref(), Some("session_branch_mismatch"));
     assert!(
         !sessions
             .calls
@@ -1293,10 +1297,6 @@ fn test_wedge_detection_attested_session_stalled() {
             coderabbit_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
 
@@ -1398,10 +1398,6 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             coderabbit_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
 
@@ -1516,10 +1512,6 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             files: vec![],
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
 
@@ -1615,10 +1607,6 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             files: vec![],
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
 
@@ -1730,10 +1718,6 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             files: vec![],
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
 
@@ -2342,7 +2326,10 @@ fn adopted_red_pr_stage2_reroll_spawns_remediation_session_leaves_pr_open() {
     let mut cfg = test_cfg();
     cfg.stage = 2; // Stage 2: actually execute reroll() rather than just recording the verdict
     let mut vcs = FakeVcs::new();
-    vcs.heads.insert("alice/my-cool-feature".into(), "pre-session-sha-abc123".into());
+    vcs.heads.insert(
+        "alice/my-cool-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
     let telemetry_log = std::env::temp_dir().join("afd_adopted_stage2_success.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -2478,7 +2465,10 @@ fn adopted_red_pr_stage2_reroll_spawn_failure_parks_human_held_with_escalation()
     let mut cfg = test_cfg();
     cfg.stage = 2;
     let mut vcs = FakeVcs::new();
-    vcs.heads.insert("alice/my-conflicted-feature".into(), "pre-session-sha-abc123".into());
+    vcs.heads.insert(
+        "alice/my-conflicted-feature".into(),
+        "pre-session-sha-abc123".into(),
+    );
     sessions.fail_spawn_for("fake-bead-1");
     let telemetry_log = std::env::temp_dir().join("afd_adopted_stage2_conflict.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -2599,8 +2589,7 @@ fn adopted_red_pr_structural_only_red_gates_holds_disposition_required_not_rerol
     let mut cfg = test_cfg();
     cfg.stage = 2; // Stage 2: reroll normally executes; our new branch must preempt it
     let vcs = FakeVcs::new();
-    let telemetry_log =
-        std::env::temp_dir().join("afd_structural_only_red_gates.jsonl");
+    let telemetry_log = std::env::temp_dir().join("afd_structural_only_red_gates.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
     let summary = run_tick(
@@ -2657,8 +2646,7 @@ fn adopted_red_pr_structural_only_red_gates_holds_disposition_required_not_rerol
     );
 
     // Telemetry must show DISPOSITION_REQUIRED, not PARKED_HUMAN_HELD.
-    let log_contents =
-        std::fs::read_to_string(&telemetry_log).expect("telemetry log must exist");
+    let log_contents = std::fs::read_to_string(&telemetry_log).expect("telemetry log must exist");
     assert!(
         log_contents.contains("\"DISPOSITION_REQUIRED\""),
         "DISPOSITION_REQUIRED telemetry event must be emitted; log:\n{log_contents}"
@@ -2741,8 +2729,7 @@ fn adopted_red_pr_mixed_red_gates_still_rerolls() {
         "alice/mixed-red-gates".into(),
         "pre-session-sha-mixed".into(),
     );
-    let telemetry_log =
-        std::env::temp_dir().join("afd_mixed_red_gates_rerolls.jsonl");
+    let telemetry_log = std::env::temp_dir().join("afd_mixed_red_gates_rerolls.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
     let summary = run_tick(
@@ -2793,8 +2780,7 @@ fn adopted_red_pr_mixed_red_gates_still_rerolls() {
         session_calls.iter().any(|c| c.starts_with("spawn(")),
         "reroll must spawn a remediation session: {session_calls:?}"
     );
-    let log_contents =
-        std::fs::read_to_string(&telemetry_log).expect("telemetry log must exist");
+    let log_contents = std::fs::read_to_string(&telemetry_log).expect("telemetry log must exist");
     assert!(
         log_contents.contains("\"REROLL_START\""),
         "reroll must emit REROLL_START telemetry; log:\n{log_contents}"
@@ -3247,7 +3233,10 @@ fn drive_existing_pr_bead_dispatches_onto_pr_head_branch_not_generated_branch() 
     };
 
     let summary = run_tick(&deps, 0, 0).expect("tick should succeed");
-    assert_eq!(summary.beads_dispatched, 1, "the drive-PR bead must dispatch");
+    assert_eq!(
+        summary.beads_dispatched, 1,
+        "the drive-PR bead must dispatch"
+    );
 
     let final_overlay = store
         .load("jleechan-af-drive-pr288-gd2x")
@@ -3283,7 +3272,8 @@ fn drive_existing_pr_bead_dispatches_onto_pr_head_branch_not_generated_branch() 
         .find(|e| e["eventType"] == "TASK_DISPATCHED")
         .expect("TASK_DISPATCHED event must be emitted");
     assert_eq!(
-        dispatched["context"]["branch"], "factory/jleechan-xa99-reconciliation-rebased"
+        dispatched["context"]["branch"],
+        "factory/jleechan-xa99-reconciliation-rebased"
     );
     assert_eq!(
         dispatched["context"]["branch_mode"], "pr_head",
@@ -3648,12 +3638,16 @@ fn newly_intaken_bead_dispatch_uses_real_tracker_title() {
     // tracker title reaches the coder, not an empty stub — is preserved as a
     // containment check, plus the tracker-supplied description.
     assert!(
-        prompts[0].1.contains("Wire a durable Linux trigger (owner/repo)"),
+        prompts[0]
+            .1
+            .contains("Wire a durable Linux trigger (owner/repo)"),
         "new intake must dispatch the real tracker title, not an empty stub prompt: {}",
         prompts[0].1
     );
     assert!(
-        prompts[0].1.contains("systemd user unit acceptance criteria"),
+        prompts[0]
+            .1
+            .contains("systemd user unit acceptance criteria"),
         "tracker-supplied description must reach the coder prompt: {}",
         prompts[0].1
     );
@@ -3722,10 +3716,6 @@ fn drive_existing_pr_pending_ci_does_not_reach_ready() {
             coderabbit_status: "approved".into(),
             ci_pending: true,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
 
@@ -3818,10 +3808,6 @@ fn drive_existing_pr_failed_ci_parks_human_held() {
             coderabbit_status: "approved".into(),
             ci_pending: false,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
 
@@ -3932,9 +3918,16 @@ fn recover_human_held_requeues_queued_bead_with_attempt_below_max() {
         log.contains("\"prior_state\":\"HUMAN_HELD\""),
         "telemetry metadata must record the prior HUMAN_HELD state; got: {log}"
     );
+    // jleechan-t40t r6: production state.rs::recover_human_held clears
+    // pr_number = NULL on recovery (line ~1239) so the recovered overlay
+    // does NOT carry the dead PR from the prior attempt into the new
+    // dispatch. FakeStateStore mirrors that contract, so the RECOVERED
+    // telemetry event reports `pr_number: null` — the prior PR number is
+    // intentionally NOT carried forward.
     assert!(
-        log.contains("\"pr_number\":4242"),
-        "telemetry metadata must carry the recovered PR number; got: {log}"
+        log.contains("\"pr_number\":null"),
+        "telemetry metadata must record the cleared (null) pr_number after \
+         recover_human_held clears it (mirrors production contract); got: {log}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -4626,10 +4619,6 @@ fn er_runner_capped_unknown_only_gate_report_escalates_and_parks_at_recovery_cap
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
 
@@ -4886,10 +4875,6 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             coderabbit_status: "approved".into(),
             ci_pending: true,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
     store
@@ -4992,10 +4977,6 @@ fn attested_ci_pending_does_not_timebox_park() {
             coderabbit_status: "approved".into(),
             ci_pending: true,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
     store
@@ -5129,7 +5110,16 @@ fn non_green_bead_reenters_loop_via_automated_human_held_exit() {
         overlay.autonomy_secs, 0,
         "autonomy_secs must reset (matches shell `recover-held`); the next dispatch starts fresh"
     );
-    assert_eq!(overlay.pr_number, Some(5050));
+    assert_eq!(
+        overlay.pr_number, None,
+        "recover_human_held must clear pr_number so the recovered bead does \
+         NOT carry the dead PR from the prior attempt into the new dispatch \
+         (mirrors production state.rs::recover_human_held)"
+    );
+    assert_eq!(
+        overlay.session_id, None,
+        "recover_human_held must clear session_id (mirror production contract)"
+    );
     assert_eq!(
         summary.beads_recovered_from_held, 1,
         "summary must reflect the recovery (no shell `recover-held` was invoked)"
@@ -5199,10 +5189,6 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             coderabbit_status: "approved".into(),
             ci_pending: false,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
     store
@@ -5281,9 +5267,9 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
                 session_id: Some("sess-1".into()),
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            target_repo: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                target_repo: None,
             })
             .unwrap();
         store
@@ -5319,10 +5305,6 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
     // PR 101 deliberately has no scripted entry — `pr_snapshot(101)`
@@ -5499,10 +5481,6 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
 
@@ -5868,10 +5846,6 @@ fn qdw_green_snapshot(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         coderabbit_status: "green".into(),
         ci_pending: false,
         head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
     }
 }
 
@@ -6442,10 +6416,6 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
 
@@ -6637,10 +6607,6 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
 
@@ -6756,6 +6722,16 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
     // vendor3 (agy) is healthy and would have produced a usable verdict —
     // the bug is that it is never dispatched.
     write_fake_reviewer(&fake_bin_dir, "agy", "pass");
+    // vendor4 (gemini) is also healthy. Bead jleechan-984e r2 / strict
+    // merge policy (#328): because the dual-dispatch primaries (codex,
+    // claude) both failed to parse and only agy (the 3rd vendor in the
+    // fallback loop) produced a verdict, `used_vendors == ["agy"]` — a
+    // single-family review. This test now asserts the bead MUST park
+    // HUMAN_HELD instead of reaching READY: the fallback chain still works,
+    // but the cross-model guarantee refuses strict-green on a single-family
+    // Pass.
+    write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
@@ -6829,10 +6805,6 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
 
@@ -6859,19 +6831,24 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    // Bead jleechan-984e r2 / strict merge policy (#328): the fallback
+    // chain still works (agy's verdict was parsed and recorded), but the
+    // cross-model guarantee refuses strict-green because only `agy` ran
+    // (single family). The bead must park HUMAN_HELD, NOT reach READY.
     assert_eq!(
-        summary.beads_ready, 1,
-        "jleechan-baaf regression: when the first two dispatched reviewer \
+        summary.beads_ready, 0,
+        "jleechan-baaf regression (r2): when the first two dispatched reviewer \
          vendors (codex, claude) both fail to produce a parseable verdict \
-         but a third vendor (agy) is available in `priority` and would \
-         succeed, `skeptic_evidence` must fall back to it instead of \
-         propagating a total-outage Err. summary={summary:?}\n\
-         telemetry:\n{telemetry}"
+         but a third vendor (agy) is available in `priority` and succeeds, \
+         `skeptic_evidence` MUST fall back to it (NOT propagate a total- \
+         outage Err) — but with single-family agy the bead MUST park on \
+         the cross-model gate (issue #385 / strict merge policy #328) \
+         instead of reaching READY. summary={summary:?}\ntelemetry:\n{telemetry}"
     );
     assert!(
-        telemetry.contains("\"all_green\":true"),
-        "GATE_ASSESSMENT must report all_green:true once the third vendor's \
-         verdict is used; telemetry:\n{telemetry}"
+        telemetry.contains("\"all_green\":false"),
+        "GATE_ASSESSMENT must report all_green:false because the cross-model \
+         gate blocks single-family Pass; telemetry:\n{telemetry}"
     );
 
     let overlay = store
@@ -6880,9 +6857,26 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
         .expect("overlay must still exist");
     assert_eq!(
         overlay.state,
-        OverlayState::Ready,
-        "bead must reach READY via the third vendor's verdict, not stay \
-         ATTESTED on a false total-outage"
+        OverlayState::HumanHeld,
+        "bead must park HUMAN_HELD via the third vendor's verdict on the \
+         cross-model gate failure, not stay ATTESTED on a false total-outage \
+         and not reach READY (single-family review cannot pass strict merge \
+         policy #328)"
+    );
+    // The fallback chain itself MUST have worked — `agy` must appear in
+    // skeptic_reviewers (proving the 3rd-vendor slot was reached and its
+    // verdict parsed). This is the regression guard for the baaf bug:
+    // before the fix, an outage of the first two vendors caused a total-
+    // outage Err, never reaching agy.
+    assert!(
+        telemetry.contains("\"skeptic_reviewers\":[\"agy\"]"),
+        "fallback chain regression (baaf): agy must appear in skeptic_reviewers \
+         after codex+claude both fail to parse; telemetry:\n{telemetry}"
+    );
+    assert!(
+        telemetry.contains("\"review_degraded\":true"),
+        "single-family agy review MUST emit review_degraded:true so strict \
+         merge policy #328 refuses strict-green; telemetry:\n{telemetry}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -6924,6 +6918,14 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     write_fake_reviewer(&fake_bin_dir, "codex", "not a verdict at all");
     write_fake_reviewer(&fake_bin_dir, "claude", "still not a verdict");
     write_fake_reviewer(&fake_bin_dir, "agy", "pass");
+    // Bead jleechan-984e r2 / strict merge policy (#328): agy alone is a
+    // single-family review, so we add gemini (google-gemini family) as a
+    // second healthy vendor so the cross-model guarantee is satisfied.
+    // This keeps the test focused on its wzgl-acceptance (per-gate
+    // breakdown + vendor identity in telemetry) without coupling it to the
+    // cross-model gate failure mode covered by the cursor-agent test below.
+    write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
@@ -6996,17 +6998,11 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
 
-    let telemetry_log = std::env::temp_dir().join(format!(
-        "afd_wzgl_gate_report_{}.jsonl",
-        std::process::id()
-    ));
+    let telemetry_log =
+        std::env::temp_dir().join(format!("afd_wzgl_gate_report_{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&telemetry_log);
 
     let summary = run_tick(
@@ -7025,15 +7021,26 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     )
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
-    assert_eq!(summary.beads_ready, 1, "bead should reach READY via the agy fallback verdict");
+    // Bead jleechan-984e r2 / strict merge policy (#328): agy alone is a
+    // single-family review, so the bead must park HUMAN_HELD on the
+    // cross-model gate failure instead of reaching READY. The telemetry
+    // shape (per-gate object, vendor identity) is the focus of this test;
+    // the ready-vs-held outcome is a side effect of the r2 wiring.
+    assert_eq!(
+        summary.beads_ready, 0,
+        "bead must park HUMAN_HELD (single-family agy review is blocked by \
+         cross-model gate under r2 / strict merge policy #328)"
+    );
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
     let gate_assessment_line = telemetry
         .lines()
         .find(|line| line.contains("\"eventType\":\"GATE_ASSESSMENT\""))
         .unwrap_or_else(|| panic!("no GATE_ASSESSMENT line found; telemetry:\n{telemetry}"));
-    let parsed: serde_json::Value = serde_json::from_str(gate_assessment_line)
-        .unwrap_or_else(|e| panic!("GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(gate_assessment_line).unwrap_or_else(|e| {
+            panic!("GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}")
+        });
     let context = &parsed["context"];
 
     // jleechan-wzgl (PR #239 review round 1): `gates` MUST be a
@@ -7046,7 +7053,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     let gates = context["gates"]
         .as_object()
         .unwrap_or_else(|| panic!("GATE_ASSESSMENT context.gates must be a {{gate_name: verdict}} object, not an array; context:\n{context}"));
-    const CANONICAL_GATE_KEYS: [&str; 8] = [
+    const CANONICAL_GATE_KEYS: [&str; 7] = [
         "ci_green",
         "no_conflicts",
         "coderabbit",
@@ -7054,12 +7061,11 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         "comments_resolved",
         "evidence_review",
         "skeptic",
-        "vacuous_red_green", // added in PR #472 (vendor-outage resilience plumbing)
     ];
     assert_eq!(
         gates.len(),
-        8,
-        "GATE_ASSESSMENT must report all 8 per-gate results (7 canonical + vacuous_red_green), not just all_green; context:\n{context}"
+        7,
+        "GATE_ASSESSMENT must report all 7 per-gate results, not just all_green; context:\n{context}"
     );
     for key in CANONICAL_GATE_KEYS {
         assert!(
@@ -7070,9 +7076,9 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         );
     }
 
-    let skeptic_reviewers = context["skeptic_reviewers"]
-        .as_array()
-        .unwrap_or_else(|| panic!("GATE_ASSESSMENT context.skeptic_reviewers must be an array; context:\n{context}"));
+    let skeptic_reviewers = context["skeptic_reviewers"].as_array().unwrap_or_else(|| {
+        panic!("GATE_ASSESSMENT context.skeptic_reviewers must be an array; context:\n{context}")
+    });
     let skeptic_reviewers: Vec<&str> = skeptic_reviewers
         .iter()
         .filter_map(|v| v.as_str())
@@ -7141,17 +7147,35 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
         .expect("python3 predicate failed to run to completion");
     let predicate_stdout = String::from_utf8_lossy(&output.stdout);
     let predicate_stderr = String::from_utf8_lossy(&output.stderr);
+    // Bead jleechan-984e r2: agy alone is single-family, so the
+    // GATE_ASSESSMENT line is now NOT all-green (the skeptic gate emits
+    // verdict=fail with the cross-model reason). The auto-merge-guard.sh
+    // predicate parses the line (proving the dict-shaped gates + canonical
+    // vocab contract holds) and reports `FAIL:skeptic` with exit 1 because
+    // the cross-model gate tripped. The telemetry-shape contract is what
+    // this test exists to lock in; the ready-vs-fail outcome is the r2
+    // wiring's side effect.
     assert!(
-        output.status.success(),
-        "auto-merge-guard.sh's real predicate must accept the emitted \
-         GATE_ASSESSMENT line (dict-shaped gates, canonical vocab) for this \
-         all-green scenario; stdout={predicate_stdout}\nstderr={predicate_stderr}\n\
+        predicate_stderr.is_empty(),
+        "predicate must parse the GATE_ASSESSMENT line without stderr; \
+         stdout={predicate_stdout}\nstderr={predicate_stderr}\n\
          line={gate_assessment_line}"
     );
     assert!(
-        predicate_stdout.contains("no-fail"),
-        "expected a non-blocking 'no-fail' verdict from auto-merge-guard.sh's \
-         predicate for this all-green scenario; got: {predicate_stdout}"
+        predicate_stdout.starts_with("FAIL:"),
+        "r2 acceptance: single-family agy review must produce a \
+         FAIL:<gate> prefix from auto-merge-guard.sh (the cross-model gate \
+         blocks strict-green); got: {predicate_stdout}"
+    );
+    assert!(
+        predicate_stdout.contains("skeptic"),
+        "r2 acceptance: the FAIL must name the skeptic gate (the gate the \
+         cross-model wire flipped to fail); got: {predicate_stdout}"
+    );
+    assert!(
+        !output.status.success(),
+        "r2 acceptance: predicate must exit non-zero (block the merge) when \
+         cross-model gate fails; got exit success for stdout={predicate_stdout}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -7230,8 +7254,7 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
     snapshot.ci_status = "failure".into();
     scm.pr_snapshots.insert(pr, snapshot);
 
-    let telemetry_log =
-        std::env::temp_dir().join("afd_9xrs_cross_repo_verification_loop.jsonl");
+    let telemetry_log = std::env::temp_dir().join("afd_9xrs_cross_repo_verification_loop.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
     let summary = run_tick(
@@ -7321,7 +7344,9 @@ fn cross_repo_bead_verification_loop_uses_its_own_repo_not_cfg_target_repo() {
     let skeptic_prompt = llm_calls
         .iter()
         .find(|c| c.contains("Stage-1 Skeptic"))
-        .unwrap_or_else(|| panic!("expected a Stage-1 Skeptic prompt among judge() calls, got: {llm_calls:?}"));
+        .unwrap_or_else(|| {
+            panic!("expected a Stage-1 Skeptic prompt among judge() calls, got: {llm_calls:?}")
+        });
     assert!(
         skeptic_prompt.contains("owner/repo"),
         "skeptic prompt must embed the bead's own repo, got: {skeptic_prompt:?}"
@@ -7390,6 +7415,12 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
     // vendor4 (gemini) is healthy and would have produced a usable verdict
     // — the bug (pre-fix) is that `priority[3]` is never reached.
     write_fake_reviewer(&fake_bin_dir, "gemini", "pass");
+    // vendor5 (cursor-agent) is also healthy. Bead jleechan-984e r2 /
+    // strict merge policy (#328): gemini + cursor-agent are two distinct
+    // model families (google-gemini, cursor), so the cross-model guarantee
+    // is satisfied and the bead reaches READY. `gemini` alone would now
+    // park HUMAN_HELD (single family).
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
@@ -7464,10 +7495,6 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             coderabbit_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
-            bugbot_status: "unknown".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![]
-        
         },
     );
 
@@ -7494,19 +7521,25 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
     .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
 
     let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    // Bead jleechan-984e r2 / strict merge policy (#328): the 4th-vendor
+    // fallback chain still works (gemini was reached and parsed), but the
+    // cross-model guarantee refuses strict-green because only gemini ran
+    // (single family). The bead must park HUMAN_HELD, NOT reach READY.
     assert_eq!(
-        summary.beads_ready, 1,
-        "jleechan-bkru regression: when the first THREE dispatched/fallback \
-         reviewer vendors (codex, claude, agy) all fail to produce a \
-         parseable verdict but a fourth vendor (gemini) is available in \
-         `priority` and would succeed, `skeptic_evidence` must fall back \
-         to it instead of propagating a total-outage Err. \
-         summary={summary:?}\ntelemetry:\n{telemetry}"
+        summary.beads_ready, 0,
+        "jleechan-bkru regression (r2): when the first THREE dispatched/ \
+         fallback reviewer vendors (codex, claude, agy) all fail to \
+         produce a parseable verdict but a fourth vendor (gemini) is \
+         available in `priority` and succeeds, `skeptic_evidence` MUST \
+         fall back to it (NOT propagate a total-outage Err) — but with \
+         single-family gemini the bead MUST park on the cross-model gate \
+         (issue #385 / strict merge policy #328) instead of reaching \
+         READY. summary={summary:?}\ntelemetry:\n{telemetry}"
     );
     assert!(
-        telemetry.contains("\"all_green\":true"),
-        "GATE_ASSESSMENT must report all_green:true once the fourth \
-         vendor's verdict is used; telemetry:\n{telemetry}"
+        telemetry.contains("\"all_green\":false"),
+        "GATE_ASSESSMENT must report all_green:false because the cross-model \
+         gate blocks single-family Pass; telemetry:\n{telemetry}"
     );
 
     let overlay = store
@@ -7515,9 +7548,459 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
         .expect("overlay must still exist");
     assert_eq!(
         overlay.state,
-        OverlayState::Ready,
-        "bead must reach READY via the fourth vendor's verdict, not stay \
-         ATTESTED on a false total-outage"
+        OverlayState::HumanHeld,
+        "bead must park HUMAN_HELD via the fourth vendor's verdict on the \
+         cross-model gate failure, not stay ATTESTED on a false total-outage \
+         and not reach READY (single-family review cannot pass strict merge \
+         policy #328)"
+    );
+    // The fallback chain itself MUST have worked — gemini must appear in
+    // skeptic_reviewers (proving the 4th-vendor slot was reached and its
+    // verdict parsed).
+    assert!(
+        telemetry.contains("\"skeptic_reviewers\":[\"gemini\"]"),
+        "fallback chain regression (bkru): gemini must appear in \
+         skeptic_reviewers after codex+claude+agy all fail to parse; \
+         telemetry:\n{telemetry}"
+    );
+    assert!(
+        telemetry.contains("\"review_degraded\":true"),
+        "single-family gemini review MUST emit review_degraded:true so \
+         strict merge policy #328 refuses strict-green; telemetry:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+// --- jleechan-984e / issue #385: cross-model reviewer + review_degraded ---
+//
+// Issue #385 acceptance: "assessment telemetry shows two model families on
+// a normal run; vendor-down fallback test; degraded flag when only one
+// family available." This test exercises BOTH halves of that contract
+// through the real `run_tick` call stack:
+//
+//   1. The 5th priority member (`cursor-agent`, a different model family
+//      from claude/codex/agy/gemini/minimax) is reachable as a vendor
+//      fallback when the first four are unavailable — proving the
+//      `cursor-agent -f <prompt>` dispatch arm in `dispatch_reviewer` and
+//      the appended `cursor-agent` entry in the priority list.
+//
+//   2. When the gate-7 reviewer set ends up as `["agy", "cursor-agent"]`
+//      (two distinct families per `verifier::vendor_model_family`), the
+//      GATE_ASSESSMENT telemetry carries `review_degraded: false`, so
+//      strict merge policy (#328) treats the assessment as strict-green
+//      rather than NOT strict-green.
+//
+//   3. The single-family failure mode — `["agy"]` only because cursor-agent
+//      and every earlier vendor failed to parse — produces
+//      `review_degraded: true` in GATE_ASSESSMENT, which is the exact
+//      fail-closed signal the issue asks for.
+#[test]
+#[cfg(unix)]
+fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_fake_reviewers_cursor_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    // vendors 1-4 all fail to parse (mimics the live 2026-07-09
+    // codex/claude/agy triple-outage that motivated issue #385). vendor5
+    // (`cursor-agent`) is healthy and produces a parseable verdict.
+    write_fake_reviewer(&fake_bin_dir, "codex", "not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "claude", "still not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "agy", "also not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "gemini", "also still not a verdict");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+
+    // coder=minimax → priority = [codex, claude, agy, gemini, cursor-agent].
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "minimax"),
+    ]);
+
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+
+    let mut cfg = test_cfg();
+    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" → is_test_repo == false
+
+    store.overlays.borrow_mut().insert(
+        "real-repo-bead-cursoragent".into(),
+        BeadOverlay {
+            bead_id: "real-repo-bead-cursoragent".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(559),
+            branch: Some("factory/real-repo-bead-cursoragent-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+    store
+        .branches
+        .borrow_mut()
+        .push("factory/real-repo-bead-cursoragent-r1".into());
+    store.branch_beads.borrow_mut().insert(
+        "factory/real-repo-bead-cursoragent-r1".into(),
+        "real-repo-bead-cursoragent".into(),
+    );
+
+    scm.pr_snapshots.insert(
+        559,
+        PrSnapshot {
+            pr_number: 559,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadbeef559".into(),
+            body: String::new(),
+            comments: vec![PrComment {
+                author: "some-reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
+            files: vec![],
+            updated_at_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            ci_status: "green".into(),
+            coderabbit_status: "green".into(),
+            ci_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_real_target_repo_skeptic_cursoragent_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    // Bead jleechan-984e r2 (issue #385 / strict merge policy #328):
+    // cursor-agent ALONE is a single-family review; strict merge policy now
+    // fail-closed refuses strict-green on that path. The bead must therefore
+    // NOT reach READY (it parks HUMAN_HELD on the cross-model gate failure).
+    // The fallback chain itself still works — `skeptic_reviewers` proves
+    // cursor-agent was reached and its verdict parsed.
+    assert_eq!(
+        summary.beads_ready, 0,
+        "issue #385 r2 / strict merge policy #328: cursor-agent alone is a \
+         single-family review, so the bead must NOT reach READY (it must \
+         park on the cross-model gate failure, not propagate a total-outage \
+         Err). summary={summary:?}\ntelemetry:\n{telemetry}"
+    );
+    assert!(
+        telemetry.contains("\"all_green\":false"),
+        "GATE_ASSESSMENT must report all_green:false because the cross-model \
+         gate blocks single-family Pass; telemetry:\n{telemetry}"
+    );
+
+    // Acceptance check #1 from issue #385: the cursor-agent reviewer must
+    // appear in `skeptic_reviewers` (it's the only vendor that produced
+    // a parseable verdict on this run).
+    let gate_assessment_line = telemetry
+        .lines()
+        .find(|l| l.contains("\"eventType\":\"GATE_ASSESSMENT\""))
+        .unwrap_or_else(|| {
+            panic!("no GATE_ASSESSMENT line; telemetry:\n{telemetry}")
+        });
+    let gate_assessment: serde_json::Value = serde_json::from_str(gate_assessment_line)
+        .unwrap_or_else(|e| {
+            panic!(
+                "GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}"
+            )
+        });
+    let context = gate_assessment
+        .get("context")
+        .unwrap_or_else(|| panic!("no context: {gate_assessment_line}"));
+
+    let skeptic_reviewers = context["skeptic_reviewers"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "GATE_ASSESSMENT context.skeptic_reviewers must be an array; context:\n{context}"
+            )
+        });
+    let skeptic_reviewers: Vec<&str> = skeptic_reviewers
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        skeptic_reviewers.contains(&"cursor-agent"),
+        "issue #385 acceptance: cursor-agent must appear in skeptic_reviewers \
+         after the first four vendors fail to parse; got: {skeptic_reviewers:?}"
+    );
+
+    // Acceptance check #2 from issue #385: with only one vendor having
+    // contributed (cursor-agent) and that vendor belonging to a single
+    // model family, `review_degraded` MUST be true — strict merge policy
+    // (#328) MUST treat this assessment as NOT strict-green. r2 wires that
+    // signal into the skeptic gate so all_green is now correctly false
+    // (instead of true-with-degraded-flag like in r1).
+    assert_eq!(
+        context["review_degraded"].as_bool(),
+        Some(true),
+        "issue #385 acceptance: review_degraded MUST be true when only one \
+         model family (cursor) contributed; context:\n{context}"
+    );
+    // r2 acceptance: the skeptic gate must emit the cross-model Red reason,
+    // not Pass.
+    let skeptic_gate = context["gates"]["skeptic"].clone();
+    let skeptic_verdict = skeptic_gate
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        skeptic_verdict, "fail",
+        "issue #385 r2 acceptance: cross-model gate must flip single-family \
+         Pass to fail; skeptic gate: {skeptic_gate}"
+    );
+    let skeptic_evidence = skeptic_gate
+        .get("evidence")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|e| e.as_str()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    assert!(
+        skeptic_evidence
+            .iter()
+            .any(|s| s.contains("cross-model") || s.contains("review_degraded")),
+        "issue #385 r2 acceptance: skeptic gate Red reason must name the \
+         cross-model failure; got: {skeptic_evidence:?}"
+    );
+
+    let overlay = store
+        .load("real-repo-bead-cursoragent")
+        .unwrap()
+        .expect("overlay must still exist");
+    // r2 / strict merge policy (#328): cursor-agent alone is a single-family
+    // review. The bead must park (HUMAN_HELD) on the cross-model gate
+    // failure, NOT reach READY. The dispatch worked — the verdict parsed —
+    // but the cross-model guarantee refuses strict-green until a second
+    // family contributes.
+    assert_eq!(
+        overlay.state,
+        OverlayState::HumanHeld,
+        "issue #385 r2 / strict merge policy #328: cursor-agent alone is a \
+         single-family review; the bead must park HUMAN_HELD on the \
+         cross-model gate failure, not stay ATTESTED and not reach READY"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+    let _ = std::fs::remove_dir_all(&fake_bin_dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
+    // The opposite half of the cross-model guarantee: when two vendors
+    // from DISTINCT model families both contribute, review_degraded MUST
+    // be false. We arrange for `codex` and `claude` to be the two
+    // healthy reviewers — `codex` is `openai` family, `claude` is
+    // `anthropic`. coder=agy (excluded from priority → priority becomes
+    // [codex, claude, gemini, cursor-agent] with both codex and claude
+    // reaching vendor1/vendor2 dual-dispatch and BOTH producing parseable
+    // verdicts).
+    let _lock = REAL_TARGET_REPO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let fake_bin_dir = std::env::temp_dir().join(format!(
+        "afd_fake_reviewers_twofam_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    write_fake_reviewer(&fake_bin_dir, "codex", "pass");
+    write_fake_reviewer(&fake_bin_dir, "claude", "pass");
+    write_fake_reviewer(&fake_bin_dir, "agy", "unreachable");
+    write_fake_reviewer(&fake_bin_dir, "gemini", "unreachable");
+    write_fake_reviewer(&fake_bin_dir, "cursor-agent", "unreachable");
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
+    ]);
+
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+
+    let mut cfg = test_cfg();
+    cfg.target_repo = "myorg/myrepo".into(); // NOT "owner/repo" → is_test_repo == false
+
+    store.overlays.borrow_mut().insert(
+        "real-repo-bead-twofam".into(),
+        BeadOverlay {
+            bead_id: "real-repo-bead-twofam".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(560),
+            branch: Some("factory/real-repo-bead-twofam-r1".into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+    store
+        .branches
+        .borrow_mut()
+        .push("factory/real-repo-bead-twofam-r1".into());
+    store.branch_beads.borrow_mut().insert(
+        "factory/real-repo-bead-twofam-r1".into(),
+        "real-repo-bead-twofam".into(),
+    );
+
+    scm.pr_snapshots.insert(
+        560,
+        PrSnapshot {
+            pr_number: 560,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadbeef560".into(),
+            body: String::new(),
+            comments: vec![PrComment {
+                author: "some-reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: 0,
+            }],
+            files: vec![],
+            updated_at_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            ci_status: "green".into(),
+            coderabbit_status: "green".into(),
+            ci_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_real_target_repo_skeptic_twofam_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("run_tick should succeed against a real (non-owner/repo) target_repo");
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert_eq!(
+        summary.beads_ready, 1,
+        "two-family dual-dispatch: codex + claude both pass → bead must reach READY. \
+         summary={summary:?}\ntelemetry:\n{telemetry}"
+    );
+
+    let gate_assessment_line = telemetry
+        .lines()
+        .find(|l| l.contains("\"eventType\":\"GATE_ASSESSMENT\""))
+        .unwrap_or_else(|| {
+            panic!("no GATE_ASSESSMENT line; telemetry:\n{telemetry}")
+        });
+    let gate_assessment: serde_json::Value = serde_json::from_str(gate_assessment_line)
+        .unwrap_or_else(|e| {
+            panic!(
+                "GATE_ASSESSMENT line is not valid JSON: {e}\nline: {gate_assessment_line}"
+            )
+        });
+    let context = gate_assessment
+        .get("context")
+        .unwrap_or_else(|| panic!("no context: {gate_assessment_line}"));
+
+    let skeptic_reviewers: Vec<&str> = context["skeptic_reviewers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    // Both codex (openai) and claude (anthropic) are in the dual-dispatch
+    // vendor1/vendor2 primary positions and both produced parseable
+    // verdicts, so both MUST appear in skeptic_reviewers.
+    assert!(
+        skeptic_reviewers.contains(&"codex") && skeptic_reviewers.contains(&"claude"),
+        "both codex and claude must be in skeptic_reviewers (both dual-dispatch \
+         primaries produced parseable verdicts); got: {skeptic_reviewers:?}"
+    );
+    // Two distinct model families → review_degraded MUST be false.
+    assert_eq!(
+        context["review_degraded"].as_bool(),
+        Some(false),
+        "issue #385 acceptance: two distinct model families (codex=openai, \
+         claude=anthropic) → review_degraded MUST be false; context:\n{context}"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);
@@ -8341,7 +8824,11 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
     let mut scm = FakeScm::new();
     let mut snap_a = qdw_green_snapshot(
         801,
-        vec![PrComment { author: "dark-factory-er".into(), body: "/er PASS".into(), created_at_epoch: 0 }],
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
     );
     snap_a.ci_success = false;
     snap_a.ci_status = "failure".into();
@@ -8349,7 +8836,11 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
 
     let mut snap_b = qdw_green_snapshot(
         802,
-        vec![PrComment { author: "dark-factory-er".into(), body: "/er PASS".into(), created_at_epoch: 0 }],
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: 0,
+        }],
     );
     snap_b.ci_success = false;
     snap_b.ci_status = "failure".into();
@@ -8373,8 +8864,18 @@ fn cq8r_per_bead_isolation_reroll_comparator_failure_does_not_abort_fast_tier() 
         .insert("bob/cq8r-bead-b-branch".into(), "bead-b-head-sha".into());
 
     for (bead_id, pr, branch, prior_text) in [
-        ("cq8r-bead-a", 801u64, "alice/cq8r-bead-a-branch", "BEAD-A-PRIOR-MARKER"),
-        ("cq8r-bead-b", 802u64, "bob/cq8r-bead-b-branch", "bead-b-prior-text"),
+        (
+            "cq8r-bead-a",
+            801u64,
+            "alice/cq8r-bead-a-branch",
+            "BEAD-A-PRIOR-MARKER",
+        ),
+        (
+            "cq8r-bead-b",
+            802u64,
+            "bob/cq8r-bead-b-branch",
+            "bead-b-prior-text",
+        ),
     ] {
         store
             .save(&BeadOverlay {
@@ -8559,8 +9060,7 @@ fn write_fake_gh_capturing_repo_arg(
         expect_num = expect_num,
         capture = capture_file.display()
     );
-    std::fs::write(&path, script)
-        .unwrap_or_else(|e| panic!("failed to write fake gh: {e}"));
+    std::fs::write(&path, script).unwrap_or_else(|e| panic!("failed to write fake gh: {e}"));
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).unwrap();
@@ -8837,9 +9337,6 @@ fn seed_attested_red_ci_bead(
             coderabbit_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: now.saturating_sub(60),
-            bugbot_status: "green".to_string(),
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![],
         },
     );
     branch
@@ -8944,7 +9441,10 @@ fn tick_deferred_reroll_stays_attested_and_reselects_next_tick() {
     };
 
     let summary1 = run_tick(&deps, 1, 0).expect("tick 1 should succeed");
-    assert_eq!(summary1.gates_assessed, 1, "tick 1 must gate-assess the ATTESTED bead");
+    assert_eq!(
+        summary1.gates_assessed, 1,
+        "tick 1 must gate-assess the ATTESTED bead"
+    );
     let after1 = store.load("defer-bead").unwrap().unwrap();
     assert_eq!(
         after1.state,
@@ -9205,10 +9705,7 @@ fn session_branch_mismatch_park_kills_associated_ao_session_and_clears_handle() 
     // Script the fake AO session to report a branch that does NOT match
     // the bead's registered branch, so `deps.sessions.session_branch` returns
     // `Ok(Some(<actual>))` and the positive-mismatch check fires.
-    sessions.set_session_branch(
-        "df-mh9o-mismatch",
-        "factory/wa-3004-hook-refactor",
-    );
+    sessions.set_session_branch("df-mh9o-mismatch", "factory/wa-3004-hook-refactor");
 
     let telemetry_log = std::env::temp_dir().join("afd_test_mh9o_mismatch.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -9386,8 +9883,10 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
         "factory/bead-mh9o-adopted-r1".into(),
         "bbbbbbbbbbbbbbbb".into(),
     );
-    vcs.ancestor_pairs
-        .insert(("aaaaaaaaaaaaaaaa".into(), "bbbbbbbbbbbbbbbb".into()), false);
+    vcs.ancestor_pairs.insert(
+        ("aaaaaaaaaaaaaaaa".into(), "bbbbbbbbbbbbbbbb".into()),
+        false,
+    );
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -9515,7 +10014,8 @@ fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
         .as_deref()
         .expect("HUMAN_HELD overlay must have a park_reason");
     assert!(
-        park_reason == "unmapped_repo" || park_reason.starts_with("escalation_local_fallback:unmapped_repo"),
+        park_reason == "unmapped_repo"
+            || park_reason.starts_with("escalation_local_fallback:unmapped_repo"),
         "park_reason must be unmapped_repo-derived, got: {park_reason:?}"
     );
 
@@ -9533,14 +10033,1017 @@ fn run_tick_emits_parked_human_held_for_unmapped_repo_dispatch_failure() {
         "telemetry MUST emit PARKED_HUMAN_HELD for unmapped_repo parks; events = {:?}",
         events
     );
-    let transient_error = events
-        .iter()
-        .find(|e| e["eventType"] == "BEAD_DISPATCH_TRANSIENT_ERROR" && e["beadId"] == "no-repo-bead");
+    let transient_error = events.iter().find(|e| {
+        e["eventType"] == "BEAD_DISPATCH_TRANSIENT_ERROR" && e["beadId"] == "no-repo-bead"
+    });
     assert!(
         transient_error.is_none(),
         "unmapped_repo park must NOT fall through to BEAD_DISPATCH_TRANSIENT_ERROR; events = {:?}",
         events
     );
 
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-t40t (issue #326, live incident jleechan-t8fd / PR #316):
+/// branch-mismatch handling preserves stale `pr_number`, blocking
+/// discovery of a later correct PR — bead stays DISPATCHED indefinitely.
+/// Regression test: a bead is dispatched onto a branch that originally
+/// resolved to PR `3001`, but the live state has a LATER PR (`3002`) on
+/// the same branch (e.g. the original PR was closed and a fresh one was
+/// opened on the same head ref). The slow-tier DISPATCHED→ATTESTED path
+/// must re-resolve `pr_number` from the branch, NOT trust the stale
+/// stored `pr_number`, so the bead promotes against the correct PR.
+///
+/// Pre-fix: this test fails — `pr_number` stays `3001`, the bead never
+/// converges, and no `PR_NUMBER_REREZOLVED` telemetry event fires.
+/// Post-fix: `pr_number` becomes `3002`, the bead promotes past
+/// DISPATCHED, and the telemetry log carries the `PR_NUMBER_REREZOLVED`
+/// line so the drift is auditable from the daemon log alone.
+#[test]
+fn slow_tier_dispatched_branch_mismatch_re_resolves_stale_pr_number() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    // Seed a DISPATCHED bead on `factory/stale-pr-bead-r1` with a STALE
+    // `pr_number = 3001`. Live state: a different PR (3002) is now bound
+    // to the same branch — must supersede the stored value.
+    let branch = "factory/stale-pr-bead-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "stale-pr-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(3001), // stale
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("stale-pr-bead", branch).unwrap();
+
+    // Script the branch→PR lookup: branch now resolves to 3002 (current).
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(3002));
+    // PR 3002 has green gates; PR 3001 is irrelevant after re-resolution.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        3002,
+        PrSnapshot {
+            pr_number: 3002,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "cafebabe".into(),
+            body: "".into(),
+            comments: vec![PrComment {
+                author: "reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: now,
+            }],
+            files: vec![],
+            updated_at_epoch: now,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_t40t_branch_mismatch_stale_pr.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let summary = run_tick(&deps, 1, 0).expect("tick should succeed");
+    let after = store.load("stale-pr-bead").unwrap().unwrap();
+
+    // Core fix: `pr_number` was re-resolved from the branch — old value
+    // is gone, new value is stored, persisted state was updated.
+    assert_eq!(
+        after.pr_number,
+        Some(3002),
+        "branch→PR re-resolution must supersede the stale stored pr_number"
+    );
+    assert_ne!(
+        after.state,
+        OverlayState::Dispatched,
+        "bead must advance past DISPATCHED against the correctly-resolved PR \
+         (this is the core convergence invariant the bug violated; it may land \
+         at ATTESTED with pending gates or at READY when the scripted snapshot is \
+         all-green — both prove the drift was detected)"
+    );
+    assert_eq!(
+        summary.beads_dispatched, 0,
+        "this bead was already DISPATCHED (seeded), so no fresh dispatch should occur"
+    );
+
+    // Auditability: the drift must be observable from the daemon log alone
+    // — `grep PR_NUMBER_REREZOLVED` must find it without reading code.
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let rerez = events
+        .iter()
+        .find(|e| e["eventType"].as_str() == Some("PR_NUMBER_REREZOLVED"))
+        .expect("expected a PR_NUMBER_REREZOLVED telemetry event after drift detection");
+    let context = &rerez["context"];
+    assert_eq!(context["branch"].as_str(), Some(branch));
+    assert_eq!(context["previous_pr_number"].as_u64(), Some(3001));
+    assert_eq!(context["current_pr_number"].as_u64(), Some(3002));
+    assert_eq!(
+        context["reason"].as_str(),
+        Some("branch_mismatch_stale_state")
+    );
+
+    // Sanity: the FakeScm was actually called with the right (repo, branch)
+    // tuple (not cfg.target_repo or some other wrong key).
+    let calls = scm.calls.borrow();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == &format!("pr_number_for_branch(owner/repo,{branch})")),
+        "expected pr_number_for_branch(owner/repo,{branch}) in calls, got: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == "pr_snapshot_for_repo(owner/repo,3002)"),
+        "fast-tier gate assessment must query the RE-RESOLVED pr 3002, not the stale 3001: {calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|c| c.contains(",3001)")),
+        "no gate assessment may target the stale pr 3001 once drift is detected: {calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-t40t complement: a DISPATCHED bead whose stored `pr_number`
+/// ALREADY matches the branch's live PR must NOT re-emit the drift
+/// telemetry (it would be a per-tick spam storm on healthy beads) and
+/// must NOT regress to a different value. The branch→PR re-resolution
+/// is a quiet self-healing check, not a hot path.
+#[test]
+fn slow_tier_dispatched_branch_mismatch_no_op_when_pr_number_already_matches() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    let branch = "factory/clean-pr-bead-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "clean-pr-bead".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(4001),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("clean-pr-bead", branch).unwrap();
+
+    // Branch→PR lookup agrees with the stored pr_number — no drift.
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(4001));
+    // Pre-gate validation: stored pr 4001 is OPEN on the same branch.
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 4001),
+        PrHeadBranch::SameRepo(branch.into()),
+    );
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        4001,
+        PrSnapshot {
+            pr_number: 4001,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "abc".into(),
+            body: "".into(),
+            comments: vec![PrComment {
+                author: "reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: now,
+            }],
+            files: vec![],
+            updated_at_epoch: now,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_t40t_branch_mismatch_clean.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+    let _ = run_tick(&deps, 1, 0).expect("tick should succeed");
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    assert!(
+        !body.lines().any(|l| l.contains("PR_NUMBER_REREZOLVED")),
+        "no drift event must fire when stored pr_number already matches the live PR"
+    );
+    assert!(
+        !body
+            .lines()
+            .any(|l| l.contains("PR_NUMBER_REREZOLVE_TRANSIENT_ERROR")),
+        "no transient-error event must fire on a clean FakeScm lookup"
+    );
+    let after = store.load("clean-pr-bead").unwrap().unwrap();
+    assert_eq!(after.pr_number, Some(4001));
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-t40t r6 contract: a DISPATCHED bead whose stored `pr_number`
+/// points at a PR that has MERGED (or otherwise no longer exists for the
+/// bead's branch) must NOT promote to ATTESTED against the stale number.
+/// The pre-fix path treated `Ok(None)` from `pr_number_for_branch` as
+/// "no drift — keep the stored value", which let a stale `pr_number`
+/// ride through DISPATCHED→ATTESTED against a PR the branch was no
+/// longer bound to, leaving the bead stuck against a closed/merged PR
+/// forever. Fail-closed: clear the stale `pr_number`, stay DISPATCHED,
+/// emit `PR_NUMBER_REREZOLVED_NO_OPEN_PR` so the operator can grep it.
+#[test]
+fn slow_tier_dispatched_branch_mismatch_clears_stale_pr_number_when_branch_has_no_open_pr() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    // Repro: bead's branch is a FRESH -rN (no open PR exists yet), but
+    // a stale `pr_number` from a prior attempt (or a PR that already
+    // merged and was reopened under a new number) is recorded on the
+    // overlay. Pre-fix: bead promoted to ATTESTED against the stale PR.
+    // Post-fix: stale `pr_number` cleared, bead stays DISPATCHED.
+    let branch = "factory/merged-prior-pr-r2";
+    store
+        .save(&BeadOverlay {
+            bead_id: "merged-prior-pr".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(6001), // stale: prior PR merged/closed
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("merged-prior-pr", branch).unwrap();
+
+    // Branch→PR lookup returns Ok(None): the branch has no open PR.
+    // (Mirrors the post-merge "fresh -rN" repro: the stale PR is closed,
+    // and the new branch has nothing bound yet.)
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), None);
+
+    // No scripted snapshot for the stale 6001 — it must never be queried.
+    let telemetry_log = std::env::temp_dir().join("afd_t40t_branch_mismatch_no_open_pr.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let _ = run_tick(&deps, 1, 0).expect("tick should succeed");
+    let after = store.load("merged-prior-pr").unwrap().unwrap();
+
+    // Fail-closed contract: stale pr_number MUST be cleared and bead MUST
+    // stay DISPATCHED. Promoting to ATTESTED against a closed/merged PR
+    // would route every gate assessment at a dead PR — exactly the
+    // jleechan-t8fd / PR #316 wedge the r6 guidance addresses.
+    assert_eq!(
+        after.pr_number, None,
+        "stale pr_number must be cleared when branch→PR resolves to Ok(None); \
+         the merged-PRIor-PR repro keeps the bead wedged otherwise"
+    );
+    assert_eq!(
+        after.state,
+        OverlayState::Dispatched,
+        "bead must stay DISPATCHED when no live PR exists for its branch; \
+         promotion to ATTESTED against a stale/closed PR is the r6 defect"
+    );
+
+    // Auditability: the daemon log carries PR_NUMBER_REREZOLVED_NO_OPEN_PR
+    // so the operator can grep for it without reading code.
+    let body = std::fs::read_to_string(&telemetry_log).unwrap();
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let no_open_pr = events
+        .iter()
+        .find(|e| e["eventType"].as_str() == Some("PR_NUMBER_REREZOLVED_NO_OPEN_PR"))
+        .expect(
+            "expected PR_NUMBER_REREZOLVED_NO_OPEN_PR telemetry when stale pr_number is cleared",
+        );
+    let ctx = &no_open_pr["context"];
+    assert_eq!(ctx["branch"].as_str(), Some(branch));
+    assert_eq!(ctx["previous_pr_number"].as_u64(), Some(6001));
+    assert_eq!(ctx["reason"].as_str(), Some("branch_mismatch_no_open_pr"));
+
+    // Sanity: the stale pr 6001 must NEVER be queried for a snapshot.
+    let calls = scm.calls.borrow();
+    assert!(
+        !calls.iter().any(|c| c.contains(",6001)")),
+        "no gate assessment may target the stale pr 6001 after it's cleared: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == &format!("pr_number_for_branch(owner/repo,{branch})")),
+        "expected pr_number_for_branch lookup on this branch: {calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-t40t r6: gate assessment must NOT proceed against a stored
+/// `pr_number` whose underlying PR is no longer OPEN, or whose head ref
+/// has drifted off the bead's recorded branch. Mismatches re-resolve by
+/// head branch; inconclusive lookups DEFER (do NOT promote, do NOT
+/// gate-assess against the stale pr).
+#[test]
+fn slow_tier_pre_gate_validation_re_resolves_when_stored_pr_no_longer_open() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let mut cfg = test_cfg();
+    // Pre-gate validation is opt-in (default false) so legacy tests
+    // aren't disturbed. This test exercises pre-gate drift detection,
+    // so enable it.
+    cfg.pre_gate_validation_enabled = true;
+
+    // Bead reached ATTESTED via the slow tier, but the stored pr 7001
+    // is now CLOSED. Branch has a NEW live PR (7002) bound to it.
+    // Gate assessment must NOT query the closed 7001.
+    let branch = "factory/drifted-pr-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "drifted-pr".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(7001),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("drifted-pr", branch).unwrap();
+
+    // Stored pr 7001 is CLOSED (not OPEN) — head ref differs from bead's branch.
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 7001),
+        PrHeadBranch::NotFound, // closed -> NotFound
+    );
+    // Branch→PR re-resolution succeeds with the current 7002.
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(7002));
+
+    // Script the new PR's snapshot.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        7002,
+        PrSnapshot {
+            pr_number: 7002,
+            ci_success: true,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "deadbeef".into(),
+            body: "".into(),
+            comments: vec![PrComment {
+                author: "reviewer".into(),
+                body: "/er PASS".into(),
+                created_at_epoch: now,
+            }],
+            files: vec![],
+            updated_at_epoch: now,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            head_committed_epoch: now.saturating_sub(60),
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_t40t_pre_gate_validation_drift.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let _ = run_tick(&deps, 1, 0).expect("tick should succeed");
+    let after = store.load("drifted-pr").unwrap().unwrap();
+
+    // The stale pr_number must have been re-resolved to 7002, and gate
+    // assessment must have queried 7002 (not the stale 7001).
+    assert_eq!(
+        after.pr_number,
+        Some(7002),
+        "pre-gate validation must re-resolve pr_number from the branch when \
+         the stored pr is no longer OPEN"
+    );
+    let calls = scm.calls.borrow();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == "pr_snapshot_for_repo(owner/repo,7002)"),
+        "gate assessment must query the re-resolved 7002: {calls:?}"
+    );
+    // Pre-gate probes (ci_pending_for_attested, active-overlay wedge loop)
+    // ARE allowed to query the stale 7001 BEFORE the re-resolution runs.
+    // What MUST NOT happen is any pr_snapshot_for_repo call AFTER the
+    // `pr_number_for_branch` re-resolution that still targets 7001 — that
+    // would mean a gate-assessment landed on the closed PR.
+    let pr_reresolve_idx = calls
+        .iter()
+        .position(|c| c == "pr_number_for_branch(owner/repo,factory/drifted-pr-r1)")
+        .expect("expected a pr_number_for_branch re-resolution call");
+    let post_reresolve_calls = &calls[pr_reresolve_idx + 1..];
+    assert!(
+        !post_reresolve_calls.iter().any(|c| c.contains(",7001)")),
+        "no pr_snapshot_for_repo targeting the stale 7001 may fire AFTER \
+         pre-gate validation re-resolved to 7002; got: {post_reresolve_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-t40t r12 (issue #326), finding 1: a TRANSIENT
+/// `pr_number_for_branch` error while re-resolving a DISPATCHED bead must FAIL
+/// CLOSED — keep the bead DISPATCHED and retry next tick — NEVER promote
+/// DISPATCHED→ATTESTED against the stale, unvalidated `pr_number`.
+#[test]
+fn transient_pr_number_reresolve_error_keeps_dispatched_no_promotion() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    // A DISPATCHED, non-adopted bead with a STALE pr_number that would promote
+    // to ATTESTED (ready_to_promote == true for non-adopted) if the resolution
+    // didn't error.
+    let branch = "factory/t40t-transient-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "t40t-transient".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(999),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("t40t-transient", branch).unwrap();
+    // The branch→PR resolution fails transiently this tick.
+    scm.pr_number_for_branch_errors
+        .insert(("owner/repo".into(), branch.into()), "gh api timeout".into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_t40t_transient_reresolve.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("transient resolution error must not abort the tick");
+
+    let overlay = store.load("t40t-transient").unwrap().unwrap();
+    assert_eq!(
+        overlay.state,
+        OverlayState::Dispatched,
+        "a transient re-resolution error must NOT promote to ATTESTED"
+    );
+    assert_eq!(
+        overlay.pr_number,
+        Some(999),
+        "the stale pr_number is left untouched (revalidated next tick), not consumed"
+    );
+    assert_eq!(
+        summary.gates_assessed, 0,
+        "a bead kept DISPATCHED must not be gate-assessed this tick"
+    );
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("\"PR_NUMBER_REREZOLVE_TRANSIENT_ERROR\"")
+            && log.contains("kept_dispatched_no_promotion"),
+        "must emit the fail-closed transient-error telemetry; log:\n{log}"
+    );
+    assert!(
+        !log.contains("\"PR_OPENED\""),
+        "must NOT promote (no PR_OPENED) on an unvalidated stale pr_number; log:\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-t40t r12 (issue #326), finding 3: pre-gate validation on an
+/// ATTESTED bead whose stored PR is closed AND whose branch has no live PR
+/// must DEMOTE the bead to DISPATCHED (so the branch→PR re-resolution path
+/// re-promotes it when a live PR appears) — not clear `pr_number` and strand
+/// it ATTESTED forever. Two ticks: tick 1 demotes; tick 2 (live PR now bound)
+/// re-resolves and re-promotes.
+#[test]
+fn pre_gate_no_open_pr_demotes_attested_to_dispatched_and_resumes() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let mut cfg = test_cfg();
+    cfg.pre_gate_validation_enabled = true;
+
+    let branch = "factory/t40t-noopenpr-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "t40t-noopenpr".into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(8001),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("t40t-noopenpr", branch).unwrap();
+    // Stored PR 8001 is closed (NotFound), and the branch currently has NO
+    // live PR (no pr_numbers_for_branch entry -> Ok(None)).
+    scm.open_pr_head_refs
+        .insert(("owner/repo".into(), 8001), PrHeadBranch::NotFound);
+
+    let telemetry_log = std::env::temp_dir().join("afd_t40t_no_open_pr_demote.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    // --- Tick 1: no live PR -> demote to DISPATCHED (not stranded ATTESTED).
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("pre-gate no-open-pr must not abort the tick");
+
+    let after1 = store.load("t40t-noopenpr").unwrap().unwrap();
+    assert_eq!(
+        after1.state,
+        OverlayState::Dispatched,
+        "an ATTESTED bead whose branch has no live PR must be demoted to \
+         DISPATCHED for re-resolution, not left ATTESTED with a null pr_number"
+    );
+    assert_eq!(after1.pr_number, None);
+    let log1 = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log1.contains("demoted_attested_to_dispatched_for_rerezolve"),
+        "must audit the demotion; log:\n{log1}"
+    );
+
+    // --- Tick 2: a live PR (8002) is now bound to the branch. The DISPATCHED
+    // re-resolution path must pick it up and re-promote to ATTESTED.
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(8002));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 8002),
+        PrHeadBranch::SameRepo(branch.into()),
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut snap = qdw_green_snapshot(
+        8002,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: now,
+        }],
+    );
+    snap.head_committed_epoch = now.saturating_sub(60);
+    scm.pr_snapshots.insert(8002, snap);
+
+    run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        2,
+        0,
+    )
+    .expect("re-resolution tick must not error");
+
+    let after2 = store.load("t40t-noopenpr").unwrap().unwrap();
+    assert_eq!(
+        after2.pr_number,
+        Some(8002),
+        "the demoted bead must re-resolve to the live PR once one is bound"
+    );
+    // It re-promoted through ATTESTED and, since the new PR is all-green,
+    // continued to READY in the same tick — proving the demotion produced a
+    // recoverable hold, not a terminal strand.
+    assert_eq!(
+        after2.state,
+        OverlayState::Ready,
+        "the demoted bead must resume (here all-green -> READY), not stay stranded"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+// jleechan-yoqy / issue #323: end-to-end evidence-contract gate verification
+// through the real fast tier. The coder's `**Evidence**:` marker must point at
+// a fetchable, non-empty gist whose head matches the PR head; anything else is
+// a fail-closed evidence-gate FAIL.
+// ===========================================================================
+
+fn evidence_bead(store: &FakeStateStore, scm: &mut FakeScm, bead_id: &str, pr: u64, branch: &str, body: &str) {
+    store
+        .save(&BeadOverlay {
+            bead_id: bead_id.into(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch(bead_id, branch).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut snap = qdw_green_snapshot(
+        pr,
+        vec![PrComment {
+            author: "dark-factory-er".into(),
+            body: "/er PASS".into(),
+            created_at_epoch: now,
+        }],
+    );
+    snap.head_sha = "deadbeefcafe".into();
+    snap.head_committed_epoch = now.saturating_sub(60);
+    snap.body = body.into();
+    scm.pr_snapshots.insert(pr, snap);
+}
+
+#[test]
+fn evidence_gate_verified_gist_reaches_ready() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-ok",
+        9101,
+        "factory/ev-ok-r1",
+        "**Evidence**: https://gist.github.com/u/goodgist (head deadbeefcafe)",
+    );
+    scm.gists.insert("goodgist".into(), true); // fetchable + non-empty
+
+    let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_ok.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let summary = run_tick(
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
+        1, 0,
+    )
+    .expect("tick must not error");
+    assert_eq!(summary.gates_assessed, 1);
+    assert_eq!(
+        store.load("ev-ok").unwrap().unwrap().state,
+        OverlayState::Ready,
+        "a verified evidence gist must let an otherwise-green PR reach READY"
+    );
+    assert!(scm.calls.borrow().iter().any(|c| c.contains("gist_nonempty(goodgist)")));
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn evidence_gate_empty_gist_fails_closed_not_ready() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-empty",
+        9102,
+        "factory/ev-empty-r1",
+        "**Evidence**: https://gist.github.com/u/emptygist (head deadbeefcafe)",
+    );
+    scm.gists.insert("emptygist".into(), false); // fetchable but EMPTY
+
+    let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_empty.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    let summary = run_tick(
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
+        1, 0,
+    )
+    .expect("tick must not error");
+    assert_eq!(summary.gates_assessed, 1);
+    assert_ne!(
+        store.load("ev-empty").unwrap().unwrap().state,
+        OverlayState::Ready,
+        "an empty evidence gist must fail the evidence gate (never READY)"
+    );
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("evidence contract") && log.contains("empty"),
+        "the evidence-gate failure must carry distinct 'evidence contract ... empty' text; log:\n{log}"
+    );
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn evidence_gate_head_mismatch_fails_closed() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // Marker references a STALE head that does not match the PR head.
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-stale",
+        9103,
+        "factory/ev-stale-r1",
+        "**Evidence**: https://gist.github.com/u/goodgist (head 00000000stale)",
+    );
+    scm.gists.insert("goodgist".into(), true);
+
+    let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_stale.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    run_tick(
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
+        1, 0,
+    )
+    .expect("tick must not error");
+    assert_ne!(
+        store.load("ev-stale").unwrap().unwrap().state,
+        OverlayState::Ready,
+        "a stale-head evidence marker must fail the evidence gate"
+    );
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("does not match PR head"),
+        "head-mismatch failure text expected; log:\n{log}"
+    );
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// r5 finding 2: an evidence marker LINE that is present but incomplete
+/// (missing gist URL or `(head <sha>)`) must FAIL the evidence gate
+/// (fail-closed) — not be treated as NotProvided.
+#[test]
+fn evidence_gate_incomplete_marker_fails_closed() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    // Marker present but no gist URL / no (head ..) — parse_evidence -> None,
+    // but has_evidence_marker -> true.
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-incomplete",
+        9104,
+        "factory/ev-incomplete-r1",
+        "**Evidence**: I ran the tests, trust me",
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_incomplete.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    run_tick(
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
+        1, 0,
+    ).expect("tick must not error");
+    assert_ne!(
+        store.load("ev-incomplete").unwrap().unwrap().state,
+        OverlayState::Ready,
+        "an incomplete evidence marker must fail the gate (never READY)"
+    );
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("marker present but missing"),
+        "incomplete-marker failure text expected; log:\n{log}"
+    );
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// r5 finding 3: a TRANSIENT gist-fetch error must map to Unknown (wait), NOT
+/// a Red — so infra noise doesn't churn a reroll. The bead stays ATTESTED and
+/// the evidence gate reports pending, not a defect.
+#[test]
+fn evidence_gate_transient_gist_error_is_pending_not_red() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    evidence_bead(
+        &store,
+        &mut scm,
+        "ev-transient",
+        9105,
+        "factory/ev-transient-r1",
+        "**Evidence**: https://gist.github.com/u/flaky (head deadbeefcafe)",
+    );
+    scm.gists_transient.insert("flaky".into()); // gh outage on fetch
+
+    let telemetry_log = std::env::temp_dir().join("afd_yoqy_ev_transient.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+    run_tick(
+        &TickDeps { scm: &scm, tracker: &tracker, sessions: &sessions, llm: &llm, store: &store, vcs: &vcs, cfg: &cfg, telemetry_log: &telemetry_log },
+        1, 0,
+    ).expect("tick must not error");
+    // Not READY (evidence unknown), but NOT parked/rerolled — stays ATTESTED to retry.
+    assert_eq!(
+        store.load("ev-transient").unwrap().unwrap().state,
+        OverlayState::Attested,
+        "a transient gist error must leave the bead ATTESTED (wait), not reroll/park"
+    );
+    let log = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        log.contains("evidence contract pending"),
+        "transient gist error must surface as a pending Unknown; log:\n{log}"
+    );
+    assert!(
+        !log.contains("REROLL_VERDICT_RECORDED") && !log.contains("PARKED_HUMAN_HELD"),
+        "a transient gist error must not reroll or park; log:\n{log}"
+    );
     let _ = std::fs::remove_file(&telemetry_log);
 }

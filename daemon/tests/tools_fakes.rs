@@ -71,11 +71,8 @@ fn fake_scm_returns_scripted_permission_and_records_call() {
             updated_at_epoch: 0,
             ci_status: "green".to_string(),
             coderabbit_status: "green".to_string(),
-            bugbot_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
-            pending_check_names: vec![],
-            check_names_and_buckets: vec![],
         },
     );
 

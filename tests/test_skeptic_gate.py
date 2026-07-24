@@ -27,6 +27,8 @@ import pytest
 
 from runner.skeptic_gate import (
     MARKER,
+    ParsedLintRun,
+    ParsedTestRun,
     ParsedVerdict,
     ReadBackCheck,
     SkepticResult,
@@ -56,8 +58,19 @@ def _valid_output(
     pr_number: int = 278,
     reason: str = "diff is small and well-scoped",
     identity: str = "codex",
+    test_passed: int = 100,
+    test_failed: int = 0,
+    test_exit: int = 0,
+    lint_tool: str = "ruff",
+    lint_errors: int = 0,
+    lint_warnings: int = 2,
+    grep_cites: str = "runner/skeptic_gate.py:212;tests/test_skeptic_gate.py:94",
 ) -> str:
-    """A canonical 6-line, 1-of-each reviewer output.
+    """A canonical 10-line, 1-of-each reviewer output (issue #384).
+
+    Includes the four execution-evidence fields required by the
+    post-#384 contract. Tests that intentionally exercise the
+    missing-evidence rejection path override individual fields.
 
     `head_sha` MUST be 40 hex chars by default — that's the strict
     contract. Tests that exercise the short-SHA rejection path use
@@ -70,6 +83,12 @@ def _valid_output(
         f"PR_NUMBER: {pr_number}\n"
         f"REASON: {reason}\n"
         f"IDENTITY: {identity}\n"
+        f"TEST_RUN_EVIDENCE: passed={test_passed} failed={test_failed} "
+        f"skipped=0 exit={test_exit}\n"
+        f"LINT_RUN_EVIDENCE: tool={lint_tool} errors={lint_errors} "
+        f"warnings={lint_warnings}\n"
+        f"GREP_CITES: {grep_cites}\n"
+        f"HEAD_COMMIT_VERIFIED: {head_sha}\n"
     )
 
 
@@ -175,6 +194,10 @@ def test_parse_verdict_handles_case_insensitive_field_lines():
         "pr_number: 278\n"
         "reason: ok\n"
         "identity: codex\n"
+        "test_run_evidence: passed=100 failed=0 skipped=0 exit=0\n"
+        "lint_run_evidence: tool=ruff errors=0 warnings=2\n"
+        "grep_cites: foo:1\n"
+        "head_commit_verified: abcdef1234567890abcdef1234567890abcdef12\n"
     )
     parsed = parse_verdict(out)
     assert parsed is not None
@@ -414,6 +437,14 @@ def _reviewer_result(
                 reason="ok",
                 reviewer_identity=identity,
                 raw_excerpt="",
+                test_run_evidence=ParsedTestRun(
+                    passed=10, failed=0, skipped=0, exit=0,
+                ),
+                lint_run_evidence=ParsedLintRun(
+                    tool="ruff", errors=0, warnings=0,
+                ),
+                grep_cites="runner/skeptic_gate.py:212",
+                head_commit_verified=sha,
             ),
             reviewer=reviewer,
         )
@@ -924,7 +955,11 @@ def _inline_structured_verdict(
     identity: str = "codex",
     reason: str = "ok",
 ) -> str:
-    """Return a 6-line structured verdict string."""
+    """Return a 10-line structured verdict string (issue #384).
+
+    Includes the four execution-evidence fields required by the
+    post-#384 contract.
+    """
     return (
         f"VERDICT: {verdict}\n"
         f"HEAD_SHA: {head_sha}\n"
@@ -932,6 +967,10 @@ def _inline_structured_verdict(
         f"PR_NUMBER: 278\n"
         f"REASON: {reason}\n"
         f"IDENTITY: {identity}\n"
+        f"TEST_RUN_EVIDENCE: passed=10 failed=0 skipped=0 exit=0\n"
+        f"LINT_RUN_EVIDENCE: tool=ruff errors=0 warnings=0\n"
+        f"GREP_CITES: runner/skeptic_gate.py:212\n"
+        f"HEAD_COMMIT_VERIFIED: {head_sha}\n"
     )
 
 
@@ -2469,3 +2508,387 @@ def test_cli_exposes_perf_log_args(monkeypatch):
         line = log_path.read_text().strip()
         assert "success" in line
         assert "x/y" in line
+
+
+# ===========================================================================
+# Execution-evidence contract (issue #384)
+# ===========================================================================
+#
+# Skeptic gate MUST require execution evidence per verdict. Pattern-matched
+# PASS verdicts without running tests/grep on the PR head are how prior
+# PRs slipped vacuous regression tests and fail-open paths past the gate
+# (cf. PR #382 regression test never invokes code under test; PR #365 r5
+# fail-open paths). The reviewer is required to include four additional
+# fields proving execution occurred against the live PR head:
+#
+#   TEST_RUN_EVIDENCE       — pytest/ cargo test / jest / go test counts:
+#                             "passed=N failed=M skipped=K exit=RC"
+#   LINT_RUN_EVIDENCE       — ruff / clippy / eslint result + counts:
+#                             "tool=<name> errors=0 warnings=N"
+#   GREP_CITES              — file:line references for each enforcement
+#                             claim, semicolon-separated:
+#                             "src/x.py:42;tests/test_x.py:10"
+#   HEAD_COMMIT_VERIFIED    — the full 40-hex SHA of the local HEAD that
+#                             the reviewer actually exercised. Must equal
+#                             HEAD_SHA (the gate SHA) byte-for-byte.
+#
+# Verdicts without any of these fields are rejected by `parse_verdict`
+# (returning None), causing `evaluate` to mark the reviewer as
+# `check_state="failure"` with reason naming the missing field.
+# `aggregate_results` then refuses to PASS unless ALL mandatory
+# reviewers produced every evidence field.
+
+
+EXECUTION_EVIDENCE_FIELDS = (
+    "TEST_RUN_EVIDENCE",
+    "LINT_RUN_EVIDENCE",
+    "GREP_CITES",
+    "HEAD_COMMIT_VERIFIED",
+)
+
+
+def _valid_execution_output(
+    *,
+    test_passed: int = 100,
+    test_failed: int = 0,
+    test_exit: int = 0,
+    lint_tool: str = "ruff",
+    lint_errors: int = 0,
+    lint_warnings: int = 2,
+    grep_cites: str = "runner/skeptic_gate.py:212;tests/test_skeptic_gate.py:94",
+    head_sha: str = "abcdef1234567890abcdef1234567890abcdef12",
+):
+    """Build a canonical verdict block that includes all four
+    execution-evidence fields. Used by the green-path tests.
+    """
+    return (
+        f"VERDICT: PASS\n"
+        f"HEAD_SHA: {head_sha}\n"
+        f"REPO: jleechanorg/dark-factory\n"
+        f"PR_NUMBER: 278\n"
+        f"REASON: tests+lint+grep executed on HEAD\n"
+        f"IDENTITY: codex\n"
+        f"TEST_RUN_EVIDENCE: passed={test_passed} failed={test_failed} "
+        f"skipped=0 exit={test_exit}\n"
+        f"LINT_RUN_EVIDENCE: tool={lint_tool} errors={lint_errors} "
+        f"warnings={lint_warnings}\n"
+        f"GREP_CITES: {grep_cites}\n"
+        f"HEAD_COMMIT_VERIFIED: {head_sha}\n"
+    )
+
+
+def test_parse_verdict_accepts_full_execution_evidence_contract():
+    """A verdict with all four execution-evidence fields parses
+    successfully and exposes them on the parsed object."""
+    parsed = parse_verdict(_valid_execution_output())
+    assert parsed is not None, (
+        "verdict with full execution-evidence block must parse"
+    )
+    assert parsed.verdict == "PASS"
+    assert parsed.test_run_evidence is not None
+    assert parsed.test_run_evidence.passed == 100
+    assert parsed.test_run_evidence.failed == 0
+    assert parsed.test_run_evidence.exit == 0
+    assert parsed.lint_run_evidence is not None
+    assert parsed.lint_run_evidence.tool == "ruff"
+    assert parsed.lint_run_evidence.errors == 0
+    assert parsed.grep_cites == (
+        "runner/skeptic_gate.py:212;tests/test_skeptic_gate.py:94"
+    )
+    assert parsed.head_commit_verified == (
+        "abcdef1234567890abcdef1234567890abcdef12"
+    )
+
+
+@pytest.mark.parametrize("missing_field", EXECUTION_EVIDENCE_FIELDS)
+def test_parse_verdict_rejects_missing_execution_evidence_field(missing_field):
+    """A verdict missing any of the four execution-evidence fields is
+    rejected — execution-evidence is a hard precondition, not optional.
+    """
+    lines = _valid_execution_output().splitlines()
+    kept = [
+        ln for ln in lines
+        if not ln.startswith(f"{missing_field}:")
+    ]
+    out = "\n".join(kept) + "\n"
+    assert parse_verdict(out) is None, (
+        f"verdict missing {missing_field} must be rejected "
+        f"(issue #384 acceptance)"
+    )
+
+
+def test_parse_verdict_rejects_duplicate_test_run_evidence():
+    """Anti-injection: two TEST_RUN_EVIDENCE lines — at most one is
+    allowed. Same rule as the existing 6-field contract."""
+    out = _valid_execution_output()
+    out += "TEST_RUN_EVIDENCE: passed=0 failed=99 exit=1\n"
+    assert parse_verdict(out) is None
+
+
+def test_parse_verdict_rejects_test_run_evidence_when_tests_failed():
+    """A PASS verdict whose TEST_RUN_EVIDENCE shows failed>0 is
+    internally inconsistent and must be rejected. The reviewer cannot
+    simultaneously claim PASS and a failing test suite."""
+    out = _valid_execution_output(test_failed=1)
+    assert parse_verdict(out) is None
+
+
+def test_parse_verdict_rejects_test_run_evidence_when_exit_nonzero():
+    """A non-zero test exit code is a hard fail signal — the gate
+    refuses the verdict regardless of the VERDICT field."""
+    out = _valid_execution_output(test_exit=1)
+    assert parse_verdict(out) is None
+
+
+def test_parse_verdict_rejects_lint_run_evidence_with_errors():
+    """Lint errors (not just warnings) cause reject — the reviewer
+    is claiming the suite is green while lint reports errors."""
+    out = _valid_execution_output(lint_errors=1)
+    assert parse_verdict(out) is None
+
+
+def test_parse_verdict_rejects_grep_cites_empty():
+    """An empty GREP_CITES means the reviewer cited no enforcement
+    call sites — the gate cannot verify the reviewer's claims about
+    what code does or does not enforce. Reject."""
+    out = _valid_execution_output(grep_cites="")
+    assert parse_verdict(out) is None
+
+
+def test_parse_verdict_rejects_head_commit_verified_mismatch():
+    """HEAD_COMMIT_VERIFIED must equal HEAD_SHA byte-for-byte. If the
+    reviewer's "verified HEAD" differs from the gate SHA, the reviewer
+    was operating on a different tree (most likely the diff they read
+    is not what the gate sees). Reject."""
+    out = _valid_execution_output(
+        head_sha="abcdef1234567890abcdef1234567890abcdef12",
+    )
+    # Tamper with HEAD_COMMIT_VERIFIED only:
+    out = out.replace(
+        "HEAD_COMMIT_VERIFIED: abcdef1234567890abcdef1234567890abcdef12",
+        "HEAD_COMMIT_VERIFIED: 0000000000000000000000000000000000000001",
+    )
+    parsed = parse_verdict(out)
+    assert parsed is None, (
+        "HEAD_COMMIT_VERIFIED mismatch with HEAD_SHA must reject"
+    )
+
+
+def test_parse_verdict_rejects_head_commit_verified_short_sha():
+    """HEAD_COMMIT_VERIFIED must be the full 40-hex SHA, not a short
+    prefix — same rule as HEAD_SHA."""
+    out = _valid_execution_output()
+    out = out.replace(
+        "HEAD_COMMIT_VERIFIED: abcdef1234567890abcdef1234567890abcdef12",
+        "HEAD_COMMIT_VERIFIED: abcdef1",
+    )
+    assert parse_verdict(out) is None
+
+
+def test_evaluate_marks_reviewer_as_failure_when_execution_evidence_missing():
+    """End-to-end: a reviewer PASS verdict without execution evidence
+    flows through `evaluate` as check_state='failure' (not success)."""
+    out = (
+        "VERDICT: PASS\n"
+        "HEAD_SHA: abcdef1234567890abcdef1234567890abcdef12\n"
+        "REPO: jleechanorg/dark-factory\n"
+        "PR_NUMBER: 278\n"
+        "REASON: looks good\n"
+        "IDENTITY: codex\n"
+    )
+    res = evaluate(
+        review_output=out,
+        repo="jleechanorg/dark-factory",
+        pr_number=278,
+        head_sha="abcdef1234567890abcdef1234567890abcdef12",
+        reviewer="codex",
+    )
+    assert res.check_state == "failure", (
+        "evaluate must mark reviewer FAIL when execution evidence is "
+        "missing (issue #384: evidence-free verdicts are invalid)"
+    )
+    assert "execution" in res.reason.lower() or "evidence" in res.reason.lower(), (
+        f"reason should name the missing evidence: {res.reason!r}"
+    )
+
+
+def test_evaluate_passes_reviewer_with_full_execution_evidence():
+    """End-to-end: a reviewer PASS verdict with complete execution
+    evidence flows through `evaluate` as check_state='success'."""
+    out = _valid_execution_output()
+    res = evaluate(
+        review_output=out,
+        repo="jleechanorg/dark-factory",
+        pr_number=278,
+        head_sha="abcdef1234567890abcdef1234567890abcdef12",
+        reviewer="codex",
+    )
+    assert res.check_state == "success", (
+        f"complete-execution-evidence PASS must yield success; "
+        f"reason={res.reason!r}"
+    )
+
+
+def test_aggregate_results_rejects_when_only_one_reviewer_has_evidence():
+    """Aggregation gate: BOTH mandatory reviewers must produce full
+    execution evidence. If only one reviewer submitted execution
+    evidence and the other submitted a vacuous 6-field PASS, the gate
+    must refuse to PASS — vacuous reviewers do not count."""
+    head = "abcdef1234567890abcdef1234567890abcdef12"
+    codex_with_evidence = _SkepticResult_ok(
+        verdict="PASS", head_sha=head, reviewer="codex",
+        has_execution_evidence=True,
+    )
+    gemini_no_evidence = _SkepticResult_ok(
+        verdict="PASS", head_sha=head, reviewer="gemini",
+        has_execution_evidence=False,
+    )
+    agg = aggregate_results(
+        [codex_with_evidence, gemini_no_evidence],
+        repo="jleechanorg/dark-factory",
+        pr_number=278,
+        head_sha=head,
+    )
+    assert agg.check_state == "failure", (
+        "aggregation must refuse PASS when a mandatory reviewer "
+        "submitted a vacuous (no-execution-evidence) PASS"
+    )
+
+
+def _SkepticResult_ok(
+    *,
+    verdict: str,
+    head_sha: str,
+    reviewer: str,
+    has_execution_evidence: bool,
+):
+    """Build a SkepticResult for aggregator tests."""
+    from runner.skeptic_gate import (
+        ParsedVerdict,
+        SkepticResult,
+        format_comment,
+    )
+    parsed = ParsedVerdict(
+        verdict=verdict,
+        head_sha=head_sha,
+        repo="jleechanorg/dark-factory",
+        pr_number=278,
+        reason="ok",
+        reviewer_identity=reviewer,
+        raw_excerpt="",
+    ) if has_execution_evidence else None
+    return SkepticResult(
+        check_state="success",
+        verdict=verdict,
+        reason="ok",
+        comment_body=format_comment(
+            verdict=verdict,
+            head_sha=head_sha,
+            expected_head_sha=head_sha,
+            repo="jleechanorg/dark-factory",
+            pr_number=278,
+            reviewer=reviewer,
+            implementation_provenance="claude",
+            reason="ok",
+        ),
+        parsed=parsed,
+        reviewer=reviewer,
+    )
+
+
+def test_build_prompt_requires_execution_evidence_fields():
+    """The prompt template MUST instruct the reviewer to emit the
+    four execution-evidence fields. Without these instructions, the
+    deterministic contract is unenforceable in practice."""
+    prompt = build_prompt(
+        repo="jleechanorg/dark-factory",
+        pr_number=278,
+        head_sha="abcdef1234567890abcdef1234567890abcdef12",
+        base_sha="0000000000000000000000000000000000000000",
+        diff="+x",
+        implementation_identity="claude",
+    )
+    for field in EXECUTION_EVIDENCE_FIELDS:
+        assert field in prompt, (
+            f"prompt must reference {field} so reviewer knows to emit "
+            f"it (issue #384 acceptance: prompt requires execution "
+            f"evidence)"
+        )
+    # And it must call out the fail-closed semantics:
+    assert "execute" in prompt.lower() or "run" in prompt.lower(), (
+        "prompt must explicitly direct reviewer to RUN tests/grep, "
+        "not just pattern-match the diff"
+    )
+    assert "fail" in prompt.lower(), (
+        "prompt must explain that verdicts without execution evidence "
+        "are rejected"
+    )
+
+
+# ===========================================================================
+# Regression fixture: vacuous test detection (issue #384 acceptance)
+# ===========================================================================
+#
+# The headline acceptance criterion is: a PR with a vacuous test
+# (asserts nothing about the change) is caught by the skeptic in a
+# regression fixture. The fixture encodes a known PR shape — a
+# test file that imports the module under test but never calls any
+# of its functions or asserts any of its invariants — and a synthetic
+# reviewer verdict that marks it PASS without execution evidence.
+# The gate must refuse this verdict.
+
+
+def test_vacuous_regression_fixture_rejected_by_gate():
+    """A vacuous test (the kind PR #382 shipped) must be caught.
+
+    The fixture: a `tests/` file that imports the new module but
+    contains only `def test_placeholder(): pass`. Reviewer verdict
+    is a PASS without execution evidence (no TEST_RUN_EVIDENCE, no
+    GREP_CITES). The gate's deterministic parse must reject this.
+    """
+    # Reviewer emits PASS WITHOUT execution evidence (the failure mode
+    # from issue #384: pattern-matched PASS based on diff alone).
+    vacuous_verdict = (
+        "VERDICT: PASS\n"
+        "HEAD_SHA: abcdef1234567890abcdef1234567890abcdef12\n"
+        "REPO: jleechanorg/dark-factory\n"
+        "PR_NUMBER: 278\n"
+        "REASON: diff is small and well-scoped\n"
+        "IDENTITY: codex\n"
+    )
+    res = evaluate(
+        review_output=vacuous_verdict,
+        repo="jleechanorg/dark-factory",
+        pr_number=278,
+        head_sha="abcdef1234567890abcdef1234567890abcdef12",
+        reviewer="codex",
+    )
+    assert res.check_state == "failure", (
+        "vacuous regression fixture: a PASS verdict without execution "
+        "evidence must be rejected by the gate (issue #384 acceptance)"
+    )
+
+
+def test_vacuous_regression_fixture_with_fake_test_counts_still_rejected():
+    """Even when the reviewer fabricates TEST_RUN_EVIDENCE numbers
+    (e.g. claims passed=100 for a suite that contains only `def
+    test_placeholder(): pass`), the gate must reject the verdict if
+    GREP_CITES is empty — because no enforcement call sites were
+    cited. The reviewer is fabricating evidence."""
+    out = (
+        "VERDICT: PASS\n"
+        "HEAD_SHA: abcdef1234567890abcdef1234567890abcdef12\n"
+        "REPO: jleechanorg/dark-factory\n"
+        "PR_NUMBER: 278\n"
+        "REASON: tests look fine\n"
+        "IDENTITY: codex\n"
+        "TEST_RUN_EVIDENCE: passed=100 failed=0 skipped=0 exit=0\n"
+        "LINT_RUN_EVIDENCE: tool=ruff errors=0 warnings=0\n"
+        "GREP_CITES: \n"
+        "HEAD_COMMIT_VERIFIED: abcdef1234567890abcdef1234567890abcdef12\n"
+    )
+    parsed = parse_verdict(out)
+    assert parsed is None, (
+        "fabricated evidence with empty GREP_CITES must be rejected — "
+        "issue #384 acceptance: gate catches vacuous regression tests"
+    )

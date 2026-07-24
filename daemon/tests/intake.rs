@@ -24,8 +24,8 @@ fn test_cfg() -> Config {
         reroll_head_stability_window_secs: 1,
         reroll_death_confirm_secs: 0,
         held_recheck_cooldown_secs: 900,
-        escalation_refire_secs: 3600,
         repos: std::collections::HashMap::new(),
+        pre_gate_validation_enabled: false,
     }
 }
 

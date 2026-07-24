@@ -960,7 +960,9 @@ fn render_coder_prompt(
          worktree happens to have configured, even if one exists.\n\
          BRANCH: {branch} — the daemon watches this exact branch on \
          {target_repo} for your commits. Push to it after EVERY green unit of \
-         work; never hold more than ~30 minutes of uncommitted changes.\n\
+         work; never hold more than ~30 minutes of uncommitted changes. Push ONLY\
+         to this branch (factory attestation cross-checks the resolved PR's head ref\
+         against this value; pushing elsewhere stalls the bead).\n\
          PUSH COMMAND (run this verbatim, never a bare `git push`): git push {remote} {branch}\n\
          \n\
          DELIVERABLE: a pull request from {branch} to the default branch of \
@@ -973,9 +975,15 @@ fn render_coder_prompt(
          - Do NOT force-push over commits you did not author.\n\
          - Work only within the task's scope; file follow-up notes rather \
          than expanding scope.\n\
+         - EVIDENCE (required to pass the evidence gate): publish a PUBLIC gist \
+         of your verification output (`gh gist create --public <file>`), then put \
+         this exact line in the PR body: `{evidence_marker} <gist-url> (head <sha>)` \
+         where <sha> is the PR head commit. The gist must be non-empty and its \
+         head <sha> must match the PR head.\n\
          {tree_block}",
         id = bead.id,
         title = bead.title,
+        evidence_marker = crate::tools::EVIDENCE_MARKER,
     )
 }
 
@@ -1498,8 +1506,8 @@ mod tests {
             reroll_head_stability_window_secs: 30,
             reroll_death_confirm_secs: 5,
             held_recheck_cooldown_secs: 900,
-            escalation_refire_secs: 3600,
             repos: std::collections::HashMap::new(),
+            pre_gate_validation_enabled: false,
         }
     }
 
@@ -1786,18 +1794,8 @@ mod tests {
     /// the global repo (the jleechan-9sh5 discipline this spec explicitly
     /// calls out). No branch registration, no spawn attempt.
     #[test]
-    fn dispatch_ready_derives_for_unmapped_repo() {
-        // Bead jleechan-87ea / PR #289 AC #2: a syntactically valid but
-        // unmapped `owner/repo` (not in [repos.*], not the global target_repo)
-        // DERIVES safe routing (last path segment as ao_project) and dispatches
-        // successfully. The daemon logs an eprintln! warn at resolve_repo
-        // time. The unmapped-only fail-closed path is reserved for
-        // syntactically-invalid repos or true AO-project collisions.
-        let sessions = FakeSessions::new(1);
-        sessions
-            .scripted_worktree_remote
-            .borrow_mut()
-            .insert("unrelated-repo".to_string(), "https://github.com/someorg/unrelated-repo.git".to_string());
+    fn dispatch_ready_parks_human_held_when_target_repo_is_unmapped() {
+        let sessions = FakeSessions::new(0);
         let store = FakeStateStore::new();
         store
             .save(&BeadOverlay {
@@ -1814,10 +1812,9 @@ mod tests {
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
                 park_reason: None,
-                // Syntactically valid owner/repo, neither cfg().target_repo
-                // ("owner/repo") nor any [repos.*] entry names it. With
-                // PR #289, resolve_repo now derives ao_project="unrelated-repo"
-                // and dispatch proceeds (with an eprintln! warn).
+                // Neither cfg().target_repo ("owner/repo") nor any
+                // [repos.*] entry (cfg() has an empty repos table) names
+                // this repo.
                 target_repo: Some("someorg/unrelated-repo".to_string()),
             })
             .unwrap();
@@ -1826,23 +1823,33 @@ mod tests {
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
-        assert_eq!(
-            report.success_count(),
-            1,
-            "a syntactically-valid unseen repo must derive routing and dispatch"
-        );
-        assert_eq!(
-            report.failures.len(),
-            0,
-            "no failures expected for a derived dispatch"
+        assert_eq!(report.success_count(), 0, "unmapped repo must never spawn");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].phase, "unmapped_target_repo");
+        assert!(
+            report.failures[0].error.contains("someorg/unrelated-repo"),
+            "error should name the unmapped repo: {}",
+            report.failures[0].error
         );
 
         let overlay = store.load("bead-0").unwrap().unwrap();
-        assert_eq!(overlay.state, OverlayState::Dispatched);
+        assert_eq!(overlay.state, OverlayState::HumanHeld);
+        assert_eq!(overlay.park_reason.as_deref(), Some("unmapped_target_repo"));
         assert!(
-            overlay.branch.is_some(),
-            "derived dispatch must register a branch"
+            overlay.branch.is_none(),
+            "no branch should ever be registered/assigned for an unmappable bead"
         );
+        assert!(
+            store.branches.borrow().is_empty(),
+            "register_branch must never be called for an unmapped repo"
+        );
+        let spawn_calls = sessions
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("spawn("))
+            .count();
+        assert_eq!(spawn_calls, 0, "Sessions::spawn must never be called");
     }
 
     /// jleechan-8jxr r2 acceptance criterion #1: a manually-created factory
@@ -2800,6 +2807,15 @@ mod tests {
             prompt.contains("git push worldai factory/bead-x-r1"),
             "literal push command missing: {prompt}"
         );
+        // jleechan-t8fd / jleechanorg/dark-factory#310 — the prompt must
+        // explicitly tell the coder that pushing anywhere but the stamped
+        // `BRANCH:` value is rejected by attestation, so the coder cannot
+        // mistake it for a PR head branch.
+        assert!(
+            prompt.contains("Push ONLY"),
+            "explicit \"Push ONLY\" authorization line missing (bead \
+             jleechan-t8fd / jleechanorg/dark-factory#310): {prompt}"
+        );
         assert!(
             prompt.contains("Do NOT merge"),
             "no-merge rule missing — merge authority stays with the gates"
@@ -2813,6 +2829,16 @@ mod tests {
             "external ref missing"
         );
         assert!(prompt.contains("flux.rs"), "file-tree orientation missing");
+        // jleechan-yoqy / issue #323: the coder must be told to publish a
+        // public gist and write the ONE canonical evidence marker.
+        assert!(
+            prompt.contains(crate::tools::EVIDENCE_MARKER),
+            "coder prompt must mandate the canonical evidence marker: {prompt}"
+        );
+        assert!(
+            prompt.contains("gh gist create --public"),
+            "coder prompt must instruct publishing a public gist"
+        );
     }
 
     #[test]
@@ -3192,6 +3218,15 @@ mod tests {
         assert!(
             prompt.contains("git push origin factory/bead-0-r1"),
             "prompt must state the literal push command verbatim: {prompt}"
+        );
+        // jleechan-t8fd / jleechanorg/dark-factory#310 — explicit authorized-
+        // branch line. The factory's attestation cross-checks the resolved
+        // PR's head ref against the stamped BRANCH value; the prompt must
+        // tell the coder this so they don't push to a PR head branch.
+        assert!(
+            prompt.contains("Push ONLY"),
+            "explicit \"Push ONLY\" authorization line missing (bead \
+             jleechan-t8fd / jleechanorg/dark-factory#310): {prompt}"
         );
     }
 
