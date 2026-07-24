@@ -185,6 +185,14 @@ pub struct PrSnapshot {
     /// timestamp, so this floor narrows the stale-verdict hole rather than
     /// closing it exactly.
     pub head_committed_epoch: u64,
+    /// Names of check-runs that are still pending (bucket == "pending"),
+    /// used by the verification step's outage-aware CI-pending override to
+    /// distinguish real CI from in-outage provider stale-pending statuses.
+    pub pending_check_names: Vec<String>,
+    /// (name, bucket) pairs for ALL check-runs, letting the verification
+    /// step recompute `ci_success`/`ci_status` after filtering out
+    /// in-outage provider checks during the grace-period override.
+    pub check_names_and_buckets: Vec<(String, String)>,
 }
 
 /// Parameters for spawning a new AO/`aow` session (design doc §4).

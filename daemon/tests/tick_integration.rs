@@ -151,6 +151,8 @@ fn one_full_tick_cycle_keeps_unknown_only_gate_attested() {
             bugbot_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
     // The router call already happened in tick 1; re-script the same `FakeLlm`
@@ -1058,6 +1060,8 @@ fn test_wedge_detection_attested_session_stalled() {
             bugbot_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
 
@@ -1156,6 +1160,8 @@ fn test_wedge_detection_attested_session_not_stalled_if_remote_ahead() {
             bugbot_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
 
@@ -1260,6 +1266,8 @@ fn test_wedge_detection_still_parks_when_local_matches_remote() {
             updated_at_epoch: now_epoch - 2000,
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
             ci_success: true,
             mergeable: true,
             coderabbit_approved: true,
@@ -1356,6 +1364,8 @@ fn test_wedge_detection_still_parks_when_local_is_ahead_of_remote() {
             updated_at_epoch: now_epoch - 2000,
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
             ci_success: true,
             mergeable: true,
             coderabbit_approved: true,
@@ -1468,6 +1478,8 @@ fn test_wedge_detection_still_parks_when_branches_have_diverged() {
             updated_at_epoch: now_epoch - 2000,
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
             ci_success: true,
             mergeable: true,
             coderabbit_approved: true,
@@ -3624,6 +3636,8 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
             bugbot_status: "approved".into(),
             ci_pending: true,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
     *tracker.fail_next_comment.borrow_mut() = Some("transient comment failure".into());
@@ -3685,10 +3699,455 @@ fn er_runner_capped_unknown_only_comment_failure_retries_before_parking() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
-// jleechan-gib: stop the autonomy clock during ci_pending. ATTESTED beads
-// whose PR has ci_pending=true must NOT have autonomy_secs incremented,
-// because CI wait time is wall-clock time the operator (or CI itself) owns,
-// not coder session time we are budgeting against.
+// =============================================================================
+// Task 2 (reviewer-outage-resilience): outage-aware CI-pending override tests.
+// =============================================================================
+
+/// Helper: insert an ATTESTED bead owning PR `pr` on `branch`, with the branch
+/// registered in the store. Mirrors the `drive_existing_pr_pending_ci_*` setup.
+fn attested_bead(store: &FakeStateStore, bead_id: &str, pr: u64, branch: &str) {
+    store.overlays.borrow_mut().insert(
+        bead_id.to_string(),
+        BeadOverlay {
+            bead_id: bead_id.to_string(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(pr),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        },
+    );
+    store.branches.borrow_mut().push(branch.into());
+    store
+        .branch_beads
+        .borrow_mut()
+        .insert(branch.into(), bead_id.into());
+}
+
+/// Helper: mark a vendor in-outage in the FakeStateStore's vendor_health map.
+fn mark_vendor_in_outage(store: &FakeStateStore, vendor: &str) {
+    store.vendor_health.borrow_mut().insert(
+        vendor.to_string(),
+        daemon::state::VendorHealth {
+            vendor: vendor.to_string(),
+            in_outage: true,
+            consecutive_pending: 3,
+            outage_observations: 3,
+            success_observations: 0,
+            last_success_head: None,
+            last_outage_epoch: Some(1_000_000),
+            last_observed_head: None,
+            last_observed_epoch: None,
+        },
+    );
+}
+
+/// Read a telemetry JSONL file into a vec of `serde_json::Value` events.
+fn read_telemetry_events(path: &std::path::Path) -> Vec<serde_json::Value> {
+    let body = std::fs::read_to_string(path).unwrap_or_default();
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// Task 2: when the ONLY pending check-run is from an in-outage provider
+/// (CodeRabbit) and the 15-minute grace period has elapsed, the verification
+/// step waives the stale pending status, recomputes CI as green (the real
+/// `build` check passed), and proceeds to gate assessment.
+#[test]
+fn outage_grace_period_waives_stale_pending_after_15min() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    attested_bead(&store, "outage-bead", 9001, "factory/outage-bead-r1");
+    mark_vendor_in_outage(&store, "coderabbit");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        9001,
+        PrSnapshot {
+            pr_number: 9001,
+            // Pre-override: ci_pending=true, ci_status unknown (the stale
+            // CodeRabbit pending check forces any_pending -> unknown).
+            ci_success: false,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "outage-head".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: now,
+            ci_status: "unknown".into(),
+            coderabbit_status: "unknown".into(),
+            bugbot_status: "green".to_string(),
+            ci_pending: true,
+            // Head committed 30 minutes ago — well past the 15-min grace.
+            head_committed_epoch: now.saturating_sub(1800),
+            pending_check_names: vec!["CodeRabbit".into()],
+            check_names_and_buckets: vec![
+                ("CodeRabbit".into(), "pending".into()),
+                ("build".into(), "pass".into()),
+            ],
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_outage_grace_waive.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    // The override waived the stale pending status, so assessment proceeded.
+    assert_eq!(
+        summary.gates_assessed, 1,
+        "grace-elapsed outage override must let assessment proceed"
+    );
+
+    let events = read_telemetry_events(&telemetry_log);
+    let event_types: Vec<String> = events
+        .iter()
+        .filter_map(|e| e["eventType"].as_str().map(String::from))
+        .collect();
+    assert!(
+        event_types
+            .iter()
+            .any(|t| t == "VERIFICATION_OUTAGE_GRACE_PERIOD"),
+        "expected VERIFICATION_OUTAGE_GRACE_PERIOD event, got: {event_types:?}"
+    );
+    // The stale-pending path must NOT have fired.
+    assert!(
+        !event_types.iter().any(|t| t == "VERIFICATION_PENDING"),
+        "VERIFICATION_PENDING must not fire when the override waives stale pending"
+    );
+    // The real CI result reported in the grace event must be green.
+    let grace_evt = events
+        .iter()
+        .find(|e| e["eventType"].as_str() == Some("VERIFICATION_OUTAGE_GRACE_PERIOD"))
+        .expect("grace event must exist");
+    assert_eq!(
+        grace_evt["context"]["real_ci_result"].as_str(),
+        Some("green"),
+        "real CI (build=pass) must be reported green after waiving CodeRabbit"
+    );
+    assert_eq!(
+        grace_evt["context"]["pending_checks_waived"].as_array().map(|a| a.len()),
+        Some(1),
+        "exactly one pending check (CodeRabbit) should be waived"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Task 2: when the grace period has NOT yet elapsed (head committed only 60s
+/// ago), the verification step keeps waiting — `ci_pending` stays true and no
+/// gate assessment runs.
+#[test]
+fn outage_grace_period_keeps_pending_before_15min() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    attested_bead(&store, "outage-bead-early", 9002, "factory/outage-bead-early-r1");
+    mark_vendor_in_outage(&store, "coderabbit");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        9002,
+        PrSnapshot {
+            pr_number: 9002,
+            ci_success: false,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "outage-head-early".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: now,
+            ci_status: "unknown".into(),
+            coderabbit_status: "unknown".into(),
+            bugbot_status: "green".to_string(),
+            ci_pending: true,
+            // Head committed 60s ago — well short of the 15-min grace.
+            head_committed_epoch: now.saturating_sub(60),
+            pending_check_names: vec!["CodeRabbit".into()],
+            check_names_and_buckets: vec![
+                ("CodeRabbit".into(), "pending".into()),
+                ("build".into(), "pass".into()),
+            ],
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_outage_grace_wait.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    // Grace not elapsed -> still pending -> no assessment.
+    assert_eq!(
+        summary.gates_assessed, 0,
+        "must not assess while outage grace period is still running"
+    );
+
+    let events = read_telemetry_events(&telemetry_log);
+    let event_types: Vec<String> = events
+        .iter()
+        .filter_map(|e| e["eventType"].as_str().map(String::from))
+        .collect();
+    assert!(
+        event_types
+            .iter()
+            .any(|t| t == "VERIFICATION_OUTAGE_GRACE_WAIT"),
+        "expected VERIFICATION_OUTAGE_GRACE_WAIT event, got: {event_types:?}"
+    );
+    assert!(
+        !event_types
+            .iter()
+            .any(|t| t == "VERIFICATION_OUTAGE_GRACE_PERIOD"),
+        "VERIFICATION_OUTAGE_GRACE_PERIOD must not fire before grace elapses"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Task 2: when there is a REAL CI check still pending (not from an in-outage
+/// provider), the override must NOT fire — `ci_pending` stays true and the
+/// verification step keeps waiting, even if an in-outage provider is also
+/// pending and the grace period has elapsed.
+#[test]
+fn outage_grace_period_keeps_pending_when_real_ci_pending() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    attested_bead(&store, "outage-bead-real", 9003, "factory/outage-bead-real-r1");
+    mark_vendor_in_outage(&store, "coderabbit");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        9003,
+        PrSnapshot {
+            pr_number: 9003,
+            ci_success: false,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "outage-head-real".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: now,
+            ci_status: "unknown".into(),
+            coderabbit_status: "unknown".into(),
+            bugbot_status: "green".to_string(),
+            ci_pending: true,
+            head_committed_epoch: now.saturating_sub(1800),
+            // BOTH a stale CodeRabbit pending AND a real `tests` pending.
+            pending_check_names: vec!["CodeRabbit".into(), "tests".into()],
+            check_names_and_buckets: vec![
+                ("CodeRabbit".into(), "pending".into()),
+                ("tests".into(), "pending".into()),
+            ],
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_outage_grace_real_pending.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    // Real CI still pending -> no override -> no assessment.
+    assert_eq!(
+        summary.gates_assessed, 0,
+        "real CI pending must keep the verification step waiting"
+    );
+
+    let events = read_telemetry_events(&telemetry_log);
+    let event_types: Vec<String> = events
+        .iter()
+        .filter_map(|e| e["eventType"].as_str().map(String::from))
+        .collect();
+    assert!(
+        !event_types
+            .iter()
+            .any(|t| t == "VERIFICATION_OUTAGE_GRACE_PERIOD"),
+        "override must NOT fire when a real CI check is still pending"
+    );
+    assert!(
+        event_types.iter().any(|t| t == "VERIFICATION_PENDING"),
+        "VERIFICATION_PENDING must fire for real pending CI"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// Task 2: when the grace period has elapsed and a real (non-outage) CI check
+/// FAILED, the override waives the stale pending status but recomputes CI as
+/// red — the assessment proceeds and the real CI failure still fails exactly
+/// as before (the override never waives a FAILED check).
+#[test]
+fn outage_grace_period_preserves_real_ci_failure() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok("pass".into()));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+
+    attested_bead(&store, "outage-bead-fail", 9004, "factory/outage-bead-fail-r1");
+    mark_vendor_in_outage(&store, "coderabbit");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    scm.pr_snapshots.insert(
+        9004,
+        PrSnapshot {
+            pr_number: 9004,
+            ci_success: false,
+            mergeable: true,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "outage-head-fail".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: now,
+            ci_status: "unknown".into(),
+            coderabbit_status: "unknown".into(),
+            bugbot_status: "green".to_string(),
+            ci_pending: true,
+            head_committed_epoch: now.saturating_sub(1800),
+            pending_check_names: vec!["CodeRabbit".into()],
+            check_names_and_buckets: vec![
+                ("CodeRabbit".into(), "pending".into()),
+                ("build".into(), "fail".into()),
+            ],
+        },
+    );
+
+    let telemetry_log = std::env::temp_dir().join("afd_outage_grace_real_fail.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let summary = run_tick(
+        &TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+        },
+        1,
+        0,
+    )
+    .expect("tick should succeed");
+
+    // Override fired (assessment proceeded) but real CI failed -> not READY.
+    assert_eq!(
+        summary.gates_assessed, 1,
+        "grace-elapsed override must let assessment proceed even with a real CI failure"
+    );
+
+    let events = read_telemetry_events(&telemetry_log);
+    let grace_evt = events
+        .iter()
+        .find(|e| e["eventType"].as_str() == Some("VERIFICATION_OUTAGE_GRACE_PERIOD"))
+        .expect("grace event must exist");
+    assert_eq!(
+        grace_evt["context"]["real_ci_result"].as_str(),
+        Some("red"),
+        "real CI failure (build=fail) must be reported red, NOT waived"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 #[test]
 fn attested_ci_pending_does_not_bump_autonomy_secs() {
     let mut scm = FakeScm::new();
@@ -3746,6 +4205,8 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             bugbot_status: "approved".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
     store
@@ -4545,6 +5006,8 @@ struct QdwAssessRefetchScm {
             bugbot_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
 
@@ -4802,6 +5265,8 @@ fn attested_ci_pending_does_not_bump_autonomy_secs() {
             bugbot_status: "approved".into(),
             ci_pending: true,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
     store
@@ -4905,6 +5370,8 @@ fn attested_ci_pending_does_not_timebox_park() {
             bugbot_status: "approved".into(),
             ci_pending: true,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
     store
@@ -5118,6 +5585,8 @@ fn attested_ci_not_pending_does_bump_autonomy_secs() {
             bugbot_status: "approved".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
     store
@@ -5235,6 +5704,8 @@ fn qdw_per_bead_isolation_snapshot_failure_does_not_abort_fast_tier() {
             bugbot_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
     // PR 101 deliberately has no scripted entry — `pr_snapshot(101)`
@@ -5412,6 +5883,8 @@ fn qdw_ci_pending_snapshot_failure_does_not_park_near_timebox_bead() {
             bugbot_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
 
@@ -5778,6 +6251,8 @@ fn qdw_green_snapshot(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         bugbot_status: "green".into(),
         ci_pending: false,
         head_committed_epoch: 0,
+        pending_check_names: vec![],
+        check_names_and_buckets: vec![],
     }
 }
 
@@ -6349,6 +6824,8 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
             bugbot_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
 
@@ -6541,6 +7018,8 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             bugbot_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
 
@@ -6740,6 +7219,8 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
             bugbot_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
 
@@ -6934,6 +7415,8 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
             bugbot_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
 
@@ -7447,6 +7930,8 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             bugbot_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
 
@@ -7646,6 +8131,8 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
             bugbot_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
 
@@ -7887,6 +8374,8 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
             bugbot_status: "green".into(),
             ci_pending: false,
             head_committed_epoch: 0,
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
 
@@ -8893,7 +9382,9 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
-            head_committed_epoch: 0,
+            head_committed_epoch: now.saturating_sub(60),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
 
@@ -9705,7 +10196,9 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
             ci_status: "green".into(),
             coderabbit_status: "green".into(),
             ci_pending: false,
-            head_committed_epoch: 0,
+            head_committed_epoch: now.saturating_sub(60),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
 
@@ -9816,6 +10309,8 @@ fn transient_spawn_failures_below_cap_stay_retriable_and_do_not_park() {
             bugbot_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: now.saturating_sub(60),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
 
@@ -9976,8 +10471,102 @@ fn transient_spawn_retry_cap_exceeded_parks_human_held_with_escalation() {
             bugbot_status: "green".to_string(),
             ci_pending: false,
             head_committed_epoch: now.saturating_sub(60),
+            pending_check_names: vec![],
+            check_names_and_buckets: vec![],
         },
     );
+
+    let telemetry_log = std::env::temp_dir().join("afd_t40t_pre_gate_validation_drift.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+    };
+
+    let _ = run_tick(&deps, 1, 0).expect("tick should succeed");
+    let after = store.load("drifted-pr").unwrap().unwrap();
+
+    // The stale pr_number must have been re-resolved to 7002, and gate
+    // assessment must have queried 7002 (not the stale 7001).
+    assert_eq!(
+        after.pr_number,
+        Some(7002),
+        "pre-gate validation must re-resolve pr_number from the branch when \
+         the stored pr is no longer OPEN"
+    );
+    let calls = scm.calls.borrow();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == "pr_snapshot_for_repo(owner/repo,7002)"),
+        "gate assessment must query the re-resolved 7002: {calls:?}"
+    );
+    // Pre-gate probes (ci_pending_for_attested, active-overlay wedge loop)
+    // ARE allowed to query the stale 7001 BEFORE the re-resolution runs.
+    // What MUST NOT happen is any pr_snapshot_for_repo call AFTER the
+    // `pr_number_for_branch` re-resolution that still targets 7001 — that
+    // would mean a gate-assessment landed on the closed PR.
+    let pr_reresolve_idx = calls
+        .iter()
+        .position(|c| c == "pr_number_for_branch(owner/repo,factory/drifted-pr-r1)")
+        .expect("expected a pr_number_for_branch re-resolution call");
+    let post_reresolve_calls = &calls[pr_reresolve_idx + 1..];
+    assert!(
+        !post_reresolve_calls.iter().any(|c| c.contains(",7001)")),
+        "no pr_snapshot_for_repo targeting the stale 7001 may fire AFTER \
+         pre-gate validation re-resolved to 7002; got: {post_reresolve_calls:?}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// jleechan-t40t r12 (issue #326), finding 1: a TRANSIENT
+/// `pr_number_for_branch` error while re-resolving a DISPATCHED bead must FAIL
+/// CLOSED — keep the bead DISPATCHED and retry next tick — NEVER promote
+/// DISPATCHED→ATTESTED against the stale, unvalidated `pr_number`.
+#[test]
+fn transient_pr_number_reresolve_error_keeps_dispatched_no_promotion() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let vcs = FakeVcs::new();
+    let cfg = test_cfg();
+
+    // A DISPATCHED, non-adopted bead with a STALE pr_number that would promote
+    // to ATTESTED (ready_to_promote == true for non-adopted) if the resolution
+    // didn't error.
+    let branch = "factory/t40t-transient-r1";
+    store
+        .save(&BeadOverlay {
+            bead_id: "t40t-transient".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 5,
+            spend_usd: 0.0,
+            pr_number: Some(999),
+            branch: Some(branch.into()),
+            session_id: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+        })
+        .unwrap();
+    store.register_branch("t40t-transient", branch).unwrap();
+    // The branch→PR resolution fails transiently this tick.
+    scm.pr_number_for_branch_errors
+        .insert(("owner/repo".into(), branch.into()), "gh api timeout".into());
 
     let telemetry_log = std::env::temp_dir().join("afd_t40t_branch_mismatch_clean.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
@@ -10732,6 +11321,8 @@ struct IsoRerollLlm;
         bugbot_status: "green".into(),
         ci_pending: false,
         head_committed_epoch: fresh_epoch.saturating_sub(120),
+        pending_check_names: vec![],
+        check_names_and_buckets: vec![],
     };
     scm.pr_snapshots.insert(901, snap.clone());
 

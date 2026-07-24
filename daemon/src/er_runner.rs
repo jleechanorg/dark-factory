@@ -274,6 +274,8 @@ pub fn snapshot_with_comments(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         bugbot_status: "green".into(),
         ci_pending: false,
         head_committed_epoch: 0,
+        pending_check_names: vec![],
+        check_names_and_buckets: vec![],
     }
 }
 

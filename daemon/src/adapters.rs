@@ -650,6 +650,8 @@ impl Scm for CliScm {
                         bugbot_status: "green".to_string(),
                         ci_pending: false,
                         head_committed_epoch: snap.head_committed_epoch.unwrap_or(0),
+                        pending_check_names: vec![],
+                        check_names_and_buckets: vec![],
                     });
                 }
             }
@@ -925,6 +927,20 @@ impl Scm for CliScm {
                 any_failed = true;
             }
         }
+        // Task 2 (reviewer-outage-resilience): collect the pending
+        // check-run names and the full (name, bucket) list so the
+        // verification step's outage-aware CI-pending override can
+        // distinguish real CI from in-outage provider stale-pending
+        // statuses and recompute ci_success after waiving them.
+        let pending_check_names: Vec<String> = checks
+            .iter()
+            .filter(|c| c.bucket == "pending")
+            .map(|c| c.name.clone())
+            .collect();
+        let check_names_and_buckets: Vec<(String, String)> = checks
+            .iter()
+            .map(|c| (c.name.clone(), c.bucket.clone()))
+            .collect();
         let ci_status = if checks.is_empty() || any_pending {
             "unknown".to_string()
         } else if any_failed {
@@ -1127,6 +1143,8 @@ impl Scm for CliScm {
             bugbot_status,
             ci_pending,
             head_committed_epoch,
+            pending_check_names,
+            check_names_and_buckets,
         };
         {
             let mut cache = self.pr_snapshot_cache.lock().unwrap();

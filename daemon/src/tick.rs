@@ -87,6 +87,12 @@ const ESCALATION_SENTINEL_ATTEMPT: u32 = u32::MAX;
 /// before a provider is marked in-outage in the `vendor_health` ledger.
 const VENDOR_OUTAGE_CONSECUTIVE_PENDING_THRESHOLD: u32 = 3;
 
+/// Task 2 (reviewer-outage-resilience): grace period (seconds) measured from
+/// the PR head commit's committer epoch after which an in-outage provider's
+/// stale pending check-run status is waived so the verification step can
+/// proceed and report the true CI result. 15 minutes.
+const OUTAGE_GRACE_PERIOD_SECS: u64 = 900;
+
 /// Bead jleechan-msmq: an ATTESTED bead with `reroll_count > 0` is in the
 /// reroll pipeline. The OLD PR's gate verdict cannot advance the bead
 /// (the reroll branch IS the advancement); re-assessing it on every
@@ -2146,6 +2152,137 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 continue;
             }
         };
+        // Task 2 (reviewer-outage-resilience): outage-aware CI-pending
+        // override. When `ci_pending` is true ONLY because of stale pending
+        // check-runs from in-outage review-bot providers (and every real CI
+        // check has completed), waive those pending statuses after a 15-minute
+        // grace period (measured from the head commit's committer epoch) so
+        // the assessment can proceed and report the true CI result. All real
+        // CI failures still fail the assessment exactly as before — the
+        // override never waives a FAILED check, only a stale PENDING status.
+        if snapshot.ci_pending {
+            // Build the set of in-outage provider name-match patterns from
+            // the vendor_health ledger. "coderabbit" -> ["coderabbit"];
+            // "bugbot" -> ["bugbot", "cursor"] (matching the bugbot_status
+            // derivation in adapters.rs).
+            let mut outage_patterns: Vec<&str> = Vec::new();
+            let mut outage_vendors: Vec<&str> = Vec::new();
+            if deps
+                .store
+                .vendor_health("coderabbit")
+                .ok()
+                .flatten()
+                .is_some_and(|h| h.in_outage)
+            {
+                outage_patterns.push("coderabbit");
+                outage_vendors.push("coderabbit");
+            }
+            if deps
+                .store
+                .vendor_health("bugbot")
+                .ok()
+                .flatten()
+                .is_some_and(|h| h.in_outage)
+            {
+                outage_patterns.push("bugbot");
+                outage_patterns.push("cursor");
+                outage_vendors.push("bugbot");
+            }
+
+            // Partition pending check names: those matching an in-outage
+            // provider pattern (case-insensitive substring) vs. real CI.
+            let matches_outage = |name: &str| {
+                let lower = name.to_lowercase();
+                outage_patterns.iter().any(|p| lower.contains(p))
+            };
+            let waived: Vec<String> = snapshot
+                .pending_check_names
+                .iter()
+                .filter(|n| matches_outage(n))
+                .cloned()
+                .collect();
+            let real_pending: Vec<String> = snapshot
+                .pending_check_names
+                .iter()
+                .filter(|n| !matches_outage(n))
+                .cloned()
+                .collect();
+
+            // Only override when ALL pending check-runs belong to in-outage
+            // providers. Any real CI still pending => keep waiting.
+            if real_pending.is_empty() && !outage_patterns.is_empty() {
+                let now_epoch_ovr = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let elapsed = now_epoch_ovr.saturating_sub(snapshot.head_committed_epoch);
+                if elapsed >= OUTAGE_GRACE_PERIOD_SECS {
+                    // Recompute ci_success/ci_status from the full check-run
+                    // list, EXCLUDING in-outage provider checks. Real CI
+                    // failures remain failures; an all-outage-provider PR
+                    // (no remaining checks) is treated as green (waived).
+                    let remaining: Vec<&(String, String)> = snapshot
+                        .check_names_and_buckets
+                        .iter()
+                        .filter(|(name, _)| !matches_outage(name))
+                        .collect();
+                    let any_real_fail = remaining
+                        .iter()
+                        .any(|(_, b)| b == "fail" || b == "cancel");
+                    let any_real_pending = remaining
+                        .iter()
+                        .any(|(_, b)| b == "pending");
+                    let (ci_success, ci_status) = if remaining.is_empty() {
+                        (true, "green".to_string())
+                    } else if any_real_fail {
+                        (false, "red".to_string())
+                    } else if any_real_pending {
+                        // Should not happen (real_pending was empty), but
+                        // fail-closed: keep pending rather than false-green.
+                        (snapshot.ci_success, snapshot.ci_status.clone())
+                    } else {
+                        (true, "green".to_string())
+                    };
+                    snapshot.ci_pending = false;
+                    snapshot.ci_success = ci_success;
+                    snapshot.ci_status = ci_status;
+                    let _ = emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Attested.as_str(),
+                        "VERIFICATION_OUTAGE_GRACE_PERIOD",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "vendor": outage_vendors,
+                            "head_sha": snapshot.head_sha,
+                            "head_committed_epoch": snapshot.head_committed_epoch,
+                            "grace_period_secs": OUTAGE_GRACE_PERIOD_SECS,
+                            "pending_checks_waived": waived,
+                            "real_ci_result": if snapshot.ci_success { "green" } else { "red" },
+                        }),
+                    );
+                } else {
+                    // Grace period not yet elapsed — keep waiting.
+                    let _ = emit(
+                        deps.telemetry_log,
+                        bead_id,
+                        overlay.attempt,
+                        OverlayState::Attested.as_str(),
+                        "VERIFICATION_OUTAGE_GRACE_WAIT",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "vendor": outage_vendors,
+                            "head_sha": snapshot.head_sha,
+                            "head_committed_epoch": snapshot.head_committed_epoch,
+                            "elapsed_secs": elapsed,
+                            "grace_period_secs": OUTAGE_GRACE_PERIOD_SECS,
+                            "pending_checks_waived": waived,
+                        }),
+                    );
+                }
+            }
+        }
         if snapshot.ci_pending {
             emit(
                 deps.telemetry_log,
