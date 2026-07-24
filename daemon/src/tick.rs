@@ -1644,6 +1644,43 @@ fn skeptic_evidence(
     // `er_runner::build_er_prompt` — makes the reviewer query the RIGHT repo
     // regardless of daemon cwd, instead of silently reviewing PR #{pr} in
     // whatever repo happened to be checked out.
+    //
+    // Task 3 (reviewer-outage-resilience): tell the skeptic reviewer which
+    // review providers are currently in outage so its completeness check can
+    // account for the missing signals (their gates have been waived). Only
+    // append the note when at least one vendor is in outage; the healthy path
+    // keeps the prompt byte-identical to before.
+    let outage_note = {
+        let mut waived: Vec<&str> = Vec::new();
+        if deps
+            .store
+            .vendor_health("coderabbit")
+            .ok()
+            .flatten()
+            .is_some_and(|h| h.in_outage)
+        {
+            waived.push("coderabbit");
+        }
+        if deps
+            .store
+            .vendor_health("bugbot")
+            .ok()
+            .flatten()
+            .is_some_and(|h| h.in_outage)
+        {
+            waived.push("bugbot");
+        }
+        if waived.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nNote: the following review providers are currently in \
+                 outage and their gates have been waived: {}. Account for \
+                 this in your completeness check.",
+                waived.join(", ")
+            )
+        }
+    };
     let prompt = format!(
         "You are the Stage-1 Skeptic gate for an autonomous coding factory.\n\
          Review bead {bead_id}'s PR #{pr} in repo {repo} end-to-end (diff, \
@@ -1652,7 +1689,7 @@ fn skeptic_evidence(
            gh pr view {pr} --repo {repo} --json body,comments\n\
            gh pr checks {pr} --repo {repo}\n\
          Respond with exactly one line of the form:\n\
-         pass|warn <note>|fail <reason>",
+         pass|warn <note>|fail <reason>{outage_note}",
     );
 
     let coder_agent = std::env::var("DARK_FACTORY_CODER_DEFAULT")
@@ -2526,8 +2563,42 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // `verifier::assess`'s own serialization, so this can't drift from
         // what was actually computed, and `evidence.skeptic_reviewers`
         // names the vendor(s) that produced this tick's skeptic verdict.
-        let mut gate_assessment_context = report.to_json();
+        //
+        // Task 3 (reviewer-outage-resilience): annotate in-outage provider
+        // gates with the canonical "waived_vendor_unavailable" token. Build
+        // the in-outage vendor list from the `vendor_health` ledger for both
+        // review providers, then pass it to `to_json_with_outage` so the
+        // provider's OWN gate key (coderabbit / bugbot) carries the waiver
+        // token instead of its real verdict. All other gates keep their real
+        // verdict and remain fully enforced/blocking.
+        let mut in_outage_vendors: Vec<&str> = Vec::new();
+        if deps
+            .store
+            .vendor_health("coderabbit")
+            .ok()
+            .flatten()
+            .is_some_and(|h| h.in_outage)
+        {
+            in_outage_vendors.push("coderabbit");
+        }
+        if deps
+            .store
+            .vendor_health("bugbot")
+            .ok()
+            .flatten()
+            .is_some_and(|h| h.in_outage)
+        {
+            in_outage_vendors.push("bugbot");
+        }
+        let mut gate_assessment_context = report.to_json_with_outage(&in_outage_vendors);
         if let Some(obj) = gate_assessment_context.as_object_mut() {
+            // Task 3: surface the list of vendors whose gates were waived so
+            // the merge authority and operators can see which gates carried
+            // "waived_vendor_unavailable" without re-deriving it.
+            obj.insert(
+                "waived_vendors".to_string(),
+                serde_json::json!(in_outage_vendors),
+            );
             obj.insert(
                 "skeptic_reviewers".to_string(),
                 serde_json::json!(evidence.skeptic_reviewers),
